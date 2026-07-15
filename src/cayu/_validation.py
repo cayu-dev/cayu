@@ -202,6 +202,26 @@ def require_unicode_scalar_json(value: Any, field_name: str) -> Any:
     return value
 
 
+def require_durable_json_text(value: Any, field_name: str) -> Any:
+    """Reject strings that cannot round-trip through every durable JSON store."""
+
+    if type(value) is str:
+        require_unicode_scalar_text(value, field_name)
+        if "\x00" in value:
+            raise ValueError(f"`{field_name}` must not contain NUL characters.")
+        return value
+    if type(value) is list:
+        for index, item in enumerate(value):
+            require_durable_json_text(item, f"{field_name}[{index}]")
+        return value
+    if type(value) is dict:
+        for key, item in value.items():
+            require_durable_json_text(key, f"{field_name} key")
+            require_durable_json_text(item, f"{field_name}.{key}")
+        return value
+    return value
+
+
 def freeze_json_value(value: Any) -> Any:
     """Recursively freeze an already validated JSON-compatible value."""
 

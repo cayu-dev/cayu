@@ -2479,6 +2479,68 @@
       "title": "ClientGenerationContract",
       "type": "object"
     },
+    "CompactSessionBody": {
+      "additionalProperties": false,
+      "properties": {
+        "budget_limits": {
+          "items": {
+            "$ref": "#/components/schemas/BudgetLimit"
+          },
+          "title": "Budget Limits",
+          "type": "array"
+        },
+        "expected_run_epoch": {
+          "minimum": 0.0,
+          "title": "Expected Run Epoch",
+          "type": "integer"
+        },
+        "expected_transcript_cursor": {
+          "minimum": 0.0,
+          "title": "Expected Transcript Cursor",
+          "type": "integer"
+        },
+        "idempotency_key": {
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "^[^\\x00]+$",
+          "title": "Idempotency Key",
+          "type": "string"
+        },
+        "instructions": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Instructions"
+        },
+        "limits": {
+          "$ref": "#/components/schemas/RunLimits"
+        },
+        "requested_by": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ResolutionActor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "idempotency_key",
+        "expected_run_epoch",
+        "expected_transcript_cursor"
+      ],
+      "title": "CompactSessionBody",
+      "type": "object"
+    },
     "CostLineItem": {
       "additionalProperties": false,
       "description": "Estimated cost for one model.completed event.",
@@ -7473,6 +7535,90 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/sessions/{session_id}/compact": {
+      "post": {
+        "operation_id": "compact_session_api_sessions__session_id__compact_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Cayu-Mutation-ID",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._~-]*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Client-generated mutation identity used to correlate an ambiguous SSE reconnect with its durable server acceptance event. Send the same value on the initial mutation and every Last-Event-ID replay request; it is a replay correlation key, not permission to repeat the POST.",
+              "title": "Cayu-Mutation-Id"
+            }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "pattern": "^[^\\x00]+$",
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/CompactSessionBody"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "description": "SSE stream. Runtime `data:` frames contain SseEventEnvelope JSON; `event: error` frames contain SseErrorEnvelope JSON.",
+                "type": "string"
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
               }
             }
           }

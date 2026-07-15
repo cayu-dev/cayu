@@ -1308,6 +1308,34 @@ export type ClientGenerationContract = {
 };
 
 /**
+ * CompactSessionBody
+ */
+export type CompactSessionBody = {
+    /**
+     * Budget Limits
+     */
+    budget_limits?: Array<BudgetLimit>;
+    /**
+     * Expected Run Epoch
+     */
+    expected_run_epoch: number;
+    /**
+     * Expected Transcript Cursor
+     */
+    expected_transcript_cursor: number;
+    /**
+     * Idempotency Key
+     */
+    idempotency_key: string;
+    /**
+     * Instructions
+     */
+    instructions?: string | null;
+    limits?: RunLimits;
+    requested_by?: ResolutionActor | null;
+};
+
+/**
  * CostLineItem
  *
  * Estimated cost for one model.completed event.
@@ -3913,6 +3941,56 @@ export type GetSessionApiSessionsSessionIdGetResponses = {
 };
 
 export type GetSessionApiSessionsSessionIdGetResponse = GetSessionApiSessionsSessionIdGetResponses[keyof GetSessionApiSessionsSessionIdGetResponses];
+
+export type CompactSessionApiSessionsSessionIdCompactPostData = {
+    body: CompactSessionBody;
+    headers?: {
+        /**
+         * Cayu-Mutation-Id
+         *
+         * Client-generated mutation identity used to correlate an ambiguous SSE reconnect with its durable server acceptance event. Send the same value on the initial mutation and every Last-Event-ID replay request; it is a replay correlation key, not permission to repeat the POST.
+         */
+        'Cayu-Mutation-ID'?: string | null;
+    };
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: never;
+    url: '/api/sessions/{session_id}/compact';
+};
+
+export type CompactSessionApiSessionsSessionIdCompactPostErrors = {
+    /**
+     * The replay session or mutation target does not exist.
+     */
+    404: ApiErrorResponse;
+    /**
+     * The replay event marker is unknown or the mutation conflicts with the current session state.
+     */
+    409: ApiErrorResponse;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+    /**
+     * The mutation could not open an accepted durable stream.
+     */
+    500: ApiErrorResponse;
+};
+
+export type CompactSessionApiSessionsSessionIdCompactPostError = CompactSessionApiSessionsSessionIdCompactPostErrors[keyof CompactSessionApiSessionsSessionIdCompactPostErrors];
+
+export type CompactSessionApiSessionsSessionIdCompactPostResponses = {
+    /**
+     * SSE stream. Runtime `data:` frames contain SseEventEnvelope JSON; `event: error` frames contain SseErrorEnvelope JSON.
+     */
+    200: string;
+};
+
+export type CompactSessionApiSessionsSessionIdCompactPostResponse = CompactSessionApiSessionsSessionIdCompactPostResponses[keyof CompactSessionApiSessionsSessionIdCompactPostResponses];
 
 export type EstimateSessionCostApiSessionsSessionIdCostPostData = {
     body: SessionCostBody;

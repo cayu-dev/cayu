@@ -68,6 +68,7 @@ _TABLES = (
     "cayu_session_labels",
     "cayu_transcript_messages",
     "cayu_checkpoints",
+    "cayu_session_operations",
     "cayu_tasks",
     "cayu_sessions",
     "cayu_schema_migrations",
@@ -168,7 +169,7 @@ def test_validate_mode_rejects_pre_insert_xid_postgres_schema(postgres_dsn: str)
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 17"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 18"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -195,7 +196,7 @@ def test_revision_fourteen_requires_cascade_index_migration(postgres_dsn: str) -
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 17"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 18"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -239,7 +240,7 @@ def test_revision_fifteen_requires_session_sequence_index_migration(postgres_dsn
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 17"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 18"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -369,7 +370,7 @@ def test_revision_seventeen_requires_pending_action_index_migration(
 
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             async with conn.cursor() as cur:
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 17")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 17")
                 await cur.execute("DROP INDEX idx_cayu_checkpoints_pending_control_action")
                 await cur.execute("DROP INDEX idx_cayu_events_pending_action_barrier")
                 await cur.execute("DROP INDEX idx_cayu_events_pending_action_lookup")
@@ -388,7 +389,7 @@ def test_revision_seventeen_requires_pending_action_index_migration(
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 17"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 18"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -520,6 +521,46 @@ def test_revision_seventeen_requires_pending_action_index_migration(
     asyncio.run(runner())
 
 
+def test_revision_seventeen_requires_session_operation_migration(postgres_dsn: str) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 18")
+                await cur.execute("DROP TABLE cayu_session_operations")
+            await conn.commit()
+
+        validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
+        try:
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 18"):
+                await validator.ensure_schema()
+        finally:
+            await validator.close()
+
+        migrator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            await migrator.ensure_schema()
+        finally:
+            await migrator.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute("SELECT to_regclass('cayu_session_operations')")
+            assert await cur.fetchone() == ("cayu_session_operations",)
+
+    asyncio.run(runner())
+
+
 def test_revision_seventeen_rejects_incomplete_lookup_index(postgres_dsn: str) -> None:
     async def runner() -> None:
         import psycopg
@@ -533,7 +574,7 @@ def test_revision_seventeen_rejects_incomplete_lookup_index(postgres_dsn: str) -
 
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             async with conn.cursor() as cur:
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 17")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 17")
                 await cur.execute("DROP INDEX idx_cayu_checkpoints_pending_control_action")
                 await cur.execute("DROP INDEX idx_cayu_events_pending_action_barrier")
                 await cur.execute("DROP INDEX idx_cayu_events_pending_action_lookup")

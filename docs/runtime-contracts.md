@@ -52,6 +52,69 @@ Built-in policies include `RecentTurnsContextPolicy`, `MessageWindowContextPolic
 
 Compaction checkpoints store the summary and `compacted_transcript_cursor`, the provider-neutral transcript position covered by that summary. The model-facing summary is injected as synthetic user context, not as a system instruction, and is not appended to the durable transcript. Compaction events include cursor, compactor, count, error, and provider metadata needed for audit/debugging, but they do not include the summary text.
 
+### Explicit application-requested compaction
+
+`CayuApp.compact_session(CompactSessionRequest(...))` asks the runtime to update
+an existing session's model-facing `context_compaction` checkpoint without
+resuming the agent loop or creating a user or assistant turn. The target agent
+must use `CheckpointCompactionContextPolicy`, and the session must be at a
+completed, failed, or interrupted boundary with no unresolved approval, user
+input, tool round, or interruption cascade. The request supplies an idempotency
+key plus the expected run epoch and transcript cursor. Both fences are checked
+again in the atomic store transaction before the compactor is invoked.
+
+The operation writes its single live durable claim into the session checkpoint
+and publishes the claim with `context.compaction.started` atomically. While its
+lease is active, resume, fork, recovery, deletion, and other explicit compaction
+operations reject the same source session. After the five-minute lease expires,
+resume and fork may proceed, a new idempotency key may replace the abandoned
+operation, or a worker may reclaim the same equivalent request. The authenticated
+caller is recorded on each attempt but does not change that request identity, so
+another authorized operator can recover it. Every causal event carries the stable
+operation ID and a distinct attempt ID. A late superseded attempt cannot publish
+its checkpoint, but any observed provider usage remains in the operation's replay
+history. Successful publication writes the new checkpoint together with causal
+`model.completed`, `context.compaction.completed`, and `session.checkpointed`
+events. Failure writes any observed provider usage together with
+`context.compaction.failed` and leaves the previous compaction checkpoint in
+place. Completion and failure atomically move the inactive operation record into
+the store's per-session replay index and remove it from checkpoint state. This
+keeps exact idempotent replay durable without making every later checkpoint write
+copy the session's full operation history.
+
+An equivalent retry with the same idempotency key replays the original durable
+events without calling the compactor again, even after a later resume advances
+the session epoch or transcript; changing any request field under the same key
+fails. A checkpoint-copy fork inherits the compacted context but starts with an
+independent operation/idempotency ledger. Retrying a failed operation requires
+a new idempotency key. Optional
+instructions are bounded and passed only to the compactor. Explicit-compaction
+events use a bounded metadata allowlist: causal fields include `mode="bounded"`,
+provider telemetry is reduced to bounded model identity and normalized usage,
+and completion telemetry retains only cursor/count fields. Events store
+instruction presence plus a SHA-256 digest, never instruction text, summary
+text, arbitrary compactor metadata, provider continuation state, or raw usage.
+The operation's `RunLimits` use the request invocation for `scope="run"` and
+durable session usage for `scope="session"`. Supplied cost budgets and matching
+app-policy budgets are checked against their normal run/session/shared scopes.
+Provider-backed compaction uses the same atomic reservation ledger and renewable
+lease as a normal provider step. Pre-provider `budget.checked` and reservation
+lifecycle events are durably linked to the active compaction attempt before the
+provider runs; deterministic compactors perform no provider-cost check or
+reservation. Custom `ContextCompactor` implementations used with cost budgets
+must implement `provider_budget_identity(session)`, returning the charged
+provider/model pair or `None` only when they perform no provider work. Provider
+usage is persisted even when a limit rejects the new checkpoint, so its cost
+cannot disappear on retry. The server adapter exposes the same contract at
+`POST /api/sessions/{session_id}/compact` through the replayable mutation
+protocol; mutation and authenticated actor identity are server concerns, while
+compaction policy remains runtime-owned.
+
+This explicit primitive is separate from automatic checkpoint compaction during
+a provider loop. It also does not choose when cache deadlines or economics make
+compaction desirable; higher-level scheduling policy may call this primitive
+after making that decision.
+
 `TranscriptDigestCompactor` is the deterministic fallback. It converts older messages into a clipped text digest and does not perform semantic summarization. `ModelCompactor` is the provider-backed implementation for production semantic summaries: it sends a text-only compaction request with no tools to a configured `ModelProvider`, rejects tool calls from the compaction model, and stores the returned text as the checkpoint summary. Model compaction bounds the serialized compaction input with `max_input_chars` by default so very large transcripts cannot create unbounded provider requests; the default prompt preserves compaction instructions and existing summary while clipping only the newly compacted transcript digest. Callers can tune or disable that bound explicitly. Callers can provide `system_prompt` to change compaction-model behavior and `prompt_builder` to replace the user prompt body.
 
 `PromptCacheCompactor` is the cache-aware first-checkpoint strategy. On its
@@ -512,7 +575,7 @@ such as limit values, error type, or interruption type when available. It does
 not estimate cost because Cayu does not own provider pricing; callers pass their own pricing to
 `POST /api/sessions/{session_id}/cost` when they need cost estimates.
 
-Session stores also expose `list_sessions(SessionQuery(...))` for dashboard and replay views, and `load_transcript(session_id)` for the provider-neutral model conversation used by resume and compaction APIs. Runtime code can write one event with `append_event(...)` or write a durable batch with `append_events(...)`. Runtime code appends transcript messages as it builds the model conversation: initial messages, resumed request messages, assistant model messages, and tool-result messages. Batched event appends must be atomic: if one event in the batch is invalid or duplicated, none of the batch should be persisted. Terminal tool events must be durable before approval retry and ordinary tool-round recovery can safely skip execution. `append_transcript_messages_and_transform_checkpoint(...)` must also be atomic: it is the boundary used when opening or closing recoverable tool rounds, where the transcript cannot be updated independently from the current checkpoint.
+Session stores also expose `list_sessions(SessionQuery(...))` for dashboard and replay views, and `load_transcript(session_id)` for the provider-neutral model conversation used by resume and compaction APIs. Runtime code can write one event with `append_event(...)` or write a durable batch with `append_events(...)`. Runtime code appends transcript messages as it builds the model conversation: initial messages, resumed request messages, assistant model messages, and tool-result messages. Batched event appends must be atomic: if one event in the batch is invalid or duplicated, none of the batch should be persisted. Terminal tool events must be durable before approval retry and ordinary tool-round recovery can safely skip execution. `append_transcript_messages_and_transform_checkpoint(...)` must also be atomic: it is the boundary used when opening or closing recoverable tool rounds, where the transcript cannot be updated independently from the current checkpoint. `publish_checkpoint_and_events(...)` validates lifecycle, run-epoch, and transcript-cursor fences and publishes a transformed checkpoint plus its causal event batch in one transaction. Durable operations use `publish_session_operation(...)` for the stronger boundary that atomically publishes the checkpoint, causal events, and normalized operation replay records.
 
 ## TaskStore
 
@@ -1019,8 +1082,11 @@ request budgets. They may also use `scope="agent"` or `scope="causal"` for
 dynamic work-item budgets passed by the caller; those keys must match the
 current agent name or current `causal_budget_id`. `scope="app"` is accepted for
 intentional per-request global checks, but durable app-wide policy normally
-belongs on `CayuApp(budget_policy=...)`. Request budget limits must not include
-reservations; strict concurrent reservations are app-policy/ledger behavior.
+belongs on `CayuApp(budget_policy=...)`. Request budget limits may include
+reservations only for shared `app`/`agent`/`causal` scopes; `session` and `run`
+request budgets remain cooperatively enforced because a session executes its
+provider steps serially. All reservations route through the configured budget
+ledger.
 `BudgetLimit.action` defaults to `"interrupt"`. With `action="notify"`, Cayu
 emits a durable `budget.limit_reached` event when the estimated-cost threshold
 is reached, but it does not emit `session.limit_reached`, does not interrupt the

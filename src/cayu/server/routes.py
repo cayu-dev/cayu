@@ -22,6 +22,7 @@ from pydantic import (
     StringConstraints,
     ValidationError,
     field_validator,
+    model_validator,
 )
 from sse_starlette.sse import EventSourceResponse
 
@@ -32,6 +33,7 @@ from cayu._validation import (
     copy_json_value,
     copy_label_map,
     require_clean_nonblank,
+    require_durable_json_text,
     require_unicode_scalar_text,
 )
 from cayu.artifacts import (
@@ -67,6 +69,7 @@ from cayu.runtime.costs import (
 )
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.sessions import (
+    CompactSessionRequest,
     EventOrder,
     EventQuery,
     EventRecord,
@@ -187,6 +190,14 @@ _MutationAcceptanceStage = Literal[
 ]
 
 NonBlankString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+PersistableNonBlankString = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        pattern=r"^[^\x00]+$",
+    ),
+]
 ReplaySafeSessionId = Annotated[
     str,
     StringConstraints(
@@ -803,6 +814,36 @@ class InterruptSessionBody(BaseModel):
     reason: NonBlankString | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     requested_by: ResolutionActor | None = None
+
+
+class CompactSessionBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    idempotency_key: PersistableNonBlankString = Field(max_length=256)
+    expected_run_epoch: StrictInt = Field(ge=0)
+    expected_transcript_cursor: StrictInt = Field(ge=0)
+    instructions: NonBlankString | None = Field(default=None, max_length=4096)
+    limits: RunLimits = Field(default_factory=RunLimits)
+    budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
+    requested_by: ResolutionActor | None = None
+
+    @field_validator("budget_limits", mode="before")
+    @classmethod
+    def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...]:
+        return copy_request_budget_limits(value)
+
+    @model_validator(mode="after")
+    def validate_durable_text(self) -> CompactSessionBody:
+        require_durable_json_text(
+            self.model_dump(mode="json", exclude={"requested_by"}),
+            "CompactSessionBody",
+        )
+        if self.requested_by is not None:
+            require_durable_json_text(
+                self.requested_by.model_dump(mode="json", exclude={"claims"}),
+                "CompactSessionBody.requested_by",
+            )
+        return self
 
 
 class UpdateSessionLabelsBody(BaseModel):
@@ -2203,6 +2244,53 @@ def create_router(
                 mutation_id=mutation_id,
                 mutation_kind="resume",
                 session_id=body.session_id,
+            ),
+            conflict_error_types=(RuntimeError, TimeoutError, ValueError),
+        )
+
+    @router.post(
+        "/sessions/{session_id}/compact",
+        response_class=EventSourceResponse,
+        responses=STREAMING_ENDPOINT_RESPONSES,
+    )
+    async def compact_session(
+        session_id: PersistableNonBlankString,
+        body: CompactSessionBody,
+        http_request: Request,
+        auth_context: AuthContext | None = optional_auth_context,
+        mutation_id: MutationIdHeader = None,
+    ):
+        replay = await _replay_events_response(
+            http_request,
+            expected_session_id=session_id,
+        )
+        if replay is not None:
+            return replay
+        session = await session_store.load(session_id)
+        if session is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session not found: {session_id}",
+            )
+
+        request = CompactSessionRequest(
+            session_id=session_id,
+            idempotency_key=body.idempotency_key,
+            expected_run_epoch=body.expected_run_epoch,
+            expected_transcript_cursor=body.expected_transcript_cursor,
+            instructions=body.instructions,
+            limits=body.limits,
+            budget_limits=body.budget_limits,
+            requested_by=_request_interruption_actor(auth_context, body.requested_by),
+        )
+        return await _accepted_event_stream_response(
+            cayu_app.compact_session(request),
+            cayu_app=cayu_app,
+            session_id=session_id,
+            after_accept=_mutation_acceptance_callback(
+                mutation_id=mutation_id,
+                mutation_kind="session.compact",
+                session_id=session_id,
             ),
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )

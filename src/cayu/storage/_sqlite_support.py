@@ -125,6 +125,14 @@ _BASELINE_DDL = """
         pending_action_metrics_ready INTEGER NOT NULL DEFAULT 1
     );
 
+    CREATE TABLE IF NOT EXISTS cayu_session_operations (
+        session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+        idempotency_key TEXT NOT NULL,
+        record_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (session_id, idempotency_key)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_cayu_checkpoints_pending_interruption_cascade
         ON cayu_checkpoints(session_id)
         WHERE json_type(state_json, '$.pending_interruption_cascade') IS NOT NULL;
@@ -450,6 +458,15 @@ _MIGRATION_STEPS: dict[int, str] = {
                 'tool.call.approval_denied'
             )
               AND pending_action_lookup_key IS NOT NULL;
+    """,
+    18: """
+        CREATE TABLE IF NOT EXISTS cayu_session_operations (
+            session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+            idempotency_key TEXT NOT NULL,
+            record_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (session_id, idempotency_key)
+        );
     """,
 }
 

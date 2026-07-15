@@ -35,6 +35,8 @@ from cayu.runtime.sessions import (
     Session,
     SessionIdentity,
     SessionListResult,
+    SessionOperationPublication,
+    SessionOperationTransform,
     SessionOrder,
     SessionOutcome,
     SessionQuery,
@@ -47,6 +49,7 @@ from cayu.runtime.sessions import (
     TranscriptQuery,
     TranscriptRecord,
     _activate_session_run_fence,
+    _active_unexpired_session_operation_id,
     _assert_session_run_epoch,
     _copy_session_event_batch,
     _current_session_run_epoch,
@@ -92,7 +95,7 @@ from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = 17
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = 18
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
     contains_style="sqlite_nocase_like",
@@ -746,36 +749,37 @@ class SQLiteSessionStore(SessionStore):
 
     async def delete_session(self, session_id: str) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
-        blocked = [str(status) for status in DELETE_BLOCKED_SESSION_STATUSES]
-        placeholders = ", ".join("?" for _ in blocked)
         async with self._lock:
-            with self._connection:
-                # Guard the status check inside the statement so a concurrent
-                # transition into a delete-blocked status cannot slip between a
-                # separate SELECT and the DELETE. ON DELETE CASCADE removes
-                # events/labels/checkpoint/transcript; the self-FK is ON DELETE
-                # SET NULL so children keep loading with no parent.
-                cursor = self._connection.execute(
-                    f"""
-                    DELETE FROM cayu_sessions
-                    WHERE id = ? AND status NOT IN ({placeholders})
-                    """,
-                    (session_id, *blocked),
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                session = self._load_unlocked(session_id)
+                if session is None:
+                    self._connection.rollback()
+                    return
+                if session.status in DELETE_BLOCKED_SESSION_STATUSES:
+                    raise ValueError(
+                        f"Cannot delete a session while it is {session.status}; "
+                        f"interrupt it first: {session_id}"
+                    )
+                active_operation_id = _active_unexpired_session_operation_id(
+                    self._load_checkpoint_unlocked(session_id),
+                    now=datetime.now(UTC),
                 )
-            if cursor.rowcount == 0:
-                # Nothing was deleted: either the session is already gone
-                # (idempotent no-op) or it is in a delete-blocked status.
-                row = self._connection.execute(
-                    "SELECT status FROM cayu_sessions WHERE id = ?",
+                if active_operation_id is not None:
+                    raise ValueError(
+                        "Cannot delete a session while durable operation "
+                        f"{active_operation_id} is active: {session_id}"
+                    )
+                # ON DELETE CASCADE removes events/labels/checkpoint/transcript;
+                # the self-FK is ON DELETE SET NULL so children keep loading.
+                self._connection.execute(
+                    "DELETE FROM cayu_sessions WHERE id = ?",
                     (session_id,),
-                ).fetchone()
-                if row is None:
-                    return  # idempotent: deleting a missing session is a no-op
-                status = SessionStatus(row["status"])
-                raise ValueError(
-                    f"Cannot delete a session while it is {status}; "
-                    f"interrupt it first: {session_id}"
                 )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
 
     async def update_labels(self, session_id: str, labels: dict[str, str]) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -1138,6 +1142,257 @@ class SQLiteSessionStore(SessionStore):
                 raise
 
         await self._run_write(statement)
+
+    async def publish_checkpoint_and_events(
+        self,
+        session_id: str,
+        *,
+        checkpoint_transform: CheckpointTransform,
+        events: list[Event],
+        expected_statuses: set[SessionStatus] | None = None,
+        expected_run_epoch: int | None = None,
+        expected_transcript_cursor: int | None = None,
+    ) -> Session:
+        return await self._publish_checkpoint_and_events(
+            session_id,
+            checkpoint_transform=checkpoint_transform,
+            operation_idempotency_key=None,
+            operation_transform=None,
+            events=events,
+            expected_statuses=expected_statuses,
+            expected_run_epoch=expected_run_epoch,
+            expected_transcript_cursor=expected_transcript_cursor,
+        )
+
+    async def load_session_operation(
+        self,
+        session_id: str,
+        idempotency_key: str,
+    ) -> dict[str, Any] | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        idempotency_key = require_clean_nonblank(idempotency_key, "idempotency_key")
+
+        def query(connection: sqlite3.Connection) -> dict[str, Any] | None:
+            if not _session_exists(connection, session_id):
+                raise KeyError(f"Session not found: {session_id}")
+            row = connection.execute(
+                "SELECT record_json FROM cayu_session_operations "
+                "WHERE session_id = ? AND idempotency_key = ?",
+                (session_id, idempotency_key),
+            ).fetchone()
+            return None if row is None else json.loads(row["record_json"])
+
+        return await self._run_read(query)
+
+    async def publish_session_operation(
+        self,
+        session_id: str,
+        *,
+        idempotency_key: str,
+        operation_transform: SessionOperationTransform,
+        events: list[Event],
+        expected_statuses: set[SessionStatus] | None = None,
+        expected_run_epoch: int | None = None,
+        expected_transcript_cursor: int | None = None,
+    ) -> Session:
+        return await self._publish_checkpoint_and_events(
+            session_id,
+            checkpoint_transform=None,
+            operation_idempotency_key=require_clean_nonblank(
+                idempotency_key,
+                "idempotency_key",
+            ),
+            operation_transform=operation_transform,
+            events=events,
+            expected_statuses=expected_statuses,
+            expected_run_epoch=expected_run_epoch,
+            expected_transcript_cursor=expected_transcript_cursor,
+        )
+
+    async def _publish_checkpoint_and_events(
+        self,
+        session_id: str,
+        *,
+        checkpoint_transform: CheckpointTransform | None,
+        operation_idempotency_key: str | None,
+        operation_transform: SessionOperationTransform | None,
+        events: list[Event],
+        expected_statuses: set[SessionStatus] | None,
+        expected_run_epoch: int | None,
+        expected_transcript_cursor: int | None,
+    ) -> Session:
+        from cayu.runtime.pending_actions import pending_action_event_storage_values
+
+        session_id, copied_events = _copy_session_event_batch(session_id, events)
+        if (checkpoint_transform is None) == (operation_transform is None):
+            raise TypeError("Exactly one checkpoint publication transform is required.")
+        if operation_transform is not None and operation_idempotency_key is None:
+            raise TypeError("operation_idempotency_key is required.")
+        allowed_statuses = (
+            None
+            if expected_statuses is None
+            else _validate_status_set(expected_statuses, "expected_statuses")
+        )
+        updated_at = datetime.now(UTC)
+
+        def statement(connection: sqlite3.Connection) -> Session:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                loaded = self._load_unlocked(session_id)
+                if loaded is None:
+                    raise KeyError(f"Session not found: {session_id}")
+                _assert_session_run_epoch(session_id, loaded)
+                if allowed_statuses is not None and loaded.status not in allowed_statuses:
+                    raise SessionStatusConflict(
+                        "Session status is not eligible for checkpoint publication: "
+                        f"{loaded.status}"
+                    )
+                if expected_run_epoch is not None and loaded.run_epoch != expected_run_epoch:
+                    raise SessionRunFenced(
+                        f"Session source run epoch is stale: expected {expected_run_epoch}, "
+                        f"current {loaded.run_epoch}."
+                    )
+                cursor_row = connection.execute(
+                    "SELECT COUNT(*) AS count FROM cayu_transcript_messages WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                current_cursor = cursor_row["count"]
+                if (
+                    expected_transcript_cursor is not None
+                    and current_cursor != expected_transcript_cursor
+                ):
+                    raise ValueError(
+                        "Session source transcript cursor is stale: expected "
+                        f"{expected_transcript_cursor}, current {current_cursor}."
+                    )
+                current_checkpoint = self._load_checkpoint_unlocked(session_id)
+                operation_records: dict[str, dict[str, Any]] = {}
+                if operation_transform is not None:
+                    operation_row = connection.execute(
+                        "SELECT record_json FROM cayu_session_operations "
+                        "WHERE session_id = ? AND idempotency_key = ?",
+                        (session_id, operation_idempotency_key),
+                    ).fetchone()
+                    current_operation = (
+                        None if operation_row is None else json.loads(operation_row["record_json"])
+                    )
+                    publication = operation_transform(
+                        loaded,
+                        current_checkpoint,
+                        current_operation,
+                    )
+                    if type(publication) is not SessionOperationPublication:
+                        raise TypeError(
+                            "Session operation transform must return a SessionOperationPublication."
+                        )
+                    transformed = copy_json_value(publication.checkpoint, "checkpoint")
+                    operation_records = copy_json_value(
+                        publication.operation_records,
+                        "operation_records",
+                    )
+                else:
+                    assert checkpoint_transform is not None
+                    transformed = checkpoint_transform(loaded, current_checkpoint)
+                    if transformed is None:
+                        raise ValueError("Checkpoint transform must return a checkpoint.")
+                    transformed = copy_json_value(transformed, "checkpoint")
+                event_rows = []
+                for event in copied_events:
+                    lookup_key, projection, projection_bytes = pending_action_event_storage_values(
+                        event
+                    )
+                    event_rows.append(
+                        (
+                            session_id,
+                            event.id,
+                            str(event.type),
+                            sqlite_support.format_datetime(event.timestamp),
+                            event.agent_name,
+                            event.environment_name,
+                            event.workflow_name,
+                            event.tool_name,
+                            sqlite_support.json_dumps(event.payload),
+                            lookup_key,
+                            projection,
+                            projection_bytes,
+                        )
+                    )
+                _touch_session_activity(connection, session_id, updated_at)
+                connection.execute(
+                    """
+                    INSERT INTO cayu_checkpoints (
+                        session_id, state_json, updated_at,
+                        pending_action_source_bytes,
+                        pending_action_tool_call_count,
+                        pending_action_flags,
+                        pending_action_metrics_ready
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        state_json = excluded.state_json,
+                        updated_at = excluded.updated_at,
+                        pending_action_source_bytes = excluded.pending_action_source_bytes,
+                        pending_action_tool_call_count = excluded.pending_action_tool_call_count,
+                        pending_action_flags = excluded.pending_action_flags,
+                        pending_action_metrics_ready = excluded.pending_action_metrics_ready
+                    """,
+                    sqlite_support.checkpoint_row_values(session_id, transformed, updated_at),
+                )
+                if operation_records:
+                    connection.executemany(
+                        """
+                        INSERT INTO cayu_session_operations (
+                            session_id, idempotency_key, record_json, updated_at
+                        )
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(session_id, idempotency_key) DO UPDATE SET
+                            record_json = excluded.record_json,
+                            updated_at = excluded.updated_at
+                        """,
+                        [
+                            (
+                                session_id,
+                                key,
+                                sqlite_support.json_dumps(record),
+                                sqlite_support.format_datetime(updated_at),
+                            )
+                            for key, record in operation_records.items()
+                        ],
+                    )
+                if event_rows:
+                    connection.executemany(
+                        """
+                        INSERT INTO cayu_events (
+                            session_id, event_id, event_type, timestamp,
+                            agent_name, environment_name, workflow_name, tool_name,
+                            payload_json, pending_action_lookup_key,
+                            pending_action_projection_json, pending_action_projection_bytes
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        event_rows,
+                    )
+                connection.commit()
+            except sqlite3.IntegrityError as exc:
+                connection.rollback()
+                existing_event_id = _first_existing_event_id(
+                    connection,
+                    session_id,
+                    [event.id for event in copied_events],
+                )
+                if existing_event_id is not None:
+                    raise ValueError(
+                        f"Event already exists for session {session_id}: {existing_event_id}"
+                    ) from exc
+                raise
+            except Exception:
+                connection.rollback()
+                raise
+            return loaded.model_copy(
+                update={"updated_at": updated_at, "last_activity_at": updated_at}
+            )
+
+        return await self._run_write(statement)
 
     async def load_events(self, session_id: str) -> list[Event]:
         session_id = require_clean_nonblank(session_id, "session_id")

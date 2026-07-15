@@ -15,6 +15,7 @@ from cayu._validation import (
     copy_json_value,
     copy_label_map,
     require_clean_nonblank,
+    require_durable_json_text,
     require_nonblank,
 )
 from cayu.artifacts import (
@@ -659,7 +660,9 @@ class ContextRequest(BaseModel):
         default=None,
         exclude=True,
     )
+    force_compaction: StrictBool = False
     force_bounded_compaction: StrictBool = False
+    compaction_instructions: str | None = Field(default=None, max_length=4096)
 
     @field_validator("messages")
     @classmethod
@@ -693,6 +696,13 @@ class ContextRequest(BaseModel):
         if value is None:
             return None
         return require_clean_nonblank(value, "environment_name")
+
+    @field_validator("compaction_instructions")
+    @classmethod
+    def validate_optional_compaction_instructions(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_nonblank(value, "compaction_instructions")
 
 
 class ContextPolicy(ABC):
@@ -1506,6 +1516,7 @@ class CompactionRequest(BaseModel):
     context_messages: list[Message] = Field(default_factory=list)
     cache_prefix_request: ModelRequest | None = None
     force_bounded_compaction: StrictBool = False
+    instructions: str | None = Field(default=None, max_length=4096)
 
     @field_validator("messages")
     @classmethod
@@ -1536,6 +1547,13 @@ class CompactionRequest(BaseModel):
             return None
         return require_nonblank(value, "existing_summary")
 
+    @field_validator("instructions")
+    @classmethod
+    def validate_optional_instructions(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_nonblank(value, "instructions")
+
 
 CompactionPromptBuilder = Callable[[CompactionRequest], str]
 
@@ -1557,21 +1575,36 @@ class CompactionResult(BaseModel):
     @field_validator("summary")
     @classmethod
     def validate_summary(cls, value: str) -> str:
-        return require_nonblank(value, "summary")
+        value = require_nonblank(value, "summary")
+        return require_durable_json_text(value, "summary")
 
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        copied = copy_json_value(value, "metadata")
+        return require_durable_json_text(copied, "metadata")
 
     @field_validator("model_completed_payloads", mode="before")
     @classmethod
     def copy_model_completed_payloads(cls, value: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return copy_json_value(value, "model_completed_payloads")
+        copied = copy_json_value(value, "model_completed_payloads")
+        return require_durable_json_text(copied, "model_completed_payloads")
 
 
 class ContextCompactor(ABC):
     """Summarizes older context into durable checkpoint data."""
+
+    def provider_budget_identity(self, session: Session) -> tuple[str, str] | None:
+        """Declare the provider/model charged by one compaction invocation.
+
+        Return ``None`` only for a compactor that never performs provider work.
+        Provider-backed custom compactors must override this method so the
+        runtime can enforce app and request budgets before dispatch.
+        """
+
+        raise NotImplementedError(
+            f"{type(self).__name__} must declare its provider budget identity."
+        )
 
     @abstractmethod
     async def compact(self, request: CompactionRequest) -> CompactionResult:
@@ -1587,6 +1620,9 @@ class TranscriptDigestCompactor(ContextCompactor):
         if max_summary_chars < 200:
             raise ValueError("max_summary_chars must be at least 200.")
         self.max_summary_chars = max_summary_chars
+
+    def provider_budget_identity(self, session: Session) -> None:
+        return None
 
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         summary = _budgeted_digest_summary(
@@ -1707,6 +1743,9 @@ class ModelCompactor(ContextCompactor):
         self.prompt_builder = prompt_builder
         # `None` keeps retries disabled (the default policy is one attempt).
         self.retry_policy = copy_retry_policy(retry_policy)
+
+    def provider_budget_identity(self, session: Session) -> tuple[str, str]:
+        return self.provider.name, self.model
 
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         if self.prompt_builder is None:
@@ -1876,6 +1915,13 @@ class PromptCacheCompactor(ContextCompactor):
             self._fallback = fallback_compactor
         else:
             raise TypeError("fallback_compactor must be a ContextCompactor.")
+
+    def provider_budget_identity(self, session: Session) -> tuple[str, str]:
+        if self.provider.name != session.provider_name and self.model is None:
+            raise ValueError(
+                "model is required when the compactor provider differs from the session provider."
+            )
+        return self.provider.name, self.model if self.model is not None else session.model
 
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         provider_differs = self.provider.name != request.session.provider_name
@@ -2268,9 +2314,9 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
             previous_summary = None
 
         newly_compactable = request.messages[previous_cursor:compactable_cursor]
-        should_compact = len(compactable_messages) >= self.compact_after_messages and bool(
-            newly_compactable
-        )
+        should_compact = (
+            request.force_compaction or len(compactable_messages) >= self.compact_after_messages
+        ) and bool(newly_compactable)
 
         checkpoint_update = None
         checkpoint_event_payload = None
@@ -2330,6 +2376,7 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                             context_messages=context_messages,
                             cache_prefix_request=cache_prefix_request,
                             force_bounded_compaction=force_bounded_compaction,
+                            instructions=request.compaction_instructions,
                         )
                     )
                 finally:
@@ -3248,6 +3295,8 @@ def _default_compaction_prompt_parts(
     ]
     if request.existing_summary is not None:
         sections.append("Existing summary:\n" + request.existing_summary)
+    if request.instructions is not None:
+        sections.append("Additional compaction instructions:\n" + request.instructions)
     prefix = "\n\n".join(sections)
     transcript_prefix = "Transcript to compact:\n"
     transcript_digest = _messages_digest(request.messages)

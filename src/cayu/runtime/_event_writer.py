@@ -52,6 +52,22 @@ class RuntimeEventWriter:
             await self._emit_to_sinks(event)
         return copied_events
 
+    async def fan_out_persisted(self, events: list[Event]) -> list[Event]:
+        """Apply budget/sink side effects after a store-owned atomic publication."""
+
+        if type(events) is not list:
+            raise TypeError("Runtime events must be a list.")
+        copied_events: list[Event] = []
+        for event in events:
+            if type(event) is not Event:
+                raise TypeError("Runtime events must be Event instances.")
+            copied = event.model_copy(deep=True)
+            if copied.type == EventType.MODEL_COMPLETED:
+                await self._budget_store.append_event(copied)
+            await self._emit_to_sinks(copied)
+            copied_events.append(copied)
+        return copied_events
+
     async def _emit_to_sinks(self, event: Event) -> None:
         for sink in self._event_sinks:
             try:

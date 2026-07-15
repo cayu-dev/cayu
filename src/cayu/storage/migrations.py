@@ -127,6 +127,10 @@ REVISIONS: tuple[Revision, ...] = (
     # batches. Every checkpoint and event writer must maintain that metadata
     # atomically, so pre-17 binaries must not write against a revision-17 database.
     Revision(revision=17, kind=RevisionKind.BREAKING, compatible_from=17),
+    # Normalize terminal durable-operation records out of checkpoint state.
+    # Completion now atomically updates the checkpoint, appends events, and
+    # writes the replay record, so older writers must not share this schema.
+    Revision(revision=18, kind=RevisionKind.BREAKING, compatible_from=18),
 )
 
 #: The revision an empty database is initialized to.

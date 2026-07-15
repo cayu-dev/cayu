@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import inspect
+import json
 import logging
 import mimetypes
 import time
@@ -158,7 +160,9 @@ from cayu.runtime.budgets import (
     request_budget_limits_for_session,
 )
 from cayu.runtime.context import (
+    CheckpointCompactionContextPolicy,
     ContextBuildError,
+    ContextBuildResult,
     ContextCompactionTelemetry,
     ContextKnowledgeTelemetry,
     ContextPolicy,
@@ -249,6 +253,7 @@ from cayu.runtime.retry_policy import (
     retry_event_payload,
 )
 from cayu.runtime.sessions import (
+    CompactSessionRequest,
     EventOrder,
     EventQuery,
     EventRecord,
@@ -263,11 +268,13 @@ from cayu.runtime.sessions import (
     RunRequest,
     Session,
     SessionIdentity,
+    SessionOperationPublication,
     SessionOrder,
     SessionQuery,
     SessionStatus,
     SessionStore,
     _current_session_run_epoch,
+    copy_compact_session_request,
     copy_fork_session_request,
     copy_incomplete_session_recovery_request,
     copy_incomplete_sessions_recovery_request,
@@ -326,6 +333,7 @@ from cayu.runtime.tool_rounds import (
 )
 from cayu.runtime.usage import (
     USAGE_BEARING_EVENT_TYPES,
+    CacheUsageMetrics,
     CausalBudgetUsageSummary,
     SessionUsageSummary,
     UsageMetrics,
@@ -374,6 +382,16 @@ class _SessionInterruptedByRequest(Exception):
     def __init__(self, session_id: str) -> None:
         self.session_id = require_clean_nonblank(session_id, "session_id")
         super().__init__(f"Session interrupted: {self.session_id}")
+
+
+class _SessionCompactionReplay(Exception):
+    def __init__(self, event_ids: Iterable[str]) -> None:
+        self.event_ids = tuple(event_ids)
+        super().__init__("Replay an existing durable session compaction outcome.")
+
+
+class SessionCompactionAttemptSuperseded(RuntimeError):
+    """A recovered compaction attempt owns the durable operation claim."""
 
 
 class _ModelAttemptFailed(Exception):
@@ -512,6 +530,9 @@ _STREAM_INTERRUPT_POLL_INTERVAL_S = 0.05
 _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY = "pending_session_interrupt"
 _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY = "pending_interruption_cascade"
 _ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY = "environment_factory_reconnect"
+_SESSION_OPERATIONS_CHECKPOINT_KEY = "session_operations"
+_CONTEXT_COMPACTION_OPERATION_KIND = "context_compaction"
+_SESSION_OPERATION_CLAIM_LEASE = timedelta(minutes=5)
 _INTERRUPTION_TYPE_OPERATOR_REQUESTED = "operator_requested"
 _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED = "runtime_interrupted"
 _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED = "tool_approval_required"
@@ -1048,7 +1069,7 @@ class _ToolRoundRunner:
             await app.session_store.append_transcript_messages_and_transform_checkpoint(
                 session.id,
                 tool_result_messages,
-                _replace_checkpoint_preserving_interruption_cascade(cleared_checkpoint),
+                _replace_checkpoint_preserving_runtime_state(cleared_checkpoint),
             )
         except asyncio.CancelledError:
             if await app._session_interrupt_requested(session.id):
@@ -1056,7 +1077,7 @@ class _ToolRoundRunner:
                 await app.session_store.append_transcript_messages_and_transform_checkpoint(
                     session.id,
                     tool_result_messages,
-                    _replace_checkpoint_preserving_interruption_cascade(cleared_checkpoint),
+                    _replace_checkpoint_preserving_runtime_state(cleared_checkpoint),
                 )
             raise
 
@@ -2445,6 +2466,1189 @@ class CayuApp:
             await session_stream.aclose()
             raise
 
+    async def compact_session(
+        self,
+        request: CompactSessionRequest,
+    ) -> AsyncIterator[Event]:
+        if type(request) is not CompactSessionRequest:
+            raise TypeError("Runtime compaction requires a CompactSessionRequest.")
+        operation_stream = self._compact_session(request)
+        try:
+            async for event in self._stream_with_out_of_band_session_events(
+                request.session_id,
+                operation_stream,
+            ):
+                yield event
+        except GeneratorExit:
+            await operation_stream.aclose()
+            raise
+
+    async def _compact_session(
+        self,
+        request: CompactSessionRequest,
+    ) -> AsyncGenerator[Event, None]:
+        """Compact model-facing context without appending a conversation turn."""
+
+        request = copy_compact_session_request(request)
+        loaded_session = await self.session_store.load(request.session_id)
+        if loaded_session is None:
+            raise KeyError(f"Session not found: {request.session_id}")
+        request_digest = _compact_session_request_digest(request)
+        checkpoint_before_claim = await self.session_store.load_checkpoint(loaded_session.id)
+        persisted_before_claim = await self.session_store.load_session_operation(
+            loaded_session.id,
+            request.idempotency_key,
+        )
+        if type(persisted_before_claim) is dict:
+            if persisted_before_claim.get("request_digest") != request_digest:
+                raise ValueError(
+                    "Session compaction idempotency key was already used for a different request."
+                )
+            replay_event_ids = _session_compaction_replay_event_ids(persisted_before_claim)
+            if replay_event_ids is not None:
+                for event in await self._load_session_compaction_replay_events(
+                    session_id=loaded_session.id,
+                    event_ids=replay_event_ids,
+                ):
+                    yield event
+                return
+        if (
+            checkpoint_before_claim is not None
+            and _SESSION_OPERATIONS_CHECKPOINT_KEY in checkpoint_before_claim
+        ):
+            existing_before_claim = _session_operation_state(checkpoint_before_claim)[
+                "records"
+            ].get(request.idempotency_key)
+            if type(existing_before_claim) is dict:
+                if existing_before_claim.get("request_digest") != request_digest:
+                    raise ValueError(
+                        "Session compaction idempotency key was already used for a "
+                        "different request."
+                    )
+                replay_event_ids = _session_compaction_replay_event_ids(existing_before_claim)
+                if replay_event_ids is not None:
+                    for event in await self._load_session_compaction_replay_events(
+                        session_id=loaded_session.id,
+                        event_ids=replay_event_ids,
+                    ):
+                        yield event
+                    return
+        if loaded_session.status not in _RESUMABLE_SESSION_STATUSES:
+            raise ValueError(
+                f"Session compaction requires a resumable session boundary: {loaded_session.status}"
+            )
+        if loaded_session.run_epoch != request.expected_run_epoch:
+            raise ValueError(
+                "Session compaction source run epoch is stale: expected "
+                f"{request.expected_run_epoch}, current {loaded_session.run_epoch}."
+            )
+
+        registered_agent = self._get_registered_agent(loaded_session.agent_name)
+        context_policy = registered_agent.context_policy
+        if not isinstance(context_policy, CheckpointCompactionContextPolicy):
+            raise ValueError(
+                "Explicit session compaction requires a configured "
+                "CheckpointCompactionContextPolicy."
+            )
+        registered_environment = self._get_registered_environment_for_session(
+            loaded_session.environment_name
+        )
+        environment_name = _environment_name(registered_environment)
+        transcript = await self.session_store.load_transcript(loaded_session.id)
+        if len(transcript) != request.expected_transcript_cursor:
+            raise ValueError(
+                "Session compaction source transcript cursor is stale: expected "
+                f"{request.expected_transcript_cursor}, current {len(transcript)}."
+            )
+
+        candidate_app_policy_budget_limits = budget_limits_for_session(
+            policy=self.budget_policy,
+            agent_name=registered_agent.spec.name,
+            causal_budget_id=loaded_session.causal_budget_id,
+        )
+        candidate_request_budget_limits = request_budget_limits_for_session(
+            limits=request.budget_limits,
+            agent_name=registered_agent.spec.name,
+            causal_budget_id=loaded_session.causal_budget_id,
+        )
+        compactor_provider_name: str | None = None
+        compactor_model: str | None = None
+        if candidate_app_policy_budget_limits or candidate_request_budget_limits:
+            try:
+                provider_budget_identity = context_policy.compactor.provider_budget_identity(
+                    loaded_session
+                )
+            except NotImplementedError as exc:
+                raise RuntimeError(
+                    "Explicit compaction with cost budgets requires the ContextCompactor "
+                    "to declare provider_budget_identity(session), returning provider/model "
+                    "or None for deterministic execution."
+                ) from exc
+            if provider_budget_identity is not None:
+                if (
+                    type(provider_budget_identity) is not tuple
+                    or len(provider_budget_identity) != 2
+                ):
+                    raise TypeError(
+                        "ContextCompactor.provider_budget_identity must return a "
+                        "(provider_name, model) tuple or None."
+                    )
+                compactor_provider_name = _require_application_compaction_event_text(
+                    provider_budget_identity[0],
+                    "compactor_provider_name",
+                )
+                compactor_model = _require_application_compaction_event_text(
+                    provider_budget_identity[1],
+                    "compactor_model",
+                )
+        if compactor_provider_name is None:
+            app_policy_budget_limits: tuple[BudgetLimit, ...] = ()
+            budget_limits: tuple[BudgetLimit, ...] = ()
+        else:
+            app_policy_budget_limits = candidate_app_policy_budget_limits
+            budget_limits = (*app_policy_budget_limits, *candidate_request_budget_limits)
+        operation_started_at = time.monotonic()
+
+        operation_id = str(uuid4())
+        claim_probe_now = self._clock()
+        attempt_id = str(uuid4())
+        if (
+            type(persisted_before_claim) is dict
+            and persisted_before_claim.get("request_digest") == request_digest
+            and persisted_before_claim.get("status") == "abandoned"
+        ):
+            persisted_operation_id = persisted_before_claim.get("operation_id")
+            if type(persisted_operation_id) is not str:
+                raise ValueError("Persisted session operation is missing its operation id.")
+            operation_id = require_clean_nonblank(
+                persisted_operation_id,
+                "operation_id",
+            )
+        if (
+            checkpoint_before_claim is not None
+            and _SESSION_OPERATIONS_CHECKPOINT_KEY in checkpoint_before_claim
+        ):
+            existing_before_claim = _session_operation_state(checkpoint_before_claim)[
+                "records"
+            ].get(request.idempotency_key)
+            if (
+                type(existing_before_claim) is dict
+                and existing_before_claim.get("request_digest") == request_digest
+                and existing_before_claim.get("status") == "running"
+                and (
+                    (expiry := _operation_claim_expiry(existing_before_claim)) is not None
+                    and expiry <= claim_probe_now
+                )
+            ):
+                operation_id = require_clean_nonblank(
+                    existing_before_claim.get("operation_id"),
+                    "operation_id",
+                )
+        started_event = Event(
+            type=EventType.CONTEXT_COMPACTION_STARTED,
+            session_id=loaded_session.id,
+            agent_name=registered_agent.spec.name,
+            environment_name=environment_name,
+            payload=_application_compaction_causal_payload(
+                request=request,
+                operation_id=operation_id,
+                attempt_id=attempt_id,
+                source_cursor=len(transcript),
+                compactor=type(context_policy.compactor).__name__,
+            ),
+        )
+        claimed_checkpoint: dict[str, Any] | None = None
+
+        def claim_operation(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+            persisted_record: dict[str, Any] | None,
+        ) -> SessionOperationPublication:
+            nonlocal operation_id, claimed_checkpoint
+            claim_now = self._clock()
+            claim_expires_at = claim_now + _SESSION_OPERATION_CLAIM_LEASE
+            if current_session.run_epoch != request.expected_run_epoch:
+                raise ValueError(
+                    "Session compaction source run epoch is stale: expected "
+                    f"{request.expected_run_epoch}, current {current_session.run_epoch}."
+                )
+            _reject_unresumable_session_checkpoint(
+                current_session,
+                checkpoint,
+                allow_active_operation=True,
+            )
+            updated = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+            operations = _session_operation_state(updated)
+            _abandon_expired_session_operation(operations, now=claim_now)
+            records = operations["records"]
+            existing = records.get(request.idempotency_key)
+            if existing is None and persisted_record is not None:
+                existing = copy_json_value(persisted_record, "session_operation")
+                if existing.get("status") == "abandoned":
+                    records[request.idempotency_key] = existing
+            if existing is not None:
+                if existing.get("request_digest") != request_digest:
+                    raise ValueError(
+                        "Session compaction idempotency key was already used for a "
+                        "different request."
+                    )
+                status = existing.get("status")
+                if status == "running":
+                    raise RuntimeError(
+                        "Equivalent session compaction operation is already running: "
+                        f"{existing.get('operation_id')}"
+                    )
+                if status == "abandoned":
+                    operation_id = require_clean_nonblank(
+                        existing.get("operation_id"),
+                        "operation_id",
+                    )
+                    if started_event.payload.get("operation_id") != operation_id:
+                        raise RuntimeError(
+                            "Abandoned session compaction changed during claim; retry it."
+                        )
+                    if operations.get("active_operation_id") is not None:
+                        raise RuntimeError(
+                            "Session already has an active durable operation: "
+                            f"{operations.get('active_operation_id')}"
+                        )
+                    operations["active_operation_id"] = operation_id
+                    existing["status"] = "running"
+                    existing["attempt_count"] = existing.get("attempt_count", 1) + 1
+                    existing["current_attempt_id"] = attempt_id
+                    existing["event_ids"] = [
+                        *existing.get("event_ids", []),
+                        started_event.id,
+                    ]
+                    existing["claim_expires_at"] = claim_expires_at.isoformat()
+                    existing["updated_at"] = claim_now.isoformat()
+                    existing.pop("abandoned_at", None)
+                    updated[_SESSION_OPERATIONS_CHECKPOINT_KEY] = operations
+                    claimed_checkpoint = copy_json_value(updated, "checkpoint")
+                    archived_records = _archive_inactive_session_operation_records(
+                        updated,
+                        except_idempotency_key=request.idempotency_key,
+                    )
+                    return SessionOperationPublication(
+                        checkpoint=updated,
+                        operation_records=archived_records,
+                    )
+                operation_id = require_clean_nonblank(
+                    existing.get("operation_id"),
+                    "operation_id",
+                )
+                stored_event_ids = _session_compaction_replay_event_ids(existing)
+                if stored_event_ids is None:
+                    raise RuntimeError("Running session compaction changed during claim.")
+                raise _SessionCompactionReplay(stored_event_ids)
+            active_operation_id = operations.get("active_operation_id")
+            if active_operation_id is not None:
+                raise RuntimeError(
+                    f"Session already has an active durable operation: {active_operation_id}"
+                )
+            operations["active_operation_id"] = operation_id
+            records[request.idempotency_key] = {
+                "operation_id": operation_id,
+                "kind": _CONTEXT_COMPACTION_OPERATION_KIND,
+                "reason": request.reason,
+                "request_digest": request_digest,
+                "status": "running",
+                "source_run_epoch": request.expected_run_epoch,
+                "source_transcript_cursor": request.expected_transcript_cursor,
+                "attempt_count": 1,
+                "current_attempt_id": attempt_id,
+                "event_ids": [started_event.id],
+                "instruction_present": request.instructions is not None,
+                "instruction_digest": _optional_text_digest(request.instructions),
+                "claim_expires_at": claim_expires_at.isoformat(),
+                "created_at": claim_now.isoformat(),
+                "updated_at": claim_now.isoformat(),
+            }
+            updated[_SESSION_OPERATIONS_CHECKPOINT_KEY] = operations
+            claimed_checkpoint = copy_json_value(updated, "checkpoint")
+            archived_records = _archive_inactive_session_operation_records(
+                updated,
+                except_idempotency_key=request.idempotency_key,
+            )
+            return SessionOperationPublication(
+                checkpoint=updated,
+                operation_records=archived_records,
+            )
+
+        replay_event_ids: tuple[str, ...] | None = None
+        try:
+            await self.session_store.publish_session_operation(
+                loaded_session.id,
+                idempotency_key=request.idempotency_key,
+                operation_transform=claim_operation,
+                events=[started_event],
+                expected_statuses=_RESUMABLE_SESSION_STATUSES,
+                expected_run_epoch=request.expected_run_epoch,
+                expected_transcript_cursor=request.expected_transcript_cursor,
+            )
+        except _SessionCompactionReplay as replay:
+            replay_event_ids = replay.event_ids
+        if replay_event_ids is not None:
+            for event in await self._load_session_compaction_replay_events(
+                session_id=loaded_session.id,
+                event_ids=replay_event_ids,
+            ):
+                yield event
+            return
+        if claimed_checkpoint is None:
+            raise AssertionError("New session compaction did not persist its operation claim.")
+
+        await self._event_writer.fan_out_persisted([started_event])
+        yield started_event
+        attempt_events: list[Event] = []
+        reached_budget_keys: set[tuple[str, str | None, str, str, Decimal]] = set()
+        budget_reservations: list[_BudgetStepReservation] = []
+        budget_reservations_settled = False
+        operation_published = False
+        try:
+            limit_decision = await self._compaction_run_limit_decision(
+                session=loaded_session,
+                limits=request.limits,
+                attempt_events=attempt_events,
+                operation_started_at=operation_started_at,
+            )
+            if limit_decision is not None:
+                raise RuntimeError(f"Compaction limit reached: {limit_decision.message}")
+            budget_error = await self._enforce_compaction_budget_limits(
+                session=loaded_session,
+                budget_limits=budget_limits,
+                app_policy_budget_limits=app_policy_budget_limits,
+                attempt_events=attempt_events,
+                reached_budget_keys=reached_budget_keys,
+                request=request,
+                operation_id=operation_id,
+                attempt_id=attempt_id,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                compactor=type(context_policy.compactor).__name__,
+                provider_name=compactor_provider_name,
+                model=compactor_model,
+            )
+            if attempt_events:
+                persisted_attempt_events = list(attempt_events)
+                await self._persist_compaction_attempt_events(
+                    session=loaded_session,
+                    request=request,
+                    operation_id=operation_id,
+                    attempt_id=attempt_id,
+                    events=persisted_attempt_events,
+                )
+                attempt_events.clear()
+                await self._event_writer.fan_out_persisted(persisted_attempt_events)
+                for event in persisted_attempt_events:
+                    yield event
+            if budget_error is not None:
+                raise budget_error
+
+            reservation_failure = await self._reserve_compaction_budget(
+                session=loaded_session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                budget_limits=budget_limits,
+                provider_name=compactor_provider_name,
+                model=compactor_model,
+                request=request,
+                operation_id=operation_id,
+                attempt_id=attempt_id,
+                compactor=type(context_policy.compactor).__name__,
+                reservations=budget_reservations,
+                events=attempt_events,
+            )
+            reservation_error: RuntimeError | None = None
+            if reservation_failure is not None:
+                budget_reservations_settled = True
+                attempt_events.append(
+                    _application_compaction_ledger_event(
+                        event_type=EventType.BUDGET_LIMIT_REACHED,
+                        payload=budget_reservation_payload(reservation_failure),
+                        request=request,
+                        operation_id=operation_id,
+                        attempt_id=attempt_id,
+                        session=loaded_session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        compactor=type(context_policy.compactor).__name__,
+                    )
+                )
+                reservation_error = RuntimeError(
+                    f"Compaction budget reservation failed: {reservation_failure.message}"
+                )
+            if attempt_events:
+                persisted_attempt_events = list(attempt_events)
+                await self._persist_compaction_attempt_events(
+                    session=loaded_session,
+                    request=request,
+                    operation_id=operation_id,
+                    attempt_id=attempt_id,
+                    events=persisted_attempt_events,
+                )
+                attempt_events.clear()
+                await self._event_writer.fan_out_persisted(persisted_attempt_events)
+                for event in persisted_attempt_events:
+                    yield event
+            if reservation_error is not None:
+                raise reservation_error
+
+            result, reservation_lease_failure = await self._await_compaction_with_budget_heartbeat(
+                lambda: context_policy.build_with_checkpoint(
+                    ContextRequest(
+                        session=loaded_session,
+                        agent=_session_agent_spec(
+                            registered_agent=registered_agent,
+                            session=loaded_session,
+                        ),
+                        messages=transcript,
+                        step=1,
+                        environment_name=environment_name,
+                        metadata={
+                            "operation_id": operation_id,
+                            "reason": request.reason,
+                        },
+                        force_compaction=True,
+                        force_bounded_compaction=True,
+                        compaction_instructions=request.instructions,
+                    ),
+                    checkpoint=claimed_checkpoint,
+                ),
+                reservations=budget_reservations,
+            )
+            if result.checkpoint is None or result.checkpoint_event_payload is None:
+                raise ValueError("Session has no complete older context to compact.")
+
+            telemetry_events = [
+                _application_compaction_event(
+                    telemetry=telemetry,
+                    request=request,
+                    operation_id=operation_id,
+                    attempt_id=attempt_id,
+                    session=loaded_session,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    compactor=type(context_policy.compactor).__name__,
+                )
+                for telemetry in result.compaction_telemetry
+                if telemetry.event_type != EventType.CONTEXT_COMPACTION_STARTED
+            ]
+            attempt_events.extend(
+                event for event in telemetry_events if event.type == EventType.MODEL_COMPLETED
+            )
+            attempt_events.extend(
+                await self._reconcile_compaction_budget_reservations(
+                    budget_reservations,
+                    model_completed_events=[
+                        event for event in attempt_events if event.type == EventType.MODEL_COMPLETED
+                    ],
+                    session=loaded_session,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    request=request,
+                    operation_id=operation_id,
+                    attempt_id=attempt_id,
+                    compactor=type(context_policy.compactor).__name__,
+                )
+            )
+            budget_reservations_settled = True
+            if reservation_lease_failure is not None:
+                raise reservation_lease_failure
+            limit_decision = await self._compaction_run_limit_decision(
+                session=loaded_session,
+                limits=request.limits,
+                attempt_events=attempt_events,
+                operation_started_at=operation_started_at,
+            )
+            if limit_decision is not None:
+                raise RuntimeError(f"Compaction limit reached: {limit_decision.message}")
+            budget_error = await self._enforce_compaction_budget_limits(
+                session=loaded_session,
+                budget_limits=budget_limits,
+                app_policy_budget_limits=app_policy_budget_limits,
+                attempt_events=attempt_events,
+                reached_budget_keys=reached_budget_keys,
+                request=request,
+                operation_id=operation_id,
+                attempt_id=attempt_id,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                compactor=type(context_policy.compactor).__name__,
+                provider_name=compactor_provider_name,
+                model=compactor_model,
+            )
+            if budget_error is not None:
+                raise budget_error
+            checkpoint_event = Event(
+                type=EventType.SESSION_CHECKPOINTED,
+                session_id=loaded_session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                payload={
+                    **copy_json_value(
+                        result.checkpoint_event_payload,
+                        "checkpoint_event_payload",
+                    ),
+                    **_application_compaction_causal_payload(
+                        request=request,
+                        operation_id=operation_id,
+                        attempt_id=attempt_id,
+                        source_cursor=request.expected_transcript_cursor,
+                        result_cursor=result.checkpoint_event_payload.get(
+                            "compacted_transcript_cursor"
+                        ),
+                        compactor=type(context_policy.compactor).__name__,
+                    ),
+                },
+            )
+            published_events = [
+                *attempt_events,
+                *[event for event in telemetry_events if event.type != EventType.MODEL_COMPLETED],
+                checkpoint_event,
+            ]
+            event_ids = [started_event.id, *[event.id for event in published_events]]
+            await self.session_store.publish_session_operation(
+                loaded_session.id,
+                idempotency_key=request.idempotency_key,
+                operation_transform=lambda _session, checkpoint, persisted_record: (
+                    _complete_session_operation_checkpoint(
+                        checkpoint=checkpoint,
+                        persisted_record=persisted_record,
+                        compacted_checkpoint=result.checkpoint,
+                        idempotency_key=request.idempotency_key,
+                        operation_id=operation_id,
+                        attempt_id=attempt_id,
+                        event_ids=event_ids,
+                        result_cursor=result.checkpoint_event_payload.get(
+                            "compacted_transcript_cursor"
+                        ),
+                        completed_at=self._clock(),
+                    )
+                ),
+                events=published_events,
+                expected_statuses=_RESUMABLE_SESSION_STATUSES,
+                expected_run_epoch=request.expected_run_epoch,
+                expected_transcript_cursor=request.expected_transcript_cursor,
+            )
+            operation_published = True
+            await self._event_writer.fan_out_persisted(published_events)
+            for event in published_events:
+                yield event
+        except GeneratorExit:
+            if budget_reservations and not budget_reservations_settled:
+                release_events = await self._release_compaction_budget_reservations(
+                    budget_reservations,
+                    session=loaded_session,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    request=request,
+                    operation_id=operation_id,
+                    attempt_id=attempt_id,
+                    compactor=type(context_policy.compactor).__name__,
+                    reason="compaction operation abandoned",
+                )
+                await self._persist_compaction_attempt_events(
+                    session=loaded_session,
+                    request=request,
+                    operation_id=operation_id,
+                    attempt_id=attempt_id,
+                    events=release_events,
+                )
+                await self._event_writer.fan_out_persisted(release_events)
+                budget_reservations_settled = True
+            raise
+        except BaseException as exc:
+            if operation_published:
+                raise
+            if isinstance(exc, ContextBuildError):
+                failed_model_events = [
+                    _application_compaction_event(
+                        telemetry=telemetry,
+                        request=request,
+                        operation_id=operation_id,
+                        attempt_id=attempt_id,
+                        session=loaded_session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        compactor=type(context_policy.compactor).__name__,
+                    )
+                    for telemetry in exc.compaction_telemetry
+                    if telemetry.event_type == EventType.MODEL_COMPLETED
+                ]
+                existing_attempt_event_ids = {event.id for event in attempt_events}
+                attempt_events.extend(
+                    event
+                    for event in failed_model_events
+                    if event.id not in existing_attempt_event_ids
+                )
+            if budget_reservations and not budget_reservations_settled:
+                model_completed_events = [
+                    event for event in attempt_events if event.type == EventType.MODEL_COMPLETED
+                ]
+                if model_completed_events:
+                    settlement_events = await self._reconcile_compaction_budget_reservations(
+                        budget_reservations,
+                        model_completed_events=model_completed_events,
+                        session=loaded_session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        request=request,
+                        operation_id=operation_id,
+                        attempt_id=attempt_id,
+                        compactor=type(context_policy.compactor).__name__,
+                    )
+                elif isinstance(exc, _BudgetReservationLeaseLostBeforeModelDispatch):
+                    settlement_events = await self._release_compaction_budget_reservations(
+                        budget_reservations,
+                        session=loaded_session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        request=request,
+                        operation_id=operation_id,
+                        attempt_id=attempt_id,
+                        compactor=type(context_policy.compactor).__name__,
+                        reason="compaction reservation lease lost before provider dispatch",
+                    )
+                elif isinstance(exc, _BudgetReservationLeaseLost):
+                    settlement_events = (
+                        await self._reconcile_uncertain_compaction_budget_reservations(
+                            budget_reservations,
+                            session=loaded_session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                            request=request,
+                            operation_id=operation_id,
+                            attempt_id=attempt_id,
+                            compactor=type(context_policy.compactor).__name__,
+                        )
+                    )
+                else:
+                    settlement_events = await self._release_compaction_budget_reservations(
+                        budget_reservations,
+                        session=loaded_session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        request=request,
+                        operation_id=operation_id,
+                        attempt_id=attempt_id,
+                        compactor=type(context_policy.compactor).__name__,
+                        reason="compaction provider step did not complete",
+                    )
+                attempt_events.extend(settlement_events)
+                budget_reservations_settled = True
+            failed_event = Event(
+                type=EventType.CONTEXT_COMPACTION_FAILED,
+                session_id=loaded_session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                payload={
+                    **_application_compaction_causal_payload(
+                        request=request,
+                        operation_id=operation_id,
+                        attempt_id=attempt_id,
+                        source_cursor=request.expected_transcript_cursor,
+                        compactor=type(context_policy.compactor).__name__,
+                    ),
+                    "error_type": type(exc).__name__,
+                },
+            )
+            await self.session_store.publish_session_operation(
+                loaded_session.id,
+                idempotency_key=request.idempotency_key,
+                operation_transform=_fail_session_operation_checkpoint(
+                    idempotency_key=request.idempotency_key,
+                    operation_id=operation_id,
+                    attempt_id=attempt_id,
+                    failed_event_id=failed_event.id,
+                    attempt_event_ids=[event.id for event in attempt_events],
+                    error_type=type(exc).__name__,
+                    completed_at=self._clock(),
+                ),
+                events=[*attempt_events, failed_event],
+            )
+            failed_events = [*attempt_events, failed_event]
+            await self._event_writer.fan_out_persisted(failed_events)
+            for event in failed_events:
+                yield event
+            raise
+
+    async def _load_session_compaction_replay_events(
+        self,
+        *,
+        session_id: str,
+        event_ids: tuple[str, ...],
+    ) -> list[Event]:
+        events: list[Event] = []
+        for event_id in event_ids:
+            records = await self.session_store.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    event_id=event_id,
+                    limit=1,
+                )
+            )
+            if len(records) != 1:
+                raise RuntimeError(
+                    f"Session compaction replay event is missing from durable history: {event_id}"
+                )
+            events.append(copy_event(records[0].event))
+        return events
+
+    async def _compaction_run_limit_decision(
+        self,
+        *,
+        session: Session,
+        limits: RunLimits,
+        attempt_events: list[Event],
+        operation_started_at: float,
+    ) -> StopDecision | None:
+        if not has_run_limits(limits):
+            return None
+        usage_events = list(attempt_events)
+        if limits.scope == "session":
+            usage_events = [*await self._session_usage_events(session.id), *usage_events]
+            created_at = session.created_at
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=UTC)
+            elapsed_seconds = max(
+                0,
+                int((self._clock() - created_at.astimezone(UTC)).total_seconds()),
+            )
+        else:
+            elapsed_seconds = max(0, int(time.monotonic() - operation_started_at))
+        return first_reached_limit(
+            limits=limits,
+            usage=session_usage_summary(session.id, usage_events),
+            elapsed_seconds=elapsed_seconds,
+        )
+
+    async def _compaction_budget_checks(
+        self,
+        *,
+        session: Session,
+        budget_limits: tuple[BudgetLimit, ...],
+        attempt_events: list[Event],
+        provider_name: str | None,
+        model: str | None,
+    ) -> list[tuple[BudgetLimit, BudgetCheck]]:
+        checks: list[tuple[BudgetLimit, BudgetCheck]] = []
+        for limit in budget_limits:
+            if limit.scope in {"app", "agent", "causal"}:
+                existing_events = await self.budget_store.load_events_for_budget(
+                    scope=limit.scope,
+                    key=limit.key,
+                    window=limit.window,
+                )
+            elif limit.scope == "session":
+                existing_events = await self._session_usage_events(session.id)
+            elif limit.scope == "run":
+                existing_events = []
+            else:
+                raise ValueError(f"Unsupported request budget scope: {limit.scope}")
+            events = events_for_budget_window(
+                [*existing_events, *attempt_events],
+                limit.window,
+                now=self._clock(),
+            )
+            event_provider_name, event_model = _latest_model_event_identity(attempt_events)
+            effective_provider_name = event_provider_name or provider_name
+            effective_model = event_model or model
+            if effective_provider_name is None or effective_model is None:
+                summary = estimate_session_cost(
+                    session_id=session.id,
+                    events=events,
+                    pricing=limit.pricing,
+                    currency=limit.currency,
+                )
+                if (
+                    summary.unpriced_model_steps == 0
+                    and summary.total_cost < limit.max_estimated_cost
+                ):
+                    continue
+            check = budget_check_from_events(
+                limit=limit,
+                events=events,
+                provider_name=effective_provider_name,
+                model=effective_model,
+                effective_at=self._clock(),
+            )
+            checks.append((limit, check))
+        return checks
+
+    async def _enforce_compaction_budget_limits(
+        self,
+        *,
+        session: Session,
+        budget_limits: tuple[BudgetLimit, ...],
+        app_policy_budget_limits: tuple[BudgetLimit, ...],
+        attempt_events: list[Event],
+        reached_budget_keys: set[tuple[str, str | None, str, str, Decimal]],
+        request: CompactSessionRequest,
+        operation_id: str,
+        attempt_id: str,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+        compactor: str,
+        provider_name: str | None,
+        model: str | None,
+    ) -> RuntimeError | None:
+        checks = await self._compaction_budget_checks(
+            session=session,
+            budget_limits=budget_limits,
+            attempt_events=attempt_events,
+            provider_name=provider_name,
+            model=model,
+        )
+        interrupt_error: RuntimeError | None = None
+        for budget_limit, check in checks:
+            if any(budget_limit is limit for limit in app_policy_budget_limits):
+                attempt_events.append(
+                    _application_compaction_ledger_event(
+                        event_type=EventType.BUDGET_CHECKED,
+                        payload=budget_check_payload(check),
+                        request=request,
+                        operation_id=operation_id,
+                        attempt_id=attempt_id,
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        compactor=compactor,
+                    )
+                )
+            if not check.limit_reached:
+                continue
+            budget_key = _budget_check_identity(check)
+            if budget_key not in reached_budget_keys:
+                attempt_events.append(
+                    _application_compaction_budget_event(
+                        check=check,
+                        request=request,
+                        operation_id=operation_id,
+                        attempt_id=attempt_id,
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        compactor=compactor,
+                    )
+                )
+                reached_budget_keys.add(budget_key)
+            if budget_limit.action == "interrupt" and interrupt_error is None:
+                interrupt_error = RuntimeError(f"Compaction budget limit reached: {check.message}")
+        return interrupt_error
+
+    async def _persist_compaction_attempt_events(
+        self,
+        *,
+        session: Session,
+        request: CompactSessionRequest,
+        operation_id: str,
+        attempt_id: str,
+        events: list[Event],
+    ) -> None:
+        if not events:
+            return
+        await self.session_store.publish_session_operation(
+            session.id,
+            idempotency_key=request.idempotency_key,
+            operation_transform=_append_session_operation_attempt_events(
+                idempotency_key=request.idempotency_key,
+                operation_id=operation_id,
+                attempt_id=attempt_id,
+                event_ids=[event.id for event in events],
+                updated_at=self._clock(),
+            ),
+            events=events,
+            expected_statuses=_RESUMABLE_SESSION_STATUSES,
+            expected_run_epoch=request.expected_run_epoch,
+            expected_transcript_cursor=request.expected_transcript_cursor,
+        )
+
+    async def _reserve_compaction_budget(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+        budget_limits: tuple[BudgetLimit, ...],
+        provider_name: str | None,
+        model: str | None,
+        request: CompactSessionRequest,
+        operation_id: str,
+        attempt_id: str,
+        compactor: str,
+        reservations: list[_BudgetStepReservation],
+        events: list[Event],
+    ) -> BudgetReservationResult | None:
+        limits = [limit for limit in budget_limits if limit.reservation is not None]
+        if not limits:
+            return None
+        if provider_name is None or model is None:
+            return None
+
+        for limit in limits:
+            result = await self.budget_ledger.reserve(
+                limit=limit,
+                session_id=session.id,
+                agent_name=registered_agent.spec.name,
+                provider_name=provider_name,
+                model=model,
+            )
+            events.append(
+                _application_compaction_ledger_event(
+                    event_type=(
+                        EventType.BUDGET_RESERVED
+                        if result.accepted
+                        else EventType.BUDGET_RESERVATION_FAILED
+                    ),
+                    payload=budget_reservation_payload(result),
+                    request=request,
+                    operation_id=operation_id,
+                    attempt_id=attempt_id,
+                    session=session,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    compactor=compactor,
+                )
+            )
+            if not result.accepted:
+                events.extend(
+                    await self._release_compaction_budget_reservations(
+                        reservations,
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        request=request,
+                        operation_id=operation_id,
+                        attempt_id=attempt_id,
+                        compactor=compactor,
+                        reason="compaction budget reservation failed",
+                    )
+                )
+                reservations.clear()
+                return result
+            if result.record is None:
+                raise RuntimeError("Accepted compaction budget reservation has no record.")
+            reservations.append(_BudgetStepReservation(limit=limit, record=result.record))
+        return None
+
+    async def _await_compaction_with_budget_heartbeat(
+        self,
+        build: Callable[[], Awaitable[ContextBuildResult]],
+        *,
+        reservations: list[_BudgetStepReservation],
+    ) -> tuple[ContextBuildResult, BaseException | None]:
+        if not reservations:
+            return await build(), None
+        try:
+            await self._renew_budget_reservations(reservations)
+        except _BudgetReservationLeaseLost as exc:
+            raise _BudgetReservationLeaseLostBeforeModelDispatch(
+                "Compaction budget reservation lease was lost before provider dispatch."
+            ) from exc
+        ttl_seconds = self.budget_ledger.reservation_ttl_seconds
+        if ttl_seconds is None:
+            return await build(), None
+
+        async def await_build() -> ContextBuildResult:
+            return await build()
+
+        build_task = asyncio.create_task(await_build())
+        heartbeat_task = asyncio.create_task(
+            self._heartbeat_budget_reservations(
+                reservations,
+                interval_seconds=ttl_seconds / 3,
+            )
+        )
+        try:
+            done, _ = await asyncio.wait(
+                {build_task, heartbeat_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if heartbeat_task in done:
+                failure = _budget_heartbeat_task_failure(heartbeat_task)
+                if build_task.done():
+                    try:
+                        return build_task.result(), failure
+                    except ContextBuildError as build_failure:
+                        build_failure.add_note(
+                            "Budget reservation lease was also lost as compaction failed: "
+                            f"{failure}"
+                        )
+                        raise build_failure from failure
+                    except BaseException as build_failure:
+                        failure.add_note(
+                            "Compactor also failed while reservation lease loss was handled: "
+                            f"{type(build_failure).__name__}: {build_failure}"
+                        )
+                        raise failure from build_failure
+                if not build_task.done():
+                    build_task.cancel()
+                    try:
+                        return await build_task, failure
+                    except asyncio.CancelledError:
+                        pass
+                    except ContextBuildError as build_failure:
+                        build_failure.add_note(
+                            "Budget reservation lease was also lost as compaction failed: "
+                            f"{failure}"
+                        )
+                        raise build_failure from failure
+                    except BaseException as build_failure:
+                        failure.add_note(
+                            "Compactor also failed while reservation lease loss was handled: "
+                            f"{type(build_failure).__name__}: {build_failure}"
+                        )
+                raise failure
+            result = build_task.result()
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
+            try:
+                await self._renew_budget_reservations(reservations)
+            except _BudgetReservationLeaseLost as exc:
+                return result, exc
+            return result, None
+        finally:
+            if not build_task.done():
+                build_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await build_task
+            if not heartbeat_task.done():
+                heartbeat_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat_task
+
+    async def _reconcile_compaction_budget_reservations(
+        self,
+        reservations: list[_BudgetStepReservation],
+        *,
+        model_completed_events: list[Event],
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+        request: CompactSessionRequest,
+        operation_id: str,
+        attempt_id: str,
+        compactor: str,
+    ) -> list[Event]:
+        events: list[Event] = []
+        for reservation in reservations:
+            priced_actuals = []
+            try:
+                priced_actuals = [
+                    budget_actual_cost_for_event(limit=reservation.limit, event=event)
+                    for event in model_completed_events
+                ]
+                if not priced_actuals:
+                    raise ValueError("Compaction completed without model usage.")
+                actual_amount = sum(
+                    (priced.amount for priced in priced_actuals),
+                    start=Decimal("0"),
+                )
+                reason = "compaction model completed"
+            except ValueError:
+                actual_amount = reservation.record.reserved_amount
+                reason = "compaction completed without priced usage; charged reserved amount"
+            reconciliation = await self.budget_ledger.reconcile(
+                reservation_id=reservation.record.reservation_id,
+                actual_amount=actual_amount,
+                reason=reason,
+                occurred_at=(
+                    model_completed_events[-1].timestamp
+                    if model_completed_events
+                    else self._clock()
+                ),
+            )
+            if len(priced_actuals) == 1:
+                reconciliation = budget_reconciliation_with_pricing(
+                    reconciliation,
+                    priced_actuals[0].line_item,
+                )
+            events.append(
+                _application_compaction_ledger_event(
+                    event_type=EventType.BUDGET_RECONCILED,
+                    payload=budget_reconciliation_payload(reconciliation),
+                    request=request,
+                    operation_id=operation_id,
+                    attempt_id=attempt_id,
+                    session=session,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    compactor=compactor,
+                )
+            )
+        return events
+
+    async def _reconcile_uncertain_compaction_budget_reservations(
+        self,
+        reservations: list[_BudgetStepReservation],
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+        request: CompactSessionRequest,
+        operation_id: str,
+        attempt_id: str,
+        compactor: str,
+    ) -> list[Event]:
+        events: list[Event] = []
+        for reservation in reservations:
+            reconciliation = await self.budget_ledger.reconcile(
+                reservation_id=reservation.record.reservation_id,
+                actual_amount=reservation.record.reserved_amount,
+                reason="compaction reservation lease lost; charged reserved amount",
+                occurred_at=self._clock(),
+            )
+            events.append(
+                _application_compaction_ledger_event(
+                    event_type=EventType.BUDGET_RECONCILED,
+                    payload=budget_reconciliation_payload(reconciliation),
+                    request=request,
+                    operation_id=operation_id,
+                    attempt_id=attempt_id,
+                    session=session,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    compactor=compactor,
+                )
+            )
+        return events
+
+    async def _release_compaction_budget_reservations(
+        self,
+        reservations: list[_BudgetStepReservation],
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+        request: CompactSessionRequest,
+        operation_id: str,
+        attempt_id: str,
+        compactor: str,
+        reason: str,
+    ) -> list[Event]:
+        events: list[Event] = []
+        for reservation in reservations:
+            reconciliation = await self.budget_ledger.release(
+                reservation_id=reservation.record.reservation_id,
+                reason=reason,
+            )
+            events.append(
+                _application_compaction_ledger_event(
+                    event_type=EventType.BUDGET_RESERVATION_RELEASED,
+                    payload=budget_reconciliation_payload(reconciliation),
+                    request=request,
+                    operation_id=operation_id,
+                    attempt_id=attempt_id,
+                    session=session,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    compactor=compactor,
+                )
+            )
+        return events
+
     async def interrupt_session(self, request: InterruptSessionRequest) -> AsyncIterator[Event]:
         if type(request) is not InterruptSessionRequest:
             raise TypeError("Runtime interruption requires an InterruptSessionRequest.")
@@ -3192,19 +4396,36 @@ class CayuApp:
             current_session: Session,
             current_checkpoint: dict[str, Any] | None,
         ) -> dict[str, Any] | None:
-            if approval_support.pending_approval_from_checkpoint(current_checkpoint) is not None:
+            updated_checkpoint = (
+                None
+                if current_checkpoint is None
+                else copy_json_value(current_checkpoint, "checkpoint")
+            )
+            if (
+                updated_checkpoint is not None
+                and _SESSION_OPERATIONS_CHECKPOINT_KEY in updated_checkpoint
+            ):
+                operations = _session_operation_state(updated_checkpoint)
+                _abandon_expired_session_operation(operations, now=self._clock())
+                updated_checkpoint[_SESSION_OPERATIONS_CHECKPOINT_KEY] = operations
+            active_operation_id = _active_session_operation_id(updated_checkpoint)
+            if active_operation_id is not None:
+                raise RuntimeError(
+                    f"Session has an active durable operation: {active_operation_id}"
+                )
+            if approval_support.pending_approval_from_checkpoint(updated_checkpoint) is not None:
                 raise RuntimeError(
                     "Session has a pending tool approval. Resolve it with "
                     "resolve_tool_approval(...) before resuming with new messages."
                 )
-            if pending_user_input_from_checkpoint(current_checkpoint) is not None:
+            if pending_user_input_from_checkpoint(updated_checkpoint) is not None:
                 raise RuntimeError(
                     "Session is awaiting user input. Answer it with "
                     "resolve_user_input(...) before resuming with new messages."
                 )
             if (
                 current_session.status == SessionStatus.COMPLETED
-                and tool_round_recovery.pending_tool_round_from_checkpoint(current_checkpoint)
+                and tool_round_recovery.pending_tool_round_from_checkpoint(updated_checkpoint)
                 is not None
             ):
                 raise RuntimeError(
@@ -3212,14 +4433,14 @@ class CayuApp:
                     "Inspect or recover the session state before resuming it."
                 )
             if (
-                current_checkpoint is not None
-                and _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY in current_checkpoint
+                updated_checkpoint is not None
+                and _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY in updated_checkpoint
             ):
                 raise RuntimeError(
                     "Session has an incomplete background interruption cascade. "
                     "Retry the interruption before resuming with new messages."
                 )
-            return current_checkpoint
+            return updated_checkpoint
 
         # Report deterministic checkpoint conflicts before claiming the session,
         # then repeat the same validation inside the atomic transition below so a
@@ -3357,6 +4578,18 @@ class CayuApp:
                 current_source: Session,
                 source_checkpoint: dict[str, Any] | None,
             ) -> dict[str, Any] | None:
+                if (
+                    source_checkpoint is not None
+                    and _SESSION_OPERATIONS_CHECKPOINT_KEY in source_checkpoint
+                ):
+                    operations = _session_operation_state(source_checkpoint)
+                    _abandon_expired_session_operation(operations, now=self._clock())
+                    source_checkpoint[_SESSION_OPERATIONS_CHECKPOINT_KEY] = operations
+                active_operation_id = _active_session_operation_id(source_checkpoint)
+                if active_operation_id is not None:
+                    raise RuntimeError(
+                        f"Session has an active durable operation: {active_operation_id}"
+                    )
                 if current_source.status == SessionStatus.INTERRUPTED and source_checkpoint is None:
                     raise RuntimeError(
                         "Interrupted session cannot be forked because checkpoint state is missing."
@@ -3374,11 +4607,33 @@ class CayuApp:
                         "Session has an incomplete background interruption cascade. "
                         "Retry the interruption before forking it."
                     )
-                return approval_support.checkpoint_for_fork(
+                fork_checkpoint = approval_support.checkpoint_for_fork(
                     checkpoint=source_checkpoint,
                     agent_name=agent_name,
                     environment_name=environment_name,
                 )
+                if fork_checkpoint is not None:
+                    fork_checkpoint.pop(_SESSION_OPERATIONS_CHECKPOINT_KEY, None)
+                return fork_checkpoint
+        else:
+
+            def checkpoint_transform(
+                _current_source: Session,
+                source_checkpoint: dict[str, Any] | None,
+            ) -> None:
+                if (
+                    source_checkpoint is not None
+                    and _SESSION_OPERATIONS_CHECKPOINT_KEY in source_checkpoint
+                ):
+                    operations = _session_operation_state(source_checkpoint)
+                    _abandon_expired_session_operation(operations, now=self._clock())
+                    source_checkpoint[_SESSION_OPERATIONS_CHECKPOINT_KEY] = operations
+                active_operation_id = _active_session_operation_id(source_checkpoint)
+                if active_operation_id is not None:
+                    raise RuntimeError(
+                        f"Session has an active durable operation: {active_operation_id}"
+                    )
+                return None
 
         inherited_taint_labels = await self._prior_taint_labels_for_policy(
             session_id=source_session.id,
@@ -3750,7 +5005,7 @@ class CayuApp:
             await self.session_store.append_transcript_messages_and_transform_checkpoint(
                 session.id,
                 tool_result_messages,
-                _replace_checkpoint_preserving_interruption_cascade(cleared_checkpoint),
+                _replace_checkpoint_preserving_runtime_state(cleared_checkpoint),
             )
             pending_cleared = True
 
@@ -4496,7 +5751,7 @@ class CayuApp:
             await self.session_store.append_transcript_messages_and_transform_checkpoint(
                 session.id,
                 tool_result_messages,
-                _replace_checkpoint_preserving_interruption_cascade(cleared_checkpoint),
+                _replace_checkpoint_preserving_runtime_state(cleared_checkpoint),
             )
             pending_approval_cleared = True
             yield await self._event_writer.emit(
@@ -5778,7 +7033,7 @@ class CayuApp:
                             self.session_store.append_transcript_messages_and_transform_checkpoint(
                                 session.id,
                                 [assistant_message],
-                                _replace_checkpoint_preserving_interruption_cascade(checkpoint),
+                                _replace_checkpoint_preserving_runtime_state(checkpoint),
                             )
                         )
                     else:
@@ -8181,7 +9436,7 @@ class CayuApp:
                 )
                 await self.session_store.transform_checkpoint(
                     session.id,
-                    _replace_checkpoint_preserving_interruption_cascade(cleared_checkpoint),
+                    _replace_checkpoint_preserving_runtime_state(cleared_checkpoint),
                 )
                 yield await self._event_writer.emit(
                     approval_support.cleared_event(
@@ -8231,7 +9486,7 @@ class CayuApp:
             await self.session_store.append_transcript_messages_and_transform_checkpoint(
                 session.id,
                 tool_result_messages,
-                _replace_checkpoint_preserving_interruption_cascade(cleared_checkpoint),
+                _replace_checkpoint_preserving_runtime_state(cleared_checkpoint),
             )
             yield await self._event_writer.emit(
                 approval_support.cleared_event(
@@ -8246,7 +9501,7 @@ class CayuApp:
             await self.session_store.append_transcript_messages_and_transform_checkpoint(
                 session.id,
                 tool_result_messages,
-                _replace_checkpoint_preserving_interruption_cascade(cleared_checkpoint),
+                _replace_checkpoint_preserving_runtime_state(cleared_checkpoint),
             )
 
     async def _policy_plan_for_tool_round(
@@ -9106,7 +10361,7 @@ class CayuApp:
         )
         await self.session_store.transform_checkpoint(
             session.id,
-            _replace_checkpoint_preserving_interruption_cascade(checkpoint),
+            _replace_checkpoint_preserving_runtime_state(checkpoint),
         )
         return (
             approval,
@@ -9183,7 +10438,7 @@ class CayuApp:
         checkpoint[PENDING_USER_INPUT_CHECKPOINT_KEY] = pending.model_dump(mode="json")
         await self.session_store.transform_checkpoint(
             session.id,
-            _replace_checkpoint_preserving_interruption_cascade(checkpoint),
+            _replace_checkpoint_preserving_runtime_state(checkpoint),
         )
         return (
             pending,
@@ -9245,7 +10500,7 @@ class CayuApp:
         copied_checkpoint.pop(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY, None)
         await self.session_store.transform_checkpoint(
             session_id,
-            _replace_checkpoint_preserving_interruption_cascade(copied_checkpoint),
+            _replace_checkpoint_preserving_runtime_state(copied_checkpoint),
         )
 
     async def _checkpoint_without_pending_tool_approval(
@@ -9275,7 +10530,7 @@ class CayuApp:
         copied_checkpoint.pop(approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY, None)
         await self.session_store.transform_checkpoint(
             session_id,
-            _replace_checkpoint_preserving_interruption_cascade(copied_checkpoint),
+            _replace_checkpoint_preserving_runtime_state(copied_checkpoint),
         )
 
     async def _load_pending_session_interrupt_payload(
@@ -10116,7 +11371,7 @@ class CayuApp:
         await self.session_store.append_transcript_messages_and_transform_checkpoint(
             session.id,
             interrupted_messages,
-            _replace_checkpoint_preserving_interruption_cascade(cleared_checkpoint),
+            _replace_checkpoint_preserving_runtime_state(cleared_checkpoint),
         )
 
     async def _subagent_children_by_idempotency_key(
@@ -10327,7 +11582,7 @@ class CayuApp:
         await self.session_store.append_transcript_messages_and_transform_checkpoint(
             session.id,
             tool_result_messages,
-            _replace_checkpoint_preserving_interruption_cascade(cleared_checkpoint),
+            _replace_checkpoint_preserving_runtime_state(cleared_checkpoint),
         )
         yield await self._event_writer.emit(
             Event(
@@ -10800,7 +12055,7 @@ class CayuApp:
         copied_checkpoint[_ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY] = state
         await self.session_store.transform_checkpoint(
             session_id,
-            _replace_checkpoint_preserving_interruption_cascade(copied_checkpoint),
+            _replace_checkpoint_preserving_runtime_state(copied_checkpoint),
         )
 
     async def _checkpoint_preserving_runtime_state(
@@ -10829,7 +12084,7 @@ class CayuApp:
                     )
         await self.session_store.transform_checkpoint(
             session_id,
-            _replace_checkpoint_preserving_interruption_cascade(copied_checkpoint),
+            _replace_checkpoint_preserving_runtime_state(copied_checkpoint),
         )
 
     async def _emit_environment_binding_started(
@@ -11774,6 +13029,660 @@ def _validate_environment_spec(spec: EnvironmentSpec) -> EnvironmentSpec:
     )
 
 
+def _compact_session_request_digest(request: CompactSessionRequest) -> str:
+    payload = request.model_dump(mode="json")
+    # The authenticated caller is audit data for each attempt, not part of the
+    # operation's semantic identity. A different operator must be able to
+    # recover the same idempotent request after its lease expires.
+    payload.pop("requested_by", None)
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _optional_text_digest(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _session_operation_state(checkpoint: dict[str, Any]) -> dict[str, Any]:
+    stored = checkpoint.get(_SESSION_OPERATIONS_CHECKPOINT_KEY)
+    if stored is None:
+        return {"version": 1, "active_operation_id": None, "records": {}}
+    if type(stored) is not dict:
+        raise ValueError("Session operation checkpoint must be an object.")
+    operations = copy_json_value(stored, _SESSION_OPERATIONS_CHECKPOINT_KEY)
+    if operations.get("version") != 1:
+        raise ValueError("Unsupported session operation checkpoint version.")
+    records = operations.get("records")
+    if type(records) is not dict:
+        raise ValueError("Session operation checkpoint records must be an object.")
+    active_operation_id = operations.get("active_operation_id")
+    if active_operation_id is not None:
+        require_clean_nonblank(active_operation_id, "active_operation_id")
+    return operations
+
+
+def _active_session_operation_id(checkpoint: dict[str, Any] | None) -> str | None:
+    if checkpoint is None or _SESSION_OPERATIONS_CHECKPOINT_KEY not in checkpoint:
+        return None
+    active_operation_id = _session_operation_state(checkpoint).get("active_operation_id")
+    return active_operation_id if type(active_operation_id) is str else None
+
+
+def _operation_claim_expiry(record: dict[str, Any]) -> datetime | None:
+    value = record.get("claim_expires_at")
+    if type(value) is not str:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def _abandon_expired_session_operation(
+    operations: dict[str, Any],
+    *,
+    now: datetime,
+) -> str | None:
+    active_operation_id = operations.get("active_operation_id")
+    if type(active_operation_id) is not str:
+        return None
+    records = operations.get("records")
+    if type(records) is not dict:
+        raise ValueError("Session operation checkpoint records must be an object.")
+    active_record = next(
+        (
+            record
+            for record in records.values()
+            if type(record) is dict and record.get("operation_id") == active_operation_id
+        ),
+        None,
+    )
+    if active_record is None:
+        raise RuntimeError("Active durable session operation record is missing.")
+    expiry = _operation_claim_expiry(active_record)
+    if active_record.get("status") != "running" or expiry is None or expiry > now:
+        return None
+    active_record["status"] = "abandoned"
+    active_record["abandoned_at"] = now.isoformat()
+    active_record["updated_at"] = now.isoformat()
+    active_record.pop("claim_expires_at", None)
+    operations["active_operation_id"] = None
+    return active_operation_id
+
+
+def _session_compaction_replay_event_ids(
+    record: dict[str, Any],
+) -> tuple[str, ...] | None:
+    status = record.get("status")
+    if status in {"running", "abandoned"}:
+        return None
+    if status not in {"completed", "failed"}:
+        raise RuntimeError(f"Unsupported session compaction operation status: {status}")
+    stored_event_ids = record.get("event_ids")
+    if type(stored_event_ids) is not list or not all(
+        type(event_id) is str and event_id for event_id in stored_event_ids
+    ):
+        raise RuntimeError("Completed session compaction operation is missing replay event ids.")
+    return tuple(stored_event_ids)
+
+
+def _store_session_operation_state(
+    checkpoint: dict[str, Any],
+    operations: dict[str, Any],
+) -> None:
+    records = operations.get("records")
+    if type(records) is not dict:
+        raise ValueError("Session operation checkpoint records must be an object.")
+    if records or operations.get("active_operation_id") is not None:
+        checkpoint[_SESSION_OPERATIONS_CHECKPOINT_KEY] = operations
+    else:
+        checkpoint.pop(_SESSION_OPERATIONS_CHECKPOINT_KEY, None)
+
+
+def _archive_inactive_session_operation_records(
+    checkpoint: dict[str, Any],
+    *,
+    except_idempotency_key: str,
+) -> dict[str, dict[str, Any]]:
+    """Move inactive operation records out of the live checkpoint."""
+
+    operations = _session_operation_state(checkpoint)
+    records = operations["records"]
+    archived: dict[str, dict[str, Any]] = {}
+    for key, record in list(records.items()):
+        if key == except_idempotency_key:
+            continue
+        if type(record) is not dict:
+            raise ValueError("Session operation checkpoint records must be objects.")
+        if record.get("status") == "running":
+            raise RuntimeError("Checkpoint contains an untracked running session operation.")
+        archived[key] = records.pop(key)
+    _store_session_operation_state(checkpoint, operations)
+    return archived
+
+
+def _reject_unresumable_session_checkpoint(
+    session: Session,
+    checkpoint: dict[str, Any] | None,
+    *,
+    allow_active_operation: bool = False,
+) -> None:
+    if approval_support.pending_approval_from_checkpoint(checkpoint) is not None:
+        raise RuntimeError("Session has a pending tool approval.")
+    if pending_user_input_from_checkpoint(checkpoint) is not None:
+        raise RuntimeError("Session is awaiting user input.")
+    if tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint) is not None:
+        raise RuntimeError("Session has a pending tool round.")
+    if checkpoint is not None and _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY in checkpoint:
+        raise RuntimeError("Session has an incomplete background interruption cascade.")
+    if checkpoint is not None and not allow_active_operation:
+        operations = _session_operation_state(checkpoint)
+        active_operation_id = operations.get("active_operation_id")
+        if active_operation_id is not None:
+            raise RuntimeError(f"Session has an active durable operation: {active_operation_id}")
+
+
+def _application_compaction_causal_payload(
+    *,
+    request: CompactSessionRequest,
+    operation_id: str,
+    attempt_id: str,
+    source_cursor: int,
+    compactor: str,
+    result_cursor: Any = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "operation_id": operation_id,
+        "attempt_id": attempt_id,
+        "request_id": request.idempotency_key,
+        "reason": request.reason,
+        "source_run_epoch": request.expected_run_epoch,
+        "source_transcript_cursor": source_cursor,
+        "compactor": _application_compaction_event_text(compactor) or "ContextCompactor",
+        "mode": "bounded",
+        "instruction_present": request.instructions is not None,
+        "instruction_digest": _optional_text_digest(request.instructions),
+        "actor": resolution_actor_payload(request.requested_by),
+    }
+    if type(result_cursor) is int and result_cursor >= 0:
+        payload["result_transcript_cursor"] = result_cursor
+    return payload
+
+
+_APPLICATION_COMPACTION_EVENT_TEXT_MAX_BYTES = 512
+_APPLICATION_COMPACTION_EVENT_INTEGER_MAX = 9_223_372_036_854_775_807
+
+
+def _application_compaction_event_text(value: Any) -> str | None:
+    if type(value) is not str or not value or value != value.strip():
+        return None
+    if any(
+        0xD800 <= ord(char) <= 0xDFFF or ord(char) < 0x20 or ord(char) == 0x7F for char in value
+    ):
+        return None
+    if len(value.encode("utf-8")) > _APPLICATION_COMPACTION_EVENT_TEXT_MAX_BYTES:
+        return None
+    return value
+
+
+def _require_application_compaction_event_text(value: Any, field_name: str) -> str:
+    value = require_clean_nonblank(value, field_name)
+    if _application_compaction_event_text(value) is None:
+        raise ValueError(
+            f"`{field_name}` must contain valid Unicode without control characters "
+            f"and be at most {_APPLICATION_COMPACTION_EVENT_TEXT_MAX_BYTES} UTF-8 bytes."
+        )
+    return value
+
+
+def _application_compaction_event_integer(value: Any) -> int | None:
+    if type(value) is not int or value < 0 or value > _APPLICATION_COMPACTION_EVENT_INTEGER_MAX:
+        return None
+    return value
+
+
+def _application_compaction_raw_usage(value: Any) -> dict[str, Any] | None:
+    if type(value) is not dict:
+        return None
+    raw_usage: dict[str, Any] = {}
+    for key in (
+        "input_tokens",
+        "prompt_tokens",
+        "output_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    ):
+        bounded = _application_compaction_event_integer(value.get(key))
+        if bounded is not None:
+            raw_usage[key] = bounded
+    for key, allowed_keys in (
+        ("input_tokens_details", ("cached_tokens",)),
+        ("prompt_tokens_details", ("cached_tokens",)),
+        ("output_tokens_details", ("reasoning_tokens", "thinking_tokens")),
+        ("completion_tokens_details", ("reasoning_tokens", "thinking_tokens")),
+    ):
+        details = value.get(key)
+        if type(details) is not dict:
+            continue
+        bounded_details = {
+            detail_key: bounded
+            for detail_key in allowed_keys
+            if (bounded := _application_compaction_event_integer(details.get(detail_key)))
+            is not None
+        }
+        if bounded_details:
+            raw_usage[key] = bounded_details
+    cache_creation = value.get("cache_creation")
+    if type(cache_creation) is dict:
+        cache_creation_total = 0
+        for index, cache_value in enumerate(cache_creation.values()):
+            if index >= 16:
+                break
+            bounded = _application_compaction_event_integer(cache_value)
+            if bounded is not None:
+                cache_creation_total += bounded
+        if cache_creation_total:
+            raw_usage["cache_creation"] = {"bounded_total": cache_creation_total}
+    return raw_usage or None
+
+
+def _application_compaction_usage_metrics(payload: dict[str, Any]) -> UsageMetrics | None:
+    supplied_metrics = payload.get("usage_metrics")
+    identity_source = supplied_metrics if type(supplied_metrics) is dict else payload
+    provider_name = _application_compaction_event_text(identity_source.get("provider_name"))
+    requested_model = _application_compaction_event_text(identity_source.get("requested_model"))
+    model = _application_compaction_event_text(identity_source.get("model"))
+    if type(supplied_metrics) is dict:
+        cache = supplied_metrics.get("cache")
+        if type(cache) is not dict:
+            cache = {}
+        return UsageMetrics(
+            provider_name=provider_name,
+            requested_model=requested_model,
+            model=model,
+            input_tokens=_application_compaction_event_integer(supplied_metrics.get("input_tokens"))
+            or 0,
+            output_tokens=_application_compaction_event_integer(
+                supplied_metrics.get("output_tokens")
+            )
+            or 0,
+            total_tokens=_application_compaction_event_integer(supplied_metrics.get("total_tokens"))
+            or 0,
+            reasoning_output_tokens=_application_compaction_event_integer(
+                supplied_metrics.get("reasoning_output_tokens")
+            )
+            or 0,
+            cache=CacheUsageMetrics(
+                read_tokens=_application_compaction_event_integer(cache.get("read_tokens")) or 0,
+                write_tokens=_application_compaction_event_integer(cache.get("write_tokens")) or 0,
+                cached_input_tokens=_application_compaction_event_integer(
+                    cache.get("cached_input_tokens")
+                )
+                or 0,
+                uncached_input_tokens=_application_compaction_event_integer(
+                    cache.get("uncached_input_tokens")
+                )
+                or 0,
+            ),
+        )
+    raw_usage = _application_compaction_raw_usage(payload.get("usage"))
+    if raw_usage is None:
+        return None
+    return usage_metrics_from_event_payload(
+        {
+            "provider_name": provider_name,
+            "requested_model": requested_model,
+            "model": model,
+            "usage": raw_usage,
+        }
+    )
+
+
+def _application_compaction_event(
+    *,
+    telemetry: ContextCompactionTelemetry,
+    request: CompactSessionRequest,
+    operation_id: str,
+    attempt_id: str,
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    environment_name: str | None,
+    compactor: str,
+) -> Event:
+    telemetry_payload = telemetry.payload
+    payload: dict[str, Any] = {}
+    if telemetry.event_type == EventType.MODEL_COMPLETED:
+        metrics = _application_compaction_usage_metrics(telemetry_payload)
+        payload["purpose"] = "context_compaction"
+        if metrics is not None:
+            payload["usage_metrics"] = metrics.model_dump()
+            for key in ("provider_name", "requested_model", "model"):
+                value = getattr(metrics, key)
+                if value is not None:
+                    payload[key] = value
+        else:
+            for key in ("provider_name", "requested_model", "model"):
+                value = _application_compaction_event_text(telemetry_payload.get(key))
+                if value is not None:
+                    payload[key] = value
+        for key in ("compaction_outcome", "usage_unavailable_reason"):
+            value = _application_compaction_event_text(telemetry_payload.get(key))
+            if value is not None:
+                payload[key] = value
+    elif telemetry.event_type == EventType.CONTEXT_COMPACTION_COMPLETED:
+        payload["checkpoint"] = "context_compaction"
+        for key in (
+            "compacted_transcript_cursor",
+            "previous_compacted_transcript_cursor",
+            "newly_compacted_message_count",
+            "recent_message_count",
+            "summary_chars",
+        ):
+            value = _application_compaction_event_integer(telemetry_payload.get(key))
+            if value is not None:
+                payload[key] = value
+    payload.update(
+        _application_compaction_causal_payload(
+            request=request,
+            operation_id=operation_id,
+            attempt_id=attempt_id,
+            source_cursor=request.expected_transcript_cursor,
+            result_cursor=payload.get("compacted_transcript_cursor"),
+            compactor=compactor,
+        )
+    )
+    return Event(
+        type=telemetry.event_type,
+        session_id=session.id,
+        agent_name=registered_agent.spec.name,
+        environment_name=environment_name,
+        payload=payload,
+    )
+
+
+def _application_compaction_budget_event(
+    *,
+    check: BudgetCheck,
+    request: CompactSessionRequest,
+    operation_id: str,
+    attempt_id: str,
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    environment_name: str | None,
+    compactor: str,
+) -> Event:
+    return Event(
+        type=EventType.BUDGET_LIMIT_REACHED,
+        session_id=session.id,
+        agent_name=registered_agent.spec.name,
+        environment_name=environment_name,
+        payload={
+            **budget_check_payload(check),
+            **_application_compaction_causal_payload(
+                request=request,
+                operation_id=operation_id,
+                attempt_id=attempt_id,
+                source_cursor=request.expected_transcript_cursor,
+                compactor=compactor,
+            ),
+        },
+    )
+
+
+def _application_compaction_ledger_event(
+    *,
+    event_type: EventType,
+    payload: dict[str, Any],
+    request: CompactSessionRequest,
+    operation_id: str,
+    attempt_id: str,
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    environment_name: str | None,
+    compactor: str,
+) -> Event:
+    return Event(
+        type=event_type,
+        session_id=session.id,
+        agent_name=registered_agent.spec.name,
+        environment_name=environment_name,
+        payload={
+            **copy_json_value(payload, "compaction_budget_payload"),
+            **_application_compaction_causal_payload(
+                request=request,
+                operation_id=operation_id,
+                attempt_id=attempt_id,
+                source_cursor=request.expected_transcript_cursor,
+                compactor=compactor,
+            ),
+        },
+    )
+
+
+def _budget_check_identity(
+    check: BudgetCheck,
+) -> tuple[str, str | None, str, str, Decimal]:
+    return (
+        check.scope,
+        check.key,
+        check.window.storage_key,
+        check.action,
+        check.maximum,
+    )
+
+
+def _latest_model_event_identity(events: list[Event]) -> tuple[str | None, str | None]:
+    for event in reversed(events):
+        if event.type != EventType.MODEL_COMPLETED:
+            continue
+        provider_name = event.payload.get("provider_name")
+        model = event.payload.get("model") or event.payload.get("requested_model")
+        return (
+            provider_name if type(provider_name) is str else None,
+            model if type(model) is str else None,
+        )
+    return None, None
+
+
+def _complete_session_operation_checkpoint(
+    *,
+    checkpoint: dict[str, Any] | None,
+    persisted_record: dict[str, Any] | None,
+    compacted_checkpoint: dict[str, Any],
+    idempotency_key: str,
+    operation_id: str,
+    attempt_id: str,
+    event_ids: list[str],
+    result_cursor: Any,
+    completed_at: datetime,
+) -> SessionOperationPublication:
+    if checkpoint is None:
+        raise SessionCompactionAttemptSuperseded(
+            "Session compaction attempt was superseded before publication."
+        )
+    updated = copy_json_value(checkpoint, "checkpoint")
+    operations = _session_operation_state(updated)
+    record = operations["records"].get(idempotency_key)
+    if type(record) is not dict or record.get("operation_id") != operation_id:
+        if persisted_record is not None and persisted_record.get("operation_id") == operation_id:
+            raise SessionCompactionAttemptSuperseded(
+                "Session compaction attempt was superseded before publication."
+            )
+        raise RuntimeError("Session compaction operation claim was lost before publication.")
+    if (
+        record.get("status") != "running"
+        or record.get("current_attempt_id") != attempt_id
+        or operations.get("active_operation_id") != operation_id
+    ):
+        raise SessionCompactionAttemptSuperseded(
+            "Session compaction attempt was superseded before publication."
+        )
+    if persisted_record is not None:
+        if persisted_record.get("operation_id") != operation_id:
+            raise RuntimeError(
+                "Session compaction operation replay record does not match its claim."
+            )
+        if persisted_record.get("status") != "abandoned":
+            raise SessionCompactionAttemptSuperseded(
+                "Session compaction attempt was superseded before publication."
+            )
+    compacted_state = copy_json_value(compacted_checkpoint, "compacted_checkpoint")
+    compacted_context = compacted_state.get(_CONTEXT_COMPACTION_OPERATION_KIND)
+    if type(compacted_context) is not dict:
+        raise ValueError("Compacted checkpoint is missing context compaction state.")
+    updated[_CONTEXT_COMPACTION_OPERATION_KIND] = compacted_context
+    record["status"] = "completed"
+    existing_event_ids = record.get("event_ids", [])
+    record["event_ids"] = [
+        *existing_event_ids,
+        *(event_id for event_id in event_ids if event_id not in existing_event_ids),
+    ]
+    record["result_transcript_cursor"] = result_cursor
+    record["completed_at"] = completed_at.isoformat()
+    record["updated_at"] = completed_at.isoformat()
+    record.pop("claim_expires_at", None)
+    operations["active_operation_id"] = None
+    terminal_record = operations["records"].pop(idempotency_key)
+    _store_session_operation_state(updated, operations)
+    return SessionOperationPublication(
+        checkpoint=updated,
+        operation_records={idempotency_key: terminal_record},
+    )
+
+
+def _append_session_operation_attempt_events(
+    *,
+    idempotency_key: str,
+    operation_id: str,
+    attempt_id: str,
+    event_ids: list[str],
+    updated_at: datetime,
+) -> Callable[
+    [Session, dict[str, Any] | None, dict[str, Any] | None],
+    SessionOperationPublication,
+]:
+    def append_events(
+        _session: Session,
+        checkpoint: dict[str, Any] | None,
+        persisted_record: dict[str, Any] | None,
+    ) -> SessionOperationPublication:
+        if checkpoint is None:
+            raise SessionCompactionAttemptSuperseded(
+                "Session compaction attempt was superseded before event publication."
+            )
+        updated = copy_json_value(checkpoint, "checkpoint")
+        operations = _session_operation_state(updated)
+        record = operations["records"].get(idempotency_key)
+        if type(record) is not dict or record.get("operation_id") != operation_id:
+            if (
+                persisted_record is not None
+                and persisted_record.get("operation_id") == operation_id
+            ):
+                raise SessionCompactionAttemptSuperseded(
+                    "Session compaction attempt was superseded before event publication."
+                )
+            raise RuntimeError("Session compaction operation claim was lost before publication.")
+        if (
+            record.get("status") != "running"
+            or record.get("current_attempt_id") != attempt_id
+            or operations.get("active_operation_id") != operation_id
+        ):
+            raise SessionCompactionAttemptSuperseded(
+                "Session compaction attempt was superseded before event publication."
+            )
+        existing_event_ids = record.get("event_ids", [])
+        record["event_ids"] = [
+            *existing_event_ids,
+            *(event_id for event_id in event_ids if event_id not in existing_event_ids),
+        ]
+        record["updated_at"] = updated_at.isoformat()
+        updated[_SESSION_OPERATIONS_CHECKPOINT_KEY] = operations
+        return SessionOperationPublication(checkpoint=updated)
+
+    return append_events
+
+
+def _fail_session_operation_checkpoint(
+    *,
+    idempotency_key: str,
+    operation_id: str,
+    attempt_id: str,
+    failed_event_id: str,
+    attempt_event_ids: list[str],
+    error_type: str,
+    completed_at: datetime,
+) -> Callable[
+    [Session, dict[str, Any] | None, dict[str, Any] | None],
+    SessionOperationPublication,
+]:
+    def fail(
+        _session: Session,
+        checkpoint: dict[str, Any] | None,
+        persisted_record: dict[str, Any] | None,
+    ) -> SessionOperationPublication:
+        updated = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+        operations = _session_operation_state(updated)
+        record = operations["records"].get(idempotency_key)
+        if type(record) is not dict or record.get("operation_id") != operation_id:
+            if (
+                persisted_record is not None
+                and persisted_record.get("operation_id") == operation_id
+            ):
+                terminal_record = copy_json_value(persisted_record, "session_operation")
+                existing_event_ids = terminal_record.get("event_ids", [])
+                terminal_record["event_ids"] = [
+                    *existing_event_ids,
+                    *(
+                        event_id
+                        for event_id in [*attempt_event_ids, failed_event_id]
+                        if event_id not in existing_event_ids
+                    ),
+                ]
+                return SessionOperationPublication(
+                    checkpoint=updated,
+                    operation_records={idempotency_key: terminal_record},
+                )
+            raise RuntimeError("Session compaction operation claim was lost before failure.")
+        existing_event_ids = record.get("event_ids", [])
+        record["event_ids"] = [
+            *existing_event_ids,
+            *(
+                event_id
+                for event_id in [*attempt_event_ids, failed_event_id]
+                if event_id not in existing_event_ids
+            ),
+        ]
+        if (
+            record.get("status") != "running"
+            or record.get("current_attempt_id") != attempt_id
+            or operations.get("active_operation_id") != operation_id
+        ):
+            updated[_SESSION_OPERATIONS_CHECKPOINT_KEY] = operations
+            return SessionOperationPublication(checkpoint=updated)
+        record["status"] = "failed"
+        record["error_type"] = error_type
+        record["completed_at"] = completed_at.isoformat()
+        record["updated_at"] = completed_at.isoformat()
+        record.pop("claim_expires_at", None)
+        operations["active_operation_id"] = None
+        terminal_record = operations["records"].pop(idempotency_key)
+        _store_session_operation_state(updated, operations)
+        return SessionOperationPublication(
+            checkpoint=updated,
+            operation_records={idempotency_key: terminal_record},
+        )
+
+    return fail
+
+
 def _validate_run_request(request: RunRequest) -> RunRequest:
     return copy_run_request(request)
 
@@ -12697,7 +14606,7 @@ def _interruption_request_id_from_payload(payload: dict[str, Any]) -> str | None
     return request_id
 
 
-def _replace_checkpoint_preserving_interruption_cascade(
+def _replace_checkpoint_preserving_runtime_state(
     checkpoint: dict[str, Any],
 ):
     replacement = copy_json_value(checkpoint, "checkpoint")
@@ -12707,6 +14616,7 @@ def _replace_checkpoint_preserving_interruption_cascade(
         for key, field_name in (
             (_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY, "pending_session_interrupt"),
             (_PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY, "pending_interruption_cascade"),
+            (_SESSION_OPERATIONS_CHECKPOINT_KEY, "session_operations"),
         ):
             updated.pop(key, None)
             if current is not None and key in current:

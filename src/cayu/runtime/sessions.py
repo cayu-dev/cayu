@@ -10,7 +10,7 @@ from contextvars import ContextVar
 from copy import deepcopy
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import (
@@ -26,11 +26,14 @@ from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs 
 
 from cayu._validation import (
     JsonUtf8SizeCounter,
+    copy_json_object,
     copy_json_value,
     copy_label_map,
     json_utf8_size_within_limit,
     require_clean_nonblank,
+    require_durable_json_text,
     require_nonblank,
+    require_unicode_scalar_text,
 )
 from cayu.core.events import Event, EventType, copy_event
 from cayu.core.messages import Message, MessageRole, ThinkingPart, copy_message, detach_message
@@ -264,6 +267,66 @@ class ResumeRequest(BaseModel):
         if value is None:
             return None
         return require_clean_nonblank(value, info.field_name)
+
+
+class CompactSessionRequest(BaseModel):
+    """Request an explicit, application-owned compaction of durable session context."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    idempotency_key: str = Field(max_length=256)
+    expected_run_epoch: StrictInt = Field(ge=0)
+    expected_transcript_cursor: StrictInt = Field(ge=0)
+    reason: Literal["application_requested"] = "application_requested"
+    instructions: str | None = Field(default=None, max_length=4096)
+    limits: RunLimits = Field(default_factory=RunLimits)
+    budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
+    requested_by: ResolutionActor | None = None
+
+    @field_validator("session_id", "idempotency_key")
+    @classmethod
+    def validate_required_strings(cls, value: str, info) -> str:
+        value = require_clean_nonblank(value, info.field_name)
+        value = require_unicode_scalar_text(value, info.field_name)
+        if "\x00" in value:
+            raise ValueError(f"`{info.field_name}` must not contain NUL characters.")
+        return value
+
+    @field_validator("instructions")
+    @classmethod
+    def validate_optional_instructions(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_nonblank(value, "instructions")
+
+    @field_validator("limits")
+    @classmethod
+    def copy_limits(cls, value: RunLimits) -> RunLimits:
+        return copy_run_limits(value)
+
+    @field_validator("budget_limits", mode="before")
+    @classmethod
+    def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...]:
+        return copy_request_budget_limits(value)
+
+    @field_validator("requested_by")
+    @classmethod
+    def copy_requested_by(cls, value: ResolutionActor | None) -> ResolutionActor | None:
+        return copy_resolution_actor(value)
+
+    @model_validator(mode="after")
+    def validate_durable_text(self) -> CompactSessionRequest:
+        require_durable_json_text(
+            self.model_dump(mode="json", exclude={"requested_by"}),
+            "CompactSessionRequest",
+        )
+        if self.requested_by is not None:
+            require_durable_json_text(
+                self.requested_by.model_dump(mode="json", exclude={"claims"}),
+                "CompactSessionRequest.requested_by",
+            )
+        return self
 
 
 class InterruptSessionRequest(BaseModel):
@@ -578,6 +641,39 @@ def _project_interruption_cascade_marker(marker: Any) -> dict[str, Any] | None:
 CheckpointTransform = Callable[
     [Session, dict[str, Any] | None],
     dict[str, Any] | None,
+]
+
+
+class SessionOperationPublication(BaseModel):
+    """One atomic checkpoint/event publication plus terminal operation records."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    checkpoint: dict[str, Any]
+    operation_records: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+    @field_validator("checkpoint", mode="before")
+    @classmethod
+    def copy_checkpoint(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return copy_json_object(value, "checkpoint")
+
+    @field_validator("operation_records", mode="before")
+    @classmethod
+    def copy_operation_records(
+        cls,
+        value: dict[str, dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        copied = copy_json_object(value, "operation_records")
+        for key, record in copied.items():
+            require_clean_nonblank(key, "operation_records key")
+            if type(record) is not dict:
+                raise ValueError("Session operation records must be objects.")
+        return copied
+
+
+SessionOperationTransform = Callable[
+    [Session, dict[str, Any] | None, dict[str, Any] | None],
+    SessionOperationPublication,
 ]
 
 
@@ -1544,6 +1640,41 @@ class SessionStore(ABC):
         """Append events to a session in one durable batch."""
 
     @abstractmethod
+    async def publish_checkpoint_and_events(
+        self,
+        session_id: str,
+        *,
+        checkpoint_transform: CheckpointTransform,
+        events: list[Event],
+        expected_statuses: set[SessionStatus] | None = None,
+        expected_run_epoch: int | None = None,
+        expected_transcript_cursor: int | None = None,
+    ) -> Session:
+        """Atomically transform a checkpoint and append its causal event batch."""
+
+    @abstractmethod
+    async def load_session_operation(
+        self,
+        session_id: str,
+        idempotency_key: str,
+    ) -> dict[str, Any] | None:
+        """Load one terminal durable operation record by caller idempotency key."""
+
+    @abstractmethod
+    async def publish_session_operation(
+        self,
+        session_id: str,
+        *,
+        idempotency_key: str,
+        operation_transform: SessionOperationTransform,
+        events: list[Event],
+        expected_statuses: set[SessionStatus] | None = None,
+        expected_run_epoch: int | None = None,
+        expected_transcript_cursor: int | None = None,
+    ) -> Session:
+        """Atomically publish a checkpoint, events, and terminal operation records."""
+
+    @abstractmethod
     async def load_events(self, session_id: str) -> list[Event]:
         """Load all events for a session."""
 
@@ -1710,6 +1841,7 @@ class InMemorySessionStore(SessionStore):
         self._next_event_sequence = 1
         self._transcripts: dict[str, list[Message]] = {}
         self._checkpoints: dict[str, dict[str, Any]] = {}
+        self._session_operation_records: dict[str, dict[str, dict[str, Any]]] = {}
         self._pending_action_session_ids: set[str] = set()
 
     def _store_checkpoint_unlocked(self, session_id: str, checkpoint: dict[str, Any]) -> None:
@@ -1809,6 +1941,7 @@ class InMemorySessionStore(SessionStore):
             self._event_ids[session.id] = set()
             self._session_event_records[session.id] = []
             self._pending_action_event_records[session.id] = {}
+            self._session_operation_records[session.id] = {}
             self._transcripts[session.id] = []
             return session.model_copy(deep=True)
 
@@ -1868,6 +2001,7 @@ class InMemorySessionStore(SessionStore):
             self._event_ids[fork.id] = set()
             self._session_event_records[fork.id] = []
             self._pending_action_event_records[fork.id] = {}
+            self._session_operation_records[fork.id] = {}
             self._transcripts[fork.id] = copied_transcript
             if copied_checkpoint is not None:
                 self._store_checkpoint_unlocked(fork.id, copied_checkpoint)
@@ -1937,6 +2071,15 @@ class InMemorySessionStore(SessionStore):
                     f"Cannot delete a session while it is {session.status}; "
                     f"interrupt it first: {session_id}"
                 )
+            active_operation_id = _active_unexpired_session_operation_id(
+                self._checkpoints.get(session_id),
+                now=datetime.now(UTC),
+            )
+            if active_operation_id is not None:
+                raise ValueError(
+                    "Cannot delete a session while durable operation "
+                    f"{active_operation_id} is active: {session_id}"
+                )
             self._sessions.pop(session_id, None)
             self._events.pop(session_id, None)
             self._event_ids.pop(session_id, None)
@@ -1946,6 +2089,7 @@ class InMemorySessionStore(SessionStore):
             self._pending_action_latest_barrier_records.pop(session_id, None)
             self._transcripts.pop(session_id, None)
             self._checkpoints.pop(session_id, None)
+            self._session_operation_records.pop(session_id, None)
             self._pending_action_session_ids.discard(session_id)
             self._event_records = [
                 record for record in self._event_records if record.event.session_id != session_id
@@ -2132,13 +2276,61 @@ class InMemorySessionStore(SessionStore):
     async def append_event(self, session_id: str, event: Event) -> None:
         await self.append_events(session_id, [event])
 
-    async def append_events(self, session_id: str, events: list[Event]) -> None:
+    def _append_events_unlocked(
+        self,
+        session: Session,
+        events: list[Event],
+    ) -> Session:
         from cayu.runtime.pending_actions import (
             pending_action_event_lookup_id,
             pending_action_lookup_key,
             project_pending_action_event_record,
         )
 
+        session_id = session.id
+        existing_ids = self._event_ids[session_id]
+        for event in events:
+            if event.id in existing_ids:
+                raise ValueError(f"Event already exists for session {session_id}: {event.id}")
+
+        prepared: list[tuple[EventRecord, str, EventRecord | None, str | None]] = []
+        next_sequence = self._next_event_sequence
+        for event in events:
+            stored_event = event.model_copy(deep=True)
+            record = EventRecord(sequence=next_sequence, event=stored_event)
+            event_type = str(stored_event.type)
+            projected_record: EventRecord | None = None
+            lookup_key: str | None = None
+            if event_type in PENDING_ACTION_EVENT_TYPE_VALUES:
+                projected_record = project_pending_action_event_record(record)
+                lookup_id = pending_action_event_lookup_id(stored_event)
+                if lookup_id is not None:
+                    lookup_key = pending_action_lookup_key(lookup_id)
+            prepared.append((record, event_type, projected_record, lookup_key))
+            next_sequence += 1
+
+        session_records = self._session_event_records.setdefault(session_id, [])
+        for record, event_type, projected_record, lookup_key in prepared:
+            stored_event = record.event
+            self._events[session_id].append(stored_event)
+            self._event_records.append(record)
+            self._event_records_by_id[(session_id, stored_event.id)] = record
+            session_records.append(record)
+            if projected_record is not None:
+                if event_type in PENDING_ACTION_BARRIER_EVENT_TYPE_VALUES:
+                    self._pending_action_latest_barrier_records[session_id] = projected_record
+                elif lookup_key is not None:
+                    by_lookup_id = self._pending_action_event_records.setdefault(session_id, {})
+                    by_event_type = by_lookup_id.setdefault(lookup_key, {})
+                    by_event_type[event_type] = projected_record
+            self._type_event_records.setdefault(event_type, []).append(record)
+            existing_ids.add(stored_event.id)
+        self._next_event_sequence = next_sequence
+        if not events:
+            return session
+        return session.model_copy(update={"last_activity_at": datetime.now(UTC)})
+
+    async def append_events(self, session_id: str, events: list[Event]) -> None:
         session_id, copied_events = _copy_session_event_batch(session_id, events)
 
         async with self._lock:
@@ -2146,45 +2338,144 @@ class InMemorySessionStore(SessionStore):
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
             _assert_session_run_epoch(session_id, session)
-            existing_ids = self._event_ids[session_id]
-            for event in copied_events:
-                if event.id in existing_ids:
-                    raise ValueError(f"Event already exists for session {session_id}: {event.id}")
+            self._sessions[session_id] = self._append_events_unlocked(session, copied_events)
 
-            session_records = self._session_event_records.setdefault(session_id, [])
-            for event in copied_events:
-                stored_event = event.model_copy(deep=True)
-                self._events[session_id].append(stored_event)
-                record = EventRecord(
-                    sequence=self._next_event_sequence,
-                    event=stored_event,
+    async def publish_checkpoint_and_events(
+        self,
+        session_id: str,
+        *,
+        checkpoint_transform: CheckpointTransform,
+        events: list[Event],
+        expected_statuses: set[SessionStatus] | None = None,
+        expected_run_epoch: int | None = None,
+        expected_transcript_cursor: int | None = None,
+    ) -> Session:
+        session_id, copied_events = _copy_session_event_batch(session_id, events)
+        if checkpoint_transform is None:
+            raise TypeError("checkpoint_transform is required.")
+        allowed_statuses = (
+            None
+            if expected_statuses is None
+            else _validate_status_set(expected_statuses, "expected_statuses")
+        )
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            _assert_session_run_epoch(session_id, session)
+            if allowed_statuses is not None and session.status not in allowed_statuses:
+                raise SessionStatusConflict(
+                    f"Session status is not eligible for checkpoint publication: {session.status}"
                 )
-                self._event_records.append(record)
-                self._event_records_by_id[(session_id, stored_event.id)] = record
-                # Share the same EventRecord across the secondary indexes; records are
-                # immutable in practice and query paths copy before returning.
-                session_records.append(record)
-                event_type = str(stored_event.type)
-                if event_type in PENDING_ACTION_EVENT_TYPE_VALUES:
-                    projected_record = project_pending_action_event_record(record)
-                    if event_type in PENDING_ACTION_BARRIER_EVENT_TYPE_VALUES:
-                        self._pending_action_latest_barrier_records[session_id] = projected_record
-                    else:
-                        lookup_id = pending_action_event_lookup_id(stored_event)
-                        if lookup_id is not None:
-                            lookup_key = pending_action_lookup_key(lookup_id)
-                            by_lookup_id = self._pending_action_event_records.setdefault(
-                                session_id, {}
-                            )
-                            by_event_type = by_lookup_id.setdefault(lookup_key, {})
-                            by_event_type[event_type] = projected_record
-                self._type_event_records.setdefault(event_type, []).append(record)
-                existing_ids.add(stored_event.id)
-                self._next_event_sequence += 1
-            if copied_events:
-                self._sessions[session_id] = session.model_copy(
-                    update={"last_activity_at": datetime.now(UTC)}
+            if expected_run_epoch is not None and session.run_epoch != expected_run_epoch:
+                raise SessionRunFenced(
+                    f"Session source run epoch is stale: expected {expected_run_epoch}, "
+                    f"current {session.run_epoch}."
                 )
+            current_cursor = len(self._transcripts.get(session_id, []))
+            if (
+                expected_transcript_cursor is not None
+                and current_cursor != expected_transcript_cursor
+            ):
+                raise ValueError(
+                    "Session source transcript cursor is stale: expected "
+                    f"{expected_transcript_cursor}, current {current_cursor}."
+                )
+            current = self._checkpoints.get(session_id)
+            transformed = checkpoint_transform(
+                session.model_copy(deep=True),
+                None if current is None else deepcopy(current),
+            )
+            if transformed is None:
+                raise ValueError("Checkpoint transform must return a checkpoint.")
+            copied_checkpoint = copy_json_value(transformed, "checkpoint")
+            updated = self._append_events_unlocked(session, copied_events)
+            self._store_checkpoint_unlocked(session_id, copied_checkpoint)
+            self._sessions[session_id] = updated
+            return updated.model_copy(deep=True)
+
+    async def load_session_operation(
+        self,
+        session_id: str,
+        idempotency_key: str,
+    ) -> dict[str, Any] | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        idempotency_key = require_clean_nonblank(idempotency_key, "idempotency_key")
+        async with self._lock:
+            if session_id not in self._sessions:
+                raise KeyError(f"Session not found: {session_id}")
+            record = self._session_operation_records.get(session_id, {}).get(idempotency_key)
+            return None if record is None else copy_json_value(record, "session_operation")
+
+    async def publish_session_operation(
+        self,
+        session_id: str,
+        *,
+        idempotency_key: str,
+        operation_transform: SessionOperationTransform,
+        events: list[Event],
+        expected_statuses: set[SessionStatus] | None = None,
+        expected_run_epoch: int | None = None,
+        expected_transcript_cursor: int | None = None,
+    ) -> Session:
+        session_id, copied_events = _copy_session_event_batch(session_id, events)
+        idempotency_key = require_clean_nonblank(idempotency_key, "idempotency_key")
+        if operation_transform is None:
+            raise TypeError("operation_transform is required.")
+        allowed_statuses = (
+            None
+            if expected_statuses is None
+            else _validate_status_set(expected_statuses, "expected_statuses")
+        )
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            _assert_session_run_epoch(session_id, session)
+            if allowed_statuses is not None and session.status not in allowed_statuses:
+                raise SessionStatusConflict(
+                    f"Session status is not eligible for checkpoint publication: {session.status}"
+                )
+            if expected_run_epoch is not None and session.run_epoch != expected_run_epoch:
+                raise SessionRunFenced(
+                    f"Session source run epoch is stale: expected {expected_run_epoch}, "
+                    f"current {session.run_epoch}."
+                )
+            current_cursor = len(self._transcripts.get(session_id, []))
+            if (
+                expected_transcript_cursor is not None
+                and current_cursor != expected_transcript_cursor
+            ):
+                raise ValueError(
+                    "Session source transcript cursor is stale: expected "
+                    f"{expected_transcript_cursor}, current {current_cursor}."
+                )
+            current_checkpoint = self._checkpoints.get(session_id)
+            current_record = self._session_operation_records.get(session_id, {}).get(
+                idempotency_key
+            )
+            publication = operation_transform(
+                session.model_copy(deep=True),
+                None if current_checkpoint is None else deepcopy(current_checkpoint),
+                None
+                if current_record is None
+                else copy_json_value(current_record, "session_operation"),
+            )
+            if type(publication) is not SessionOperationPublication:
+                raise TypeError(
+                    "Session operation transform must return a SessionOperationPublication."
+                )
+            copied_checkpoint = copy_json_value(publication.checkpoint, "checkpoint")
+            copied_records = copy_json_value(
+                publication.operation_records,
+                "operation_records",
+            )
+            updated = self._append_events_unlocked(session, copied_events)
+            self._store_checkpoint_unlocked(session_id, copied_checkpoint)
+            operation_records = self._session_operation_records.setdefault(session_id, {})
+            operation_records.update(copied_records)
+            self._sessions[session_id] = updated
+            return updated.model_copy(deep=True)
 
     async def load_events(self, session_id: str) -> list[Event]:
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -2961,6 +3252,22 @@ def copy_resume_request(request: ResumeRequest) -> ResumeRequest:
     )
 
 
+def copy_compact_session_request(request: CompactSessionRequest) -> CompactSessionRequest:
+    if type(request) is not CompactSessionRequest:
+        raise TypeError("Session compaction requires a CompactSessionRequest.")
+    return CompactSessionRequest(
+        session_id=request.session_id,
+        idempotency_key=request.idempotency_key,
+        expected_run_epoch=request.expected_run_epoch,
+        expected_transcript_cursor=request.expected_transcript_cursor,
+        reason=request.reason,
+        instructions=request.instructions,
+        limits=copy_run_limits(request.limits),
+        budget_limits=copy_request_budget_limits(request.budget_limits),
+        requested_by=copy_resolution_actor(request.requested_by),
+    )
+
+
 def copy_interrupt_session_request(request: InterruptSessionRequest) -> InterruptSessionRequest:
     if type(request) is not InterruptSessionRequest:
         raise TypeError("Session interruption requires an InterruptSessionRequest.")
@@ -3305,6 +3612,53 @@ def _sort_sessions(sessions: list[Session], order_by: SessionOrder) -> list[Sess
 
 # Sessions that must be interrupted before they can be deleted (in-flight work).
 DELETE_BLOCKED_SESSION_STATUSES = frozenset({SessionStatus.RUNNING, SessionStatus.INTERRUPTING})
+
+
+def _active_unexpired_session_operation_id(
+    checkpoint: dict[str, Any] | None,
+    *,
+    now: datetime,
+) -> str | None:
+    """Return the active durable operation while its claim lease is valid."""
+
+    if checkpoint is None:
+        return None
+    stored = checkpoint.get("session_operations")
+    if stored is None:
+        return None
+    if type(stored) is not dict:
+        raise ValueError("Session operation checkpoint must be an object.")
+    active_operation_id = stored.get("active_operation_id")
+    if active_operation_id is None:
+        return None
+    active_operation_id = require_clean_nonblank(
+        active_operation_id,
+        "active_operation_id",
+    )
+    records = stored.get("records")
+    if type(records) is not dict:
+        raise ValueError("Session operation checkpoint records must be an object.")
+    active_record = next(
+        (
+            record
+            for record in records.values()
+            if type(record) is dict and record.get("operation_id") == active_operation_id
+        ),
+        None,
+    )
+    if active_record is None:
+        raise ValueError("Active durable session operation record is missing.")
+    claim_expires_at = active_record.get("claim_expires_at")
+    if type(claim_expires_at) is not str:
+        return active_operation_id
+    try:
+        expiry = datetime.fromisoformat(claim_expires_at)
+    except ValueError:
+        return active_operation_id
+    if expiry.tzinfo is None or expiry.utcoffset() is None:
+        return active_operation_id
+    return active_operation_id if expiry.astimezone(UTC) > now.astimezone(UTC) else None
+
 
 _DESCENDING_SESSION_ORDERS = frozenset({SessionOrder.CREATED_AT_DESC, SessionOrder.UPDATED_AT_DESC})
 _CREATED_AT_ORDERS = frozenset({SessionOrder.CREATED_AT_ASC, SessionOrder.CREATED_AT_DESC})

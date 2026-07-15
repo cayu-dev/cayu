@@ -12498,7 +12498,7 @@ def test_interruption_cascade_completion_clear_failure_is_durably_reported(monke
     }
 
 
-def test_checkpoint_replacement_preserves_current_cascade_marker_without_resurrection():
+def test_checkpoint_replacement_preserves_current_runtime_state_without_resurrection():
     async def run():
         store = InMemorySessionStore()
         app = CayuApp(session_store=store, enable_logging=False)
@@ -12519,6 +12519,16 @@ def test_checkpoint_replacement_preserves_current_cascade_marker_without_resurre
             "attempt_id": "stale-attempt",
             "interrupt_payload": {"interruption_type": "operator_requested"},
         }
+        current_operations = {
+            "version": 1,
+            "active_operation_id": None,
+            "records": {"current-operation": {"status": "completed"}},
+        }
+        stale_operations = {
+            "version": 1,
+            "active_operation_id": None,
+            "records": {"stale-operation": {"status": "completed"}},
+        }
         await store.checkpoint(
             session_id,
             {
@@ -12527,6 +12537,7 @@ def test_checkpoint_replacement_preserves_current_cascade_marker_without_resurre
                     "interruption_type": "operator_requested",
                 },
                 "pending_interruption_cascade": current_marker,
+                "session_operations": current_operations,
                 "current": True,
             },
         )
@@ -12536,22 +12547,27 @@ def test_checkpoint_replacement_preserves_current_cascade_marker_without_resurre
                 "interruption_type": "operator_requested",
             },
             "pending_interruption_cascade": stale_marker,
+            "session_operations": stale_operations,
             "replacement": True,
         }
         await store.transform_checkpoint(
             session_id,
-            runtime_app_module._replace_checkpoint_preserving_interruption_cascade(
-                stale_replacement
-            ),
+            runtime_app_module._replace_checkpoint_preserving_runtime_state(stale_replacement),
         )
         preserved = await store.load_checkpoint(session_id)
         await app._clear_pending_session_interrupt(session_id)
         await app._clear_pending_interruption_cascade(session_id)
         await store.transform_checkpoint(
             session_id,
-            runtime_app_module._replace_checkpoint_preserving_interruption_cascade(
-                stale_replacement
-            ),
+            lambda _session, checkpoint: {
+                key: value
+                for key, value in (checkpoint or {}).items()
+                if key != "session_operations"
+            },
+        )
+        await store.transform_checkpoint(
+            session_id,
+            runtime_app_module._replace_checkpoint_preserving_runtime_state(stale_replacement),
         )
         return preserved, await store.load_checkpoint(session_id)
 
@@ -12565,6 +12581,11 @@ def test_checkpoint_replacement_preserves_current_cascade_marker_without_resurre
         "pending_interruption_cascade": {
             "attempt_id": "current-attempt",
             "interrupt_payload": {"interruption_type": "operator_requested"},
+        },
+        "session_operations": {
+            "version": 1,
+            "active_operation_id": None,
+            "records": {"current-operation": {"status": "completed"}},
         },
         "replacement": True,
     }

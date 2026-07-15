@@ -53,6 +53,7 @@ from cayu.artifacts import ArtifactListResult, ArtifactMetadata, ArtifactReadRes
 from cayu.core.events import Event, EventType
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
+    CheckpointCompactionContextPolicy,
     EventQuery,
     EventRecord,
     InMemorySessionStore,
@@ -61,6 +62,7 @@ from cayu.runtime import (
     RunRequest,
     SessionIdentity,
     SessionStatus,
+    TranscriptDigestCompactor,
 )
 from cayu.server import create_server, mount_cayu, mount_dashboard
 from cayu.server.routes import (
@@ -5007,6 +5009,34 @@ def test_server_delete_running_session_conflicts() -> None:
     assert response.status_code == 409
 
 
+def test_server_delete_active_durable_operation_conflicts() -> None:
+    async def seed(store):
+        await _create_session(store, "sess_active_operation")
+        expires_at = datetime.now(UTC) + timedelta(minutes=5)
+        await store.checkpoint(
+            "sess_active_operation",
+            {
+                "session_operations": {
+                    "version": 1,
+                    "active_operation_id": "operation-1",
+                    "records": {
+                        "request-1": {
+                            "operation_id": "operation-1",
+                            "status": "running",
+                            "claim_expires_at": expires_at.isoformat(),
+                        }
+                    },
+                }
+            },
+        )
+
+    _, client = _lifecycle_store_and_client(seed)
+
+    response = client.delete("/api/sessions/sess_active_operation")
+    assert response.status_code == 409
+    assert "durable operation operation-1 is active" in response.json()["detail"]
+
+
 def test_server_updates_session_labels() -> None:
     async def seed(store):
         await _create_session(store, "sess_lab", labels={"team": "research"})
@@ -6177,6 +6207,124 @@ def test_streaming_mutation_id_header_rejects_unsafe_values_before_execution() -
 
     assert response.status_code == 422
     assert asyncio.run(app.session_store.load_state("session-invalid-mutation-id")) is None
+
+
+def test_explicit_compaction_endpoint_uses_replayable_mutation_contract() -> None:
+    app = CayuApp(enable_logging=False)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=TranscriptDigestCompactor(),
+            max_user_turns=1,
+        ),
+    )
+
+    async def prepare() -> tuple[int, int]:
+        session = await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="session-explicit-compact-endpoint",
+                messages=[Message.text("user", "create only")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        transcript = [
+            Message.text("user", "old request"),
+            Message.text("assistant", "old answer"),
+            Message.text("user", "current request"),
+            Message.text("assistant", "current answer"),
+        ]
+        await app.session_store.append_transcript_messages(session.id, transcript)
+        completed = await app.session_store.update_status(session.id, SessionStatus.COMPLETED)
+        return completed.run_epoch, len(transcript)
+
+    run_epoch, transcript_cursor = asyncio.run(prepare())
+    client = TestClient(create_server(app, dev=True))
+    session_id = "session-explicit-compact-endpoint"
+    body = {
+        "idempotency_key": "compact-endpoint-1",
+        "expected_run_epoch": run_epoch,
+        "expected_transcript_cursor": transcript_cursor,
+        "instructions": "Keep decisions.",
+        "requested_by": {"subject": "operator@example.com"},
+    }
+    with client.stream(
+        "POST",
+        f"/api/sessions/{session_id}/compact",
+        json=body,
+        headers={"Cayu-Mutation-ID": "mutation-compact-1"},
+    ) as response:
+        assert response.status_code == 200
+        frames = [frame for frame in _sse_frames(response) if "data" in frame]
+
+    event_types = [frame["data"]["type"] for frame in frames]
+    assert event_types[:3] == [
+        EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.CONTEXT_COMPACTION_COMPLETED,
+        EventType.SESSION_CHECKPOINTED,
+    ]
+    accepted_events = client.get(
+        f"/api/sessions/{session_id}/events",
+        params={"event_type": EventType.SERVER_MUTATION_ACCEPTED},
+    ).json()["events"]
+    assert len(accepted_events) == 1
+    accepted = accepted_events[0]
+    assert accepted["payload"] == {
+        "mutation_id": "mutation-compact-1",
+        "mutation_kind": "session.compact",
+        "accepted_event_id": frames[0]["data"]["id"],
+        "accepted_event_type": EventType.CONTEXT_COMPACTION_STARTED,
+    }
+    assert frames[0]["data"]["payload"]["actor"] == {
+        "subject": "operator@example.com",
+        "tenant": None,
+        "source": "request",
+    }
+    assert "/api/sessions/{session_id}/compact" in client.get("/openapi.json").json()["paths"]
+
+
+@pytest.mark.parametrize(
+    ("path", "idempotency_key", "location"),
+    [
+        ("/api/sessions/missing/compact", "invalid-\x00key", ["body", "idempotency_key"]),
+        ("/api/sessions/invalid%00id/compact", "compact-1", ["path", "session_id"]),
+    ],
+)
+def test_explicit_compaction_endpoint_rejects_unpersistable_identifiers(
+    path: str,
+    idempotency_key: str,
+    location: list[str],
+) -> None:
+    client = TestClient(create_server(CayuApp(enable_logging=False), dev=True))
+
+    response = client.post(
+        path,
+        json={
+            "idempotency_key": idempotency_key,
+            "expected_run_epoch": 0,
+            "expected_transcript_cursor": 0,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == location
+
+
+def test_explicit_compaction_endpoint_rejects_unpersistable_nested_text() -> None:
+    client = TestClient(create_server(CayuApp(enable_logging=False), dev=True))
+
+    response = client.post(
+        "/api/sessions/missing/compact",
+        json={
+            "idempotency_key": "compact-1",
+            "expected_run_epoch": 0,
+            "expected_transcript_cursor": 0,
+            "instructions": "invalid-\x00instructions",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body"]
 
 
 def test_sse_replay_preserves_canonical_policy_denial_attribution() -> None:
@@ -7358,6 +7506,14 @@ def test_oversized_replay_frame_remains_durable_and_fails_live_observer_clearly(
             "/api/sessions/session_approval_replay/interrupt",
             {},
         ),
+        (
+            "/api/sessions/session_approval_replay/compact",
+            {
+                "idempotency_key": "compact-replay",
+                "expected_run_epoch": 0,
+                "expected_transcript_cursor": 1,
+            },
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -7417,6 +7573,7 @@ def test_mutation_routes_replay_without_reexecuting(
     app.resolve_user_input = unexpected_execution
     app.recover_user_input = unexpected_execution
     app.interrupt_session = unexpected_execution
+    app.compact_session = unexpected_execution
     client = TestClient(create_server(app, dev=True))
 
     with client.stream(

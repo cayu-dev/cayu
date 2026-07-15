@@ -58,6 +58,15 @@ def _make_client(*, expose_docs: bool | None = None) -> TestClient:
     [
         ("POST", "/api/run", {"prompt": "hello"}),
         ("POST", "/api/resume", {"session_id": "session-1", "prompt": "hi"}),
+        (
+            "POST",
+            "/api/sessions/session-1/compact",
+            {
+                "idempotency_key": "compact-1",
+                "expected_run_epoch": 0,
+                "expected_transcript_cursor": 0,
+            },
+        ),
         ("POST", "/api/sessions/session-1/interrupt", None),
         (
             "POST",
@@ -200,6 +209,15 @@ def test_auth_guards_read_and_contract_routes(
     [
         ("POST", "/api/run", {"prompt": "hello"}),
         ("POST", "/api/resume", {"session_id": "session-1", "prompt": "hi"}),
+        (
+            "POST",
+            "/api/sessions/session-1/compact",
+            {
+                "idempotency_key": "compact-1",
+                "expected_run_epoch": 0,
+                "expected_transcript_cursor": 0,
+            },
+        ),
         ("POST", "/api/sessions/session-1/interrupt", None),
         (
             "POST",

@@ -917,7 +917,7 @@ def test_sqlite_session_store_revision_thirteen_requires_run_fencing_migration(t
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 17"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 18"):
         SQLiteSessionStore(db_path)
 
     reopened = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
@@ -956,7 +956,7 @@ def test_sqlite_session_store_revision_fourteen_requires_cascade_index_migration
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 17"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 18"):
         SQLiteSessionStore(db_path)
 
     reopened = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
@@ -1033,7 +1033,7 @@ def test_sqlite_session_store_revision_sixteen_requires_pending_action_index(tmp
 
     connection = sqlite3.connect(db_path)
     try:
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 17")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 17")
         connection.execute("DROP INDEX idx_cayu_checkpoints_pending_control_action")
         connection.execute("DROP INDEX idx_cayu_events_pending_action_barrier")
         connection.execute("DROP INDEX idx_cayu_events_pending_action_lookup")
@@ -1051,7 +1051,7 @@ def test_sqlite_session_store_revision_sixteen_requires_pending_action_index(tmp
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 17"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 18"):
         SQLiteSessionStore(db_path)
 
     reopened = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
@@ -1223,6 +1223,42 @@ def test_sqlite_session_store_revision_sixteen_requires_pending_action_index(tmp
     )
 
 
+def test_sqlite_revision_seventeen_requires_session_operation_migration(tmp_path) -> None:
+    db_path = tmp_path / "revision-17-session-operations.sqlite"
+    store = SQLiteSessionStore(db_path)
+    asyncio.run(_close(store))
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 18")
+        connection.execute("DROP TABLE cayu_session_operations")
+        connection.execute("PRAGMA user_version = 17")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 18"):
+        SQLiteSessionStore(db_path)
+
+    migrated = SQLiteSessionStore(
+        db_path,
+        schema_mode=schema_migrations.SchemaMode.MIGRATE,
+    )
+    asyncio.run(_close(migrated))
+
+    connection = sqlite3.connect(db_path)
+    try:
+        operation_table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cayu_session_operations'"
+        ).fetchone()
+        revision = connection.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        connection.close()
+
+    assert operation_table is not None
+    assert revision == schema_migrations.LATEST_REVISION
+
+
 def test_sqlite_revision_seventeen_rejects_conflicting_same_name_index(tmp_path) -> None:
     db_path = tmp_path / "sessions.sqlite"
     store = SQLiteSessionStore(db_path)
@@ -1230,7 +1266,7 @@ def test_sqlite_revision_seventeen_rejects_conflicting_same_name_index(tmp_path)
 
     connection = sqlite3.connect(db_path)
     try:
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 17")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 17")
         connection.execute("DROP INDEX idx_cayu_checkpoints_pending_control_action")
         connection.execute("DROP INDEX idx_cayu_events_pending_action_barrier")
         connection.execute("DROP INDEX idx_cayu_events_pending_action_lookup")
@@ -1312,7 +1348,7 @@ def test_sqlite_revision_seventeen_resumes_committed_checkpoint_batches(
             for index, row in enumerate(session_rows)
         ],
     )
-    connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 17")
+    connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 17")
     connection.execute("DROP INDEX idx_cayu_checkpoints_pending_control_action")
     connection.execute("DROP INDEX idx_cayu_events_pending_action_barrier")
     connection.execute("DROP INDEX idx_cayu_events_pending_action_lookup")
@@ -1567,8 +1603,8 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         "status_reason",
         "status_payload_json",
     }.issubset(task_columns)
-    # Revisions 2-7 and 11-16 are additive; revision 17 changes the checkpoint
-    # writer contract and therefore raises the compatibility floor.
+    # Revisions 2-7 and 11-16 are additive. Revisions 17 and 18 change atomic
+    # writer contracts and therefore each raises the compatibility floor.
     assert revisions == [(rev.revision, rev.compatible_from) for rev in schema_migrations.REVISIONS]
     assert revisions == [
         (1, 1),
@@ -1588,6 +1624,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (15, 10),
         (16, 10),
         (17, 17),
+        (18, 18),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

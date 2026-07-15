@@ -84,6 +84,15 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS cayu_session_operations (
+        session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+        idempotency_key TEXT NOT NULL,
+        record JSONB NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY (session_id, idempotency_key)
+    )
+    """,
+    """
     CREATE INDEX IF NOT EXISTS idx_cayu_checkpoints_pending_interruption_cascade
         ON cayu_checkpoints(session_id)
         WHERE state ? 'pending_interruption_cascade'

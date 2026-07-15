@@ -37,6 +37,7 @@ _TABLES = (
     "cayu_session_labels",
     "cayu_transcript_messages",
     "cayu_checkpoints",
+    "cayu_session_operations",
     "cayu_tasks",
     "cayu_sessions",
     "cayu_schema_migrations",
