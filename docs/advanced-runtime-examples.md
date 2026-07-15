@@ -141,7 +141,7 @@ The research example separates two different questions:
 
 That distinction is why Cayu records provider-reported total usage instead of
 marketing a context-size estimate as realized savings. Dollar savings require a
-pricing catalog and must include source, evaluator, repair, and retry overhead.
+price book and must include source, evaluator, repair, and retry overhead.
 The [cost optimization and governance guide](cost-optimization.md) applies the
 same evidence standard across Cayu's optimization and budget-control options.
 

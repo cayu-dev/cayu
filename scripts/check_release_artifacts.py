@@ -17,6 +17,7 @@ _SDIST_REQUIRED = {
     "src/cayu/__init__.py",
     "src/cayu/data/__init__.py",
     "src/cayu/data/default_model_catalog.json",
+    "src/cayu/data/default_price_book.json",
 }
 _SDIST_ALLOWED_ROOTS = {
     ".gitignore",
@@ -34,6 +35,7 @@ _WHEEL_REQUIRED = {
     "cayu/cli/console.py",
     "cayu/data/__init__.py",
     "cayu/data/default_model_catalog.json",
+    "cayu/data/default_price_book.json",
     "cayu/guides/application-anatomy.md",
     "cayu/guides/authoring.md",
     "cayu/guides/diagnostics.md",

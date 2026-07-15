@@ -44,8 +44,8 @@ from cayu.runtime import (
     ContextCountingConfig,
     ContextCountingMode,
     InMemorySessionStore,
-    ModelPricing,
-    PricingCatalog,
+    ModelPrice,
+    PriceBook,
     RunLimits,
     RunRequest,
     ToolApprovalDecision,
@@ -445,9 +445,9 @@ def test_g3b_budget_trip() -> None:
     budget = BudgetLimit(
         max_estimated_cost=Decimal("0.002"),
         window=BudgetWindow.all_time(),
-        pricing=PricingCatalog(
+        pricing=PriceBook(
             prices=(
-                ModelPricing(
+                ModelPrice.fixed(
                     provider_name="fake",
                     model="fake-model",
                     input_per_million=Decimal("1"),

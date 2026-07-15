@@ -8,12 +8,10 @@ from examples._advanced_support import ScenarioResult, completed_batch, structur
 from examples.cache_aware_research_council.scenario import run_scenario
 
 from cayu import (
-    ModelCatalog,
-    ModelInfo,
-    PriceTier,
+    ModelPrice,
+    PriceBook,
     Provenance,
     ScriptedModelProvider,
-    TieredPricing,
 )
 
 
@@ -78,22 +76,16 @@ async def run(root: Path) -> ScenarioResult:
             ),
         ]
     )
-    model_catalog = ModelCatalog(
-        catalog_version="deterministic-fixture-v1",
+    price_book = PriceBook(
+        price_book_version="deterministic-fixture-v1",
         generated_at="2026-01-01T00:00:00Z",
-        models=(
-            ModelInfo(
+        prices=(
+            ModelPrice.fixed(
                 provider_name="scripted",
                 model="scripted-model",
                 match="exact",
-                pricing=TieredPricing(
-                    standard=(
-                        PriceTier(
-                            input_per_million=Decimal("1.00"),
-                            output_per_million=Decimal("5.00"),
-                        ),
-                    ),
-                ),
+                input_per_million=Decimal("1.00"),
+                output_per_million=Decimal("5.00"),
                 provenance=Provenance(
                     source="deterministic fixture; not provider pricing",
                     url="https://example.invalid/cayu/research-council-pricing-fixture",
@@ -107,7 +99,7 @@ async def run(root: Path) -> ScenarioResult:
         provider=provider,
         model="scripted-model",
         mode="deterministic",
-        model_catalog=model_catalog,
+        price_book=price_book,
     )
 
 

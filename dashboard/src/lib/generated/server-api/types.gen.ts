@@ -1099,10 +1099,7 @@ export type BudgetLimit = {
      * Max Estimated Cost
      */
     max_estimated_cost: number | string;
-    /**
-     * Pricing
-     */
-    pricing: PricingCatalog | ModelCatalog;
+    pricing: PriceBook;
     reservation?: BudgetReservation | null;
     /**
      * Scope
@@ -1369,6 +1366,14 @@ export type CostLineItem = {
      */
     priced: boolean;
     /**
+     * Pricing Effective From
+     */
+    pricing_effective_from?: string | null;
+    /**
+     * Pricing Effective Through
+     */
+    pricing_effective_through?: string | null;
+    /**
      * Pricing Match
      */
     pricing_match?: 'exact' | 'prefix' | null;
@@ -1524,63 +1529,15 @@ export type ListSessionsResponse = {
 export type MessageRole = 'user' | 'assistant' | 'system' | 'tool';
 
 /**
- * ModelCatalog
+ * ModelPrice
  *
- * A versioned set of ``ModelInfo`` records: the model catalog.
- *
- * Cost and budget APIs can consume it directly to preserve context tiers. It can also
- * project into the compatible ``PricingCatalog`` contract without losing pricing semantics
- * via ``pricing_catalog()``. Use ``resolve()`` to find the record whose canonical key or
- * exact alias, or explicit match prefix prices a runtime model id; ``match()`` is a strict
- * canonical-record lookup.
+ * Pricing identity and its non-overlapping effective schedules.
  */
-export type ModelCatalog = {
-    /**
-     * Catalog Version
-     */
-    catalog_version: string;
-    /**
-     * Generated At
-     */
-    generated_at: string;
-    /**
-     * Models
-     */
-    models: Array<ModelInfo>;
-};
-
-/**
- * ModelInfo
- *
- * A model's full profile: identity, objective capabilities, lifecycle, and
- * tiered pricing.
- *
- * Projects into the compatibility cost shape via ``to_model_pricing()`` while retaining
- * its tiers, or into one selected tier via ``pricing_at(input_tokens)``. ``match_prefixes``
- * declares additional narrow prefix keys without broadening the canonical model key.
- * Capabilities are objective facts only — no quality/benchmark scores.
- */
-export type ModelInfo = {
+export type ModelPrice = {
     /**
      * Aliases
      */
     aliases?: Array<string>;
-    /**
-     * Context Window
-     */
-    context_window?: number | null;
-    /**
-     * Deprecated
-     */
-    deprecated?: boolean;
-    /**
-     * Family
-     */
-    family?: string | null;
-    /**
-     * Knowledge Cutoff
-     */
-    knowledge_cutoff?: string | null;
     /**
      * Match
      */
@@ -1590,96 +1547,17 @@ export type ModelInfo = {
      */
     match_prefixes?: Array<string>;
     /**
-     * Max Output Tokens
-     */
-    max_output_tokens?: number | null;
-    /**
-     * Modalities In
-     */
-    modalities_in?: Array<string>;
-    /**
-     * Modalities Out
-     */
-    modalities_out?: Array<string>;
-    /**
      * Model
      */
     model: string;
-    pricing: TieredPricing;
-    /**
-     * Prompt Caching
-     */
-    prompt_caching?: boolean;
-    provenance: Provenance;
     /**
      * Provider Name
      */
     provider_name: string;
     /**
-     * Reasoning
+     * Schedules
      */
-    reasoning?: boolean;
-    /**
-     * Release Date
-     */
-    release_date?: string | null;
-    /**
-     * Retirement Date
-     */
-    retirement_date?: string | null;
-    /**
-     * Structured Output
-     */
-    structured_output?: boolean;
-    /**
-     * Tool Calling
-     */
-    tool_calling?: boolean;
-};
-
-/**
- * ModelPricing
- *
- * Model pricing per 1M tokens, with optional projected tiers and provenance.
- */
-export type ModelPricing = {
-    /**
-     * Cache Read Input Per Million
-     */
-    cache_read_input_per_million?: number | string | null;
-    /**
-     * Cache Write Input Per Million
-     */
-    cache_write_input_per_million?: number | string | null;
-    /**
-     * Currency
-     */
-    currency?: string;
-    /**
-     * Input Per Million
-     */
-    input_per_million: number | string;
-    /**
-     * Match
-     */
-    match?: 'exact' | 'prefix';
-    /**
-     * Model
-     */
-    model: string;
-    /**
-     * Output Per Million
-     */
-    output_per_million: number | string;
-    /**
-     * Pricing Tiers
-     */
-    pricing_tiers?: Array<PriceTier> | null;
-    provenance?: Provenance | null;
-    /**
-     * Provider Name
-     */
-    provider_name: string;
+    schedules: Array<PriceSchedule>;
 };
 
 /**
@@ -1854,6 +1732,44 @@ export type PendingKnowledgeListResponse = {
 };
 
 /**
+ * PriceBook
+ *
+ * A versioned collection of application-owned commercial model prices.
+ */
+export type PriceBook = {
+    /**
+     * Generated At
+     */
+    generated_at?: string;
+    /**
+     * Price Book Version
+     */
+    price_book_version?: string;
+    /**
+     * Prices
+     */
+    prices: Array<ModelPrice>;
+};
+
+/**
+ * PriceSchedule
+ *
+ * One price schedule, effective on inclusive UTC calendar dates.
+ */
+export type PriceSchedule = {
+    /**
+     * Effective From
+     */
+    effective_from?: string | null;
+    /**
+     * Effective Through
+     */
+    effective_through?: string | null;
+    pricing: TieredPricing;
+    provenance: Provenance;
+};
+
+/**
  * PriceTier
  *
  * One context band of tiered pricing.
@@ -1885,21 +1801,9 @@ export type PriceTier = {
 };
 
 /**
- * PricingCatalog
- *
- * Collection of user-supplied model prices used for cost estimation.
- */
-export type PricingCatalog = {
-    /**
-     * Prices
-     */
-    prices: Array<ModelPricing>;
-};
-
-/**
  * Provenance
  *
- * Where a model's facts came from and when (audit metadata; not priced).
+ * Where model or pricing facts came from and when they were checked.
  */
 export type Provenance = {
     /**
@@ -2147,10 +2051,7 @@ export type SessionCostBody = {
      * Currency
      */
     currency?: string;
-    /**
-     * Pricing
-     */
-    pricing: PricingCatalog | ModelCatalog;
+    pricing: PriceBook;
 };
 
 /**
@@ -2308,10 +2209,7 @@ export type SessionsSummaryBody = {
      * Currency
      */
     currency?: string;
-    /**
-     * Pricing
-     */
-    pricing?: PricingCatalog | ModelCatalog | null;
+    pricing?: PriceBook | null;
 };
 
 /**
@@ -2607,9 +2505,9 @@ export type ThinkingConfig = {
  * Full pricing for one model: context-band tiers plus optional batch and
  * cache-write-duration rates.
  *
- * Only the context-band ``standard`` tiers feed the cost engine today (via
- * ``ModelInfo.to_model_pricing``/``pricing_at``). A tier-local cache-write rate takes
- * precedence over the legacy model-wide ``cache_write_5m_per_million`` fallback.
+ * Only the context-band ``standard`` tiers feed the cost engine today. A tier-local
+ * cache-write rate takes precedence over the model-wide
+ * ``cache_write_5m_per_million`` fallback.
  * ``batch`` and ``cache_write_1h_per_million`` are carried for completeness and future
  * use — they are NOT auto-applied by ``estimate_session_cost``.
  */

@@ -16,8 +16,8 @@ from cayu.runtime import (
     BudgetLimit,
     BudgetReservation,
     BudgetWindow,
-    ModelPricing,
-    PricingCatalog,
+    ModelPrice,
+    PriceBook,
 )
 
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
@@ -59,9 +59,9 @@ def _reservation_budget_limit(
         key=key,
         max_estimated_cost=Decimal(max_cost),
         window=BudgetWindow.all_time() if window is None else window,
-        pricing=PricingCatalog(
+        pricing=PriceBook(
             prices=(
-                ModelPricing(
+                ModelPrice.fixed(
                     provider_name="fake",
                     model="fake-model",
                     input_per_million=Decimal("1"),

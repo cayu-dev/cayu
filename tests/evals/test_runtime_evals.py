@@ -36,8 +36,10 @@ from cayu import (
     MaxToolCalls,
     MaxTotalTokens,
     Message,
-    ModelCatalog,
     ModelInfo,
+    ModelPrice,
+    PriceBook,
+    PriceSchedule,
     PriceTier,
     Provenance,
     RunRequest,
@@ -930,40 +932,55 @@ def test_max_total_tokens_fails_when_usage_missing():
     assert result.passed is False
 
 
-def test_max_estimated_cost_accepts_tiered_model_catalog():
+def test_max_estimated_cost_accepts_tiered_price_book():
     boundary = 100_000
     model = ModelInfo(
         provider_name="fixture",
         model="tiered-model",
         context_window=200_000,
         tool_calling=True,
-        pricing=TieredPricing(
-            standard=(
-                PriceTier(
-                    max_input_tokens=boundary,
-                    input_per_million=Decimal("1"),
-                    output_per_million=Decimal("2"),
-                ),
-                PriceTier(
-                    input_per_million=Decimal("10"),
-                    output_per_million=Decimal("20"),
-                ),
-            )
-        ),
         provenance=Provenance(
             source="fixture",
-            url="https://example.test/pricing",
+            url="https://example.test/models",
             as_of="2026-07-13",
         ),
     )
-    catalog = ModelCatalog(
-        catalog_version="fixture",
+    pricing = TieredPricing(
+        standard=(
+            PriceTier(
+                max_input_tokens=boundary,
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("2"),
+            ),
+            PriceTier(
+                input_per_million=Decimal("10"),
+                output_per_million=Decimal("20"),
+            ),
+        )
+    )
+    price_book = PriceBook(
+        price_book_version="fixture",
         generated_at="2026-07-13",
-        models=(model,),
+        prices=(
+            ModelPrice(
+                provider_name=model.provider_name,
+                model=model.model,
+                schedules=(
+                    PriceSchedule(
+                        pricing=pricing,
+                        provenance=Provenance(
+                            source="fixture",
+                            url="https://example.test/pricing",
+                            as_of="2026-07-13",
+                        ),
+                    ),
+                ),
+            ),
+        ),
     )
     input_tokens = boundary + 1
-    tier = model.pricing_at(input_tokens)
-    maximum = Decimal(input_tokens) * model.pricing.base().input_per_million / Decimal(1_000_000)
+    tier = pricing.tier_for(input_tokens)
+    maximum = Decimal(input_tokens) * pricing.base().input_per_million / Decimal(1_000_000)
     event = Event(
         type=EventType.MODEL_COMPLETED,
         session_id="sess_eval",
@@ -988,7 +1005,7 @@ def test_max_estimated_cost_accepts_tiered_model_catalog():
         events=(event,),
     )
 
-    result = asyncio.run(MaxEstimatedCost(maximum, pricing=catalog).evaluate(ctx))
+    result = asyncio.run(MaxEstimatedCost(maximum, pricing=price_book).evaluate(ctx))
 
     expected = Decimal(input_tokens) * tier.input_per_million / Decimal(1_000_000)
     assert result.passed is False

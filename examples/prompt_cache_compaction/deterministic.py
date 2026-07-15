@@ -8,13 +8,11 @@ from typing import TYPE_CHECKING
 from examples.prompt_cache_compaction.scenario import run_scenario
 
 from cayu import (
-    ModelCatalog,
-    ModelInfo,
+    ModelPrice,
     ModelStreamEvent,
-    PriceTier,
+    PriceBook,
     Provenance,
     ScriptedModelProvider,
-    TieredPricing,
 )
 
 if TYPE_CHECKING:
@@ -85,24 +83,17 @@ async def run(root: Path) -> ScenarioResult:
             )
         ]
     )
-    model_catalog = ModelCatalog(
-        catalog_version="deterministic-fixture-v1",
+    price_book = PriceBook(
+        price_book_version="deterministic-fixture-v1",
         generated_at="2026-01-01T00:00:00Z",
-        models=(
-            ModelInfo(
+        prices=(
+            ModelPrice.fixed(
                 provider_name="scripted",
                 model="scripted-model",
-                prompt_caching=True,
-                pricing=TieredPricing(
-                    standard=(
-                        PriceTier(
-                            input_per_million=Decimal("3.00"),
-                            output_per_million=Decimal("15.00"),
-                            cache_read_input_per_million=Decimal("0.30"),
-                        ),
-                    ),
-                    cache_write_5m_per_million=Decimal("3.75"),
-                ),
+                input_per_million=Decimal("3.00"),
+                output_per_million=Decimal("15.00"),
+                cache_read_input_per_million=Decimal("0.30"),
+                cache_write_input_per_million=Decimal("3.75"),
                 provenance=Provenance(
                     source="deterministic fixture; not provider pricing",
                     url="https://example.invalid/cayu/prompt-cache-pricing-fixture",
@@ -118,7 +109,7 @@ async def run(root: Path) -> ScenarioResult:
         model="scripted-model",
         mode="deterministic",
         stable_context_lines=40,
-        model_catalog=model_catalog,
+        price_book=price_book,
     )
 
 

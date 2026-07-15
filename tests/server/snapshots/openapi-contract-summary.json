@@ -2110,15 +2110,7 @@
           "title": "Max Estimated Cost"
         },
         "pricing": {
-          "anyOf": [
-            {
-              "$ref": "#/components/schemas/PricingCatalog"
-            },
-            {
-              "$ref": "#/components/schemas/ModelCatalog"
-            }
-          ],
-          "title": "Pricing"
+          "$ref": "#/components/schemas/PriceBook"
         },
         "reservation": {
           "anyOf": [
@@ -2566,6 +2558,30 @@
           "title": "Priced",
           "type": "boolean"
         },
+        "pricing_effective_from": {
+          "anyOf": [
+            {
+              "format": "date",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Pricing Effective From"
+        },
+        "pricing_effective_through": {
+          "anyOf": [
+            {
+              "format": "date",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Pricing Effective Through"
+        },
         "pricing_match": {
           "anyOf": [
             {
@@ -2894,38 +2910,9 @@
       "title": "MessageRole",
       "type": "string"
     },
-    "ModelCatalog": {
+    "ModelPrice": {
       "additionalProperties": false,
-      "description": "A versioned set of ``ModelInfo`` records: the model catalog.\n\nCost and budget APIs can consume it directly to preserve context tiers. It can also\nproject into the compatible ``PricingCatalog`` contract without losing pricing semantics\nvia ``pricing_catalog()``. Use ``resolve()`` to find the record whose canonical key or\nexact alias, or explicit match prefix prices a runtime model id; ``match()`` is a strict\ncanonical-record lookup.",
-      "properties": {
-        "catalog_version": {
-          "title": "Catalog Version",
-          "type": "string"
-        },
-        "generated_at": {
-          "title": "Generated At",
-          "type": "string"
-        },
-        "models": {
-          "items": {
-            "$ref": "#/components/schemas/ModelInfo"
-          },
-          "minItems": 1,
-          "title": "Models",
-          "type": "array"
-        }
-      },
-      "required": [
-        "catalog_version",
-        "generated_at",
-        "models"
-      ],
-      "title": "ModelCatalog",
-      "type": "object"
-    },
-    "ModelInfo": {
-      "additionalProperties": false,
-      "description": "A model's full profile: identity, objective capabilities, lifecycle, and\ntiered pricing.\n\nProjects into the compatibility cost shape via ``to_model_pricing()`` while retaining\nits tiers, or into one selected tier via ``pricing_at(input_tokens)``. ``match_prefixes``\ndeclares additional narrow prefix keys without broadening the canonical model key.\nCapabilities are objective facts only \u2014 no quality/benchmark scores.",
+      "description": "Pricing identity and its non-overlapping effective schedules.",
       "properties": {
         "aliases": {
           "default": [],
@@ -2934,46 +2921,6 @@
           },
           "title": "Aliases",
           "type": "array"
-        },
-        "context_window": {
-          "anyOf": [
-            {
-              "exclusiveMinimum": 0.0,
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Context Window"
-        },
-        "deprecated": {
-          "default": false,
-          "title": "Deprecated",
-          "type": "boolean"
-        },
-        "family": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Family"
-        },
-        "knowledge_cutoff": {
-          "anyOf": [
-            {
-              "format": "date",
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Knowledge Cutoff"
         },
         "match": {
           "default": "prefix",
@@ -2992,223 +2939,29 @@
           "title": "Match Prefixes",
           "type": "array"
         },
-        "max_output_tokens": {
-          "anyOf": [
-            {
-              "exclusiveMinimum": 0.0,
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Max Output Tokens"
-        },
-        "modalities_in": {
-          "default": [
-            "text"
-          ],
-          "items": {
-            "type": "string"
-          },
-          "title": "Modalities In",
-          "type": "array"
-        },
-        "modalities_out": {
-          "default": [
-            "text"
-          ],
-          "items": {
-            "type": "string"
-          },
-          "title": "Modalities Out",
-          "type": "array"
-        },
         "model": {
           "title": "Model",
           "type": "string"
-        },
-        "pricing": {
-          "$ref": "#/components/schemas/TieredPricing"
-        },
-        "prompt_caching": {
-          "default": false,
-          "title": "Prompt Caching",
-          "type": "boolean"
-        },
-        "provenance": {
-          "$ref": "#/components/schemas/Provenance"
         },
         "provider_name": {
           "title": "Provider Name",
           "type": "string"
         },
-        "reasoning": {
-          "default": false,
-          "title": "Reasoning",
-          "type": "boolean"
-        },
-        "release_date": {
-          "anyOf": [
-            {
-              "format": "date",
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Release Date"
-        },
-        "retirement_date": {
-          "anyOf": [
-            {
-              "format": "date",
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Retirement Date"
-        },
-        "structured_output": {
-          "default": false,
-          "title": "Structured Output",
-          "type": "boolean"
-        },
-        "tool_calling": {
-          "default": false,
-          "title": "Tool Calling",
-          "type": "boolean"
+        "schedules": {
+          "items": {
+            "$ref": "#/components/schemas/PriceSchedule"
+          },
+          "minItems": 1,
+          "title": "Schedules",
+          "type": "array"
         }
       },
       "required": [
         "provider_name",
         "model",
-        "pricing",
-        "provenance"
+        "schedules"
       ],
-      "title": "ModelInfo",
-      "type": "object"
-    },
-    "ModelPricing": {
-      "additionalProperties": false,
-      "description": "Model pricing per 1M tokens, with optional projected tiers and provenance.",
-      "properties": {
-        "cache_read_input_per_million": {
-          "anyOf": [
-            {
-              "minimum": 0.0,
-              "type": "number"
-            },
-            {
-              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Cache Read Input Per Million"
-        },
-        "cache_write_input_per_million": {
-          "anyOf": [
-            {
-              "minimum": 0.0,
-              "type": "number"
-            },
-            {
-              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Cache Write Input Per Million"
-        },
-        "currency": {
-          "default": "USD",
-          "title": "Currency",
-          "type": "string"
-        },
-        "input_per_million": {
-          "anyOf": [
-            {
-              "minimum": 0.0,
-              "type": "number"
-            },
-            {
-              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
-              "type": "string"
-            }
-          ],
-          "title": "Input Per Million"
-        },
-        "match": {
-          "default": "prefix",
-          "enum": [
-            "exact",
-            "prefix"
-          ],
-          "title": "Match",
-          "type": "string"
-        },
-        "model": {
-          "title": "Model",
-          "type": "string"
-        },
-        "output_per_million": {
-          "anyOf": [
-            {
-              "minimum": 0.0,
-              "type": "number"
-            },
-            {
-              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
-              "type": "string"
-            }
-          ],
-          "title": "Output Per Million"
-        },
-        "pricing_tiers": {
-          "anyOf": [
-            {
-              "items": {
-                "$ref": "#/components/schemas/PriceTier"
-              },
-              "minItems": 1,
-              "type": "array"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Pricing Tiers"
-        },
-        "provenance": {
-          "anyOf": [
-            {
-              "$ref": "#/components/schemas/Provenance"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "provider_name": {
-          "title": "Provider Name",
-          "type": "string"
-        }
-      },
-      "required": [
-        "provider_name",
-        "model",
-        "input_per_million",
-        "output_per_million"
-      ],
-      "title": "ModelPricing",
+      "title": "ModelPrice",
       "type": "object"
     },
     "PendingActionKind": {
@@ -3535,6 +3288,77 @@
       "title": "PendingKnowledgeListResponse",
       "type": "object"
     },
+    "PriceBook": {
+      "additionalProperties": false,
+      "description": "A versioned collection of application-owned commercial model prices.",
+      "properties": {
+        "generated_at": {
+          "default": "unspecified",
+          "title": "Generated At",
+          "type": "string"
+        },
+        "price_book_version": {
+          "default": "application",
+          "title": "Price Book Version",
+          "type": "string"
+        },
+        "prices": {
+          "items": {
+            "$ref": "#/components/schemas/ModelPrice"
+          },
+          "minItems": 1,
+          "title": "Prices",
+          "type": "array"
+        }
+      },
+      "required": [
+        "prices"
+      ],
+      "title": "PriceBook",
+      "type": "object"
+    },
+    "PriceSchedule": {
+      "additionalProperties": false,
+      "description": "One price schedule, effective on inclusive UTC calendar dates.",
+      "properties": {
+        "effective_from": {
+          "anyOf": [
+            {
+              "format": "date",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Effective From"
+        },
+        "effective_through": {
+          "anyOf": [
+            {
+              "format": "date",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Effective Through"
+        },
+        "pricing": {
+          "$ref": "#/components/schemas/TieredPricing"
+        },
+        "provenance": {
+          "$ref": "#/components/schemas/Provenance"
+        }
+      },
+      "required": [
+        "pricing",
+        "provenance"
+      ],
+      "title": "PriceSchedule",
+      "type": "object"
+    },
     "PriceTier": {
       "additionalProperties": false,
       "description": "One context band of tiered pricing.\n\nTiers are ordered ascending by ``max_input_tokens``; the final tier may use\n``None`` to mean \"and above\".",
@@ -3617,28 +3441,9 @@
       "title": "PriceTier",
       "type": "object"
     },
-    "PricingCatalog": {
-      "additionalProperties": false,
-      "description": "Collection of user-supplied model prices used for cost estimation.",
-      "properties": {
-        "prices": {
-          "items": {
-            "$ref": "#/components/schemas/ModelPricing"
-          },
-          "minItems": 1,
-          "title": "Prices",
-          "type": "array"
-        }
-      },
-      "required": [
-        "prices"
-      ],
-      "title": "PricingCatalog",
-      "type": "object"
-    },
     "Provenance": {
       "additionalProperties": false,
-      "description": "Where a model's facts came from and when (audit metadata; not priced).",
+      "description": "Where model or pricing facts came from and when they were checked.",
       "properties": {
         "as_of": {
           "title": "As Of",
@@ -4079,15 +3884,7 @@
           "type": "string"
         },
         "pricing": {
-          "anyOf": [
-            {
-              "$ref": "#/components/schemas/PricingCatalog"
-            },
-            {
-              "$ref": "#/components/schemas/ModelCatalog"
-            }
-          ],
-          "title": "Pricing"
+          "$ref": "#/components/schemas/PriceBook"
         }
       },
       "required": [
@@ -4355,16 +4152,12 @@
         "pricing": {
           "anyOf": [
             {
-              "$ref": "#/components/schemas/PricingCatalog"
-            },
-            {
-              "$ref": "#/components/schemas/ModelCatalog"
+              "$ref": "#/components/schemas/PriceBook"
             },
             {
               "type": "null"
             }
-          ],
-          "title": "Pricing"
+          ]
         }
       },
       "title": "SessionsSummaryBody",
@@ -4855,7 +4648,7 @@
     },
     "TieredPricing": {
       "additionalProperties": false,
-      "description": "Full pricing for one model: context-band tiers plus optional batch and\ncache-write-duration rates.\n\nOnly the context-band ``standard`` tiers feed the cost engine today (via\n``ModelInfo.to_model_pricing``/``pricing_at``). A tier-local cache-write rate takes\nprecedence over the legacy model-wide ``cache_write_5m_per_million`` fallback.\n``batch`` and ``cache_write_1h_per_million`` are carried for completeness and future\nuse \u2014 they are NOT auto-applied by ``estimate_session_cost``.",
+      "description": "Full pricing for one model: context-band tiers plus optional batch and\ncache-write-duration rates.\n\nOnly the context-band ``standard`` tiers feed the cost engine today. A tier-local\ncache-write rate takes precedence over the model-wide\n``cache_write_5m_per_million`` fallback.\n``batch`` and ``cache_write_1h_per_million`` are carried for completeness and future\nuse \u2014 they are NOT auto-applied by ``estimate_session_cost``.",
       "properties": {
         "batch": {
           "anyOf": [

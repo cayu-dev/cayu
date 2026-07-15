@@ -141,6 +141,7 @@ from cayu.runtime.budgets import (
     budget_limits_for_session,
     budget_price,
     budget_reconciliation_payload,
+    budget_reconciliation_with_pricing,
     budget_reservation_payload,
     copy_budget_policy,
     copy_request_budget_limits,
@@ -170,8 +171,7 @@ from cayu.runtime.context_counting import (
 )
 from cayu.runtime.costs import (
     CausalBudgetCostSummary,
-    ModelCatalog,
-    PricingCatalog,
+    PriceBook,
     SessionCostSummary,
     estimate_causal_budget_cost,
     estimate_session_cost,
@@ -1491,7 +1491,9 @@ class CayuApp:
         self.budget_store = (
             budget_store if budget_store is not None else SessionBudgetStore(self.session_store)
         )
-        self.budget_ledger = budget_ledger if budget_ledger is not None else InMemoryBudgetLedger()
+        self.budget_ledger = (
+            budget_ledger if budget_ledger is not None else InMemoryBudgetLedger(clock=self._clock)
+        )
         self.event_watcher_store = (
             event_watcher_store if event_watcher_store is not None else InMemoryEventWatcherStore()
         )
@@ -3086,7 +3088,7 @@ class CayuApp:
     async def get_session_cost(
         self,
         session_id: str,
-        pricing: PricingCatalog | ModelCatalog,
+        pricing: PriceBook,
         *,
         currency: str = "USD",
     ) -> SessionCostSummary:
@@ -3111,7 +3113,7 @@ class CayuApp:
     async def get_causal_budget_cost(
         self,
         causal_budget_id: str,
-        pricing: PricingCatalog | ModelCatalog,
+        pricing: PriceBook,
         *,
         currency: str = "USD",
     ) -> CausalBudgetCostSummary:
@@ -7445,7 +7447,7 @@ class CayuApp:
         for budget_limit in budget_limits:
             budget_events = events
             budget_baseline: SessionCostSummary | None = None
-            budget_window_now = datetime.now(UTC)
+            budget_window_now = self._clock()
             if budget_limit.scope in {"app", "agent", "causal"}:
                 budget_events = await self.budget_store.load_events_for_budget(
                     scope=budget_limit.scope,
@@ -7488,6 +7490,7 @@ class CayuApp:
                 limit=budget_limit,
                 cost_summary=cost_summary,
                 cost_baseline=budget_baseline,
+                effective_at=budget_window_now,
             )
             if budget_outcome is None:
                 continue
@@ -7536,6 +7539,7 @@ class CayuApp:
                 events=events,
                 provider_name=session.provider_name,
                 model=session.model,
+                effective_at=self._clock(),
             )
             emitted_events.append(
                 await self._event_writer.emit(
@@ -7707,11 +7711,13 @@ class CayuApp:
     ) -> AsyncIterator[Event]:
         reconciliations: list[BudgetReconciliation] = []
         for reservation in reservations:
+            priced_actual = None
             try:
-                actual_amount = budget_actual_cost_for_event(
+                priced_actual = budget_actual_cost_for_event(
                     limit=reservation.limit,
                     event=model_completed_event,
                 )
+                actual_amount = priced_actual.amount
                 reason = "model completed"
             except ValueError:
                 actual_amount = reservation.record.reserved_amount
@@ -7722,6 +7728,11 @@ class CayuApp:
                 reason=reason,
                 occurred_at=model_completed_event.timestamp,
             )
+            if priced_actual is not None:
+                reconciliation = budget_reconciliation_with_pricing(
+                    reconciliation,
+                    priced_actual.line_item,
+                )
             reconciliations.append(reconciliation)
 
         for reconciliation in reconciliations:
@@ -12746,6 +12757,7 @@ def _first_budget_limit_outcome(
     limit: BudgetLimit,
     cost_summary: SessionCostSummary,
     cost_baseline: SessionCostSummary | None,
+    effective_at: datetime,
 ) -> _BudgetLimitOutcome | None:
     if type(session) is not Session:
         raise TypeError("session must be a Session instance.")
@@ -12784,7 +12796,11 @@ def _first_budget_limit_outcome(
                 unpriced_model_steps=unpriced_model_steps,
             ),
         )
-    preflight_error = _budget_limit_preflight_error(session=session, limit=limit)
+    preflight_error = _budget_limit_preflight_error(
+        session=session,
+        limit=limit,
+        effective_at=effective_at,
+    )
     if preflight_error is not None:
         decision = StopDecision(
             limit=StopLimit.ESTIMATED_COST,
@@ -12850,13 +12866,19 @@ def _budget_check_from_stop_decision(
     )
 
 
-def _budget_limit_preflight_error(*, session: Session, limit: BudgetLimit) -> str | None:
+def _budget_limit_preflight_error(
+    *,
+    session: Session,
+    limit: BudgetLimit,
+    effective_at: datetime,
+) -> str | None:
     if limit.allow_unpriced:
         return None
     price = budget_price(
         limit,
         provider_name=session.provider_name,
         model=session.model,
+        effective_at=effective_at,
     )
     if price is None:
         return (

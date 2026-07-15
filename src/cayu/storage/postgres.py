@@ -1856,11 +1856,6 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         agent_name = require_clean_nonblank(agent_name, "agent_name")
         provider_name = require_clean_nonblank(provider_name, "provider_name")
         model = require_clean_nonblank(model, "model")
-        requested = _budget_reservation_amount(
-            limit=limit,
-            provider_name=provider_name,
-            model=model,
-        )
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             try:
@@ -1870,6 +1865,12 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                         (_budget_advisory_lock_key(limit),),
                     )
                     now = self._clock()
+                    requested = _budget_reservation_amount(
+                        limit=limit,
+                        provider_name=provider_name,
+                        model=model,
+                        effective_at=now,
+                    )
                     await self._reap_expired(cur, now, limit=limit)
                     current = await self._used_amount(cur, limit, now=now)
                     projected = current + requested

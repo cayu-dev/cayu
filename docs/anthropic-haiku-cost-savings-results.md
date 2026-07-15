@@ -118,10 +118,10 @@ The estimates use Anthropic's direct Claude API standard rates as of
 - cache hit or refresh: $0.10 per million tokens.
 
 Source: [Anthropic Claude Platform pricing](https://platform.claude.com/docs/en/about-claude/pricing).
-The caller-supplied catalog was versioned
+The caller-supplied price book was versioned
 `anthropic-claude-api-pricing-2026-07-13`; every result records its version,
 generation time, source URL, as-of date, provider/model match, and currency.
-The exact checked-in catalog is
+The exact checked-in price book is
 [`docs/evidence/anthropic-haiku-4-5-pricing-2026-07-13.json`](evidence/anthropic-haiku-4-5-pricing-2026-07-13.json).
 
 The sanitized machine-readable trial envelope is
@@ -133,19 +133,19 @@ workflow and benchmark-harness totals; and the resolved pricing tier.
 
 ## Reproduce
 
-Use the checked-in provenance-bearing catalog, or create one for another price
+Use the checked-in provenance-bearing price book, or create one for another price
 snapshot, then run:
 
 ```bash
 ANTHROPIC_API_KEY=... \
 CAYU_ANTHROPIC_MODEL=claude-haiku-4-5-20251001 \
-CAYU_PROMPT_CACHE_MODEL_CATALOG=docs/evidence/anthropic-haiku-4-5-pricing-2026-07-13.json \
+CAYU_PROMPT_CACHE_PRICE_BOOK=docs/evidence/anthropic-haiku-4-5-pricing-2026-07-13.json \
 uv run python -m examples.prompt_cache_compaction.app \
   --mode live --provider anthropic --trials 3
 
 ANTHROPIC_API_KEY=... \
 CAYU_ANTHROPIC_MODEL=claude-haiku-4-5-20251001 \
-CAYU_RESEARCH_COUNCIL_MODEL_CATALOG=docs/evidence/anthropic-haiku-4-5-pricing-2026-07-13.json \
+CAYU_RESEARCH_COUNCIL_PRICE_BOOK=docs/evidence/anthropic-haiku-4-5-pricing-2026-07-13.json \
 uv run python -m examples.cache_aware_research_council.app \
   --mode live --provider anthropic --trials 3
 ```

@@ -65,12 +65,13 @@ affect operational cost, but Cayu does not present them as savings examples.
 | Cache read/write accounting | `UsageMetrics.cache` separates read, write, cached, and uncached input counters; cost line items can price each category independently | Treating every input token as full-price or ignoring cache creation premiums |
 | Session and whole-workflow reports | `get_session_usage/cost`, `get_causal_budget_usage/cost`, and session/causal summary endpoints derive reports from durable events | Reconstructing spend from logs, one process, or only the terminal model response |
 
-Pricing remains caller supplied today. `ModelCatalog` records version,
-generation time, per-model provenance, tiered prices, and cache rates. Issue
-[#175](https://github.com/vertexkg/cayu/issues/175) tracks a small bundled,
-dated catalog snapshot and public default loader. Until that lands, applications
-should load their own catalog and fail closed for unknown models when enforcing
-dollar limits.
+Pricing policy remains application owned. `PriceBook` records version,
+generation time, price-specific provenance, effective dates, tiered prices, and
+cache rates; `default_price_book()` supplies Cayu's dated public snapshot.
+`ModelCatalog` is a separate metadata-only routing and capability resource and is
+never accepted by cost or budget APIs. Applications should choose the appropriate
+price book for their commercial agreement and fail closed for unknown or expired
+prices when enforcing dollar limits.
 
 Usage and estimated cost are not invoices. A provider may charge a failed or
 aborted attempt without returning usable token counters; negotiated rates,
@@ -90,7 +91,7 @@ A credible comparison should record all of the following:
 3. **Two denominators:** show the first candidate attempt and the
    retry-inclusive whole workflow. Include source preparation, compaction,
    evaluation, repair, and child sessions in the latter.
-4. **Pricing provenance:** identify catalog version, generated-at time,
+4. **Pricing provenance:** identify price-book version, generated-at time,
    provider source, URL, as-of date, currency, match rule, and pricing tier.
    Without that evidence, report tokens rather than dollars.
 5. **Quality floor:** use task outcomes, deterministic checks, or evaluator

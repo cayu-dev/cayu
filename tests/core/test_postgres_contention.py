@@ -28,7 +28,7 @@ from cayu import (
     TaskCreate,
     TaskQuery,
 )
-from cayu.runtime import BudgetLimit, BudgetReservation, BudgetWindow, ModelPricing, PricingCatalog
+from cayu.runtime import BudgetLimit, BudgetReservation, BudgetWindow, ModelPrice, PriceBook
 from cayu.storage import migrations as schema
 from cayu.storage.migrations import SchemaMode
 from cayu.storage.postgres import _SCHEMA_ADVISORY_LOCK_KEY
@@ -58,9 +58,9 @@ def _reservation_budget_limit(max_cost: str, *, key: str | None = None) -> Budge
         key=key,
         max_estimated_cost=Decimal(max_cost),
         window=BudgetWindow.all_time(),
-        pricing=PricingCatalog(
+        pricing=PriceBook(
             prices=(
-                ModelPricing(
+                ModelPrice.fixed(
                     provider_name="fake",
                     model="fake-model",
                     input_per_million=Decimal("1"),

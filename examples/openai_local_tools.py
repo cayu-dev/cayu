@@ -16,9 +16,9 @@ from cayu import (
     LocalRunner,
     LocalWorkspace,
     Message,
-    ModelPricing,
+    ModelPrice,
     OpenAIProvider,
-    PricingCatalog,
+    PriceBook,
     ReadFileTool,
     RunRequest,
     WriteFileTool,
@@ -102,9 +102,9 @@ async def main() -> None:
     print("usage_cache_write_tokens", usage.usage.cache.write_tokens)
     print("usage_cached_input_tokens", usage.usage.cache.cached_input_tokens)
 
-    pricing = PricingCatalog(
+    pricing = PriceBook(
         prices=(
-            ModelPricing(
+            ModelPrice.fixed(
                 provider_name="openai",
                 model=os.environ.get("CAYU_OPENAI_PRICING_MODEL_PREFIX", model),
                 match="prefix",

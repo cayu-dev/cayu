@@ -8,8 +8,8 @@ from cayu import (
     AgentSpec,
     CayuApp,
     Message,
-    ModelPricing,
-    PricingCatalog,
+    ModelPrice,
+    PriceBook,
     RetryPolicy,
     RunRequest,
 )
@@ -61,9 +61,9 @@ async def main() -> None:
 
     usage = await app.get_session_usage("demo_usage_cost")
 
-    pricing = PricingCatalog(
+    pricing = PriceBook(
         prices=(
-            ModelPricing(
+            ModelPrice.fixed(
                 provider_name="openai",
                 model="gpt-5.5",
                 match="prefix",

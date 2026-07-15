@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
-from typing import Any, Literal, cast
+from typing import Any, Literal, NamedTuple, cast
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -22,13 +22,14 @@ from pydantic import (
 from cayu._validation import require_clean_nonblank
 from cayu.core.events import Event, EventType, copy_event
 from cayu.runtime.costs import (
-    ModelCatalog,
-    ModelPricing,
-    PricingCatalog,
-    PricingSource,
+    CostLineItem,
+    PriceBook,
+    Provenance,
     SessionCostSummary,
+    _resolve_price_book,
+    _ResolvedPrice,
     estimate_session_cost,
-    pricing_source_price,
+    resolve_price_book,
 )
 
 BudgetScope = Literal["app", "agent", "causal", "session", "run"]
@@ -163,7 +164,7 @@ class BudgetLimit(BaseModel):
 
     scope: BudgetScope = "session"
     max_estimated_cost: Decimal = Field(gt=0)
-    pricing: PricingCatalog | ModelCatalog
+    pricing: PriceBook
     currency: str = "USD"
     window: BudgetWindow = Field(default_factory=BudgetWindow.all_time)
     key: str | None = None
@@ -418,18 +419,51 @@ class BudgetReconciliation(BaseModel):
     actual_amount: Decimal | None = Field(default=None, ge=0)
     released_amount: Decimal = Field(ge=0)
     reason: str | None = None
+    pricing_provider_name: str | None = None
+    pricing_model: str | None = None
+    pricing_match: Literal["exact", "prefix"] | None = None
+    pricing_provenance: Provenance | None = None
+    pricing_effective_from: date | None = None
+    pricing_effective_through: date | None = None
+    pricing_tier_max_input_tokens: StrictInt | None = Field(default=None, gt=0)
 
     @field_validator("reservation_id")
     @classmethod
     def validate_reconciliation_id(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
 
-    @field_validator("reason")
+    @field_validator("reason", "pricing_provider_name", "pricing_model")
     @classmethod
     def validate_reconciliation_reason(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
         return require_clean_nonblank(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_pricing_evidence(self) -> BudgetReconciliation:
+        identity = (
+            self.pricing_provider_name,
+            self.pricing_model,
+            self.pricing_match,
+            self.pricing_provenance,
+        )
+        evidence = (
+            *identity,
+            self.pricing_effective_from,
+            self.pricing_effective_through,
+            self.pricing_tier_max_input_tokens,
+        )
+        if any(value is not None for value in evidence) and not all(
+            value is not None for value in identity
+        ):
+            raise ValueError("reconciliation pricing identity and provenance must be complete")
+        if (
+            self.pricing_effective_from is not None
+            and self.pricing_effective_through is not None
+            and self.pricing_effective_from > self.pricing_effective_through
+        ):
+            raise ValueError("reconciliation pricing effective window is reversed")
+        return self
 
     @field_validator("reserved_amount", "actual_amount", "released_amount")
     @classmethod
@@ -635,13 +669,14 @@ class InMemoryBudgetLedger(BudgetLedger):
         provider_name: str,
         model: str,
     ) -> BudgetReservationResult:
-        request = _budget_reservation_amount(
-            limit=limit,
-            provider_name=provider_name,
-            model=model,
-        )
-        now = self._clock()
         async with self._lock:
+            now = self._clock()
+            request = _budget_reservation_amount(
+                limit=limit,
+                provider_name=provider_name,
+                model=model,
+                effective_at=now,
+            )
             self._reap_expired_unlocked(now, limit=limit)
             current = _ledger_used_amount(
                 self._records.values(),
@@ -945,6 +980,7 @@ def budget_check_from_events(
     events: list[Event],
     provider_name: str | None = None,
     model: str | None = None,
+    effective_at: datetime | None = None,
 ) -> BudgetCheck:
     if type(limit) is not BudgetLimit:
         raise TypeError("limit must be a BudgetLimit.")
@@ -968,7 +1004,15 @@ def budget_check_from_events(
         )
     elif (
         not limit.allow_unpriced
-        and (preflight_error := _budget_preflight_error(limit, provider_name, model)) is not None
+        and (
+            preflight_error := _budget_preflight_error(
+                limit,
+                provider_name,
+                model,
+                effective_at=effective_at,
+            )
+        )
+        is not None
     ):
         limit_reached = True
         message = preflight_error
@@ -1047,10 +1091,23 @@ def _budget_preflight_error(
     limit: BudgetLimit,
     provider_name: str | None,
     model: str | None,
+    *,
+    effective_at: datetime | None,
 ) -> str | None:
-    price = budget_price(limit, provider_name=provider_name, model=model)
+    reference = (
+        datetime.now(UTC) if effective_at is None else _utc_datetime(effective_at, "effective_at")
+    )
+    resolution = _resolve_price_book(
+        limit.pricing,
+        provider_name=provider_name,
+        model=model,
+        input_tokens=0,
+        effective_on=reference.astimezone(UTC).date(),
+    )
+    price = resolution.resolved
     if price is None:
-        return f"Budget cannot be verified because {provider_name}/{model} has no matching pricing."
+        reason = resolution.missing_reason or "no matching model pricing"
+        return f"Budget cannot be verified because {provider_name}/{model}: {reason}."
     if price.currency.upper() != limit.currency.upper():
         return (
             "Budget cannot be verified because "
@@ -1087,6 +1144,27 @@ def budget_reservation_payload(result: BudgetReservationResult) -> dict[str, Any
 def budget_reconciliation_payload(reconciliation: BudgetReconciliation) -> dict[str, Any]:
     if type(reconciliation) is not BudgetReconciliation:
         raise TypeError("reconciliation must be a BudgetReconciliation.")
+    pricing = None
+    if reconciliation.pricing_provider_name is not None:
+        pricing = {
+            "provider_name": reconciliation.pricing_provider_name,
+            "model": reconciliation.pricing_model,
+            "match": reconciliation.pricing_match,
+            "provenance": reconciliation.pricing_provenance.model_dump(mode="json")
+            if reconciliation.pricing_provenance is not None
+            else None,
+            "effective_from": (
+                None
+                if reconciliation.pricing_effective_from is None
+                else reconciliation.pricing_effective_from.isoformat()
+            ),
+            "effective_through": (
+                None
+                if reconciliation.pricing_effective_through is None
+                else reconciliation.pricing_effective_through.isoformat()
+            ),
+            "tier_max_input_tokens": reconciliation.pricing_tier_max_input_tokens,
+        }
     return {
         "reservation_id": reconciliation.reservation_id,
         "status": reconciliation.status,
@@ -1096,10 +1174,16 @@ def budget_reconciliation_payload(reconciliation: BudgetReconciliation) -> dict[
         ),
         "released_amount": str(reconciliation.released_amount),
         "reason": reconciliation.reason,
+        "pricing": pricing,
     }
 
 
-def budget_actual_cost_for_event(*, limit: BudgetLimit, event: Event) -> Decimal:
+class _BudgetActualCost(NamedTuple):
+    amount: Decimal
+    line_item: CostLineItem
+
+
+def budget_actual_cost_for_event(*, limit: BudgetLimit, event: Event) -> _BudgetActualCost:
     if type(limit) is not BudgetLimit:
         raise TypeError("limit must be a BudgetLimit.")
     if type(event) is not Event:
@@ -1112,7 +1196,35 @@ def budget_actual_cost_for_event(*, limit: BudgetLimit, event: Event) -> Decimal
     )
     if summary.unpriced_model_steps > 0:
         raise ValueError("Cannot reconcile budget reservation from unpriced model usage.")
-    return summary.total_cost
+    if len(summary.line_items) != 1:
+        raise ValueError("Budget reconciliation requires exactly one priced model step.")
+    return _BudgetActualCost(summary.total_cost, summary.line_items[0])
+
+
+def budget_reconciliation_with_pricing(
+    reconciliation: BudgetReconciliation,
+    line_item: CostLineItem,
+) -> BudgetReconciliation:
+    if type(reconciliation) is not BudgetReconciliation:
+        raise TypeError("reconciliation must be a BudgetReconciliation.")
+    if type(line_item) is not CostLineItem or not line_item.priced:
+        raise TypeError("line_item must be a priced CostLineItem.")
+    return BudgetReconciliation.model_validate(
+        {
+            **reconciliation.model_dump(mode="python"),
+            "pricing_provider_name": line_item.pricing_provider_name,
+            "pricing_model": line_item.pricing_model,
+            "pricing_match": line_item.pricing_match,
+            "pricing_provenance": (
+                None
+                if line_item.pricing_provenance is None
+                else line_item.pricing_provenance.model_copy(deep=True)
+            ),
+            "pricing_effective_from": line_item.pricing_effective_from,
+            "pricing_effective_through": line_item.pricing_effective_through,
+            "pricing_tier_max_input_tokens": line_item.pricing_tier_max_input_tokens,
+        }
+    )
 
 
 def _budget_reservation_amount(
@@ -1120,6 +1232,7 @@ def _budget_reservation_amount(
     limit: BudgetLimit,
     provider_name: str,
     model: str,
+    effective_at: datetime,
 ) -> Decimal:
     if limit.reservation is None:
         raise ValueError("Budget limit does not define a reservation policy.")
@@ -1134,6 +1247,7 @@ def _budget_reservation_amount(
         provider_name=provider_name,
         model=model,
         input_tokens=reserved_input_tokens,
+        effective_at=effective_at,
     )
     if price is None:
         raise ValueError(f"Budget reservation cannot be priced for {provider_name}/{model}.")
@@ -1169,13 +1283,17 @@ def budget_price(
     provider_name: str | None,
     model: str | None,
     input_tokens: int = 0,
-) -> ModelPricing | None:
-    source: PricingSource = limit.pricing
-    return pricing_source_price(
-        source,
+    effective_at: datetime | None = None,
+) -> _ResolvedPrice | None:
+    effective_at = (
+        datetime.now(UTC) if effective_at is None else _utc_datetime(effective_at, "effective_at")
+    )
+    return resolve_price_book(
+        limit.pricing,
         provider_name=provider_name,
         model=model,
         input_tokens=input_tokens,
+        effective_on=effective_at.astimezone(UTC).date(),
     )
 
 

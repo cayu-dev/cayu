@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterable
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from importlib import resources
+from itertools import pairwise
 from pathlib import Path
 from typing import Literal, NamedTuple, TypeVar
 
@@ -27,101 +28,11 @@ _TOKENS_PER_MILLION = Decimal("1000000")
 _MatchT = TypeVar("_MatchT")
 
 
-class ModelPricing(BaseModel):
-    """Model pricing per 1M tokens, with optional projected tiers and provenance."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    provider_name: str
-    model: str
-    input_per_million: Decimal = Field(ge=0)
-    output_per_million: Decimal = Field(ge=0)
-    cache_read_input_per_million: Decimal | None = Field(default=None, ge=0)
-    cache_write_input_per_million: Decimal | None = Field(default=None, ge=0)
-    currency: str = "USD"
-    match: Literal["exact", "prefix"] = "prefix"
-    pricing_tiers: tuple[PriceTier, ...] | None = Field(
-        default=None,
-        min_length=1,
-        exclude_if=lambda value: value is None,
-    )
-    provenance: Provenance | None = Field(
-        default=None,
-        exclude_if=lambda value: value is None,
-    )
-
-    @field_validator("provider_name", "model", "currency")
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
-
-    @field_validator(
-        "input_per_million",
-        "output_per_million",
-        "cache_read_input_per_million",
-        "cache_write_input_per_million",
-    )
-    @classmethod
-    def validate_decimal(cls, value: Decimal | None, info) -> Decimal | None:
-        if value is None:
-            return None
-        if not value.is_finite():
-            raise ValueError(f"{info.field_name} must be finite.")
-        return value
-
-    @model_validator(mode="after")
-    def validate_pricing_tiers(self) -> ModelPricing:
-        if self.pricing_tiers is None:
-            return self
-        tiered = TieredPricing(currency=self.currency, standard=self.pricing_tiers)
-        base = tiered.base()
-        if (
-            self.input_per_million != base.input_per_million
-            or self.output_per_million != base.output_per_million
-            or self.cache_read_input_per_million != base.cache_read_input_per_million
-            or (
-                base.cache_write_input_per_million is not None
-                and self.cache_write_input_per_million != base.cache_write_input_per_million
-            )
-        ):
-            raise ValueError("ModelPricing base rates must match the first pricing tier.")
-        return self
-
-
-class PricingCatalog(BaseModel):
-    """Collection of user-supplied model prices used for cost estimation."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    prices: tuple[ModelPricing, ...] = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def validate_unique_matches(self) -> PricingCatalog:
-        seen: set[tuple[str, str, str]] = set()
-        for price in self.prices:
-            key = _match_key(price.provider_name, price.model, price.match)
-            if key in seen:
-                raise ValueError("Pricing catalog contains duplicate provider/model/match entries.")
-            seen.add(key)
-        return self
-
-    def match_price(self, *, provider_name: str | None, model: str | None) -> ModelPricing | None:
-        def price_key(price: ModelPricing) -> tuple[str, str, str]:
-            return (price.provider_name, price.model, price.match)
-
-        return _best_match_record(
-            self.prices,
-            provider_name=provider_name,
-            model=model,
-            key=price_key,
-        )
-
-
 _MODEL_ENTITY_CONFIG = ConfigDict(extra="forbid", frozen=True, protected_namespaces=())
 
 
 class Provenance(BaseModel):
-    """Where a model's facts came from and when (audit metadata; not priced)."""
+    """Where model or pricing facts came from and when they were checked."""
 
     model_config = _MODEL_ENTITY_CONFIG
 
@@ -173,9 +84,9 @@ class TieredPricing(BaseModel):
     """Full pricing for one model: context-band tiers plus optional batch and
     cache-write-duration rates.
 
-    Only the context-band ``standard`` tiers feed the cost engine today (via
-    ``ModelInfo.to_model_pricing``/``pricing_at``). A tier-local cache-write rate takes
-    precedence over the legacy model-wide ``cache_write_5m_per_million`` fallback.
+    Only the context-band ``standard`` tiers feed the cost engine today. A tier-local
+    cache-write rate takes precedence over the model-wide
+    ``cache_write_5m_per_million`` fallback.
     ``batch`` and ``cache_write_1h_per_million`` are carried for completeness and future
     use — they are NOT auto-applied by ``estimate_session_cost``.
     """
@@ -221,7 +132,7 @@ class TieredPricing(BaseModel):
         return self
 
     def base(self) -> PriceTier:
-        """The smallest-context (first) tier — the flat back-compat price."""
+        """The smallest-context (first) tier — the base price."""
         return self.standard[0]
 
     def tier_for(self, input_tokens: int) -> PriceTier:
@@ -233,15 +144,195 @@ class TieredPricing(BaseModel):
         return self.standard[-1]
 
 
-class ModelInfo(BaseModel):
-    """A model's full profile: identity, objective capabilities, lifecycle, and
-    tiered pricing.
+class PriceSchedule(BaseModel):
+    """One price schedule, effective on inclusive UTC calendar dates."""
 
-    Projects into the compatibility cost shape via ``to_model_pricing()`` while retaining
-    its tiers, or into one selected tier via ``pricing_at(input_tokens)``. ``match_prefixes``
-    declares additional narrow prefix keys without broadening the canonical model key.
-    Capabilities are objective facts only — no quality/benchmark scores.
-    """
+    model_config = _MODEL_ENTITY_CONFIG
+
+    effective_from: date | None = None
+    effective_through: date | None = None
+    pricing: TieredPricing
+    provenance: Provenance
+
+    @model_validator(mode="after")
+    def validate_window(self) -> PriceSchedule:
+        if (
+            self.effective_from is not None
+            and self.effective_through is not None
+            and self.effective_from > self.effective_through
+        ):
+            raise ValueError("price schedule effective_from must not follow effective_through.")
+        return self
+
+    def applies_on(self, effective_on: date) -> bool:
+        return (self.effective_from is None or effective_on >= self.effective_from) and (
+            self.effective_through is None or effective_on <= self.effective_through
+        )
+
+
+class _PriceMatchRule(NamedTuple):
+    model: str
+    match: Literal["exact", "prefix"]
+
+
+class ModelPrice(BaseModel):
+    """Pricing identity and its non-overlapping effective schedules."""
+
+    model_config = _MODEL_ENTITY_CONFIG
+
+    provider_name: str
+    model: str
+    aliases: tuple[str, ...] = ()
+    match: Literal["exact", "prefix"] = "prefix"
+    match_prefixes: tuple[str, ...] = ()
+    schedules: tuple[PriceSchedule, ...] = Field(min_length=1)
+
+    @classmethod
+    def fixed(
+        cls,
+        *,
+        provider_name: str,
+        model: str,
+        input_per_million: Decimal,
+        output_per_million: Decimal,
+        cache_read_input_per_million: Decimal | None = None,
+        cache_write_input_per_million: Decimal | None = None,
+        currency: str = "USD",
+        aliases: tuple[str, ...] = (),
+        match: Literal["exact", "prefix"] = "prefix",
+        match_prefixes: tuple[str, ...] = (),
+        provenance: Provenance | None = None,
+    ) -> ModelPrice:
+        """Build one application-owned price with no validity bound.
+
+        Use explicit ``PriceSchedule`` values when a rate has a known start or end.
+        """
+        source = provenance or Provenance(
+            source="application",
+            url="application://price-book",
+            as_of="unspecified",
+        )
+        return cls(
+            provider_name=provider_name,
+            model=model,
+            aliases=aliases,
+            match=match,
+            match_prefixes=match_prefixes,
+            schedules=(
+                PriceSchedule(
+                    pricing=TieredPricing(
+                        currency=currency,
+                        standard=(
+                            PriceTier(
+                                input_per_million=input_per_million,
+                                output_per_million=output_per_million,
+                                cache_read_input_per_million=cache_read_input_per_million,
+                                cache_write_input_per_million=cache_write_input_per_million,
+                            ),
+                        ),
+                    ),
+                    provenance=source,
+                ),
+            ),
+        )
+
+    @field_validator("provider_name", "model")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("aliases", "match_prefixes")
+    @classmethod
+    def validate_string_members(cls, value: tuple[str, ...], info) -> tuple[str, ...]:
+        return tuple(require_clean_nonblank(member, info.field_name) for member in value)
+
+    @model_validator(mode="after")
+    def validate_schedules(self) -> ModelPrice:
+        ordered = sorted(
+            self.schedules,
+            key=lambda schedule: (
+                date.min if schedule.effective_from is None else schedule.effective_from
+            ),
+        )
+        if list(self.schedules) != ordered:
+            raise ValueError("price schedules must be ordered by effective_from.")
+        for previous, current in pairwise(ordered):
+            if previous.effective_through is None or current.effective_from is None:
+                raise ValueError("price schedules overlap.")
+            if current.effective_from <= previous.effective_through:
+                raise ValueError("price schedules overlap.")
+        return self
+
+    def _match_rules(self) -> tuple[_PriceMatchRule, ...]:
+        return (
+            _PriceMatchRule(model=self.model, match=self.match),
+            *(_PriceMatchRule(model=alias, match="exact") for alias in self.aliases),
+            *(_PriceMatchRule(model=prefix, match="prefix") for prefix in self.match_prefixes),
+        )
+
+    def schedule_on(self, effective_on: date) -> PriceSchedule | None:
+        return next(
+            (schedule for schedule in self.schedules if schedule.applies_on(effective_on)),
+            None,
+        )
+
+
+class _PriceBookMatch(NamedTuple):
+    price: ModelPrice
+    model: str
+    match: Literal["exact", "prefix"]
+
+
+def _price_book_match_key(candidate: _PriceBookMatch) -> tuple[str, str, str]:
+    return (candidate.price.provider_name, candidate.model, candidate.match)
+
+
+class PriceBook(BaseModel):
+    """A versioned collection of application-owned commercial model prices."""
+
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
+
+    price_book_version: str = "application"
+    generated_at: str = "unspecified"
+    prices: tuple[ModelPrice, ...] = Field(min_length=1)
+
+    @field_validator("price_book_version", "generated_at")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_unique_matches(self) -> PriceBook:
+        seen: set[tuple[str, str, str]] = set()
+        for price in self.prices:
+            for rule in price._match_rules():
+                key = _match_key(price.provider_name, rule.model, rule.match)
+                if key in seen:
+                    raise ValueError("Price book contains duplicate provider/model/match entries.")
+                seen.add(key)
+        return self
+
+    def _resolve_match(
+        self,
+        *,
+        provider_name: str | None,
+        model: str | None,
+    ) -> _PriceBookMatch | None:
+        candidates: tuple[_PriceBookMatch, ...] = tuple(
+            _PriceBookMatch(price=price, model=rule.model, match=rule.match)
+            for price in self.prices
+            for rule in price._match_rules()
+        )
+        return _best_match_record(
+            candidates,
+            provider_name=provider_name,
+            model=model,
+            key=_price_book_match_key,
+        )
+
+
+class ModelInfo(BaseModel):
+    """A model's identity, objective capabilities, lifecycle, and provenance."""
 
     model_config = _MODEL_ENTITY_CONFIG
 
@@ -263,10 +354,8 @@ class ModelInfo(BaseModel):
     knowledge_cutoff: date | None = None
     deprecated: StrictBool = False
     retirement_date: date | None = None
-    # pricing
     match: Literal["exact", "prefix"] = "prefix"
     match_prefixes: tuple[str, ...] = ()
-    pricing: TieredPricing
     provenance: Provenance
 
     @field_validator("provider_name", "model")
@@ -287,62 +376,11 @@ class ModelInfo(BaseModel):
     def validate_string_members(cls, value: tuple[str, ...], info) -> tuple[str, ...]:
         return tuple(require_clean_nonblank(member, info.field_name) for member in value)
 
-    def _model_pricing(
-        self,
-        tier: PriceTier,
-        *,
-        include_projection_metadata: bool = False,
-    ) -> ModelPricing:
-        def effective_cache_write_price(candidate: PriceTier) -> Decimal | None:
-            return (
-                candidate.cache_write_input_per_million
-                if candidate.cache_write_input_per_million is not None
-                else self.pricing.cache_write_5m_per_million
-            )
-
-        projected_tiers = (
-            tuple(
-                candidate.model_copy(
-                    update={"cache_write_input_per_million": effective_cache_write_price(candidate)}
-                )
-                for candidate in self.pricing.standard
-            )
-            if include_projection_metadata
-            else None
-        )
-        return ModelPricing(
-            provider_name=self.provider_name,
-            model=self.model,
-            input_per_million=tier.input_per_million,
-            output_per_million=tier.output_per_million,
-            cache_read_input_per_million=tier.cache_read_input_per_million,
-            cache_write_input_per_million=effective_cache_write_price(tier),
-            currency=self.pricing.currency,
-            match=self.match,
-            pricing_tiers=projected_tiers,
-            provenance=self.provenance,
-        )
-
-    def to_model_pricing(self) -> ModelPricing:
-        """Compatibility row retaining the tier/provenance metadata used for pricing."""
-        return self._model_pricing(self.pricing.base(), include_projection_metadata=True)
-
-    def pricing_at(self, input_tokens: int) -> ModelPricing:
-        """Flat ``ModelPricing`` from the tier that prices ``input_tokens``."""
-        return self._model_pricing(self.pricing.tier_for(input_tokens))
-
     def _match_rules(self) -> tuple[_ModelMatchRule, ...]:
         return (
             _ModelMatchRule(model=self.model, match=self.match),
             *(_ModelMatchRule(model=alias, match="exact") for alias in self.aliases),
             *(_ModelMatchRule(model=prefix, match="prefix") for prefix in self.match_prefixes),
-        )
-
-    def _pricing_rows(self) -> tuple[ModelPricing, ...]:
-        primary = self.to_model_pricing()
-        return tuple(
-            primary.model_copy(update={"model": rule.model, "match": rule.match})
-            for rule in self._match_rules()
         )
 
 
@@ -358,14 +396,7 @@ class _CatalogMatch(NamedTuple):
 
 
 class ModelCatalog(BaseModel):
-    """A versioned set of ``ModelInfo`` records: the model catalog.
-
-    Cost and budget APIs can consume it directly to preserve context tiers. It can also
-    project into the compatible ``PricingCatalog`` contract without losing pricing semantics
-    via ``pricing_catalog()``. Use ``resolve()`` to find the record whose canonical key or
-    exact alias, or explicit match prefix prices a runtime model id; ``match()`` is a strict
-    canonical-record lookup.
-    """
+    """A versioned metadata registry used for model discovery and routing."""
 
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
@@ -380,8 +411,6 @@ class ModelCatalog(BaseModel):
 
     @model_validator(mode="after")
     def validate_unique_models(self) -> ModelCatalog:
-        # Mirror PricingCatalog.validate_unique_matches: reject duplicate matching keys at
-        # construction rather than crashing later when the catalog is projected/priced.
         seen: set[tuple[str, str, str]] = set()
         for info in self.models:
             for rule in info._match_rules():
@@ -392,11 +421,6 @@ class ModelCatalog(BaseModel):
                     )
                 seen.add(key)
         return self
-
-    def pricing_catalog(self) -> PricingCatalog:
-        return PricingCatalog(
-            prices=tuple(price for model in self.models for price in model._pricing_rows())
-        )
 
     def _resolve_match(
         self,
@@ -422,29 +446,13 @@ class ModelCatalog(BaseModel):
         return matched
 
     def resolve(self, *, provider_name: str | None, model: str | None) -> ModelInfo | None:
-        """The most-specific record whose primary or explicit prefix matches the model."""
+        """The most-specific metadata record whose declared identity matches the model."""
 
         matched = self._resolve_match(provider_name=provider_name, model=model)
         return None if matched is None else matched.info
 
-    def _price_at(
-        self,
-        *,
-        provider_name: str | None,
-        model: str | None,
-        input_tokens: int,
-    ) -> tuple[ModelPricing, PriceTier] | None:
-        matched = self._resolve_match(provider_name=provider_name, model=model)
-        if matched is None:
-            return None
-        tier = matched.info.pricing.tier_for(input_tokens)
-        price = matched.info._model_pricing(tier).model_copy(
-            update={"model": matched.model, "match": matched.match}
-        )
-        return price, tier
-
     def match(self, *, provider_name: str, model: str) -> ModelInfo | None:
-        """Exact ``(provider_name, model)`` record lookup (see ``resolve`` for pricing-style
+        """Exact ``(provider_name, model)`` record lookup (see ``resolve`` for declared
         prefix matching)."""
         for info in self.models:
             if info.provider_name == provider_name and info.model == model:
@@ -479,9 +487,6 @@ class ModelCatalog(BaseModel):
         return selected
 
 
-PricingSource = PricingCatalog | ModelCatalog
-
-
 def dump_model_catalog(catalog: ModelCatalog) -> str:
     """Deterministic JSON: models sorted by (provider_name, model), sorted keys,
     trailing newline — stable enough to commit and diff."""
@@ -507,6 +512,26 @@ def default_model_catalog() -> ModelCatalog:
     return ModelCatalog.model_validate_json(resource.read_text(encoding="utf-8"))
 
 
+def dump_price_book(price_book: PriceBook) -> str:
+    """Serialize a price book deterministically for review and packaging."""
+    if type(price_book) is not PriceBook:
+        raise TypeError("price_book must be a PriceBook instance.")
+    ordered = tuple(sorted(price_book.prices, key=lambda price: (price.provider_name, price.model)))
+    data = price_book.model_copy(update={"prices": ordered}).model_dump(mode="json")
+    return json.dumps(data, sort_keys=True, indent=2) + "\n"
+
+
+def load_price_book(path: str | Path) -> PriceBook:
+    """Load a price book from a JSON file written by ``dump_price_book``."""
+    return PriceBook.model_validate_json(Path(path).read_text())
+
+
+def default_price_book() -> PriceBook:
+    """Load Cayu's bundled, dated price book without network access."""
+    resource = resources.files("cayu.data").joinpath("default_price_book.json")
+    return PriceBook.model_validate_json(resource.read_text(encoding="utf-8"))
+
+
 class CostLineItem(BaseModel):
     """Estimated cost for one model.completed event."""
 
@@ -520,8 +545,9 @@ class CostLineItem(BaseModel):
     pricing_model: str | None = None
     pricing_match: Literal["exact", "prefix"] | None = None
     pricing_provenance: Provenance | None = None
-    # Ceiling of the tiered-pricing band that priced this step (None = the open-ended tier, or
-    # flat/no-catalog pricing). Lets an audit see which context band applied without the catalog.
+    pricing_effective_from: date | None = None
+    pricing_effective_through: date | None = None
+    # Ceiling of the tiered-pricing band that priced this step (None = open-ended).
     pricing_tier_max_input_tokens: StrictInt | None = None
     priced: StrictBool
     currency: str
@@ -599,25 +625,45 @@ class CausalBudgetCostSummary(BaseModel):
         return _copy_string_list(value, info.field_name)
 
 
-def copy_pricing_catalog(catalog: PricingCatalog) -> PricingCatalog:
-    if type(catalog) is not PricingCatalog:
-        raise TypeError("Pricing catalog must be a PricingCatalog instance.")
-    return PricingCatalog(prices=tuple(price.model_copy(deep=True) for price in catalog.prices))
+def copy_price_book(price_book: PriceBook) -> PriceBook:
+    if type(price_book) is not PriceBook:
+        raise TypeError("price_book must be a PriceBook instance.")
+    return PriceBook(
+        price_book_version=price_book.price_book_version,
+        generated_at=price_book.generated_at,
+        prices=tuple(price.model_copy(deep=True) for price in price_book.prices),
+    )
 
 
 def estimate_session_cost(
     *,
     session_id: str,
     events: list[Event],
-    pricing: PricingSource | None = None,
+    pricing: PriceBook,
     currency: str = "USD",
-    catalog: ModelCatalog | None = None,
 ) -> SessionCostSummary:
     session_id = require_clean_nonblank(session_id, "session_id")
     currency = require_clean_nonblank(currency, "currency").upper()
-    pricing, catalog = _split_pricing_sources(pricing, catalog)
+    pricing = copy_price_book(pricing)
     if type(events) is not list:
         raise TypeError("events must be a list.")
+
+    return _estimate_session_cost(
+        session_id=session_id,
+        events=events,
+        pricing=pricing,
+        currency=currency,
+    )
+
+
+def _estimate_session_cost(
+    *,
+    session_id: str,
+    events: list[Event],
+    pricing: PriceBook,
+    currency: str,
+) -> SessionCostSummary:
+    """Estimate one session from already validated scalar inputs and a pricing snapshot."""
 
     line_items: list[CostLineItem] = []
     model_step = 0
@@ -646,7 +692,7 @@ def estimate_session_cost(
                 metrics=metrics,
                 pricing=pricing,
                 currency=currency,
-                catalog=catalog,
+                effective_on=_effective_date(event.timestamp),
             )
         )
 
@@ -669,28 +715,36 @@ def estimate_causal_budget_cost(
     causal_budget_id: str,
     session_ids: list[str],
     events: list[Event],
-    pricing: PricingSource | None = None,
+    pricing: PriceBook,
     currency: str = "USD",
-    catalog: ModelCatalog | None = None,
 ) -> CausalBudgetCostSummary:
     causal_budget_id = require_clean_nonblank(causal_budget_id, "causal_budget_id")
     copied_session_ids = _copy_string_list(session_ids, "session_ids")
     known_session_ids = set(copied_session_ids)
-    filtered_events = [event for event in events if event.session_id in known_session_ids]
-    summary = estimate_session_cost(
+    filtered_events: list[Event] = []
+    events_by_session: dict[str, list[Event]] = {session_id: [] for session_id in known_session_ids}
+    for event in events:
+        if event.session_id not in known_session_ids:
+            continue
+        if type(event) is not Event:
+            raise TypeError("events must contain Event instances.")
+        filtered_events.append(event)
+        events_by_session[event.session_id].append(event)
+
+    pricing = copy_price_book(pricing)
+    currency = require_clean_nonblank(currency, "currency").upper()
+    summary = _estimate_session_cost(
         session_id=causal_budget_id,
         events=filtered_events,
         pricing=pricing,
         currency=currency,
-        catalog=catalog,
     )
     session_costs = tuple(
-        estimate_session_cost(
+        _estimate_session_cost(
             session_id=session_id,
-            events=[event for event in filtered_events if event.session_id == session_id],
+            events=events_by_session[session_id],
             pricing=pricing,
             currency=currency,
-            catalog=catalog,
         )
         for session_id in copied_session_ids
     )
@@ -708,164 +762,131 @@ def estimate_causal_budget_cost(
     )
 
 
-def _split_pricing_sources(
-    pricing: PricingSource | None,
-    catalog: ModelCatalog | None,
-) -> tuple[PricingCatalog | None, ModelCatalog | None]:
-    if pricing is None and catalog is None:
-        raise ValueError("estimate_session_cost requires pricing or catalog.")
-    if isinstance(pricing, ModelCatalog):
-        if catalog is not None:
-            raise ValueError("Pass a ModelCatalog as pricing or catalog, not both.")
-        catalog = pricing
-        pricing = None
-    elif pricing is not None:
-        pricing = copy_pricing_catalog(pricing)
-    if catalog is not None and type(catalog) is not ModelCatalog:
-        raise TypeError("catalog must be a ModelCatalog instance.")
-    return pricing, catalog
-
-
 class _ResolvedPrice(NamedTuple):
-    price: ModelPricing
-    tier_max_input_tokens: int | None
-    provenance: Provenance | None
+    price: ModelPrice
+    matched_model: str
+    match: Literal["exact", "prefix"]
+    schedule: PriceSchedule
+    tier: PriceTier
+
+    @property
+    def currency(self) -> str:
+        return self.schedule.pricing.currency
+
+    @property
+    def input_per_million(self) -> Decimal:
+        return self.tier.input_per_million
+
+    @property
+    def output_per_million(self) -> Decimal:
+        return self.tier.output_per_million
+
+    @property
+    def cache_read_input_per_million(self) -> Decimal | None:
+        return self.tier.cache_read_input_per_million
+
+    @property
+    def cache_write_input_per_million(self) -> Decimal | None:
+        if self.tier.cache_write_input_per_million is not None:
+            return self.tier.cache_write_input_per_million
+        return self.schedule.pricing.cache_write_5m_per_million
 
 
-def pricing_source_price(
-    source: PricingSource,
-    *,
-    provider_name: str | None,
-    model: str | None,
-    input_tokens: int = 0,
-) -> ModelPricing | None:
-    """Resolve one pricing source with its matching and context-tier semantics."""
-    resolved = _resolve_source_price(
-        source,
-        provider_name=provider_name,
-        model=model,
-        input_tokens=input_tokens,
-    )
-    return None if resolved is None else resolved.price
+class _PriceResolution(NamedTuple):
+    resolved: _ResolvedPrice | None
+    missing_reason: str | None
 
 
-def _resolve_source_price(
-    source: PricingSource,
+def resolve_price_book(
+    price_book: PriceBook,
     *,
     provider_name: str | None,
     model: str | None,
     input_tokens: int,
+    effective_on: date,
 ) -> _ResolvedPrice | None:
-    if isinstance(source, ModelCatalog):
-        match = source._price_at(
-            provider_name=provider_name,
-            model=model,
-            input_tokens=input_tokens,
-        )
-        if match is None:
-            return None
-        price, tier = match
-        return _ResolvedPrice(
-            price,
-            tier.max_input_tokens,
-            price.provenance,
-        )
+    """Resolve one price-book entry, effective schedule, and context tier."""
+    return _resolve_price_book(
+        price_book,
+        provider_name=provider_name,
+        model=model,
+        input_tokens=input_tokens,
+        effective_on=effective_on,
+    ).resolved
 
-    price = source.match_price(provider_name=provider_name, model=model)
-    if price is None or price.pricing_tiers is None:
-        return None if price is None else _ResolvedPrice(price, None, price.provenance)
-    tier = TieredPricing(currency=price.currency, standard=price.pricing_tiers).tier_for(
-        input_tokens
-    )
-    return _ResolvedPrice(
-        price.model_copy(
-            update={
-                "input_per_million": tier.input_per_million,
-                "output_per_million": tier.output_per_million,
-                "cache_read_input_per_million": tier.cache_read_input_per_million,
-                "cache_write_input_per_million": (
-                    tier.cache_write_input_per_million
-                    if tier.cache_write_input_per_million is not None
-                    else price.cache_write_input_per_million
-                ),
-                "pricing_tiers": None,
-            },
-            deep=True,
+
+def _resolve_price_book(
+    price_book: PriceBook,
+    *,
+    provider_name: str | None,
+    model: str | None,
+    input_tokens: int,
+    effective_on: date,
+) -> _PriceResolution:
+    matched = price_book._resolve_match(provider_name=provider_name, model=model)
+    if matched is None:
+        return _PriceResolution(None, "no matching model pricing")
+    schedule = matched.price.schedule_on(effective_on)
+    if schedule is None:
+        schedules = matched.price.schedules
+        latest = schedules[-1].effective_through
+        reason = (
+            "pricing schedule expired"
+            if latest is not None and effective_on > latest
+            else "no applicable pricing schedule"
+        )
+        return _PriceResolution(None, reason)
+    return _PriceResolution(
+        _ResolvedPrice(
+            price=matched.price,
+            matched_model=matched.model,
+            match=matched.match,
+            schedule=schedule,
+            tier=schedule.pricing.tier_for(input_tokens),
         ),
-        tier.max_input_tokens,
-        price.provenance,
+        None,
     )
 
 
 def _resolve_price(
     *,
     metrics: UsageMetrics,
-    pricing: PricingCatalog | None,
-    catalog: ModelCatalog | None,
-    currency: str,
-) -> _ResolvedPrice | None:
-    """Resolve the per-step price and the tiered band that produced it.
-
-    An explicit flat price is treated as an application override when both sources match in
-    the requested currency; the tier-aware catalog fills models absent from that override.
-    Currency-matching results always beat mismatched results. If neither source uses the
-    requested currency, the flat override is returned first so the caller reports that
-    mismatch. ``tier_max_input_tokens`` is the ceiling of the catalog band used (``None`` for
-    the open-ended tier or a flat price).
-    """
-    candidates: list[_ResolvedPrice] = []
-    for source in (pricing, catalog):
-        if source is None:
-            continue
-        resolved = _match_with_requested_fallback(
-            metrics,
-            lambda model, source=source: _resolve_source_price(
-                source,
-                provider_name=metrics.provider_name,
-                model=model,
-                input_tokens=metrics.input_tokens,
-            ),
-        )
-        if resolved is not None:
-            candidates.append(resolved)
-    if not candidates:
-        return None
-    for resolved in candidates:
-        if resolved.price.currency.upper() == currency.upper():
-            return resolved
-    return candidates[0]
-
-
-def _match_with_requested_fallback(
-    metrics: UsageMetrics, lookup: Callable[[str | None], _MatchT | None]
-) -> _MatchT | None:
-    """Look up the provider-resolved model, or the request only when none was reported."""
-    result = lookup(metrics.model)
-    if result is None and metrics.model is None:
-        result = lookup(metrics.requested_model)
-    return result
+    pricing: PriceBook,
+    effective_on: date,
+) -> _PriceResolution:
+    # A provider-reported model is authoritative for billing. Falling back from a
+    # present-but-unpriced resolved model to the requested model could silently apply
+    # the wrong rate after routing; use the request only when no resolved model exists.
+    billing_model = metrics.model if metrics.model is not None else metrics.requested_model
+    return _resolve_price_book(
+        pricing,
+        provider_name=metrics.provider_name,
+        model=billing_model,
+        input_tokens=metrics.input_tokens,
+        effective_on=effective_on,
+    )
 
 
 def _cost_line_item(
     *,
     model_step: int,
     metrics: UsageMetrics,
-    pricing: PricingCatalog | None,
+    pricing: PriceBook,
     currency: str,
-    catalog: ModelCatalog | None = None,
+    effective_on: date,
 ) -> CostLineItem:
-    resolved = _resolve_price(metrics=metrics, pricing=pricing, catalog=catalog, currency=currency)
-    if resolved is None:
+    resolution = _resolve_price(metrics=metrics, pricing=pricing, effective_on=effective_on)
+    if resolution.resolved is None:
         return _unpriced_line_item(
             model_step=model_step,
             provider_name=metrics.provider_name,
             requested_model=metrics.requested_model,
             model=metrics.model,
             currency=currency,
-            reason="no matching model pricing",
+            reason=resolution.missing_reason or "no matching model pricing",
             metrics=metrics,
         )
-    price = resolved.price
+    price = resolution.resolved
 
     if price.currency.upper() != currency.upper():
         return _unpriced_line_item(
@@ -909,11 +930,13 @@ def _cost_line_item(
         provider_name=metrics.provider_name,
         requested_model=metrics.requested_model,
         model=metrics.model,
-        pricing_provider_name=price.provider_name,
-        pricing_model=price.model,
+        pricing_provider_name=price.price.provider_name,
+        pricing_model=price.matched_model,
         pricing_match=price.match,
-        pricing_provenance=resolved.provenance,
-        pricing_tier_max_input_tokens=resolved.tier_max_input_tokens,
+        pricing_provenance=price.schedule.provenance,
+        pricing_effective_from=price.schedule.effective_from,
+        pricing_effective_through=price.schedule.effective_through,
+        pricing_tier_max_input_tokens=price.tier.max_input_tokens,
         priced=True,
         currency=currency.upper(),
         input_tokens=metrics.input_tokens,
@@ -964,6 +987,13 @@ def _token_cost(tokens: int, price_per_million: Decimal) -> Decimal:
     return Decimal(tokens) * price_per_million / _TOKENS_PER_MILLION
 
 
+def _effective_date(timestamp: datetime) -> date:
+    """Normalize runtime timestamps to the UTC calendar date used by price schedules."""
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        timestamp = timestamp.replace(tzinfo=UTC)
+    return timestamp.astimezone(UTC).date()
+
+
 def _normalize_provider(provider_name: str) -> str:
     """Case/whitespace-insensitive provider key, shared by matching, dedup, and routing."""
     return provider_name.strip().lower()
@@ -986,7 +1016,7 @@ def _best_match_record(
     ``key(record)`` yields ``(provider_name, model, match)`` with ``match`` in
     {"exact", "prefix"}. Provider is compared case-insensitively; an exact match, then a
     longer configured model, wins ties, and the earliest record wins an outright tie — the
-    single matching rule shared by ``PricingCatalog.match_price`` and ``ModelCatalog.resolve``.
+    single matching rule shared by price books and model catalogs.
     Records are read directly (no throwaway projection list per call).
     """
     provider = _normalize_provider(provider_name) if type(provider_name) is str else None
@@ -994,8 +1024,8 @@ def _best_match_record(
     if provider is None or model_name is None:
         return None
 
-    best: tuple[tuple[int, int], int, _MatchT] | None = None
-    for index, record in enumerate(records):
+    best: tuple[tuple[int, int], _MatchT] | None = None
+    for record in records:
         cand_provider, cand_model, cand_match = key(record)
         if _normalize_provider(cand_provider) != provider:
             continue
@@ -1005,8 +1035,8 @@ def _best_match_record(
         ):
             score = (1 if cand_match == "exact" else 0, len(cand_model))
             if best is None or score > best[0]:
-                best = (score, index, record)
-    return None if best is None else best[2]
+                best = (score, record)
+    return None if best is None else best[1]
 
 
 def _optional_nonblank(value: object) -> str | None:

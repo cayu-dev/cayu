@@ -5,8 +5,9 @@ from examples._advanced_support import paired_cost_evidence
 from cayu import (
     Event,
     EventType,
-    ModelCatalog,
-    ModelInfo,
+    ModelPrice,
+    PriceBook,
+    PriceSchedule,
     PriceTier,
     Provenance,
     SessionCostSummary,
@@ -19,7 +20,7 @@ def _cost(
     *,
     session_id: str,
     input_tokens: int,
-    catalog: ModelCatalog,
+    price_book: PriceBook,
     currency: str = "USD",
 ):
     event = Event(
@@ -45,42 +46,46 @@ def _cost(
     return estimate_session_cost(
         session_id=session_id,
         events=[event],
-        catalog=catalog,
+        pricing=price_book,
         currency=currency,
     )
 
 
-def _catalog(
+def _price_book(
     *,
     provider_name: str = "provider",
     model: str = "model",
-    catalog_version: str = "tiered-v1",
-) -> ModelCatalog:
-    return ModelCatalog(
-        catalog_version=catalog_version,
+    price_book_version: str = "tiered-v1",
+) -> PriceBook:
+    return PriceBook(
+        price_book_version=price_book_version,
         generated_at="2026-07-13T00:00:00Z",
-        models=(
-            ModelInfo(
+        prices=(
+            ModelPrice(
                 provider_name=provider_name,
                 model=model,
                 match="exact",
-                pricing=TieredPricing(
-                    standard=(
-                        PriceTier(
-                            max_input_tokens=100,
-                            input_per_million=Decimal("1"),
-                            output_per_million=Decimal("5"),
+                schedules=(
+                    PriceSchedule(
+                        pricing=TieredPricing(
+                            standard=(
+                                PriceTier(
+                                    max_input_tokens=100,
+                                    input_per_million=Decimal("1"),
+                                    output_per_million=Decimal("5"),
+                                ),
+                                PriceTier(
+                                    input_per_million=Decimal("2"),
+                                    output_per_million=Decimal("10"),
+                                ),
+                            )
                         ),
-                        PriceTier(
-                            input_per_million=Decimal("2"),
-                            output_per_million=Decimal("10"),
+                        provenance=Provenance(
+                            source="test fixture",
+                            url="https://example.invalid/pricing",
+                            as_of="2026-07-13",
                         ),
-                    )
-                ),
-                provenance=Provenance(
-                    source="test fixture",
-                    url="https://example.invalid/pricing",
-                    as_of="2026-07-13",
+                    ),
                 ),
             ),
         ),
@@ -91,7 +96,7 @@ def test_paired_cost_evidence_fails_closed_when_pair_is_missing() -> None:
     evidence = paired_cost_evidence(
         candidate=None,
         baseline=(),
-        catalog=_catalog(),
+        price_book=_price_book(),
         baseline_cost_field="paired_baseline_cost",
     )
 
@@ -105,13 +110,13 @@ def test_paired_cost_evidence_fails_closed_without_catalog() -> None:
     evidence = paired_cost_evidence(
         candidate=(),
         baseline=(),
-        catalog=None,
+        price_book=None,
         baseline_cost_field="paired_baseline_cost",
     )
 
     assert evidence == {
         "status": "unpriced",
-        "reason": "no caller-supplied model catalog",
+        "reason": "no caller-supplied price book",
         "candidate_cost": None,
         "paired_baseline_cost": None,
         "savings": None,
@@ -123,7 +128,7 @@ def test_paired_cost_evidence_fails_closed_for_empty_summaries() -> None:
     evidence = paired_cost_evidence(
         candidate=(),
         baseline=(),
-        catalog=_catalog(),
+        price_book=_price_book(),
         baseline_cost_field="paired_baseline_cost",
     )
 
@@ -134,33 +139,33 @@ def test_paired_cost_evidence_fails_closed_for_empty_summaries() -> None:
 
 
 def test_paired_cost_evidence_fails_closed_for_unpriced_attempt() -> None:
-    catalog = _catalog()
-    unpriced_catalog = _catalog(
+    price_book = _price_book()
+    unpriced_price_book = _price_book(
         provider_name="other-provider",
         model="other-model",
-        catalog_version="empty-v1",
+        price_book_version="empty-v1",
     )
     evidence = paired_cost_evidence(
-        candidate=(_cost(session_id="candidate", input_tokens=50, catalog=unpriced_catalog),),
-        baseline=(_cost(session_id="baseline", input_tokens=50, catalog=catalog),),
-        catalog=catalog,
+        candidate=(_cost(session_id="candidate", input_tokens=50, price_book=unpriced_price_book),),
+        baseline=(_cost(session_id="baseline", input_tokens=50, price_book=price_book),),
+        price_book=price_book,
         baseline_cost_field="paired_baseline_cost",
     )
 
     assert evidence == {
         "status": "unpriced",
-        "reason": "the caller-supplied catalog did not price every paired attempt",
+        "reason": "the caller-supplied price book did not price every paired attempt",
         "candidate_cost": None,
         "paired_baseline_cost": None,
         "savings": None,
         "savings_percent": None,
-        "catalog_version": "tiered-v1",
-        "catalog_generated_at": "2026-07-13T00:00:00Z",
+        "price_book_version": "tiered-v1",
+        "price_book_generated_at": "2026-07-13T00:00:00Z",
     }
 
 
 def test_paired_cost_evidence_fails_closed_for_different_currencies() -> None:
-    catalog = _catalog()
+    price_book = _price_book()
     evidence = paired_cost_evidence(
         candidate=(
             SessionCostSummary(
@@ -182,7 +187,7 @@ def test_paired_cost_evidence_fails_closed_for_different_currencies() -> None:
                 total_cost=Decimal("0"),
             ),
         ),
-        catalog=catalog,
+        price_book=price_book,
         baseline_cost_field="paired_baseline_cost",
     )
 
@@ -193,18 +198,18 @@ def test_paired_cost_evidence_fails_closed_for_different_currencies() -> None:
 
 
 def test_paired_cost_evidence_fails_closed_when_attempts_use_different_pricing_tiers() -> None:
-    catalog = _catalog()
+    price_book = _price_book()
 
     evidence = paired_cost_evidence(
-        candidate=(_cost(session_id="candidate", input_tokens=50, catalog=catalog),),
-        baseline=(_cost(session_id="baseline", input_tokens=150, catalog=catalog),),
-        catalog=catalog,
+        candidate=(_cost(session_id="candidate", input_tokens=50, price_book=price_book),),
+        baseline=(_cost(session_id="baseline", input_tokens=150, price_book=price_book),),
+        price_book=price_book,
         baseline_cost_field="paired_baseline_cost",
     )
 
     assert evidence == {
         "status": "unavailable",
         "reason": "paired attempts resolved different pricing rows or tiers",
-        "catalog_version": "tiered-v1",
-        "catalog_generated_at": "2026-07-13T00:00:00Z",
+        "price_book_version": "tiered-v1",
+        "price_book_generated_at": "2026-07-13T00:00:00Z",
     }

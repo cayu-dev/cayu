@@ -10,7 +10,7 @@ from cayu.artifacts import ArtifactScope
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, TextPart, ToolCallPart, ToolResultPart
 from cayu.evals.models import EvalAssertionResult, EvalContext, ProbeRequirements
-from cayu.runtime.costs import ModelCatalog, PricingCatalog, estimate_session_cost
+from cayu.runtime.costs import PriceBook, estimate_session_cost
 from cayu.runtime.sessions import SessionStatus
 
 
@@ -465,7 +465,7 @@ class MaxEstimatedCost(EvalAssertion):
     def __init__(
         self,
         maximum: Decimal | str | int | float,
-        pricing: PricingCatalog | ModelCatalog,
+        pricing: PriceBook,
         *,
         currency: str = "USD",
     ) -> None:

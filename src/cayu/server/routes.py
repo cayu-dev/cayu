@@ -56,8 +56,7 @@ from cayu.runtime.approvals import (
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
 from cayu.runtime.costs import (
     CausalBudgetCostSummary,
-    ModelCatalog,
-    PricingCatalog,
+    PriceBook,
     SessionCostSummary,
 )
 from cayu.runtime.costs import (
@@ -821,12 +820,12 @@ class UpdateSessionMetadataBody(BaseModel):
 
 
 class SessionCostBody(BaseModel):
-    pricing: PricingCatalog | ModelCatalog
+    pricing: PriceBook
     currency: NonBlankString = "USD"
 
 
 class SessionsSummaryBody(BaseModel):
-    pricing: PricingCatalog | ModelCatalog | None = None
+    pricing: PriceBook | None = None
     currency: NonBlankString = "USD"
 
 

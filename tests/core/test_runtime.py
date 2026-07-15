@@ -112,16 +112,15 @@ from cayu.runtime import (
     KnowledgeInjectionPolicy,
     LoopPolicy,
     MessageWindowContextPolicy,
-    ModelCatalog,
     ModelCompactor,
-    ModelInfo,
-    ModelPricing,
+    ModelPrice,
     NativeStructuredOutputUnsupported,
     ObservedDeltaContextEstimator,
     ParameterConstrainedToolPolicy,
     PendingToolApproval,
+    PriceBook,
+    PriceSchedule,
     PriceTier,
-    PricingCatalog,
     PromptCacheCompactor,
     Provenance,
     RecentTurnsContextPolicy,
@@ -2929,9 +2928,9 @@ def fake_budget_limit(
     return BudgetLimit(
         max_estimated_cost=Decimal(max_estimated_cost),
         window=BudgetWindow.all_time() if window is None else window,
-        pricing=PricingCatalog(
+        pricing=PriceBook(
             prices=(
-                ModelPricing(
+                ModelPrice.fixed(
                     provider_name="fake",
                     model="fake-model",
                     input_per_million=Decimal("1"),
@@ -6703,9 +6702,9 @@ def test_cayu_app_budget_limit_fails_closed_when_model_step_is_unpriced():
                 budget_limits=(
                     BudgetLimit(
                         max_estimated_cost=Decimal("100"),
-                        pricing=PricingCatalog(
+                        pricing=PriceBook(
                             prices=(
-                                ModelPricing(
+                                ModelPrice.fixed(
                                     provider_name="fake",
                                     model="other-model",
                                     input_per_million=Decimal("1"),
@@ -6761,9 +6760,9 @@ def test_cayu_app_budget_limit_allows_unpriced_steps_when_explicitly_configured(
                 budget_limits=(
                     BudgetLimit(
                         max_estimated_cost=Decimal("100"),
-                        pricing=PricingCatalog(
+                        pricing=PriceBook(
                             prices=(
-                                ModelPricing(
+                                ModelPrice.fixed(
                                     provider_name="fake",
                                     model="other-model",
                                     input_per_million=Decimal("1"),
@@ -7187,6 +7186,19 @@ def test_cayu_app_budget_reservation_reconciles_model_step():
     assert reserved.payload["actual"] == "1"
     assert reconciled.payload["actual_amount"] == "0.25"
     assert reconciled.payload["released_amount"] == "0.75"
+    assert reconciled.payload["pricing"] == {
+        "provider_name": "fake",
+        "model": "fake-model",
+        "match": "prefix",
+        "provenance": {
+            "source": "application",
+            "url": "application://price-book",
+            "as_of": "unspecified",
+        },
+        "effective_from": None,
+        "effective_through": None,
+        "tier_max_input_tokens": None,
+    }
 
 
 def test_cayu_app_heartbeats_silent_live_budget_reservation() -> None:
@@ -7693,33 +7705,37 @@ def test_cayu_app_tiered_causal_reservation_counts_cached_input_for_tier() -> No
             )
         ]
     )
-    catalog = ModelCatalog(
-        catalog_version="test",
+    pricing = PriceBook(
+        price_book_version="test",
         generated_at="2026-01-01",
-        models=(
-            ModelInfo(
+        prices=(
+            ModelPrice(
                 provider_name="anthropic",
                 model="claude-test",
-                pricing=TieredPricing(
-                    standard=(
-                        PriceTier(
-                            max_input_tokens=200_000,
-                            input_per_million=Decimal("1"),
-                            output_per_million=Decimal("2"),
-                            cache_read_input_per_million=Decimal("0.1"),
+                schedules=(
+                    PriceSchedule(
+                        pricing=TieredPricing(
+                            standard=(
+                                PriceTier(
+                                    max_input_tokens=200_000,
+                                    input_per_million=Decimal("1"),
+                                    output_per_million=Decimal("2"),
+                                    cache_read_input_per_million=Decimal("0.1"),
+                                ),
+                                PriceTier(
+                                    max_input_tokens=None,
+                                    input_per_million=Decimal("10"),
+                                    output_per_million=Decimal("20"),
+                                    cache_read_input_per_million=Decimal("1"),
+                                ),
+                            )
                         ),
-                        PriceTier(
-                            max_input_tokens=None,
-                            input_per_million=Decimal("10"),
-                            output_per_million=Decimal("20"),
-                            cache_read_input_per_million=Decimal("1"),
+                        provenance=Provenance(
+                            source="official",
+                            url="https://example.test/pricing",
+                            as_of="2026-01-01",
                         ),
-                    )
-                ),
-                provenance=Provenance(
-                    source="official",
-                    url="https://example.test/pricing",
-                    as_of="2026-01-01",
+                    ),
                 ),
             ),
         ),
@@ -7732,7 +7748,7 @@ def test_cayu_app_tiered_causal_reservation_counts_cached_input_for_tier() -> No
                     scope="causal",
                     key="job-tiered",
                     max_estimated_cost=Decimal("2"),
-                    pricing=catalog,
+                    pricing=pricing,
                     reservation=BudgetReservation(
                         max_input_tokens=100_000,
                         max_output_tokens=0,
@@ -8351,9 +8367,9 @@ def test_cayu_app_budget_fails_closed_for_unpriced_model_steps():
                 BudgetLimit(
                     scope="app",
                     max_estimated_cost=Decimal("100"),
-                    pricing=PricingCatalog(
+                    pricing=PriceBook(
                         prices=(
-                            ModelPricing(
+                            ModelPrice.fixed(
                                 provider_name="fake",
                                 model="other-model",
                                 input_per_million=Decimal("1"),
@@ -8397,7 +8413,7 @@ def test_cayu_app_budget_fails_closed_for_unpriced_model_steps():
         EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
-    assert "no matching pricing" in first_events[2].payload["message"]
+    assert "no matching model pricing" in first_events[2].payload["message"]
     assert first_events[2].payload["unpriced_model_steps"] == 0
     assert [event.type for event in second_events] == [
         EventType.SESSION_STARTED,
@@ -8407,7 +8423,7 @@ def test_cayu_app_budget_fails_closed_for_unpriced_model_steps():
         EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
-    assert "no matching pricing" in second_events[2].payload["message"]
+    assert "no matching model pricing" in second_events[2].payload["message"]
     assert second_events[2].payload["unpriced_model_steps"] == 0
     assert len(provider.requests) == 0
 

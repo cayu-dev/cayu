@@ -34,8 +34,8 @@ from cayu import (
     LocalWorkspace,
     MaxTotalTokens,
     Message,
-    ModelPricing,
-    PricingCatalog,
+    ModelPrice,
+    PriceBook,
     ReadFileTool,
     ReadKnowledgeTool,
     RunRequest,
@@ -610,9 +610,9 @@ def _budget_limit() -> BudgetLimit:
     return BudgetLimit(
         max_estimated_cost=Decimal("0.001"),
         window=BudgetWindow.all_time(),
-        pricing=PricingCatalog(
+        pricing=PriceBook(
             prices=(
-                ModelPricing(
+                ModelPrice.fixed(
                     provider_name=BUDGET_PROVIDER,
                     model=MODEL,
                     input_per_million=Decimal("1"),

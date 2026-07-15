@@ -64,6 +64,7 @@ jobs:
           name: model-catalog-refresh
           path: |
             src/cayu/data/default_model_catalog.json
+            src/cayu/data/default_price_book.json
             model-catalog-refresh.md
           if-no-files-found: warn
           retention-days: 1
@@ -106,10 +107,12 @@ jobs:
       - name: Open a reviewed catalog PR when records changed
         uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7
         with:
-          add-paths: src/cayu/data/default_model_catalog.json
+          add-paths: |
+            src/cayu/data/default_model_catalog.json
+            src/cayu/data/default_price_book.json
           branch: automation/model-catalog-refresh
           delete-branch: true
-          commit-message: "chore: refresh bundled model catalog"
-          title: "Refresh bundled model catalog"
+          commit-message: "chore: refresh bundled model data"
+          title: "Refresh bundled model catalog and price book"
           body-path: model-catalog-refresh.md
           labels: model-catalog

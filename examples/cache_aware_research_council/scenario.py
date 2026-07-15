@@ -24,7 +24,7 @@ from cayu import (
     CheckpointCompactionContextPolicy,
     EventType,
     Message,
-    ModelCatalog,
+    PriceBook,
     ResumeRequest,
     RunRequest,
     SessionStore,
@@ -131,7 +131,7 @@ async def run_scenario(
     provider: ModelProvider,
     model: str,
     mode: str,
-    model_catalog: ModelCatalog | None = None,
+    price_book: PriceBook | None = None,
 ) -> ScenarioResult:
     prompts = {
         "source": SOURCE_CONTEXT,
@@ -331,7 +331,7 @@ async def run_scenario(
         app,
         baseline_session_ids=[baseline_ids[role] for role in research_roles],
         candidate_session_ids=[branch_ids[role] for role in research_roles],
-        model_catalog=model_catalog,
+        price_book=price_book,
     )
     assertions = {
         "causal_budget_shared": {item.causal_budget_id for item in sessions} == {causal_budget_id},
@@ -421,22 +421,23 @@ async def _paired_cost_evidence(
     *,
     baseline_session_ids: list[str],
     candidate_session_ids: list[str],
-    model_catalog: ModelCatalog | None,
+    price_book: PriceBook | None,
 ) -> dict[str, Any]:
-    if model_catalog is None:
+    if price_book is None:
         return paired_cost_evidence(
             candidate=(),
             baseline=(),
-            catalog=None,
+            price_book=None,
             baseline_cost_field="paired_baseline_cost",
         )
+    selected_price_book = price_book
 
     async def priced_sessions(session_ids: list[str]):
         return [
             estimate_session_cost(
                 session_id=session_id,
                 events=await app.session_store.load_events(session_id),
-                catalog=model_catalog,
+                pricing=selected_price_book,
             )
             for session_id in session_ids
         ]
@@ -446,7 +447,7 @@ async def _paired_cost_evidence(
     return paired_cost_evidence(
         candidate=candidate,
         baseline=baseline,
-        catalog=model_catalog,
+        price_book=selected_price_book,
         baseline_cost_field="paired_baseline_cost",
     )
 

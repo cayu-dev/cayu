@@ -18,7 +18,17 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 
-from cayu import ModelCatalog, default_model_catalog, dump_model_catalog
+from cayu import (
+    ModelCatalog,
+    ModelInfo,
+    ModelPrice,
+    PriceBook,
+    default_model_catalog,
+    default_price_book,
+    dump_model_catalog,
+    dump_price_book,
+)
+from cayu.runtime.costs import resolve_price_book
 from maintenance.model_catalog.browser_verifier import (
     DEFAULT_MAX_VERIFY_COST_USD,
     DEFAULT_VERIFIER_MODEL,
@@ -28,16 +38,24 @@ from maintenance.model_catalog.browser_verifier import (
     verifier_model_info,
 )
 from maintenance.model_catalog.decide import Action, Decision, decide
-from maintenance.model_catalog.diff import format_catalog_diff, markdown_code_span
+from maintenance.model_catalog.diff import (
+    format_catalog_diff,
+    format_price_book_diff,
+    markdown_code_span,
+)
 from maintenance.model_catalog.policy import (
     VERIFY_MAX_AGE_DAYS,
     model_policy_errors,
+    price_policy_errors,
     suspicious_price_changes,
     validate_catalog,
+    validate_price_book,
+    validate_resource_pair,
 )
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 CATALOG_PATH = REPOSITORY_ROOT / "src/cayu/data/default_model_catalog.json"
+PRICE_BOOK_PATH = REPOSITORY_ROOT / "src/cayu/data/default_price_book.json"
 REPORT_PATH = REPOSITORY_ROOT / "model-catalog-refresh.md"
 _REPORT_TEXT_LIMIT = 800
 _EVIDENCE_TEXT_LIMIT = 2_000
@@ -65,14 +83,32 @@ def _safe_report_text(value: str, *, limit: int = _REPORT_TEXT_LIMIT) -> str:
     return re.sub(r"([\\`*_{}\[\]()#+.!|>-])", r"\\\1", html_escaped)
 
 
-def _verifier_rates(catalog: ModelCatalog) -> tuple[float, float]:
-    info = verifier_model_info(
+def _verifier_rates(catalog: ModelCatalog, price_book: PriceBook) -> tuple[float, float]:
+    verifier_model_info(
         catalog,
         provider_name=VERIFIER_PROVIDER_NAME,
         model=DEFAULT_VERIFIER_MODEL,
     )
-    base = info.pricing.base()
-    return float(base.input_per_million), float(base.output_per_million)
+    price = resolve_price_book(
+        price_book,
+        provider_name=VERIFIER_PROVIDER_NAME,
+        model=DEFAULT_VERIFIER_MODEL,
+        input_tokens=0,
+        effective_on=datetime.now(UTC).date(),
+    )
+    if price is None:
+        raise ValueError("The maintenance verifier has no currently applicable price.")
+    return float(price.input_per_million), float(price.output_per_million)
+
+
+def _price_for_model(price_book: PriceBook, model: ModelInfo) -> ModelPrice:
+    for price in price_book.prices:
+        if (
+            price.provider_name.casefold() == model.provider_name.casefold()
+            and price.model == model.model
+        ):
+            return price
+    raise ValueError(f"No canonical bundled price for {model.provider_name}/{model.model}.")
 
 
 def _max_verify_cost() -> float:
@@ -89,11 +125,14 @@ def _max_verify_cost() -> float:
 def _format_report(
     original: ModelCatalog,
     candidate: ModelCatalog,
+    original_price_book: PriceBook,
+    candidate_price_book: PriceBook,
     *,
     flagged: list[_VerificationFlag],
     evidence: list[_VerificationEvidence],
 ) -> str:
     report = format_catalog_diff(original, candidate)
+    report += "\n" + format_price_book_diff(original_price_book, candidate_price_book)
     if flagged:
         report += "\n### Verification flags\n\n"
         for flag in flagged:
@@ -121,6 +160,7 @@ async def _run(
 ) -> None:
     today = datetime.now(UTC).date().isoformat()
     original = default_model_catalog()
+    original_price_book = default_price_book()
     requested = set(only)
     known = {f"{model.provider_name}/{model.model}" for model in original.models}
     unknown = sorted(requested - known)
@@ -128,6 +168,9 @@ async def _run(
         raise ValueError("unknown catalog model(s): " + ", ".join(unknown))
     verifier: BrowserVerifier | None = None
     kept = []
+    price_updates = {
+        (price.provider_name.casefold(), price.model): price for price in original_price_book.prices
+    }
     flagged: list[_VerificationFlag] = []
     evidence: list[_VerificationEvidence] = []
     provider_survivors = Counter(model.provider_name for model in original.models)
@@ -145,20 +188,33 @@ async def _run(
             )
         )
         REPORT_PATH.write_text(
-            _format_report(original, original, flagged=flagged, evidence=evidence),
+            _format_report(
+                original,
+                original,
+                original_price_book,
+                original_price_book,
+                flagged=flagged,
+                evidence=evidence,
+            ),
             encoding="utf-8",
         )
         raise
 
     for model in original.models:
         identity = f"{model.provider_name}/{model.model}"
+        current_price = _price_for_model(original_price_book, model)
         if requested and identity not in requested:
             kept.append(model)
             continue
         decision = (
             Decision(Action.VERIFY, "forced verification")
             if force_all
-            else decide(model, now=today, max_age_days=max_age_days)
+            else decide(
+                model,
+                price=current_price,
+                now=today,
+                max_age_days=max_age_days,
+            )
         )
         if decision.action is Action.ACCEPT:
             kept.append(model)
@@ -177,12 +233,19 @@ async def _run(
                     )
                 )
                 REPORT_PATH.write_text(
-                    _format_report(original, original, flagged=flagged, evidence=evidence),
+                    _format_report(
+                        original,
+                        original,
+                        original_price_book,
+                        original_price_book,
+                        flagged=flagged,
+                        evidence=evidence,
+                    ),
                     encoding="utf-8",
                 )
                 raise
         try:
-            outcome = await verifier.averify(model)
+            outcome = await verifier.averify(model, current_price)
         except Exception as exc:
             kept.append(model)
             flagged.append(
@@ -197,14 +260,30 @@ async def _run(
             input_tokens += outcome.usage.get("input_tokens", 0)
             output_tokens += outcome.usage.get("output_tokens", 0)
         if outcome.verified and outcome.model is not None:
+            verified_price = outcome.price or current_price
             verified += 1
-            evidence.append(
-                _VerificationEvidence(
-                    identity=identity,
-                    source_url=outcome.model.provenance.url,
-                    quote=outcome.evidence,
+            if outcome.evidence:
+                pricing_provenance = outcome.pricing_provenance
+                if pricing_provenance is None:
+                    verified_schedule = verified_price.schedule_on(date.fromisoformat(today))
+                    pricing_provenance = (
+                        verified_schedule or verified_price.schedules[-1]
+                    ).provenance
+                evidence.append(
+                    _VerificationEvidence(
+                        identity=f"{identity} pricing",
+                        source_url=pricing_provenance.url,
+                        quote=outcome.evidence,
+                    )
                 )
-            )
+            if outcome.model_evidence:
+                evidence.append(
+                    _VerificationEvidence(
+                        identity=f"{identity} model facts",
+                        source_url=outcome.model.provenance.url,
+                        quote=outcome.model_evidence,
+                    )
+                )
             if outcome.model.deprecated:
                 if (
                     model.provider_name == VERIFIER_PROVIDER_NAME
@@ -253,6 +332,7 @@ async def _run(
                     )
                 else:
                     provider_survivors[model.provider_name] -= 1
+                    price_updates.pop((model.provider_name.casefold(), model.model), None)
                     flagged.append(
                         _VerificationFlag(
                             identity=identity,
@@ -267,19 +347,31 @@ async def _run(
                     today=date.fromisoformat(today),
                     max_age_days=None,
                 )
-                suspicious = suspicious_price_changes(model, outcome.model)
-                if policy_errors or suspicious:
+                price_errors = price_policy_errors(
+                    verified_price,
+                    today=date.fromisoformat(today),
+                    max_age_days=None,
+                )
+                suspicious = suspicious_price_changes(
+                    model,
+                    outcome.model,
+                    current_price,
+                    verified_price,
+                    effective_on=(outcome.pricing_effective_from or date.fromisoformat(today)),
+                )
+                if policy_errors or price_errors or suspicious:
                     kept.append(model)
                     flagged.append(
                         _VerificationFlag(
                             identity=identity,
                             reason=decision.reason,
                             note="automated update rejected: "
-                            + "; ".join([*policy_errors, *suspicious]),
+                            + "; ".join([*policy_errors, *price_errors, *suspicious]),
                         )
                     )
                 else:
                     kept.append(outcome.model)
+                    price_updates[(model.provider_name.casefold(), model.model)] = verified_price
         else:
             kept.append(model)
             flagged.append(
@@ -310,7 +402,14 @@ async def _run(
                         )
                     )
                     REPORT_PATH.write_text(
-                        _format_report(original, original, flagged=flagged, evidence=evidence),
+                        _format_report(
+                            original,
+                            original,
+                            original_price_book,
+                            original_price_book,
+                            flagged=flagged,
+                            evidence=evidence,
+                        ),
                         encoding="utf-8",
                     )
                     raise
@@ -366,20 +465,35 @@ async def _run(
                 )
 
     candidate_models = tuple(kept)
-    records_changed = candidate_models != original.models
+    candidate_prices = tuple(
+        sorted(price_updates.values(), key=lambda price: (price.provider_name, price.model))
+    )
+    records_changed = (
+        candidate_models != original.models or candidate_prices != original_price_book.prices
+    )
     provisional = ModelCatalog(
         catalog_version=today if records_changed else original.catalog_version,
         generated_at=today if records_changed else original.generated_at,
         models=candidate_models,
+    )
+    provisional_price_book = PriceBook(
+        price_book_version=(today if records_changed else original_price_book.price_book_version),
+        generated_at=today if records_changed else original_price_book.generated_at,
+        prices=candidate_prices,
     )
     # ``model_copy(update=...)`` is intentionally used while merging partial verifier
     # results. Re-parse the complete candidate here so every nested ModelInfo/pricing
     # invariant is enforced before repository data can be written.
     try:
         candidate = ModelCatalog.model_validate(provisional.model_dump(mode="json"))
+        candidate_price_book = PriceBook.model_validate(
+            provisional_price_book.model_dump(mode="json")
+        )
         # A refresh PR may expose stale, inconclusive records for review, but it may never
         # introduce unsupported providers, non-official sources, or invalid catalog structure.
         validate_catalog(candidate, max_age_days=None)
+        validate_price_book(candidate_price_book, max_age_days=None)
+        validate_resource_pair(candidate, candidate_price_book)
         # The refresh may not write a catalog that cannot price and run its own maintenance
         # agent. Replacement is a deliberate code + catalog change, never an automated deletion.
         verifier_model_info(
@@ -396,17 +510,32 @@ async def _run(
             )
         )
         REPORT_PATH.write_text(
-            _format_report(original, provisional, flagged=flagged, evidence=evidence),
+            _format_report(
+                original,
+                provisional,
+                original_price_book,
+                provisional_price_book,
+                flagged=flagged,
+                evidence=evidence,
+            ),
             encoding="utf-8",
         )
         raise
 
-    report = _format_report(original, candidate, flagged=flagged, evidence=evidence)
+    report = _format_report(
+        original,
+        candidate,
+        original_price_book,
+        candidate_price_book,
+        flagged=flagged,
+        evidence=evidence,
+    )
     REPORT_PATH.write_text(report, encoding="utf-8")
     if records_changed:
         CATALOG_PATH.write_text(dump_model_catalog(candidate), encoding="utf-8")
+        PRICE_BOOK_PATH.write_text(dump_price_book(candidate_price_book), encoding="utf-8")
 
-    rate_in, rate_out = _verifier_rates(original)
+    rate_in, rate_out = _verifier_rates(original, original_price_book)
     cost = input_tokens / 1e6 * rate_in + output_tokens / 1e6 * rate_out
     print(
         f"models={len(kept)} attempted={attempted} verified={verified} "

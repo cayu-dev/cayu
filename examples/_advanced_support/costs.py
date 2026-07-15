@@ -4,22 +4,22 @@ from collections.abc import Sequence
 from decimal import Decimal
 from typing import Any, Literal
 
-from cayu import ModelCatalog, SessionCostSummary
+from cayu import PriceBook, SessionCostSummary
 
 
 def paired_cost_evidence(
     *,
     candidate: Sequence[SessionCostSummary] | None,
     baseline: Sequence[SessionCostSummary] | None,
-    catalog: ModelCatalog | None,
+    price_book: PriceBook | None,
     baseline_cost_field: Literal["bounded_baseline_cost", "paired_baseline_cost"],
 ) -> dict[str, Any]:
     """Build one fail-closed, provenance-bearing paired cost envelope."""
     if candidate is None or baseline is None:
         return {"status": "unavailable", "reason": "paired completion usage is missing"}
-    if catalog is None:
+    if price_book is None:
         return _unpriced(
-            reason="no caller-supplied model catalog",
+            reason="no caller-supplied price book",
             baseline_cost_field=baseline_cost_field,
         )
     if not candidate or not baseline:
@@ -27,9 +27,9 @@ def paired_cost_evidence(
     summaries = [*candidate, *baseline]
     if any(summary.unpriced_model_steps for summary in summaries):
         return _unpriced(
-            reason="the caller-supplied catalog did not price every paired attempt",
+            reason="the caller-supplied price book did not price every paired attempt",
             baseline_cost_field=baseline_cost_field,
-            catalog=catalog,
+            price_book=price_book,
         )
 
     currencies = {summary.currency for summary in summaries}
@@ -50,16 +50,20 @@ def paired_cost_evidence(
         return {
             "status": "unavailable",
             "reason": "paired attempts resolved different pricing rows or tiers",
-            "catalog_version": catalog.catalog_version,
-            "catalog_generated_at": catalog.generated_at,
+            "price_book_version": price_book.price_book_version,
+            "price_book_generated_at": price_book.generated_at,
         }
     provider_name, model, match, tier_max_input_tokens = pricing_resolutions.pop()
-    model_info = catalog.resolve(provider_name=provider_name, model=model)
-    if model_info is None:
+    pricing_provenances = {
+        item.pricing_provenance.model_dump_json() if item.pricing_provenance is not None else None
+        for item in line_items
+        if item.priced
+    }
+    if len(pricing_provenances) != 1 or None in pricing_provenances:
         return _unpriced(
             reason="paired pricing provenance could not be resolved",
             baseline_cost_field=baseline_cost_field,
-            catalog=catalog,
+            price_book=price_book,
         )
 
     candidate_total = sum((summary.total_cost for summary in candidate), Decimal("0"))
@@ -77,13 +81,17 @@ def paired_cost_evidence(
         baseline_cost_field: str(baseline_total),
         "savings": str(savings),
         "savings_percent": None if savings_percent is None else str(savings_percent),
-        "catalog_version": catalog.catalog_version,
-        "catalog_generated_at": catalog.generated_at,
+        "price_book_version": price_book.price_book_version,
+        "price_book_generated_at": price_book.generated_at,
         "pricing_provider_name": provider_name,
         "pricing_model": model,
         "pricing_match": match,
         "pricing_tier_max_input_tokens": tier_max_input_tokens,
-        "pricing_provenance": model_info.provenance.model_dump(mode="json"),
+        "pricing_provenance": next(
+            item.pricing_provenance.model_dump(mode="json")
+            for item in line_items
+            if item.pricing_provenance is not None
+        ),
     }
 
 
@@ -91,7 +99,7 @@ def _unpriced(
     *,
     reason: str,
     baseline_cost_field: str,
-    catalog: ModelCatalog | None = None,
+    price_book: PriceBook | None = None,
 ) -> dict[str, Any]:
     evidence: dict[str, Any] = {
         "status": "unpriced",
@@ -101,7 +109,7 @@ def _unpriced(
         "savings": None,
         "savings_percent": None,
     }
-    if catalog is not None:
-        evidence["catalog_version"] = catalog.catalog_version
-        evidence["catalog_generated_at"] = catalog.generated_at
+    if price_book is not None:
+        evidence["price_book_version"] = price_book.price_book_version
+        evidence["price_book_generated_at"] = price_book.generated_at
     return evidence

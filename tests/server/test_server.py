@@ -39,7 +39,6 @@ from cayu import (
     LocalArtifactStore,
     Message,
     MessageRole,
-    ModelCatalog,
     SecretRedactor,
     Task,
     TaskCreate,
@@ -48,7 +47,7 @@ from cayu import (
     ThinkingPart,
     UserInputTool,
     WorkspaceBinding,
-    default_model_catalog,
+    default_price_book,
 )
 from cayu.artifacts import ArtifactListResult, ArtifactMetadata, ArtifactReadResult, ArtifactStore
 from cayu.core.events import Event, EventType
@@ -270,6 +269,43 @@ async def _collect_run(app: CayuApp, request: RunRequest) -> list[Event]:
     return [event async for event in app.run(request)]
 
 
+def _price_book_payload(
+    *,
+    provider_name: str = "fake",
+    model: str = "fake-model",
+    input_per_million: str = "1",
+    output_per_million: str = "1",
+    cache_read_input_per_million: str | None = None,
+    standard: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    tier: dict[str, object] = {
+        "input_per_million": input_per_million,
+        "output_per_million": output_per_million,
+    }
+    if cache_read_input_per_million is not None:
+        tier["cache_read_input_per_million"] = cache_read_input_per_million
+    return {
+        "price_book_version": "test",
+        "generated_at": "2026-07-13",
+        "prices": [
+            {
+                "provider_name": provider_name,
+                "model": model,
+                "schedules": [
+                    {
+                        "pricing": {"standard": standard or [tier]},
+                        "provenance": {
+                            "source": "official",
+                            "url": "https://example.com/pricing",
+                            "as_of": "2026-07-13",
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+
 def test_server_uses_app_task_store_for_runs_and_task_list() -> None:
     app = CayuApp(task_store=InMemoryTaskStore())
     app.register_provider(OneShotProvider(), default=True)
@@ -281,16 +317,7 @@ def test_server_uses_app_task_store_for_runs_and_task_list() -> None:
             dev=True,
             dashboard_config={
                 "apiBaseUrl": "/ignored",
-                "pricingCatalog": {
-                    "prices": [
-                        {
-                            "provider_name": "fake",
-                            "model": "fake-model",
-                            "input_per_million": "1",
-                            "output_per_million": "3",
-                        }
-                    ]
-                },
+                "priceBook": _price_book_payload(output_per_million="3"),
             },
         )
     )
@@ -302,7 +329,7 @@ def test_server_uses_app_task_store_for_runs_and_task_list() -> None:
     assert "root" in dashboard.text
     assert '"basePath":"/cayu"' in dashboard.text
     assert '"apiBaseUrl":"/api"' in dashboard.text
-    assert '"pricingCatalog":{"prices":[{"provider_name":"fake"' in dashboard.text
+    assert '"priceBook":{"price_book_version":"test"' in dashboard.text
 
     with client.stream("POST", "/api/run", json={"prompt": "hello"}) as response:
         assert response.status_code == 200
@@ -316,22 +343,22 @@ def test_server_uses_app_task_store_for_runs_and_task_list() -> None:
     assert tasks[0]["lease_expires_at"] is None
 
 
-def test_server_dashboard_accepts_default_model_catalog_config() -> None:
+def test_server_dashboard_accepts_default_price_book_config() -> None:
     app = CayuApp()
-    catalog = default_model_catalog()
+    price_book = default_price_book()
     client = TestClient(
         create_server(
             app,
             dev=True,
-            dashboard_config={"pricingCatalog": catalog},
+            dashboard_config={"priceBook": price_book},
         )
     )
 
     dashboard = client.get("/cayu/")
 
     assert dashboard.status_code == 200
-    assert f'"catalog_version":"{catalog.catalog_version}"' in dashboard.text
-    assert '"models":[' in dashboard.text
+    assert f'"price_book_version":"{price_book.price_book_version}"' in dashboard.text
+    assert '"prices":[' in dashboard.text
 
 
 def test_server_run_rejection_before_session_creates_no_task() -> None:
@@ -1796,16 +1823,7 @@ def test_server_run_accepts_budget_limits() -> None:
                 {
                     "scope": "session",
                     "max_estimated_cost": "0.000001",
-                    "pricing": {
-                        "prices": [
-                            {
-                                "provider_name": "fake",
-                                "model": "fake-model",
-                                "input_per_million": "1",
-                                "output_per_million": "1",
-                            }
-                        ]
-                    },
+                    "pricing": _price_book_payload(),
                 }
             ],
         },
@@ -2183,37 +2201,22 @@ def test_server_exposes_filtered_sessions_summary() -> None:
             ("order_by", "created_at_asc"),
         ],
         json={
-            "pricing": {
-                "catalog_version": "test",
-                "generated_at": "2026-07-13",
-                "models": [
+            "pricing": _price_book_payload(
+                standard=[
                     {
-                        "provider_name": "fake",
-                        "model": "fake-model",
-                        "pricing": {
-                            "standard": [
-                                {
-                                    "max_input_tokens": 5,
-                                    "input_per_million": "1",
-                                    "output_per_million": "2",
-                                    "cache_read_input_per_million": "0.25",
-                                },
-                                {
-                                    "max_input_tokens": None,
-                                    "input_per_million": "10",
-                                    "output_per_million": "20",
-                                    "cache_read_input_per_million": "2",
-                                },
-                            ]
-                        },
-                        "provenance": {
-                            "source": "official",
-                            "url": "https://example.com/pricing",
-                            "as_of": "2026-07-13",
-                        },
-                    }
-                ],
-            }
+                        "max_input_tokens": 5,
+                        "input_per_million": "1",
+                        "output_per_million": "2",
+                        "cache_read_input_per_million": "0.25",
+                    },
+                    {
+                        "max_input_tokens": None,
+                        "input_per_million": "10",
+                        "output_per_million": "20",
+                        "cache_read_input_per_million": "2",
+                    },
+                ]
+            )
         },
     )
 
@@ -2942,16 +2945,7 @@ def test_server_run_rejects_request_budget_reservations() -> None:
                 {
                     "scope": "session",
                     "max_estimated_cost": "0.01",
-                    "pricing": {
-                        "prices": [
-                            {
-                                "provider_name": "fake",
-                                "model": "fake-model",
-                                "input_per_million": "1",
-                                "output_per_million": "1",
-                            }
-                        ]
-                    },
+                    "pricing": _price_book_payload(),
                     "reservation": {
                         "max_input_tokens": 1,
                         "max_output_tokens": 0,
@@ -3007,17 +3001,10 @@ def test_server_exposes_session_cost_estimate() -> None:
     response = client.post(
         "/api/sessions/cost_1/cost",
         json={
-            "pricing": {
-                "prices": [
-                    {
-                        "provider_name": "fake",
-                        "model": "fake-model",
-                        "input_per_million": "1",
-                        "output_per_million": "2",
-                        "cache_read_input_per_million": "0.25",
-                    }
-                ]
-            }
+            "pricing": _price_book_payload(
+                output_per_million="2",
+                cache_read_input_per_million="0.25",
+            )
         },
     )
 
@@ -3038,7 +3025,13 @@ def test_server_exposes_session_cost_estimate() -> None:
                 "pricing_provider_name": "fake",
                 "pricing_model": "fake-model",
                 "pricing_match": "prefix",
-                "pricing_provenance": None,
+                "pricing_provenance": {
+                    "source": "official",
+                    "url": "https://example.com/pricing",
+                    "as_of": "2026-07-13",
+                },
+                "pricing_effective_from": None,
+                "pricing_effective_through": None,
                 "pricing_tier_max_input_tokens": None,
                 "priced": True,
                 "currency": "USD",
@@ -3058,7 +3051,7 @@ def test_server_exposes_session_cost_estimate() -> None:
     }
 
 
-def test_server_cost_accepts_tiered_model_catalog() -> None:
+def test_server_cost_accepts_tiered_price_book() -> None:
     app = CayuApp()
     app.register_provider(UsageProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -3072,34 +3065,38 @@ def test_server_cost_accepts_tiered_model_catalog() -> None:
             ),
         )
     )
-    catalog = {
-        "catalog_version": "test",
+    price_book = {
+        "price_book_version": "test",
         "generated_at": "2026-07-13",
-        "models": [
+        "prices": [
             {
                 "provider_name": "fake",
                 "model": "fake-model",
-                "pricing": {
-                    "standard": [
-                        {
-                            "max_input_tokens": 5,
-                            "input_per_million": "1",
-                            "output_per_million": "2",
-                            "cache_read_input_per_million": "0.25",
+                "schedules": [
+                    {
+                        "pricing": {
+                            "standard": [
+                                {
+                                    "max_input_tokens": 5,
+                                    "input_per_million": "1",
+                                    "output_per_million": "2",
+                                    "cache_read_input_per_million": "0.25",
+                                },
+                                {
+                                    "max_input_tokens": None,
+                                    "input_per_million": "10",
+                                    "output_per_million": "20",
+                                    "cache_read_input_per_million": "2",
+                                },
+                            ]
                         },
-                        {
-                            "max_input_tokens": None,
-                            "input_per_million": "10",
-                            "output_per_million": "20",
-                            "cache_read_input_per_million": "2",
+                        "provenance": {
+                            "source": "official",
+                            "url": "https://example.com/pricing",
+                            "as_of": "2026-07-13",
                         },
-                    ]
-                },
-                "provenance": {
-                    "source": "official",
-                    "url": "https://example.com/pricing",
-                    "as_of": "2026-07-13",
-                },
+                    }
+                ],
             }
         ],
     }
@@ -3107,27 +3104,20 @@ def test_server_cost_accepts_tiered_model_catalog() -> None:
     client = TestClient(create_server(app, dev=True))
     response = client.post(
         "/api/sessions/tiered_cost/cost",
-        json={"pricing": catalog},
-    )
-    projected_response = client.post(
-        "/api/sessions/tiered_cost/cost",
-        json={
-            "pricing": ModelCatalog.model_validate(catalog)
-            .pricing_catalog()
-            .model_dump(mode="json")
-        },
+        json={"pricing": price_book},
     )
 
     assert response.status_code == 200
-    assert projected_response.status_code == 200
-    assert projected_response.json() == response.json()
     body = response.json()
     assert body["total_cost"] == "0.00010"
     assert body["line_items"][0]["pricing_tier_max_input_tokens"] is None
-    assert body["line_items"][0]["pricing_provenance"] == catalog["models"][0]["provenance"]
+    assert (
+        body["line_items"][0]["pricing_provenance"]
+        == price_book["prices"][0]["schedules"][0]["provenance"]
+    )
 
 
-def test_server_exposes_causal_budget_usage_and_cost_with_tiered_model_catalog() -> None:
+def test_server_exposes_causal_budget_usage_and_cost_with_tiered_price_book() -> None:
     app = CayuApp()
     app.register_provider(UsageProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -3146,36 +3136,40 @@ def test_server_exposes_causal_budget_usage_and_cost_with_tiered_model_catalog()
 
     client = TestClient(create_server(app, dev=True))
     usage_response = client.get("/api/causal-budgets/job_shared/usage")
-    catalog = {
-        "catalog_version": "test",
+    price_book = {
+        "price_book_version": "test",
         "generated_at": "2026-07-13",
-        "models": [
+        "prices": [
             {
                 "provider_name": "fake",
                 "model": "fake-model",
-                "pricing": {
-                    "standard": [
-                        {
-                            "max_input_tokens": 5,
-                            "input_per_million": "1",
-                            "output_per_million": "2",
+                "schedules": [
+                    {
+                        "pricing": {
+                            "standard": [
+                                {
+                                    "max_input_tokens": 5,
+                                    "input_per_million": "1",
+                                    "output_per_million": "2",
+                                },
+                                {
+                                    "max_input_tokens": None,
+                                    "input_per_million": "10",
+                                    "output_per_million": "20",
+                                },
+                            ]
                         },
-                        {
-                            "max_input_tokens": None,
-                            "input_per_million": "10",
-                            "output_per_million": "20",
+                        "provenance": {
+                            "source": "official",
+                            "url": "https://example.com/pricing",
+                            "as_of": "2026-07-13",
                         },
-                    ]
-                },
-                "provenance": {
-                    "source": "official",
-                    "url": "https://example.com/pricing",
-                    "as_of": "2026-07-13",
-                },
+                    }
+                ],
             }
         ],
     }
-    pricing_body = {"pricing": catalog}
+    pricing_body = {"pricing": price_book}
     cost_response = client.post(
         "/api/causal-budgets/job_shared/cost",
         json=pricing_body,
@@ -3270,7 +3264,8 @@ def test_server_exposes_causal_budget_usage_and_cost_with_tiered_model_catalog()
     assert cost_response.json()["model_steps"] == 2
     assert cost_response.json()["total_cost"] == "0.00020"
     assert all(
-        item["line_items"][0]["pricing_provenance"] == catalog["models"][0]["provenance"]
+        item["line_items"][0]["pricing_provenance"]
+        == price_book["prices"][0]["schedules"][0]["provenance"]
         for item in cost_response.json()["session_costs"]
     )
     assert all(
@@ -3314,7 +3309,7 @@ def test_server_rejects_a_merged_flat_and_model_catalog_pricing_body() -> None:
     client = TestClient(create_server(app, dev=True))
     ambiguous = {
         "prices": [],
-        "catalog_version": "test",
+        "price_book_version": "test",
         "generated_at": "2026-07-13",
         "models": [],
     }
@@ -3346,16 +3341,10 @@ def test_server_session_cost_reports_unpriced_steps() -> None:
     response = client.post(
         "/api/sessions/cost_unpriced/cost",
         json={
-            "pricing": {
-                "prices": [
-                    {
-                        "provider_name": "other-provider",
-                        "model": "other-model",
-                        "input_per_million": "1",
-                        "output_per_million": "1",
-                    }
-                ]
-            }
+            "pricing": _price_book_payload(
+                provider_name="other-provider",
+                model="other-model",
+            )
         },
     )
 
@@ -3375,18 +3364,7 @@ def test_server_session_cost_returns_404_for_missing_session() -> None:
     client = TestClient(create_server(app, dev=True))
     response = client.post(
         "/api/sessions/missing/cost",
-        json={
-            "pricing": {
-                "prices": [
-                    {
-                        "provider_name": "fake",
-                        "model": "fake-model",
-                        "input_per_million": "1",
-                        "output_per_million": "1",
-                    }
-                ]
-            }
-        },
+        json={"pricing": _price_book_payload()},
     )
 
     assert response.status_code == 404
@@ -3401,18 +3379,7 @@ def test_server_session_cost_validates_pricing_body() -> None:
     client = TestClient(create_server(app, dev=True))
     response = client.post(
         "/api/sessions/session_1/cost",
-        json={
-            "pricing": {
-                "prices": [
-                    {
-                        "provider_name": "fake",
-                        "model": "fake-model",
-                        "input_per_million": "-1",
-                        "output_per_million": "1",
-                    }
-                ]
-            }
-        },
+        json={"pricing": _price_book_payload(input_per_million="-1")},
     )
 
     assert response.status_code == 422

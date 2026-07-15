@@ -105,15 +105,16 @@ jobs:
       - run: uv run python scripts/check_release_artifacts.py dist/first/*
       - run: uv venv --python 3.11 .release-venv
       - run: uv pip install --python .release-venv/bin/python dist/first/*.whl
-      - name: Check bundled model catalog from the installed wheel
+      - name: Check bundled model catalog and price book from the installed wheel
         run: |
           .release-venv/bin/python - <<'PY'
           import cayu
 
           catalog = cayu.default_model_catalog()
+          price_book = cayu.default_price_book()
           assert cayu.__name__ == "cayu"
           assert catalog.models
-          assert catalog.pricing_catalog().prices
+          assert price_book.prices
           for model in catalog.models:
               assert catalog.match(
                   provider_name=model.provider_name,

@@ -30,7 +30,7 @@ uv run python -m examples.prompt_cache_compaction.app
 The Anthropic mode requires an API key and checks the provider's raw cache
 counters. Cache observability is available only when the raw provider payload
 contains cache fields; normalized zero defaults do not count as provider-reported
-zeroes. Without a caller catalog it reports token categories and an explicit
+zeroes. Without a caller price book it reports token categories and an explicit
 `unpriced` result:
 
 ```bash
@@ -48,14 +48,14 @@ whose capability differs from those defaults. The bounded control receives the
 same neutral thinking configuration as the cache-aware candidate.
 
 To estimate the two first-compaction attempts in dollars, point
-`CAYU_PROMPT_CACHE_MODEL_CATALOG` at an application-owned `ModelCatalog` JSON
-file. The result includes catalog version/generation time and the matched
+`CAYU_PROMPT_CACHE_PRICE_BOOK` at an application-owned `PriceBook` JSON
+file. The result includes price-book version/generation time and the matched
 model's source, URL, and as-of date. A missing or non-matching entry remains
 unpriced rather than being treated as free:
 
 ```bash
 ANTHROPIC_API_KEY=... \
-CAYU_PROMPT_CACHE_MODEL_CATALOG=/path/to/model-catalog.json \
+CAYU_PROMPT_CACHE_PRICE_BOOK=/path/to/price-book.json \
 uv run python -m examples.prompt_cache_compaction.app \
   --mode live --provider anthropic --trials 1
 ```

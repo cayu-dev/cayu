@@ -38,7 +38,7 @@ ANTHROPIC_API_KEY=... uv run python -m examples.prompt_cache_compaction.app \
 The current executable example also runs a bounded `ModelCompactor` control
 from the same captured compactable source and reports that comparison-only
 attempt separately from candidate-session usage. Dollar evidence is emitted
-only when a provenance-bearing caller catalog is supplied. This historical run
+only when a provenance-bearing caller price book is supplied. This historical run
 does not cover the attachment path. That boundary is verified hermetically in
 `tests/core/test_prompt_cache_compactor.py`, including resolved attachment bytes
 on the exact cached request prefix and bounded fallback when provider/model

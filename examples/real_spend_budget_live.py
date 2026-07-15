@@ -19,8 +19,8 @@ from cayu import (
     EventType,
     InMemoryBudgetLedger,
     Message,
-    ModelPricing,
-    PricingCatalog,
+    ModelPrice,
+    PriceBook,
     RunRequest,
 )
 from cayu.providers import ModelProvider, OpenAIProvider
@@ -58,9 +58,9 @@ async def _run_contract(
     model: str,
     provider_options: dict[str, Any],
 ) -> dict[str, object]:
-    pricing = PricingCatalog(
+    pricing = PriceBook(
         prices=(
-            ModelPricing(
+            ModelPrice.fixed(
                 provider_name=provider_name,
                 model=model,
                 input_per_million=INPUT_PER_MILLION,

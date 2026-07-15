@@ -25,6 +25,7 @@ def _valid_wheel_names() -> set[str]:
         "cayu/cli/console.py",
         "cayu/data/__init__.py",
         "cayu/data/default_model_catalog.json",
+        "cayu/data/default_price_book.json",
         "cayu/guides/application-anatomy.md",
         "cayu/guides/authoring.md",
         "cayu/guides/diagnostics.md",
@@ -70,6 +71,7 @@ def test_validate_sdist_rejects_tests_tree(tmp_path) -> None:
         "src/cayu/__init__.py": "",
         "src/cayu/data/__init__.py": "",
         "src/cayu/data/default_model_catalog.json": "{}",
+        "src/cayu/data/default_price_book.json": "{}",
         "tests/test_leaked.py": "",
     }
     with tarfile.open(sdist, "w:gz") as archive:

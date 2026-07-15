@@ -4,7 +4,7 @@
   "producing_commit": "947ae38c4eabfcccb66ab2a778a9ffb875c37f3b",
   "provider_name": "anthropic",
   "model": "claude-haiku-4-5-20251001",
-  "pricing_catalog": "anthropic-haiku-4-5-pricing-2026-07-13.json",
+  "price_book": "anthropic-haiku-4-5-pricing-2026-07-13.json",
   "prompt_cache_compaction": {
     "aggregate": {
       "baseline_cost": "0.025633",

@@ -861,16 +861,18 @@ summary includes `session_ids`, `session_count`, and per-session
 are included. The optional server exposes this grouped view at
 `GET /api/causal-budgets/{causal_budget_id}/usage`.
 
-`PricingCatalog` and `ModelPricing` estimate session cost from durable
-`model.completed` events. Cayu ships a dated `default_model_catalog()` snapshot,
-which callers can pass directly for context-tier pricing; callers can also supply a
-flat `PricingCatalog`. Loading the default is offline and never refreshes data at
+`PriceBook`, `ModelPrice`, and `PriceSchedule` estimate session cost from durable
+`model.completed` events. Cayu ships an independent dated `default_price_book()`
+snapshot. `default_model_catalog()` is metadata-only and is not a pricing source.
+Loading either default is offline and never refreshes data at
 runtime. `CayuApp.get_session_cost(session_id, pricing)` walks each
 model step, matches the provider-returned model to exact or prefix pricing
-entries using raw prefix semantics. The bundled catalog keeps its canonical entries exact
+entries using raw prefix semantics. The bundled price book keeps its canonical entries exact
 and declares narrow snapshot prefixes separately. The provider-returned model is authoritative; the
 requested model is consulted only when the provider reported no model identity. It returns a `SessionCostSummary`
-with per-step `CostLineItem` records. Missing usage or missing pricing is
+with per-step `CostLineItem` records. The applicable schedule is selected from each
+durable event's UTC timestamp, and the line item carries its effective boundaries and
+provenance. Missing usage, unknown identity, expired pricing, or another schedule gap is
 reported as unpriced line items so dashboards and operators can see estimation
 gaps instead of silently treating them as free. If cache read/write prices are
 omitted, the estimator falls back to the configured input-token price for those
@@ -878,7 +880,7 @@ counters.
 
 The optional FastAPI server exposes the same estimator at
 `POST /api/sessions/{session_id}/cost`. The request body supplies a
-`PricingCatalog` and optional `currency`; the response is the JSON form of
+`PriceBook` and optional `currency`; the response is the JSON form of
 `SessionCostSummary`, with decimal cost values serialized as strings for stable
 API output.
 
@@ -943,7 +945,7 @@ For many-session health views, use `POST /api/sessions/summary` with the same
 typed filters, exact labels, and label selectors as `GET /api/sessions`. It
 returns the matched sessions, per-session outcome and event counts, aggregate
 normalized usage, and optional aggregate/per-session cost when the request body
-includes a `PricingCatalog`. This is the right endpoint for app dashboards like
+includes a `PriceBook`. This is the right endpoint for app dashboards like
 "usage and cost for org 123's AP Q2 invoice sessions" where there may not be one
 shared causal budget id.
 
@@ -958,14 +960,14 @@ The `usage` field summarizes model and tool usage for the returned page. The
 `provider_breakdown` and `model_breakdown` fields group `model.completed` usage
 events by provider and provider/model, respectively, so dashboards can show real
 token totals without guessing from session-level model lists. If the request body
-includes a `PricingCatalog`, the `cost` field is populated with estimated cost
+includes a `PriceBook`, the `cost` field is populated with estimated cost
 line items and `unpriced_model_steps`; otherwise `cost` is `null`.
 
 ```bash
 curl -X POST \
   "http://localhost:8000/api/sessions/summary?label=organization=org_123&label_selector=project%20in%20(ap_q2,research)&debug_state=needs_attention" \
   -H "Content-Type: application/json" \
-  -d '{"pricing":{"prices":[{"provider_name":"openai","model":"gpt-5.5","match":"prefix","input_per_million":"2.00","output_per_million":"8.00","cache_read_input_per_million":"0.50"}]}}'
+  -d '{"pricing":{"prices":[{"provider_name":"openai","model":"gpt-5.5","match":"prefix","schedules":[{"pricing":{"standard":[{"input_per_million":"2.00","output_per_million":"8.00","cache_read_input_per_million":"0.50"}]},"provenance":{"source":"application","url":"application://price-book","as_of":"2026-07-14"}}]}]}}'
 ```
 
 For compact health views, use the server's
@@ -985,8 +987,7 @@ deployment.
 
 `RunLimits` provides hard token/tool/time stop controls for runtime calls.
 `BudgetLimit` provides estimated-cost stop controls backed by an explicitly selected
-`PricingCatalog` or tier-aware `ModelCatalog`. Pass `default_model_catalog()` directly so
-context-tier pricing is selected from each completed model step. Request-scoped
+`PriceBook`. Pass `default_price_book()` for Cayu's reviewed default rates. Request-scoped
 `BudgetLimit` entries can be attached through
 `budget_limits` on `RunRequest`, `ResumeRequest`, `DispatchRequest`,
 `ToolApprovalRequest`, and `ToolApprovalRecoveryRequest`. `scope="session"` is
@@ -1029,7 +1030,7 @@ midnight, calendar weeks start on Monday, and calendar months start on the first
 day of the month. Rolling and calendar windows can be used together as separate
 `BudgetLimit` entries when an app needs both spend-velocity protection and
 daily/monthly accounting. Budget limits are estimated from the same normalized
-usage and caller-supplied `PricingCatalog` used by request-scoped
+usage and caller-supplied `PriceBook` used by request-scoped
 `BudgetLimit` entries.
 
 `scope="app"` applies to all sessions and must not set `key`. `scope="agent"`
@@ -1063,7 +1064,7 @@ Strict concurrent hard caps use `BudgetLimit.reservation` plus a
 `BudgetLedger`. A reservation declares the maximum input, output, cache-read,
 and cache-write tokens the application is willing to fund for one provider step.
 Before the provider call, Cayu prices that worst-case step with the same
-pricing source and atomically reserves it in the ledger. For a tiered `ModelCatalog`,
+price book and the ledger's injected clock, then atomically reserves it. For tiered pricing,
 the input-context tier is selected from maximum input plus maximum cache-read and
 cache-write input; each category is then charged at its corresponding rate. Maximum
 output is charged at that tier's output rate but does not select the input-context tier.

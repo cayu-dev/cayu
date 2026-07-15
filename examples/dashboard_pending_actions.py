@@ -32,8 +32,8 @@ from cayu import (
     KnowledgeStatus,
     LocalArtifactStore,
     Message,
-    ModelPricing,
-    PricingCatalog,
+    ModelPrice,
+    PriceBook,
     RunRequest,
     SQLiteKnowledgeStore,
     SQLiteSessionStore,
@@ -54,9 +54,9 @@ from cayu.tools import UserInputTool
 WORKSPACE = Path(__file__).parent / ".examples-workspaces" / "dashboard-pending-actions"
 DB_DIR = WORKSPACE / ".cayu"
 
-DEMO_PRICING = PricingCatalog(
+DEMO_PRICING = PriceBook(
     prices=(
-        ModelPricing(
+        ModelPrice.fixed(
             provider_name="fake",
             model="fake-model",
             input_per_million=Decimal("1.00"),
@@ -740,7 +740,7 @@ def main() -> None:
     server = create_server(
         app,
         dev=True,
-        dashboard_config={"pricingCatalog": DEMO_PRICING.model_dump(mode="json")},
+        dashboard_config={"priceBook": DEMO_PRICING.model_dump(mode="json")},
     )
     host = os.environ.get("CAYU_DASHBOARD_HOST", "127.0.0.1")
     port = int(os.environ.get("CAYU_DASHBOARD_PORT", "8001"))

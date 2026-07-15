@@ -5,8 +5,13 @@ from __future__ import annotations
 import argparse
 from datetime import date
 
-from cayu import default_model_catalog
-from maintenance.model_catalog.policy import CATALOG_MAX_AGE_DAYS, validate_catalog
+from cayu import default_model_catalog, default_price_book
+from maintenance.model_catalog.policy import (
+    CATALOG_MAX_AGE_DAYS,
+    validate_catalog,
+    validate_price_book,
+    validate_resource_pair,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -20,11 +25,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     catalog = default_model_catalog()
+    price_book = default_price_book()
     max_age_days = None if args.skip_staleness else args.max_age_days
     validate_catalog(catalog, today=args.today, max_age_days=max_age_days)
+    validate_price_book(price_book, today=args.today, max_age_days=max_age_days)
+    validate_resource_pair(catalog, price_book)
     print(
-        f"validated {len(catalog.models)} bundled models "
-        f"(catalog {catalog.catalog_version}, "
+        f"validated {len(catalog.models)} bundled models and "
+        f"{len(price_book.prices)} bundled prices "
+        f"(catalog {catalog.catalog_version}, price book {price_book.price_book_version}, "
         f"max age {f'{args.max_age_days}d' if max_age_days is not None else 'not checked'})"
     )
     return 0

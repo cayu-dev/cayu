@@ -139,7 +139,7 @@ Current assertions cover:
 - tool arguments
 - tool result text
 - model step and token ceilings
-- estimated-cost ceilings with a supplied pricing catalog
+- estimated-cost ceilings with a supplied price book
 - workspace file existence/content
 - artifact creation
 

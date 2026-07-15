@@ -22,8 +22,8 @@ from cayu import (
     EventType,
     InMemorySessionStore,
     Message,
-    ModelPricing,
-    PricingCatalog,
+    ModelPrice,
+    PriceBook,
     RunRequest,
     ScriptedModelProvider,
     SessionIdentity,
@@ -61,9 +61,9 @@ def _causal_budget_limit(key: str) -> BudgetLimit:
         scope="causal",
         key=key,
         max_estimated_cost=Decimal("100"),
-        pricing=PricingCatalog(
+        pricing=PriceBook(
             prices=(
-                ModelPricing(
+                ModelPrice.fixed(
                     provider_name="fake",
                     model="fake-model",
                     input_per_million=Decimal("1"),

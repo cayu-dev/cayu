@@ -204,7 +204,7 @@ async function fetchUsageRollup(query: SessionsSummaryQuery): Promise<UsageRollu
         offset: undefined,
       },
       {
-        pricing: dashboardConfig.pricingCatalog,
+        pricing: dashboardConfig.priceBook,
       },
     )
     pages += 1
@@ -477,7 +477,7 @@ export function UsagePage() {
               icon={AlertTriangle}
               label="Unpriced Steps"
               value={formatCount(data.cost?.unpriced_model_steps)}
-              detail={data.cost ? "from pricing catalog" : "cost not estimated"}
+              detail={data.cost ? "from price book" : "cost not estimated"}
               tone={data.cost?.unpriced_model_steps ? "warning" : "default"}
             />
           </div>

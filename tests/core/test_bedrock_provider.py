@@ -18,8 +18,8 @@ from cayu import (
     EventType,
     FileAttachmentKind,
     Message,
-    ModelPricing,
-    PricingCatalog,
+    ModelPrice,
+    PriceBook,
     RunRequest,
     StructuredOutputSpec,
     file_attachment,
@@ -683,9 +683,9 @@ async def test_bedrock_provider_supports_structured_output_via_tools() -> None:
     assert usage_metrics["total_tokens"] == 12
     cost = await app.get_session_cost(
         completed.session_id,
-        PricingCatalog(
+        PriceBook(
             prices=(
-                ModelPricing(
+                ModelPrice.fixed(
                     provider_name="bedrock",
                     model="anthropic.claude-test",
                     input_per_million=Decimal("1"),

@@ -12,11 +12,12 @@ from __future__ import annotations
 
 import re
 from collections.abc import Collection, Mapping
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from cayu import ModelInfo, PriceTier, Provenance
+from cayu import ModelInfo, ModelPrice, PriceSchedule, PriceTier, Provenance
 from maintenance.model_catalog.verify import VerifyOutcome
 
 _PRICE = {"type": ["string", "number", "null"]}
@@ -92,12 +93,29 @@ VERIFIED_SCHEMA: dict[str, Any] = {
             "description": "true if the page marks the model deprecated/retired/legacy.",
         },
         "source_url": {"type": "string", "description": "URL of the official page you read."},
+        "pricing_effective_from": {
+            "type": ["string", "null"],
+            "description": "Published ISO date when the reported rates begin. Use null when "
+            "the rates apply now and the page gives no explicit start date. For an announced "
+            "future transition, report the future rates and their future start date.",
+        },
         "evidence": {
             "type": "string",
             "maxLength": 2000,
             "description": "REQUIRED. Verbatim quote of the exact pricing row(s)/cell(s) you "
             "read — include the model name and every number you reported. This is how the "
             "values are trusted; if you cannot quote it, set confirmed=false.",
+        },
+        "model_source_url": {
+            "type": ["string", "null"],
+            "description": "Official model/capability page used for model facts, or null when "
+            "model facts were not independently verified.",
+        },
+        "model_evidence": {
+            "type": ["string", "null"],
+            "maxLength": 2000,
+            "description": "Verbatim model-fact evidence supporting context/lifecycle updates, "
+            "or null when only pricing was verified.",
         },
         "note": {"type": "string"},
     },
@@ -163,6 +181,7 @@ def normalized_source_url(value: str) -> str:
 def parse_verified(
     data: dict[str, Any],
     original: ModelInfo,
+    original_price: ModelPrice,
     *,
     as_of: str,
     browsed_urls: Collection[str],
@@ -204,6 +223,64 @@ def parse_verified(
     # Provenance is derived from the browser trace, not copied from the model's claim.
     source_url = normalized_source_url(normalized_browsed[normalized_claim])
 
+    model_source = data.get("model_source_url")
+    model_evidence = data.get("model_evidence")
+    model_provenance: Provenance | None = None
+    if model_source is not None or model_evidence is not None:
+        if not isinstance(model_source, str) or not model_source.strip():
+            return VerifyOutcome(
+                verified=False,
+                note="model-fact verification returned no official source URL",
+            )
+        if not isinstance(model_evidence, str) or not model_evidence.strip():
+            return VerifyOutcome(
+                verified=False,
+                note="model-fact verification returned no grounding evidence",
+            )
+        normalized_model_claim = normalized_source_url(model_source)
+        if normalized_model_claim not in normalized_browsed:
+            return VerifyOutcome(
+                verified=False,
+                note="claimed model source URL was not visited by the page-reading tools",
+            )
+        model_provenance = Provenance(
+            source="official",
+            url=normalized_source_url(normalized_browsed[normalized_model_claim]),
+            as_of=as_of,
+        )
+
+    try:
+        verified_on = date.fromisoformat(as_of)
+    except ValueError:
+        return VerifyOutcome(verified=False, note="as_of is not an ISO date")
+    raw_pricing_effective_from = data.get("pricing_effective_from")
+    if raw_pricing_effective_from is None:
+        pricing_effective_from = verified_on
+    elif isinstance(raw_pricing_effective_from, str):
+        try:
+            pricing_effective_from = date.fromisoformat(raw_pricing_effective_from)
+        except ValueError:
+            return VerifyOutcome(
+                verified=False,
+                note="pricing_effective_from is not an ISO date",
+            )
+    else:
+        return VerifyOutcome(
+            verified=False,
+            note="pricing_effective_from must be an ISO date or null",
+        )
+    if pricing_effective_from == date.min:
+        return VerifyOutcome(
+            verified=False,
+            note="pricing_effective_from must be later than 0001-01-01",
+        )
+
+    target_schedule = original_price.schedule_on(pricing_effective_from)
+    reference_schedule = target_schedule or original_price.schedule_on(verified_on)
+    if reference_schedule is None:
+        reference_schedule = original_price.schedules[-1]
+    original_pricing = reference_schedule.pricing
+
     # An explicit null/empty context_tiers value means flat pricing and removes curated upper
     # tiers. Missing or malformed output is not authoritative and retains them. A valid non-empty
     # list replaces the complete tier set.
@@ -224,7 +301,7 @@ def parse_verified(
         tiers.sort(key=lambda t: (t.max_input_tokens is None, t.max_input_tokens or 0))
         new_standard = tuple(tiers)
     else:
-        base = original.pricing.base()
+        base = original_pricing.base()
         base_over: dict[str, Any] = {}
         for field, src in (
             ("input_per_million", "input_per_million"),
@@ -242,7 +319,7 @@ def parse_verified(
         )
         new_standard = (
             base.model_copy(update=base_over),
-            *(original.pricing.standard[1:] if keep_upper_tiers else ()),
+            *(original_pricing.standard[1:] if keep_upper_tiers else ()),
         )
 
     pricing_over: dict[str, Any] = {"standard": new_standard}
@@ -275,21 +352,84 @@ def parse_verified(
             pricing_over["batch"] = None
         elif bi is not None and bo is not None:
             pricing_over["batch"] = PriceTier(input_per_million=bi, output_per_million=bo)
-    new_pricing = original.pricing.model_copy(update=pricing_over)
+    new_pricing = original_pricing.model_copy(update=pricing_over)
 
-    model_updates: dict[str, Any] = {
-        "pricing": new_pricing,
-        "provenance": Provenance(source="official", url=source_url, as_of=as_of),
-    }
-    if type(data.get("context_window")) is int:
-        model_updates["context_window"] = data["context_window"]
-    if "deprecated" in data:
-        model_updates["deprecated"] = bool(data["deprecated"])
+    pricing_provenance = Provenance(source="official", url=source_url, as_of=as_of)
+    if target_schedule is None:
+        future_starts = tuple(
+            schedule.effective_from
+            for schedule in original_price.schedules
+            if schedule.effective_from is not None
+            and schedule.effective_from > pricing_effective_from
+        )
+        updated_schedule = PriceSchedule(
+            effective_from=pricing_effective_from,
+            effective_through=(min(future_starts) - timedelta(days=1) if future_starts else None),
+            pricing=new_pricing,
+            provenance=pricing_provenance,
+        )
+        updated_schedules = tuple(
+            sorted(
+                (*original_price.schedules, updated_schedule),
+                key=lambda schedule: schedule.effective_from or date.min,
+            )
+        )
+    else:
+        target_index = next(
+            index
+            for index, schedule in enumerate(original_price.schedules)
+            if schedule is target_schedule
+        )
+        if (
+            new_pricing != target_schedule.pricing
+            and target_schedule.effective_from != pricing_effective_from
+        ):
+            previous_schedule = target_schedule.model_copy(
+                update={"effective_through": pricing_effective_from - timedelta(days=1)}
+            )
+            updated_schedule = PriceSchedule(
+                effective_from=pricing_effective_from,
+                effective_through=target_schedule.effective_through,
+                pricing=new_pricing,
+                provenance=pricing_provenance,
+            )
+            updated_schedules = (
+                *original_price.schedules[:target_index],
+                previous_schedule,
+                updated_schedule,
+                *original_price.schedules[target_index + 1 :],
+            )
+        else:
+            updated_schedule = target_schedule.model_copy(
+                update={"pricing": new_pricing, "provenance": pricing_provenance}
+            )
+            updated_schedules = (
+                *original_price.schedules[:target_index],
+                updated_schedule,
+                *original_price.schedules[target_index + 1 :],
+            )
+    corrected_price = ModelPrice.model_validate(
+        original_price.model_copy(update={"schedules": updated_schedules}).model_dump(mode="json")
+    )
 
-    corrected = original.model_copy(update=model_updates)
+    model_updates: dict[str, Any] = {}
+    if model_provenance is not None:
+        model_updates["provenance"] = model_provenance
+        if type(data.get("context_window")) is int:
+            model_updates["context_window"] = data["context_window"]
+        if "deprecated" in data:
+            model_updates["deprecated"] = bool(data["deprecated"])
+
+    corrected = ModelInfo.model_validate(
+        original.model_copy(update=model_updates).model_dump(mode="json")
+    )
     return VerifyOutcome(
         verified=True,
         model=corrected,
+        price=corrected_price,
         note=data.get("note", "official-verified"),
         evidence=evidence.strip(),
+        pricing_provenance=pricing_provenance,
+        pricing_effective_from=pricing_effective_from,
+        model_evidence=(model_evidence.strip() if isinstance(model_evidence, str) else ""),
     )

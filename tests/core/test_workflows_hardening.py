@@ -54,8 +54,8 @@ from cayu.runtime import (
     EventQuery,
     IncompleteSessionsRecoveryRequest,
     InMemoryEventSink,
-    ModelPricing,
-    PricingCatalog,
+    ModelPrice,
+    PriceBook,
     RetryPolicy,
     RunLimits,
     RunRequest,
@@ -177,9 +177,9 @@ def _budget_limit(max_estimated_cost: str = "1.00") -> BudgetLimit:
     return BudgetLimit(
         max_estimated_cost=Decimal(max_estimated_cost),
         window=BudgetWindow.all_time(),
-        pricing=PricingCatalog(
+        pricing=PriceBook(
             prices=(
-                ModelPricing(
+                ModelPrice.fixed(
                     provider_name="scripted",
                     model="scripted-model",
                     input_per_million=Decimal("1"),

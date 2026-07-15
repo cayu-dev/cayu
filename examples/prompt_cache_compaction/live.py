@@ -13,7 +13,7 @@ from cayu import (
     CachePolicy,
     ThinkingConfig,
 )
-from cayu.runtime import load_model_catalog
+from cayu.runtime import load_price_book
 
 if TYPE_CHECKING:
     from examples._advanced_support import ScenarioResult
@@ -51,8 +51,8 @@ async def run(root: Path, provider_name: str | None = None) -> ScenarioResult:
         )
     )
     baseline_provider = AnthropicProvider()
-    catalog_path = os.environ.get("CAYU_PROMPT_CACHE_MODEL_CATALOG")
-    model_catalog = load_model_catalog(Path(catalog_path)) if catalog_path else None
+    price_book_path = os.environ.get("CAYU_PROMPT_CACHE_PRICE_BOOK")
+    price_book = load_price_book(Path(price_book_path)) if price_book_path else None
     return await run_scenario(
         root,
         provider=provider,
@@ -68,7 +68,7 @@ async def run(root: Path, provider_name: str | None = None) -> ScenarioResult:
             "cache counters; do not repeat it in responses."
         ),
         thinking=thinking,
-        model_catalog=model_catalog,
+        price_book=price_book,
     )
 
 

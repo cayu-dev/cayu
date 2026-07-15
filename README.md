@@ -1328,13 +1328,12 @@ bounded session state, event, and transcript endpoints. Terminal stream-error
 text is processed by the application's configured secret redactor and bounded
 before it is exposed to the authenticated control plane.
 
-Apps that want the bundled dashboard to estimate cost can inject a pricing
-catalog through `dashboard_config={"pricingCatalog": pricing.model_dump(mode="json")}`.
+Apps that want the bundled dashboard to estimate cost can inject a price book
+through `dashboard_config={"priceBook": prices.model_dump(mode="json")}`.
 For Cayu's reviewed default snapshot, use
-`default_model_catalog().model_dump(mode="json")` as that value so dashboard estimates
-retain context tiers and the configuration is explicitly JSON-compatible.
-The dashboard sends that catalog to summary endpoints when rendering usage
-views. The app still chooses the catalog explicitly; Cayu never fetches prices
+`default_price_book().model_dump(mode="json")` so the configuration is explicitly
+JSON-compatible. The dashboard sends that price book to summary endpoints when rendering usage
+views. The app still chooses the prices explicitly; Cayu never fetches prices
 or changes them at runtime.
 
 Local generated agents should keep their runtime portable: put agent
@@ -1448,10 +1447,10 @@ Estimate session cost from the same durable usage events with Cayu's bundled,
 dated snapshot:
 
 ```python
-from cayu import default_model_catalog
+from cayu import default_price_book
 
-catalog = default_model_catalog()
-cost = await app.get_session_cost("session_123", catalog)
+prices = default_price_book()
+cost = await app.get_session_cost("session_123", prices)
 
 print(cost.total_cost)
 print(cost.unpriced_model_steps)
@@ -1459,9 +1458,9 @@ print(cost.unpriced_model_steps)
 
 The loader is explicit and offline. It reads the snapshot shipped in the installed
 Cayu release; it never contacts providers or updates itself while an application is
-running. Every full catalog record carries its official source URL and verification
-date. The default snapshot covers a deliberately small set of current, tool-capable
-models under provider keys `openai`, `anthropic`, `google`, `vertex`, and `azure`.
+running. Every price schedule carries its official source URL, verification date, and
+validity window. The default price book covers a deliberately small set under provider
+keys `openai`, `anthropic`, `google`, `vertex`, and `azure`.
 Unknown providers and models remain unpriced rather than being treated as free.
 
 Applications can replace the bundled prices with their own account, region, or
@@ -1470,11 +1469,11 @@ contract prices:
 ```python
 from decimal import Decimal
 
-from cayu import ModelPricing, PricingCatalog
+from cayu import ModelPrice, PriceBook
 
-pricing = PricingCatalog(
+pricing = PriceBook(
     prices=(
-        ModelPricing(
+        ModelPrice.fixed(
             provider_name="openai",
             model="gpt-5.5",
             input_per_million=Decimal("2.00"),
@@ -1490,7 +1489,7 @@ print(cost.total_cost)
 print(cost.unpriced_model_steps)
 ```
 
-One-off `ModelPricing` entries default to raw prefix matching, so callers must choose narrow
+One-off `ModelPrice` entries default to raw prefix matching, so callers must choose narrow
 stable keys or set `match="exact"` for one literal ID. The bundled catalog uses exact
 canonical model IDs, exact aliases, and explicit narrow `match_prefixes` for known provider
 snapshot forms. For example, the exact `gpt-5.6` alias resolves to `gpt-5.6-sol` without pricing
@@ -1509,13 +1508,12 @@ cache prices when your provider or account charges them differently.
 Provider registration names are part of pricing identity. Gemini-compatible providers must be
 registered as `google` to use the bundled Google rows; older applications using `gemini` should
 rename the provider or supply custom prices under that name. Model aliases are exact model keys
-and do not alias provider names. The low-level cost estimators may receive both a model catalog and a
-flat catalog; a same-currency flat entry then acts as the explicit override, and the model catalog
-fills unmatched models. Public app cost and budget APIs normally receive one complete source.
+and do not alias provider names. A custom `PriceBook` is a complete replacement; Cayu does not
+implicitly overlay it on the bundled prices.
 
 The optional server exposes the same estimate at
 `POST /api/sessions/{session_id}/cost`. The request body supplies the selected
-pricing source; clients can send the bundled `ModelCatalog` or an app-owned flat catalog:
+price book:
 
 ```json
 {
@@ -1525,9 +1523,24 @@ pricing source; clients can send the bundled `ModelCatalog` or an app-owned flat
         "provider_name": "openai",
         "model": "gpt-5.5",
         "match": "prefix",
-        "input_per_million": "2.00",
-        "output_per_million": "8.00",
-        "cache_read_input_per_million": "0.50"
+        "schedules": [
+          {
+            "pricing": {
+              "standard": [
+                {
+                  "input_per_million": "2.00",
+                  "output_per_million": "8.00",
+                  "cache_read_input_per_million": "0.50"
+                }
+              ]
+            },
+            "provenance": {
+              "source": "application",
+              "url": "application://price-book",
+              "as_of": "2026-07-14"
+            }
+          }
+        ]
       }
     ]
   }
@@ -1540,8 +1553,8 @@ For grouped work-item cost, send the same pricing body to
 fields as session cost summaries, plus `session_costs` for per-session
 breakdown.
 
-See [Model catalog](docs/model-catalog.md) for coverage, provenance, overrides,
-budget use, and the reviewed refresh/release process.
+See [Model catalog and price book](docs/model-catalog.md) for coverage, provenance,
+effective dates, budget use, and the reviewed refresh/release process.
 
 For grouped work-item status plus cost, send the same body to
 `POST /api/causal-budgets/{causal_budget_id}/summary`.
@@ -1571,9 +1584,9 @@ tool-approval continuation requests:
 ```python
 from decimal import Decimal
 
-from cayu import BudgetLimit, Message, RunLimits, RunRequest, default_model_catalog
+from cayu import BudgetLimit, Message, RunLimits, RunRequest, default_price_book
 
-catalog = default_model_catalog()
+prices = default_price_book()
 
 request = RunRequest(
     agent_name="assistant",
@@ -1588,7 +1601,7 @@ request = RunRequest(
         BudgetLimit(
             scope="session",
             max_estimated_cost=Decimal("0.50"),
-            pricing=catalog,
+            pricing=prices,
         ),
     ),
 )
@@ -1605,8 +1618,8 @@ enforces a lifetime estimated-cost budget, while `scope="run"` compares only
 estimated cost added during the current invocation.
 
 Budget limits are estimates derived from normalized usage metrics and the
-pricing source supplied by your app. Passing a `ModelCatalog` retains context tiers;
-passing a flat `PricingCatalog` uses its configured flat rates. They are not provider invoices. By
+price book supplied by your app. `ModelCatalog` is metadata-only and is not accepted by cost or
+budget APIs. Estimates are not provider invoices. By
 default, request-scoped interrupt budgets fail closed when a newly observed
 model step has no matching pricing entry, because Cayu cannot prove that the
 budget is still safe. Request-scoped notify budgets emit `budget.limit_reached`
@@ -1696,7 +1709,7 @@ app = CayuApp(
 )
 ```
 
-App budgets use the same caller-supplied pricing source as request
+App budgets use the same caller-supplied price book as request
 `BudgetLimit` entries. Rolling windows are UTC timestamp duration windows over
 durable model events, for example "the last hour." Calendar windows evaluate the
 current local `day`, `week`, or `month` for an explicit IANA timezone; days reset

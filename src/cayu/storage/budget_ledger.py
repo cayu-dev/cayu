@@ -82,16 +82,16 @@ class SQLiteBudgetLedger(BudgetLedger):
         agent_name = require_clean_nonblank(agent_name, "agent_name")
         provider_name = require_clean_nonblank(provider_name, "provider_name")
         model = require_clean_nonblank(model, "model")
-        requested = _budget_reservation_amount(
-            limit=limit,
-            provider_name=provider_name,
-            model=model,
-        )
-
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
                 now = self._clock()
+                requested = _budget_reservation_amount(
+                    limit=limit,
+                    provider_name=provider_name,
+                    model=model,
+                    effective_at=now,
+                )
                 self._reap_expired_unlocked(now, limit=limit)
                 current = self._used_amount_unlocked(limit, now=now)
                 projected = current + requested

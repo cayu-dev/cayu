@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from subprocess import CompletedProcess
@@ -17,12 +17,16 @@ from cayu import (
     InMemorySessionStore,
     ModelCatalog,
     ModelInfo,
+    ModelPrice,
     ModelProvider,
     ModelRequest,
     ModelStreamEvent,
+    PriceBook,
     PriceTier,
     ToolContext,
     default_model_catalog,
+    default_price_book,
+    estimate_session_cost,
 )
 from maintenance.model_catalog import agent_tools as catalog_tools
 from maintenance.model_catalog import browser, refresh, search
@@ -33,6 +37,7 @@ from maintenance.model_catalog.browser_verifier import (
     browsed_urls,
     verifier_model_info,
 )
+from maintenance.model_catalog.decide import Action, decide
 from maintenance.model_catalog.diff import catalog_diff, format_catalog_diff, markdown_code_span
 from maintenance.model_catalog.guidance import WORKSPACE_GUIDANCE
 from maintenance.model_catalog.policy import (
@@ -40,8 +45,11 @@ from maintenance.model_catalog.policy import (
     VERIFY_MAX_AGE_DAYS,
     VERIFY_SCHEDULE_DAYS,
     model_policy_errors,
+    price_policy_errors,
     suspicious_price_changes,
     validate_catalog,
+    validate_price_book,
+    validate_resource_pair,
 )
 from maintenance.model_catalog.security import PROVIDER_METADATA_KEY, validate_official_url
 from maintenance.model_catalog.verified import VERIFIED_SCHEMA, _dec, parse_verified
@@ -52,6 +60,34 @@ def _provider_model(provider_name: str) -> ModelInfo:
     return next(
         model for model in default_model_catalog().models if model.provider_name == provider_name
     )
+
+
+def _provider_price(provider_name: str) -> ModelPrice:
+    model = _provider_model(provider_name)
+    return next(
+        price
+        for price in default_price_book().prices
+        if price.provider_name == model.provider_name and price.model == model.model
+    )
+
+
+_VERIFICATION_DATE = date(2026, 7, 13)
+
+
+def _pricing(price: ModelPrice):
+    schedule = price.schedule_on(_VERIFICATION_DATE)
+    assert schedule is not None
+    return schedule.pricing
+
+
+def _with_pricing(price: ModelPrice, pricing) -> ModelPrice:
+    active = price.schedule_on(_VERIFICATION_DATE)
+    assert active is not None
+    schedules = tuple(
+        schedule.model_copy(update={"pricing": pricing}) if schedule is active else schedule
+        for schedule in price.schedules
+    )
+    return price.model_copy(update={"schedules": schedules})
 
 
 _OPENAI_PAGE = "https://developers.openai.com/api/pricing"
@@ -67,7 +103,35 @@ def _browser_context(provider_name: str = "openai") -> ToolContext:
 
 def test_default_catalog_satisfies_release_policy() -> None:
     catalog = default_model_catalog()
+    price_book = default_price_book()
     validate_catalog(catalog, today=date.fromisoformat(catalog.generated_at))
+    validate_price_book(price_book, today=date.fromisoformat(price_book.generated_at))
+    validate_resource_pair(catalog, price_book)
+
+
+def test_resource_pair_rejects_undocumented_price_only_identity() -> None:
+    catalog = default_model_catalog()
+    price_book = default_price_book()
+    gateway_price = ModelPrice.fixed(
+        provider_name="openai",
+        model="gateway-billing-only",
+        input_per_million=Decimal("1"),
+        output_per_million=Decimal("2"),
+    )
+    candidate = price_book.model_copy(update={"prices": (*price_book.prices, gateway_price)})
+
+    with pytest.raises(ValueError, match="undocumented bundled price-only identities"):
+        validate_resource_pair(catalog, candidate)
+
+    validate_resource_pair(
+        catalog,
+        candidate,
+        allowed_price_only_identities={("openai", "gateway-billing-only")},
+    )
+
+    missing_canonical_price = price_book.model_copy(update={"prices": price_book.prices[1:]})
+    with pytest.raises(ValueError, match="bundled model identities without canonical prices"):
+        validate_resource_pair(catalog, missing_canonical_price)
 
 
 def test_release_policy_rejects_stale_provenance() -> None:
@@ -188,6 +252,9 @@ def test_verifier_schema_is_strict_and_covers_rich_catalog_pricing() -> None:
         "cache_write_1h_per_million",
         "context_tiers",
         "evidence",
+        "pricing_effective_from",
+        "model_source_url",
+        "model_evidence",
     } <= set(VERIFIED_SCHEMA["properties"])
 
 
@@ -216,6 +283,7 @@ def test_search_results_decode_ddg_target_exactly_once() -> None:
 
 def test_verified_official_data_updates_the_canonical_model_info() -> None:
     original = _provider_model("anthropic")
+    original_price = _provider_price("anthropic")
 
     outcome = parse_verified(
         {
@@ -230,9 +298,13 @@ def test_verified_official_data_updates_the_canonical_model_info() -> None:
             "batch_output_per_million": "8",
             "deprecated": False,
             "source_url": "https://platform.claude.com/docs/pricing",
+            "pricing_effective_from": None,
             "evidence": "Claude Sonnet pricing row",
+            "model_source_url": "https://platform.claude.com/docs/pricing",
+            "model_evidence": "Claude Sonnet context window 1000001",
         },
         original,
+        original_price,
         as_of="2026-07-13",
         browsed_urls={"https://platform.claude.com/docs/pricing"},
         browsed_pricing_modes={"https://platform.claude.com/docs/pricing": {"standard", "batch"}},
@@ -241,12 +313,249 @@ def test_verified_official_data_updates_the_canonical_model_info() -> None:
     assert outcome.verified is True
     assert outcome.evidence == "Claude Sonnet pricing row"
     assert outcome.model is not None
+    assert outcome.price is not None
     assert outcome.model.context_window == 1_000_001
-    assert outcome.model.pricing.base().input_per_million == Decimal("3.25")
-    assert outcome.model.pricing.batch is not None
-    assert outcome.model.pricing.batch.output_per_million == Decimal("8")
+    pricing = _pricing(outcome.price)
+    assert pricing.base().input_per_million == Decimal("3.25")
+    assert pricing.batch is not None
+    assert pricing.batch.output_per_million == Decimal("8")
     assert outcome.model.provenance.source == "official"
     assert outcome.model.provenance.as_of == "2026-07-13"
+
+
+def test_verified_price_change_preserves_historical_event_cost() -> None:
+    model = _provider_model("openai")
+    original_price = _provider_price("openai")
+    original_pricing = _pricing(original_price)
+    original_price = _with_pricing(
+        original_price,
+        original_pricing.model_copy(
+            update={
+                "standard": (
+                    original_pricing.base().model_copy(
+                        update={
+                            "input_per_million": Decimal("1"),
+                            "output_per_million": Decimal("4"),
+                        }
+                    ),
+                )
+            }
+        ),
+    )
+    historical = Event(
+        type=EventType.MODEL_COMPLETED,
+        session_id="historical",
+        timestamp=datetime(2026, 7, 12, tzinfo=UTC),
+        payload={
+            "usage_metrics": {
+                "provider_name": model.provider_name,
+                "model": model.model,
+                "input_tokens": 1_000_000,
+                "output_tokens": 0,
+                "total_tokens": 1_000_000,
+            }
+        },
+    )
+    current = historical.model_copy(
+        update={"session_id": "current", "timestamp": datetime(2026, 7, 13, tzinfo=UTC)}
+    )
+    before = estimate_session_cost(
+        session_id="historical",
+        events=[historical],
+        pricing=PriceBook(prices=(original_price,)),
+    )
+
+    outcome = parse_verified(
+        _verified_payload(input_per_million="2", output_per_million="8"),
+        model,
+        original_price,
+        as_of="2026-07-13",
+        browsed_urls={"https://openai.com/api/pricing/"},
+        browsed_pricing_modes={"https://openai.com/api/pricing/": {"standard"}},
+    )
+
+    assert outcome.verified and outcome.price is not None
+    after = estimate_session_cost(
+        session_id="historical",
+        events=[historical, current],
+        pricing=PriceBook(prices=(outcome.price,)),
+    )
+    assert before.total_cost == Decimal("1")
+    assert [item.total_cost for item in after.line_items] == [Decimal("1"), Decimal("2")]
+    assert outcome.price.schedules[0].effective_through == date(2026, 7, 12)
+    assert outcome.price.schedules[1].effective_from == date(2026, 7, 13)
+
+
+def test_pricing_only_verification_does_not_refresh_model_fact_provenance() -> None:
+    model = _provider_model("openai")
+
+    outcome = parse_verified(
+        _verified_payload(context_window=(model.context_window or 1) + 1),
+        model,
+        _provider_price("openai"),
+        as_of="2026-07-13",
+        browsed_urls={"https://openai.com/api/pricing/"},
+        browsed_pricing_modes={"https://openai.com/api/pricing/": {"standard"}},
+    )
+
+    assert outcome.verified and outcome.model is not None
+    assert outcome.model == model
+    assert outcome.model_evidence == ""
+    assert outcome.pricing_provenance is not None
+    assert outcome.pricing_provenance.as_of == "2026-07-13"
+
+
+def test_verified_future_transition_creates_a_future_schedule() -> None:
+    model = _provider_model("openai")
+    original_price = _provider_price("openai")
+    original_pricing = _pricing(original_price)
+    original_price = _with_pricing(
+        original_price,
+        original_pricing.model_copy(
+            update={
+                "standard": (
+                    original_pricing.base().model_copy(
+                        update={
+                            "input_per_million": Decimal("1"),
+                            "output_per_million": Decimal("4"),
+                        }
+                    ),
+                )
+            }
+        ),
+    )
+
+    outcome = parse_verified(
+        _verified_payload(
+            input_per_million="2",
+            output_per_million="8",
+            pricing_effective_from="2026-09-01",
+        ),
+        model,
+        original_price,
+        as_of="2026-07-13",
+        browsed_urls={"https://openai.com/api/pricing/"},
+        browsed_pricing_modes={"https://openai.com/api/pricing/": {"standard"}},
+    )
+
+    assert outcome.verified and outcome.price is not None
+    assert outcome.price.schedules[0].effective_through == date(2026, 8, 31)
+    assert outcome.price.schedules[1].effective_from == date(2026, 9, 1)
+    events = [
+        Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id="transition",
+            timestamp=timestamp,
+            payload={
+                "usage_metrics": {
+                    "provider_name": model.provider_name,
+                    "model": model.model,
+                    "input_tokens": 1_000_000,
+                    "output_tokens": 0,
+                    "total_tokens": 1_000_000,
+                }
+            },
+        )
+        for timestamp in (
+            datetime(2026, 8, 31, 23, 59, tzinfo=UTC),
+            datetime(2026, 9, 1, tzinfo=UTC),
+        )
+    ]
+    summary = estimate_session_cost(
+        session_id="transition",
+        events=events,
+        pricing=PriceBook(prices=(outcome.price,)),
+    )
+    assert [item.total_cost for item in summary.line_items] == [Decimal("1"), Decimal("2")]
+
+
+def test_verified_transition_rejects_the_minimum_date_without_crashing() -> None:
+    model = _provider_model("openai")
+
+    outcome = parse_verified(
+        _verified_payload(pricing_effective_from="0001-01-01"),
+        model,
+        _provider_price("openai"),
+        as_of="2026-07-13",
+        browsed_urls={"https://openai.com/api/pricing/"},
+        browsed_pricing_modes={"https://openai.com/api/pricing/": {"standard"}},
+    )
+
+    assert outcome.verified is False
+    assert outcome.note == "pricing_effective_from must be later than 0001-01-01"
+
+
+def test_refresh_decision_ages_model_and_pricing_provenance_independently() -> None:
+    model = _provider_model("openai").model_copy(
+        update={
+            "provenance": _provider_model("openai").provenance.model_copy(
+                update={"as_of": "2026-07-13"}
+            )
+        }
+    )
+    price = _provider_price("openai")
+    active = price.schedule_on(date(2026, 7, 13))
+    assert active is not None
+    stale = active.model_copy(
+        update={"provenance": active.provenance.model_copy(update={"as_of": "2026-06-01"})}
+    )
+    stale_price = price.model_copy(
+        update={
+            "schedules": tuple(
+                stale if schedule is active else schedule for schedule in price.schedules
+            )
+        }
+    )
+
+    decision = decide(
+        model,
+        price=stale_price,
+        now="2026-07-13",
+        max_age_days=14,
+    )
+
+    assert decision.action is Action.VERIFY
+    assert decision.reason == "stale pricing (42d)"
+    assert decide(model, price=None, now="2026-07-13").reason == "missing price"
+
+
+def test_price_policy_freshness_applies_only_to_the_active_schedule() -> None:
+    price = next(
+        item
+        for item in default_price_book().prices
+        if item.provider_name == "anthropic" and item.model == "claude-sonnet-5"
+    )
+    current, future = price.schedules
+    candidate = price.model_copy(
+        update={
+            "schedules": (
+                current.model_copy(
+                    update={
+                        "provenance": current.provenance.model_copy(update={"as_of": "2026-08-01"})
+                    }
+                ),
+                future.model_copy(
+                    update={
+                        "provenance": future.provenance.model_copy(update={"as_of": "2026-07-01"})
+                    }
+                ),
+            )
+        }
+    )
+
+    before_transition = price_policy_errors(
+        candidate,
+        today=date(2026, 8, 13),
+        max_age_days=30,
+    )
+    after_transition = price_policy_errors(
+        candidate,
+        today=date(2026, 9, 1),
+        max_age_days=30,
+    )
+
+    assert not any("provenance is stale" in error for error in before_transition)
+    assert any("schedule[1]: provenance is stale" in error for error in after_transition)
 
 
 def _verified_payload(**updates):
@@ -263,7 +572,10 @@ def _verified_payload(**updates):
         "context_tiers": None,
         "deprecated": False,
         "source_url": "https://openai.com/api/pricing/",
+        "pricing_effective_from": None,
         "evidence": "official pricing row",
+        "model_source_url": None,
+        "model_evidence": None,
         "note": "verified",
     }
     payload.update(updates)
@@ -277,6 +589,7 @@ def test_verified_confirmation_requires_grounding_evidence(evidence) -> None:
     outcome = parse_verified(
         _verified_payload(evidence=evidence),
         original,
+        _provider_price("openai"),
         as_of="2026-07-13",
         browsed_urls={"https://openai.com/api/pricing/"},
         browsed_pricing_modes={"https://openai.com/api/pricing/": {"standard"}},
@@ -290,7 +603,9 @@ def test_verified_confirmation_requires_grounding_evidence(evidence) -> None:
 
 def test_verified_explicit_nulls_remove_obsolete_pricing_dimensions() -> None:
     model = _provider_model("openai")
-    base = model.pricing.base().model_copy(update={"max_input_tokens": 100_000})
+    price = _provider_price("openai")
+    pricing = _pricing(price)
+    base = pricing.base().model_copy(update={"max_input_tokens": 100_000})
     upper = base.model_copy(
         update={
             "max_input_tokens": None,
@@ -298,42 +613,44 @@ def test_verified_explicit_nulls_remove_obsolete_pricing_dimensions() -> None:
             "output_per_million": base.output_per_million * 2,
         }
     )
-    original = model.model_copy(
-        update={
-            "pricing": model.pricing.model_copy(
-                update={
-                    "standard": (base, upper),
-                    "cache_write_5m_per_million": Decimal("3"),
-                    "cache_write_1h_per_million": Decimal("4"),
-                    "batch": PriceTier(
-                        input_per_million=Decimal("1"),
-                        output_per_million=Decimal("4"),
-                    ),
-                }
-            )
-        }
+    original_price = _with_pricing(
+        price,
+        pricing.model_copy(
+            update={
+                "standard": (base, upper),
+                "cache_write_5m_per_million": Decimal("3"),
+                "cache_write_1h_per_million": Decimal("4"),
+                "batch": PriceTier(
+                    input_per_million=Decimal("1"),
+                    output_per_million=Decimal("4"),
+                ),
+            }
+        ),
     )
 
     outcome = parse_verified(
         _verified_payload(),
-        original,
+        model,
+        original_price,
         as_of="2026-07-13",
         browsed_urls={"https://openai.com/api/pricing/"},
         browsed_pricing_modes={"https://openai.com/api/pricing/": {"standard", "batch"}},
     )
 
-    assert outcome.verified and outcome.model is not None
-    pricing = outcome.model.pricing
-    assert len(pricing.standard) == 1
-    assert pricing.base().cache_read_input_per_million is None
-    assert pricing.cache_write_5m_per_million is None
-    assert pricing.cache_write_1h_per_million is None
-    assert pricing.batch is None
+    assert outcome.verified and outcome.price is not None
+    updated_pricing = _pricing(outcome.price)
+    assert len(updated_pricing.standard) == 1
+    assert updated_pricing.base().cache_read_input_per_million is None
+    assert updated_pricing.cache_write_5m_per_million is None
+    assert updated_pricing.cache_write_1h_per_million is None
+    assert updated_pricing.batch is None
 
 
 def test_verified_malformed_tier_boundary_retains_curated_tiers() -> None:
     model = _provider_model("openai")
-    base = model.pricing.base().model_copy(update={"max_input_tokens": 100_000})
+    price = _provider_price("openai")
+    pricing = _pricing(price)
+    base = pricing.base().model_copy(update={"max_input_tokens": 100_000})
     upper = base.model_copy(
         update={
             "max_input_tokens": None,
@@ -341,8 +658,9 @@ def test_verified_malformed_tier_boundary_retains_curated_tiers() -> None:
             "output_per_million": base.output_per_million * 2,
         }
     )
-    original = model.model_copy(
-        update={"pricing": model.pricing.model_copy(update={"standard": (base, upper)})}
+    original_price = _with_pricing(
+        price,
+        pricing.model_copy(update={"standard": (base, upper)}),
     )
 
     outcome = parse_verified(
@@ -356,19 +674,22 @@ def test_verified_malformed_tier_boundary_retains_curated_tiers() -> None:
                 }
             ]
         ),
-        original,
+        model,
+        original_price,
         as_of="2026-07-13",
         browsed_urls={"https://openai.com/api/pricing/"},
         browsed_pricing_modes={"https://openai.com/api/pricing/": {"standard"}},
     )
 
-    assert outcome.verified and outcome.model is not None
-    assert outcome.model.pricing.standard[1:] == original.pricing.standard[1:]
+    assert outcome.verified and outcome.price is not None
+    assert _pricing(outcome.price).standard[1:] == _pricing(original_price).standard[1:]
 
 
 def test_verified_missing_or_malformed_pricing_does_not_clear_curated_values() -> None:
     model = _provider_model("openai")
-    base = model.pricing.base().model_copy(update={"max_input_tokens": 100_000})
+    price = _provider_price("openai")
+    pricing = _pricing(price)
+    base = pricing.base().model_copy(update={"max_input_tokens": 100_000})
     upper = base.model_copy(
         update={
             "max_input_tokens": None,
@@ -376,20 +697,19 @@ def test_verified_missing_or_malformed_pricing_does_not_clear_curated_values() -
             "output_per_million": base.output_per_million * 2,
         }
     )
-    original = model.model_copy(
-        update={
-            "pricing": model.pricing.model_copy(
-                update={
-                    "standard": (base, upper),
-                    "cache_write_5m_per_million": Decimal("3"),
-                    "cache_write_1h_per_million": Decimal("4"),
-                    "batch": PriceTier(
-                        input_per_million=Decimal("1"),
-                        output_per_million=Decimal("4"),
-                    ),
-                }
-            )
-        }
+    original_price = _with_pricing(
+        price,
+        pricing.model_copy(
+            update={
+                "standard": (base, upper),
+                "cache_write_5m_per_million": Decimal("3"),
+                "cache_write_1h_per_million": Decimal("4"),
+                "batch": PriceTier(
+                    input_per_million=Decimal("1"),
+                    output_per_million=Decimal("4"),
+                ),
+            }
+        ),
     )
     payload = _verified_payload(
         context_tiers="malformed",
@@ -402,23 +722,25 @@ def test_verified_missing_or_malformed_pricing_does_not_clear_curated_values() -
 
     outcome = parse_verified(
         payload,
-        original,
+        model,
+        original_price,
         as_of="2026-07-13",
         browsed_urls={"https://openai.com/api/pricing/"},
         browsed_pricing_modes={"https://openai.com/api/pricing/": {"standard", "batch"}},
     )
 
-    assert outcome.verified and outcome.model is not None
+    assert outcome.verified and outcome.price is not None
+    original_pricing = _pricing(original_price)
     expected_standard = (
-        original.pricing.base().model_copy(
+        original_pricing.base().model_copy(
             update={
                 "input_per_million": Decimal("2"),
                 "output_per_million": Decimal("8"),
             }
         ),
-        *original.pricing.standard[1:],
+        *original_pricing.standard[1:],
     )
-    assert outcome.model.pricing == original.pricing.model_copy(
+    assert _pricing(outcome.price) == original_pricing.model_copy(
         update={"standard": expected_standard}
     )
 
@@ -429,6 +751,7 @@ def test_verified_confirmation_requires_the_claimed_source_to_have_been_browsed(
     outcome = parse_verified(
         _verified_payload(source_url="https://openai.com/api/pricing/?region=us"),
         original,
+        _provider_price("openai"),
         as_of="2026-07-13",
         browsed_urls={"https://platform.openai.com/docs/pricing"},
         browsed_pricing_modes={"https://platform.openai.com/docs/pricing": {"standard"}},
@@ -445,6 +768,7 @@ def test_verified_confirmation_requires_standard_mode_browser_proof() -> None:
     outcome = parse_verified(
         _verified_payload(),
         original,
+        _provider_price("openai"),
         as_of="2026-07-13",
         browsed_urls={"https://openai.com/api/pricing/"},
         browsed_pricing_modes={},
@@ -463,6 +787,7 @@ def test_verified_rejects_batch_values_without_batch_mode_browser_proof() -> Non
             batch_output_per_million="2.25",
         ),
         original,
+        _provider_price("openai"),
         as_of="2026-07-13",
         browsed_urls={"https://openai.com/api/pricing/"},
         browsed_pricing_modes={"https://openai.com/api/pricing/": {"standard"}},
@@ -474,51 +799,62 @@ def test_verified_rejects_batch_values_without_batch_mode_browser_proof() -> Non
 
 def test_verified_null_batch_without_batch_mode_preserves_curated_batch() -> None:
     model = _provider_model("openai")
+    price = _provider_price("openai")
     curated_batch = PriceTier(
         input_per_million=Decimal("0.5"),
         output_per_million=Decimal("3"),
     )
-    original = model.model_copy(
-        update={"pricing": model.pricing.model_copy(update={"batch": curated_batch})}
+    original_price = _with_pricing(
+        price,
+        _pricing(price).model_copy(update={"batch": curated_batch}),
     )
 
     outcome = parse_verified(
         _verified_payload(),
-        original,
+        model,
+        original_price,
         as_of="2026-07-13",
         browsed_urls={"https://openai.com/api/pricing/"},
         browsed_pricing_modes={"https://openai.com/api/pricing/": {"standard"}},
     )
 
-    assert outcome.verified and outcome.model is not None
-    assert outcome.model.pricing.batch == curated_batch
+    assert outcome.verified and outcome.price is not None
+    assert _pricing(outcome.price).batch == curated_batch
 
 
 def test_release_policy_rejects_zero_and_implausibly_large_prices() -> None:
-    catalog = default_model_catalog()
-    model = catalog.models[0]
+    price_book = default_price_book()
+    original_price = price_book.prices[0]
     for price, message in (("0", "greater than zero"), ("1001", "exceeds 1000")):
-        tier = model.pricing.base().model_copy(update={"input_per_million": Decimal(price)})
-        changed = model.model_copy(
-            update={"pricing": model.pricing.model_copy(update={"standard": (tier,)})}
+        original_pricing = _pricing(original_price)
+        tier = original_pricing.base().model_copy(update={"input_per_million": Decimal(price)})
+        changed = _with_pricing(
+            original_price,
+            original_pricing.model_copy(update={"standard": (tier,)}),
         )
-        candidate = catalog.model_copy(update={"models": (changed, *catalog.models[1:])})
+        candidate = price_book.model_copy(update={"prices": (changed, *price_book.prices[1:])})
         with pytest.raises(ValueError, match=message):
-            validate_catalog(candidate, today=date.fromisoformat(catalog.generated_at))
+            validate_price_book(
+                candidate,
+                today=date.fromisoformat(price_book.generated_at),
+            )
 
 
 def test_automated_price_changes_flag_large_deltas() -> None:
     model = default_model_catalog().models[0]
-    tier = model.pricing.base().model_copy(
-        update={"input_per_million": model.pricing.base().input_per_million * 5}
+    price = default_price_book().prices[0]
+    pricing = _pricing(price)
+    tier = pricing.base().model_copy(
+        update={"input_per_million": pricing.base().input_per_million * 5}
     )
-    changed = model.model_copy(
-        update={"pricing": model.pricing.model_copy(update={"standard": (tier,)})}
+    changed_price = _with_pricing(
+        price,
+        pricing.model_copy(update={"standard": (tier,)}),
     )
 
-    warnings = suspicious_price_changes(model, changed)
+    warnings = suspicious_price_changes(model, model, price, changed_price)
 
-    assert any("standard[0].input changed" in warning for warning in warnings)
+    assert any("schedule[0].standard[0].input changed" in warning for warning in warnings)
 
 
 def test_catalog_policy_bounds_context_window_updates() -> None:
@@ -539,14 +875,16 @@ def test_catalog_policy_bounds_context_window_updates() -> None:
         "context_window must be a positive integer" in error
         for error in model_policy_errors(nonpositive, today=date(2026, 7, 13), max_age_days=None)
     )
-    assert suspicious_price_changes(model, nonpositive) == []
+    price = default_price_book().prices[0]
+    assert suspicious_price_changes(model, nonpositive, price, price) == []
 
 
 def test_automated_context_window_changes_flag_large_deltas() -> None:
     model = default_model_catalog().models[0].model_copy(update={"context_window": 100_000})
     changed = model.model_copy(update={"context_window": 500_000})
 
-    warnings = suspicious_price_changes(model, changed)
+    price = default_price_book().prices[0]
+    warnings = suspicious_price_changes(model, changed, price, price)
 
     assert "context_window changed from 100000 to 500000" in warnings
 
@@ -557,6 +895,7 @@ def test_verified_boolean_context_window_does_not_replace_curated_value() -> Non
     outcome = parse_verified(
         _verified_payload(context_window=True),
         original,
+        _provider_price("openai"),
         as_of="2026-07-13",
         browsed_urls={"https://openai.com/api/pricing/"},
         browsed_pricing_modes={"https://openai.com/api/pricing/": {"standard"}},
@@ -1040,7 +1379,7 @@ def test_browser_verifier_applies_cost_limit_to_caller_supplied_app() -> None:
         max_cost_usd=0.03,
     )
 
-    asyncio.run(verifier.averify(_provider_model("openai")))
+    asyncio.run(verifier.averify(_provider_model("openai"), _provider_price("openai")))
 
     assert len(app.requests) == 1
     assert len(app.requests[0].budget_limits) == 1
@@ -1128,7 +1467,10 @@ def test_browser_verifier_stops_after_unknown_resolved_model() -> None:
         )
         verifier = BrowserVerifier(as_of="2026-07-13", app=app)
 
-        outcome = await verifier.averify(_provider_model("openai"))
+        outcome = await verifier.averify(
+            _provider_model("openai"),
+            _provider_price("openai"),
+        )
         return provider, outcome, app.emitted_events
 
     provider, outcome, events = asyncio.run(exercise())
@@ -1147,6 +1489,7 @@ def test_refresh_paths_are_repository_relative_after_chdir(tmp_path, monkeypatch
 
     assert repository_root == refresh.REPOSITORY_ROOT
     assert repository_root / "src/cayu/data/default_model_catalog.json" == refresh.CATALOG_PATH
+    assert repository_root / "src/cayu/data/default_price_book.json" == refresh.PRICE_BOOK_PATH
     assert repository_root / "model-catalog-refresh.md" == refresh.REPORT_PATH
     assert refresh.CATALOG_PATH.is_file()
 
@@ -1164,9 +1507,12 @@ def test_refresh_report_escapes_and_bounds_untrusted_verifier_text() -> None:
     assert len(refresh._safe_report_text("x" * 2_000)) == refresh._REPORT_TEXT_LIMIT
     evidence = "e" * 1_500
     catalog = default_model_catalog()
+    price_book = default_price_book()
     report = refresh._format_report(
         catalog,
         catalog,
+        price_book,
+        price_book,
         flagged=[],
         evidence=[
             refresh._VerificationEvidence(
@@ -1194,7 +1540,7 @@ def test_refresh_removes_newly_deprecated_models_before_policy_validation(
         def __init__(self, **kwargs) -> None:
             pass
 
-        async def averify(self, model):
+        async def averify(self, model, price):
             deprecated = (model.provider_name, model.model) == deprecated_identity
             return VerifyOutcome(
                 verified=True,
@@ -1207,6 +1553,7 @@ def test_refresh_removes_newly_deprecated_models_before_policy_validation(
     report_path = tmp_path / "report.md"
     monkeypatch.setattr(refresh, "BrowserVerifier", FakeBrowserVerifier)
     monkeypatch.setattr(refresh, "CATALOG_PATH", catalog_path)
+    monkeypatch.setattr(refresh, "PRICE_BOOK_PATH", tmp_path / "prices.json")
     monkeypatch.setattr(refresh, "REPORT_PATH", report_path)
 
     asyncio.run(refresh._run(force_all=True, max_age_days=30))
@@ -1231,7 +1578,7 @@ def test_refresh_preserves_active_verifier_when_marked_deprecated(tmp_path, monk
         def __init__(self, **kwargs) -> None:
             pass
 
-        async def averify(self, model):
+        async def averify(self, model, price):
             return VerifyOutcome(
                 verified=True,
                 model=model.model_copy(update={"deprecated": True}),
@@ -1242,6 +1589,7 @@ def test_refresh_preserves_active_verifier_when_marked_deprecated(tmp_path, monk
     catalog_path = tmp_path / "catalog.json"
     monkeypatch.setattr(refresh, "BrowserVerifier", FakeBrowserVerifier)
     monkeypatch.setattr(refresh, "CATALOG_PATH", catalog_path)
+    monkeypatch.setattr(refresh, "PRICE_BOOK_PATH", tmp_path / "prices.json")
     monkeypatch.setattr(refresh, "REPORT_PATH", report_path)
 
     asyncio.run(refresh._run(force_all=True, max_age_days=30, only=(identity,)))
@@ -1265,7 +1613,7 @@ def test_refresh_rejects_deprecation_from_non_official_host(tmp_path, monkeypatc
         def __init__(self, **kwargs) -> None:
             pass
 
-        async def averify(self, model):
+        async def averify(self, model, price):
             provenance = model.provenance.model_copy(update={"url": "https://example.com/pricing"})
             return VerifyOutcome(
                 verified=True,
@@ -1277,6 +1625,7 @@ def test_refresh_rejects_deprecation_from_non_official_host(tmp_path, monkeypatc
     report_path = tmp_path / "report.md"
     monkeypatch.setattr(refresh, "BrowserVerifier", FakeBrowserVerifier)
     monkeypatch.setattr(refresh, "CATALOG_PATH", tmp_path / "catalog.json")
+    monkeypatch.setattr(refresh, "PRICE_BOOK_PATH", tmp_path / "prices.json")
     monkeypatch.setattr(refresh, "REPORT_PATH", report_path)
 
     asyncio.run(refresh._run(force_all=True, max_age_days=30, only=(identity,)))
@@ -1308,7 +1657,7 @@ def test_refresh_preserves_one_model_when_provider_deprecates_every_record(
         def __init__(self, **kwargs) -> None:
             pass
 
-        async def averify(self, model):
+        async def averify(self, model, price):
             return VerifyOutcome(
                 verified=True,
                 model=model.model_copy(update={"deprecated": True}),
@@ -1320,6 +1669,7 @@ def test_refresh_preserves_one_model_when_provider_deprecates_every_record(
     report_path = tmp_path / "report.md"
     monkeypatch.setattr(refresh, "BrowserVerifier", FakeBrowserVerifier)
     monkeypatch.setattr(refresh, "CATALOG_PATH", catalog_path)
+    monkeypatch.setattr(refresh, "PRICE_BOOK_PATH", tmp_path / "prices.json")
     monkeypatch.setattr(refresh, "REPORT_PATH", report_path)
 
     asyncio.run(refresh._run(force_all=True, max_age_days=30, only=selected))
@@ -1340,22 +1690,28 @@ def test_refresh_rejects_one_invalid_record_without_aborting_other_updates(
         def __init__(self, **kwargs) -> None:
             pass
 
-        async def averify(self, model):
+        async def averify(self, model, price):
             identity = (model.provider_name, model.model)
             if identity == invalid_identity:
-                zero = model.pricing.base().model_copy(update={"input_per_million": Decimal("0")})
-                updated = model.model_copy(
-                    update={"pricing": model.pricing.model_copy(update={"standard": (zero,)})}
+                pricing = _pricing(price)
+                zero = pricing.base().model_copy(update={"input_per_million": Decimal("0")})
+                updated_price = _with_pricing(
+                    price,
+                    pricing.model_copy(update={"standard": (zero,)}),
                 )
+                updated = model
             elif identity == safe_identity:
                 updated = model.model_copy(
                     update={"context_window": (model.context_window or 1) + 1}
                 )
+                updated_price = price
             else:
                 updated = model
+                updated_price = price
             return VerifyOutcome(
                 verified=True,
                 model=updated,
+                price=updated_price,
                 note="verified",
                 evidence="official evidence",
             )
@@ -1364,6 +1720,7 @@ def test_refresh_rejects_one_invalid_record_without_aborting_other_updates(
     report_path = tmp_path / "report.md"
     monkeypatch.setattr(refresh, "BrowserVerifier", FakeBrowserVerifier)
     monkeypatch.setattr(refresh, "CATALOG_PATH", catalog_path)
+    monkeypatch.setattr(refresh, "PRICE_BOOK_PATH", tmp_path / "prices.json")
     monkeypatch.setattr(refresh, "REPORT_PATH", report_path)
 
     asyncio.run(refresh._run(force_all=True, max_age_days=30))
@@ -1386,7 +1743,7 @@ def test_refresh_writes_report_before_candidate_validation_failure(tmp_path, mon
         def __init__(self, **kwargs) -> None:
             pass
 
-        async def averify(self, model):
+        async def averify(self, model, price):
             return VerifyOutcome(
                 verified=True,
                 model=model.model_copy(update={"aliases": (" ",)}),
@@ -1398,6 +1755,7 @@ def test_refresh_writes_report_before_candidate_validation_failure(tmp_path, mon
     report_path = tmp_path / "report.md"
     monkeypatch.setattr(refresh, "BrowserVerifier", FakeBrowserVerifier)
     monkeypatch.setattr(refresh, "CATALOG_PATH", catalog_path)
+    monkeypatch.setattr(refresh, "PRICE_BOOK_PATH", tmp_path / "prices.json")
     monkeypatch.setattr(refresh, "REPORT_PATH", report_path)
 
     with pytest.raises(ValueError):
@@ -1419,7 +1777,7 @@ def test_refresh_only_verifies_selected_catalog_identity(tmp_path, monkeypatch) 
         def __init__(self, **kwargs) -> None:
             pass
 
-        async def averify(self, model):
+        async def averify(self, model, price):
             observed.append(f"{model.provider_name}/{model.model}")
             return VerifyOutcome(
                 verified=True,
@@ -1430,6 +1788,7 @@ def test_refresh_only_verifies_selected_catalog_identity(tmp_path, monkeypatch) 
 
     monkeypatch.setattr(refresh, "BrowserVerifier", FakeBrowserVerifier)
     monkeypatch.setattr(refresh, "CATALOG_PATH", tmp_path / "catalog.json")
+    monkeypatch.setattr(refresh, "PRICE_BOOK_PATH", tmp_path / "prices.json")
     monkeypatch.setattr(refresh, "REPORT_PATH", tmp_path / "report.md")
 
     asyncio.run(
@@ -1467,6 +1826,7 @@ def test_recommendation_audit_reports_unbundled_official_model(tmp_path, monkeyp
     report_path = tmp_path / "report.md"
     monkeypatch.setattr(refresh, "BrowserVerifier", FakeBrowserVerifier)
     monkeypatch.setattr(refresh, "CATALOG_PATH", tmp_path / "catalog.json")
+    monkeypatch.setattr(refresh, "PRICE_BOOK_PATH", tmp_path / "prices.json")
     monkeypatch.setattr(refresh, "REPORT_PATH", report_path)
 
     asyncio.run(
@@ -1507,6 +1867,7 @@ def test_recommendation_audit_accepts_models_covered_by_exact_aliases(
 
     monkeypatch.setattr(refresh, "BrowserVerifier", FakeBrowserVerifier)
     monkeypatch.setattr(refresh, "CATALOG_PATH", tmp_path / "catalog.json")
+    monkeypatch.setattr(refresh, "PRICE_BOOK_PATH", tmp_path / "prices.json")
     monkeypatch.setattr(refresh, "REPORT_PATH", tmp_path / "report.md")
 
     asyncio.run(
@@ -1528,12 +1889,13 @@ def test_refresh_fails_when_every_attempt_is_inconclusive(tmp_path, monkeypatch)
         def __init__(self, **kwargs) -> None:
             pass
 
-        async def averify(self, model):
+        async def averify(self, model, price):
             return VerifyOutcome(verified=False, note="browser unavailable")
 
     report_path = tmp_path / "report.md"
     monkeypatch.setattr(refresh, "BrowserVerifier", FakeBrowserVerifier)
     monkeypatch.setattr(refresh, "CATALOG_PATH", tmp_path / "catalog.json")
+    monkeypatch.setattr(refresh, "PRICE_BOOK_PATH", tmp_path / "prices.json")
     monkeypatch.setattr(refresh, "REPORT_PATH", report_path)
 
     with pytest.raises(RuntimeError, match="all attempted model verifications"):
@@ -1560,6 +1922,7 @@ def test_refresh_verifier_construction_failure_writes_report(tmp_path, monkeypat
     report_path = tmp_path / "report.md"
     monkeypatch.setattr(refresh, "BrowserVerifier", BrokenBrowserVerifier)
     monkeypatch.setattr(refresh, "CATALOG_PATH", tmp_path / "catalog.json")
+    monkeypatch.setattr(refresh, "PRICE_BOOK_PATH", tmp_path / "prices.json")
     monkeypatch.setattr(refresh, "REPORT_PATH", report_path)
 
     with pytest.raises(ValueError, match="OPENAI_API_KEY"):
@@ -1577,6 +1940,7 @@ def test_fresh_refresh_does_not_construct_live_verifier(tmp_path, monkeypatch) -
 
     monkeypatch.setattr(refresh, "BrowserVerifier", UnexpectedBrowserVerifier)
     monkeypatch.setattr(refresh, "CATALOG_PATH", tmp_path / "catalog.json")
+    monkeypatch.setattr(refresh, "PRICE_BOOK_PATH", tmp_path / "prices.json")
     monkeypatch.setattr(refresh, "REPORT_PATH", tmp_path / "report.md")
 
     asyncio.run(refresh._run(force_all=False, max_age_days=10_000))
@@ -1586,6 +1950,7 @@ def test_refresh_invalid_cost_limit_still_writes_report(tmp_path, monkeypatch) -
     report_path = tmp_path / "report.md"
     monkeypatch.setenv("MAX_VERIFY_COST_USD", "not-a-number")
     monkeypatch.setattr(refresh, "CATALOG_PATH", tmp_path / "catalog.json")
+    monkeypatch.setattr(refresh, "PRICE_BOOK_PATH", tmp_path / "prices.json")
     monkeypatch.setattr(refresh, "REPORT_PATH", report_path)
 
     with pytest.raises(ValueError, match="MAX_VERIFY_COST_USD"):

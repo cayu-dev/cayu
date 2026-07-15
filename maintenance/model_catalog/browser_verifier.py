@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -23,9 +24,12 @@ from cayu import (
     LocalArtifactStore,
     ModelCatalog,
     ModelInfo,
+    ModelPrice,
     OpenAIProvider,
+    PriceBook,
     RunRequest,
     default_model_catalog,
+    default_price_book,
 )
 from cayu.core.events import EventType
 from cayu.core.messages import Message, MessageRole, TextPart
@@ -49,7 +53,8 @@ DEFAULT_VERIFIER_MODEL = "gpt-5.6-luna"
 # Agent identity, core behavior, and the pricing-page rules required when the scheduled verifier
 # runs without an environment carrying workspace instructions.
 SYSTEM = (
-    "You verify an AI model's full pricing + capabilities against the PROVIDER'S OFFICIAL page.\n"
+    "You verify an AI model's pricing and, independently, its capabilities against the "
+    "PROVIDER'S OFFICIAL pages.\n"
     "\nFIND THE RIGHT PAGE: use search_web, then read the provider's API / DEVELOPER token-pricing "
     "page (per-1M-token rates), NOT the consumer plan page (Pro/Team/Enterprise subscriptions). If a "
     "page only shows monthly subscription prices, it's the wrong page — keep looking.\n"
@@ -64,8 +69,13 @@ SYSTEM = (
     "verified. Use explicit single-mode reads or screenshots only for retries.\n"
     "\nFollow the workspace pricing-page guidance for which fields to extract and the layout traps "
     "to avoid.\n"
-    "\nGROUND EVERYTHING: put in `evidence` a verbatim quote of the exact pricing row(s)/cell(s) you "
-    "read — the model name and every number you reported. If you can't quote it, set confirmed=false. "
+    "\nGROUND PRICING: put in `evidence` a verbatim quote of the exact pricing row(s)/cell(s) you "
+    "read — the model name and every price you reported. If the page announces a future rate, "
+    "return that rate with its published ISO date in `pricing_effective_from`. If you can't quote "
+    "pricing, set confirmed=false. "
+    "GROUND MODEL FACTS SEPARATELY: update context or lifecycle facts only when an official model "
+    "page states them; return that page and quote in `model_source_url` and `model_evidence`. Use "
+    "null for both when you verified only pricing. "
     "Set confirmed=false only if, after read_page AND screenshot, you can't reach an authoritative "
     "page. Be precise; read exact numbers; never guess."
     "\n\n[Pricing-page maintenance guidance]\n" + WORKSPACE_GUIDANCE
@@ -115,9 +125,15 @@ def _recommendation_prompt(provider_name: str, existing_models: tuple[str, ...])
     )
 
 
-def _prompt(model: ModelInfo) -> str:
-    base = model.pricing.base()
-    p = model.pricing
+def _prompt(model: ModelInfo, price: ModelPrice, *, effective_on: date) -> str:
+    schedule = price.schedule_on(effective_on)
+    if schedule is None:
+        schedule = price.schedules[-1]
+        schedule_note = " (last known schedule; no price currently applies)"
+    else:
+        schedule_note = ""
+    base = schedule.pricing.base()
+    p = schedule.pricing
     tiers = "; ".join(
         f"up_to={tier.max_input_tokens}: input={tier.input_per_million}, "
         f"cache_read={tier.cache_read_input_per_million}, "
@@ -127,7 +143,8 @@ def _prompt(model: ModelInfo) -> str:
     return (
         f"Verify this model on {model.provider_name}'s OFFICIAL token-pricing page.\n"
         f"  model: {model.model}\n"
-        f"  current input / output per 1M: {base.input_per_million} / {base.output_per_million}\n"
+        f"  current input / output per 1M{schedule_note}: "
+        f"{base.input_per_million} / {base.output_per_million}\n"
         f"  current cache read per 1M: {base.cache_read_input_per_million}\n"
         f"  current cache write 5m / 1h per 1M: {p.cache_write_5m_per_million} / {p.cache_write_1h_per_million}\n"
         f"  current batch input/output per 1M: "
@@ -137,8 +154,11 @@ def _prompt(model: ModelInfo) -> str:
         "Call read_page with pricing_mode=all. It returns separately labeled Standard and Batch "
         "sections when Batch is offered. Report Batch values only from a verified Batch section; "
         "never copy Standard values into Batch fields.\n"
-        "Confirm or correct EACH of these from the official page, and return the verified values "
-        "(null any dimension this provider does not offer). Quote your source row in `evidence`."
+        "Confirm or correct EACH price from the official page, and return the verified values "
+        "(null any dimension this provider does not offer). If the page publishes a future price "
+        "transition, return the future rates and its ISO start date. Quote the price row in "
+        "`evidence`. Verify model facts independently and provide `model_source_url` plus "
+        "`model_evidence`, or leave both null."
     )
 
 
@@ -163,7 +183,7 @@ def verifier_model_info(
 def _build_budget_limits(
     max_cost_usd: float | None,
     *,
-    catalog: ModelCatalog,
+    price_book: PriceBook,
 ) -> tuple[BudgetLimit, ...]:
     """Per-verification cost cap. If a single verification's estimated cost exceeds this, cayu
     interrupts the session (which then yields no structured output -> flagged), so a runaway
@@ -175,7 +195,7 @@ def _build_budget_limits(
         BudgetLimit(
             scope="session",
             max_estimated_cost=Decimal(str(max_cost_usd)),
-            pricing=catalog,
+            pricing=price_book,
             allow_unpriced=False,
         ),
     )
@@ -273,8 +293,9 @@ class BrowserVerifier:
         self._env_name: str | None = None
         self._artifact_dir: TemporaryDirectory[str] | None = None
         catalog = default_model_catalog()
+        price_book = default_price_book()
         verifier_model_info(catalog, model=model)
-        self._budget_limits = _build_budget_limits(max_cost_usd, catalog=catalog)
+        self._budget_limits = _build_budget_limits(max_cost_usd, price_book=price_book)
         if app is None:
             app = CayuApp(session_store=InMemorySessionStore())
             app.register_provider(OpenAIProvider(), default=True)
@@ -315,10 +336,10 @@ class BrowserVerifier:
             )
         self.app = app
 
-    def verify(self, model: ModelInfo) -> VerifyOutcome:
-        return asyncio.run(self.averify(model))
+    def verify(self, model: ModelInfo, price: ModelPrice) -> VerifyOutcome:
+        return asyncio.run(self.averify(model, price))
 
-    async def averify(self, model: ModelInfo) -> VerifyOutcome:
+    async def averify(self, model: ModelInfo, price: ModelPrice) -> VerifyOutcome:
         # NATIVE: the provider enforces the JSON schema on the final message, so the agent can't
         # forget to emit it or return malformed output (a source of the old "no structured output"
         # flags) — tool calls during the run still work; only the final answer is schema-constrained.
@@ -327,7 +348,11 @@ class BrowserVerifier:
             json_schema=VERIFIED_SCHEMA,
             strategy=StructuredOutputStrategy.NATIVE,
         )
-        msg = Message(role=MessageRole.USER, content=(TextPart(text=_prompt(model)),))
+        effective_on = date.fromisoformat(self.as_of)
+        msg = Message(
+            role=MessageRole.USER,
+            content=(TextPart(text=_prompt(model, price, effective_on=effective_on)),),
+        )
         events: list[Any] = []
         async for e in self.app.run(
             RunRequest(
@@ -352,6 +377,7 @@ class BrowserVerifier:
             parse_verified(
                 data,
                 model,
+                price,
                 as_of=self.as_of,
                 browsed_urls=browsed_urls(events),
                 browsed_pricing_modes=browsed_pricing_modes(events),

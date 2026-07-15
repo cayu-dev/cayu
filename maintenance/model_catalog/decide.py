@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import date
 from enum import Enum
 
-from cayu import ModelInfo
+from cayu import ModelInfo, ModelPrice
 from maintenance.model_catalog.policy import VERIFY_MAX_AGE_DAYS
 
 
@@ -30,6 +30,7 @@ def decide(
     model: ModelInfo,
     *,
     now: str,
+    price: ModelPrice | None = None,
     sources_agree: bool = True,
     max_age_days: int = VERIFY_MAX_AGE_DAYS,
 ) -> Decision:
@@ -38,9 +39,21 @@ def decide(
     if model.context_window is None or not model.modalities_in:
         return Decision(Action.VERIFY, "incomplete capabilities")
     try:
-        age = (date.fromisoformat(now) - date.fromisoformat(model.provenance.as_of)).days
+        today = date.fromisoformat(now)
+        age = (today - date.fromisoformat(model.provenance.as_of)).days
     except ValueError:
-        return Decision(Action.VERIFY, "unparseable as_of")
+        return Decision(Action.VERIFY, "unparseable model as_of")
     if age > max_age_days:
-        return Decision(Action.VERIFY, f"stale ({age}d)")
+        return Decision(Action.VERIFY, f"stale model facts ({age}d)")
+    if price is None:
+        return Decision(Action.VERIFY, "missing price")
+    schedule = price.schedule_on(today)
+    if schedule is None:
+        return Decision(Action.VERIFY, "no applicable price schedule")
+    try:
+        price_age = (today - date.fromisoformat(schedule.provenance.as_of)).days
+    except ValueError:
+        return Decision(Action.VERIFY, "unparseable pricing as_of")
+    if price_age > max_age_days:
+        return Decision(Action.VERIFY, f"stale pricing ({price_age}d)")
     return Decision(Action.ACCEPT, "fresh, agreed, complete")

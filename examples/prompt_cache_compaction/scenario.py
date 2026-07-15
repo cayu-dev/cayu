@@ -22,8 +22,8 @@ from cayu import (
     Event,
     EventType,
     Message,
-    ModelCatalog,
     ModelCompactor,
+    PriceBook,
     PromptCacheCompactor,
     ResumeRequest,
     RunRequest,
@@ -234,20 +234,20 @@ def _paired_cost_evidence(
     *,
     candidate_event: Event | None,
     baseline_payload: dict[str, Any] | None,
-    catalog: ModelCatalog | None,
+    price_book: PriceBook | None,
 ) -> dict[str, Any]:
     if candidate_event is None or baseline_payload is None:
         return paired_cost_evidence(
             candidate=None,
             baseline=None,
-            catalog=catalog,
+            price_book=price_book,
             baseline_cost_field="bounded_baseline_cost",
         )
-    if catalog is None:
+    if price_book is None:
         return paired_cost_evidence(
             candidate=(),
             baseline=(),
-            catalog=None,
+            price_book=None,
             baseline_cost_field="bounded_baseline_cost",
         )
 
@@ -259,17 +259,17 @@ def _paired_cost_evidence(
     candidate_cost = estimate_session_cost(
         session_id=candidate_event.session_id,
         events=[candidate_event],
-        catalog=catalog,
+        pricing=price_book,
     )
     baseline_cost = estimate_session_cost(
         session_id=baseline_event.session_id,
         events=[baseline_event],
-        catalog=catalog,
+        pricing=price_book,
     )
     return paired_cost_evidence(
         candidate=(candidate_cost,),
         baseline=(baseline_cost,),
-        catalog=catalog,
+        price_book=price_book,
         baseline_cost_field="bounded_baseline_cost",
     )
 
@@ -280,7 +280,7 @@ def _retry_inclusive_cost_evidence(
     provider_attempts: int,
     input_tokens: int,
     output_tokens: int,
-    catalog: ModelCatalog | None,
+    price_book: PriceBook | None,
     session_id: str,
 ) -> dict[str, Any]:
     evidence: dict[str, Any] = {
@@ -289,16 +289,16 @@ def _retry_inclusive_cost_evidence(
         "model_steps": sum(event.type == EventType.MODEL_COMPLETED for event in events),
         "provider_attempts": provider_attempts,
     }
-    if catalog is None:
+    if price_book is None:
         return {
             **evidence,
             "cost_status": "unpriced",
             "cost": None,
             "unpriced_or_missing_usage_attempts": provider_attempts,
-            "reason": "no caller-supplied model catalog",
+            "reason": "no caller-supplied price book",
         }
 
-    summary = estimate_session_cost(session_id=session_id, events=events, catalog=catalog)
+    summary = estimate_session_cost(session_id=session_id, events=events, pricing=price_book)
     unpriced_or_missing = summary.unpriced_model_steps + max(
         0, provider_attempts - summary.model_steps
     )
@@ -341,7 +341,7 @@ async def run_scenario(
     provider_options: dict[str, Any] | None = None,
     system_prompt_suffix: str = "",
     thinking: ThinkingConfig | None = None,
-    model_catalog: ModelCatalog | None = None,
+    price_book: PriceBook | None = None,
 ) -> ScenarioResult:
     run_id = uuid4().hex[:12]
     session_id = f"prompt-cache-compaction-{run_id}"
@@ -510,7 +510,7 @@ async def run_scenario(
         provider_attempts=len(requests),
         input_tokens=session.usage["input_tokens"],
         output_tokens=session.usage["output_tokens"],
-        catalog=model_catalog,
+        price_book=price_book,
         session_id=session_id,
     )
     baseline_input_tokens = baseline_usage.get("input_tokens")
@@ -523,7 +523,7 @@ async def run_scenario(
         + (baseline_input_tokens if type(baseline_input_tokens) is int else 0),
         output_tokens=session.usage["output_tokens"]
         + (baseline_output_tokens if type(baseline_output_tokens) is int else 0),
-        catalog=model_catalog,
+        price_book=price_book,
         session_id=f"{session_id}-benchmark-harness",
     )
     bounded_baseline_shape = (
@@ -540,7 +540,7 @@ async def run_scenario(
     paired_cost = _paired_cost_evidence(
         candidate_event=compaction_events[0] if compaction_events else None,
         baseline_payload=baseline_payload,
-        catalog=model_catalog,
+        price_book=price_book,
     )
     provenance_gated = (
         paired_cost.get("status") == "unpriced"
