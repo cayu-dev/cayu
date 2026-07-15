@@ -44,7 +44,16 @@ from cayu.core import (
 )
 from cayu.core.events import copy_event
 from cayu.core.messages import copy_message, copy_message_part
-from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.core.tools import (
+    _POLICY_DENIAL_TEXT_MAX_BYTES,
+    _POLICY_DENIAL_TRUNCATION_MARKER,
+    Tool,
+    ToolContext,
+    ToolEffect,
+    ToolResult,
+    ToolSpec,
+    _bound_policy_denial_text,
+)
 from cayu.environments import Environment, EnvironmentSpec
 from cayu.mcp import McpServerSpec
 from cayu.providers import (
@@ -409,6 +418,21 @@ def test_tool_result_supports_text_structured_and_artifacts():
     assert result.structured == {"echoed": "ok"}
     assert result.artifacts == []
     assert result.is_error is False
+
+
+def test_policy_denial_text_bound_is_utf8_safe_and_idempotent():
+    exact = "a" * _POLICY_DENIAL_TEXT_MAX_BYTES
+    assert _bound_policy_denial_text(exact) == exact
+
+    oversized = "🙂" * _POLICY_DENIAL_TEXT_MAX_BYTES
+    bounded = _bound_policy_denial_text(oversized)
+    assert len(bounded.encode("utf-8")) <= _POLICY_DENIAL_TEXT_MAX_BYTES
+    assert bounded.endswith(_POLICY_DENIAL_TRUNCATION_MARKER)
+    assert _bound_policy_denial_text(bounded) == bounded
+
+    # A custom policy can bypass ordinary input validation and return a lone
+    # surrogate. Its denial must remain fail-closed and durably valid UTF-8.
+    assert _bound_policy_denial_text("unsafe\ud800reason") == "unsafe?reason"
 
 
 def test_tool_result_rejects_coerced_error_flags():

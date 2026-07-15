@@ -196,8 +196,10 @@ class QaCommandPolicy(CommandPolicy):
         return CommandPolicyResult(decision=CommandPolicyDecision.ALLOW)
 ```
 
-A denied command surfaces as a `tool.call.failed` event with a structured error the
-model can read and route around — the demo shows a `rm -rf /` attempt being denied.
+A denied command surfaces as one `tool.call.blocked` event with
+`denied_by=command_policy` and a structured error the model can read and route
+around — the demo shows a `rm -rf /` attempt being denied. It is not also emitted
+as `tool.call.failed`.
 
 ## 6. The agent
 

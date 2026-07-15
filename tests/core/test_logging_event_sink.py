@@ -252,6 +252,35 @@ def test_logging_event_sink_truncates_errors(caplog: pytest.LogCaptureFixture) -
     assert "mnopqrstuvwxyz" not in caplog.records[0].message
 
 
+def test_logging_event_sink_summarizes_policy_denial_once_and_bounded(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    logger = logging.getLogger("cayu.test.policy_denial")
+    sink = LoggingEventSink(logger=logger, error_summary_limit=12)
+    event = Event(
+        type=EventType.TOOL_CALL_BLOCKED,
+        session_id="sess_policy_denial",
+        tool_name="exec_command",
+        payload={
+            "tool_call_id": "call_1",
+            "denied_by": "command_policy",
+            "decision": "deny",
+            "reason": "abcdefghijklmnopqrstuvwxyz",
+        },
+    )
+
+    caplog.set_level(logging.WARNING, logger=logger.name)
+    asyncio.run(sink.emit(event))
+
+    assert len(caplog.records) == 1
+    message = caplog.records[0].message
+    assert message.count("tool.call.blocked") == 1
+    assert "denied_by=command_policy" in message
+    assert "decision=deny" in message
+    assert "reason=abcdefghijkl..." in message
+    assert "mnopqrstuvwxyz" not in message
+
+
 def test_logging_event_sink_escapes_control_characters(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

@@ -1288,6 +1288,67 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
 
 
 @pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_round_trip_canonical_policy_denial_payload(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+    payload = {
+        "tool_name": "exec_command",
+        "tool_call_id": "call_denied",
+        "tool_round_id": "round_denied",
+        "idempotency_key": "cayu-tool:v1:denied",
+        "denied_by": "command_policy",
+        "decision": "deny",
+        "reason": "Remote mutation is not allowed.",
+        "result": {
+            "content": "Command denied by policy. Remote mutation is not allowed.",
+            "structured": {
+                "error": "command_denied",
+                "decision": "deny",
+                "reason": "Remote mutation is not allowed.",
+            },
+            "artifacts": [],
+            "is_error": True,
+        },
+    }
+
+    async def run_store_operations() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_policy_denial_round_trip",
+                messages=[Message.text("user", "push")],
+            ),
+            identity=_identity(),
+        )
+        await store.append_event(
+            "sess_policy_denial_round_trip",
+            Event(
+                id="event_policy_denial",
+                type=EventType.TOOL_CALL_BLOCKED,
+                session_id="sess_policy_denial_round_trip",
+                tool_name="exec_command",
+                payload=payload,
+            ),
+        )
+
+        records = await store.query_events(
+            EventQuery(
+                session_id="sess_policy_denial_round_trip",
+                event_type=EventType.TOOL_CALL_BLOCKED,
+            )
+        )
+
+        assert len(records) == 1
+        assert records[0].event.tool_name == "exec_command"
+        assert records[0].event.payload == payload
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
 def test_session_stores_query_events_with_multiple_event_types(
     store_factory: StoreFactory,
     tmp_path,

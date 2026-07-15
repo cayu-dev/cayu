@@ -48,6 +48,7 @@ async def run_tool(
             async with asyncio.timeout(timeout_seconds) as timer:
                 result = await tool.run(ctx, arguments)
         if type(result) is not ToolResult:
+            ctx._discard_policy_denials_for(tool)
             return ToolResult(
                 content=(
                     "Tool returned invalid result type: "
@@ -57,6 +58,7 @@ async def run_tool(
             )
         return tool_results.normalize_tool_result(tool_results.validate_tool_result(result))
     except TimeoutError as exc:
+        ctx._discard_policy_denials_for(tool)
         if timer is not None and timer.expired():
             return ToolResult(
                 content=f"Tool call timed out after {timeout_seconds} seconds.",
@@ -64,6 +66,7 @@ async def run_tool(
             )
         return ToolResult(content=tool_results.exception_message(exc), is_error=True)
     except Exception as exc:
+        ctx._discard_policy_denials_for(tool)
         return ToolResult(content=tool_results.exception_message(exc), is_error=True)
 
 

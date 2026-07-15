@@ -472,7 +472,11 @@ def test_process_command_policy_runs_allowed_and_blocks_denied_command_in_cayu_a
     ]
     completed = [event for event in events if event.type is EventType.TOOL_CALL_COMPLETED]
     assert completed[0].payload["result"]["structured"]["stdout"].strip() == str(work)
-    denied = next(event for event in events if event.type is EventType.TOOL_CALL_FAILED)
+    denied = next(event for event in events if event.type is EventType.TOOL_CALL_BLOCKED)
+    assert denied.payload["denied_by"] == "command_policy"
+    assert denied.payload["decision"] == "deny"
+    assert denied.payload["metadata"] == {}
+    assert all(event.type is not EventType.TOOL_CALL_FAILED for event in events)
     assert denied.payload["result"]["structured"] == {
         "error": "command_denied",
         "decision": "deny",

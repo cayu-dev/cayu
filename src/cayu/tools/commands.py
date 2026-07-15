@@ -11,7 +11,15 @@ from cayu._validation import (
     require_nonblank,
     require_unicode_scalar_text,
 )
-from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.core.tools import (
+    _COMMAND_POLICY_DENIAL_SOURCE,
+    Tool,
+    ToolContext,
+    ToolEffect,
+    ToolResult,
+    ToolSpec,
+    _bound_policy_denial_result,
+)
 from cayu.runners import ExecCommand, ExecResult, Runner, RunnerUnavailableError
 from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation
 
@@ -193,7 +201,7 @@ class ExecCommandTool(Tool):
             if type(verdict) is not CommandPolicyResult:
                 raise TypeError("Command policy must return a CommandPolicyResult.")
             if verdict.decision is not CommandPolicyDecision.ALLOW:
-                return _policy_refusal_result(verdict)
+                return _policy_refusal_result(verdict, ctx=ctx, source=self)
             cwd = canonical_cwd
         try:
             result = await runner.exec(
@@ -242,16 +250,22 @@ class ExecCommandTool(Tool):
         )
 
 
-def _policy_refusal_result(verdict: CommandPolicyResult) -> ToolResult:
+def _policy_refusal_result(
+    verdict: CommandPolicyResult,
+    *,
+    ctx: ToolContext,
+    source: object,
+) -> ToolResult:
     if verdict.decision is CommandPolicyDecision.DENY:
         content = "Command denied by policy."
         error = "command_denied"
     else:
         content = "Command requires approval before it can run."
         error = "command_approval_required"
+    reason = verdict.reason or content
     if verdict.reason is not None:
         content = f"{content} {verdict.reason}"
-    return ToolResult(
+    raw_result = ToolResult(
         content=content,
         structured={
             "error": error,
@@ -260,6 +274,14 @@ def _policy_refusal_result(verdict: CommandPolicyResult) -> ToolResult:
         },
         is_error=True,
     )
+    ctx._record_policy_denial(
+        source=source,
+        denied_by=_COMMAND_POLICY_DENIAL_SOURCE,
+        decision=verdict.decision.value,
+        reason=reason,
+        result=raw_result,
+    )
+    return _bound_policy_denial_result(raw_result)
 
 
 def _command_from_args(args: dict) -> ExecCommand:

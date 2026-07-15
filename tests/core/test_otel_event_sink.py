@@ -419,7 +419,12 @@ def test_blocked_tool_closes_its_span_with_error() -> None:
                 session_id="sess1",
                 tool_name="exec_command",
                 # Real BLOCKED payload carries the message under "reason" (not "error").
-                payload={"tool_call_id": "call_1", "reason": "denied by policy"},
+                payload={
+                    "tool_call_id": "call_1",
+                    "denied_by": "command_policy",
+                    "decision": "deny",
+                    "reason": "denied by policy",
+                },
             ),
             Event(type=EventType.SESSION_COMPLETED, session_id="sess1", payload={}),
         ],
@@ -427,7 +432,102 @@ def test_blocked_tool_closes_its_span_with_error() -> None:
     tool = _spans_by_name(exporter)["execute_tool exec_command"]
     assert tool.status.status_code == StatusCode.ERROR
     assert tool.status.description == "denied by policy"
+    assert tool.attributes[otel.CAYU_TOOL_DENIED_BY] == "command_policy"
+    assert tool.attributes[otel.CAYU_TOOL_POLICY_DECISION] == "deny"
+    assert (
+        len(
+            [
+                span
+                for span in exporter.get_finished_spans()
+                if span.name == "execute_tool exec_command"
+            ]
+        )
+        == 1
+    )
     # Closed by the BLOCKED event, not swept at session end.
+    assert sink._sessions == {}
+
+
+def test_resumed_mixed_policy_round_traces_blocked_sibling_without_start() -> None:
+    exporter, sink = _make_sink()
+    _drive(
+        sink,
+        [
+            Event(
+                type=EventType.SESSION_RESUMED,
+                session_id="sess1",
+                agent_name="assistant",
+                payload={},
+            ),
+            # A sibling denied during whole-round planning has no STARTED event when
+            # the approval-gated call is later approved and the round resumes.
+            Event(
+                type=EventType.TOOL_CALL_BLOCKED,
+                session_id="sess1",
+                tool_name="echo",
+                payload={
+                    "tool_call_id": "call_denied",
+                    "denied_by": "tool_policy",
+                    "decision": "deny",
+                    "reason": "echo is blocked",
+                },
+            ),
+            Event(
+                type=EventType.TOOL_CALL_STARTED,
+                session_id="sess1",
+                tool_name="side_effect",
+                payload={"tool_call_id": "call_approved"},
+            ),
+            Event(
+                type=EventType.TOOL_CALL_COMPLETED,
+                session_id="sess1",
+                tool_name="side_effect",
+                payload={"tool_call_id": "call_approved"},
+            ),
+            Event(type=EventType.SESSION_COMPLETED, session_id="sess1", payload={}),
+        ],
+    )
+
+    spans = _spans_by_name(exporter)
+    assert set(spans) == {
+        "cayu.session assistant",
+        "execute_tool echo",
+        "execute_tool side_effect",
+    }
+    session = spans["cayu.session assistant"]
+    denied = spans["execute_tool echo"]
+    assert denied.parent.span_id == session.context.span_id
+    assert denied.start_time == denied.end_time
+    assert denied.status.status_code == StatusCode.ERROR
+    assert denied.status.description == "echo is blocked"
+    assert denied.attributes[otel.GEN_AI_TOOL_NAME] == "echo"
+    assert denied.attributes[otel.GEN_AI_TOOL_CALL_ID] == "call_denied"
+    assert denied.attributes[otel.CAYU_TOOL_DENIED_BY] == "tool_policy"
+    assert denied.attributes[otel.CAYU_TOOL_POLICY_DECISION] == "deny"
+    assert sink._sessions == {}
+
+
+def test_unmatched_non_policy_block_does_not_synthesize_tool_span() -> None:
+    exporter, sink = _make_sink()
+    _drive(
+        sink,
+        [
+            Event(type=EventType.SESSION_RESUMED, session_id="sess1", payload={}),
+            Event(
+                type=EventType.TOOL_CALL_BLOCKED,
+                session_id="sess1",
+                tool_name="echo",
+                payload={
+                    "tool_call_id": "call_hook_blocked",
+                    "blocked_by": "before_tool_call_hook",
+                    "reason": "hook blocked the call",
+                },
+            ),
+            Event(type=EventType.SESSION_COMPLETED, session_id="sess1", payload={}),
+        ],
+    )
+
+    assert [span.name for span in exporter.get_finished_spans()] == ["cayu.session"]
     assert sink._sessions == {}
 
 

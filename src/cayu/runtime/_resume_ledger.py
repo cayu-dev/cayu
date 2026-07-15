@@ -5,10 +5,12 @@ from dataclasses import dataclass
 
 from cayu._validation import copy_json_value
 from cayu.core.events import Event, EventType
+from cayu.core.tools import _bound_policy_denial_text
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime.approvals import PendingToolCallApproval
 from cayu.runtime.tool_policy import ToolPolicyDecision, ToolPolicyResult
+from cayu.vaults import SecretRedactor
 
 
 @dataclass(frozen=True)
@@ -87,6 +89,23 @@ def policy_result_from_pending_tool_call(
         reason=pending_tool_call.reason,
         metadata=copy_json_value(pending_tool_call.metadata, "metadata"),
     )
+
+
+def policy_reason_for_pending_tool_call(
+    policy_result: ToolPolicyResult | None,
+    *,
+    redactor: SecretRedactor | None = None,
+) -> str | None:
+    """Bound only durable denials; approval prompts retain their full policy text."""
+
+    if policy_result is None or policy_result.reason is None:
+        return None
+    if policy_result.decision is ToolPolicyDecision.DENY:
+        reason = policy_result.reason
+        if redactor is not None:
+            reason = redactor.redact_text(reason)
+        return _bound_policy_denial_text(reason)
+    return policy_result.reason
 
 
 def tool_call_outcome_from_terminal_event(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import json
 import sys
 import threading
 from collections.abc import AsyncIterator
@@ -26,14 +27,28 @@ from cayu import (
 )
 from cayu.artifacts import LocalArtifactStore
 from cayu.core import AgentSpec, Event, EventType, Message
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.core.tools import (
+    _POLICY_DENIAL_TEXT_MAX_BYTES,
+    _POLICY_DENIAL_TRUNCATION_MARKER,
+    Tool,
+    ToolContext,
+    ToolResult,
+    ToolSpec,
+    _bound_policy_denial_text,
+)
 from cayu.providers import (
     ModelProvider,
     ModelRequest,
     ModelStreamEvent,
 )
 from cayu.runners import ExecCommand, ExecResult, LocalRunner, Runner, RunnerUnavailableError
-from cayu.runtime import CayuApp, RunRequest
+from cayu.runtime import (
+    AfterToolCallDecision,
+    CayuApp,
+    RunRequest,
+    RuntimeHook,
+    ToolCallHookContext,
+)
 from cayu.tools import ExecCommandTool
 from cayu.tools.commands import (
     DEFAULT_OUTPUT_LIMIT_BYTES,
@@ -87,6 +102,10 @@ class FakeProvider(ModelProvider):
         self.requests.append(request)
         for event in self.event_batches[len(self.requests) - 1]:
             yield event
+
+
+async def collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
+    return [event async for event in app.run(request)]
 
 
 class ContextRecordingTool(Tool):
@@ -1993,6 +2012,7 @@ def test_exec_command_tool_policy_deny_blocks_runner():
         )
     )
 
+    assert type(result) is ToolResult
     assert result.is_error is True
     assert result.content == ("Command denied by policy. Shell scripts are not allowed here.")
     assert result.structured == {
@@ -2000,8 +2020,47 @@ def test_exec_command_tool_policy_deny_blocks_runner():
         "decision": "deny",
         "reason": "Shell scripts are not allowed here.",
     }
+    assert result.model_dump() == {
+        "content": "Command denied by policy. Shell scripts are not allowed here.",
+        "structured": {
+            "error": "command_denied",
+            "decision": "deny",
+            "reason": "Shell scripts are not allowed here.",
+        },
+        "artifacts": [],
+        "is_error": True,
+    }
+    assert dict(result) == result.model_dump()
+    assert result == ToolResult(**result.model_dump())
     assert policy.requests[0][1].cwd == "repo"
     assert policy.requests[0][1].canonical_cwd == "/workspace/repo"
+    assert runner.command is None
+
+
+@pytest.mark.parametrize(
+    "decision",
+    [CommandPolicyDecision.DENY, CommandPolicyDecision.REQUIRE_COMMAND_APPROVAL],
+)
+def test_exec_command_tool_bounds_oversized_policy_refusal(decision):
+    runner = RecordingRunner()
+    reason = "policy says no 🙂 " * 600
+    policy = _StaticCommandPolicy(CommandPolicyResult(decision=decision, reason=reason))
+    tool = ExecCommandTool(policy=policy)
+    context = ToolContext(session_id="sess_bounded_command_denial", runner=runner)
+
+    result = asyncio.run(tool.run(context, {"argv": ["git", "push"]}))
+
+    assert type(result) is ToolResult
+    assert result.is_error is True
+    assert len(result.content.encode("utf-8")) <= _POLICY_DENIAL_TEXT_MAX_BYTES
+    assert result.content.endswith(_POLICY_DENIAL_TRUNCATION_MARKER)
+    assert result.structured is not None
+    assert result.structured["reason"] == _bound_policy_denial_text(reason)
+    denial = context._policy_denial_for(tool)
+    assert denial is not None
+    assert denial.reason == reason
+    assert denial.result.structured is not None
+    assert denial.result.structured["reason"] == reason
     assert runner.command is None
 
 
@@ -2039,6 +2098,454 @@ def test_exec_command_tool_policy_require_approval_blocks_runner():
         "reason": None,
     }
     assert runner.command is None
+
+
+@pytest.mark.parametrize(
+    ("decision", "expected_error", "policy_reason", "expected_reason"),
+    [
+        (
+            CommandPolicyDecision.DENY,
+            "command_denied",
+            "Command is outside the approved workflow.",
+            "Command is outside the approved workflow.",
+        ),
+        (
+            CommandPolicyDecision.REQUIRE_COMMAND_APPROVAL,
+            "command_approval_required",
+            None,
+            "Command requires approval before it can run.",
+        ),
+        (
+            CommandPolicyDecision.DENY,
+            "command_denied",
+            "oversized command denial 🙂 " * 500,
+            _bound_policy_denial_text("oversized command denial 🙂 " * 500),
+        ),
+    ],
+)
+def test_exec_command_policy_refusal_emits_one_canonical_blocked_event(
+    decision,
+    expected_error,
+    policy_reason,
+    expected_reason,
+):
+    runner = RecordingRunner()
+
+    class AttemptedRewriteHook(RuntimeHook):
+        def __init__(self) -> None:
+            self.event_types: list[EventType | str] = []
+
+        async def after_tool_call(self, context: ToolCallHookContext) -> AfterToolCallDecision:
+            self.event_types.append(context.tool_event.type)
+            return AfterToolCallDecision(
+                action="modify",
+                modified_result=ToolResult(content="rewritten as success"),
+            )
+
+    hook = AttemptedRewriteHook()
+    policy = _StaticCommandPolicy(CommandPolicyResult(decision=decision, reason=policy_reason))
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_policy_refusal",
+                    name="exec_command",
+                    arguments={
+                        "argv": ["printenv", "TOP_SECRET"],
+                        "env": {"TOP_SECRET": "env-secret-value"},
+                        "stdin": "stdin-secret-value",
+                    },
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("I will use another approach."),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(EnvironmentSpec(name="policy-runner"), runner=runner),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[ExecCommandTool(policy=policy)],
+        runtime_hooks=[hook],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=f"sess_command_policy_{decision.value}",
+                messages=[Message.text("user", "run the command")],
+            ),
+        )
+    )
+
+    blocked = [event for event in events if event.type == EventType.TOOL_CALL_BLOCKED]
+    assert len(blocked) == 1
+    assert all(event.type != EventType.TOOL_CALL_FAILED for event in events)
+    assert all(event.type != EventType.TOOL_CALL_APPROVAL_REQUESTED for event in events)
+    assert all(event.type != EventType.SESSION_INTERRUPTED for event in events)
+    assert runner.command is None
+    assert hook.event_types == [EventType.TOOL_CALL_BLOCKED]
+    payload = blocked[0].payload
+    assert payload["denied_by"] == "command_policy"
+    assert payload["decision"] == decision.value
+    assert payload["metadata"] == {}
+    assert payload["reason"] == expected_reason
+    assert payload["tool_name"] == "exec_command"
+    assert payload["tool_call_id"] == "call_policy_refusal"
+    assert payload["tool_round_id"]
+    assert payload["idempotency_key"].startswith("cayu-tool:v1:")
+    assert payload["result"]["structured"]["error"] == expected_error
+    assert payload["result"]["content"] != "rewritten as success"
+    assert len(payload["result"]["content"].encode("utf-8")) <= (_POLICY_DENIAL_TEXT_MAX_BYTES)
+    if policy_reason is not None:
+        assert payload["result"]["structured"]["reason"] == _bound_policy_denial_text(policy_reason)
+    terminal_json = json.dumps(payload)
+    assert "env-secret-value" not in terminal_json
+    assert "stdin-secret-value" not in terminal_json
+    assert "TOP_SECRET" not in terminal_json
+
+    transcript = asyncio.run(app.session_store.load_transcript(blocked[0].session_id))
+    tool_result = next(message for message in transcript if message.role == "tool").content[0]
+    assert tool_result.tool_call_id == "call_policy_refusal"
+    assert tool_result.is_error is True
+    if policy_reason is not None and len(policy_reason.encode("utf-8")) > (
+        _POLICY_DENIAL_TEXT_MAX_BYTES
+    ):
+        assert tool_result.content.endswith(_POLICY_DENIAL_TRUNCATION_MARKER)
+    else:
+        assert expected_reason in tool_result.content
+    assert asyncio.run(app.session_store.load_checkpoint(blocked[0].session_id)) == {}
+
+
+def test_command_policy_denial_is_redacted_before_runtime_bounding():
+    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+
+    secret_value = "BOUNDARY_SECRET_command_value"
+    raw_reason = "a" * 4050 + secret_value
+    runner = RecordingRunner()
+    policy = _StaticCommandPolicy(
+        CommandPolicyResult(decision=CommandPolicyDecision.DENY, reason=raw_reason)
+    )
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_secret_command",
+                    name="exec_command",
+                    arguments={"argv": ["git", "push"]},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [ModelStreamEvent.completed({"finish_reason": "stop"})],
+        ]
+    )
+    app = CayuApp(secret_redactor=SecretRedactor(secret_value), enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(EnvironmentSpec(name="redacted-policy-runner"), runner=runner),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[ExecCommandTool(policy=policy)],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_redacted_command_policy_denial",
+                messages=[Message.text("user", "push")],
+            ),
+        )
+    )
+
+    blocked = next(event for event in events if event.type == EventType.TOOL_CALL_BLOCKED)
+    redacted_reason = raw_reason.replace(secret_value, REDACTED_SECRET)
+    assert "BOUNDARY" not in str(blocked.payload)
+    assert blocked.payload["reason"] == _bound_policy_denial_text(redacted_reason)
+    assert blocked.payload["result"]["content"] == _bound_policy_denial_text(
+        f"Command denied by policy. {redacted_reason}"
+    )
+    assert blocked.payload["result"]["structured"]["reason"] == (
+        _bound_policy_denial_text(redacted_reason)
+    )
+    assert runner.command is None
+    transcript = asyncio.run(app.session_store.load_transcript(blocked.session_id))
+    tool_result = next(message for message in transcript if message.role == "tool").content[0]
+    assert "BOUNDARY" not in str(tool_result.model_dump(mode="json"))
+
+
+def test_command_policy_redaction_preserves_protocol_fields_that_match_secrets():
+    from cayu.vaults import SecretRedactor
+
+    secret_values = [
+        "reason",
+        "denied",
+        "deny",
+        "command",
+        "policy",
+        "decision",
+        "result",
+        "error",
+    ]
+    redactor = SecretRedactor(secret_values)
+    raw_reason = "reason denied deny command policy decision result error " * 300
+    runner = RecordingRunner()
+    policy = _StaticCommandPolicy(
+        CommandPolicyResult(decision=CommandPolicyDecision.DENY, reason=raw_reason)
+    )
+    observed: dict[str, object] = {}
+
+    class ObserveCanonicalCommandDenial(RuntimeHook):
+        async def after_tool_call(self, context: ToolCallHookContext) -> None:
+            observed["payload"] = context.tool_event.payload
+            observed["structured"] = context.result.structured
+
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_command_collision",
+                    name="exec_command",
+                    arguments={"argv": ["git", "push"]},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [ModelStreamEvent.completed({"finish_reason": "stop"})],
+        ]
+    )
+    app = CayuApp(secret_redactor=redactor, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(EnvironmentSpec(name="protocol-policy-runner"), runner=runner),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[ExecCommandTool(policy=policy)],
+        runtime_hooks=[ObserveCanonicalCommandDenial()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_command_policy_protocol_collision",
+                messages=[Message.text("user", "push")],
+            ),
+        )
+    )
+
+    expected_reason = _bound_policy_denial_text(redactor.redact_text(raw_reason))
+    expected_content = _bound_policy_denial_text(
+        redactor.redact_text(f"Command denied by policy. {raw_reason}")
+    )
+    blocked = next(event for event in events if event.type == EventType.TOOL_CALL_BLOCKED)
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert blocked.payload["tool_name"] == "exec_command"
+    assert blocked.payload["denied_by"] == "command_policy"
+    assert blocked.payload["decision"] == "deny"
+    assert blocked.payload["metadata"] == {}
+    assert blocked.payload["reason"] == expected_reason
+    assert blocked.payload["result"]["content"] == expected_content
+    assert blocked.payload["result"]["structured"] == {
+        "error": "command_denied",
+        "decision": "deny",
+        "reason": expected_reason,
+    }
+    assert observed["payload"] == blocked.payload
+    assert observed["structured"] == blocked.payload["result"]["structured"]
+    assert runner.command is None
+
+    transcript = asyncio.run(app.session_store.load_transcript(blocked.session_id))
+    tool_result = next(message for message in transcript if message.role == "tool").content[0]
+    assert tool_result.content == expected_content
+    assert tool_result.structured == blocked.payload["result"]["structured"]
+
+
+def test_allowed_nonzero_command_remains_completed_and_not_policy_blocked():
+    runner = RecordingRunner(ExecResult(stderr="not found", exit_code=7))
+    policy = _StaticCommandPolicy(CommandPolicyResult(decision=CommandPolicyDecision.ALLOW))
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_nonzero",
+                    name="exec_command",
+                    arguments={"argv": ["missing-command"]},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [ModelStreamEvent.completed({"finish_reason": "stop"})],
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(EnvironmentSpec(name="nonzero-runner"), runner=runner),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[ExecCommandTool(policy=policy)],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_allowed_nonzero_command",
+                messages=[Message.text("user", "try it")],
+            ),
+        )
+    )
+
+    completed = [event for event in events if event.type == EventType.TOOL_CALL_COMPLETED]
+    assert len(completed) == 1
+    assert completed[0].payload["result"]["structured"]["exit_code"] == 7
+    assert all(event.type != EventType.TOOL_CALL_BLOCKED for event in events)
+    assert all(event.type != EventType.TOOL_CALL_FAILED for event in events)
+    assert runner.command == ExecCommand.process("missing-command")
+
+
+def test_command_policy_exception_remains_tool_failure_not_policy_block():
+    runner = RecordingRunner()
+
+    class RaisingCommandPolicy(CommandPolicy):
+        async def evaluate(self, ctx: ToolContext, request: CommandRequest) -> CommandPolicyResult:
+            del ctx, request
+            raise RuntimeError("command policy crashed")
+
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_policy_error",
+                    name="exec_command",
+                    arguments={"argv": ["pwd"]},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [ModelStreamEvent.completed({"finish_reason": "stop"})],
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(EnvironmentSpec(name="policy-error-runner"), runner=runner),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[ExecCommandTool(policy=RaisingCommandPolicy())],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_command_policy_error",
+                messages=[Message.text("user", "run pwd")],
+            ),
+        )
+    )
+
+    failed = [event for event in events if event.type == EventType.TOOL_CALL_FAILED]
+    assert len(failed) == 1
+    assert failed[0].payload["result"]["content"] == "command policy crashed"
+    assert all(event.type != EventType.TOOL_CALL_BLOCKED for event in events)
+    assert runner.command is None
+
+
+def test_command_policy_denial_resolves_once_inside_mixed_tool_round():
+    runner = RecordingRunner()
+    recorder = ContextRecordingTool()
+    policy = _StaticCommandPolicy(
+        CommandPolicyResult(
+            decision=CommandPolicyDecision.DENY,
+            reason="Command denied in mixed round.",
+        )
+    )
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_denied",
+                    name="exec_command",
+                    arguments={"argv": ["git", "push"]},
+                ),
+                ModelStreamEvent.tool_call(
+                    id="call_allowed",
+                    name="record_context",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [ModelStreamEvent.completed({"finish_reason": "stop"})],
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(EnvironmentSpec(name="mixed-runner"), runner=runner),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[ExecCommandTool(policy=policy), recorder],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_mixed_command_policy_denial",
+                messages=[Message.text("user", "use both tools")],
+            ),
+        )
+    )
+
+    terminal = [
+        event
+        for event in events
+        if event.type
+        in {
+            EventType.TOOL_CALL_COMPLETED,
+            EventType.TOOL_CALL_FAILED,
+            EventType.TOOL_CALL_BLOCKED,
+        }
+    ]
+    assert [(event.payload["tool_call_id"], event.type) for event in terminal] == [
+        ("call_denied", EventType.TOOL_CALL_BLOCKED),
+        ("call_allowed", EventType.TOOL_CALL_COMPLETED),
+    ]
+    assert terminal[0].payload["denied_by"] == "command_policy"
+    assert terminal[0].payload["metadata"] == {}
+    assert terminal[0].payload["tool_round_id"] == terminal[1].payload["tool_round_id"]
+    assert runner.command is None
+    assert recorder.context is not None
+
+    transcript = asyncio.run(app.session_store.load_transcript("sess_mixed_command_policy_denial"))
+    tool_message = next(message for message in transcript if message.role == "tool")
+    assert [part.tool_call_id for part in tool_message.content] == [
+        "call_denied",
+        "call_allowed",
+    ]
 
 
 def test_command_approval_member_is_distinct_from_tool_policy():

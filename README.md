@@ -375,7 +375,7 @@ Runtime objects are copied at runtime boundaries. Mutating an agent, environment
 
 Runtime-native tools receive services through `ToolContext`: workspace, artifact store, runner, vault, credential proxy, knowledge store, and MCP server specs. Those service references are runtime-only and are excluded from serialized context data. Runtime-executed tool calls also receive a stable `ToolContext.idempotency_key` that side-effecting tools can pass to downstream idempotent APIs. `ToolSpec.effect` declares side-effect semantics (`none`, `idempotent`, or `external`) for policy, audit, and future retry decisions; it does not authorize a call by itself.
 
-Tool policies authorize registered tool calls before execution. Denied calls emit `tool.call.blocked`, do not run the tool, and are returned to the model as error tool results so the session can continue. This `tool.call.blocked` contract covers the app-level `ToolPolicy` gate; a tool's *own* internal policy — such as an `ExecCommandTool(policy=...)` `CommandPolicy` denial — instead surfaces as `tool.call.failed` with a structured error, so observability that watches only `tool.call.blocked` will miss command denials.
+Tool policies authorize registered tool calls before execution. Refusals from either the app-level `ToolPolicy` gate or `ExecCommandTool(policy=...)`'s nested `CommandPolicy` emit one `tool.call.blocked` event with `denied_by=tool_policy|command_policy`, do not run the protected operation, and return an error tool result to the model so the session can continue. An allowed tool that later fails still emits `tool.call.failed`.
 
 ## Repository Layout
 
@@ -2670,8 +2670,10 @@ Without `policy=...`, the compatibility contract is intentionally unchanged:
 model-controlled command, cwd, environment, and stdin arguments pass to the
 runner subject to the tool's input bounds and the runner's own isolation.
 
-A `CommandPolicy` denial surfaces as a `tool.call.failed` event (see the note in
-Contract Rules on blocked-vs-failed). To gate a whole tool behind human approval,
+A `CommandPolicy` denial surfaces as one `tool.call.blocked` event with
+`denied_by=command_policy`; it is not also counted as `tool.call.failed`.
+`CommandPolicyDecision.REQUIRE_COMMAND_APPROVAL` is likewise an inline refusal,
+not a durable approval checkpoint. To gate a whole tool behind human approval,
 pass `AlwaysRequireApprovalToolPolicy(tools=["post_pr_comment"])` as the agent's
 `tool_policy` instead of hand-rolling a deny-everything rule.
 

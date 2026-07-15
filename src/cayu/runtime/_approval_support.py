@@ -22,6 +22,7 @@ from cayu.runtime.approvals import (
 )
 from cayu.runtime.sessions import Session
 from cayu.runtime.tool_policy import ToolPolicyResult
+from cayu.vaults import SecretRedactor
 
 PENDING_TOOL_APPROVAL_CHECKPOINT_KEY = "pending_tool_approval"
 _APPROVAL_TERMINAL_EVENT_TYPES = frozenset(
@@ -446,6 +447,7 @@ def pending_tool_call_approvals(
     tool_calls: list[runtime_records.ToolCallRequest],
     policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] | None,
     active_taint_by_id: Mapping[str, frozenset[str]] = MappingProxyType({}),
+    redactor: SecretRedactor | None = None,
 ) -> list[PendingToolCallApproval]:
     policy_results_by_id: dict[str, ToolPolicyResult | None] = {}
     if policy_outcomes is not None:
@@ -459,7 +461,10 @@ def pending_tool_call_approvals(
                 tool_name=tool_call.name,
                 arguments=copy_json_value(tool_call.arguments, "arguments"),
                 policy_decision=policy_result.decision.value if policy_result is not None else None,
-                reason=policy_result.reason if policy_result is not None else None,
+                reason=resume_ledger.policy_reason_for_pending_tool_call(
+                    policy_result,
+                    redactor=redactor,
+                ),
                 metadata=(
                     copy_json_value(policy_result.metadata, "metadata")
                     if policy_result is not None

@@ -693,15 +693,19 @@ def test_git_command_policy_completes_local_workflow_and_blocks_seeded_bypasses(
     assert [(request.cwd, request.canonical_cwd) for request in policy.requests] == [
         ("repo", str(repository))
     ] * len(commands)
-    failed = [event for event in events if event.type is EventType.TOOL_CALL_FAILED]
-    assert len(failed) == 4
-    assert [event.payload["result"]["structured"]["reason"] for event in failed] == [
+    blocked = [event for event in events if event.type is EventType.TOOL_CALL_BLOCKED]
+    assert len(blocked) == 4
+    assert all(event.payload["denied_by"] == "command_policy" for event in blocked)
+    assert all(event.payload["decision"] == "deny" for event in blocked)
+    assert all(event.payload["metadata"] == {} for event in blocked)
+    assert all(event.type is not EventType.TOOL_CALL_FAILED for event in events)
+    assert [event.payload["result"]["structured"]["reason"] for event in blocked] == [
         "Git path is not allowed by the Git policy.",
         "Git subcommand is not supported by the Git policy.",
         "Git subcommand is not supported by the Git policy.",
         "Git subcommand is not supported by the Git policy.",
     ]
-    denial_event = json.dumps(failed[0].model_dump(mode="json"), sort_keys=True)
+    denial_event = json.dumps(blocked[0].model_dump(mode="json"), sort_keys=True)
     assert ":(glob)*.filtered" not in denial_event
     assert all(not marker.exists() for marker in markers.values())
     verify = ("--no-pager", "-c", "core.fsmonitor=false")

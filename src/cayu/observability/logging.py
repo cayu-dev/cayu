@@ -171,6 +171,13 @@ def _summarize_event(
         _append_error(parts, payload, limit=error_summary_limit, redactor=redactor)
         if event_type == EventType.TOOL_CALL_FAILED:
             _append_tool_result_reason(parts, payload, limit=error_summary_limit, redactor=redactor)
+        elif event_type == EventType.TOOL_CALL_BLOCKED:
+            _append_policy_denial(
+                parts,
+                payload,
+                limit=error_summary_limit,
+                redactor=redactor,
+            )
     elif event_type in {
         EventType.SESSION_FAILED,
         EventType.MODEL_ERROR,
@@ -297,6 +304,22 @@ def _append_tool_result_reason(
         content = result.get("content")
         if type(content) is str and content:
             parts.append(f"reason={_truncate(_clean(content, redactor=redactor), limit)}")
+
+
+def _append_policy_denial(
+    parts: list[str],
+    payload: dict[str, Any],
+    *,
+    limit: int,
+    redactor: SecretRedactor,
+) -> None:
+    denied_by = payload.get("denied_by")
+    decision = payload.get("decision")
+    reason = payload.get("reason")
+    _append(parts, "denied_by", denied_by, redactor=redactor)
+    _append(parts, "decision", decision, redactor=redactor)
+    if type(reason) is str and reason:
+        parts.append(f"reason={_truncate(_clean(reason, redactor=redactor), limit)}")
 
 
 def _append_error(

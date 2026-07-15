@@ -54,7 +54,16 @@ from cayu.core.messages import (
     ToolResultPart,
 )
 from cayu.core.thinking import ThinkingConfig, thinking_config_payload
-from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.core.tools import (
+    _TOOL_POLICY_DENIAL_SOURCE,
+    Tool,
+    ToolContext,
+    ToolEffect,
+    ToolResult,
+    ToolSpec,
+    _bound_policy_denial_result,
+    _bound_policy_denial_text,
+)
 from cayu.environments import (
     BoundWorkspace,
     Environment,
@@ -3695,9 +3704,13 @@ class CayuApp:
                             payload={
                                 "tool_call_id": tool_call.id,
                                 "idempotency_key": idempotency_key,
-                                "decision": policy_result.decision.value,
-                                "reason": reason,
-                                "metadata": policy_result.metadata,
+                                **_policy_denial_payload_fields(
+                                    tool_name=tool_call.name,
+                                    denied_by=_TOOL_POLICY_DENIAL_SOURCE,
+                                    decision=policy_result.decision.value,
+                                    reason=reason,
+                                    metadata=policy_result.metadata,
+                                ),
                                 "result": blocked_result.model_dump(),
                             },
                         ),
@@ -4370,9 +4383,13 @@ class CayuApp:
                                 "approval_id": pending_approval.approval_id,
                                 "tool_call_id": tool_call.id,
                                 "idempotency_key": idempotency_key,
-                                "decision": policy_result.decision.value,
-                                "reason": reason,
-                                "metadata": policy_result.metadata,
+                                **_policy_denial_payload_fields(
+                                    tool_name=tool_call.name,
+                                    denied_by=_TOOL_POLICY_DENIAL_SOURCE,
+                                    decision=policy_result.decision.value,
+                                    reason=reason,
+                                    metadata=policy_result.metadata,
+                                ),
                                 "result": result.model_dump(),
                             },
                         ),
@@ -8479,9 +8496,13 @@ class CayuApp:
                 payload = {
                     "tool_call_id": tool_call.id,
                     "idempotency_key": idempotency_key,
-                    "decision": resolved_policy_result.decision.value,
-                    "reason": reason,
-                    "metadata": resolved_policy_result.metadata,
+                    **_policy_denial_payload_fields(
+                        tool_name=tool_call.name,
+                        denied_by=_TOOL_POLICY_DENIAL_SOURCE,
+                        decision=resolved_policy_result.decision.value,
+                        reason=reason,
+                        metadata=resolved_policy_result.metadata,
+                    ),
                     "result": result.model_dump(),
                 }
                 if tool_round_id is not None:
@@ -8669,11 +8690,15 @@ class CayuApp:
                     event_type=EventType.TOOL_CALL_BLOCKED,
                     result=ToolResult(content=reason, is_error=True),
                     extra_payload={
-                        "reason": reason,
-                        "decision": reauthorization.decision.value,
+                        **_policy_denial_payload_fields(
+                            tool_name=effective_tool_call.name,
+                            denied_by=_TOOL_POLICY_DENIAL_SOURCE,
+                            decision=reauthorization.decision.value,
+                            reason=reason,
+                            metadata=reauthorization.metadata,
+                        ),
                         "blocked_by": "tool_policy_reauthorization",
                         "idempotency_key": idempotency_key,
-                        **effective_arguments_payload,
                     },
                     task_id=task_id,
                     tool_round_id=tool_round_id,
@@ -8701,30 +8726,31 @@ class CayuApp:
             # ctx_metadata is a freshly copied dict and taint_labels is already validated, so set
             # the key directly instead of re-deep-copying the whole payload via the helper.
             ctx_metadata[TAINT_LABELS_METADATA_KEY] = sorted(taint_labels)
+        tool_context = ToolContext(
+            session_id=session.id,
+            agent_name=registered_agent.spec.name,
+            environment_name=environment_name,
+            causal_budget_id=session.causal_budget_id,
+            workspace_id=_workspace_id(registered_environment),
+            artifact_store_id=_artifact_store_id(registered_environment),
+            idempotency_key=idempotency_key,
+            workspace=_workspace(registered_environment),
+            artifact_store=_artifact_store(registered_environment),
+            runner=_runner(registered_environment),
+            vault=_vault(registered_environment),
+            proxy=_proxy(
+                registered_environment,
+                on_resolve=resolved_proxy_secrets.append,
+                on_authorize=proxy_authorizations.append,
+            ),
+            knowledge_store=_knowledge_store(registered_environment),
+            mcp_servers=_mcp_servers(registered_environment),
+            metadata=ctx_metadata,
+        )
         try:
             result = await tool_execution.run_tool(
                 tool=registered_tool.tool,
-                ctx=ToolContext(
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    causal_budget_id=session.causal_budget_id,
-                    workspace_id=_workspace_id(registered_environment),
-                    artifact_store_id=_artifact_store_id(registered_environment),
-                    idempotency_key=idempotency_key,
-                    workspace=_workspace(registered_environment),
-                    artifact_store=_artifact_store(registered_environment),
-                    runner=_runner(registered_environment),
-                    vault=_vault(registered_environment),
-                    proxy=_proxy(
-                        registered_environment,
-                        on_resolve=resolved_proxy_secrets.append,
-                        on_authorize=proxy_authorizations.append,
-                    ),
-                    knowledge_store=_knowledge_store(registered_environment),
-                    mcp_servers=_mcp_servers(registered_environment),
-                    metadata=ctx_metadata,
-                ),
+                ctx=tool_context,
                 # effective_tool_call.arguments is the (re-authorized) private copy to execute.
                 arguments=effective_tool_call.arguments,
                 timeout_seconds=self._tool_timeout_seconds,
@@ -8775,6 +8801,39 @@ class CayuApp:
         tool_swallowed_cancellation = current_task is not None and current_task.cancelling() > 0
         if tool_swallowed_cancellation and await self._session_is_interrupting(session.id):
             raise _SessionInterruptedByRequest(session.id)
+        policy_denial = tool_context._policy_denial_for(registered_tool.tool)
+        if policy_denial is not None:
+            # Nested policy refusals are authority outcomes, not failed executions. Their trusted
+            # control metadata travels through the private per-call context signal; the tool still
+            # returns the exact public ToolResult that hooks, transcripts, and direct callers expect.
+            # Exact instance matching is intentional: a nested or delegated tool must not relabel
+            # its registered caller's result without a future explicit delegation contract.
+            async for event in self._emit_terminal_tool_result(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                tool_call=effective_tool_call,
+                event_type=EventType.TOOL_CALL_BLOCKED,
+                result=policy_denial.result,
+                extra_payload={
+                    "idempotency_key": idempotency_key,
+                    **_policy_denial_payload_fields(
+                        tool_name=effective_tool_call.name,
+                        denied_by=policy_denial.denied_by,
+                        decision=policy_denial.decision,
+                        reason=policy_denial.reason,
+                        metadata={},
+                    ),
+                },
+                task_id=task_id,
+                tool_round_id=tool_round_id,
+                approval_id=approval_id,
+                input_id=input_id,
+                allow_modification=False,
+                redactor=redactor,
+            ):
+                yield event
+            return
         event_type = (
             EventType.TOOL_CALL_FAILED if result.is_error else EventType.TOOL_CALL_COMPLETED
         )
@@ -9030,6 +9089,7 @@ class CayuApp:
                 tool_calls=tool_calls,
                 policy_outcomes=policy_outcomes,
                 active_taint_by_id=active_taint_by_id,
+                redactor=self._secret_redactor,
             ),
             structured_output=copy_structured_output_spec(structured_output),
             thinking=thinking,
@@ -9109,6 +9169,7 @@ class CayuApp:
                 tool_calls=tool_calls,
                 policy_outcomes=policy_outcomes,
                 active_taint_by_id=active_taint_by_id,
+                redactor=self._secret_redactor,
             ),
             structured_output=copy_structured_output_spec(structured_output),
             thinking=thinking,
@@ -9159,6 +9220,7 @@ class CayuApp:
             tool_calls=tool_calls,
             policy_outcomes=policy_outcomes,
             structured_output=structured_output,
+            redactor=self._secret_redactor,
         )
 
     async def _checkpoint_without_pending_tool_round(
@@ -11034,6 +11096,7 @@ class CayuApp:
         approval_id: str | None,
         input_id: str | None,
         allow_modification: bool,
+        redactor: SecretRedactor | None = None,
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
         # Shared emission for the before-hook block / short-circuit terminal results.
         payload: dict[str, Any] = {
@@ -11062,6 +11125,7 @@ class CayuApp:
             tool_call=tool_call,
             result=result,
             task_id=task_id,
+            redactor=redactor,
             allow_modification=allow_modification,
         ):
             yield event
@@ -11180,7 +11244,7 @@ class CayuApp:
         # allow_modification) rewrites the result the transcript keeps and the model sees; the
         # rewritten result is re-redacted so hook-injected secrets are scrubbed too. `event` is
         # unpersisted here but carries a stable id, reused when it persists.
-        event, result = _redact_tool_result_event(
+        event, result = _prepare_tool_result_event(
             event=event,
             result=result,
             redactor=resolved_redactor,
@@ -11204,7 +11268,7 @@ class CayuApp:
             payload = dict(event.payload)
             payload["result"] = final_result.model_dump()
             event = event.model_copy(update={"payload": payload})
-            event, final_result = _redact_tool_result_event(
+            event, final_result = _prepare_tool_result_event(
                 event=event,
                 result=final_result,
                 redactor=resolved_redactor,
@@ -11306,7 +11370,15 @@ class CayuApp:
                 # or recovery-supplied) result. Only the hook's view is redacted; the threaded
                 # result is re-redacted before persistence.
                 arguments=redactor.redact_json(tool_call.arguments),
-                result=tool_results.redact_tool_result(current_result, redactor),
+                result=(
+                    current_result
+                    if _is_policy_denial_event(tool_event) and not allow_modification
+                    else _redact_tool_result_for_event(
+                        event=tool_event,
+                        result=current_result,
+                        redactor=redactor,
+                    )
+                ),
                 task_id=task_id,
             )
             try:
@@ -14208,6 +14280,148 @@ def _redact_tool_result_event(
         raise AssertionError("Event payload redaction returned non-object payload.")
     payload["result"] = redacted_result.model_dump()
     return event.model_copy(update={"payload": payload}), redacted_result
+
+
+_POLICY_DENIAL_CONTROL_PAYLOAD_FIELDS = frozenset(
+    {
+        "approval_id",
+        "blocked_by",
+        "decision",
+        "denied_by",
+        "idempotency_key",
+        "input_id",
+        "tool_call_id",
+        "tool_name",
+        "tool_round_id",
+    }
+)
+_POLICY_DENIAL_CONTROL_RESULT_FIELDS = frozenset({"decision", "error"})
+
+
+def _prepare_tool_result_event(
+    *,
+    event: Event,
+    result: ToolResult,
+    redactor: SecretRedactor,
+) -> tuple[Event, ToolResult]:
+    """Redact a terminal result, preserving policy schema before applying its cap."""
+
+    if _is_policy_denial_event(event):
+        event, result = _redact_policy_denial_event(
+            event=event,
+            result=result,
+            redactor=redactor,
+        )
+    else:
+        event, result = _redact_tool_result_event(
+            event=event,
+            result=result,
+            redactor=redactor,
+        )
+    return _bound_policy_denial_event(event=event, result=result)
+
+
+def _redact_tool_result_for_event(
+    *,
+    event: Event,
+    result: ToolResult,
+    redactor: SecretRedactor,
+) -> ToolResult:
+    if _is_policy_denial_event(event):
+        return _redact_policy_denial_result(result, redactor)
+    return tool_results.redact_tool_result(result, redactor)
+
+
+def _is_policy_denial_event(event: Event) -> bool:
+    return event.type == EventType.TOOL_CALL_BLOCKED and "denied_by" in event.payload
+
+
+def _redact_policy_denial_event(
+    *,
+    event: Event,
+    result: ToolResult,
+    redactor: SecretRedactor,
+) -> tuple[Event, ToolResult]:
+    """Redact policy diagnostics without rewriting their protocol keys or control values."""
+
+    redacted_result = _redact_tool_result_for_event(
+        event=event,
+        result=result,
+        redactor=redactor,
+    )
+    if not redactor.has_values:
+        return event, redacted_result
+    payload: dict[str, Any] = {}
+    for key, value in event.payload.items():
+        if key == "result":
+            continue
+        if key in _POLICY_DENIAL_CONTROL_PAYLOAD_FIELDS:
+            payload[key] = copy_json_value(value, key)
+        else:
+            payload[key] = redactor.redact_json(value)
+    payload["result"] = redacted_result.model_dump()
+    return event.model_copy(update={"payload": payload}), redacted_result
+
+
+def _redact_policy_denial_result(
+    result: ToolResult,
+    redactor: SecretRedactor,
+) -> ToolResult:
+    if type(result) is not ToolResult:
+        raise TypeError("Policy denial results must be ToolResult instances.")
+    if not isinstance(redactor, SecretRedactor):
+        raise TypeError("redactor must be a SecretRedactor.")
+    if not redactor.has_values:
+        return result
+    structured = result.structured
+    if structured is not None:
+        structured = {
+            key: (
+                copy_json_value(value, key)
+                if key in _POLICY_DENIAL_CONTROL_RESULT_FIELDS
+                else redactor.redact_json(value)
+            )
+            for key, value in structured.items()
+        }
+    return ToolResult(
+        content=redactor.redact_text(result.content),
+        structured=structured,
+        artifacts=redactor.redact_json(result.artifacts),
+        is_error=result.is_error,
+    )
+
+
+def _bound_policy_denial_event(*, event: Event, result: ToolResult) -> tuple[Event, ToolResult]:
+    """Apply the denial cap after redaction and keep payload/result synchronized."""
+
+    if event.type != EventType.TOOL_CALL_BLOCKED or "denied_by" not in event.payload:
+        return event, result
+    bounded_result = _bound_policy_denial_result(result)
+    payload = dict(event.payload)
+    reason = payload.get("reason")
+    if type(reason) is not str:
+        raise ValueError("`reason` must be a string.")
+    payload["reason"] = _bound_policy_denial_text(require_nonblank(reason, "reason"))
+    payload["result"] = bounded_result.model_dump()
+    return event.model_copy(update={"payload": payload}), bounded_result
+
+
+def _policy_denial_payload_fields(
+    *,
+    tool_name: str,
+    denied_by: str,
+    decision: str,
+    reason: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Canonical, argument-free attribution for a policy-denied tool call."""
+    return {
+        "tool_name": require_clean_nonblank(tool_name, "tool_name"),
+        "denied_by": require_clean_nonblank(denied_by, "denied_by"),
+        "decision": require_clean_nonblank(decision, "decision"),
+        "reason": require_nonblank(reason, "reason"),
+        "metadata": copy_json_value(metadata, "metadata"),
+    }
 
 
 def _redact_tool_call_outcomes(

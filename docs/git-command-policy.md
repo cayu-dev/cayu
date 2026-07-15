@@ -161,7 +161,8 @@ Unlisted subcommands fail closed. In particular, the policy denies:
 Denial reasons identify only the rejected category. They never interpolate the
 argv item, path, revision, commit message, environment value, stdin, repository
 content, credential, URL, or command output. The terminal
-`tool.call.failed` result therefore stays category-only. The ordinary Cayu
+`tool.call.blocked` result therefore stays category-only and carries
+`denied_by=command_policy`. The ordinary Cayu
 audit/replay contract still records the model's original tool arguments on
 `tool.call.started`; do not place secrets in command argv, environment, stdin,
 or commit messages when that event stream is not an appropriate secret store.

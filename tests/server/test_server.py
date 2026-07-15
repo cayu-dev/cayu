@@ -6179,6 +6179,85 @@ def test_streaming_mutation_id_header_rejects_unsafe_values_before_execution() -
     assert asyncio.run(app.session_store.load_state("session-invalid-mutation-id")) is None
 
 
+def test_sse_replay_preserves_canonical_policy_denial_attribution() -> None:
+    session_id = "session_policy_denial_replay"
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+
+    async def seed() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "push")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.append_events(
+            session_id,
+            [
+                Event(
+                    id="event_tool_started",
+                    type=EventType.TOOL_CALL_STARTED,
+                    session_id=session_id,
+                    tool_name="exec_command",
+                    payload={"tool_call_id": "call_1"},
+                ),
+                Event(
+                    id="event_tool_blocked",
+                    type=EventType.TOOL_CALL_BLOCKED,
+                    session_id=session_id,
+                    tool_name="exec_command",
+                    payload={
+                        "tool_name": "exec_command",
+                        "tool_call_id": "call_1",
+                        "tool_round_id": "round_1",
+                        "idempotency_key": "cayu-tool:v1:call_1",
+                        "denied_by": "command_policy",
+                        "decision": "deny",
+                        "reason": "Remote mutation is not allowed.",
+                        "result": {
+                            "content": "Command denied by policy.",
+                            "structured": {"error": "command_denied"},
+                            "artifacts": [],
+                            "is_error": True,
+                        },
+                    },
+                ),
+                Event(
+                    id="event_session_completed",
+                    type=EventType.SESSION_COMPLETED,
+                    session_id=session_id,
+                ),
+            ],
+        )
+        await store.update_status(session_id, SessionStatus.COMPLETED)
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, dev=True))
+
+    with client.stream(
+        "POST",
+        "/api/run",
+        json={"prompt": "ignored during replay", "session_id": session_id},
+        headers={"Last-Event-ID": f"{session_id}:"},
+    ) as response:
+        assert response.status_code == 200
+        frames = [frame for frame in _sse_frames(response) if "data" in frame]
+
+    blocked = next(
+        frame["data"] for frame in frames if frame["data"]["type"] == "tool.call.blocked"
+    )
+    assert blocked["payload"]["denied_by"] == "command_policy"
+    assert blocked["payload"]["decision"] == "deny"
+    assert blocked["payload"]["tool_name"] == "exec_command"
+    assert [frame["data"]["id"] for frame in frames] == [
+        "event_tool_started",
+        "event_tool_blocked",
+        "event_session_completed",
+    ]
+
+
 def test_run_disconnect_after_http_acceptance_before_first_body_replays_from_start() -> None:
     task_store = InMemoryTaskStore()
     app = CayuApp(task_store=task_store)

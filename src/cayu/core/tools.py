@@ -18,7 +18,7 @@ from pydantic import (
     field_validator,
 )
 
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
 
 
 class ToolEffect(StrEnum):
@@ -198,6 +198,57 @@ class ToolResult(BaseModel):
         return copy_json_value(value, info.field_name)
 
 
+_TOOL_POLICY_DENIAL_SOURCE = "tool_policy"
+_COMMAND_POLICY_DENIAL_SOURCE = "command_policy"
+_POLICY_DENIAL_TEXT_MAX_BYTES = 4 * 1024
+_POLICY_DENIAL_TRUNCATION_MARKER = "\n[policy denial reason truncated]"
+
+
+def _bound_policy_denial_text(value: str) -> str:
+    """Bound trusted policy diagnostics without splitting a Unicode scalar."""
+
+    value = require_nonblank(value, "policy denial text")
+    # Policy implementations are application code and can construct a string with
+    # lone surrogates. Keep the refusal fail-closed while making its durable form
+    # valid UTF-8 rather than turning the denial into an operational failure.
+    encoded = value.encode("utf-8", errors="replace")
+    if len(encoded) <= _POLICY_DENIAL_TEXT_MAX_BYTES:
+        return encoded.decode("utf-8")
+    marker = _POLICY_DENIAL_TRUNCATION_MARKER.encode("utf-8")
+    prefix = encoded[: _POLICY_DENIAL_TEXT_MAX_BYTES - len(marker)]
+    return prefix.decode("utf-8", errors="ignore").rstrip() + _POLICY_DENIAL_TRUNCATION_MARKER
+
+
+def _bound_policy_denial_result(result: ToolResult) -> ToolResult:
+    """Bound the model-facing and structured reason fields of a denial result."""
+
+    if type(result) is not ToolResult:
+        raise TypeError("Policy denial results must be ToolResult instances.")
+    structured = result.structured
+    if structured is not None and type(structured.get("reason")) is str:
+        structured = {
+            **structured,
+            "reason": _bound_policy_denial_text(structured["reason"]),
+        }
+    return ToolResult(
+        content=_bound_policy_denial_text(result.content),
+        structured=structured,
+        artifacts=result.artifacts,
+        is_error=result.is_error,
+    )
+
+
+@dataclass(frozen=True)
+class _PolicyDenialSignal:
+    """Runtime-only attribution recorded alongside an ordinary tool result."""
+
+    source: object
+    denied_by: str
+    decision: str
+    reason: str
+    result: ToolResult
+
+
 @runtime_checkable
 class WorkspaceHandle(Protocol):
     """Structural contract for the workspace handed to tools.
@@ -307,6 +358,41 @@ class ToolContext(BaseModel):
     knowledge_store: KnowledgeStoreHandle | None = Field(default=None, exclude=True)
     mcp_servers: tuple[Any, ...] = Field(default_factory=tuple, exclude=True)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    _policy_denials: list[_PolicyDenialSignal] = PrivateAttr(default_factory=list)
+
+    def _record_policy_denial(
+        self,
+        *,
+        source: object,
+        denied_by: str,
+        decision: str,
+        reason: str,
+        result: ToolResult,
+    ) -> None:
+        """Record trusted control metadata without changing the public ToolResult contract."""
+
+        if type(result) is not ToolResult:
+            raise TypeError("Policy denial results must be ToolResult instances.")
+        self._policy_denials.append(
+            _PolicyDenialSignal(
+                source=source,
+                denied_by=require_clean_nonblank(denied_by, "denied_by"),
+                decision=require_clean_nonblank(decision, "decision"),
+                reason=require_nonblank(reason, "reason"),
+                result=result,
+            )
+        )
+
+    def _policy_denial_for(self, source: object) -> _PolicyDenialSignal | None:
+        for denial in reversed(self._policy_denials):
+            if denial.source is source:
+                return denial
+        return None
+
+    def _discard_policy_denials_for(self, source: object) -> None:
+        self._policy_denials[:] = [
+            denial for denial in self._policy_denials if denial.source is not source
+        ]
 
     @field_validator("metadata", mode="before")
     @classmethod

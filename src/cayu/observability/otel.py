@@ -29,6 +29,8 @@ CAYU_SESSION_ID = "cayu.session.id"
 CAYU_AGENT_NAME = "cayu.agent.name"
 CAYU_ENVIRONMENT_NAME = "cayu.environment.name"
 CAYU_MODEL_STEP = "cayu.model.step"
+CAYU_TOOL_DENIED_BY = "cayu.tool.denied_by"
+CAYU_TOOL_POLICY_DECISION = "cayu.tool.policy_decision"
 # Marks a span force-closed without its own completion event (e.g. an in-flight
 # model/tool span when the session was interrupted) so it is not mistaken for a
 # clean success.
@@ -50,9 +52,10 @@ _SESSION_END_EVENTS = frozenset(
         EventType.SESSION_INTERRUPTED,
     }
 )
-# Tool-call events that terminate a tool span with a non-success outcome. BLOCKED
-# (policy denial) and APPROVAL_DENIED follow a TOOL_CALL_STARTED, so they must close
-# the span — otherwise it orphans and is recorded as a success at session end.
+# Tool-call events that terminate a tool span with a non-success outcome. Most close
+# a preceding TOOL_CALL_STARTED span. A canonical policy BLOCKED event may instead be
+# terminal-only when a planned denial is resumed beside an approved sibling; the sink
+# synthesizes that denial observation rather than dropping it from tracing.
 _TOOL_CALL_ERROR_EVENTS = frozenset(
     {
         EventType.TOOL_CALL_FAILED,
@@ -318,15 +321,28 @@ class OpenTelemetryEventSink(EventSink):
             self._finish(
                 state.tools.pop(tool_call_id), error=None, incomplete=True, end_time=event_ns
             )
+        state.tools[tool_call_id] = self._new_tool_span(
+            state=state,
+            event=event,
+            start_time=event_ns,
+        )
+
+    def _new_tool_span(
+        self,
+        *,
+        state: _SessionSpans,
+        event: Event,
+        start_time: int,
+    ) -> Any:
         tool_name = event.tool_name
         name = _span_name(_OPERATION_EXECUTE_TOOL, tool_name)
         span = self._tracer.start_span(
-            name, context=self._trace.set_span_in_context(state.root), start_time=event_ns
+            name, context=self._trace.set_span_in_context(state.root), start_time=start_time
         )
         span.set_attribute(GEN_AI_OPERATION_NAME, _OPERATION_EXECUTE_TOOL)
         _set_str(span, GEN_AI_TOOL_NAME, tool_name)
-        _set_str(span, GEN_AI_TOOL_CALL_ID, tool_call_id)
-        state.tools[tool_call_id] = span
+        _set_str(span, GEN_AI_TOOL_CALL_ID, _tool_call_id(event))
+        return span
 
     def _end_tool_span(self, event: Event, *, error: str | None) -> None:
         state = self._sessions.get(event.session_id)
@@ -334,8 +350,25 @@ class OpenTelemetryEventSink(EventSink):
             return
         event_ns = _event_time_ns(event)
         state.last_activity_ns = event_ns
-        span = state.tools.pop(_tool_call_id(event), None)
+        tool_call_id = _tool_call_id(event)
+        span = state.tools.pop(tool_call_id, None)
+        denied_by = event.payload.get("denied_by")
+        if (
+            span is None
+            and event.type == EventType.TOOL_CALL_BLOCKED
+            and tool_call_id
+            and type(denied_by) is str
+            and denied_by
+        ):
+            # Approval planning can persist a DENY beside a REQUIRE_APPROVAL call.
+            # On resume the denied sibling emits only its canonical terminal event;
+            # represent that authority decision as an instantaneous child span without
+            # inventing a runtime TOOL_CALL_STARTED event that would affect accounting.
+            span = self._new_tool_span(state=state, event=event, start_time=event_ns)
         if span is not None:
+            if event.type == EventType.TOOL_CALL_BLOCKED:
+                _set_str(span, CAYU_TOOL_DENIED_BY, denied_by)
+                _set_str(span, CAYU_TOOL_POLICY_DECISION, event.payload.get("decision"))
             self._finish(span, error=error, end_time=event_ns)
 
     def _resolve_parent_context(self, event: Event) -> Any:
