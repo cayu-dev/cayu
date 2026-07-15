@@ -770,6 +770,7 @@ def test_runner_close_bounds_grant_drain_and_retries_without_releasing_resources
         )
         managed = result.environment.runner
         assert managed is not None
+        managed._teardown_timeout_s = 0.01
         managed._grant_revoker.teardown_timeout_s = 0.01
         broker: TransparentEgressBroker = adapter.captured["broker"]
         grant = adapter.captured["grant"]

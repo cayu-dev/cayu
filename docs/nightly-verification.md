@@ -110,24 +110,25 @@ or in CI.
 | Advanced runtime examples | `ANTHROPIC_API_KEY` for prompt-cache compaction; `GEMINI_API_KEY` for the other primary checks; `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` for portability checks | provider-dependent | `advanced-prompt-cache-compaction`, `advanced-research-council`, `advanced-counterfactual-approval`, `advanced-repo-tournament`, `advanced-tainted-incident`, plus provider-suffixed portability checks |
 | Dashboard browser | `cayu[browser]` and installed Chromium | $0 | `dashboard-behavior` |
 
-The CI workflow also runs dashboard lint/typecheck, generated-client drift,
-package build, and packaged-asset status checks. It still does not run dashboard
-browser behavior tests.
+The CI workflow requires the disposable Postgres tier, Docker runner checks, and
+Docker virtual-egress checks as part of its Python 3.14 suite. It also runs
+dashboard lint/typecheck, generated-client drift, package build, and
+packaged-asset status checks. It still does not run dashboard browser behavior
+tests.
 
 ### Interpreter coverage
 
-CI runs the full test suite on Python 3.14 only. The lint and typecheck legs run
+CI runs the full test suite on Python 3.14 only. The static-check leg runs
 on Python 3.11, with ruff `target-version = "py311"` and ty
 `python-version = "3.11"`, so statically detectable compatibility problems in
 their checked paths still fail at PR time. These checks do not prove runtime
 compatibility with the `requires-python = ">=3.11"` floor.
 
 The full test suite is not automated on Python 3.11, 3.12, or 3.13. The release
-artifact job performs package and CLI smoke checks on Python 3.11, and the
-targeted Docker runner check uses Python 3.12, but neither replaces full-suite
-coverage. With Docker available for the disposable Postgres tier (or
-`CAYU_TEST_POSTGRES_DSN` set), run omitted interpreters manually with the same
-loud Postgres requirement as CI:
+artifact job performs package and CLI smoke checks on Python 3.11, but it does
+not replace full-suite coverage. With Docker available for the disposable
+Postgres tier (or `CAYU_TEST_POSTGRES_DSN` set), run omitted interpreters
+manually with the same loud Postgres requirement as CI:
 
 ```console
 $ CAYU_REQUIRE_POSTGRES=1 uv run --frozen --extra dev --extra server --python 3.11 pytest -q
@@ -135,13 +136,14 @@ $ CAYU_REQUIRE_POSTGRES=1 uv run --frozen --extra dev --extra server --python 3.
 $ CAYU_REQUIRE_POSTGRES=1 uv run --frozen --extra dev --extra server --python 3.13 pytest -q
 ```
 
-### CI source coverage visibility
+### Main and release CI source coverage visibility
 
-The Python 3.14 test leg records line and branch coverage for the `cayu` package.
-Missing lines appear in the job log, and the complete report is written to the
-GitHub Actions job summary. This is diagnostic visibility, not a release-quality
-score: CI has no global coverage threshold, so a percentage cannot fail the job;
-test or coverage-tool failures still do.
+Pull requests run the Python 3.14 test leg without coverage instrumentation to
+keep feedback fast. Pushes to `main` and release tags record line and branch
+coverage for the `cayu` package. Missing lines appear in the job log, and the
+complete report is written to the GitHub Actions job summary. This is diagnostic
+visibility, not a release-quality score: CI has no global coverage threshold, so
+a percentage cannot fail the job; test or coverage-tool failures still do.
 
 Source coverage shows which in-process Python paths the required pytest suite
 executed. It does not replace the capability checks above and does not prove the

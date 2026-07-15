@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from cayu.cli import main
+from cayu.cli import storage as storage_cli
 from cayu.storage import migrations as schema
 
 
@@ -126,9 +127,19 @@ def test_storage_status_connection_error_does_not_leak_dsn(capsys):
     assert "s3cr3t" not in err
 
 
-def test_storage_export_connection_error_does_not_leak_dsn(capsys):
+def test_storage_export_connection_error_does_not_leak_dsn(capsys, monkeypatch):
     # Export must redact the DSN password on a Postgres connection failure too.
     dsn = "postgresql://admin:s3cr3t@127.0.0.1:1/nope"
+
+    class FailingStore:
+        async def ensure_schema(self) -> None:
+            raise RuntimeError(f"connection failed for {dsn}")
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(storage_cli, "_session_store", lambda _args: FailingStore())
+
     assert main(["storage", "export", "--postgres", dsn]) == 1
     err = capsys.readouterr().err
     assert "error:" in err

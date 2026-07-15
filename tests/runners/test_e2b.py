@@ -876,6 +876,7 @@ def test_e2b_runner_times_out_delayed_start_without_hanging() -> None:
             runner.exec(ExecCommand.process("sleep", "30"), timeout_s=1),
             timeout=2,
         )
+        sandbox.commands.background_delay_s = 0
         sandbox.commands.next_handle = FakeHandle()
         after = await runner.exec(ExecCommand.process("pwd"))
         return sandbox, result, after.exit_code

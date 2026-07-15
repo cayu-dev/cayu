@@ -14,20 +14,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  lint:
-    name: Lint (ruff)
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv python install 3.11
-      - run: uv sync --frozen --extra dev --python 3.11
-      - run: uv run ruff check src/ tests/ examples/ scripts/ maintenance/
-      - run: uv run ruff format --check src/ tests/ examples/ scripts/ maintenance/
-
-  typecheck:
-    name: Type diagnostics (ty)
+  static:
+    name: Static checks
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -35,51 +23,36 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - run: uv python install 3.11
       - run: uv sync --frozen --extra dev --extra server --python 3.11
+      - run: uv run ruff check src/ tests/ examples/ scripts/ maintenance/
+      - run: uv run ruff format --check src/ tests/ examples/ scripts/ maintenance/
       - run: uv run ty check src/cayu examples maintenance
+      - run: uv lock --check
 
   test:
     name: Test (Python 3.14)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      CAYU_REQUIRE_POSTGRES: "1"
+      CAYU_REQUIRE_DOCKER_RUNNER: "1"
+      CAYU_REQUIRE_DOCKER_EGRESS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: uv python install 3.14
       - run: uv sync --frozen --extra dev --extra server --python 3.14
+      - name: Test
+        if: github.event_name == 'pull_request'
+        run: uv run pytest -q --durations=20
       - name: Test with coverage visibility
+        if: github.event_name != 'pull_request'
         run: |
           uv run pytest -q \
+            --durations=20 \
             --cov=cayu \
             --cov-branch \
             --cov-report=term-missing:skip-covered \
             --cov-report=markdown-append:${GITHUB_STEP_SUMMARY}
-        env:
-          CAYU_REQUIRE_POSTGRES: "1"
-
-  docker-runner:
-    name: Docker runner live
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv python install 3.12
-      - run: uv sync --frozen --extra dev --python 3.12
-      - run: uv run pytest tests/runners/test_docker_live.py -q
-        env:
-          CAYU_REQUIRE_DOCKER_RUNNER: "1"
-      - run: uv run pytest tests/egress/test_docker_egress_e2e.py -q
-        env:
-          CAYU_REQUIRE_DOCKER_EGRESS: "1"
-
-  lockfile:
-    name: Lockfile sync
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv lock --check
 
   package:
     name: Release artifacts
