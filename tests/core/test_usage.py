@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
+from tests.core._budget_ledger_contract import assert_idempotent_terminal_settlements
 
 from cayu.core import Event, EventType, Message
 from cayu.providers import UsageDialect
@@ -361,6 +362,20 @@ def test_in_memory_budget_ledger_reserves_reconciles_and_releases() -> None:
     assert released.released_amount == Decimal("0.22")
 
 
+def test_in_memory_budget_ledger_terminal_settlements_are_idempotent() -> None:
+    clock = MutableClock(datetime(2026, 1, 1, tzinfo=UTC))
+    asyncio.run(
+        assert_idempotent_terminal_settlements(
+            InMemoryBudgetLedger(clock=clock),
+            _reservation_budget_limit(
+                max_cost="0.25",
+                window=BudgetWindow.rolling(seconds=60),
+            ),
+            clock=clock,
+        )
+    )
+
+
 def test_in_memory_budget_ledger_window_bounds_active_reservations() -> None:
     async def run():
         clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
@@ -607,6 +622,28 @@ def test_sqlite_budget_ledger_reserves_reconciles_and_releases(tmp_path) -> None
     assert blocked.actual == Decimal("0.44")
     assert reconciled.released_amount == Decimal("0.21")
     assert released.status == "released"
+
+
+def test_sqlite_budget_ledger_terminal_settlements_are_idempotent(tmp_path) -> None:
+    async def run() -> None:
+        clock = MutableClock(datetime(2026, 1, 1, tzinfo=UTC))
+        ledger = SQLiteBudgetLedger(
+            tmp_path / "budget-idempotency.sqlite",
+            clock=clock,
+        )
+        try:
+            await assert_idempotent_terminal_settlements(
+                ledger,
+                _reservation_budget_limit(
+                    max_cost="0.25",
+                    window=BudgetWindow.rolling(seconds=60),
+                ),
+                clock=clock,
+            )
+        finally:
+            await ledger.close()
+
+    asyncio.run(run())
 
 
 def test_sqlite_budget_ledger_persists_rolling_window_key(tmp_path) -> None:

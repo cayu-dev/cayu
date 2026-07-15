@@ -1196,7 +1196,7 @@ after model completions.
 
 Strict concurrent hard caps use `BudgetLimit.reservation` plus a
 `BudgetLedger`. A reservation declares the maximum input, output, cache-read,
-and cache-write tokens the application is willing to fund for one provider step.
+and cache-write tokens the application is willing to fund for one provider dispatch.
 Before the provider call, Cayu prices that worst-case step with the same
 price book and the ledger's injected clock, then atomically reserves it. For tiered pricing,
 the input-context tier is selected from maximum input plus maximum cache-read and
@@ -1206,8 +1206,20 @@ Accepted reservations
 emit `budget.reserved`; failed reservations emit `budget.reservation_failed`,
 then `budget.limit_reached`, and stop before the provider request. After
 `model.completed`, Cayu reconciles the reservation to actual normalized usage
-and emits `budget.reconciled`. If the model step fails before completion, Cayu
-releases the reservation and emits `budget.reservation_released`.
+and emits `budget.reconciled`. A failure proven to occur before Cayu enters
+provider-controlled stream execution releases the reservation and emits
+`budget.reservation_released`. Once provider dispatch may have occurred, a
+failure without usable completed usage instead reconciles the full reserved
+amount and emits `budget.reconciled` with the constrained reason
+`provider usage unknown after dispatch; charged reserved amount`. This budget
+event never embeds the provider error body, and the provider failure remains the
+session's terminal error. If a durable `model.completed` event is already
+available, its priced usage remains authoritative even when a later stream
+failure terminates the session. Retry attempts are accounted independently: each
+attempt must acquire its own atomic reservation before dispatch and reconciles
+that reservation to its exact durable completion cost or, when that attempt's
+usage is unknown, to the full reserved amount. A denied retry reservation stops
+before another provider call.
 With rolling or calendar budget windows, unresolved active reservations continue
 to consume capacity until they are reconciled or released; reconciled spend ages
 out by the reconciliation/model-completion timestamp.
@@ -1227,6 +1239,12 @@ recovery path releases it. All workers sharing a durable ledger must use the sam
 TTL and reasonably synchronized clocks. Custom expiring `BudgetLedger`
 implementations must advertise their TTL and implement `heartbeat`; the base
 custom-ledger contract is non-expiring.
+
+Terminal ledger operations are idempotent by reservation id and outcome. An
+identical reconciliation or release retry returns the first stored result without
+changing its accounting timestamp. A retry that changes the terminal action,
+charged amount, or reason is rejected rather than rewriting financial history.
+The built-in in-memory, SQLite, and Postgres ledgers implement this same contract.
 
 `InMemoryBudgetLedger` is the default and is only strict inside one process.
 Multi-worker apps that need hard shared caps should pass `SQLiteBudgetLedger`

@@ -140,7 +140,6 @@ from cayu.runtime.budgets import (
     BudgetLedger,
     BudgetLimit,
     BudgetPolicy,
-    BudgetReconciliation,
     BudgetReservationRecord,
     BudgetReservationResult,
     BudgetStore,
@@ -371,6 +370,23 @@ from cayu.vaults import (
 RegisteredAgent = runtime_records.RegisteredAgent
 RegisteredEnvironment = runtime_records.RegisteredEnvironment
 
+_UNKNOWN_POST_DISPATCH_BUDGET_REASON = (
+    "provider usage unknown after dispatch; charged reserved amount"
+)
+
+
+def _add_budget_failure_note(
+    authoritative_failure: BaseException,
+    *,
+    operation: str,
+    accounting_failure: Exception,
+) -> None:
+    note = (
+        f"Budget {operation} also failed: {type(accounting_failure).__name__}: {accounting_failure}"
+    )
+    if note not in getattr(authoritative_failure, "__notes__", ()):
+        authoritative_failure.add_note(note)
+
 
 class _SessionInterrupted(Exception):
     def __init__(self, approval: PendingToolApproval) -> None:
@@ -424,6 +440,12 @@ class _BudgetReservationLeaseLostBeforeModelDispatch(_BudgetReservationLeaseLost
     """Raised when lease loss is detected before any provider attempt starts."""
 
 
+class _BudgetDispatchReservationFailed(RuntimeError):
+    def __init__(self, result: BudgetReservationResult) -> None:
+        self.result = result
+        super().__init__(result.message)
+
+
 def _budget_heartbeat_task_failure(task: asyncio.Task[None]) -> BaseException:
     if task.cancelled():
         return _BudgetReservationLeaseLost(
@@ -473,6 +495,51 @@ class _ContextPressureObservation:
 class _BudgetStepReservation:
     limit: BudgetLimit
     record: BudgetReservationRecord
+
+
+@dataclass
+class _BudgetProviderDispatch:
+    reservations: tuple[_BudgetStepReservation, ...]
+    completion: Event | None = None
+    settled_reservation_ids: set[str] = field(default_factory=set)
+
+    @property
+    def settled(self) -> bool:
+        return self.settled_reservation_ids == {
+            reservation.record.reservation_id for reservation in self.reservations
+        }
+
+
+@dataclass
+class _BudgetModelStepLifecycle:
+    dispatches: list[_BudgetProviderDispatch] = field(default_factory=list)
+    pending_reservations: tuple[_BudgetStepReservation, ...] | None = None
+    reservation_transition_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    @property
+    def provider_dispatch_may_have_occurred(self) -> bool:
+        return bool(self.dispatches)
+
+    def prepare_provider_dispatch(
+        self,
+        reservations: list[_BudgetStepReservation],
+    ) -> None:
+        if self.pending_reservations is not None:
+            raise RuntimeError("Provider dispatch already has prepared budget reservations.")
+        self.pending_reservations = tuple(reservations)
+
+    def mark_provider_dispatch(self) -> None:
+        if self.pending_reservations is None:
+            raise RuntimeError("Provider dispatch has no prepared budget reservations.")
+        self.dispatches.append(_BudgetProviderDispatch(self.pending_reservations))
+        self.pending_reservations = None
+
+    def record_model_completion(self, event: Event) -> None:
+        if not self.dispatches:
+            raise RuntimeError("Model completed before provider dispatch was recorded.")
+        if self.dispatches[-1].completion is not None:
+            raise RuntimeError("Provider dispatch produced more than one model completion.")
+        self.dispatches[-1].completion = event
 
 
 @dataclass(frozen=True)
@@ -3568,6 +3635,7 @@ class CayuApp:
         heartbeat_task = asyncio.create_task(
             self._heartbeat_budget_reservations(
                 reservations,
+                reservation_transition_lock=None,
                 interval_seconds=ttl_seconds / 3,
             )
         )
@@ -6992,6 +7060,7 @@ class CayuApp:
                     budget_reservations,
                     reservation_failure,
                     reservation_events,
+                    reservation_error,
                 ) = await self._reserve_budget_for_model_step(
                     session=session,
                     registered_agent=registered_agent,
@@ -6999,8 +7068,25 @@ class CayuApp:
                     environment_name=environment_name,
                     request_budget_limits=budget_limits,
                 )
-                for event in reservation_events:
-                    yield event
+                try:
+                    for event in reservation_events:
+                        yield event
+                except GeneratorExit as authoritative_exc:
+                    if reservation_failure is None and reservation_error is None:
+                        async for _ in self._budget_settlement_events_preserving_failure(
+                            self._release_budget_reservations(
+                                budget_reservations,
+                                session=session,
+                                registered_agent=registered_agent,
+                                environment_name=environment_name,
+                                reason="model step abandoned before provider dispatch",
+                            ),
+                            authoritative_failure=authoritative_exc,
+                        ):
+                            pass
+                    raise
+                if reservation_error is not None:
+                    raise reservation_error
                 if reservation_failure is not None:
                     async for event in self._stop_session_for_budget_reservation_failed(
                         session=session,
@@ -7019,13 +7105,16 @@ class CayuApp:
                 if budget_reservations and self.budget_ledger.reservation_ttl_seconds is not None:
                     try:
                         await self._renew_budget_reservations(budget_reservations)
-                    except _BudgetReservationLeaseLost:
-                        async for event in self._release_budget_reservations(
-                            budget_reservations,
-                            session=session,
-                            registered_agent=registered_agent,
-                            environment_name=environment_name,
-                            reason="reservation lease expired before model step",
+                    except _BudgetReservationLeaseLost as authoritative_exc:
+                        async for event in self._budget_settlement_events_preserving_failure(
+                            self._release_budget_reservations(
+                                budget_reservations,
+                                session=session,
+                                registered_agent=registered_agent,
+                                environment_name=environment_name,
+                                reason="reservation lease expired before model step",
+                            ),
+                            authoritative_failure=authoritative_exc,
                         ):
                             yield event
                         raise
@@ -7033,7 +7122,66 @@ class CayuApp:
                 assistant_message: Message | None = None
                 assistant_step_result: AssistantStepResult | None = None
                 tool_calls: list[runtime_records.ToolCallRequest] = []
-                model_completed_event: Event | None = None
+                budget_model_step_lifecycle = _BudgetModelStepLifecycle()
+                budget_model_step_lifecycle.prepare_provider_dispatch(budget_reservations)
+
+                async def prepare_provider_dispatch(
+                    lifecycle: _BudgetModelStepLifecycle = budget_model_step_lifecycle,
+                    reservations: list[_BudgetStepReservation] = budget_reservations,
+                    model_session: Session = session,
+                ) -> tuple[list[Event], BudgetReservationResult | None, Exception | None]:
+                    if lifecycle.pending_reservations is not None:
+                        return [], None, None
+                    settlement_events: list[Event] = []
+                    try:
+                        async for event in self._reconcile_dispatched_budget_reservations(
+                            reservations,
+                            lifecycle=lifecycle,
+                            session=model_session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                            unknown_reason=_UNKNOWN_POST_DISPATCH_BUDGET_REASON,
+                        ):
+                            settlement_events.append(event)
+                    except Exception as settlement_error:
+                        return settlement_events, None, settlement_error
+                    (
+                        retry_reservations,
+                        retry_reservation_failure,
+                        retry_reservation_events,
+                        retry_reservation_error,
+                    ) = await self._reserve_budget_for_model_step(
+                        session=model_session,
+                        registered_agent=registered_agent,
+                        registered_provider=registered_provider,
+                        environment_name=environment_name,
+                        request_budget_limits=budget_limits,
+                    )
+                    if retry_reservation_error is not None:
+                        return (
+                            settlement_events + retry_reservation_events,
+                            None,
+                            retry_reservation_error,
+                        )
+                    if retry_reservation_failure is not None:
+                        return (
+                            settlement_events + retry_reservation_events,
+                            retry_reservation_failure,
+                            None,
+                        )
+                    reservations.extend(retry_reservations)
+                    lifecycle.prepare_provider_dispatch(retry_reservations)
+                    return settlement_events + retry_reservation_events, None, None
+
+                async def before_provider_dispatch(
+                    reservations: list[_BudgetStepReservation] = budget_reservations,
+                    lifecycle: _BudgetModelStepLifecycle = budget_model_step_lifecycle,
+                ) -> None:
+                    await self._before_budgeted_provider_dispatch(
+                        reservations,
+                        lifecycle=lifecycle,
+                    )
+
                 try:
                     model_step_events = self._run_model_step_with_context_overflow_recovery(
                         provider=provider,
@@ -7051,78 +7199,139 @@ class CayuApp:
                         step=step,
                         retry_policy=retry_policy,
                         transcript_cursor_before_request=len(messages),
+                        prepare_provider_dispatch=prepare_provider_dispatch,
+                        before_provider_dispatch=before_provider_dispatch,
                     )
                     guarded_model_step_events = self._model_step_events_with_budget_heartbeat(
                         model_step_events,
                         reservations=budget_reservations,
+                        lifecycle=budget_model_step_lifecycle,
                     )
                     async for event, result in guarded_model_step_events:
                         if event is not None:
                             if event.type == EventType.MODEL_COMPLETED:
-                                model_completed_event = event
+                                budget_model_step_lifecycle.record_model_completion(event)
                             yield event
                         if result is not None:
                             assistant_step_result = result
                             assistant_message = result.assistant_message
                             tool_calls = result.tool_calls
-                except _BudgetReservationLeaseLostBeforeModelDispatch:
-                    async for event in self._release_budget_reservations(
+                except GeneratorExit as authoritative_exc:
+                    async for _ in self._budget_settlement_events_preserving_failure(
+                        self._settle_budget_reservations_after_model_failure(
+                            budget_reservations,
+                            lifecycle=budget_model_step_lifecycle,
+                            session=session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                            release_reason="model step abandoned before provider dispatch",
+                        ),
+                        authoritative_failure=authoritative_exc,
+                    ):
+                        pass
+                    raise
+                except _BudgetDispatchReservationFailed as exc:
+                    async for event in self._settle_budget_reservations_after_model_failure(
                         budget_reservations,
+                        lifecycle=budget_model_step_lifecycle,
                         session=session,
                         registered_agent=registered_agent,
                         environment_name=environment_name,
-                        reason="reservation lease expired before model dispatch",
+                        release_reason="retry reservation failed before provider dispatch",
+                    ):
+                        yield event
+                    async for event in self._stop_session_for_budget_reservation_failed(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=environment_name,
+                        result=exc.result,
+                        messages=messages,
+                        run_started_at=run_started_at,
+                        turn_usage_tracker=turn_usage_tracker,
+                        active_run=active_run,
+                    ):
+                        yield event
+                    return
+                except _BudgetReservationLeaseLostBeforeModelDispatch as authoritative_exc:
+                    async for event in self._budget_settlement_events_preserving_failure(
+                        self._release_budget_reservations(
+                            budget_reservations,
+                            session=session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                            reason="reservation lease expired before model dispatch",
+                        ),
+                        authoritative_failure=authoritative_exc,
                     ):
                         yield event
                     raise
-                except _BudgetReservationLeaseLost:
-                    async for event in self._reconcile_uncertain_budget_reservations(
-                        budget_reservations,
-                        model_completed_event=model_completed_event,
-                        session=session,
-                        registered_agent=registered_agent,
-                        environment_name=environment_name,
+                except _BudgetReservationLeaseLost as authoritative_exc:
+                    async for event in self._budget_settlement_events_preserving_failure(
+                        self._settle_budget_reservations_after_model_failure(
+                            budget_reservations,
+                            lifecycle=budget_model_step_lifecycle,
+                            session=session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                            release_reason="reservation heartbeat lost before provider dispatch",
+                            unknown_reason="reservation heartbeat lost; charged reserved amount",
+                        ),
+                        authoritative_failure=authoritative_exc,
                     ):
                         yield event
                     raise
-                except _SessionInterruptedByRequest:
-                    async for event in self._release_budget_reservations(
-                        budget_reservations,
-                        session=session,
-                        registered_agent=registered_agent,
-                        environment_name=environment_name,
-                        reason="session interrupted",
+                except _SessionInterruptedByRequest as authoritative_exc:
+                    async for event in self._budget_settlement_events_preserving_failure(
+                        self._settle_budget_reservations_after_model_failure(
+                            budget_reservations,
+                            lifecycle=budget_model_step_lifecycle,
+                            session=session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                            release_reason="session interrupted before provider dispatch",
+                        ),
+                        authoritative_failure=authoritative_exc,
                     ):
                         yield event
                     raise
-                except asyncio.CancelledError:
-                    async for event in self._release_budget_reservations(
-                        budget_reservations,
-                        session=session,
-                        registered_agent=registered_agent,
-                        environment_name=environment_name,
-                        reason="model step cancelled",
+                except asyncio.CancelledError as authoritative_exc:
+                    async for event in self._budget_settlement_events_preserving_failure(
+                        self._settle_budget_reservations_after_model_failure(
+                            budget_reservations,
+                            lifecycle=budget_model_step_lifecycle,
+                            session=session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                            release_reason="model step cancelled before provider dispatch",
+                        ),
+                        authoritative_failure=authoritative_exc,
                     ):
                         yield event
                     raise
-                except Exception:
-                    async for event in self._release_budget_reservations(
-                        budget_reservations,
-                        session=session,
-                        registered_agent=registered_agent,
-                        environment_name=environment_name,
-                        reason="model step did not complete",
+                except Exception as provider_exc:
+                    async for event in self._budget_settlement_events_preserving_failure(
+                        self._settle_budget_reservations_after_model_failure(
+                            budget_reservations,
+                            lifecycle=budget_model_step_lifecycle,
+                            session=session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                            release_reason="model step failed before provider dispatch",
+                        ),
+                        authoritative_failure=provider_exc,
                     ):
                         yield event
                     raise
 
-                if model_completed_event is not None:
-                    async for event in self._reconcile_budget_reservations(
+                if budget_model_step_lifecycle.dispatches:
+                    async for event in self._reconcile_dispatched_budget_reservations(
                         budget_reservations,
-                        model_completed_event=model_completed_event,
+                        lifecycle=budget_model_step_lifecycle,
                         session=session,
                         registered_agent=registered_agent,
                         environment_name=environment_name,
+                        unknown_reason=_UNKNOWN_POST_DISPATCH_BUDGET_REASON,
                     ):
                         yield event
 
@@ -8065,6 +8274,10 @@ class CayuApp:
         step: int,
         retry_policy: RetryPolicy,
         transcript_cursor_before_request: int,
+        prepare_provider_dispatch: Callable[
+            [], Awaitable[tuple[list[Event], BudgetReservationResult | None, Exception | None]]
+        ],
+        before_provider_dispatch: Callable[[], Awaitable[None]],
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         overflow_policy = registered_agent.context_overflow_policy
         try:
@@ -8078,6 +8291,8 @@ class CayuApp:
                 step=step,
                 retry_policy=retry_policy,
                 transcript_cursor_before_request=transcript_cursor_before_request,
+                prepare_provider_dispatch=prepare_provider_dispatch,
+                before_provider_dispatch=before_provider_dispatch,
             ):
                 yield event, result
             return
@@ -8298,6 +8513,8 @@ class CayuApp:
                 step=step,
                 retry_policy=retry_policy,
                 transcript_cursor_before_request=transcript_cursor_before_request,
+                prepare_provider_dispatch=prepare_provider_dispatch,
+                before_provider_dispatch=before_provider_dispatch,
             ):
                 yield event, result
         except ModelContextOverflowError as exc:
@@ -8333,10 +8550,42 @@ class CayuApp:
         step: int,
         retry_policy: RetryPolicy,
         transcript_cursor_before_request: int,
+        prepare_provider_dispatch: Callable[
+            [], Awaitable[tuple[list[Event], BudgetReservationResult | None, Exception | None]]
+        ],
+        before_provider_dispatch: Callable[[], Awaitable[None]],
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         retry_policy = copy_retry_policy(retry_policy)
         attempt = 1
+        prior_retry_failure: _ModelAttemptFailed | None = None
         while True:
+            try:
+                (
+                    reservation_events,
+                    reservation_failure,
+                    preparation_error,
+                ) = await prepare_provider_dispatch()
+            except Exception as accounting_exc:
+                reservation_events = []
+                reservation_failure = None
+                preparation_error = accounting_exc
+            for reservation_event in reservation_events:
+                yield reservation_event, None
+            if preparation_error is not None:
+                if prior_retry_failure is None:
+                    raise preparation_error
+                authoritative_failure = prior_retry_failure.cause
+                if authoritative_failure is None:
+                    authoritative_failure = RuntimeError(prior_retry_failure.message)
+                _add_budget_failure_note(
+                    authoritative_failure,
+                    operation="retry preparation",
+                    accounting_failure=preparation_error,
+                )
+                raise authoritative_failure from prior_retry_failure
+            prior_retry_failure = None
+            if reservation_failure is not None:
+                raise _BudgetDispatchReservationFailed(reservation_failure)
             (
                 context_pressure_observation,
                 context_pressure_event,
@@ -8399,6 +8648,7 @@ class CayuApp:
                     attempt=attempt,
                     max_attempts=retry_policy.max_attempts,
                     transcript_cursor_before_request=transcript_cursor_before_request,
+                    before_provider_dispatch=before_provider_dispatch,
                 ):
                     if event is not None:
                         yield event, None
@@ -8512,6 +8762,7 @@ class CayuApp:
                     None,
                 )
                 await self._sleep_before_retry(session.id, decision)
+                prior_retry_failure = exc
                 attempt += 1
 
     async def _observe_model_request_context_pressure(
@@ -8647,6 +8898,7 @@ class CayuApp:
         attempt: int,
         max_attempts: int,
         transcript_cursor_before_request: int,
+        before_provider_dispatch: Callable[[], Awaitable[None]],
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         assistant_parts: list[
             transcript_helpers.AssistantTextPart
@@ -8673,6 +8925,10 @@ class CayuApp:
             tool_schema_chars_per_token=profile.tool_schema_chars_per_token,
         )
         interrupt_poll = _StreamInterruptPoll(self, session_id=session.id)
+        # This is the accounting boundary: once the callback returns, the next
+        # expression enters provider-controlled code and Cayu can no longer prove
+        # that the attempt did not consume billable work.
+        await before_provider_dispatch()
         try:
             async for raw_stream_event in provider.stream(model_request):
                 stream_event = _validate_stream_event(raw_stream_event)
@@ -9096,7 +9352,12 @@ class CayuApp:
         registered_provider: runtime_records.RegisteredProvider,
         environment_name: str | None,
         request_budget_limits: tuple[BudgetLimit, ...] = (),
-    ) -> tuple[list[_BudgetStepReservation], BudgetReservationResult | None, list[Event]]:
+    ) -> tuple[
+        list[_BudgetStepReservation],
+        BudgetReservationResult | None,
+        list[Event],
+        Exception | None,
+    ]:
         # Reservations come from the app budget policy and from request-scoped
         # limits on shared scopes (app/agent/causal); both route through the
         # atomic ledger so concurrent sessions cannot jointly overshoot.
@@ -9113,145 +9374,253 @@ class CayuApp:
             if limit.reservation is not None
         ]
         if not limits:
-            return [], None, []
+            return [], None, [], None
 
         reservations: list[_BudgetStepReservation] = []
         emitted_events: list[Event] = []
-        for limit in limits:
-            result = await self.budget_ledger.reserve(
-                limit=limit,
-                session_id=session.id,
-                agent_name=registered_agent.spec.name,
-                provider_name=registered_provider.name,
-                model=session.model,
-            )
-            event_type = (
-                EventType.BUDGET_RESERVED
-                if result.accepted
-                else EventType.BUDGET_RESERVATION_FAILED
-            )
-            emitted_events.append(
-                await self._event_writer.emit(
-                    Event(
-                        type=event_type,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        payload=budget_reservation_payload(result),
+        try:
+            for limit in limits:
+                result = await self.budget_ledger.reserve(
+                    limit=limit,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    provider_name=registered_provider.name,
+                    model=session.model,
+                )
+                if result.accepted:
+                    if result.record is None:
+                        raise RuntimeError("Accepted budget reservation did not return a record.")
+                    reservations.append(_BudgetStepReservation(limit=limit, record=result.record))
+                event_type = (
+                    EventType.BUDGET_RESERVED
+                    if result.accepted
+                    else EventType.BUDGET_RESERVATION_FAILED
+                )
+                emitted_events.append(
+                    await self._event_writer.emit(
+                        Event(
+                            type=event_type,
+                            session_id=session.id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=environment_name,
+                            payload=budget_reservation_payload(result),
+                        )
                     )
                 )
-            )
-            if not result.accepted:
-                release_events = [
-                    event
-                    async for event in self._release_budget_reservations(
-                        reservations,
-                        session=session,
-                        registered_agent=registered_agent,
-                        environment_name=environment_name,
-                        reason="reservation failed",
-                    )
-                ]
-                emitted_events.extend(release_events)
-                return reservations, result, emitted_events
-            if result.record is None:
-                raise RuntimeError("Accepted budget reservation did not return a record.")
-            reservations.append(_BudgetStepReservation(limit=limit, record=result.record))
-        return reservations, None, emitted_events
+                if not result.accepted:
+                    release_events = [
+                        event
+                        async for event in self._release_budget_reservations(
+                            reservations,
+                            session=session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                            reason="reservation failed",
+                        )
+                    ]
+                    emitted_events.extend(release_events)
+                    return reservations, result, emitted_events, None
+        except Exception as reservation_exc:
+            async for event in self._budget_settlement_events_preserving_failure(
+                self._release_budget_reservations(
+                    reservations,
+                    session=session,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    reason="reservation setup failed",
+                ),
+                authoritative_failure=reservation_exc,
+            ):
+                emitted_events.append(event)
+            return reservations, None, emitted_events, reservation_exc
+        return reservations, None, emitted_events, None
 
-    async def _reconcile_budget_reservations(
+    async def _reconcile_dispatched_budget_reservations(
         self,
         reservations: list[_BudgetStepReservation],
         *,
-        model_completed_event: Event,
+        lifecycle: _BudgetModelStepLifecycle,
         session: Session,
         registered_agent: runtime_records.RegisteredAgentState,
         environment_name: str | None,
+        unknown_reason: str,
     ) -> AsyncIterator[Event]:
-        reconciliations: list[BudgetReconciliation] = []
-        for reservation in reservations:
-            priced_actual = None
-            try:
-                priced_actual = budget_actual_cost_for_event(
-                    limit=reservation.limit,
-                    event=model_completed_event,
-                )
-                actual_amount = priced_actual.amount
-                reason = "model completed"
-            except ValueError:
-                actual_amount = reservation.record.reserved_amount
-                reason = "model completed without priced usage; charged reserved amount"
-            reconciliation = await self.budget_ledger.reconcile(
-                reservation_id=reservation.record.reservation_id,
-                actual_amount=actual_amount,
-                reason=reason,
-                occurred_at=model_completed_event.timestamp,
+        if not lifecycle.dispatches:
+            raise ValueError("Cannot reconcile a model step with no provider dispatch.")
+        active_lifecycle_reservation_ids = {
+            reservation.record.reservation_id
+            for dispatch in lifecycle.dispatches
+            for reservation in dispatch.reservations
+            if reservation.record.reservation_id not in dispatch.settled_reservation_ids
+        }
+        if lifecycle.pending_reservations is not None:
+            active_lifecycle_reservation_ids.update(
+                reservation.record.reservation_id for reservation in lifecycle.pending_reservations
             )
-            if priced_actual is not None:
-                reconciliation = budget_reconciliation_with_pricing(
-                    reconciliation,
-                    priced_actual.line_item,
-                )
-            reconciliations.append(reconciliation)
+        if active_lifecycle_reservation_ids != {
+            reservation.record.reservation_id for reservation in reservations
+        }:
+            raise RuntimeError("Budget dispatch lifecycle lost a reservation.")
 
-        for reconciliation in reconciliations:
-            yield await self._event_writer.emit(
-                Event(
-                    type=EventType.BUDGET_RECONCILED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload=budget_reconciliation_payload(reconciliation),
-                )
-            )
+        for dispatch in lifecycle.dispatches:
+            if dispatch.settled:
+                continue
+            emitted_events: list[Event] = []
+            settlement_failure: Exception | None = None
+            async with lifecycle.reservation_transition_lock:
+                for reservation in dispatch.reservations:
+                    reservation_id = reservation.record.reservation_id
+                    if reservation_id in dispatch.settled_reservation_ids:
+                        continue
+                    priced_actual = None
+                    if dispatch.completion is None:
+                        actual_amount = reservation.record.reserved_amount
+                        reason = unknown_reason
+                        reconciled_at = self._clock()
+                    else:
+                        reconciled_at = dispatch.completion.timestamp
+                        try:
+                            priced_actual = budget_actual_cost_for_event(
+                                limit=reservation.limit,
+                                event=dispatch.completion,
+                            )
+                        except ValueError:
+                            actual_amount = reservation.record.reserved_amount
+                            reason = "model completed without priced usage; charged reserved amount"
+                        else:
+                            actual_amount = priced_actual.amount
+                            reason = "model completed"
+                    try:
+                        reconciliation = await self.budget_ledger.reconcile(
+                            reservation_id=reservation_id,
+                            actual_amount=actual_amount,
+                            reason=reason,
+                            occurred_at=reconciled_at,
+                        )
+                        if priced_actual is not None:
+                            reconciliation = budget_reconciliation_with_pricing(
+                                reconciliation,
+                                priced_actual.line_item,
+                            )
+                        emitted_events.append(
+                            await self._event_writer.emit(
+                                Event(
+                                    type=EventType.BUDGET_RECONCILED,
+                                    session_id=session.id,
+                                    agent_name=registered_agent.spec.name,
+                                    environment_name=environment_name,
+                                    payload=budget_reconciliation_payload(reconciliation),
+                                )
+                            )
+                        )
+                    except Exception as exc:
+                        settlement_failure = exc
+                        break
+                    dispatch.settled_reservation_ids.add(reservation_id)
+                    reservations[:] = [
+                        active
+                        for active in reservations
+                        if active.record.reservation_id != reservation_id
+                    ]
+
+            for event in emitted_events:
+                yield event
+            if settlement_failure is not None:
+                raise settlement_failure
 
     async def _reconcile_uncertain_budget_reservations(
         self,
         reservations: list[_BudgetStepReservation],
         *,
-        model_completed_event: Event | None,
+        lifecycle: _BudgetModelStepLifecycle,
         session: Session,
         registered_agent: runtime_records.RegisteredAgentState,
         environment_name: str | None,
+        reason: str,
     ) -> AsyncIterator[Event]:
-        if model_completed_event is not None:
-            async for event in self._reconcile_budget_reservations(
+        async for event in self._reconcile_dispatched_budget_reservations(
+            reservations,
+            lifecycle=lifecycle,
+            session=session,
+            registered_agent=registered_agent,
+            environment_name=environment_name,
+            unknown_reason=reason,
+        ):
+            yield event
+
+    async def _settle_budget_reservations_after_model_failure(
+        self,
+        reservations: list[_BudgetStepReservation],
+        *,
+        lifecycle: _BudgetModelStepLifecycle,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+        release_reason: str,
+        unknown_reason: str = _UNKNOWN_POST_DISPATCH_BUDGET_REASON,
+    ) -> AsyncIterator[Event]:
+        if lifecycle.provider_dispatch_may_have_occurred:
+            async for event in self._reconcile_uncertain_budget_reservations(
                 reservations,
-                model_completed_event=model_completed_event,
+                lifecycle=lifecycle,
                 session=session,
                 registered_agent=registered_agent,
                 environment_name=environment_name,
+                reason=unknown_reason,
             ):
                 yield event
-            return
 
-        reconciled_at = self._clock()
-        reconciliations: list[BudgetReconciliation] = []
-        for reservation in reservations:
-            reconciliation = await self.budget_ledger.reconcile(
-                reservation_id=reservation.record.reservation_id,
-                actual_amount=reservation.record.reserved_amount,
-                reason="reservation heartbeat lost; charged reserved amount",
-                occurred_at=reconciled_at,
-            )
-            reconciliations.append(reconciliation)
+        pending_reservations = lifecycle.pending_reservations
+        if pending_reservations is not None:
+            async for event in self._release_budget_reservations(
+                list(pending_reservations),
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                reason=release_reason,
+            ):
+                yield event
 
-        for reconciliation in reconciliations:
-            yield await self._event_writer.emit(
-                Event(
-                    type=EventType.BUDGET_RECONCILED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload=budget_reconciliation_payload(reconciliation),
-                )
+    async def _budget_settlement_events_preserving_failure(
+        self,
+        settlement_events: AsyncIterator[Event],
+        *,
+        authoritative_failure: BaseException,
+    ) -> AsyncIterator[Event]:
+        try:
+            async for event in settlement_events:
+                yield event
+        except Exception as accounting_exc:
+            _add_budget_failure_note(
+                authoritative_failure,
+                operation="settlement",
+                accounting_failure=accounting_exc,
             )
+
+    async def _before_budgeted_provider_dispatch(
+        self,
+        reservations: list[_BudgetStepReservation],
+        *,
+        lifecycle: _BudgetModelStepLifecycle,
+    ) -> None:
+        async with lifecycle.reservation_transition_lock:
+            if reservations and self.budget_ledger.reservation_ttl_seconds is not None:
+                try:
+                    await self._renew_budget_reservations(reservations)
+                except _BudgetReservationLeaseLost as exc:
+                    if not lifecycle.provider_dispatch_may_have_occurred:
+                        raise _BudgetReservationLeaseLostBeforeModelDispatch(
+                            "Budget reservation lease was lost before model dispatch."
+                        ) from exc
+                    raise
+            lifecycle.mark_provider_dispatch()
 
     async def _model_step_events_with_budget_heartbeat(
         self,
         model_step_events: AsyncIterator[tuple[Event | None, AssistantStepResult | None]],
         *,
         reservations: list[_BudgetStepReservation],
+        lifecycle: _BudgetModelStepLifecycle,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         ttl_seconds = self.budget_ledger.reservation_ttl_seconds
         if not reservations or ttl_seconds is None:
@@ -9262,42 +9631,22 @@ class CayuApp:
         heartbeat_task = asyncio.create_task(
             self._heartbeat_budget_reservations(
                 reservations,
+                reservation_transition_lock=lifecycle.reservation_transition_lock,
                 interval_seconds=ttl_seconds / 3,
             )
         )
         iterator = model_step_events.__aiter__()
         next_item_task: asyncio.Task[tuple[Event | None, AssistantStepResult | None]] | None = None
         exhausted = False
-        provider_work_started = False
-        validate_before_provider_dispatch = False
         try:
             while True:
                 if heartbeat_task.done():
                     heartbeat_failure = _budget_heartbeat_task_failure(heartbeat_task)
-                    if not provider_work_started:
+                    if not lifecycle.provider_dispatch_may_have_occurred:
                         raise _BudgetReservationLeaseLostBeforeModelDispatch(
                             "Budget reservation lease was lost before model dispatch."
                         ) from heartbeat_failure
                     raise heartbeat_failure
-
-                if validate_before_provider_dispatch:
-                    try:
-                        await self._renew_budget_reservations(reservations)
-                    except _BudgetReservationLeaseLost as exc:
-                        if not provider_work_started:
-                            raise _BudgetReservationLeaseLostBeforeModelDispatch(
-                                "Budget reservation lease was lost before model dispatch."
-                            ) from exc
-                        raise
-                    if heartbeat_task.done():
-                        heartbeat_failure = _budget_heartbeat_task_failure(heartbeat_task)
-                        if not provider_work_started:
-                            raise _BudgetReservationLeaseLostBeforeModelDispatch(
-                                "Budget reservation lease was lost before model dispatch."
-                            ) from heartbeat_failure
-                        raise heartbeat_failure
-                    provider_work_started = True
-                    validate_before_provider_dispatch = False
 
                 next_item_task = asyncio.create_task(_next_model_step_item(iterator))
                 done, _ = await asyncio.wait(
@@ -9334,7 +9683,7 @@ class CayuApp:
                         # actual usage before the lease failure terminates the session.
                         next_item_task = None
                         yield completed_item
-                    if not provider_work_started:
+                    if not lifecycle.provider_dispatch_may_have_occurred:
                         raise _BudgetReservationLeaseLostBeforeModelDispatch(
                             "Budget reservation lease was lost before model dispatch."
                         ) from heartbeat_failure
@@ -9345,15 +9694,13 @@ class CayuApp:
                     exhausted = True
                     break
                 next_item_task = None
-                item_event, _ = item
-                if item_event is not None and item_event.type == EventType.MODEL_STARTED:
-                    validate_before_provider_dispatch = True
                 yield item
 
             heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat_task
-            await self._renew_budget_reservations(reservations)
+            async with lifecycle.reservation_transition_lock:
+                await self._renew_budget_reservations(reservations)
         finally:
             if next_item_task is not None and not next_item_task.done():
                 next_item_task.cancel()
@@ -9373,11 +9720,16 @@ class CayuApp:
         self,
         reservations: list[_BudgetStepReservation],
         *,
+        reservation_transition_lock: asyncio.Lock | None,
         interval_seconds: float,
     ) -> None:
         while True:
             await asyncio.sleep(interval_seconds)
-            await self._renew_budget_reservations(reservations)
+            if reservation_transition_lock is None:
+                await self._renew_budget_reservations(reservations)
+            else:
+                async with reservation_transition_lock:
+                    await self._renew_budget_reservations(reservations)
 
     async def _renew_budget_reservations(
         self,

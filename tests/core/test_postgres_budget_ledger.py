@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
+from tests.core._budget_ledger_contract import assert_idempotent_terminal_settlements
 
 from cayu.runtime import (
     BudgetLimit,
@@ -155,6 +156,22 @@ def test_postgres_budget_ledger_reserves_reconciles_and_releases(postgres_dsn) -
     assert blocked.actual == Decimal("0.44")
     assert reconciled.released_amount == Decimal("0.21")
     assert released.status == "released"
+
+
+def test_postgres_budget_ledger_terminal_settlements_are_idempotent(postgres_dsn) -> None:
+    clock = MutableClock(datetime(2026, 1, 1, tzinfo=UTC))
+
+    async def ops(ledger):
+        await assert_idempotent_terminal_settlements(
+            ledger,
+            _reservation_budget_limit(
+                max_cost="0.25",
+                window=BudgetWindow.rolling(seconds=60),
+            ),
+            clock=clock,
+        )
+
+    _run(postgres_dsn, ops, clock=clock)
 
 
 def test_postgres_budget_ledger_survives_ledger_restart(postgres_dsn) -> None:

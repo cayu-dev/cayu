@@ -527,7 +527,7 @@ class BudgetLedger(ABC):
         provider_name: str,
         model: str,
     ) -> BudgetReservationResult:
-        """Reserve budget for one model step if capacity remains."""
+        """Reserve budget for one provider dispatch if capacity remains."""
 
     @abstractmethod
     async def reconcile(
@@ -538,7 +538,12 @@ class BudgetLedger(ABC):
         reason: str | None = None,
         occurred_at: datetime | None = None,
     ) -> BudgetReconciliation:
-        """Replace an active reservation with the actual charged amount."""
+        """Replace a reservation with the charged amount.
+
+        Implementations must return the existing result for an identical retry
+        without changing its accounting timestamp, and reject a conflicting
+        terminal outcome for the same reservation.
+        """
 
     @abstractmethod
     async def release(
@@ -547,7 +552,11 @@ class BudgetLedger(ABC):
         reservation_id: str,
         reason: str,
     ) -> BudgetReconciliation:
-        """Release an active reservation without charging it."""
+        """Release an active reservation without charging it.
+
+        Implementations must return the existing result for an identical retry
+        and reject a conflicting terminal outcome for the same reservation.
+        """
 
 
 class InMemoryBudgetStore(BudgetStore):
@@ -772,15 +781,10 @@ class InMemoryBudgetLedger(BudgetLedger):
         released_at = self._clock()
         async with self._lock:
             record = self._releasable_record(reservation_id)
-            if record.status == "released":
-                return _reconciliation_from_record(record)
-            released = record.model_copy(
-                update={
-                    "status": "released",
-                    "reason": reason,
-                    "updated_at": released_at,
-                },
-                deep=True,
+            released = _released_record(
+                record,
+                reason=reason,
+                updated_at=released_at,
             )
             self._records[reservation_id] = released
             return _reconciliation_from_record(released)
@@ -820,9 +824,7 @@ class InMemoryBudgetLedger(BudgetLedger):
         record = self._records.get(reservation_id)
         if record is None:
             raise KeyError(f"Budget reservation not found: {reservation_id}")
-        if record.status == "active":
-            return record
-        if record.status == "released" and _is_expired_reservation_reason(record.reason):
+        if record.status in {"active", "released"}:
             return record
         raise ValueError(f"Budget reservation is not active: {reservation_id}")
 
@@ -830,7 +832,7 @@ class InMemoryBudgetLedger(BudgetLedger):
         record = self._records.get(reservation_id)
         if record is None:
             raise KeyError(f"Budget reservation not found: {reservation_id}")
-        if record.status == "active":
+        if record.status in {"active", "reconciled"}:
             return record
         if record.status == "released" and _is_expired_reservation_reason(record.reason):
             # Reaped by the TTL while still in flight (a long step or a wall-clock jump).
@@ -1390,6 +1392,16 @@ def _reconciled_record(
     reason: str | None,
     updated_at: datetime | None = None,
 ) -> BudgetReservationRecord:
+    if record.status == "reconciled":
+        if record.actual_amount == actual_amount and record.reason == reason:
+            return record
+        raise ValueError(
+            f"Budget reservation has a conflicting reconciliation: {record.reservation_id}"
+        )
+    if record.status != "active" and not (
+        record.status == "released" and _is_expired_reservation_reason(record.reason)
+    ):
+        raise ValueError(f"Budget reservation is not active: {record.reservation_id}")
     reconciled_at = (
         _utc_datetime(updated_at, "updated_at") if updated_at is not None else datetime.now(UTC)
     )
@@ -1399,6 +1411,31 @@ def _reconciled_record(
             "status": "reconciled",
             "reason": reason,
             "updated_at": reconciled_at,
+        },
+        deep=True,
+    )
+
+
+def _released_record(
+    record: BudgetReservationRecord,
+    *,
+    reason: str,
+    updated_at: datetime | None = None,
+) -> BudgetReservationRecord:
+    if record.status == "released":
+        if record.reason == reason or _is_expired_reservation_reason(record.reason):
+            return record
+        raise ValueError(f"Budget reservation has a conflicting release: {record.reservation_id}")
+    if record.status != "active":
+        raise ValueError(f"Budget reservation is not active: {record.reservation_id}")
+    released_at = (
+        _utc_datetime(updated_at, "updated_at") if updated_at is not None else datetime.now(UTC)
+    )
+    return record.model_copy(
+        update={
+            "status": "released",
+            "reason": reason,
+            "updated_at": released_at,
         },
         deep=True,
     )

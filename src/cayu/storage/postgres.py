@@ -51,6 +51,7 @@ from cayu.runtime.budgets import (
     _is_expired_reservation_reason,
     _reconciled_record,
     _reconciliation_from_record,
+    _released_record,
     _reservation_is_expired,
     _reservation_result,
     _validate_amount,
@@ -2074,16 +2075,10 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
             try:
                 async with conn.cursor() as cur:
                     record = await self._releasable_record_for_update(cur, reservation_id)
-                    if record.status == "released":
-                        await conn.commit()
-                        return _reconciliation_from_record(record)
-                    released = record.model_copy(
-                        update={
-                            "status": "released",
-                            "reason": reason,
-                            "updated_at": released_at,
-                        },
-                        deep=True,
+                    released = _released_record(
+                        record,
+                        reason=reason,
+                        updated_at=released_at,
                     )
                     await self._update_record(cur, released)
                 await conn.commit()
@@ -2277,9 +2272,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         reservation_id: str,
     ) -> BudgetReservationRecord:
         record = await self._load_record_for_update(cur, reservation_id)
-        if record.status == "active":
-            return record
-        if record.status == "released" and _is_expired_reservation_reason(record.reason):
+        if record.status in {"active", "released"}:
             return record
         raise ValueError(f"Budget reservation is not active: {reservation_id}")
 
@@ -2289,7 +2282,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         reservation_id: str,
     ) -> BudgetReservationRecord:
         record = await self._load_record_for_update(cur, reservation_id)
-        if record.status == "active":
+        if record.status in {"active", "reconciled"}:
             return record
         if record.status == "released" and _is_expired_reservation_reason(record.reason):
             # Reaped by the TTL while still in flight (a long step or a wall-clock jump).
