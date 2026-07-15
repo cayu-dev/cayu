@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlsplit
 
 import uvicorn
-from playwright.async_api import (
+from playwright.async_api import (  # ty: ignore[unresolved-import]
     BrowserContext,
     Page,
     Request,
