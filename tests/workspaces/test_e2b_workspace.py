@@ -227,12 +227,13 @@ def test_e2b_workspace_list_marks_depth_boundary_incomplete() -> None:
             "/home/user/workspace/level-one/level-two",
         }
     )
-    fs.files["/home/user/workspace/visible.txt"] = b"visible"
+    fs.files["/home/user/workspace/z-visible.txt"] = b"visible"
+    fs.files["/home/user/workspace/a-visible.txt"] = b"visible"
     fs.files["/home/user/workspace/level-one/level-two/hidden.txt"] = b"hidden"
 
-    result = asyncio.run(workspace.list("**/*.txt"))
+    result = asyncio.run(workspace.list("**/*.txt", limit=1))
 
-    assert result.paths == ("visible.txt",)
+    assert result.paths == ("a-visible.txt",)
     assert result.total_count is None
     assert result.truncated is True
 

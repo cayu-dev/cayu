@@ -161,8 +161,8 @@ high level:
 | Postgres stores, migrations, pgvector, real dispatch claim path | verified when Postgres is available | `postgres-required` |
 | real Docker container exec, timeout cleanup, sync binding, and virtual-egress security conformance | verified when Docker is available | `docker-runner`, `docker-live-exec`, `docker-live-sync`, `docker-live-virtual-egress` |
 | real `sbx` command cleanup and sync binding | verified when `sbx` is available | `sbx-live-exec`, `sbx-live-sync` |
-| real microsandbox runner/workspace/runtime/sync binding and opt-in guest-agent liveness | verified when microsandbox is available | `microsandbox-live-*` |
-| real E2B runner/workspace/sync binding | verified when E2B is available | `e2b-live-*` |
+| real microsandbox runner, portable workspace round-trip/path safety, runtime, sync binding, and opt-in guest-agent liveness | verified when microsandbox is available | `microsandbox-live-*` |
+| real E2B runner, portable workspace round-trip/path safety, and sync binding | verified when E2B is available | `e2b-live-*` |
 | real Microsandbox virtual-egress enforcement and secret non-possession | verified when the runtime and explicit opt-in are available | `microsandbox-live-virtual-egress` |
 | real E2B virtual-egress enforcement and secret non-possession | verified when the key, tunnel configuration, and explicit opt-in are available | `e2b-live-virtual-egress` |
 | real AWS Lambda MicroVM runner/workspace/cleanup/suspend-resume | verified when AWS and a built sidecar image are available | `lambda-microvm-live` |
@@ -211,6 +211,11 @@ There are 26 live example files across `examples/` and its provider subdirectori
 
 The deterministic runner examples use `_live_checks.py` and raise on wrong
 outputs, missing cleanup artifacts, missing files, or missing model/tool rounds.
+The E2B and Microsandbox workspace examples also reuse
+`_workspace_conformance.py` to verify the same portable round-trip and path
+validation scenarios used by the credential-free workspace conformance suite.
+Those live checks prove provider integration and a real sandbox boundary; the
+ordinary pytest suite remains hermetic.
 `artifact_file_live.py`, `context_counting_live.py`, and
 `structured_output_live.py` assert structural provider/runtime behavior and
 report `verified`; `knowledge_embedding_live.py` verifies a real OpenAI embedding

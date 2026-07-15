@@ -5,6 +5,10 @@ import os
 from collections.abc import AsyncIterator
 
 from _live_checks import require_equal
+from _workspace_conformance import (
+    verify_portable_workspace_path_safety,
+    verify_portable_workspace_round_trip,
+)
 from cayu import (
     AgentSpec,
     CayuApp,
@@ -89,6 +93,9 @@ async def main() -> None:
             runner,
             workspace_id="e2b-workspace",
         )
+        await verify_portable_workspace_round_trip(workspace, adapter="e2b-live")
+        await verify_portable_workspace_path_safety(workspace, adapter="e2b-live")
+        print("workspace_conformance portable-round-trip,path-safety")
         provider = FakeProvider()
         app = CayuApp()
         app.register_provider(provider, default=True)

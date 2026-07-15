@@ -416,17 +416,18 @@ To run commands on your own platform, implement a custom `Runner`: see the
 uv sync --extra dev
 uv run pytest
 uv run pytest tests/providers/test_provider_conformance.py -q
+uv run pytest tests/workspaces/test_workspace_conformance.py -q
 uv run ruff check src/ tests/ examples/ scripts/ maintenance/
 uv run ruff format --check src/ tests/ examples/ scripts/ maintenance/
 uv run ty check src/cayu examples maintenance
 ```
 
-The provider conformance command is deterministic and credential-free. It
-exercises every built-in adapter with scripted transports and makes no paid API
-calls. Use the opt-in checks in
+The provider and workspace conformance commands are deterministic and
+credential-free. They exercise every built-in adapter through its public
+interface and make no paid API calls. Use the opt-in checks in
 [`docs/nightly-verification.md`](docs/nightly-verification.md) when you need
-evidence from real provider accounts and models; those live checks prove a
-different boundary than the CI conformance suite.
+evidence from real providers and sandboxes; those live checks prove a different
+boundary than the CI conformance suites.
 
 Install optional file readers when the built-in `read_file` tool should inspect images/PDFs,
 resize oversized images, or extract selected PDF pages:

@@ -15,6 +15,7 @@ from cayu.workspaces.base import (
     _validate_absolute_guest_root,
     _validate_workspace_positive_limit,
     _validate_workspace_relative_path,
+    _WorkspaceListCollector,
     matches_list_pattern,
     validate_list_pattern,
 )
@@ -149,8 +150,7 @@ class E2BWorkspace(Workspace):
                 raise FileNotFoundError(f"Workspace path not found: {self.root}") from exc
             raise RuntimeError(f"Failed to list E2B workspace path: {self.root}") from exc
 
-        paths: list[str] = []
-        total_count = 0
+        collector = _WorkspaceListCollector(effective_limit)
         depth_incomplete = False
         for entry in entries:
             entry_type = _entry_type(entry)
@@ -167,13 +167,14 @@ class E2BWorkspace(Workspace):
             if entry_type != "file":
                 continue
             if matches_list_pattern(rel_path, pattern):
-                total_count += 1
-                if len(paths) < effective_limit:
-                    paths.append(rel_path)
+                collector.add(rel_path)
+        result = collector.result()
+        if not depth_incomplete:
+            return result
         return WorkspaceListResult(
-            paths=tuple(sorted(paths)),
-            total_count=None if depth_incomplete else total_count,
-            truncated=depth_incomplete or total_count > len(paths),
+            paths=result.paths,
+            total_count=None,
+            truncated=True,
         )
 
     def resolve(self, path: str) -> str:

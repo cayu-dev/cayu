@@ -1511,6 +1511,17 @@ address. They flush and unmount before runner lifecycle teardown. These
 bindings are stateless; durable identity lives in the filesystem/access point,
 so a replacement Fargate control task can recreate the binding safely.
 Workspace reads and listings are bounded at the workspace contract through `max_bytes` and `limit`, returning result objects with `truncated` metadata. Tools should rely on these bounded APIs instead of reading full files or full directory listings and truncating afterward.
+Built-in workspaces validate raw workspace-relative POSIX paths before
+normalization. They reject blank or root-collapsing paths, absolute paths, and
+every raw `..` segment, including contained forms such as
+`nested/../accepted.txt`; callers must not rely on normalization to rewrite
+model-supplied paths.
+Built-in workspace listings return the lexicographically sorted prefix selected
+by `limit`, independent of filesystem or provider enumeration order. A
+truncated result may report the exact total or `None`; callers must use
+`truncated` rather than infer completeness from `total_count`. The limit bounds
+retained and returned paths, not traversal work: an adapter may need to inspect
+the complete provider listing to select the deterministic smallest prefix.
 The built-in `read_file(path=...)` treats byte-level binary evidence as stronger than filename/MIME hints, so binary bytes are not decoded into model context just because a path has a text-like extension. Text-looking source files remain readable even when platform MIME tables classify an extension incorrectly.
 
 `MicrosandboxWorkspace` exposes a Microsandbox filesystem root through the same
@@ -1528,9 +1539,10 @@ environment = Environment(
 ```
 
 Use `MicrosandboxWorkspace` when file tools must operate inside the same
-Microsandbox boundary as `exec_command`. It uses Microsandbox's native
-filesystem API, so it does not require Python inside the sandbox image for file
-operations. Its `root` defaults to `/workspace`, matching `MicrosandboxRunner`.
+Microsandbox boundary as `exec_command`. Read, write, and delete use Cayu's
+guest-side guard and require `python3` in the sandbox; listing uses
+Microsandbox's native filesystem API. Its `root` defaults to `/workspace`,
+matching `MicrosandboxRunner`.
 
 `RunnerWorkspace` is the generic fallback for runners that do not have a native
 filesystem adapter. It uses small Python helper programs executed through the
@@ -1552,6 +1564,22 @@ Workspace result objects enforce consistent metadata:
 - `WorkspaceReadResult`: `truncated` must equal `len(content) < total_bytes`
 - `WorkspaceListResult` complete list: `truncated=false` and `total_count == len(paths)`
 - `WorkspaceListResult` truncated list: `truncated=true` and `total_count is None or total_count >= len(paths)`
+
+The deterministic conformance registry in
+`tests/workspaces/test_workspace_conformance.py` exercises every exported
+built-in adapter through the public `Workspace` interface. It covers portable
+round trips, raw path and symlink escape rejection, bounded reads, immutable
+result shapes, glob semantics, deterministic listing limits, resource identity, and
+declared adapter extensions. Its E2B and Microsandbox fixtures bridge the real
+guest guard and native filesystem seams to one host-backed directory, but they
+do not claim a real sandbox boundary. The opt-in E2B and Microsandbox workspace
+checks in `scripts/nightly_verification.py` reuse the portable round-trip and
+path-safety scenarios against live sandboxes.
+When exporting a new built-in workspace adapter, add its deterministic factory
+to that registry, declare stable or indeterminate resource identity and any
+adapter extensions with bounded skip reasons, and bind the portable live
+scenarios to a provider-specific live check when the adapter crosses an
+external sandbox boundary.
 
 ## ArtifactStore
 

@@ -5,12 +5,14 @@ import os
 from os import PathLike
 from pathlib import Path
 
-from cayu._validation import require_clean_nonblank, require_nonblank
+from cayu._validation import require_clean_nonblank
 from cayu.workspaces.base import (
     Workspace,
     WorkspaceListResult,
     WorkspaceReadResult,
     _local_resource_key,
+    _validate_workspace_relative_path,
+    _WorkspaceListCollector,
     matches_list_pattern,
     validate_list_pattern,
 )
@@ -83,12 +85,11 @@ class LocalWorkspace(Workspace):
         )
 
     def resolve(self, path: str) -> Path:
-        path = require_nonblank(path, "path")
-        candidate = Path(path)
-        if candidate.is_absolute():
-            raise ValueError("Workspace paths must be relative.")
+        candidate = Path(_validate_workspace_relative_path(path))
         resolved = (self.root / candidate).resolve()
         self._ensure_inside_root(resolved)
+        if resolved == self.root:
+            raise ValueError("Workspace paths must reference a file.")
         return resolved
 
     def _ensure_inside_root(self, path: Path) -> None:
@@ -98,12 +99,12 @@ class LocalWorkspace(Workspace):
             raise ValueError("Workspace path escapes the workspace root.") from exc
 
     def resolve_no_symlinks(self, path: str) -> Path:
-        path = require_nonblank(path, "path")
-        candidate = Path(path)
-        if candidate.is_absolute():
-            raise ValueError("Workspace paths must be relative.")
+        candidate = Path(_validate_workspace_relative_path(path))
         target = self._resolve_without_symlinks(candidate)
-        self._ensure_inside_root(target.resolve(strict=False))
+        resolved = target.resolve(strict=False)
+        self._ensure_inside_root(resolved)
+        if resolved == self.root:
+            raise ValueError("Workspace paths must reference a file.")
         return target
 
     def _resolve_without_symlinks(self, candidate: Path) -> Path:
@@ -159,8 +160,7 @@ def _list_files(
     pattern: str,
     limit: int | None,
 ) -> WorkspaceListResult:
-    paths: list[str] = []
-    total_count = 0
+    collector = _WorkspaceListCollector(limit)
     for path in root.rglob("*"):
         if _has_symlink_component(root, path):
             continue
@@ -170,20 +170,8 @@ def _list_files(
             continue
         if not matches_list_pattern(resolved.relative_to(root).as_posix(), pattern):
             continue
-        total_count += 1
-        if limit is None or len(paths) < limit:
-            paths.append(resolved.relative_to(root).as_posix())
-        elif limit is not None:
-            return WorkspaceListResult(
-                paths=tuple(sorted(paths)),
-                total_count=None,
-                truncated=True,
-            )
-    return WorkspaceListResult(
-        paths=tuple(sorted(paths)),
-        total_count=total_count,
-        truncated=False,
-    )
+        collector.add(resolved.relative_to(root).as_posix())
+    return collector.result(exact_total_when_truncated=False)
 
 
 def _has_symlink_component(root: Path, path: Path) -> bool:

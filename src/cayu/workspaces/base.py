@@ -3,6 +3,7 @@ from __future__ import annotations
 import posixpath
 import re
 from abc import ABC, abstractmethod
+from bisect import insort
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
@@ -62,6 +63,34 @@ class WorkspaceListResult:
         if self.total_count is not None and self.total_count < len(paths):
             raise ValueError("WorkspaceListResult total_count cannot be smaller than paths.")
         object.__setattr__(self, "paths", paths)
+
+
+class _WorkspaceListCollector:
+    """Collect a deterministic sorted prefix without retaining every matched path."""
+
+    def __init__(self, limit: int | None) -> None:
+        self._limit = limit
+        self._paths: list[str] = []
+        self._total_count = 0
+
+    def add(self, path: str) -> None:
+        self._total_count += 1
+        if self._limit is None:
+            self._paths.append(path)
+            return
+        insort(self._paths, path)
+        if len(self._paths) > self._limit:
+            self._paths.pop()
+
+    def result(self, *, exact_total_when_truncated: bool = True) -> WorkspaceListResult:
+        paths = tuple(sorted(self._paths))
+        truncated = self._total_count > len(paths)
+        total_count = self._total_count if exact_total_when_truncated or not truncated else None
+        return WorkspaceListResult(
+            paths=paths,
+            total_count=total_count,
+            truncated=truncated,
+        )
 
 
 def validate_list_pattern(pattern: str) -> str:
@@ -260,6 +289,9 @@ def _validate_workspace_relative_path(path: str) -> str:
     value = require_nonblank(path, "path")
     if posixpath.isabs(value):
         raise ValueError("Workspace paths must be relative.")
+    parts = tuple(part for part in value.split("/") if part)
+    if ".." in parts:
+        raise ValueError("Workspace path escapes the workspace root via parent traversal.")
     normalized = posixpath.normpath(value)
     if normalized in {"", "."}:
         raise ValueError("Workspace paths must reference a file.")

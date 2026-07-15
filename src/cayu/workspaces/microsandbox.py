@@ -14,6 +14,7 @@ from cayu.workspaces.base import (
     _validate_absolute_guest_root,
     _validate_workspace_positive_limit,
     _validate_workspace_relative_path,
+    _WorkspaceListCollector,
     matches_list_pattern,
     validate_list_pattern,
 )
@@ -128,18 +129,11 @@ class MicrosandboxWorkspace(Workspace):
         )
         fs = self._filesystem()
         await self._require_contained_real_path(self.root)
-        paths: list[str] = []
-        total_count = 0
+        collector = _WorkspaceListCollector(effective_limit)
         async for rel_path in _iter_files(self, fs, self.root):
             if matches_list_pattern(rel_path, pattern):
-                total_count += 1
-                if len(paths) < effective_limit:
-                    paths.append(rel_path)
-        return WorkspaceListResult(
-            paths=tuple(sorted(paths)),
-            total_count=total_count,
-            truncated=total_count > len(paths),
-        )
+                collector.add(rel_path)
+        return collector.result()
 
     def resolve(self, path: str) -> str:
         rel_path = _validate_relative_path(path)

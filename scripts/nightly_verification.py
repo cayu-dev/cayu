@@ -375,7 +375,7 @@ CHECKS: tuple[VerificationCheck, ...] = (
     ),
     VerificationCheck(
         id="microsandbox-live-workspace",
-        capability="Microsandbox workspace read/write",
+        capability="Microsandbox workspace portable round-trip and path safety",
         lane="microsandbox",
         command=("uv", "run", "python", "examples/microsandbox_workspace_live.py"),
         status_on_success=STATUS_VERIFIED,
@@ -450,7 +450,7 @@ CHECKS: tuple[VerificationCheck, ...] = (
     ),
     VerificationCheck(
         id="e2b-live-workspace",
-        capability="E2B workspace read/write",
+        capability="E2B workspace portable round-trip and path safety",
         lane="e2b",
         command=("uv", "run", "python", "examples/e2b_workspace_live.py"),
         status_on_success=STATUS_VERIFIED,
