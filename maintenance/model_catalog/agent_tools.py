@@ -56,6 +56,14 @@ class _PricingControl:
     selected: bool
 
 
+@dataclass(frozen=True)
+class _PreparedPricingPage:
+    snapshot: str
+    mode_verified: bool
+    selection_note: str
+    effective_url: str
+
+
 def _control_state(line: str) -> _PricingControl | None:
     checked = re.search(r"\bchecked=(true|false)\b", line)
     ref = re.search(r"\bref=([a-z0-9_-]+)\b", line)
@@ -128,7 +136,7 @@ async def _prepare_pricing_page(
     ctx: ToolContext,
     url: str,
     mode: str,
-) -> tuple[str, bool, str, str]:
+) -> _PreparedPricingPage:
     provider_name = provider_from_context(ctx)
     hosts = allowed_hosts(provider_name)
     requested_url = validate_official_url(url, provider_name=provider_name)
@@ -153,25 +161,40 @@ async def _prepare_pricing_page(
     if not controls:
         if mode == "standard":
             if _has_interactive_pricing_modes(snapshot):
-                return (
-                    snapshot,
-                    False,
-                    "page pricing controls do not expose Standard state",
-                    effective_url,
+                return _PreparedPricingPage(
+                    snapshot=snapshot,
+                    mode_verified=False,
+                    selection_note="page pricing controls do not expose Standard state",
+                    effective_url=effective_url,
                 )
-            return snapshot, True, "default page state", effective_url
+            return _PreparedPricingPage(
+                snapshot=snapshot,
+                mode_verified=True,
+                selection_note="default page state",
+                effective_url=effective_url,
+            )
         if not _has_interactive_pricing_modes(snapshot) and _has_explicit_static_mode(
             snapshot, mode
         ):
-            return snapshot, True, f"static {mode} pricing section", effective_url
-        return (
-            snapshot,
-            False,
-            f"page exposes no selectable or explicit {mode} pricing",
-            effective_url,
+            return _PreparedPricingPage(
+                snapshot=snapshot,
+                mode_verified=True,
+                selection_note=f"static {mode} pricing section",
+                effective_url=effective_url,
+            )
+        return _PreparedPricingPage(
+            snapshot=snapshot,
+            mode_verified=False,
+            selection_note=f"page exposes no selectable or explicit {mode} pricing",
+            effective_url=effective_url,
         )
     if all(control.selected for control in controls):
-        return snapshot, True, f"{mode} pricing controls already selected", effective_url
+        return _PreparedPricingPage(
+            snapshot=snapshot,
+            mode_verified=True,
+            selection_note=f"{mode} pricing controls already selected",
+            effective_url=effective_url,
+        )
 
     # Some official pages contain several independently switched pricing tables. Select every
     # table that exposes the requested mode so a row lower on the page cannot remain in Standard
@@ -180,7 +203,12 @@ async def _prepare_pricing_page(
     for _ in range(20):
         control = next((item for item in controls if not item.selected), None)
         if control is None:
-            return snapshot, True, f"{mode} pricing controls selected", effective_url
+            return _PreparedPricingPage(
+                snapshot=snapshot,
+                mode_verified=True,
+                selection_note=f"{mode} pricing controls selected",
+                effective_url=effective_url,
+            )
         await _exec(
             ctx,
             browser.click_command(control.ref, session=ctx.session_id, allowed_hosts=hosts),
@@ -202,12 +230,17 @@ async def _prepare_pricing_page(
         if not controls:
             break
     if controls and all(control.selected for control in controls):
-        return snapshot, True, f"{mode} pricing controls selected", effective_url
-    return (
-        snapshot,
-        False,
-        f"could not confirm that all {mode} pricing controls became selected",
-        effective_url,
+        return _PreparedPricingPage(
+            snapshot=snapshot,
+            mode_verified=True,
+            selection_note=f"{mode} pricing controls selected",
+            effective_url=effective_url,
+        )
+    return _PreparedPricingPage(
+        snapshot=snapshot,
+        mode_verified=False,
+        selection_note=f"could not confirm that all {mode} pricing controls became selected",
+        effective_url=effective_url,
     )
 
 
@@ -315,22 +348,22 @@ async def _read_page_mode(ctx: ToolContext, url: str, mode: str) -> ToolResult:
 
     if mode not in _PRICING_MODES:
         raise ValueError(f"single pricing mode must be one of {', '.join(_PRICING_MODES)}")
-    snap, mode_verified, selection_note, effective_url = await _prepare_pricing_page(ctx, url, mode)
+    page = await _prepare_pricing_page(ctx, url, mode)
     result_details = {
         "pricing_mode": mode,
-        "pricing_mode_verified": mode_verified,
-        "selection_note": selection_note,
-        "effective_url": effective_url,
+        "pricing_mode_verified": page.mode_verified,
+        "selection_note": page.selection_note,
+        "effective_url": page.effective_url,
     }
-    if not mode_verified:
+    if not page.mode_verified:
         return ToolResult(
-            content=f"{url}: {selection_note}. Do not report {mode} prices.",
+            content=f"{url}: {page.selection_note}. Do not report {mode} prices.",
             structured={"source": "selection_error", **result_details},
             is_error=True,
         )
-    mode_header = f"[verified pricing_mode={mode}; {selection_note}]\n"
-    if len(snap.strip()) >= _THIN_TEXT_CHARS:
-        compressed = _compress_snapshot(snap).strip()
+    mode_header = f"[verified pricing_mode={mode}; {page.selection_note}]\n"
+    if len(page.snapshot.strip()) >= _THIN_TEXT_CHARS:
+        compressed = _compress_snapshot(page.snapshot).strip()
         if compressed:
             return ToolResult(
                 content=mode_header + compressed[:_MAX_PAGE_CHARS],
@@ -386,18 +419,16 @@ class ScreenshotTool(Tool):
             )
         url = args["url"]
         mode = _requested_pricing_mode(args, default="standard")
-        _, mode_verified, selection_note, effective_url = await _prepare_pricing_page(
-            ctx, url, mode
-        )
-        if not mode_verified:
+        page = await _prepare_pricing_page(ctx, url, mode)
+        if not page.mode_verified:
             return ToolResult(
-                content=f"{url}: {selection_note}. Do not report {mode} prices.",
+                content=f"{url}: {page.selection_note}. Do not report {mode} prices.",
                 structured={
                     "url": url,
-                    "effective_url": effective_url,
+                    "effective_url": page.effective_url,
                     "pricing_mode": mode,
                     "pricing_mode_verified": False,
-                    "selection_note": selection_note,
+                    "selection_note": page.selection_note,
                 },
                 is_error=True,
             )
@@ -441,10 +472,10 @@ class ScreenshotTool(Tool):
             ],
             structured={
                 "url": url,
-                "effective_url": effective_url,
+                "effective_url": page.effective_url,
                 "size_bytes": meta.size_bytes,
                 "pricing_mode": mode,
                 "pricing_mode_verified": True,
-                "selection_note": selection_note,
+                "selection_note": page.selection_note,
             },
         )
