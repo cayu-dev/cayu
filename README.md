@@ -331,6 +331,7 @@ User guides:
 - [Triggering runs](docs/triggering-runs.md) — which start verb (run / dispatch / task worker / subagent / event watcher) fits your trigger.
 - [Environment factories](docs/environment-factories.md) — per-session workspaces, runners, and bindings.
 - [Build a runner](docs/build-a-runner.md) — run commands on your own platform.
+- [Git command policy](docs/git-command-policy.md) — authorize a narrow local coding-agent workflow.
 - [Evals](docs/evals.md) — assertions, trajectories, and reports.
 
 Reference and design docs (deeper, maintainer-facing):
@@ -2632,7 +2633,8 @@ filesystem, process, or network isolation; keep untrusted coding agents inside
 an appropriate container or microVM. Executable-specific restrictions can
 compose by implementing `CommandPolicy` and delegating the common controls to a
 `ProcessCommandPolicy` before evaluating that executable's argv protocol. Cayu
-does not provide a generic command-rule language.
+does not provide a generic command-rule language. Cayu's built-in
+[`GitCommandPolicy`](docs/git-command-policy.md) is the first such specialization.
 
 Without `policy=...`, the compatibility contract is intentionally unchanged:
 model-controlled command, cwd, environment, and stdin arguments pass to the

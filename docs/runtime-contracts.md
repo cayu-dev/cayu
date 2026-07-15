@@ -1281,6 +1281,13 @@ command policy preserves the unrestricted compatibility path: valid
 model-controlled arguments pass through to the runner subject to tool bounds
 and runner isolation.
 
+`GitCommandPolicy` is the first specialization. It defines a fail-closed local
+repository matrix on top of `ProcessCommandPolicy`, including structural global
+option parsing, repeated `-C` containment, explicit staging paths, and a
+hook/signing-suppressed ordinary commit shape. Its complete supported matrix,
+required safety prefix, and repository-controlled-filter residual risk are in
+[Git command policy](git-command-policy.md).
+
 The first built-in tools are:
 
 - `read_file`: read text from the active workspace by `path`, capture workspace image/PDF files as artifact snapshots when an artifact store is configured, read text artifacts by `artifact_id`, or return provider-neutral image/PDF attachment references for capable providers

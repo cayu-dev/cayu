@@ -21,6 +21,7 @@ from cayu.tools.files import (
     WriteFileTool,
     default_artifact_readers,
 )
+from cayu.tools.git_command_policy import GitCommandPolicy
 from cayu.tools.knowledge import (
     ListKnowledgeTool,
     ReadKnowledgeTool,
@@ -48,6 +49,7 @@ __all__ = [
     "CommandPolicyResult",
     "CommandRequest",
     "ExecCommandTool",
+    "GitCommandPolicy",
     "ImageArtifactReader",
     "ListArtifactsTool",
     "ListFilesTool",
