@@ -14,6 +14,10 @@ from typing import Any, Protocol
 from cayu._validation import copy_json_value
 from cayu.core.events import Event, EventType
 from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._session_control import (
+    clear_current_task_cancellation,
+    interruption_request_id_from_payload,
+)
 from cayu.runtime.approvals import ResolutionActor, resolution_actor_payload
 from cayu.runtime.sessions import (
     InterruptSessionRequest,
@@ -64,23 +68,6 @@ def suppress_interruption_cascade() -> Iterator[None]:
         # overwritten with the creator's previous value.
         with contextlib.suppress(ValueError):
             _SUPPRESS_BACKGROUND_INTERRUPTION_CASCADE.reset(token)
-
-
-def _clear_current_task_cancellation() -> None:
-    current_task = asyncio.current_task()
-    if current_task is None:
-        return
-    while current_task.cancelling():
-        current_task.uncancel()
-
-
-def _interruption_request_id_from_payload(payload: dict[str, Any]) -> str | None:
-    request_id = payload.get("interruption_request_id")
-    if request_id is None:
-        return None
-    if type(request_id) is not str or not request_id.strip():
-        raise ValueError("Interruption request ID must be a non-blank string.")
-    return request_id
 
 
 def _is_background_subagent_session(session: Session) -> bool:
@@ -292,7 +279,7 @@ class BackgroundInterruptionCoordinator:
         try:
             return await self._drain_background_interruptions_started(float(timeout_s))
         except asyncio.CancelledError:
-            _clear_current_task_cancellation()
+            clear_current_task_cancellation()
             await self._cancel_background_interruption_work()
             raise
         except BaseException:
@@ -995,7 +982,7 @@ class BackgroundInterruptionCoordinator:
             session_id,
             default={},
         )
-        interruption_request_id = _interruption_request_id_from_payload(pending_interrupt_payload)
+        interruption_request_id = interruption_request_id_from_payload(pending_interrupt_payload)
         for attempt in range(_ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS):
             if (
                 await self._latest_session_interrupted_event(

@@ -122,6 +122,14 @@ from cayu.runtime._interruption_coordinator import (
     suppress_interruption_cascade,
 )
 from cayu.runtime._model_errors import model_provider_error_from_payload
+from cayu.runtime._session_control import (
+    INTERRUPT_REQUESTED_SESSION_STATUSES,
+    ActiveSessionRun,
+    SessionControl,
+    SessionInterruptedByRequest,
+    clear_current_task_cancellation,
+    interruption_request_id_from_payload,
+)
 from cayu.runtime.approvals import (
     PendingToolApproval,
     PendingToolCallApproval,
@@ -400,12 +408,6 @@ class _UserInputInterrupt(Exception):
         self.pending = copy_pending_user_input(pending)
 
 
-class _SessionInterruptedByRequest(Exception):
-    def __init__(self, session_id: str) -> None:
-        self.session_id = require_clean_nonblank(session_id, "session_id")
-        super().__init__(f"Session interrupted: {self.session_id}")
-
-
 class _SessionCompactionReplay(Exception):
     def __init__(self, event_ids: Iterable[str]) -> None:
         self.event_ids = tuple(event_ids)
@@ -462,21 +464,6 @@ async def _next_model_step_item(
     iterator: AsyncIterator[tuple[Event | None, AssistantStepResult | None]],
 ) -> tuple[Event | None, AssistantStepResult | None]:
     return await anext(iterator)
-
-
-@dataclass
-class _ActiveSessionRun:
-    runtime_task: asyncio.Task[Any]
-    task_id: str | None
-    task_started: bool
-    task_finished: bool
-    turn_registered_agent: runtime_records.RegisteredAgentState | None = None
-    turn_environment_name: str | None = None
-    turn_started_at: float | None = None
-    turn_usage_tracker: _SessionUsageTracker | None = None
-    turn_completed_event: Event | None = None
-    turn_completed_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    out_of_band_events: asyncio.Queue[Event] = field(default_factory=asyncio.Queue)
 
 
 @dataclass(frozen=True)
@@ -591,15 +578,6 @@ _INTERRUPTIBLE_SESSION_STATUSES = {
     SessionStatus.PENDING,
     SessionStatus.RUNNING,
 }
-_INTERRUPT_REQUESTED_SESSION_STATUSES = {
-    SessionStatus.INTERRUPTING,
-    SessionStatus.INTERRUPTED,
-}
-_INTERRUPTED_EVENT_WAIT_ATTEMPTS = 10
-_INTERRUPTED_EVENT_WAIT_INTERVAL_S = 0.01
-_ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS = 600
-_ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S = 0.01
-_STREAM_INTERRUPT_POLL_INTERVAL_S = 0.05
 _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY = "pending_session_interrupt"
 _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY = "pending_interruption_cascade"
 _ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY = "environment_factory_reconnect"
@@ -669,36 +647,6 @@ class _SessionUsageTracker:
         return self._events
 
 
-class _StreamInterruptPoll:
-    """Bounds per-delta interrupt polling while a model response streams.
-
-    Phase-boundary interrupt checks always read the session store, so
-    cooperative interrupts keep their exact semantics at every step, tool
-    round, and tool call. The per-delta check inside the provider stream only
-    bounds interrupt latency mid-response; loading the session on every text
-    delta turns streaming into a store hot loop. The poll therefore hits the
-    store at most every ``_STREAM_INTERRUPT_POLL_INTERVAL_S`` seconds — unless
-    the in-process interrupt signal (set by ``interrupt_session`` after it
-    persists ``INTERRUPTING``) is set, which bypasses the throttle so
-    in-process interrupts are still observed on the next delta.
-    """
-
-    def __init__(self, app: CayuApp, *, session_id: str) -> None:
-        self._app = app
-        self._session_id = session_id
-        self._last_poll = time.monotonic()
-
-    async def raise_if_interrupted(self) -> None:
-        now = time.monotonic()
-        if (
-            not self._app._session_interrupt_signalled(self._session_id)
-            and now - self._last_poll < _STREAM_INTERRUPT_POLL_INTERVAL_S
-        ):
-            return
-        self._last_poll = now
-        await self._app._raise_if_session_interrupted(self._session_id)
-
-
 class _LimitGate:
     """Evaluates the run-limit / request-budget matrix at one phase boundary.
 
@@ -725,7 +673,7 @@ class _LimitGate:
         budget_baseline_events: list[Event],
         budget_notify_events: list[Event],
         turn_usage_tracker: _SessionUsageTracker | None = None,
-        active_run: _ActiveSessionRun | None = None,
+        active_run: ActiveSessionRun[_SessionUsageTracker] | None = None,
     ) -> None:
         self._app = app
         self._session = session
@@ -835,7 +783,7 @@ class _LimitGate:
 class _InterruptGuard:
     """Applies the session-interrupt matrix around a tool round phase.
 
-    Both interrupt signals — the cooperative ``_SessionInterruptedByRequest``
+    Both interrupt signals — the cooperative ``SessionInterruptedByRequest``
     and an ``asyncio.CancelledError`` raised while an interrupt request is
     pending — must close the tool round the same way. Callers catch either
     exception, drain :meth:`close_tool_round`, and re-raise. A cancellation
@@ -868,12 +816,12 @@ class _InterruptGuard:
     ) -> AsyncIterator[Event]:
         cancellation_artifacts: list[dict[str, Any]] | None = None
         cancellation_artifacts_by_id: dict[str, list[dict[str, Any]]] | None = None
-        if isinstance(exc, _SessionInterruptedByRequest):
+        if isinstance(exc, SessionInterruptedByRequest):
             pass
         elif isinstance(exc, asyncio.CancelledError):
-            if not await self._app._session_interrupt_requested(self._session.id):
+            if not await self._app._session_control.interrupt_requested(self._session.id):
                 return
-            _clear_current_task_cancellation()
+            clear_current_task_cancellation()
             cancellation_artifacts = _cancellation_artifacts(exc)
             # A parallel round records which call produced the artifacts, so attach them to that
             # call rather than the first unfinished one. Sequential cancellation carries no id and
@@ -962,7 +910,7 @@ class _ToolRoundRunner:
         session = self._session
         tool_outcomes: list[runtime_records.ToolCallOutcome] = []
         try:
-            await app._raise_if_session_interrupted(session.id)
+            await app._session_control.raise_if_interrupted(session.id)
             policy_plan = await app._policy_plan_for_tool_round(
                 session=session,
                 registered_agent=self._registered_agent,
@@ -970,8 +918,8 @@ class _ToolRoundRunner:
                 tool_calls=tool_calls,
                 request_metadata=self._request_metadata,
             )
-            await app._raise_if_session_interrupted(session.id)
-        except (_SessionInterruptedByRequest, asyncio.CancelledError) as exc:
+            await app._session_control.raise_if_interrupted(session.id)
+        except (SessionInterruptedByRequest, asyncio.CancelledError) as exc:
             async for event in self._interrupt_guard.close_tool_round(
                 exc,
                 messages=messages,
@@ -1026,7 +974,7 @@ class _ToolRoundRunner:
                         },
                     )
                 )
-            except (_SessionInterruptedByRequest, asyncio.CancelledError) as exc:
+            except (SessionInterruptedByRequest, asyncio.CancelledError) as exc:
                 async for event in self._interrupt_guard.close_tool_round(
                     exc,
                     messages=messages,
@@ -1118,7 +1066,7 @@ class _ToolRoundRunner:
                     break
             if self.stopped_for_limit:
                 return
-        except (_SessionInterruptedByRequest, asyncio.CancelledError) as exc:
+        except (SessionInterruptedByRequest, asyncio.CancelledError) as exc:
             async for event in self._interrupt_guard.close_tool_round(
                 exc,
                 messages=messages,
@@ -1145,8 +1093,8 @@ class _ToolRoundRunner:
                 _replace_checkpoint_preserving_runtime_state(cleared_checkpoint),
             )
         except asyncio.CancelledError:
-            if await app._session_interrupt_requested(session.id):
-                _clear_current_task_cancellation()
+            if await app._session_control.interrupt_requested(session.id):
+                clear_current_task_cancellation()
                 await app.session_store.append_transcript_messages_and_transform_checkpoint(
                     session.id,
                     tool_result_messages,
@@ -1210,7 +1158,7 @@ class _ToolRoundRunner:
         if round_tool_calls is None:
             round_tool_calls = tool_calls
         for tool_call in tool_calls:
-            await app._raise_if_session_interrupted(session.id)
+            await app._session_control.raise_if_interrupted(session.id)
             async for event in self._limit_gate.evaluate_limits(
                 messages=messages,
                 tool_calls=round_tool_calls,
@@ -1234,7 +1182,7 @@ class _ToolRoundRunner:
                 taint_labels=taint_labels_by_id.get(tool_call.id, frozenset()),
             ):
                 yield event, outcome
-            await app._raise_if_session_interrupted(session.id)
+            await app._session_control.raise_if_interrupted(session.id)
 
     async def _run_tool_calls_parallel(
         self,
@@ -1267,7 +1215,7 @@ class _ToolRoundRunner:
 
         async def execute_call(index: int, tool_call: runtime_records.ToolCallRequest) -> None:
             async with semaphore:
-                await app._raise_if_session_interrupted(session.id)
+                await app._session_control.raise_if_interrupted(session.id)
                 try:
                     async for item in app._execute_tool_call(
                         session=session,
@@ -1387,7 +1335,7 @@ def _parallel_tool_round_exception(group: BaseExceptionGroup) -> BaseException:
 
     _flatten(group)
     for exc in flattened:
-        if isinstance(exc, _SessionInterruptedByRequest | _SessionInterrupted):
+        if isinstance(exc, SessionInterruptedByRequest | _SessionInterrupted):
             return exc
     for exc in flattened:
         if not isinstance(exc, asyncio.CancelledError):
@@ -1617,14 +1565,16 @@ class CayuApp:
         self._environments: dict[str, runtime_records.RegisteredEnvironment] = {}
         self._default_provider_name: str | None = None
         self._default_environment_name: str | None = None
-        self._active_session_runs: dict[str, dict[asyncio.Task[Any], _ActiveSessionRun]] = {}
+        self._session_control = SessionControl[_SessionUsageTracker](
+            session_store=self.session_store
+        )
         self._background_interruption_coordinator = BackgroundInterruptionCoordinator(
             session_store=self.session_store,
             event_writer=self._event_writer,
             clock=self._clock,
             interrupt_session=self.interrupt_session,
             load_pending_session_interrupt_payload=self._load_pending_session_interrupt_payload,
-            latest_session_interrupted_event=self._latest_session_interrupted_event,
+            latest_session_interrupted_event=self._session_control.latest_interrupted_event,
             load_pending_interruption_cascade=self._load_pending_interruption_cascade,
             claim_pending_interruption_cascade=self._claim_pending_interruption_cascade,
             mark_pending_interruption_cascade_failed=(
@@ -1638,9 +1588,6 @@ class CayuApp:
                 self._release_pending_interruption_cascade_claim
             ),
         )
-        self._sessions_emitting_interrupted: set[str] = set()
-        self._sessions_requesting_interruption: set[str] = set()
-        self._session_interrupt_signals: dict[str, asyncio.Event] = {}
 
     def redact_json(self, value: Any) -> Any:
         """Return a JSON-compatible value with configured secret values redacted."""
@@ -2291,7 +2238,7 @@ class CayuApp:
             loaded_session = await self.session_store.load(session.id)
             if (
                 loaded_session is not None
-                and loaded_session.status in _INTERRUPT_REQUESTED_SESSION_STATUSES
+                and loaded_session.status in INTERRUPT_REQUESTED_SESSION_STATUSES
             ):
                 async for event in self._handle_session_interrupted(
                     session=loaded_session,
@@ -2303,13 +2250,13 @@ class CayuApp:
                 return
             raise
         current_task = asyncio.current_task()
-        active_factory_run: _ActiveSessionRun | None = None
+        active_factory_run: ActiveSessionRun[_SessionUsageTracker] | None = None
         if (
             registered_environment is not None
             and registered_environment.factory is not None
             and current_task is not None
         ):
-            active_factory_run = self._register_active_session_task(
+            active_factory_run = self._session_control.register_active_task(
                 session.id,
                 current_task,
                 task_id=request.task_id,
@@ -2329,7 +2276,9 @@ class CayuApp:
             )
             if factory_started_event is not None:
                 yield factory_started_event
-                async for queued_event in self._drain_out_of_band_session_events(session.id):
+                async for queued_event in self._session_control.drain_out_of_band_events(
+                    session.id
+                ):
                     yield queued_event
                 if request.task_id is not None:
                     task = await self._start_task(
@@ -2358,9 +2307,11 @@ class CayuApp:
             registered_environment = resolution.registered_environment
             for event in resolution.events:
                 yield event
-                async for queued_event in self._drain_out_of_band_session_events(session.id):
+                async for queued_event in self._session_control.drain_out_of_band_events(
+                    session.id
+                ):
                     yield queued_event
-            async for queued_event in self._drain_out_of_band_session_events(session.id):
+            async for queued_event in self._session_control.drain_out_of_band_events(session.id):
                 yield queued_event
             if resolution.error is not None:
                 task_failure_event, task_failure_error = await self._fail_task_for_run_setup_error(
@@ -2395,7 +2346,9 @@ class CayuApp:
                     registered_environment=registered_environment,
                 ):
                     yield event
-                    async for queued_event in self._drain_out_of_band_session_events(session.id):
+                    async for queued_event in self._session_control.drain_out_of_band_events(
+                        session.id
+                    ):
                         yield queued_event
                 return
 
@@ -2405,7 +2358,7 @@ class CayuApp:
                 )
             release_before_run = False
         except asyncio.CancelledError:
-            if await self._session_interrupt_requested(session.id):
+            if await self._session_control.interrupt_requested(session.id):
                 async for event in self._handle_session_interrupted(
                     session=session,
                     registered_agent=registered_agent,
@@ -2461,7 +2414,7 @@ class CayuApp:
                     await self.session_store.release_run_fence(session.id)
             finally:
                 if current_task is not None and active_factory_run is not None:
-                    self._unregister_active_session_task(session.id, current_task)
+                    self._session_control.unregister_active_task(session.id, current_task)
 
         try:
             messages = transcript_helpers.initial_messages(
@@ -2496,13 +2449,13 @@ class CayuApp:
             await self.session_store.release_run_fence(session.id)
             raise
         try:
-            async for event in self._stream_with_out_of_band_session_events(
+            async for event in self._session_control.stream_with_out_of_band_events(
                 session.id,
                 session_stream,
             ):
                 yield event
         except asyncio.CancelledError:
-            if await self._session_interrupt_requested(session.id):
+            if await self._session_control.interrupt_requested(session.id):
                 async for event in self._handle_session_interrupted(
                     session=session,
                     registered_agent=registered_agent,
@@ -2530,7 +2483,7 @@ class CayuApp:
             start_task_on_enter=False,
         )
         try:
-            async for event in self._stream_with_out_of_band_session_events(
+            async for event in self._session_control.stream_with_out_of_band_events(
                 request.session_id,
                 session_stream,
             ):
@@ -2547,7 +2500,7 @@ class CayuApp:
             raise TypeError("Runtime compaction requires a CompactSessionRequest.")
         operation_stream = self._compact_session(request)
         try:
-            async for event in self._stream_with_out_of_band_session_events(
+            async for event in self._session_control.stream_with_out_of_band_events(
                 request.session_id,
                 operation_stream,
             ):
@@ -2596,7 +2549,7 @@ class CayuApp:
                 # interruption finalizer instead of treating the store's delivery
                 # fence as a runtime failure. Unrelated status conflicts still
                 # propagate unchanged.
-                await self._raise_if_session_interrupted(session_id)
+                await self._session_control.raise_if_interrupted(session_id)
                 raise
             if eligible_through is None:
                 eligible_through = batch.eligible_through
@@ -3333,7 +3286,7 @@ class CayuApp:
             # An interrupt can win between the final provider response and the
             # atomic completion transition. Route that race through the normal
             # interrupt finalizer instead of the generic failure handler.
-            await self._raise_if_session_interrupted(session_id)
+            await self._session_control.raise_if_interrupted(session_id)
             raise
 
     async def _handle_queued_messages_before_completion(
@@ -3348,7 +3301,7 @@ class CayuApp:
         max_steps: int,
         run_started_at: float,
         turn_usage_tracker: _SessionUsageTracker,
-        active_run: _ActiveSessionRun | None,
+        active_run: ActiveSessionRun[_SessionUsageTracker] | None,
     ) -> tuple[bool, list[Event]]:
         if step < max_steps:
             return True, await self._deliver_queued_session_messages(
@@ -3836,8 +3789,8 @@ class CayuApp:
         if loaded_session is None:
             raise KeyError(f"Session not found: {request.session_id}")
         if loaded_session.status == SessionStatus.INTERRUPTED:
-            existing_interrupt_event = await self._wait_for_active_session_interrupted_event(
-                loaded_session.id
+            existing_interrupt_event = (
+                await self._session_control.wait_for_active_interrupted_event(loaded_session.id)
             )
             if existing_interrupt_event is not None:
                 retry_event: Event | None = None
@@ -3889,11 +3842,13 @@ class CayuApp:
                 loaded_session.id,
                 default={},
             )
-            existing_interrupt_event = await self._wait_for_active_session_interrupted_event(
-                loaded_session.id,
-                interruption_request_id=_interruption_request_id_from_payload(
-                    pending_interrupt_payload
-                ),
+            existing_interrupt_event = (
+                await self._session_control.wait_for_active_interrupted_event(
+                    loaded_session.id,
+                    interruption_request_id=interruption_request_id_from_payload(
+                        pending_interrupt_payload
+                    ),
+                )
             )
             if existing_interrupt_event is not None:
                 if not interruption_cascade_suppressed():
@@ -3921,7 +3876,7 @@ class CayuApp:
             "interruption_request_id": str(uuid4()),
         }
         cascade_suppressed = interruption_cascade_suppressed()
-        self._sessions_requesting_interruption.add(loaded_session.id)
+        self._session_control.begin_interruption_request(loaded_session.id)
         request_marker_active = True
         try:
             session = await self.session_store.transition_status_and_checkpoint(
@@ -3934,27 +3889,31 @@ class CayuApp:
                     cascade_created_at=self._clock(),
                 ),
             )
-            self._signal_session_interrupt(session.id)
-            active_work_signalled = self._interrupt_active_session_runs(session.id)
+            self._session_control.signal_interrupt(session.id)
+            active_work_signalled = self._session_control.cancel_active_runs(session.id)
             if active_work_signalled:
-                existing_interrupt_event = await self._wait_for_active_session_interrupted_event(
-                    session.id,
-                    interruption_request_id=interrupt_payload["interruption_request_id"],
+                existing_interrupt_event = (
+                    await self._session_control.wait_for_active_interrupted_event(
+                        session.id,
+                        interruption_request_id=interrupt_payload["interruption_request_id"],
+                    )
                 )
                 if existing_interrupt_event is not None:
                     request_marker_active = False
-                    self._sessions_requesting_interruption.discard(loaded_session.id)
+                    self._session_control.end_interruption_request(loaded_session.id)
                     yield existing_interrupt_event
                     return
                 raise TimeoutError(f"Session interruption is still finalizing: {session.id}")
             if loaded_session.status == SessionStatus.RUNNING:
-                existing_interrupt_event = await self._wait_for_active_session_interrupted_event(
-                    session.id,
-                    interruption_request_id=interrupt_payload["interruption_request_id"],
+                existing_interrupt_event = (
+                    await self._session_control.wait_for_active_interrupted_event(
+                        session.id,
+                        interruption_request_id=interrupt_payload["interruption_request_id"],
+                    )
                 )
                 if existing_interrupt_event is not None:
                     request_marker_active = False
-                    self._sessions_requesting_interruption.discard(loaded_session.id)
+                    self._session_control.end_interruption_request(loaded_session.id)
                     yield existing_interrupt_event
                     return
                 raise TimeoutError(f"Session interruption is still finalizing: {session.id}")
@@ -3962,21 +3921,23 @@ class CayuApp:
             reloaded_session = await self.session_store.load(loaded_session.id)
             if reloaded_session is None:
                 raise KeyError(f"Session not found: {loaded_session.id}") from None
-            if reloaded_session.status in _INTERRUPT_REQUESTED_SESSION_STATUSES:
-                self._signal_session_interrupt(reloaded_session.id)
+            if reloaded_session.status in INTERRUPT_REQUESTED_SESSION_STATUSES:
+                self._session_control.signal_interrupt(reloaded_session.id)
                 pending_interrupt_payload = await self._load_pending_session_interrupt_payload(
                     reloaded_session.id,
                     default={},
                 )
-                existing_interrupt_event = await self._wait_for_active_session_interrupted_event(
-                    reloaded_session.id,
-                    interruption_request_id=_interruption_request_id_from_payload(
-                        pending_interrupt_payload
-                    ),
+                existing_interrupt_event = (
+                    await self._session_control.wait_for_active_interrupted_event(
+                        reloaded_session.id,
+                        interruption_request_id=interruption_request_id_from_payload(
+                            pending_interrupt_payload
+                        ),
+                    )
                 )
                 if existing_interrupt_event is not None:
                     request_marker_active = False
-                    self._sessions_requesting_interruption.discard(loaded_session.id)
+                    self._session_control.end_interruption_request(loaded_session.id)
                     if not interruption_cascade_suppressed():
                         self._schedule_background_interruption_cascade(
                             parent_session_id=reloaded_session.id,
@@ -3985,7 +3946,7 @@ class CayuApp:
                         )
                     yield existing_interrupt_event
                     return
-                if self._has_active_session_tasks(reloaded_session.id):
+                if self._session_control.has_active_tasks(reloaded_session.id):
                     raise TimeoutError(
                         f"Session interruption is still finalizing: {reloaded_session.id}"
                     ) from None
@@ -4001,7 +3962,7 @@ class CayuApp:
                 raise
         except BaseException:
             if request_marker_active:
-                self._sessions_requesting_interruption.discard(loaded_session.id)
+                self._session_control.end_interruption_request(loaded_session.id)
             raise
 
         session = await self.session_store.update_status(session.id, SessionStatus.INTERRUPTED)
@@ -4017,9 +3978,9 @@ class CayuApp:
         )
         terminal_event_stream: AsyncIterator[Event] | None = None
         try:
-            existing_interrupt_event = await self._latest_session_interrupted_event(
+            existing_interrupt_event = await self._session_control.latest_interrupted_event(
                 session.id,
-                interruption_request_id=_interruption_request_id_from_payload(payload),
+                interruption_request_id=interruption_request_id_from_payload(payload),
             )
             if existing_interrupt_event is not None:
                 await self._clear_pending_session_interrupt(session.id)
@@ -4072,7 +4033,7 @@ class CayuApp:
             raise
         finally:
             if request_marker_active:
-                self._sessions_requesting_interruption.discard(loaded_session.id)
+                self._session_control.end_interruption_request(loaded_session.id)
         return
 
     async def recover_incomplete_session(
@@ -4213,7 +4174,7 @@ class CayuApp:
             start_task_on_enter=True,
         )
         try:
-            async for event in self._stream_with_out_of_band_session_events(
+            async for event in self._session_control.stream_with_out_of_band_events(
                 request.session_id,
                 session_stream,
             ):
@@ -5214,7 +5175,7 @@ class CayuApp:
                 release_run_fence_on_exit=False,
             )
             try:
-                async for event in self._stream_with_out_of_band_session_events(
+                async for event in self._session_control.stream_with_out_of_band_events(
                     session.id,
                     session_stream,
                 ):
@@ -5973,7 +5934,7 @@ class CayuApp:
                 release_run_fence_on_exit=False,
             )
             try:
-                async for event in self._stream_with_out_of_band_session_events(
+                async for event in self._session_control.stream_with_out_of_band_events(
                     session.id,
                     session_stream,
                 ):
@@ -6360,14 +6321,14 @@ class CayuApp:
         registered_environment = self._get_registered_environment_for_session(
             loaded_session.environment_name
         )
-        if self._has_active_session_tasks(loaded_session.id):
+        if self._session_control.has_active_tasks(loaded_session.id):
             raise RuntimeError(f"Session has active work in this process: {loaded_session.id}")
         # Reserve the in-process slot before awaiting the durable transition. The
         # check and registration are await-free, so another local recovery cannot
         # advance the run epoch while this claimant is waiting on storage.
         current_task = asyncio.current_task()
         if current_task is not None:
-            self._register_active_session_task(
+            self._session_control.register_active_task(
                 loaded_session.id,
                 current_task,
                 task_id=None,
@@ -6382,7 +6343,7 @@ class CayuApp:
             )
         except BaseException:
             if current_task is not None:
-                self._unregister_active_session_task(loaded_session.id, current_task)
+                self._session_control.unregister_active_task(loaded_session.id, current_task)
             raise
         try:
             async for event in self._recover_tool_round_claimed(
@@ -6402,7 +6363,7 @@ class CayuApp:
                 await self.session_store.release_run_fence(session.id)
             finally:
                 if current_task is not None:
-                    self._unregister_active_session_task(session.id, current_task)
+                    self._session_control.unregister_active_task(session.id, current_task)
 
     async def _recover_tool_round_claimed(
         self,
@@ -6704,12 +6665,12 @@ class CayuApp:
         task_start_attempted = task_started
         task_finished = False
         current_task = asyncio.current_task()
-        active_run: _ActiveSessionRun | None = None
+        active_run: ActiveSessionRun[_SessionUsageTracker] | None = None
         run_started_at = time.monotonic()
         # A fresh run means any earlier interrupt was fully handled before the
         # session transitioned back to RUNNING; drop a stale signal so it does
         # not force per-delta store polling for the whole resumed run.
-        self._discard_session_interrupt_signal(session.id)
+        self._session_control.discard_interrupt_signal(session.id)
         limits = copy_run_limits(limits)
         budget_limits = request_budget_limits_for_session(
             limits=budget_limits,
@@ -6740,7 +6701,7 @@ class CayuApp:
                 f"Tool name is reserved for structured output: {STRUCTURED_OUTPUT_TOOL_NAME}"
             )
         if current_task is not None:
-            active_run = self._register_active_session_task(
+            active_run = self._session_control.register_active_task(
                 session.id,
                 current_task,
                 task_id=task_id,
@@ -6907,7 +6868,7 @@ class CayuApp:
                 retry_policy=retry_policy,
             )
             for step in range(1, max_steps + 1):
-                await self._raise_if_session_interrupted(session.id)
+                await self._session_control.raise_if_interrupted(session.id)
                 for event in await self._deliver_queued_session_messages(
                     session_id=session.id,
                     messages=messages,
@@ -7044,7 +7005,7 @@ class CayuApp:
                             payload=checkpoint_event_payload,
                         )
                     )
-                await self._raise_if_session_interrupted(session.id)
+                await self._session_control.raise_if_interrupted(session.id)
 
                 model_request = await self._build_model_request(
                     session=session,
@@ -7281,7 +7242,7 @@ class CayuApp:
                     ):
                         yield event
                     raise
-                except _SessionInterruptedByRequest as authoritative_exc:
+                except SessionInterruptedByRequest as authoritative_exc:
                     async for event in self._budget_settlement_events_preserving_failure(
                         self._settle_budget_reservations_after_model_failure(
                             budget_reservations,
@@ -7736,7 +7697,7 @@ class CayuApp:
                 raise RuntimeError(f"Maximum model steps exceeded: {max_steps}")
 
             if task_id is not None:
-                await self._raise_if_session_interrupted(session.id)
+                await self._session_control.raise_if_interrupted(session.id)
                 task = await self._complete_task(
                     task_id=task_id,
                     session=session,
@@ -7833,7 +7794,7 @@ class CayuApp:
                 registered_environment=registered_environment,
             ):
                 yield event
-        except _SessionInterruptedByRequest:
+        except SessionInterruptedByRequest:
             async for event in self._handle_session_interrupted(
                 session=session,
                 registered_agent=registered_agent,
@@ -7846,7 +7807,7 @@ class CayuApp:
                 yield event
             return
         except asyncio.CancelledError:
-            if await self._session_interrupt_requested(session.id):
+            if await self._session_control.interrupt_requested(session.id):
                 async for event in self._handle_session_interrupted(
                     session=session,
                     registered_agent=registered_agent,
@@ -7950,13 +7911,13 @@ class CayuApp:
             ):
                 yield event
         finally:
-            self._discard_session_interrupt_signal(session.id)
+            self._session_control.discard_interrupt_signal(session.id)
             try:
                 if release_run_fence_on_exit:
                     await self.session_store.release_run_fence(session.id)
             finally:
                 if current_task is not None:
-                    self._unregister_active_session_task(session.id, current_task)
+                    self._session_control.unregister_active_task(session.id, current_task)
 
     async def _emit_turn_completed(
         self,
@@ -7998,7 +7959,7 @@ class CayuApp:
         status: SessionStatus,
         run_started_at: float,
         usage_tracker: _SessionUsageTracker,
-        active_run: _ActiveSessionRun | None,
+        active_run: ActiveSessionRun[_SessionUsageTracker] | None,
     ) -> Event:
         if active_run is None:
             return await self._emit_turn_completed(
@@ -8029,7 +7990,7 @@ class CayuApp:
         session: Session,
         status: SessionStatus,
     ) -> Event | None:
-        for active_run in self._active_session_run_records(session.id):
+        for active_run in self._session_control.active_runs(session.id):
             if (
                 active_run.turn_registered_agent is None
                 or active_run.turn_started_at is None
@@ -8045,12 +8006,6 @@ class CayuApp:
                 usage_tracker=active_run.turn_usage_tracker,
                 active_run=active_run,
             )
-        return None
-
-    def _active_turn_completed_event(self, session_id: str) -> Event | None:
-        for active_run in self._active_session_run_records(session_id):
-            if active_run.turn_completed_event is not None:
-                return active_run.turn_completed_event
         return None
 
     async def _start_task(
@@ -8924,7 +8879,7 @@ class CayuApp:
             document_bytes_per_token=profile.document_bytes_per_token,
             tool_schema_chars_per_token=profile.tool_schema_chars_per_token,
         )
-        interrupt_poll = _StreamInterruptPoll(self, session_id=session.id)
+        interrupt_poll = self._session_control.stream_interrupt_poll(session.id)
         # This is the accounting boundary: once the callback returns, the next
         # expression enters provider-controlled code and Cayu can no longer prove
         # that the attempt did not consume billable work.
@@ -9049,7 +9004,7 @@ class CayuApp:
                         cause=provider_error or RuntimeError(message),
                     )
                 yield emitted_event, None
-        except _SessionInterruptedByRequest:
+        except SessionInterruptedByRequest:
             raise
         except asyncio.CancelledError:
             raise
@@ -9079,7 +9034,7 @@ class CayuApp:
                 emitted_error_event=False,
                 cause=RuntimeError(message),
             )
-        await self._raise_if_session_interrupted(session.id)
+        await self._session_control.raise_if_interrupted(session.id)
         if completed_stream_event is None:
             raise RuntimeError("Model provider completed without completion metadata.")
         if step_result is None:
@@ -9091,10 +9046,10 @@ class CayuApp:
         session_id: str,
         decision: RetryDecision,
     ) -> None:
-        await self._raise_if_session_interrupted(session_id)
+        await self._session_control.raise_if_interrupted(session_id)
         if decision.delay_seconds > 0:
             await asyncio.sleep(decision.delay_seconds)
-        await self._raise_if_session_interrupted(session_id)
+        await self._session_control.raise_if_interrupted(session_id)
 
     async def _first_limit_decision(
         self,
@@ -9791,7 +9746,7 @@ class CayuApp:
         tool_round_id: str | None = None,
         run_started_at: float | None = None,
         turn_usage_tracker: _SessionUsageTracker | None = None,
-        active_run: _ActiveSessionRun | None = None,
+        active_run: ActiveSessionRun[_SessionUsageTracker] | None = None,
     ) -> AsyncIterator[Event]:
         limit_payload = _limit_reached_payload(
             decision=decision,
@@ -9866,7 +9821,7 @@ class CayuApp:
         max_steps: int,
         run_started_at: float,
         turn_usage_tracker: _SessionUsageTracker,
-        active_run: _ActiveSessionRun | None,
+        active_run: ActiveSessionRun[_SessionUsageTracker] | None,
     ) -> AsyncIterator[Event]:
         usage_summary = session_usage_summary(
             session.id,
@@ -9909,7 +9864,7 @@ class CayuApp:
         messages: list[Message],
         run_started_at: float | None = None,
         turn_usage_tracker: _SessionUsageTracker | None = None,
-        active_run: _ActiveSessionRun | None = None,
+        active_run: ActiveSessionRun[_SessionUsageTracker] | None = None,
     ) -> AsyncIterator[Event]:
         payload = budget_reservation_payload(result)
         yield await self._event_writer.emit(
@@ -9960,7 +9915,7 @@ class CayuApp:
         tool_round_id: str | None = None,
         run_started_at: float | None = None,
         turn_usage_tracker: _SessionUsageTracker | None = None,
-        active_run: _ActiveSessionRun | None = None,
+        active_run: ActiveSessionRun[_SessionUsageTracker] | None = None,
     ) -> AsyncIterator[Event]:
         payload = _budget_limit_reached_payload(check)
         yield await self._event_writer.emit(
@@ -10594,8 +10549,8 @@ class CayuApp:
                 timeout_seconds=self._tool_timeout_seconds,
             )
         except asyncio.CancelledError:
-            if proxy_authorizations and await self._session_interrupt_requested(session.id):
-                _clear_current_task_cancellation()
+            if proxy_authorizations and await self._session_control.interrupt_requested(session.id):
+                clear_current_task_cancellation()
                 redactor = _redactor_with_resolved_secrets(
                     self._secret_redactor,
                     resolved_proxy_secrets,
@@ -10637,8 +10592,8 @@ class CayuApp:
         # completion the operator raced to prevent.
         current_task = asyncio.current_task()
         tool_swallowed_cancellation = current_task is not None and current_task.cancelling() > 0
-        if tool_swallowed_cancellation and await self._session_is_interrupting(session.id):
-            raise _SessionInterruptedByRequest(session.id)
+        if tool_swallowed_cancellation and await self._session_control.is_interrupting(session.id):
+            raise SessionInterruptedByRequest(session.id)
         policy_denial = tool_context._policy_denial_for(registered_tool.tool)
         if policy_denial is not None:
             # Nested policy refusals are authority outcomes, not failed executions. Their trusted
@@ -10716,8 +10671,8 @@ class CayuApp:
         # before the interrupt propagates. Otherwise round-close records the
         # call as interrupted and recovery reports the outcome as unknown,
         # inviting an unsafe retry.
-        if await self._session_is_interrupting(session.id):
-            raise _SessionInterruptedByRequest(session.id)
+        if await self._session_control.is_interrupting(session.id):
+            raise SessionInterruptedByRequest(session.id)
 
     async def _emit_mcp_manifest_checks(
         self,
@@ -11479,7 +11434,7 @@ class CayuApp:
         actions: list[IncompleteSessionRecoveryAction] = []
         events: list[Event] = []
 
-        if self._has_active_session_tasks(session.id):
+        if self._session_control.has_active_tasks(session.id):
             return IncompleteSessionRecoveryResult(
                 session_id=session.id,
                 previous_status=previous_status,
@@ -11701,7 +11656,7 @@ class CayuApp:
         environment_name: str | None,
         run_started_at: float | None = None,
         turn_usage_tracker: _SessionUsageTracker | None = None,
-        active_run: _ActiveSessionRun | None = None,
+        active_run: ActiveSessionRun[_SessionUsageTracker] | None = None,
     ) -> None:
         """Finalize a session whose event-stream consumer went away mid-run.
 
@@ -11810,13 +11765,13 @@ class CayuApp:
         environment_name: str | None,
         run_started_at: float | None = None,
         turn_usage_tracker: _SessionUsageTracker | None = None,
-        active_run: _ActiveSessionRun | None = None,
+        active_run: ActiveSessionRun[_SessionUsageTracker] | None = None,
     ) -> AsyncIterator[Event]:
-        _clear_current_task_cancellation()
+        clear_current_task_cancellation()
         current_task = asyncio.current_task()
         if current_task is not None:
-            self._unregister_active_session_task(session.id, current_task)
-        self._sessions_emitting_interrupted.add(session.id)
+            self._session_control.unregister_active_task(session.id, current_task)
+        self._session_control.begin_emitting_interrupted(session.id)
         try:
             loaded_interrupted = await self.session_store.load(session.id)
             if loaded_interrupted is None:
@@ -11827,8 +11782,8 @@ class CayuApp:
                     SessionStatus.INTERRUPTED,
                 )
             payload = await self._load_pending_session_interrupt_payload(session.id, default={})
-            interruption_request_id = _interruption_request_id_from_payload(payload)
-            existing_interrupt_event = await self._wait_for_session_interrupted_event(
+            interruption_request_id = interruption_request_id_from_payload(payload)
+            existing_interrupt_event = await self._session_control.wait_for_interrupted_event(
                 session.id,
                 interruption_request_id=interruption_request_id,
             )
@@ -11843,7 +11798,7 @@ class CayuApp:
                 turn_completed_event = (
                     active_run.turn_completed_event
                     if active_run is not None and active_run.turn_completed_event is not None
-                    else self._active_turn_completed_event(session.id)
+                    else self._session_control.active_turn_completed_event(session.id)
                 )
                 if turn_completed_event is not None:
                     yield turn_completed_event
@@ -11892,7 +11847,7 @@ class CayuApp:
             async for event in terminal_event_stream:
                 yield event
         finally:
-            self._sessions_emitting_interrupted.discard(session.id)
+            self._session_control.end_emitting_interrupted(session.id)
 
     async def _close_interrupted_tool_round(
         self,
@@ -11909,7 +11864,9 @@ class CayuApp:
     ) -> AsyncIterator[Event]:
         if await self._tool_round_has_result_messages(session.id, tool_calls):
             return
-        terminal_event_exists = await self._latest_session_interrupted_event(session.id) is not None
+        terminal_event_exists = (
+            await self._session_control.latest_interrupted_event(session.id) is not None
+        )
         interrupted_results = _interrupted_tool_round_results(
             tool_calls=tool_calls,
             completed_outcomes=tool_outcomes,
@@ -12202,176 +12159,6 @@ class CayuApp:
                 return False
         return False
 
-    async def _raise_if_session_interrupted(self, session_id: str) -> None:
-        session = await self.session_store.load(session_id)
-        if session is None:
-            raise KeyError(f"Session not found: {session_id}")
-        if session.status in _INTERRUPT_REQUESTED_SESSION_STATUSES:
-            raise _SessionInterruptedByRequest(session_id)
-
-    async def _session_interrupt_requested(self, session_id: str) -> bool:
-        session = await self.session_store.load(session_id)
-        if session is None:
-            raise KeyError(f"Session not found: {session_id}")
-        return session.status in _INTERRUPT_REQUESTED_SESSION_STATUSES
-
-    async def _session_is_interrupting(self, session_id: str) -> bool:
-        session = await self.session_store.load(session_id)
-        if session is None:
-            raise KeyError(f"Session not found: {session_id}")
-        return session.status == SessionStatus.INTERRUPTING
-
-    def _signal_session_interrupt(self, session_id: str) -> None:
-        """Set the in-process interrupt signal for a session.
-
-        Only set after the interrupt request has been persisted to the session
-        store, so the signal never claims an interrupt the store does not
-        know about. The signal is a latency hint: throttled stream polling
-        bypasses its store-poll interval when the signal is set.
-        """
-        self._session_interrupt_signals.setdefault(session_id, asyncio.Event()).set()
-
-    def _session_interrupt_signalled(self, session_id: str) -> bool:
-        signal = self._session_interrupt_signals.get(session_id)
-        return signal is not None and signal.is_set()
-
-    def _discard_session_interrupt_signal(self, session_id: str) -> None:
-        self._session_interrupt_signals.pop(session_id, None)
-
-    async def _latest_session_interrupted_event(
-        self,
-        session_id: str,
-        *,
-        interruption_request_id: str | None = None,
-    ) -> Event | None:
-        records = await self.session_store.query_events(
-            EventQuery(
-                session_id=session_id,
-                event_type=EventType.SESSION_INTERRUPTED,
-                order_by=EventOrder.SEQUENCE_DESC,
-                limit=1,
-            )
-        )
-        if records:
-            event = records[0].event
-            if (
-                interruption_request_id is None
-                or _interruption_request_id_from_payload(event.payload) == interruption_request_id
-            ):
-                return event.model_copy(deep=True)
-        if await self.session_store.load(session_id) is None:
-            raise KeyError(f"Session not found: {session_id}")
-        return None
-
-    async def _wait_for_session_interrupted_event(
-        self,
-        session_id: str,
-        *,
-        interruption_request_id: str | None = None,
-    ) -> Event | None:
-        for attempt in range(_INTERRUPTED_EVENT_WAIT_ATTEMPTS):
-            existing_event = await self._latest_session_interrupted_event(
-                session_id,
-                interruption_request_id=interruption_request_id,
-            )
-            if existing_event is not None:
-                return existing_event
-
-            session = await self.session_store.load(session_id)
-            if session is None:
-                raise KeyError(f"Session not found: {session_id}")
-            if session.status != SessionStatus.INTERRUPTED:
-                return None
-            if attempt < _INTERRUPTED_EVENT_WAIT_ATTEMPTS - 1:
-                await asyncio.sleep(_INTERRUPTED_EVENT_WAIT_INTERVAL_S)
-
-        return None
-
-    async def _wait_for_active_session_interrupted_event(
-        self,
-        session_id: str,
-        *,
-        interruption_request_id: str | None = None,
-    ) -> Event | None:
-        for attempt in range(_ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS):
-            existing_event = await self._latest_session_interrupted_event(
-                session_id,
-                interruption_request_id=interruption_request_id,
-            )
-            if existing_event is not None:
-                return existing_event
-            if (
-                not self._has_active_session_tasks(session_id)
-                and not self._is_session_emitting_interrupted(session_id)
-                and not self._is_session_interruption_request_active(session_id)
-            ):
-                return None
-            if attempt < _ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS - 1:
-                await asyncio.sleep(_ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S)
-        return None
-
-    def _register_active_session_task(
-        self,
-        session_id: str,
-        task: asyncio.Task[Any],
-        *,
-        task_id: str | None,
-        task_started: bool,
-        task_finished: bool,
-        turn_registered_agent: runtime_records.RegisteredAgentState | None = None,
-        turn_environment_name: str | None = None,
-        turn_started_at: float | None = None,
-        turn_usage_tracker: _SessionUsageTracker | None = None,
-    ) -> _ActiveSessionRun:
-        session_id = require_clean_nonblank(session_id, "session_id")
-        active_run = _ActiveSessionRun(
-            runtime_task=task,
-            task_id=task_id,
-            task_started=task_started,
-            task_finished=task_finished,
-            turn_registered_agent=turn_registered_agent,
-            turn_environment_name=turn_environment_name,
-            turn_started_at=turn_started_at,
-            turn_usage_tracker=turn_usage_tracker,
-        )
-        self._active_session_runs.setdefault(session_id, {})[task] = active_run
-        return active_run
-
-    def _unregister_active_session_task(
-        self,
-        session_id: str,
-        task: asyncio.Task[Any],
-    ) -> None:
-        active_runs = self._active_session_runs.get(session_id)
-        if active_runs is None:
-            return
-        active_runs.pop(task, None)
-        if not active_runs:
-            self._active_session_runs.pop(session_id, None)
-
-    def _has_active_session_tasks(self, session_id: str) -> bool:
-        return any(
-            not active_run.runtime_task.done()
-            for active_run in self._active_session_run_records(session_id)
-        )
-
-    def _is_session_emitting_interrupted(self, session_id: str) -> bool:
-        return session_id in self._sessions_emitting_interrupted
-
-    def _is_session_interruption_request_active(self, session_id: str) -> bool:
-        return session_id in self._sessions_requesting_interruption
-
-    def _interrupt_active_session_runs(self, session_id: str) -> bool:
-        current_task = asyncio.current_task()
-        signalled = False
-        for active_run in self._active_session_run_records(session_id):
-            task = active_run.runtime_task
-            if task is current_task or task.done():
-                continue
-            task.cancel()
-            signalled = True
-        return signalled
-
     async def _interrupt_background_subagent_children(
         self,
         *,
@@ -12386,39 +12173,6 @@ class CayuApp:
             create_if_missing=create_if_missing,
             retry_request=retry_request,
         )
-
-    def _active_session_run_records(self, session_id: str) -> tuple[_ActiveSessionRun, ...]:
-        return tuple(self._active_session_runs.get(session_id, {}).values())
-
-    async def _stream_with_out_of_band_session_events(
-        self,
-        session_id: str,
-        stream: AsyncIterator[Event],
-    ) -> AsyncIterator[Event]:
-        try:
-            async for event in stream:
-                yield event
-                async for queued_event in self._drain_out_of_band_session_events(session_id):
-                    yield queued_event
-            async for queued_event in self._drain_out_of_band_session_events(session_id):
-                yield queued_event
-        except GeneratorExit:
-            await _close_async_iterator(stream)
-            raise
-
-    async def _drain_out_of_band_session_events(
-        self,
-        session_id: str,
-    ) -> AsyncIterator[Event]:
-        for active_run in self._active_session_run_records(session_id):
-            while not active_run.out_of_band_events.empty():
-                yield active_run.out_of_band_events.get_nowait()
-
-    def _queue_out_of_band_session_event(self, event: Event) -> None:
-        for active_run in self._active_session_run_records(event.session_id):
-            if active_run.runtime_task.done():
-                continue
-            active_run.out_of_band_events.put_nowait(copy_event(event))
 
     def scoped_event_emitter(
         self,
@@ -12459,7 +12213,7 @@ class CayuApp:
         if not isinstance(event, Event):
             raise TypeError("emit_event requires an Event instance.")
         emitted = await self._event_writer.emit(event)
-        self._queue_out_of_band_session_event(emitted)
+        self._session_control.queue_out_of_band_event(emitted)
         return emitted
 
     async def _emit_environment_factory_started(
@@ -15135,14 +14889,6 @@ def _before_stop_policy_event(
     )
 
 
-def _clear_current_task_cancellation() -> None:
-    current_task = asyncio.current_task()
-    if current_task is None:
-        return
-    while current_task.cancelling():
-        current_task.uncancel()
-
-
 def _checkpoint_with_pending_session_interrupt(
     payload: dict[str, Any],
     *,
@@ -15179,15 +14925,6 @@ def _checkpoint_with_pending_session_interrupt(
         return copied_checkpoint
 
     return transform
-
-
-def _interruption_request_id_from_payload(payload: dict[str, Any]) -> str | None:
-    request_id = payload.get("interruption_request_id")
-    if request_id is None:
-        return None
-    if type(request_id) is not str or not request_id.strip():
-        raise ValueError("Interruption request ID must be a non-blank string.")
-    return request_id
 
 
 def _replace_checkpoint_preserving_runtime_state(

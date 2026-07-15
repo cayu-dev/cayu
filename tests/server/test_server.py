@@ -5404,7 +5404,7 @@ def test_run_accepts_and_detaches_before_environment_factory_finishes() -> None:
         state = await app.session_store.load_state(session_id)
         assert state is not None
         assert state.status is SessionStatus.RUNNING
-        active_runs = app._active_session_run_records(session_id)
+        active_runs = app._session_control.active_runs(session_id)
         assert len(active_runs) == 1
         assert active_runs[0].runtime_task is not request_task
         assert not active_runs[0].runtime_task.done()
@@ -5468,7 +5468,7 @@ def test_interrupt_after_run_acceptance_cancels_detached_provider() -> None:
         await asyncio.wait_for(provider.started.wait(), timeout=1)
         messages = await asyncio.wait_for(request_task, timeout=1)
 
-        active_runs = app._active_session_run_records(session_id)
+        active_runs = app._session_control.active_runs(session_id)
         assert len(active_runs) == 1
         assert active_runs[0].runtime_task is not request_task
         assert not active_runs[0].runtime_task.done()
@@ -5508,7 +5508,7 @@ def test_interrupt_after_acceptance_before_observer_start_reaches_runtime() -> N
             cayu_app=app,
             session_id=session_id,
         )
-        active_runs = app._active_session_run_records(session_id)
+        active_runs = app._session_control.active_runs(session_id)
         assert len(active_runs) == 1
         assert not active_runs[0].runtime_task.done()
 
@@ -5789,7 +5789,7 @@ def test_request_cancellation_during_acceptance_does_not_cancel_detached_run() -
 
         release_callback.set()
         await asyncio.wait_for(provider.started.wait(), timeout=1)
-        active_runs = app._active_session_run_records(session_id)
+        active_runs = app._session_control.active_runs(session_id)
         assert len(active_runs) == 1
         assert not active_runs[0].runtime_task.done()
 
@@ -5804,7 +5804,7 @@ def test_request_cancellation_during_acceptance_does_not_cancel_detached_run() -
             await asyncio.sleep(0.01)
 
         records = await app.session_store.query_events(EventQuery(session_id=session_id, limit=100))
-        assert app._active_session_run_records(session_id) == ()
+        assert app._session_control.active_runs(session_id) == ()
         return state.status, [record.event.type for record in records]
 
     status, event_types = asyncio.run(exercise())

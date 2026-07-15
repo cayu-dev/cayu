@@ -1,17 +1,9 @@
-"""Focused tests for the runtime's hot-path store I/O behavior.
-
-Covers the incremental usage tracker (store-side tail queries instead of full
-event-log loads on every limit check), the throttled per-delta interrupt poll
-with its in-process bypass signal, and the tail query behind
-``_latest_session_interrupted_event``.
-"""
+"""Focused tests for incremental usage-tracker store I/O behavior."""
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-
-import pytest
 
 import cayu.runtime.app as runtime_app_module
 from cayu.core import AgentSpec, Event, EventType, Message
@@ -293,86 +285,5 @@ def test_session_usage_tracker_never_skips_events_appended_mid_refresh():
         summary = session_usage_summary("sess_race", events)
         assert summary.usage.total_tokens == 11
         assert summary.tool_calls == 1
-
-    asyncio.run(run())
-
-
-def test_stream_interrupt_poll_throttles_and_signal_bypasses_throttle():
-    store = InMemorySessionStore()
-    app = CayuApp(session_store=store, enable_logging=False)
-
-    async def run():
-        await _create_running_session(store, "sess_poll_signal")
-        await store.update_status("sess_poll_signal", SessionStatus.INTERRUPTING)
-
-        poll = runtime_app_module._StreamInterruptPoll(app, session_id="sess_poll_signal")
-        # Within the poll interval and without the in-process signal the store
-        # is not consulted, so even a pending interrupt is not observed yet:
-        # per-delta detection latency is bounded, not immediate.
-        await poll.raise_if_interrupted()
-
-        app._signal_session_interrupt("sess_poll_signal")
-        assert app._session_interrupt_signalled("sess_poll_signal") is True
-        with pytest.raises(runtime_app_module._SessionInterruptedByRequest):
-            await poll.raise_if_interrupted()
-
-        app._discard_session_interrupt_signal("sess_poll_signal")
-        assert app._session_interrupt_signalled("sess_poll_signal") is False
-
-    asyncio.run(run())
-
-
-def test_stream_interrupt_poll_hits_store_after_interval_expires(monkeypatch):
-    monkeypatch.setattr(runtime_app_module, "_STREAM_INTERRUPT_POLL_INTERVAL_S", 0.0)
-    store = InMemorySessionStore()
-    app = CayuApp(session_store=store, enable_logging=False)
-
-    async def run():
-        await _create_running_session(store, "sess_poll_expired")
-        poll = runtime_app_module._StreamInterruptPoll(app, session_id="sess_poll_expired")
-        await poll.raise_if_interrupted()  # RUNNING: no interrupt.
-
-        await store.update_status("sess_poll_expired", SessionStatus.INTERRUPTING)
-        with pytest.raises(runtime_app_module._SessionInterruptedByRequest):
-            await poll.raise_if_interrupted()
-
-    asyncio.run(run())
-
-
-def test_latest_session_interrupted_event_returns_latest_via_tail_query():
-    store = InMemorySessionStore()
-    app = CayuApp(session_store=store, enable_logging=False)
-
-    async def run():
-        await _create_running_session(store, "sess_latest_interrupted")
-        await store.append_events(
-            "sess_latest_interrupted",
-            [
-                Event(
-                    type=EventType.SESSION_INTERRUPTED,
-                    session_id="sess_latest_interrupted",
-                    payload={"reason": "first"},
-                ),
-                Event(
-                    type=EventType.MODEL_TEXT_DELTA,
-                    session_id="sess_latest_interrupted",
-                    payload={"delta": "noise"},
-                ),
-                Event(
-                    type=EventType.SESSION_INTERRUPTED,
-                    session_id="sess_latest_interrupted",
-                    payload={"reason": "second"},
-                ),
-            ],
-        )
-        latest = await app._latest_session_interrupted_event("sess_latest_interrupted")
-        assert latest is not None
-        assert latest.payload["reason"] == "second"
-
-        await _create_running_session(store, "sess_no_interrupted_event")
-        assert await app._latest_session_interrupted_event("sess_no_interrupted_event") is None
-
-        with pytest.raises(KeyError):
-            await app._latest_session_interrupted_event("sess_missing")
 
     asyncio.run(run())

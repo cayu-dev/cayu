@@ -28,6 +28,7 @@ from cayu.runtime import (
     SessionStatus,
 )
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime._session_control import SessionInterruptedByRequest
 
 
 class _FakeProvider(ModelProvider):
@@ -232,7 +233,7 @@ def test_interrupt_guard_closes_tool_round_on_interrupt_request():
         events = [
             event
             async for event in guard.close_tool_round(
-                runtime_app_module._SessionInterruptedByRequest(session.id),
+                SessionInterruptedByRequest(session.id),
                 messages=messages,
                 tool_calls=[_tool_call()],
                 tool_outcomes=[],

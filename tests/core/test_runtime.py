@@ -14,6 +14,7 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
+import cayu.runtime._session_control as session_control_module
 import cayu.runtime.app as runtime_app_module
 from cayu.artifacts import (
     RESOLVED_FILE_ATTACHMENTS_OPTION,
@@ -11034,11 +11035,11 @@ def test_interrupting_parent_interrupts_running_background_subagents(
     monkeypatch,
     delay_parent_finalization,
 ):
-    active_wait_attempts = runtime_app_module._ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS
-    active_wait_interval_s = runtime_app_module._ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S
+    active_wait_attempts = session_control_module.ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS
+    active_wait_interval_s = session_control_module.ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S
     if delay_parent_finalization:
-        monkeypatch.setattr(runtime_app_module, "_ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS", 2)
-        monkeypatch.setattr(runtime_app_module, "_ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S", 0)
+        monkeypatch.setattr(session_control_module, "ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS", 2)
+        monkeypatch.setattr(session_control_module, "ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S", 0)
 
     class BackgroundInterruptProvider(ModelProvider):
         name = "fake"
@@ -11131,13 +11132,13 @@ def test_interrupting_parent_interrupts_running_background_subagents(
             ).sessions
             assert children_before_parent_release[0].status == SessionStatus.RUNNING
             monkeypatch.setattr(
-                runtime_app_module,
-                "_ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS",
+                session_control_module,
+                "ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS",
                 active_wait_attempts,
             )
             monkeypatch.setattr(
-                runtime_app_module,
-                "_ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S",
+                session_control_module,
+                "ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S",
                 active_wait_interval_s,
             )
             provider.release_parent_after_cancel.set()
@@ -19569,7 +19570,7 @@ def test_inactive_recovery_does_not_fence_local_active_work() -> None:
         await store.update_status("sess_active_recovery", SessionStatus.RUNNING)
         release = asyncio.Event()
         task = asyncio.create_task(release.wait())
-        app._register_active_session_task(
+        app._session_control.register_active_task(
             "sess_active_recovery",
             task,
             task_id=None,
@@ -19589,7 +19590,7 @@ def test_inactive_recovery_does_not_fence_local_active_work() -> None:
         finally:
             release.set()
             await task
-            app._unregister_active_session_task("sess_active_recovery", task)
+            app._session_control.unregister_active_task("sess_active_recovery", task)
 
     result, session, events = asyncio.run(setup_and_recover())
 
@@ -34186,8 +34187,8 @@ def test_interrupt_session_checkpoint_failure_does_not_transition_status():
 
 
 def test_interrupt_session_cleans_request_marker_when_caller_is_cancelled(monkeypatch):
-    monkeypatch.setattr(runtime_app_module, "_ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS", 100)
-    monkeypatch.setattr(runtime_app_module, "_ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S", 0.01)
+    monkeypatch.setattr(session_control_module, "ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS", 100)
+    monkeypatch.setattr(session_control_module, "ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S", 0.01)
 
     store = InMemorySessionStore()
     app = CayuApp(session_store=store)
@@ -34215,20 +34216,20 @@ def test_interrupt_session_cleans_request_marker_when_caller_is_cancelled(monkey
             )
         )
         for _ in range(100):
-            if app._is_session_interruption_request_active("sess_cancel_interrupt_request"):
+            if app._session_control.is_interruption_request_active("sess_cancel_interrupt_request"):
                 break
             await asyncio.sleep(0.01)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        return app._is_session_interruption_request_active("sess_cancel_interrupt_request")
+        return app._session_control.is_interruption_request_active("sess_cancel_interrupt_request")
 
     assert asyncio.run(run()) is False
 
 
 def test_interrupt_session_returns_terminal_event_when_provider_delays_cancellation(monkeypatch):
-    monkeypatch.setattr(runtime_app_module, "_ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS", 2)
-    monkeypatch.setattr(runtime_app_module, "_ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S", 0)
+    monkeypatch.setattr(session_control_module, "ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS", 2)
+    monkeypatch.setattr(session_control_module, "ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S", 0)
 
     class DelayedInterruptionProvider(ModelProvider):
         name = "fake"
@@ -34320,8 +34321,8 @@ def test_interrupt_session_returns_terminal_event_when_provider_delays_cancellat
 
 
 def test_interrupt_session_does_not_finalize_unowned_running_session(monkeypatch):
-    monkeypatch.setattr(runtime_app_module, "_ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS", 2)
-    monkeypatch.setattr(runtime_app_module, "_ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S", 0)
+    monkeypatch.setattr(session_control_module, "ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS", 2)
+    monkeypatch.setattr(session_control_module, "ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S", 0)
 
     store = InMemorySessionStore()
     app = CayuApp(session_store=store)
@@ -34362,8 +34363,8 @@ def test_interrupt_session_does_not_finalize_unowned_running_session(monkeypatch
 
 
 def test_interrupt_session_transition_loser_reports_finalizing(monkeypatch):
-    monkeypatch.setattr(runtime_app_module, "_ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS", 2)
-    monkeypatch.setattr(runtime_app_module, "_ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S", 0)
+    monkeypatch.setattr(session_control_module, "ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS", 2)
+    monkeypatch.setattr(session_control_module, "ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S", 0)
 
     class LosingTransitionStore(InMemorySessionStore):
         async def transition_status_and_checkpoint(
@@ -35032,8 +35033,8 @@ def test_cancelled_runner_cleanup_diagnostics_are_attached_only_to_active_tool()
 
 
 def test_interrupt_session_suppresses_late_tool_events_while_finalizing(monkeypatch):
-    monkeypatch.setattr(runtime_app_module, "_ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS", 2)
-    monkeypatch.setattr(runtime_app_module, "_ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S", 0)
+    monkeypatch.setattr(session_control_module, "ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS", 2)
+    monkeypatch.setattr(session_control_module, "ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S", 0)
 
     class DelayedInterruptionTool(Tool):
         spec = ToolSpec(
