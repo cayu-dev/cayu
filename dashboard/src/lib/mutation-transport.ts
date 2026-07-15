@@ -384,6 +384,7 @@ export class MutationTransportController {
   private unsubscribeVisibility: (() => void) | null = null
   private visibilityWaiters = new Set<() => void>()
   private startPromise: Promise<MutationTransportSnapshot> | null = null
+  private activeObservationPromise: Promise<MutationTransportSnapshot> | null = null
 
   constructor(options: MutationTransportOptions) {
     validateRequest(options.request)
@@ -417,22 +418,52 @@ export class MutationTransportController {
     if (this.startPromise !== null) return this.startPromise
     if (this.started) throw new Error("Mutation transport cannot be restarted.")
     this.started = true
+    this.startPromise = this.beginObservation(signal)
+    return this.startPromise
+  }
+
+  reobserve(signal?: AbortSignal): Promise<MutationTransportSnapshot> {
+    if (!this.started) {
+      throw new Error("Mutation transport must be started before it can be re-observed.")
+    }
+    if (this.activeObservationPromise !== null) return this.activeObservationPromise
+    if (this.phase !== "transport_failed" || this.disposed) {
+      throw new Error("Only an incomplete mutation observation can be retried.")
+    }
+
+    // Preserve the original mutation id, durable baseline, accumulated events,
+    // confirmed operation epoch, and latest replay marker. Only the bounded
+    // connection/reconciliation episode is restarted, so re-observation can
+    // never submit the original mutation as a new operation.
+    this.reconnectAttempt = 0
+    this.recoveryStartedAt = null
+    this.recovering = true
+    this.failure = null
+    this.transition("reconnecting")
+    return this.beginObservation(signal)
+  }
+
+  private beginObservation(signal?: AbortSignal): Promise<MutationTransportSnapshot> {
+    if (this.activeObservationPromise !== null) return this.activeObservationPromise
     if (signal?.aborted) {
       this.disposed = true
       this.phase = "cancelled"
       this.emit()
-      this.startPromise = Promise.resolve(this.snapshot())
-      return this.startPromise
+      return Promise.resolve(this.snapshot())
     }
     const abort = () => this.dispose()
     signal?.addEventListener("abort", abort, { once: true })
     this.unsubscribeVisibility = this.visibility.subscribe(() => this.visibilityChanged())
-    this.startPromise = this.run().finally(() => {
+    const observation = this.run().finally(() => {
       signal?.removeEventListener("abort", abort)
       this.unsubscribeVisibility?.()
       this.unsubscribeVisibility = null
+      if (this.activeObservationPromise === observation) {
+        this.activeObservationPromise = null
+      }
     })
-    return this.startPromise
+    this.activeObservationPromise = observation
+    return observation
   }
 
   dispose(): void {

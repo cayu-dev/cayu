@@ -840,6 +840,68 @@ test("an unconfirmed initial mutation fails after bounded replay-only probes", a
   assert.equal(reads, 4)
 })
 
+test("a failed observation can resume from the same mutation and durable replay marker", async () => {
+  const attemptRequests = []
+  let recovered = false
+  const durableRecords = [
+    record(2, "event-resumed", "session.resumed"),
+    acceptanceRecord(3, "event-accepted", "event-resumed"),
+    record(4, "event-terminal", "session.completed"),
+  ]
+  const controller = transportController({
+    request: request(),
+    policy: { fallbackMaxConsecutiveFailures: 2 },
+    io: immediateIo({
+      async attempt(attemptRequest, callbacks) {
+        attemptRequests.push(attemptRequest)
+        callbacks.onAccepted()
+        if (!recovered) {
+          return { kind: "observer_failed", accepted: true, error: observerError(false) }
+        }
+        callbacks.onEvent(event("event-resumed", "session.resumed"), `${SESSION_ID}:event-resumed`)
+        callbacks.onEvent(
+          acceptanceEvent("event-accepted", "event-resumed"),
+          `${SESSION_ID}:event-accepted`,
+        )
+        callbacks.onEvent(
+          event("event-terminal", "session.completed"),
+          `${SESSION_ID}:event-terminal`,
+        )
+        return { kind: "closed", accepted: true }
+      },
+      async readEvents(_sessionId, afterSequence) {
+        return recovered
+          ? eventsPage(
+              durableRecords.filter((item) => item.sequence > afterSequence),
+              { scanThrough: 4 },
+            )
+          : eventsPage([], { scanThrough: 1 })
+      },
+      async readState() {
+        return state("completed")
+      },
+    }),
+  })
+
+  const incomplete = await controller.start()
+  assert.equal(incomplete.phase, "transport_failed")
+  assert.equal(attemptRequests.length, 1)
+  assert.equal(attemptRequests[0].lastEventId, null)
+
+  recovered = true
+  const complete = await controller.reobserve()
+
+  assert.equal(complete.phase, "terminal")
+  assert.equal(attemptRequests.length, 2)
+  assert.equal(attemptRequests[1].mutationId, MUTATION_ID)
+  assert.equal(attemptRequests[1].lastEventId, incomplete.replayMarker)
+  assert.ok(attemptRequests.slice(1).every((item) => item.lastEventId !== null))
+  assert.deepEqual(
+    complete.events.map((item) => item.id),
+    ["event-resumed", "event-accepted", "event-terminal"],
+  )
+})
+
 test("a hung initial connection is aborted and reconciled without repeating the mutation", async () => {
   const timers = controlledWatchdogs()
   let attempts = 0

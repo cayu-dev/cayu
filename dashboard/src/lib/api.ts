@@ -1,4 +1,4 @@
-import { apiUrl } from "./config"
+import { apiUrl } from "./config.ts"
 import type {
   AgentsResponse,
   ApiAgentSummary,
@@ -44,16 +44,13 @@ import type {
   RejectKnowledgeApiKnowledgeEntryIdRejectPostResponse,
   ResumeTaskApiTasksTaskIdResumePostResponse,
   SessionsSummaryBody,
-  SseErrorEnvelope,
   SseEventEnvelope,
   TaskHoldBody,
-  ToolApprovalBody,
   ToolApprovalDecision,
   ToolApprovalRecoveryBody,
   ToolApprovalRecoveryOutcome,
   ToolRoundRecoveryBody,
   UserInputRecoveryBody,
-  UserInputResolveBody,
 } from "./generated/server-api"
 
 export const SUPPORTED_SERVER_CONTRACT_VERSION = "1"
@@ -187,7 +184,7 @@ function postJson<T>(path: string, body?: unknown): Promise<T> {
   })
 }
 
-async function throwResponseError(response: Response): Promise<never> {
+export async function throwResponseError(response: Response): Promise<never> {
   const prefix = `Request failed with HTTP ${response.status}`
   const contentType = response.headers.get("content-type") || ""
   if (contentType.includes("application/json")) {
@@ -201,22 +198,6 @@ async function throwResponseError(response: Response): Promise<never> {
     }
   }
   throw new ApiClientError(prefix, response.status)
-}
-
-function parseSseEvent(raw: string): SSEEvent {
-  const event = JSON.parse(raw) as SSEEvent
-  if (typeof event.id !== "string" || typeof event.type !== "string") {
-    throw new Error("Malformed SSE event from CAYU server.")
-  }
-  return event
-}
-
-function parseSseError(raw: string): SseErrorEnvelope {
-  const event = JSON.parse(raw) as SseErrorEnvelope
-  if (event.type !== "stream.error" || typeof event.error !== "string") {
-    throw new Error("Malformed SSE error from CAYU server.")
-  }
-  return event
 }
 
 export function isSupportedServerContract(contract: ServerContract): boolean {
@@ -296,8 +277,8 @@ export async function fetchSession(id: string): Promise<SessionDetail> {
   return requestJson<SessionDetail>(`/sessions/${encodeURIComponent(id)}`)
 }
 
-export async function fetchSessionState(id: string): Promise<SessionState> {
-  return requestJson<SessionState>(`/sessions/${encodeURIComponent(id)}/state`)
+export async function fetchSessionState(id: string, signal?: AbortSignal): Promise<SessionState> {
+  return requestJson<SessionState>(`/sessions/${encodeURIComponent(id)}/state`, { signal })
 }
 
 export async function fetchSessionEvents(
@@ -395,122 +376,4 @@ export async function rejectKnowledge(entryId: string): Promise<KnowledgeEntry> 
   return postJson<RejectKnowledgeApiKnowledgeEntryIdRejectPostResponse>(
     `/knowledge/${encodeURIComponent(entryId)}/reject`,
   )
-}
-
-export async function streamRun(
-  prompt: string,
-  onEvent: (event: SSEEvent) => void,
-  onDone: () => void,
-  onError: (message: string) => void,
-) {
-  await streamJsonPost("/run", { prompt }, onEvent, onDone, onError)
-}
-
-export async function streamResume(
-  sessionId: string,
-  prompt: string,
-  onEvent: (event: SSEEvent) => void,
-  onDone: () => void,
-  onError: (message: string) => void,
-) {
-  await streamJsonPost("/resume", { session_id: sessionId, prompt }, onEvent, onDone, onError)
-}
-
-export async function streamInterruptSession(
-  sessionId: string,
-  body: SessionInterrupt,
-  onEvent: (event: SSEEvent) => void,
-  onDone: () => void,
-  onError: (message: string, error?: unknown) => void,
-) {
-  await streamJsonPost(
-    `/sessions/${encodeURIComponent(sessionId)}/interrupt`,
-    body,
-    onEvent,
-    onDone,
-    onError,
-  )
-}
-
-export async function streamResolveToolApproval(
-  body: ToolApprovalBody,
-  onEvent: (event: SSEEvent) => void,
-  onDone: () => void,
-  onError: (message: string) => void,
-) {
-  await streamJsonPost("/tool-approvals/resolve", body, onEvent, onDone, onError)
-}
-
-export async function streamRecoverToolApproval(
-  body: ToolApprovalRecoveryBody,
-  onEvent: (event: SSEEvent) => void,
-  onDone: () => void,
-  onError: (message: string) => void,
-) {
-  await streamJsonPost("/tool-approvals/recover", body, onEvent, onDone, onError)
-}
-
-export async function streamRecoverToolRound(
-  body: ToolRoundRecoveryBody,
-  onEvent: (event: SSEEvent) => void,
-  onDone: () => void,
-  onError: (message: string) => void,
-) {
-  await streamJsonPost("/tool-rounds/recover", body, onEvent, onDone, onError)
-}
-
-export async function streamResolveUserInput(
-  body: UserInputResolveBody,
-  onEvent: (event: SSEEvent) => void,
-  onDone: () => void,
-  onError: (message: string) => void,
-) {
-  await streamJsonPost("/user-input/resolve", body, onEvent, onDone, onError)
-}
-
-export async function streamRecoverUserInput(
-  body: UserInputRecoveryBody,
-  onEvent: (event: SSEEvent) => void,
-  onDone: () => void,
-  onError: (message: string) => void,
-) {
-  await streamJsonPost("/user-input/recover", body, onEvent, onDone, onError)
-}
-
-async function streamJsonPost(
-  path: string,
-  body: Record<string, unknown>,
-  onEvent: (event: SSEEvent) => void,
-  onDone: () => void,
-  onError: (message: string, error?: unknown) => void,
-) {
-  const { fetchEventSource } = await import("@microsoft/fetch-event-source")
-  try {
-    await fetchEventSource(apiUrl(path), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "same-origin",
-      body: JSON.stringify(body),
-      async onopen(response) {
-        if (!response.ok) {
-          await throwResponseError(response)
-        }
-      },
-      onmessage(msg) {
-        if (!msg.data) return
-        if (msg.event === "error") {
-          const error = parseSseError(msg.data)
-          throw new Error(error.error)
-        }
-        onEvent(parseSseEvent(msg.data))
-      },
-      onerror(error) {
-        throw error
-      },
-    })
-  } catch (error) {
-    onError(error instanceof Error ? error.message : String(error), error)
-  } finally {
-    onDone()
-  }
 }

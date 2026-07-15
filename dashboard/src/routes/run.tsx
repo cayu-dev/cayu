@@ -1,11 +1,23 @@
 import { useNavigate } from "@tanstack/react-router"
-import { AlertCircle, Bot, CheckCircle, Play, ShieldCheck, UserRound, Wrench } from "lucide-react"
+import {
+  AlertCircle,
+  Bot,
+  Check,
+  CheckCircle,
+  Copy,
+  Play,
+  ShieldCheck,
+  UserRound,
+  Wrench,
+} from "lucide-react"
 import { useEffect, useRef, useState } from "react"
 import { DataCard, Page, PageHeader } from "../components/dashboard/layout"
+import { MutationTransportStatus } from "../components/dashboard/mutation-transport-status"
 import { Button } from "../components/ui/button"
 import { Textarea } from "../components/ui/textarea"
-import { type SSEEvent, streamRun } from "../lib/api"
+import type { SSEEvent } from "../lib/api"
 import { formatCount, modelUsagePayload, numericValue } from "../lib/format"
+import type { MutationTransportSnapshot } from "../lib/mutation-transport.ts"
 
 function LiveEvent({ event }: { event: SSEEvent }) {
   const icons: Record<string, React.ReactNode> = {
@@ -87,12 +99,24 @@ export function RunPage() {
   const navigate = useNavigate()
   const [prompt, setPrompt] = useState("")
   const [running, setRunning] = useState(false)
-  const [events, setEvents] = useState<SSEEvent[]>([])
-  const [textOutput, setTextOutput] = useState("")
+  const [transport, setTransport] = useState<MutationTransportSnapshot | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [copiedSessionReference, setCopiedSessionReference] = useState<string | null>(null)
+  const [sessionReferenceError, setSessionReferenceError] = useState<string | null>(null)
+  const runAbortRef = useRef<AbortController | null>(null)
   const eventsEndRef = useRef<HTMLDivElement>(null)
   const outputEndRef = useRef<HTMLDivElement>(null)
+  const events = transport?.events ?? []
+  const textOutput = transport?.liveText ?? ""
   const visibleEventCount = events.filter((event) => event.type !== "model.text.delta").length
+
+  useEffect(
+    () => () => {
+      runAbortRef.current?.abort()
+      runAbortRef.current = null
+    },
+    [],
+  )
 
   useEffect(() => {
     if (visibleEventCount > 0) {
@@ -108,26 +132,67 @@ export function RunPage() {
 
   const handleRun = async () => {
     if (!prompt.trim()) return
+    runAbortRef.current?.abort()
+    const controller = new AbortController()
+    runAbortRef.current = controller
     setRunning(true)
-    setEvents([])
-    setTextOutput("")
+    setTransport(null)
     setError(null)
+    setCopiedSessionReference(null)
+    setSessionReferenceError(null)
 
-    await streamRun(
-      prompt,
-      (event) => {
-        setEvents((prev) => [...prev, event])
-        if (event.type === "model.text.delta") {
-          setTextOutput((prev) => prev + String(event.payload.delta || ""))
-        }
-      },
-      () => setRunning(false),
-      setError,
-    )
+    try {
+      const { executeRunMutation } = await import("../lib/mutation-browser")
+      if (controller.signal.aborted || runAbortRef.current !== controller) return
+      const snapshot = await executeRunMutation(
+        { prompt: prompt.trim() },
+        {
+          signal: controller.signal,
+          onChange: (next) => {
+            if (!controller.signal.aborted && runAbortRef.current === controller) {
+              setTransport(next)
+            }
+          },
+        },
+      )
+      if (!controller.signal.aborted && runAbortRef.current === controller) {
+        setTransport(snapshot)
+      }
+    } catch (runError) {
+      if (!controller.signal.aborted && runAbortRef.current === controller) {
+        setError(runError instanceof Error ? runError.message : "Failed to start the run.")
+      }
+    } finally {
+      if (runAbortRef.current === controller) {
+        runAbortRef.current = null
+        if (!controller.signal.aborted) setRunning(false)
+      }
+    }
   }
 
-  const lastSessionId = events.at(-1)?.session_id ?? null
+  const lastSessionId =
+    !running && transport?.phase !== "request_failed"
+      ? (transport?.sessionId ?? events.at(-1)?.session_id ?? null)
+      : null
   const attentionMessage = runAttention(events)
+  const sessionReferenceCopied = lastSessionId !== null && copiedSessionReference === lastSessionId
+
+  const handleCopySessionReference = async () => {
+    if (lastSessionId === null) return
+    try {
+      if (!navigator.clipboard?.writeText) {
+        throw new Error("Clipboard access is unavailable in this browser context.")
+      }
+      await navigator.clipboard.writeText(lastSessionId)
+      setCopiedSessionReference(lastSessionId)
+      setSessionReferenceError(null)
+    } catch (copyError) {
+      setCopiedSessionReference(null)
+      setSessionReferenceError(
+        copyError instanceof Error ? copyError.message : "Failed to copy the session reference.",
+      )
+    }
+  }
 
   return (
     <Page>
@@ -143,6 +208,47 @@ export function RunPage() {
           className="resize-none"
         />
         {error && <p className="text-sm text-destructive">{error}</p>}
+        <MutationTransportStatus snapshot={transport} />
+        {lastSessionId && (
+          <div className="flex flex-col gap-3 rounded-md border border-border bg-muted/20 p-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="min-w-0">
+              <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                Session reference
+              </div>
+              <code
+                className="block truncate text-sm"
+                data-testid="run-session-reference"
+                title={lastSessionId}
+              >
+                {lastSessionId}
+              </code>
+            </div>
+            <div className="flex shrink-0 items-center gap-2">
+              <Button variant="outline" size="sm" onClick={handleCopySessionReference}>
+                {sessionReferenceCopied ? (
+                  <Check className="mr-1.5 h-3.5 w-3.5" />
+                ) : (
+                  <Copy className="mr-1.5 h-3.5 w-3.5" />
+                )}
+                {sessionReferenceCopied ? "Copied" : "Copy"}
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() =>
+                  navigate({ to: "/sessions/$sessionId", params: { sessionId: lastSessionId } })
+                }
+              >
+                View Session →
+              </Button>
+            </div>
+          </div>
+        )}
+        {sessionReferenceError && (
+          <p className="text-sm text-destructive" role="alert">
+            {sessionReferenceError}
+          </p>
+        )}
         <div className="flex items-center justify-end">
           <Button onClick={handleRun} disabled={running || !prompt.trim()}>
             <Play className="h-4 w-4 mr-2" />
@@ -153,25 +259,7 @@ export function RunPage() {
 
       {events.length > 0 && (
         <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">
-          <DataCard
-            title="Events"
-            className="min-h-[22rem]"
-            contentClassName="min-h-0 flex-1"
-            actions={
-              lastSessionId && !running ? (
-                <Button
-                  variant="link"
-                  size="sm"
-                  className="h-auto p-0 text-xs"
-                  onClick={() =>
-                    navigate({ to: "/sessions/$sessionId", params: { sessionId: lastSessionId } })
-                  }
-                >
-                  View Session →
-                </Button>
-              ) : null
-            }
-          >
+          <DataCard title="Events" className="min-h-[22rem]" contentClassName="min-h-0 flex-1">
             <div className="h-full overflow-auto px-4 py-2">
               {attentionMessage && (
                 <div className="my-2 rounded-md border border-chart-1/30 bg-chart-1/5 p-3 text-sm">

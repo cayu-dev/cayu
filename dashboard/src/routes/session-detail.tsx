@@ -25,6 +25,10 @@ import {
 } from "lucide-react"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Page, PayloadViewer, StateMessage } from "../components/dashboard/layout"
+import {
+  MutationTransportStatus,
+  mutationTransportErrorMessage,
+} from "../components/dashboard/mutation-transport-status"
 import { Badge } from "../components/ui/badge"
 import { Button, buttonVariants } from "../components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card"
@@ -55,14 +59,6 @@ import {
   type SessionEventsPage,
   type SessionSummary,
   type SessionTranscriptPage,
-  type SSEEvent,
-  streamInterruptSession,
-  streamRecoverToolApproval,
-  streamRecoverToolRound,
-  streamRecoverUserInput,
-  streamResolveToolApproval,
-  streamResolveUserInput,
-  streamResume,
 } from "../lib/api"
 import {
   formatBytes,
@@ -73,6 +69,11 @@ import {
   numericValue,
 } from "../lib/format"
 import { dashboardPath } from "../lib/links"
+import type { MutationExecutionOptions } from "../lib/mutation-browser"
+import type {
+  MutationTransportController,
+  MutationTransportSnapshot,
+} from "../lib/mutation-transport.ts"
 import {
   isFailureEventType,
   latestFailureEvent,
@@ -123,6 +124,9 @@ import {
   transcriptHistoryQuery,
 } from "../lib/session-history"
 import { cn } from "../lib/utils"
+
+type MutationBrowserModule = typeof import("../lib/mutation-browser")
+type SessionMutationKind = "interrupt" | "resume" | "cascade" | "pending_action"
 
 const INTERRUPTIBLE_SESSION_STATUSES = new Set(["pending", "running"])
 const ACTIVE_SESSION_STATUSES = new Set(["pending", "running", "interrupting"])
@@ -1108,7 +1112,9 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   const [cascadeRetryError, setCascadeRetryError] = useState<string | null>(null)
   const [resumePrompt, setResumePrompt] = useState("")
   const [resuming, setResuming] = useState(false)
-  const [liveEvents, setLiveEvents] = useState<SSEEvent[]>([])
+  const [mutationTransport, setMutationTransport] = useState<MutationTransportSnapshot | null>(null)
+  const [retryingMutationObservation, setRetryingMutationObservation] = useState(false)
+  const [mutationObservationError, setMutationObservationError] = useState<string | null>(null)
   const [resumeError, setResumeError] = useState<string | null>(null)
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null)
   const [resolvingAction, setResolvingAction] = useState(false)
@@ -1130,7 +1136,26 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
     transcriptFilterKey,
     null,
   )
-  const mutationActive = resuming || resolvingAction || retryingCascade
+  const mutationObserverAbortRef = useRef<AbortController | null>(null)
+  const mutationTransportControllerRef = useRef<MutationTransportController | null>(null)
+  const sessionMutationKindRef = useRef<SessionMutationKind | null>(null)
+  const mutationOutcomeUnknown = mutationTransport?.phase === "transport_failed"
+  const mutationCommandsLocked = mutationOutcomeUnknown || retryingMutationObservation
+  const interruptDismissesSubmittedRequest =
+    interruptError !== null &&
+    (mutationTransport?.phase === "runtime_failed" ||
+      mutationTransport?.phase === "transport_failed")
+  const mutationActive =
+    resuming ||
+    resolvingAction ||
+    retryingCascade ||
+    retryingMutationObservation ||
+    mutationTransport?.phase === "connecting" ||
+    mutationTransport?.phase === "streaming" ||
+    mutationTransport?.phase === "reconnecting" ||
+    mutationTransport?.phase === "polling_fallback" ||
+    mutationTransport?.phase === "paused"
+  const liveEvents = mutationTransport?.events ?? []
   const detailQuery = useQuery({
     queryKey: ["session", sessionId],
     queryFn: () => fetchSession(sessionId),
@@ -1779,6 +1804,13 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
       transcriptReconcileRunner.clearPending()
       eventReconcileAbortRef.current?.abort()
       transcriptReconcileAbortRef.current?.abort()
+      const mutationObserverAbort = mutationObserverAbortRef.current
+      const mutationTransportController = mutationTransportControllerRef.current
+      mutationObserverAbortRef.current = null
+      mutationTransportControllerRef.current = null
+      sessionMutationKindRef.current = null
+      mutationObserverAbort?.abort()
+      mutationTransportController?.dispose()
     },
     [eventReconcileRunner, transcriptReconcileRunner],
   )
@@ -1850,97 +1882,270 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
       queryClient.invalidateQueries({ queryKey: ["tasks"] }),
     ])
 
+  const observeSessionMutation = async (
+    kind: SessionMutationKind,
+    execute: (
+      browser: MutationBrowserModule,
+      options: MutationExecutionOptions,
+    ) => Promise<MutationTransportSnapshot>,
+  ): Promise<MutationTransportSnapshot | null> => {
+    if (
+      mutationObserverAbortRef.current !== null ||
+      mutationTransportControllerRef.current !== null
+    ) {
+      throw new Error(
+        "A previous session mutation is still being observed. Resolve its outcome before starting another mutation.",
+      )
+    }
+    const controller = new AbortController()
+    mutationObserverAbortRef.current = controller
+    sessionMutationKindRef.current = kind
+    setMutationTransport(null)
+    setMutationObservationError(null)
+    const observer = { transportController: null as MutationTransportController | null }
+    try {
+      const browser = await import("../lib/mutation-browser")
+      if (controller.signal.aborted || mutationObserverAbortRef.current !== controller) return null
+      const snapshot = await execute(browser, {
+        signal: controller.signal,
+        onController: (nextController) => {
+          observer.transportController = nextController
+          if (!controller.signal.aborted && mutationObserverAbortRef.current === controller) {
+            mutationTransportControllerRef.current = nextController
+          }
+        },
+        onChange: (next) => {
+          if (
+            !controller.signal.aborted &&
+            observer.transportController !== null &&
+            mutationTransportControllerRef.current === observer.transportController
+          ) {
+            setMutationTransport(next)
+          }
+        },
+      })
+      if (controller.signal.aborted || mutationObserverAbortRef.current !== controller) return null
+      setMutationTransport(snapshot)
+      if (
+        snapshot.phase !== "transport_failed" &&
+        mutationTransportControllerRef.current === observer.transportController
+      ) {
+        mutationTransportControllerRef.current = null
+        sessionMutationKindRef.current = null
+      }
+      return snapshot
+    } catch (error) {
+      if (controller.signal.aborted || mutationObserverAbortRef.current !== controller) return null
+      observer.transportController?.dispose()
+      if (mutationTransportControllerRef.current === observer.transportController) {
+        mutationTransportControllerRef.current = null
+        sessionMutationKindRef.current = null
+      }
+      throw error
+    } finally {
+      if (mutationObserverAbortRef.current === controller) {
+        mutationObserverAbortRef.current = null
+      }
+    }
+  }
+
+  const abandonMutationObservationForInterrupt = () => {
+    const mutationKind = sessionMutationKindRef.current
+    if (mutationKind === "interrupt") return
+
+    const observerAbort = mutationObserverAbortRef.current
+    const transportController = mutationTransportControllerRef.current
+    mutationObserverAbortRef.current = null
+    mutationTransportControllerRef.current = null
+    sessionMutationKindRef.current = null
+    observerAbort?.abort()
+    transportController?.dispose()
+
+    if (mutationKind === "resume") {
+      setResuming(false)
+      setResumeError(null)
+    } else if (mutationKind === "cascade") {
+      setRetryingCascade(false)
+      setCascadeRetryError(null)
+    } else if (mutationKind === "pending_action") {
+      setResolvingAction(false)
+      setActionError(null)
+    }
+    setRetryingMutationObservation(false)
+    setMutationTransport(null)
+    setMutationObservationError(null)
+  }
+
+  const handleRetryMutationObservation = async () => {
+    if (mutationObserverAbortRef.current !== null) return
+    const transportController = mutationTransportControllerRef.current
+    const mutationKind = sessionMutationKindRef.current
+    if (
+      transportController === null ||
+      mutationKind === null ||
+      mutationTransport?.phase !== "transport_failed"
+    ) {
+      setMutationObservationError(
+        "The original mutation identity is no longer available for safe re-observation.",
+      )
+      return
+    }
+
+    const controller = new AbortController()
+    mutationObserverAbortRef.current = controller
+    setRetryingMutationObservation(true)
+    setMutationObservationError(null)
+    if (mutationKind === "interrupt") setInterruptRequested(true)
+    try {
+      const snapshot = await transportController.reobserve(controller.signal)
+      if (controller.signal.aborted || mutationObserverAbortRef.current !== controller) return
+      setMutationTransport(snapshot)
+      if (mutationKind === "interrupt") setInterruptRequested(false)
+      if (snapshot.phase !== "transport_failed") {
+        if (mutationTransportControllerRef.current === transportController) {
+          mutationTransportControllerRef.current = null
+          sessionMutationKindRef.current = null
+        }
+      }
+      if (snapshot.phase === "terminal") {
+        if (mutationKind === "interrupt") {
+          setInterruptSheetOpen(false)
+          setInterruptReason("")
+          setInterruptError(null)
+        } else if (mutationKind === "resume") {
+          setResumePrompt("")
+          setResumeError(null)
+        } else if (mutationKind === "cascade") {
+          setCascadeRetryError(null)
+        } else {
+          setActionError(null)
+        }
+      }
+      await refreshAfterInterrupt()
+    } catch (error) {
+      if (controller.signal.aborted || mutationObserverAbortRef.current !== controller) return
+      if (mutationKind === "interrupt") setInterruptRequested(false)
+      setMutationObservationError(
+        error instanceof Error ? error.message : "Failed to retry mutation observation.",
+      )
+    } finally {
+      if (mutationObserverAbortRef.current === controller) {
+        mutationObserverAbortRef.current = null
+        setRetryingMutationObservation(false)
+      }
+    }
+  }
+
   const handleInterrupt = async () => {
-    let streamFailed = false
+    if (interruptRequested || sessionMutationKindRef.current === "interrupt") return
+    abandonMutationObservationForInterrupt()
     setInterruptRequested(true)
     setInterruptError(null)
-    setLiveEvents([])
     const reason = interruptReason.trim()
-
-    await streamInterruptSession(
-      sessionId,
-      reason ? { reason } : {},
-      (event) => setLiveEvents((previous) => [...previous, event]),
-      () => {
-        if (!streamFailed) {
-          setInterruptSheetOpen(false)
-          setInterruptReason("")
-        }
-        void refreshAfterInterrupt().finally(() => {
-          setLiveEvents([])
-          if (streamFailed) setInterruptRequested(false)
-        })
-      },
-      (message, streamError) => {
-        if (isInterruptionConflict(streamError)) {
-          setInterruptSheetOpen(false)
-          setInterruptReason("")
-          setInterruptRequested(true)
-          return
-        }
-        streamFailed = true
+    try {
+      const snapshot = await observeSessionMutation("interrupt", (browser, options) =>
+        browser.executeInterruptMutation(sessionId, reason ? { reason } : {}, options),
+      )
+      if (snapshot === null) return
+      if (snapshot.phase === "terminal") {
+        setInterruptSheetOpen(false)
+        setInterruptReason("")
+      } else if (isInterruptionConflict(snapshot.failure?.error)) {
+        setInterruptSheetOpen(false)
+        setInterruptReason("")
+        setInterruptRequested(true)
+      } else {
         setInterruptRequested(false)
-        setInterruptError(message)
-      },
-    )
+        setInterruptError(
+          mutationTransportErrorMessage(snapshot) ?? "The interruption outcome is unavailable.",
+        )
+      }
+      await refreshAfterInterrupt()
+    } catch (error) {
+      setInterruptRequested(false)
+      setInterruptError(error instanceof Error ? error.message : "Failed to interrupt the session.")
+    }
   }
 
   const handleResume = async () => {
-    if (!resumePrompt.trim()) return
-    let streamFailed = false
+    if (!resumePrompt.trim() || resuming || mutationCommandsLocked) return
     setResuming(true)
-    setLiveEvents([])
     setResumeError(null)
-    await streamResume(
-      sessionId,
-      resumePrompt,
-      (event) => setLiveEvents((prev) => [...prev, event]),
-      () => {
-        setResuming(false)
-        if (!streamFailed) {
-          setResumePrompt("")
-        }
-        void Promise.all([refreshSessionReadModels(), pendingActionQuery.refetch()]).finally(() => {
-          setLiveEvents([])
-        })
-      },
-      (message) => {
-        streamFailed = true
-        setResumeError(message)
-      },
-    )
+    try {
+      const snapshot = await observeSessionMutation("resume", (browser, options) =>
+        browser.executeResumeMutation(
+          { session_id: sessionId, prompt: resumePrompt.trim() },
+          options,
+        ),
+      )
+      if (snapshot === null) return
+      setResuming(false)
+      if (snapshot.phase === "terminal") {
+        setResumePrompt("")
+      } else {
+        setResumeError(
+          mutationTransportErrorMessage(snapshot) ?? "The resumed run outcome is unavailable.",
+        )
+      }
+      await Promise.all([refreshSessionReadModels(), pendingActionQuery.refetch()])
+    } catch (error) {
+      setResuming(false)
+      setResumeError(error instanceof Error ? error.message : "Failed to resume the session.")
+    }
   }
 
   const handleRetryCascade = async () => {
-    let streamFailed = false
+    if (retryingCascade || mutationCommandsLocked) return
     setRetryingCascade(true)
     setCascadeRetryError(null)
-    setLiveEvents([])
-    await streamInterruptSession(
-      sessionId,
-      { reason: "Retry incomplete background interruption." },
-      (event) => setLiveEvents((previous) => [...previous, event]),
-      () => {
-        void refreshAfterInterrupt().finally(() => {
-          setRetryingCascade(false)
-          setLiveEvents([])
-        })
-      },
-      (message) => {
-        streamFailed = true
-        setRetryingCascade(false)
-        setCascadeRetryError(message)
-      },
-    )
-    if (streamFailed) setLiveEvents([])
+    try {
+      const snapshot = await observeSessionMutation("cascade", (browser, options) =>
+        browser.executeInterruptMutation(
+          sessionId,
+          { reason: "Retry incomplete background interruption." },
+          options,
+        ),
+      )
+      if (snapshot === null) return
+      setRetryingCascade(false)
+      if (snapshot.phase !== "terminal") {
+        setCascadeRetryError(
+          mutationTransportErrorMessage(snapshot) ??
+            "The background interruption outcome is unavailable.",
+        )
+      }
+      await refreshAfterInterrupt()
+    } catch (error) {
+      setRetryingCascade(false)
+      setCascadeRetryError(
+        error instanceof Error ? error.message : "Failed to retry background interruption.",
+      )
+    }
   }
 
-  const finishContinuation = (streamFailed: boolean) => {
-    void Promise.all([refreshSessionReadModels(), pendingActionQuery.refetch()]).finally(() => {
-      if (!streamFailed) {
-        setLiveEvents([])
+  const finishContinuation = () =>
+    Promise.all([refreshSessionReadModels(), pendingActionQuery.refetch()])
+
+  const completeManualRecovery = async (
+    execute: (
+      browser: MutationBrowserModule,
+      options: MutationExecutionOptions,
+    ) => Promise<MutationTransportSnapshot>,
+  ) => {
+    try {
+      const snapshot = await observeSessionMutation("pending_action", execute)
+      if (snapshot === null) return
+      setResolvingAction(false)
+      if (snapshot.phase !== "terminal") {
+        setActionError(
+          mutationTransportErrorMessage(snapshot) ?? "The recovery outcome is unavailable.",
+        )
       }
-    })
+      await finishContinuation()
+    } catch (error) {
+      setResolvingAction(false)
+      setActionError(error instanceof Error ? error.message : "Failed to recover the session.")
+    }
   }
 
   const handleApprovalDecision = async (
@@ -1948,53 +2153,61 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
     decision: "approve" | "deny",
     reason: string | null,
   ) => {
-    let streamFailed = false
+    if (resolvingAction || mutationCommandsLocked) return
     setResolvingAction(true)
-    setLiveEvents([])
     setActionError(null)
-    await streamResolveToolApproval(
-      {
-        session_id: sessionId,
-        approval_id: action.approvalId,
-        decision,
-        reason,
-      },
-      (event) => setLiveEvents((prev) => [...prev, event]),
-      () => {
-        setResolvingAction(false)
-        finishContinuation(streamFailed)
-      },
-      (message) => {
-        streamFailed = true
-        setActionError(message)
-      },
-    )
+    try {
+      const snapshot = await observeSessionMutation("pending_action", (browser, options) =>
+        browser.executeResolveToolApprovalMutation(
+          {
+            session_id: sessionId,
+            approval_id: action.approvalId,
+            decision,
+            reason,
+          },
+          options,
+        ),
+      )
+      if (snapshot === null) return
+      setResolvingAction(false)
+      if (snapshot.phase !== "terminal") {
+        setActionError(
+          mutationTransportErrorMessage(snapshot) ?? "The approval outcome is unavailable.",
+        )
+      }
+      await finishContinuation()
+    } catch (error) {
+      setResolvingAction(false)
+      setActionError(error instanceof Error ? error.message : "Failed to resolve the approval.")
+    }
   }
 
   const handleUserInputAnswer = async (
     action: Extract<PendingAction, { kind: "user_input" }>,
     answer: string,
   ) => {
-    let streamFailed = false
+    if (resolvingAction || mutationCommandsLocked) return
     setResolvingAction(true)
-    setLiveEvents([])
     setActionError(null)
-    await streamResolveUserInput(
-      {
-        session_id: sessionId,
-        input_id: action.inputId,
-        answer,
-      },
-      (event) => setLiveEvents((prev) => [...prev, event]),
-      () => {
-        setResolvingAction(false)
-        finishContinuation(streamFailed)
-      },
-      (message) => {
-        streamFailed = true
-        setActionError(message)
-      },
-    )
+    try {
+      const snapshot = await observeSessionMutation("pending_action", (browser, options) =>
+        browser.executeResolveUserInputMutation(
+          { session_id: sessionId, input_id: action.inputId, answer },
+          options,
+        ),
+      )
+      if (snapshot === null) return
+      setResolvingAction(false)
+      if (snapshot.phase !== "terminal") {
+        setActionError(
+          mutationTransportErrorMessage(snapshot) ?? "The user-input outcome is unavailable.",
+        )
+      }
+      await finishContinuation()
+    } catch (error) {
+      setResolvingAction(false)
+      setActionError(error instanceof Error ? error.message : "Failed to submit user input.")
+    }
   }
 
   const handleManualRecovery = async (
@@ -2003,19 +2216,9 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
     message: string,
     answer: string | null,
   ) => {
-    let streamFailed = false
+    if (resolvingAction || mutationCommandsLocked) return
     setResolvingAction(true)
-    setLiveEvents([])
     setActionError(null)
-    const onEvent = (event: SSEEvent) => setLiveEvents((prev) => [...prev, event])
-    const onDone = () => {
-      setResolvingAction(false)
-      finishContinuation(streamFailed)
-    }
-    const onError = (message: string) => {
-      streamFailed = true
-      setActionError(message)
-    }
 
     if (action.inputId) {
       if (!answer) {
@@ -2023,50 +2226,53 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
         setResolvingAction(false)
         return
       }
-      await streamRecoverUserInput(
-        {
-          session_id: sessionId,
-          input_id: action.inputId,
-          tool_call_id: action.toolCallId,
-          answer,
-          outcome,
-          message,
-        },
-        onEvent,
-        onDone,
-        onError,
+      const inputId = action.inputId
+      await completeManualRecovery((browser, options) =>
+        browser.executeRecoverUserInputMutation(
+          {
+            session_id: sessionId,
+            input_id: inputId,
+            tool_call_id: action.toolCallId,
+            answer,
+            outcome,
+            message,
+          },
+          options,
+        ),
       )
       return
     }
 
     if (action.approvalId) {
-      await streamRecoverToolApproval(
-        {
-          session_id: sessionId,
-          approval_id: action.approvalId,
-          tool_call_id: action.toolCallId,
-          outcome,
-          message,
-        },
-        onEvent,
-        onDone,
-        onError,
+      const approvalId = action.approvalId
+      await completeManualRecovery((browser, options) =>
+        browser.executeRecoverToolApprovalMutation(
+          {
+            session_id: sessionId,
+            approval_id: approvalId,
+            tool_call_id: action.toolCallId,
+            outcome,
+            message,
+          },
+          options,
+        ),
       )
       return
     }
 
     if (action.roundId) {
-      await streamRecoverToolRound(
-        {
-          session_id: sessionId,
-          round_id: action.roundId,
-          tool_call_id: action.toolCallId,
-          outcome,
-          message,
-        },
-        onEvent,
-        onDone,
-        onError,
+      const roundId = action.roundId
+      await completeManualRecovery((browser, options) =>
+        browser.executeRecoverToolRoundMutation(
+          {
+            session_id: sessionId,
+            round_id: roundId,
+            tool_call_id: action.toolCallId,
+            outcome,
+            message,
+          },
+          options,
+        ),
       )
       return
     }
@@ -2086,8 +2292,12 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   if (!session) return <div className="text-destructive">Session not found</div>
 
   const stateIsFresh = state !== undefined && !stateRefetchError
+  const interruptObservationInProgress = sessionMutationKindRef.current === "interrupt"
   const canInterrupt =
-    stateIsFresh && INTERRUPTIBLE_SESSION_STATUSES.has(session.status) && !interruptRequested
+    stateIsFresh &&
+    INTERRUPTIBLE_SESSION_STATUSES.has(session.status) &&
+    !interruptRequested &&
+    !interruptObservationInProgress
   const interruptionFinalizing = session.status === "interrupting" || interruptRequested
   const summary = summaryQuery.data
   const allEvents =
@@ -2132,7 +2342,10 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
         ),
   )
   const canRetryCascade =
-    stateIsFresh && session.status === "interrupted" && interruptionCascade === "failed"
+    stateIsFresh &&
+    session.status === "interrupted" &&
+    interruptionCascade === "failed" &&
+    !mutationCommandsLocked
   const cascadePending = session.status === "interrupted" && interruptionCascade === "pending"
   const canResume =
     pendingActionStatus &&
@@ -2140,7 +2353,8 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
     !pendingActionIssue &&
     !pendingActionStateUnknown &&
     !hasPendingInterruptionCascade &&
-    stateIsFresh
+    stateIsFresh &&
+    !mutationCommandsLocked
   const summaryIsCurrent =
     summary !== undefined &&
     state !== undefined &&
@@ -2409,6 +2623,17 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
         </div>
       </div>
 
+      <MutationTransportStatus
+        snapshot={mutationTransport}
+        retryingObservation={retryingMutationObservation}
+        {...(mutationOutcomeUnknown
+          ? { onRetryObservation: () => void handleRetryMutationObservation() }
+          : {})}
+      />
+      {mutationObservationError && (
+        <p className="text-sm text-destructive">{mutationObservationError}</p>
+      )}
+
       {interruptionFinalizing && (
         <div className="flex items-start gap-3 rounded-md border border-chart-1/30 bg-chart-1/5 px-4 py-3 text-sm">
           <LoaderCircle className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-chart-1" />
@@ -2582,7 +2807,7 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
                 : pendingAction.toolCallId
           }
           action={pendingAction}
-          resolving={resolvingAction}
+          resolving={resolvingAction || mutationCommandsLocked}
           error={actionError}
           onApprove={(reason) =>
             pendingAction.kind === "approval" &&
@@ -2932,9 +3157,12 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
                   onChange={(e) => setResumePrompt(e.target.value)}
                   onKeyDown={(e) => e.key === "Enter" && handleResume()}
                   placeholder="Continue with a new prompt..."
-                  disabled={resuming}
+                  disabled={resuming || mutationCommandsLocked}
                 />
-                <Button onClick={handleResume} disabled={resuming || !resumePrompt.trim()}>
+                <Button
+                  onClick={handleResume}
+                  disabled={resuming || mutationCommandsLocked || !resumePrompt.trim()}
+                >
                   <Send className="h-4 w-4 mr-2" />
                   {resuming ? "Running..." : "Resume"}
                 </Button>
@@ -2983,7 +3211,7 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
                 onChange={(event) => setInterruptReason(event.target.value)}
                 placeholder="Why is this session being interrupted?"
                 rows={4}
-                disabled={interruptRequested}
+                disabled={interruptRequested || interruptObservationInProgress}
               />
             </div>
             {interruptError && (
@@ -2998,9 +3226,13 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
               disabled={interruptRequested}
               onClick={() => setInterruptSheetOpen(false)}
             >
-              Keep running
+              {interruptDismissesSubmittedRequest ? "Close" : "Keep running"}
             </Button>
-            <Button variant="destructive" disabled={interruptRequested} onClick={handleInterrupt}>
+            <Button
+              variant="destructive"
+              disabled={interruptRequested || interruptObservationInProgress}
+              onClick={handleInterrupt}
+            >
               {interruptRequested ? (
                 <LoaderCircle className="mr-1.5 h-4 w-4 animate-spin" />
               ) : (
