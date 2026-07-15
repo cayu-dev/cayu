@@ -20,6 +20,8 @@ from cayu.storage import migrations as schema
 
 from . import _sqlite_support as sqlite_support
 
+_SQLITE_MIN_REQUIRED_REVISION = 18
+
 
 class SQLiteEventWatcherStore(EventWatcherStore):
     """SQLite-backed durable delivery state for event watchers."""
@@ -43,7 +45,11 @@ class SQLiteEventWatcherStore(EventWatcherStore):
         self._lock = asyncio.Lock()
         self._clock = _clock_or_utc_now(clock)
         self._connection = sqlite_support.connect(db_path)
-        sqlite_support.reconcile_schema(self._connection, schema_mode)
+        sqlite_support.reconcile_schema(
+            self._connection,
+            schema_mode,
+            app_min_supported=_SQLITE_MIN_REQUIRED_REVISION,
+        )
 
     async def load_state(self, watcher_name: str) -> EventWatcherState:
         watcher_name = require_clean_nonblank(watcher_name, "watcher_name")

@@ -33,6 +33,7 @@ _STREAMING_ROUTES = {
     "/api/run",
     "/api/resume",
     "/api/sessions/{session_id}/compact",
+    "/api/sessions/{session_id}/messages",
     "/api/sessions/{session_id}/interrupt",
     "/api/tool-approvals/resolve",
     "/api/tool-approvals/recover",

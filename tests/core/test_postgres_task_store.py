@@ -18,6 +18,7 @@ _TABLES = (
     "cayu_event_watcher_state",
     "cayu_events",
     "cayu_transcript_messages",
+    "cayu_session_message_queue",
     "cayu_checkpoints",
     "cayu_session_operations",
     "cayu_tasks",

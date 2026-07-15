@@ -15,14 +15,16 @@ class StopLimit(StrEnum):
     ``first_reached_limit`` produces the token, tool-call, and elapsed-time
     kinds. ``ESTIMATED_COST`` is produced by request-budget evaluation
     (``BudgetLimit``), whose ``StopDecision`` carries ``Decimal`` cost values
-    in ``maximum`` and ``actual``; it is never returned by
-    ``first_reached_limit``.
+    in ``maximum`` and ``actual``. ``MODEL_STEPS`` is produced when durable
+    queued input reaches an otherwise-complete run at its final model step;
+    neither is returned by ``first_reached_limit``.
     """
 
     INPUT_TOKENS = "input_tokens"
     OUTPUT_TOKENS = "output_tokens"
     TOTAL_TOKENS = "total_tokens"
     TOOL_CALLS = "tool_calls"
+    MODEL_STEPS = "model_steps"
     ELAPSED_SECONDS = "elapsed_seconds"
     ESTIMATED_COST = "estimated_cost"
 

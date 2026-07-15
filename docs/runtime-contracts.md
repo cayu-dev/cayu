@@ -264,6 +264,52 @@ Creates sessions, stores events, stores provider-neutral transcripts, and checkp
 
 Checkpoint field updates that can race with runtime finalization use `transform_checkpoint(...)`; transcript repair uses `append_transcript_messages_and_transform_checkpoint(...)` when it must update both atomically. Built-in stores execute those transforms while holding their session/checkpoint write boundary (a process-local lock for the in-memory store, an immediate write transaction for SQLite, and a row lock for PostgreSQL). Interruption-aware checkpoint replacements explicitly take the current `pending_session_interrupt` and `pending_interruption_cascade` values—including their absence—from that transactional snapshot, so an older runtime snapshot can neither erase active interruption state nor resurrect cleared state.
 
+### Durable session steering
+
+`CayuApp.enqueue_session_message(EnqueueSessionMessageRequest(...))` queues a
+bounded user message for a session that is currently `pending` or `running`.
+The request carries a session id, caller idempotency key, UTF-8 content (at most
+64 KiB), a `next_turn` or `on_idle` delivery mode, and optional typed
+`requested_by` provenance. Queue state belongs to `SessionStore`, not to the
+accepting `CayuApp` process: another worker may accept the request, the active
+controller discovers it through the shared store, and an accepted message
+survives worker interruption or restart. Reusing an idempotency key with the
+same request returns the original acceptance event; changing content, mode, or
+actor under that key is a conflict.
+
+Acceptance atomically inserts the queue row and its `session.message.queued`
+event. `next_turn` input becomes eligible only after the current assistant step
+and any complete tool-call round have been persisted, and before the next model
+request. `on_idle` input becomes eligible only when the runtime would otherwise
+complete the session. At either boundary, queued `next_turn` messages have
+priority over `on_idle` messages and each mode preserves store-assigned FIFO
+order. A drain fixes its maximum eligible ordering key before reading its first
+batch, then uses batches of at most 100, so messages accepted during a drain
+wait for the next safe boundary instead of extending the current batch forever.
+
+Delivery is one store transaction: append the user message to the durable
+transcript, mark its queue row delivered, and append
+`session.message.delivered`. The runtime's transition from `running` to
+`completed` uses the same store write boundary and fails while queued messages
+remain, so enqueue either wins and forces another model step or observes the
+terminal session and records nothing. A terminal-session enqueue raises the
+typed `SessionStatusConflict`. If queued input wins at the final allowed model
+step, the run emits `session.limit_reached` with `limit="model_steps"`, ends as
+`interrupted`, and preserves the queue for a later resume rather than failing
+the completed work. Queue and delivery events contain queue
+identity, mode, ordering, actor, run epoch, and transcript cursor, but never the
+message content. Operators read content through the protected transcript/store
+surface rather than the event stream.
+
+Queued steering remains queued while a session is interrupted and is delivered
+when the correct continuation path returns the runtime to its model loop. It
+cannot bypass a pending tool approval or `ask_user` request; those must be
+resolved before the queued message becomes provider-visible.
+Steering does not resolve a tool approval, answer `ask_user`, or repair an
+unknown tool outcome; those control actions retain their dedicated resolution
+and recovery APIs. The optional server exposes the replayable mutation as
+`POST /api/sessions/{session_id}/messages`.
+
 `RunRequest.session_id` is an optional caller-provided id for a new session. It must be unique. `RunRequest.task_id` optionally links a session run to an existing task. Reusing `RunRequest.session_id` never resumes an existing session.
 `RunRequest.model` optionally overrides the agent spec model for a new session. New-session provider resolution is: explicit `RunRequest.provider_name`, agent spec `provider_name`, provider `model_patterns`, then the app default provider. `CayuApp.register_provider(..., model_patterns=[...])` accepts shell-style glob patterns such as `gpt-*` or `claude-*`; ambiguous matches fail before session creation. Resume, fork, approval continuation, and recovery keep using the provider recorded on the stored session.
 `RunRequest.environment_name` optionally selects a registered environment. If omitted, the runtime uses only an environment registered with `default=True`. Registration with `default=False` never implicitly selects an environment, including for the first registration. A later `default=True` registration replaces the current application default; a later `default=False` registration does not. If no explicit default exists, simple runs execute without an environment even when named non-default environments are registered.

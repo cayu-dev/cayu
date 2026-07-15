@@ -148,6 +148,26 @@ _BASELINE_DDL = """
         message_json TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS cayu_session_message_queue (
+        ordering_key INTEGER PRIMARY KEY AUTOINCREMENT,
+        queue_id TEXT NOT NULL UNIQUE,
+        session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+        idempotency_key TEXT NOT NULL,
+        content TEXT NOT NULL,
+        delivery_mode TEXT NOT NULL,
+        status TEXT NOT NULL,
+        requested_by_json TEXT,
+        accepted_run_epoch INTEGER NOT NULL,
+        accepted_transcript_cursor INTEGER NOT NULL,
+        accepted_event_id TEXT NOT NULL,
+        accepted_at TEXT NOT NULL,
+        delivered_run_epoch INTEGER,
+        delivered_transcript_cursor INTEGER,
+        delivered_event_id TEXT,
+        delivered_at TEXT,
+        UNIQUE (session_id, idempotency_key)
+    );
+
     CREATE TABLE IF NOT EXISTS cayu_tasks (
         id TEXT PRIMARY KEY,
         type TEXT NOT NULL,
@@ -241,6 +261,8 @@ _BASELINE_DDL = """
         ON cayu_transcript_messages(session_id, sequence);
     CREATE INDEX IF NOT EXISTS idx_cayu_transcript_messages_session_role_sequence
         ON cayu_transcript_messages(session_id, role, sequence);
+    CREATE INDEX IF NOT EXISTS idx_cayu_session_message_queue_delivery
+        ON cayu_session_message_queue(session_id, status, delivery_mode, ordering_key);
     CREATE INDEX IF NOT EXISTS idx_cayu_tasks_status
         ON cayu_tasks(status);
     CREATE INDEX IF NOT EXISTS idx_cayu_tasks_type
@@ -467,6 +489,30 @@ _MIGRATION_STEPS: dict[int, str] = {
             updated_at TEXT NOT NULL,
             PRIMARY KEY (session_id, idempotency_key)
         );
+    """,
+    19: """
+        CREATE TABLE IF NOT EXISTS cayu_session_message_queue (
+            ordering_key INTEGER PRIMARY KEY AUTOINCREMENT,
+            queue_id TEXT NOT NULL UNIQUE,
+            session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+            idempotency_key TEXT NOT NULL,
+            content TEXT NOT NULL,
+            delivery_mode TEXT NOT NULL,
+            status TEXT NOT NULL,
+            requested_by_json TEXT,
+            accepted_run_epoch INTEGER NOT NULL,
+            accepted_transcript_cursor INTEGER NOT NULL,
+            accepted_event_id TEXT NOT NULL,
+            accepted_at TEXT NOT NULL,
+            delivered_run_epoch INTEGER,
+            delivered_transcript_cursor INTEGER,
+            delivered_event_id TEXT,
+            delivered_at TEXT,
+            UNIQUE (session_id, idempotency_key)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_cayu_session_message_queue_delivery
+            ON cayu_session_message_queue(session_id, status, delivery_mode, ordering_key);
     """,
 }
 
@@ -751,6 +797,8 @@ def _repair_missing_revision_17_indexes(connection: sqlite3.Connection) -> None:
 def reconcile_schema(
     connection: sqlite3.Connection,
     schema_mode: schema.SchemaMode = schema.SchemaMode.CREATE,
+    *,
+    app_min_supported: int = schema.MIN_SUPPORTED_REVISION,
 ) -> None:
     """Reconcile the SQLite schema with this binary per ``schema_mode`` (ADR 0001).
 
@@ -768,15 +816,18 @@ def reconcile_schema(
         connection.commit()
     state = read_schema_state(connection)
     if schema_mode is schema.SchemaMode.VALIDATE:
-        schema.validate(state)
+        schema.validate(state, app_min_supported=app_min_supported)
     elif schema_mode is schema.SchemaMode.CREATE:
         if state.revision == schema.UNINITIALIZED:
             _apply_pending(connection, state)
         else:
-            schema.validate(state)
+            schema.validate(state, app_min_supported=app_min_supported)
     else:  # MIGRATE
         _apply_pending(connection, state)
-        schema.validate(read_schema_state(connection))
+        schema.validate(
+            read_schema_state(connection),
+            app_min_supported=app_min_supported,
+        )
     current = read_schema_state(connection)
     if current.revision >= 17:
         if schema_mode is schema.SchemaMode.MIGRATE:

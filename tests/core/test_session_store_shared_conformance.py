@@ -15,15 +15,20 @@ from cayu.runtime import (
     CompactionResult,
     CompactSessionRequest,
     ContextCompactor,
+    EnqueueSessionMessageRequest,
     EventQuery,
     InMemorySessionStore,
     ResolutionActor,
     RunRequest,
     Session,
     SessionIdentity,
+    SessionMessageDeliveryMode,
+    SessionMessageQueueStatus,
     SessionOrder,
     SessionQuery,
+    SessionQueuedMessagesPending,
     SessionStatus,
+    SessionStatusConflict,
     SessionStore,
 )
 
@@ -37,6 +42,7 @@ _POSTGRES_TABLES = (
     "cayu_events",
     "cayu_session_labels",
     "cayu_transcript_messages",
+    "cayu_session_message_queue",
     "cayu_checkpoints",
     "cayu_session_operations",
     "cayu_tasks",
@@ -403,6 +409,318 @@ def test_session_store_conformance_blocks_delete_during_explicit_compaction(
             assert await store.load(created.id) is None
             with pytest.raises(KeyError, match="Session not found"):
                 await store.load_session_operation(created.id, request.idempotency_key)
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_durable_session_message_queue(session_store_case) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            created = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_queue_conformance",
+                    messages=[Message.text("user", "create only")],
+                ),
+                identity=_identity(),
+            )
+            idle_request = EnqueueSessionMessageRequest(
+                session_id=created.id,
+                idempotency_key="queue-idle",
+                content="idle",
+                delivery_mode=SessionMessageDeliveryMode.ON_IDLE,
+            )
+            next_one_request = EnqueueSessionMessageRequest(
+                session_id=created.id,
+                idempotency_key="queue-next-1",
+                content="next one",
+                delivery_mode=SessionMessageDeliveryMode.NEXT_TURN,
+            )
+            next_two_request = EnqueueSessionMessageRequest(
+                session_id=created.id,
+                idempotency_key="queue-next-2",
+                content="next two",
+                delivery_mode=SessionMessageDeliveryMode.NEXT_TURN,
+            )
+            idle = await store.enqueue_session_message(idle_request)
+            next_one = await store.enqueue_session_message(next_one_request)
+            next_two = await store.enqueue_session_message(next_two_request)
+            replay = await store.enqueue_session_message(next_one_request)
+            assert replay.replayed is True
+            assert replay.message.queue_id == next_one.message.queue_id
+            with pytest.raises(ValueError, match="different request"):
+                await store.enqueue_session_message(
+                    next_one_request.model_copy(update={"content": "changed"})
+                )
+
+            store = await _reopen_store(session_store_case, store)
+            reconstructed = await store.enqueue_session_message(next_one_request)
+            assert reconstructed.replayed is True
+            assert reconstructed.message == next_one.message
+
+            await store.transition_status(
+                created.id,
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.RUNNING,
+            )
+            await store.transition_status(
+                created.id,
+                from_statuses={SessionStatus.RUNNING},
+                to_status=SessionStatus.INTERRUPTED,
+            )
+            with pytest.raises(
+                SessionStatusConflict,
+                match="delivered only while running",
+            ):
+                await store.deliver_queued_session_messages(
+                    created.id,
+                    include_on_idle=True,
+                )
+            await store.transition_status(
+                created.id,
+                from_statuses={SessionStatus.INTERRUPTED},
+                to_status=SessionStatus.RUNNING,
+            )
+            first = await store.deliver_queued_session_messages(
+                created.id,
+                include_on_idle=True,
+                limit=1,
+            )
+            assert [message.queue_id for message in first.messages] == [next_one.message.queue_id]
+            assert first.has_more is True
+            late = await store.enqueue_session_message(
+                EnqueueSessionMessageRequest(
+                    session_id=created.id,
+                    idempotency_key="queue-late",
+                    content="late next boundary",
+                    delivery_mode=SessionMessageDeliveryMode.NEXT_TURN,
+                )
+            )
+            second = await store.deliver_queued_session_messages(
+                created.id,
+                include_on_idle=True,
+                eligible_through=first.eligible_through,
+                limit=1,
+            )
+            third = await store.deliver_queued_session_messages(
+                created.id,
+                include_on_idle=True,
+                eligible_through=first.eligible_through,
+                limit=1,
+            )
+            assert [message.queue_id for message in second.messages] == [next_two.message.queue_id]
+            assert [message.queue_id for message in third.messages] == [idle.message.queue_id]
+            assert third.has_more is False
+
+            with pytest.raises(SessionQueuedMessagesPending):
+                await store.transition_status_if_no_queued_messages(
+                    created.id,
+                    from_statuses={SessionStatus.RUNNING},
+                    to_status=SessionStatus.COMPLETED,
+                )
+            late_batch = await store.deliver_queued_session_messages(
+                created.id,
+                include_on_idle=False,
+            )
+            assert [message.queue_id for message in late_batch.messages] == [late.message.queue_id]
+            completed = await store.transition_status_if_no_queued_messages(
+                created.id,
+                from_statuses={SessionStatus.RUNNING},
+                to_status=SessionStatus.COMPLETED,
+            )
+            assert completed.status == SessionStatus.COMPLETED
+            transcript = await store.load_transcript(created.id)
+            assert [message.content[0].text for message in transcript] == [  # type: ignore[union-attr]
+                "next one",
+                "next two",
+                "idle",
+                "late next boundary",
+            ]
+            queue_events = [
+                event
+                for event in await store.load_events(created.id)
+                if event.type
+                in {EventType.SESSION_MESSAGE_QUEUED, EventType.SESSION_MESSAGE_DELIVERED}
+            ]
+            assert len(queue_events) == 8
+            assert all("content" not in event.payload for event in queue_events)
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_enqueue_completion_race_is_atomic(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            created = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_queue_completion_conformance",
+                    messages=[Message.text("user", "create only")],
+                ),
+                identity=_identity(),
+            )
+            await store.transition_status(
+                created.id,
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.RUNNING,
+            )
+            start = asyncio.Event()
+
+            async def enqueue():
+                await start.wait()
+                return await store.enqueue_session_message(
+                    EnqueueSessionMessageRequest(
+                        session_id=created.id,
+                        idempotency_key="completion-race",
+                        content="race steering",
+                        delivery_mode=SessionMessageDeliveryMode.NEXT_TURN,
+                    )
+                )
+
+            async def complete():
+                await start.wait()
+                return await store.transition_status_if_no_queued_messages(
+                    created.id,
+                    from_statuses={SessionStatus.RUNNING},
+                    to_status=SessionStatus.COMPLETED,
+                )
+
+            enqueue_task = asyncio.create_task(enqueue())
+            completion_task = asyncio.create_task(complete())
+            start.set()
+            enqueue_result, completion_result = await asyncio.gather(
+                enqueue_task,
+                completion_task,
+                return_exceptions=True,
+            )
+
+            if isinstance(enqueue_result, Exception):
+                assert isinstance(enqueue_result, SessionStatusConflict)
+                assert "pending or running" in str(enqueue_result)
+                assert not isinstance(completion_result, Exception)
+                assert completion_result.status is SessionStatus.COMPLETED
+                events = await store.query_events(
+                    EventQuery(
+                        session_id=created.id,
+                        event_type=EventType.SESSION_MESSAGE_QUEUED,
+                    )
+                )
+                assert events == []
+            else:
+                assert enqueue_result.message.content == "race steering"
+                assert isinstance(completion_result, SessionQueuedMessagesPending)
+                delivered = await store.deliver_queued_session_messages(
+                    created.id,
+                    include_on_idle=False,
+                )
+                assert [message.queue_id for message in delivered.messages] == [
+                    enqueue_result.message.queue_id
+                ]
+                completed = await store.transition_status_if_no_queued_messages(
+                    created.id,
+                    from_statuses={SessionStatus.RUNNING},
+                    to_status=SessionStatus.COMPLETED,
+                )
+                assert completed.status is SessionStatus.COMPLETED
+            with pytest.raises(SessionStatusConflict, match="pending or running"):
+                await store.enqueue_session_message(
+                    EnqueueSessionMessageRequest(
+                        session_id=created.id,
+                        idempotency_key="after-completion",
+                        content="too late",
+                        delivery_mode=SessionMessageDeliveryMode.NEXT_TURN,
+                    )
+                )
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_queue_boundary_is_global_and_stable(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            primary = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_queue_global_boundary_primary",
+                    messages=[Message.text("user", "primary")],
+                ),
+                identity=_identity(),
+            )
+            other = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_queue_global_boundary_other",
+                    messages=[Message.text("user", "other")],
+                ),
+                identity=_identity(),
+            )
+            for session in (primary, other):
+                await store.transition_status(
+                    session.id,
+                    from_statuses={SessionStatus.PENDING},
+                    to_status=SessionStatus.RUNNING,
+                )
+
+            primary_request = EnqueueSessionMessageRequest(
+                session_id=primary.id,
+                idempotency_key="primary-before-boundary",
+                content="deliver before boundary",
+                delivery_mode=SessionMessageDeliveryMode.NEXT_TURN,
+            )
+            accepted = await store.enqueue_session_message(primary_request)
+            other_message = await store.enqueue_session_message(
+                EnqueueSessionMessageRequest(
+                    session_id=other.id,
+                    idempotency_key="other-before-boundary",
+                    content="advance global boundary",
+                    delivery_mode=SessionMessageDeliveryMode.NEXT_TURN,
+                )
+            )
+
+            first = await store.deliver_queued_session_messages(
+                primary.id,
+                include_on_idle=False,
+            )
+            assert [message.queue_id for message in first.messages] == [accepted.message.queue_id]
+            assert first.eligible_through >= other_message.message.ordering_key
+
+            replay = await store.enqueue_session_message(primary_request)
+            assert replay.replayed is True
+            assert replay.message.status is SessionMessageQueueStatus.DELIVERED
+
+            late = await store.enqueue_session_message(
+                EnqueueSessionMessageRequest(
+                    session_id=primary.id,
+                    idempotency_key="primary-after-boundary",
+                    content="deliver after boundary",
+                    delivery_mode=SessionMessageDeliveryMode.NEXT_TURN,
+                )
+            )
+            fenced = await store.deliver_queued_session_messages(
+                primary.id,
+                include_on_idle=False,
+                eligible_through=first.eligible_through,
+            )
+            assert fenced.messages == ()
+
+            current = await store.deliver_queued_session_messages(
+                primary.id,
+                include_on_idle=False,
+            )
+            assert [message.queue_id for message in current.messages] == [late.message.queue_id]
         finally:
             await _close_store(store)
 

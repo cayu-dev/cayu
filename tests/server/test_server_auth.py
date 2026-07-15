@@ -67,6 +67,15 @@ def _make_client(*, expose_docs: bool | None = None) -> TestClient:
                 "expected_transcript_cursor": 0,
             },
         ),
+        (
+            "POST",
+            "/api/sessions/session-1/messages",
+            {
+                "idempotency_key": "message-1",
+                "content": "steer",
+                "delivery_mode": "next_turn",
+            },
+        ),
         ("POST", "/api/sessions/session-1/interrupt", None),
         (
             "POST",
@@ -216,6 +225,15 @@ def test_auth_guards_read_and_contract_routes(
                 "idempotency_key": "compact-1",
                 "expected_run_epoch": 0,
                 "expected_transcript_cursor": 0,
+            },
+        ),
+        (
+            "POST",
+            "/api/sessions/session-1/messages",
+            {
+                "idempotency_key": "message-1",
+                "content": "steer",
+                "delivery_mode": "next_turn",
             },
         ),
         ("POST", "/api/sessions/session-1/interrupt", None),

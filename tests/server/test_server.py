@@ -6406,6 +6406,79 @@ def test_sse_replay_preserves_canonical_policy_denial_attribution() -> None:
     ]
 
 
+def test_enqueue_session_message_endpoint_uses_replayable_mutation_contract() -> None:
+    app = CayuApp(enable_logging=False)
+
+    async def prepare() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="session-message-endpoint",
+                messages=[Message.text("user", "create only")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+
+    asyncio.run(prepare())
+    client = TestClient(create_server(app, dev=True))
+    session_id = "session-message-endpoint"
+    with client.stream(
+        "POST",
+        f"/api/sessions/{session_id}/messages",
+        json={
+            "idempotency_key": "message-endpoint-1",
+            "content": "Please prioritize the failing deployment.",
+            "delivery_mode": "next_turn",
+            "requested_by": {"subject": "operator@example.com"},
+        },
+        headers={"Cayu-Mutation-ID": "mutation-message-1"},
+    ) as response:
+        assert response.status_code == 200
+        frames = [frame for frame in _sse_frames(response) if "data" in frame]
+
+    queued = frames[0]["data"]
+    assert queued["type"] == EventType.SESSION_MESSAGE_QUEUED
+    assert queued["payload"]["delivery_mode"] == "next_turn"
+    assert queued["payload"]["actor"] == {
+        "subject": "operator@example.com",
+        "tenant": None,
+        "source": "request",
+    }
+    assert "content" not in queued["payload"]
+
+    persisted_events = client.get(f"/api/sessions/{session_id}/events").json()["events"]
+    persisted_queued = next(
+        event for event in persisted_events if event["type"] == EventType.SESSION_MESSAGE_QUEUED
+    )
+    assert persisted_queued["id"] == queued["id"]
+    accepted = next(
+        event for event in persisted_events if event["type"] == EventType.SERVER_MUTATION_ACCEPTED
+    )
+    assert accepted["payload"] == {
+        "mutation_id": "mutation-message-1",
+        "mutation_kind": "session.message.enqueue",
+        "accepted_event_id": queued["id"],
+        "accepted_event_type": EventType.SESSION_MESSAGE_QUEUED,
+    }
+    assert "/api/sessions/{session_id}/messages" in client.get("/openapi.json").json()["paths"]
+
+
+def test_enqueue_session_message_endpoint_rejects_nonportable_text() -> None:
+    app = CayuApp(enable_logging=False)
+    client = TestClient(create_server(app, dev=True))
+
+    response = client.post(
+        "/api/sessions/session_1/messages",
+        json={
+            "idempotency_key": "message-1",
+            "content": "hello\u0000",
+            "delivery_mode": "next_turn",
+        },
+    )
+
+    assert response.status_code == 422
+
+
 def test_run_disconnect_after_http_acceptance_before_first_body_replays_from_start() -> None:
     task_store = InMemoryTaskStore()
     app = CayuApp(task_store=task_store)
@@ -7514,6 +7587,14 @@ def test_oversized_replay_frame_remains_durable_and_fails_live_observer_clearly(
                 "expected_transcript_cursor": 1,
             },
         ),
+        (
+            "/api/sessions/session_approval_replay/messages",
+            {
+                "idempotency_key": "message-replay",
+                "content": "queued steering that must not execute",
+                "delivery_mode": "next_turn",
+            },
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -7574,6 +7655,7 @@ def test_mutation_routes_replay_without_reexecuting(
     app.recover_user_input = unexpected_execution
     app.interrupt_session = unexpected_execution
     app.compact_session = unexpected_execution
+    app.enqueue_session_message = unexpected_execution
     client = TestClient(create_server(app, dev=True))
 
     with client.stream(

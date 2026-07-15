@@ -30,6 +30,8 @@ from cayu.runtime.budgets import (
 from . import _sqlite_support as sqlite_support
 from . import migrations as schema
 
+_SQLITE_MIN_REQUIRED_REVISION = 18
+
 
 class SQLiteBudgetLedger(BudgetLedger):
     """SQLite-backed atomic budget reservation ledger.
@@ -61,7 +63,11 @@ class SQLiteBudgetLedger(BudgetLedger):
         self._reservation_ttl_seconds = _validate_reservation_ttl(reservation_ttl_seconds)
         self._connection = sqlite_support.connect(db_path)
         self._connection.row_factory = sqlite3.Row
-        sqlite_support.reconcile_schema(self._connection, schema_mode)
+        sqlite_support.reconcile_schema(
+            self._connection,
+            schema_mode,
+            app_min_supported=_SQLITE_MIN_REQUIRED_REVISION,
+        )
 
     @property
     def reservation_ttl_seconds(self) -> int | None:

@@ -131,6 +131,12 @@ REVISIONS: tuple[Revision, ...] = (
     # Completion now atomically updates the checkpoint, appends events, and
     # writes the replay record, so older writers must not share this schema.
     Revision(revision=18, kind=RevisionKind.BREAKING, compatible_from=18),
+    # Durable queued session input adds a runtime-required table and changes the
+    # session terminalization contract. A pre-19 worker can otherwise complete a
+    # session after a revision-19 process accepts queued input, permanently
+    # stranding that input. Raise the compatibility floor so mixed-version
+    # session workers cannot share a revision-19 database.
+    Revision(revision=19, kind=RevisionKind.BREAKING, compatible_from=19),
 )
 
 #: The revision an empty database is initialized to.

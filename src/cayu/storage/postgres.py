@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 from typing import Any, LiteralString, cast
+from uuid import uuid4
 
 try:
     from psycopg.errors import (
@@ -34,8 +35,9 @@ from cayu._validation import (
     require_nonblank,
 )
 from cayu.core.events import Event, EventType
-from cayu.core.messages import Message
+from cayu.core.messages import Message, MessageRole
 from cayu.embeddings import TextEmbeddingProvider, TextEmbeddingRequest
+from cayu.runtime.approvals import ResolutionActor, resolution_actor_payload
 from cayu.runtime.budgets import (
     DEFAULT_RESERVATION_TTL_SECONDS,
     BudgetLedger,
@@ -66,7 +68,10 @@ from cayu.runtime.sessions import (
     DELETE_BLOCKED_SESSION_STATUSES,
     MAX_PENDING_ACTION_RESULT_BYTES,
     MAX_PENDING_ACTION_TOOL_CALLS,
+    SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
     CheckpointTransform,
+    EnqueueSessionMessageRequest,
+    EnqueueSessionMessageResult,
     EventQuery,
     EventRecord,
     EventSummary,
@@ -79,11 +84,15 @@ from cayu.runtime.sessions import (
     Session,
     SessionIdentity,
     SessionListResult,
+    SessionMessageDeliveryBatch,
+    SessionMessageQueueStatus,
     SessionOperationPublication,
     SessionOperationTransform,
     SessionOrder,
     SessionOutcome,
     SessionQuery,
+    SessionQueuedMessage,
+    SessionQueuedMessagesPending,
     SessionRunFenced,
     SessionStateSnapshot,
     SessionStatus,
@@ -100,8 +109,11 @@ from cayu.runtime.sessions import (
     _deactivate_session_run_fence,
     _prepare_session_fork_request,
     _project_interruption_cascade_marker_fields,
+    _queued_session_message_event_payload,
+    _validate_equivalent_queued_session_message,
     _validate_session_fork_source,
     _validate_status_set,
+    copy_enqueue_session_message_request,
     copy_event_query,
     copy_run_request,
     copy_session_identity,
@@ -176,6 +188,7 @@ from cayu.storage.memory import (
 # requirement is being a stable constant unlikely to collide with app locks.
 _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 _POSTGRES_MIN_REQUIRED_REVISION = 18
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 19
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="%s",
@@ -205,6 +218,38 @@ _TASK_RETURNING_COLUMNS = (
     "task.status_reason, task.status_payload, task.input, task.result, task.error, task.metadata, "
     "task.created_at, task.updated_at, task.started_at, task.completed_at"
 )
+_SESSION_MESSAGE_QUEUE_COLUMNS = (
+    "ordering_key, queue_id, session_id, idempotency_key, content, delivery_mode, status, "
+    "requested_by, accepted_run_epoch, accepted_transcript_cursor, accepted_event_id, "
+    "accepted_at, delivered_run_epoch, delivered_transcript_cursor, delivered_event_id, "
+    "delivered_at"
+)
+
+
+def _queued_session_message_from_row(row: Any) -> SessionQueuedMessage:
+    requested_by = row[7]
+    return SessionQueuedMessage(
+        ordering_key=row[0],
+        queue_id=row[1],
+        session_id=row[2],
+        idempotency_key=row[3],
+        content=row[4],
+        delivery_mode=row[5],
+        status=row[6],
+        requested_by=(
+            None
+            if requested_by is None
+            else ResolutionActor.model_validate(_json_obj(requested_by))
+        ),
+        accepted_run_epoch=row[8],
+        accepted_transcript_cursor=row[9],
+        accepted_event_id=row[10],
+        accepted_at=row[11],
+        delivered_run_epoch=row[12],
+        delivered_transcript_cursor=row[13],
+        delivered_event_id=row[14],
+        delivered_at=row[15],
+    )
 
 
 def _ilike_contains_pattern(value: str) -> str:
@@ -531,6 +576,31 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
             PRIMARY KEY (session_id, idempotency_key)
         )
         """,
+    ),
+    19: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_session_message_queue (
+            ordering_key BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            queue_id TEXT NOT NULL UNIQUE,
+            session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+            idempotency_key TEXT NOT NULL,
+            content TEXT NOT NULL,
+            delivery_mode TEXT NOT NULL,
+            status TEXT NOT NULL,
+            requested_by JSONB,
+            accepted_run_epoch BIGINT NOT NULL,
+            accepted_transcript_cursor BIGINT NOT NULL,
+            accepted_event_id TEXT NOT NULL,
+            accepted_at TIMESTAMPTZ NOT NULL,
+            delivered_run_epoch BIGINT,
+            delivered_transcript_cursor BIGINT,
+            delivered_event_id TEXT,
+            delivered_at TIMESTAMPTZ,
+            UNIQUE (session_id, idempotency_key)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_cayu_session_message_queue_delivery "
+        "ON cayu_session_message_queue(session_id, status, delivery_mode, ordering_key)",
     ),
 }
 
@@ -975,6 +1045,8 @@ class _PostgresStoreBase:
     psycopg's async pool happy about running inside a live loop.
     """
 
+    _min_required_revision = _POSTGRES_MIN_REQUIRED_REVISION
+
     def __init__(
         self,
         conninfo: str | None = None,
@@ -1058,13 +1130,19 @@ class _PostgresStoreBase:
                     await cur.execute(pg_support.MIGRATIONS_TABLE_DDL)
                 state = await self._read_schema_state(cur)
                 if self._schema_mode is schema.SchemaMode.VALIDATE:
-                    schema.validate(state)
+                    schema.validate(
+                        state,
+                        app_min_supported=self._min_required_revision,
+                    )
                     await self._validate_postgres_schema(cur, state)
                 elif self._schema_mode is schema.SchemaMode.CREATE:
                     if state.revision == schema.UNINITIALIZED:
                         await self._apply_pending(cur, state)
                     else:
-                        schema.validate(state)
+                        schema.validate(
+                            state,
+                            app_min_supported=self._min_required_revision,
+                        )
                         await self._validate_postgres_schema(cur, state)
             await conn.commit()
 
@@ -1088,7 +1166,10 @@ class _PostgresStoreBase:
                     pending = schema.pending(current)
                     if not pending:
                         current_state = await self._read_schema_state(cur)
-                        schema.validate(current_state)
+                        schema.validate(
+                            current_state,
+                            app_min_supported=self._min_required_revision,
+                        )
                         self._validate_postgres_revision(current_state)
                         recorded_indexes = _required_concurrent_indexes(current_state.revision)
                     else:
@@ -1208,10 +1289,10 @@ class _PostgresStoreBase:
             await asyncio.sleep(0.05)
 
     def _validate_postgres_revision(self, state: schema.SchemaState) -> None:
-        if state.revision < _POSTGRES_MIN_REQUIRED_REVISION:
+        if state.revision < self._min_required_revision:
             raise schema.SchemaTooOld(
                 f"Postgres schema is at revision {state.revision}; this build requires "
-                f">= {_POSTGRES_MIN_REQUIRED_REVISION}. Run `cayu storage migrate` before "
+                f">= {self._min_required_revision}. Run `cayu storage migrate` before "
                 "starting."
             )
 
@@ -3901,6 +3982,8 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
 class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     """Postgres-backed session store for durable multi-tenant runtime state."""
 
+    _min_required_revision = _POSTGRES_SESSION_MIN_REQUIRED_REVISION
+
     async def create(
         self,
         request: RunRequest,
@@ -4396,6 +4479,66 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 _activate_session_run_fence(transitioned)
             return transitioned
 
+    async def transition_status_if_no_queued_messages(
+        self,
+        session_id: str,
+        *,
+        from_statuses: set[SessionStatus],
+        to_status: SessionStatus,
+    ) -> Session:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
+        if not isinstance(to_status, SessionStatus):
+            raise ValueError("to_status must be a SessionStatus.")
+        await self._ensure_ready()
+        updated_at = datetime.now(UTC)
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    loaded = await self._load_for_update(cur, session_id)
+                    if loaded is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    _assert_session_run_epoch(session_id, loaded)
+                    if loaded.status not in allowed_statuses:
+                        raise SessionStatusConflict(
+                            f"Session status transition not allowed: {loaded.status} -> {to_status}"
+                        )
+                    await cur.execute(
+                        "SELECT 1 FROM cayu_session_message_queue "
+                        "WHERE session_id = %s AND status = 'queued' LIMIT 1",
+                        (session_id,),
+                    )
+                    if await cur.fetchone() is not None:
+                        raise SessionQueuedMessagesPending(
+                            f"Session has durable queued messages: {session_id}"
+                        )
+                    await cur.execute(
+                        "UPDATE cayu_sessions SET status = %s, updated_at = %s, "
+                        "last_activity_at = %s, run_epoch = run_epoch + %s WHERE id = %s",
+                        (
+                            str(to_status),
+                            updated_at,
+                            updated_at,
+                            1 if to_status == SessionStatus.RUNNING else 0,
+                            session_id,
+                        ),
+                    )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+            transitioned = loaded.model_copy(
+                update={
+                    "status": to_status,
+                    "updated_at": updated_at,
+                    "last_activity_at": updated_at,
+                    "run_epoch": loaded.run_epoch + (to_status == SessionStatus.RUNNING),
+                }
+            )
+            if to_status == SessionStatus.RUNNING:
+                _activate_session_run_fence(transitioned)
+            return transitioned
+
     async def fence_stalled_run(
         self,
         session_id: str,
@@ -4565,6 +4708,361 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         f"Event already exists for session {session_id}: {existing}"
                     ) from exc
                 raise
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def enqueue_session_message(
+        self,
+        request: EnqueueSessionMessageRequest,
+    ) -> EnqueueSessionMessageResult:
+        from cayu.runtime.pending_actions import pending_action_event_storage_values
+
+        request = copy_enqueue_session_message_request(request)
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    loaded = await self._load_for_update(cur, request.session_id)
+                    if loaded is None:
+                        raise KeyError(f"Session not found: {request.session_id}")
+                    await cur.execute(
+                        f"SELECT {_SESSION_MESSAGE_QUEUE_COLUMNS} "
+                        "FROM cayu_session_message_queue "
+                        "WHERE session_id = %s AND idempotency_key = %s",
+                        (request.session_id, request.idempotency_key),
+                    )
+                    existing_row = await cur.fetchone()
+                    if existing_row is not None:
+                        existing = _queued_session_message_from_row(existing_row)
+                        _validate_equivalent_queued_session_message(existing, request)
+                        await cur.execute(
+                            "SELECT event FROM cayu_events WHERE session_id = %s AND event_id = %s",
+                            (request.session_id, existing.accepted_event_id),
+                        )
+                        event_row = await cur.fetchone()
+                        if event_row is None:
+                            raise RuntimeError(
+                                "Queued session message is missing its durable acceptance event."
+                            )
+                        await conn.commit()
+                        return EnqueueSessionMessageResult(
+                            message=existing,
+                            event=Event(**_json_obj(event_row[0])),
+                            replayed=True,
+                        )
+                    if loaded.status not in {SessionStatus.PENDING, SessionStatus.RUNNING}:
+                        raise SessionStatusConflict(
+                            "Session messages may be enqueued only while a session is pending or running."
+                        )
+                    await cur.execute(
+                        "SELECT COUNT(*) FROM cayu_transcript_messages WHERE session_id = %s",
+                        (request.session_id,),
+                    )
+                    cursor_row = await cur.fetchone()
+                    transcript_cursor = cursor_row[0] if cursor_row is not None else 0
+                    accepted_at = datetime.now(UTC)
+                    queue_id = str(uuid4())
+                    accepted_event_id = str(uuid4())
+                    await cur.execute(
+                        """
+                        INSERT INTO cayu_session_message_queue (
+                            queue_id, session_id, idempotency_key, content,
+                            delivery_mode, status, requested_by,
+                            accepted_run_epoch, accepted_transcript_cursor,
+                            accepted_event_id, accepted_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, 'queued', %s, %s, %s, %s, %s)
+                        RETURNING ordering_key
+                        """,
+                        (
+                            queue_id,
+                            request.session_id,
+                            request.idempotency_key,
+                            request.content,
+                            str(request.delivery_mode),
+                            (
+                                None
+                                if request.requested_by is None
+                                else _dumps(resolution_actor_payload(request.requested_by))
+                            ),
+                            loaded.run_epoch,
+                            transcript_cursor,
+                            accepted_event_id,
+                            accepted_at,
+                        ),
+                    )
+                    ordering_row = await cur.fetchone()
+                    if ordering_row is None:
+                        raise RuntimeError("Postgres queue insert did not return an ordering key.")
+                    ordering_key = ordering_row[0]
+                    accepted_event = Event(
+                        id=accepted_event_id,
+                        type=EventType.SESSION_MESSAGE_QUEUED,
+                        session_id=request.session_id,
+                        agent_name=loaded.agent_name,
+                        environment_name=loaded.environment_name,
+                        timestamp=accepted_at,
+                        payload=_queued_session_message_event_payload(
+                            queue_id=queue_id,
+                            delivery_mode=request.delivery_mode,
+                            ordering_key=ordering_key,
+                            actor=request.requested_by,
+                            run_epoch=loaded.run_epoch,
+                            transcript_cursor=transcript_cursor,
+                        ),
+                    )
+                    await cur.execute(
+                        "UPDATE cayu_sessions SET event_seq = event_seq + 1, "
+                        "last_activity_at = %s WHERE id = %s RETURNING event_seq",
+                        (accepted_at, request.session_id),
+                    )
+                    event_order_row = await cur.fetchone()
+                    if event_order_row is None:
+                        raise KeyError(f"Session not found: {request.session_id}")
+                    lookup_key, projection, projection_bytes = pending_action_event_storage_values(
+                        accepted_event
+                    )
+                    await cur.execute(
+                        """
+                        INSERT INTO cayu_events (
+                            session_id, session_order, event_id, event_type, timestamp,
+                            agent_name, environment_name, workflow_name, tool_name,
+                            payload, event, pending_action_lookup_key,
+                            pending_action_projection, pending_action_projection_bytes
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            request.session_id,
+                            event_order_row[0],
+                            accepted_event.id,
+                            str(accepted_event.type),
+                            accepted_event.timestamp,
+                            accepted_event.agent_name,
+                            accepted_event.environment_name,
+                            accepted_event.workflow_name,
+                            accepted_event.tool_name,
+                            _dumps(accepted_event.payload),
+                            _dumps(accepted_event.model_dump(mode="json")),
+                            lookup_key,
+                            projection,
+                            projection_bytes,
+                        ),
+                    )
+                    await cur.execute(
+                        f"SELECT {_SESSION_MESSAGE_QUEUE_COLUMNS} "
+                        "FROM cayu_session_message_queue WHERE queue_id = %s",
+                        (queue_id,),
+                    )
+                    stored_row = await cur.fetchone()
+                    if stored_row is None:
+                        raise RuntimeError("Queued session message disappeared after acceptance.")
+                await conn.commit()
+                return EnqueueSessionMessageResult(
+                    message=_queued_session_message_from_row(stored_row),
+                    event=accepted_event,
+                )
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def deliver_queued_session_messages(
+        self,
+        session_id: str,
+        *,
+        include_on_idle: bool,
+        eligible_through: int | None = None,
+        limit: int = SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
+    ) -> SessionMessageDeliveryBatch:
+        from cayu.runtime.pending_actions import pending_action_event_storage_values
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if type(include_on_idle) is not bool:
+            raise TypeError("include_on_idle must be a bool.")
+        if eligible_through is not None and eligible_through < 0:
+            raise ValueError("eligible_through must be greater than or equal to zero.")
+        if type(limit) is not int or not 1 <= limit <= SESSION_MESSAGE_DELIVERY_BATCH_LIMIT:
+            raise ValueError(f"limit must be between 1 and {SESSION_MESSAGE_DELIVERY_BATCH_LIMIT}.")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    loaded = await self._load_for_update(cur, session_id)
+                    if loaded is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    _assert_session_run_epoch(session_id, loaded)
+                    if loaded.status != SessionStatus.RUNNING:
+                        raise SessionStatusConflict(
+                            "Queued session messages may be delivered only while running."
+                        )
+                    boundary = eligible_through
+                    if boundary is None:
+                        # ``ordering_key`` is a global identity primary key. Its
+                        # global maximum is an end-of-index lookup and still
+                        # fences every message this session can currently
+                        # contain; the locked session row serializes enqueues for
+                        # this session until the transaction completes.
+                        await cur.execute(
+                            "SELECT COALESCE(MAX(ordering_key), 0) FROM cayu_session_message_queue"
+                        )
+                        boundary_row = await cur.fetchone()
+                        boundary = boundary_row[0] if boundary_row is not None else 0
+                    await cur.execute(
+                        f"SELECT {_SESSION_MESSAGE_QUEUE_COLUMNS} "
+                        "FROM cayu_session_message_queue WHERE session_id = %s "
+                        "AND status = 'queued' AND delivery_mode = 'next_turn' "
+                        "AND ordering_key <= %s ORDER BY ordering_key ASC LIMIT %s FOR UPDATE",
+                        (session_id, boundary, limit),
+                    )
+                    rows = await cur.fetchall()
+                    if not rows and include_on_idle:
+                        await cur.execute(
+                            f"SELECT {_SESSION_MESSAGE_QUEUE_COLUMNS} "
+                            "FROM cayu_session_message_queue WHERE session_id = %s "
+                            "AND status = 'queued' AND delivery_mode = 'on_idle' "
+                            "AND ordering_key <= %s ORDER BY ordering_key ASC LIMIT %s FOR UPDATE",
+                            (session_id, boundary, limit),
+                        )
+                        rows = await cur.fetchall()
+                    if not rows:
+                        await conn.commit()
+                        return SessionMessageDeliveryBatch(
+                            eligible_through=boundary,
+                            has_more=False,
+                        )
+                    await cur.execute(
+                        "SELECT COUNT(*) FROM cayu_transcript_messages WHERE session_id = %s",
+                        (session_id,),
+                    )
+                    cursor_row = await cur.fetchone()
+                    transcript_cursor = cursor_row[0] if cursor_row is not None else 0
+                    delivered_at = datetime.now(UTC)
+                    updated_messages: list[SessionQueuedMessage] = []
+                    delivery_events: list[Event] = []
+                    transcript_messages: list[Message] = []
+                    for offset, row in enumerate(rows, start=1):
+                        queued_message = _queued_session_message_from_row(row)
+                        delivered_cursor = transcript_cursor + offset
+                        delivery_event = Event(
+                            type=EventType.SESSION_MESSAGE_DELIVERED,
+                            session_id=session_id,
+                            agent_name=loaded.agent_name,
+                            environment_name=loaded.environment_name,
+                            timestamp=delivered_at,
+                            payload={
+                                **_queued_session_message_event_payload(
+                                    queue_id=queued_message.queue_id,
+                                    delivery_mode=queued_message.delivery_mode,
+                                    ordering_key=queued_message.ordering_key,
+                                    actor=queued_message.requested_by,
+                                    run_epoch=loaded.run_epoch,
+                                    transcript_cursor=delivered_cursor,
+                                ),
+                                "accepted_run_epoch": queued_message.accepted_run_epoch,
+                                "accepted_transcript_cursor": (
+                                    queued_message.accepted_transcript_cursor
+                                ),
+                            },
+                        )
+                        updated_messages.append(
+                            queued_message.model_copy(
+                                update={
+                                    "status": SessionMessageQueueStatus.DELIVERED,
+                                    "delivered_run_epoch": loaded.run_epoch,
+                                    "delivered_transcript_cursor": delivered_cursor,
+                                    "delivered_event_id": delivery_event.id,
+                                    "delivered_at": delivered_at,
+                                },
+                                deep=True,
+                            )
+                        )
+                        delivery_events.append(delivery_event)
+                        transcript_messages.append(
+                            Message.text(MessageRole.USER, queued_message.content)
+                        )
+                    await cur.executemany(
+                        "INSERT INTO cayu_transcript_messages (session_id, message) "
+                        "VALUES (%s, %s)",
+                        [
+                            (session_id, _dumps(message.model_dump(mode="json")))
+                            for message in transcript_messages
+                        ],
+                    )
+                    for updated in updated_messages:
+                        await cur.execute(
+                            "UPDATE cayu_session_message_queue SET status = 'delivered', "
+                            "delivered_run_epoch = %s, delivered_transcript_cursor = %s, "
+                            "delivered_event_id = %s, delivered_at = %s "
+                            "WHERE queue_id = %s AND status = 'queued'",
+                            (
+                                updated.delivered_run_epoch,
+                                updated.delivered_transcript_cursor,
+                                updated.delivered_event_id,
+                                delivered_at,
+                                updated.queue_id,
+                            ),
+                        )
+                    await cur.execute(
+                        "UPDATE cayu_sessions SET event_seq = event_seq + %s, "
+                        "last_activity_at = %s WHERE id = %s RETURNING event_seq",
+                        (len(delivery_events), delivered_at, session_id),
+                    )
+                    event_order_row = await cur.fetchone()
+                    if event_order_row is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    next_order = event_order_row[0] - len(delivery_events)
+                    event_rows = []
+                    for event in delivery_events:
+                        next_order += 1
+                        lookup_key, projection, projection_bytes = (
+                            pending_action_event_storage_values(event)
+                        )
+                        event_rows.append(
+                            (
+                                session_id,
+                                next_order,
+                                event.id,
+                                str(event.type),
+                                event.timestamp,
+                                event.agent_name,
+                                event.environment_name,
+                                event.workflow_name,
+                                event.tool_name,
+                                _dumps(event.payload),
+                                _dumps(event.model_dump(mode="json")),
+                                lookup_key,
+                                projection,
+                                projection_bytes,
+                            )
+                        )
+                    await cur.executemany(
+                        "INSERT INTO cayu_events (session_id, session_order, event_id, "
+                        "event_type, timestamp, agent_name, environment_name, workflow_name, "
+                        "tool_name, payload, event, pending_action_lookup_key, "
+                        "pending_action_projection, pending_action_projection_bytes) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        event_rows,
+                    )
+                    mode_clause = (
+                        "delivery_mode IN ('next_turn', 'on_idle')"
+                        if include_on_idle
+                        else "delivery_mode = 'next_turn'"
+                    )
+                    await cur.execute(
+                        "SELECT 1 FROM cayu_session_message_queue WHERE session_id = %s "
+                        "AND status = 'queued' AND ordering_key <= %s "
+                        f"AND {mode_clause} LIMIT 1",
+                        (session_id, boundary),
+                    )
+                    remaining = await cur.fetchone()
+                await conn.commit()
+                return SessionMessageDeliveryBatch(
+                    messages=tuple(updated_messages),
+                    events=tuple(delivery_events),
+                    eligible_through=boundary,
+                    has_more=remaining is not None,
+                )
             except Exception:
                 await conn.rollback()
                 raise

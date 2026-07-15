@@ -75,3 +75,20 @@ def test_revision_fourteen_remains_compatible_with_older_binaries() -> None:
         app_latest=13,
         app_min_supported=10,
     )
+
+
+def test_revision_nineteen_rejects_pre_queue_session_workers() -> None:
+    state = m.SchemaState(revision=19, compatible_from=19)
+
+    with pytest.raises(m.SchemaTooNew, match="understands revision >= 19"):
+        m.validate(
+            state,
+            app_latest=18,
+            app_min_supported=18,
+        )
+
+    m.validate(
+        state,
+        app_latest=19,
+        app_min_supported=19,
+    )

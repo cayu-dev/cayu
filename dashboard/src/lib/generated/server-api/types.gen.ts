@@ -1437,6 +1437,22 @@ export type CostLineItem = {
 };
 
 /**
+ * EnqueueSessionMessageBody
+ */
+export type EnqueueSessionMessageBody = {
+    /**
+     * Content
+     */
+    content: string;
+    delivery_mode: SessionMessageDeliveryMode;
+    /**
+     * Idempotency Key
+     */
+    idempotency_key: string;
+    requested_by?: ResolutionActor | null;
+};
+
+/**
  * EnvironmentsResponse
  */
 export type EnvironmentsResponse = {
@@ -2122,6 +2138,11 @@ export type SessionCostSummary = {
  * SessionDebugState
  */
 export type SessionDebugState = 'needs_attention' | 'session_failure' | 'tool_issue' | 'interruption';
+
+/**
+ * SessionMessageDeliveryMode
+ */
+export type SessionMessageDeliveryMode = 'next_turn' | 'on_idle';
 
 /**
  * SessionOrder
@@ -4187,6 +4208,56 @@ export type UpdateSessionLabelsApiSessionsSessionIdLabelsPatchResponses = {
 };
 
 export type UpdateSessionLabelsApiSessionsSessionIdLabelsPatchResponse = UpdateSessionLabelsApiSessionsSessionIdLabelsPatchResponses[keyof UpdateSessionLabelsApiSessionsSessionIdLabelsPatchResponses];
+
+export type EnqueueSessionMessageApiSessionsSessionIdMessagesPostData = {
+    body: EnqueueSessionMessageBody;
+    headers?: {
+        /**
+         * Cayu-Mutation-Id
+         *
+         * Client-generated mutation identity used to correlate an ambiguous SSE reconnect with its durable server acceptance event. Send the same value on the initial mutation and every Last-Event-ID replay request; it is a replay correlation key, not permission to repeat the POST.
+         */
+        'Cayu-Mutation-ID'?: string | null;
+    };
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: never;
+    url: '/api/sessions/{session_id}/messages';
+};
+
+export type EnqueueSessionMessageApiSessionsSessionIdMessagesPostErrors = {
+    /**
+     * The replay session or mutation target does not exist.
+     */
+    404: ApiErrorResponse;
+    /**
+     * The replay event marker is unknown or the mutation conflicts with the current session state.
+     */
+    409: ApiErrorResponse;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+    /**
+     * The mutation could not open an accepted durable stream.
+     */
+    500: ApiErrorResponse;
+};
+
+export type EnqueueSessionMessageApiSessionsSessionIdMessagesPostError = EnqueueSessionMessageApiSessionsSessionIdMessagesPostErrors[keyof EnqueueSessionMessageApiSessionsSessionIdMessagesPostErrors];
+
+export type EnqueueSessionMessageApiSessionsSessionIdMessagesPostResponses = {
+    /**
+     * SSE stream. Runtime `data:` frames contain SseEventEnvelope JSON; `event: error` frames contain SseErrorEnvelope JSON.
+     */
+    200: string;
+};
+
+export type EnqueueSessionMessageApiSessionsSessionIdMessagesPostResponse = EnqueueSessionMessageApiSessionsSessionIdMessagesPostResponses[keyof EnqueueSessionMessageApiSessionsSessionIdMessagesPostResponses];
 
 export type UpdateSessionMetadataApiSessionsSessionIdMetadataPatchData = {
     body: UpdateSessionMetadataBody;

@@ -5,6 +5,7 @@ import base64
 import json
 from abc import ABC, abstractmethod
 from bisect import bisect_left, bisect_right
+from collections import deque
 from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from copy import deepcopy
@@ -38,7 +39,11 @@ from cayu._validation import (
 from cayu.core.events import Event, EventType, copy_event
 from cayu.core.messages import Message, MessageRole, ThinkingPart, copy_message, detach_message
 from cayu.core.thinking import ThinkingConfig
-from cayu.runtime.approvals import ResolutionActor, copy_resolution_actor
+from cayu.runtime.approvals import (
+    ResolutionActor,
+    copy_resolution_actor,
+    resolution_actor_payload,
+)
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
@@ -56,6 +61,10 @@ class SessionStatusConflict(ValueError):
 
 class SessionRunFenced(RuntimeError):
     """A durable write was rejected because its run no longer owns the session epoch."""
+
+
+class SessionQueuedMessagesPending(RuntimeError):
+    """Terminalization lost a race to durable queued session input."""
 
 
 _SESSION_RUN_FENCES: ContextVar[dict[str, int] | None] = ContextVar(
@@ -100,6 +109,20 @@ class SessionStatus(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     INTERRUPTED = "interrupted"
+
+
+SESSION_MESSAGE_CONTENT_MAX_BYTES = 65_536
+SESSION_MESSAGE_DELIVERY_BATCH_LIMIT = 100
+
+
+class SessionMessageDeliveryMode(StrEnum):
+    NEXT_TURN = "next_turn"
+    ON_IDLE = "on_idle"
+
+
+class SessionMessageQueueStatus(StrEnum):
+    QUEUED = "queued"
+    DELIVERED = "delivered"
 
 
 class SessionDebugState(StrEnum):
@@ -327,6 +350,138 @@ class CompactSessionRequest(BaseModel):
                 "CompactSessionRequest.requested_by",
             )
         return self
+
+
+class EnqueueSessionMessageRequest(BaseModel):
+    """Submit durable user steering for an active session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    idempotency_key: str = Field(max_length=256)
+    content: str = Field(max_length=SESSION_MESSAGE_CONTENT_MAX_BYTES)
+    delivery_mode: SessionMessageDeliveryMode
+    requested_by: ResolutionActor | None = None
+
+    @field_validator("session_id", "idempotency_key")
+    @classmethod
+    def validate_required_strings(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("content")
+    @classmethod
+    def validate_content(cls, value: str) -> str:
+        value = require_nonblank(value, "content")
+        require_durable_json_text(value, "content")
+        if len(value.encode("utf-8")) > SESSION_MESSAGE_CONTENT_MAX_BYTES:
+            raise ValueError(
+                "content exceeds the maximum encoded size of "
+                f"{SESSION_MESSAGE_CONTENT_MAX_BYTES} bytes."
+            )
+        return value
+
+    @field_validator("requested_by")
+    @classmethod
+    def copy_requested_by(cls, value: ResolutionActor | None) -> ResolutionActor | None:
+        return copy_resolution_actor(value)
+
+    @model_validator(mode="after")
+    def validate_durable_text(self) -> EnqueueSessionMessageRequest:
+        require_durable_json_text(
+            self.model_dump(mode="json", exclude={"requested_by"}),
+            "EnqueueSessionMessageRequest",
+        )
+        if self.requested_by is not None:
+            require_durable_json_text(
+                self.requested_by.model_dump(mode="json", exclude={"claims"}),
+                "EnqueueSessionMessageRequest.requested_by",
+            )
+        return self
+
+
+class SessionQueuedMessage(BaseModel):
+    """One durable queued user message and its delivery state."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    queue_id: str
+    session_id: str
+    idempotency_key: str
+    content: str
+    delivery_mode: SessionMessageDeliveryMode
+    status: SessionMessageQueueStatus
+    ordering_key: StrictInt = Field(ge=1)
+    accepted_run_epoch: StrictInt = Field(ge=0)
+    accepted_transcript_cursor: StrictInt = Field(ge=0)
+    accepted_event_id: str
+    accepted_at: datetime
+    requested_by: ResolutionActor | None = None
+    delivered_run_epoch: StrictInt | None = Field(default=None, ge=0)
+    delivered_transcript_cursor: StrictInt | None = Field(default=None, ge=0)
+    delivered_event_id: str | None = None
+    delivered_at: datetime | None = None
+
+    @field_validator(
+        "queue_id",
+        "session_id",
+        "idempotency_key",
+        "content",
+        "accepted_event_id",
+        "delivered_event_id",
+    )
+    @classmethod
+    def validate_strings(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_nonblank(value, info.field_name)
+
+    @field_validator("requested_by")
+    @classmethod
+    def copy_requested_by(cls, value: ResolutionActor | None) -> ResolutionActor | None:
+        return copy_resolution_actor(value)
+
+
+class EnqueueSessionMessageResult(BaseModel):
+    """Typed enqueue result, including the durable acceptance event."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    message: SessionQueuedMessage
+    event: Event
+    replayed: StrictBool = False
+
+    @field_validator("message")
+    @classmethod
+    def copy_message(cls, value: SessionQueuedMessage) -> SessionQueuedMessage:
+        if type(value) is not SessionQueuedMessage:
+            raise TypeError("message must be a SessionQueuedMessage.")
+        return value.model_copy(deep=True)
+
+    @field_validator("event")
+    @classmethod
+    def copy_event(cls, value: Event) -> Event:
+        return copy_event(value)
+
+
+class SessionMessageDeliveryBatch(BaseModel):
+    """One bounded atomic queue-delivery batch at a fixed eligibility cutoff."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    messages: tuple[SessionQueuedMessage, ...] = Field(default_factory=tuple)
+    events: tuple[Event, ...] = Field(default_factory=tuple)
+    eligible_through: StrictInt = Field(ge=0)
+    has_more: StrictBool = False
+
+    @field_validator("messages", mode="before")
+    @classmethod
+    def copy_messages(cls, value) -> tuple[SessionQueuedMessage, ...]:
+        return tuple(message.model_copy(deep=True) for message in value)
+
+    @field_validator("events", mode="before")
+    @classmethod
+    def copy_events(cls, value) -> tuple[Event, ...]:
+        return tuple(copy_event(event) for event in value)
 
 
 class InterruptSessionRequest(BaseModel):
@@ -1612,6 +1767,16 @@ class SessionStore(ABC):
         """Atomically persist a transition/checkpoint and claim RUNNING when requested."""
 
     @abstractmethod
+    async def transition_status_if_no_queued_messages(
+        self,
+        session_id: str,
+        *,
+        from_statuses: set[SessionStatus],
+        to_status: SessionStatus,
+    ) -> Session:
+        """Atomically terminalize only when no durable queued input remains."""
+
+    @abstractmethod
     async def fence_stalled_run(
         self,
         session_id: str,
@@ -1638,6 +1803,24 @@ class SessionStore(ABC):
     @abstractmethod
     async def append_events(self, session_id: str, events: list[Event]) -> None:
         """Append events to a session in one durable batch."""
+
+    @abstractmethod
+    async def enqueue_session_message(
+        self,
+        request: EnqueueSessionMessageRequest,
+    ) -> EnqueueSessionMessageResult:
+        """Atomically accept queued input with its causal event, or replay it."""
+
+    @abstractmethod
+    async def deliver_queued_session_messages(
+        self,
+        session_id: str,
+        *,
+        include_on_idle: bool,
+        eligible_through: int | None = None,
+        limit: int = SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
+    ) -> SessionMessageDeliveryBatch:
+        """Atomically append and mark one bounded queue batch delivered."""
 
     @abstractmethod
     async def publish_checkpoint_and_events(
@@ -1843,6 +2026,16 @@ class InMemorySessionStore(SessionStore):
         self._checkpoints: dict[str, dict[str, Any]] = {}
         self._session_operation_records: dict[str, dict[str, dict[str, Any]]] = {}
         self._pending_action_session_ids: set[str] = set()
+        # Retain every accepted message for idempotent replay, but keep queued
+        # delivery state in per-session/mode deques. Hot delivery and terminal
+        # fencing therefore depend on the pending set, not historical deliveries.
+        self._queued_session_messages_by_idempotency: dict[
+            str, dict[str, SessionQueuedMessage]
+        ] = {}
+        self._pending_session_messages: dict[
+            tuple[str, SessionMessageDeliveryMode], deque[SessionQueuedMessage]
+        ] = {}
+        self._next_session_message_ordering_key = 1
 
     def _store_checkpoint_unlocked(self, session_id: str, checkpoint: dict[str, Any]) -> None:
         from cayu.runtime.pending_actions import (
@@ -2091,6 +2284,9 @@ class InMemorySessionStore(SessionStore):
             self._checkpoints.pop(session_id, None)
             self._session_operation_records.pop(session_id, None)
             self._pending_action_session_ids.discard(session_id)
+            self._queued_session_messages_by_idempotency.pop(session_id, None)
+            for delivery_mode in SessionMessageDeliveryMode:
+                self._pending_session_messages.pop((session_id, delivery_mode), None)
             self._event_records = [
                 record for record in self._event_records if record.event.session_id != session_id
             ]
@@ -2230,6 +2426,48 @@ class InMemorySessionStore(SessionStore):
                 _activate_session_run_fence(result)
             return result
 
+    async def transition_status_if_no_queued_messages(
+        self,
+        session_id: str,
+        *,
+        from_statuses: set[SessionStatus],
+        to_status: SessionStatus,
+    ) -> Session:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
+        if not isinstance(to_status, SessionStatus):
+            raise ValueError("to_status must be a SessionStatus.")
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            _assert_session_run_epoch(session_id, session)
+            if session.status not in allowed_statuses:
+                raise SessionStatusConflict(
+                    f"Session status transition not allowed: {session.status} -> {to_status}"
+                )
+            if any(
+                (session_id, delivery_mode) in self._pending_session_messages
+                for delivery_mode in SessionMessageDeliveryMode
+            ):
+                raise SessionQueuedMessagesPending(
+                    f"Session has durable queued messages: {session_id}"
+                )
+            now = datetime.now(UTC)
+            updated = session.model_copy(
+                update={
+                    "status": to_status,
+                    "updated_at": now,
+                    "last_activity_at": now,
+                    "run_epoch": session.run_epoch + (to_status == SessionStatus.RUNNING),
+                }
+            )
+            self._sessions[session_id] = updated
+            result = updated.model_copy(deep=True)
+            if to_status == SessionStatus.RUNNING:
+                _activate_session_run_fence(result)
+            return result
+
     async def fence_stalled_run(
         self,
         session_id: str,
@@ -2339,6 +2577,213 @@ class InMemorySessionStore(SessionStore):
                 raise KeyError(f"Session not found: {session_id}")
             _assert_session_run_epoch(session_id, session)
             self._sessions[session_id] = self._append_events_unlocked(session, copied_events)
+
+    async def enqueue_session_message(
+        self,
+        request: EnqueueSessionMessageRequest,
+    ) -> EnqueueSessionMessageResult:
+        request = copy_enqueue_session_message_request(request)
+        async with self._lock:
+            session = self._sessions.get(request.session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {request.session_id}")
+            messages_by_idempotency = self._queued_session_messages_by_idempotency.get(
+                request.session_id
+            )
+            existing = (
+                None
+                if messages_by_idempotency is None
+                else messages_by_idempotency.get(request.idempotency_key)
+            )
+            if existing is not None:
+                _validate_equivalent_queued_session_message(existing, request)
+                record = self._event_records_by_id.get(
+                    (request.session_id, existing.accepted_event_id)
+                )
+                if record is None:
+                    raise RuntimeError(
+                        "Queued session message is missing its durable acceptance event."
+                    )
+                return EnqueueSessionMessageResult(
+                    message=existing,
+                    event=record.event,
+                    replayed=True,
+                )
+            if session.status not in {SessionStatus.PENDING, SessionStatus.RUNNING}:
+                raise SessionStatusConflict(
+                    "Session messages may be enqueued only while a session is pending or running."
+                )
+            accepted_at = datetime.now(UTC)
+            queue_id = str(uuid4())
+            ordering_key = self._next_session_message_ordering_key
+            accepted_event = Event(
+                type=EventType.SESSION_MESSAGE_QUEUED,
+                session_id=session.id,
+                agent_name=session.agent_name,
+                environment_name=session.environment_name,
+                timestamp=accepted_at,
+                payload=_queued_session_message_event_payload(
+                    queue_id=queue_id,
+                    delivery_mode=request.delivery_mode,
+                    ordering_key=ordering_key,
+                    actor=request.requested_by,
+                    run_epoch=session.run_epoch,
+                    transcript_cursor=len(self._transcripts.get(session.id, [])),
+                ),
+            )
+            queued_message = SessionQueuedMessage(
+                queue_id=queue_id,
+                session_id=session.id,
+                idempotency_key=request.idempotency_key,
+                content=request.content,
+                delivery_mode=request.delivery_mode,
+                status=SessionMessageQueueStatus.QUEUED,
+                ordering_key=ordering_key,
+                accepted_run_epoch=session.run_epoch,
+                accepted_transcript_cursor=len(self._transcripts.get(session.id, [])),
+                accepted_event_id=accepted_event.id,
+                accepted_at=accepted_at,
+                requested_by=_audit_resolution_actor(request.requested_by),
+            )
+            self._sessions[session.id] = self._append_events_unlocked(
+                session,
+                [accepted_event],
+            )
+            self._queued_session_messages_by_idempotency.setdefault(session.id, {})[
+                queued_message.idempotency_key
+            ] = queued_message
+            pending_key = (session.id, queued_message.delivery_mode)
+            self._pending_session_messages.setdefault(pending_key, deque()).append(queued_message)
+            self._next_session_message_ordering_key += 1
+            return EnqueueSessionMessageResult(
+                message=queued_message,
+                event=accepted_event,
+            )
+
+    async def deliver_queued_session_messages(
+        self,
+        session_id: str,
+        *,
+        include_on_idle: bool,
+        eligible_through: int | None = None,
+        limit: int = SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
+    ) -> SessionMessageDeliveryBatch:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if type(include_on_idle) is not bool:
+            raise TypeError("include_on_idle must be a bool.")
+        if eligible_through is not None and eligible_through < 0:
+            raise ValueError("eligible_through must be greater than or equal to zero.")
+        if type(limit) is not int or not 1 <= limit <= SESSION_MESSAGE_DELIVERY_BATCH_LIMIT:
+            raise ValueError(f"limit must be between 1 and {SESSION_MESSAGE_DELIVERY_BATCH_LIMIT}.")
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            _assert_session_run_epoch(session_id, session)
+            if session.status != SessionStatus.RUNNING:
+                raise SessionStatusConflict(
+                    "Queued session messages may be delivered only while running."
+                )
+            boundary = (
+                self._next_session_message_ordering_key - 1
+                if eligible_through is None
+                else eligible_through
+            )
+
+            selected_key: tuple[str, SessionMessageDeliveryMode] | None = None
+            selected: list[SessionQueuedMessage] = []
+            delivery_modes: tuple[SessionMessageDeliveryMode, ...] = (
+                SessionMessageDeliveryMode.NEXT_TURN,
+            )
+            if include_on_idle:
+                delivery_modes += (SessionMessageDeliveryMode.ON_IDLE,)
+            for delivery_mode in delivery_modes:
+                pending_key = (session_id, delivery_mode)
+                pending = self._pending_session_messages.get(pending_key)
+                if pending is None or pending[0].ordering_key > boundary:
+                    continue
+                selected_key = pending_key
+                for message in pending:
+                    if len(selected) >= limit or message.ordering_key > boundary:
+                        break
+                    selected.append(message)
+                break
+            if not selected:
+                return SessionMessageDeliveryBatch(
+                    eligible_through=boundary,
+                    has_more=False,
+                )
+            if selected_key is None:
+                raise RuntimeError("Queued message selection lost its pending index.")
+
+            transcript_cursor = len(self._transcripts.get(session_id, []))
+            delivered_at = datetime.now(UTC)
+            updated_messages: list[SessionQueuedMessage] = []
+            delivery_events: list[Event] = []
+            transcript_messages: list[Message] = []
+            for offset, queued_message in enumerate(selected, start=1):
+                delivered_cursor = transcript_cursor + offset
+                delivery_event = Event(
+                    type=EventType.SESSION_MESSAGE_DELIVERED,
+                    session_id=session.id,
+                    agent_name=session.agent_name,
+                    environment_name=session.environment_name,
+                    timestamp=delivered_at,
+                    payload={
+                        **_queued_session_message_event_payload(
+                            queue_id=queued_message.queue_id,
+                            delivery_mode=queued_message.delivery_mode,
+                            ordering_key=queued_message.ordering_key,
+                            actor=queued_message.requested_by,
+                            run_epoch=session.run_epoch,
+                            transcript_cursor=delivered_cursor,
+                        ),
+                        "accepted_run_epoch": queued_message.accepted_run_epoch,
+                        "accepted_transcript_cursor": (queued_message.accepted_transcript_cursor),
+                    },
+                )
+                updated_messages.append(
+                    queued_message.model_copy(
+                        update={
+                            "status": SessionMessageQueueStatus.DELIVERED,
+                            "delivered_run_epoch": session.run_epoch,
+                            "delivered_transcript_cursor": delivered_cursor,
+                            "delivered_event_id": delivery_event.id,
+                            "delivered_at": delivered_at,
+                        },
+                        deep=True,
+                    )
+                )
+                delivery_events.append(delivery_event)
+                transcript_messages.append(
+                    detach_message(Message.text(MessageRole.USER, queued_message.content))
+                )
+
+            updated_session = self._append_events_unlocked(session, delivery_events)
+            self._transcripts.setdefault(session_id, []).extend(transcript_messages)
+            selected_queue = self._pending_session_messages[selected_key]
+            for _ in selected:
+                selected_queue.popleft()
+            if not selected_queue:
+                del self._pending_session_messages[selected_key]
+            messages_by_idempotency = self._queued_session_messages_by_idempotency[session_id]
+            for updated_message in updated_messages:
+                messages_by_idempotency[updated_message.idempotency_key] = updated_message
+            self._sessions[session_id] = updated_session
+
+            def has_eligible(delivery_mode: SessionMessageDeliveryMode) -> bool:
+                pending = self._pending_session_messages.get((session_id, delivery_mode))
+                return pending is not None and pending[0].ordering_key <= boundary
+
+            has_more = has_eligible(SessionMessageDeliveryMode.NEXT_TURN) or (
+                include_on_idle and has_eligible(SessionMessageDeliveryMode.ON_IDLE)
+            )
+            return SessionMessageDeliveryBatch(
+                messages=tuple(updated_messages),
+                events=tuple(delivery_events),
+                eligible_through=boundary,
+                has_more=has_more,
+            )
 
     async def publish_checkpoint_and_events(
         self,
@@ -3268,6 +3713,20 @@ def copy_compact_session_request(request: CompactSessionRequest) -> CompactSessi
     )
 
 
+def copy_enqueue_session_message_request(
+    request: EnqueueSessionMessageRequest,
+) -> EnqueueSessionMessageRequest:
+    if type(request) is not EnqueueSessionMessageRequest:
+        raise TypeError("Queued input requires an EnqueueSessionMessageRequest.")
+    return EnqueueSessionMessageRequest(
+        session_id=request.session_id,
+        idempotency_key=request.idempotency_key,
+        content=request.content,
+        delivery_mode=request.delivery_mode,
+        requested_by=copy_resolution_actor(request.requested_by),
+    )
+
+
 def copy_interrupt_session_request(request: InterruptSessionRequest) -> InterruptSessionRequest:
     if type(request) is not InterruptSessionRequest:
         raise TypeError("Session interruption requires an InterruptSessionRequest.")
@@ -3369,6 +3828,50 @@ def _validate_status_set(
         if not isinstance(status, SessionStatus):
             raise ValueError(f"{field_name} must contain SessionStatus values.")
     return set(statuses)
+
+
+def _audit_resolution_actor(actor: ResolutionActor | None) -> ResolutionActor | None:
+    if actor is None:
+        return None
+    return ResolutionActor(
+        subject=actor.subject,
+        tenant=actor.tenant,
+        source=actor.source,
+    )
+
+
+def _queued_session_message_event_payload(
+    *,
+    queue_id: str,
+    delivery_mode: SessionMessageDeliveryMode,
+    ordering_key: int,
+    actor: ResolutionActor | None,
+    run_epoch: int,
+    transcript_cursor: int,
+) -> dict[str, Any]:
+    return {
+        "queue_id": queue_id,
+        "delivery_mode": str(delivery_mode),
+        "ordering_key": ordering_key,
+        "actor": resolution_actor_payload(actor),
+        "run_epoch": run_epoch,
+        "transcript_cursor": transcript_cursor,
+    }
+
+
+def _validate_equivalent_queued_session_message(
+    existing: SessionQueuedMessage,
+    request: EnqueueSessionMessageRequest,
+) -> None:
+    if (
+        existing.content != request.content
+        or existing.delivery_mode != request.delivery_mode
+        or resolution_actor_payload(existing.requested_by)
+        != resolution_actor_payload(request.requested_by)
+    ):
+        raise ValueError(
+            "Session message idempotency key was already used for a different request."
+        )
 
 
 def _prepare_session_fork_request(

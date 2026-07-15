@@ -29,6 +29,8 @@ class EventType(StrEnum):
     SESSION_CHECKPOINTED = "session.checkpointed"
     SESSION_FORKED = "session.forked"
     SESSION_LIMIT_REACHED = "session.limit_reached"
+    SESSION_MESSAGE_QUEUED = "session.message.queued"
+    SESSION_MESSAGE_DELIVERED = "session.message.delivered"
     SESSION_RUN_FENCED = "session.run_fenced"
     TURN_COMPLETED = "turn.completed"
 

@@ -69,7 +69,9 @@ from cayu.runtime.costs import (
 )
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.sessions import (
+    SESSION_MESSAGE_CONTENT_MAX_BYTES,
     CompactSessionRequest,
+    EnqueueSessionMessageRequest,
     EventOrder,
     EventQuery,
     EventRecord,
@@ -84,6 +86,7 @@ from cayu.runtime.sessions import (
     RunRequest,
     Session,
     SessionDebugState,
+    SessionMessageDeliveryMode,
     SessionOrder,
     SessionOutcome,
     SessionQuery,
@@ -842,6 +845,39 @@ class CompactSessionBody(BaseModel):
             require_durable_json_text(
                 self.requested_by.model_dump(mode="json", exclude={"claims"}),
                 "CompactSessionBody.requested_by",
+            )
+        return self
+
+
+class EnqueueSessionMessageBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    idempotency_key: NonBlankString = Field(max_length=256)
+    content: NonBlankString = Field(max_length=SESSION_MESSAGE_CONTENT_MAX_BYTES)
+    delivery_mode: SessionMessageDeliveryMode
+    requested_by: ResolutionActor | None = None
+
+    @field_validator("content")
+    @classmethod
+    def validate_content_size(cls, value: str) -> str:
+        require_durable_json_text(value, "content")
+        if len(value.encode("utf-8")) > SESSION_MESSAGE_CONTENT_MAX_BYTES:
+            raise ValueError(
+                "content exceeds the maximum encoded size of "
+                f"{SESSION_MESSAGE_CONTENT_MAX_BYTES} bytes."
+            )
+        return value
+
+    @model_validator(mode="after")
+    def validate_durable_text(self) -> EnqueueSessionMessageBody:
+        require_durable_json_text(
+            self.model_dump(mode="json", exclude={"requested_by"}),
+            "EnqueueSessionMessageBody",
+        )
+        if self.requested_by is not None:
+            require_durable_json_text(
+                self.requested_by.model_dump(mode="json", exclude={"claims"}),
+                "EnqueueSessionMessageBody.requested_by",
             )
         return self
 
@@ -2290,6 +2326,58 @@ def create_router(
             after_accept=_mutation_acceptance_callback(
                 mutation_id=mutation_id,
                 mutation_kind="session.compact",
+                session_id=session_id,
+            ),
+            conflict_error_types=(RuntimeError, TimeoutError, ValueError),
+        )
+
+    @router.post(
+        "/sessions/{session_id}/messages",
+        response_class=EventSourceResponse,
+        responses=STREAMING_ENDPOINT_RESPONSES,
+    )
+    async def enqueue_session_message(
+        session_id: NonBlankString,
+        body: EnqueueSessionMessageBody,
+        http_request: Request,
+        auth_context: AuthContext | None = optional_auth_context,
+        mutation_id: MutationIdHeader = None,
+    ):
+        replay = await _replay_events_response(
+            http_request,
+            expected_session_id=session_id,
+        )
+        if replay is not None:
+            return replay
+        session = await session_store.load(session_id)
+        if session is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session not found: {session_id}",
+            )
+
+        async def operation() -> AsyncIterator[Event]:
+            result = await cayu_app.enqueue_session_message(
+                EnqueueSessionMessageRequest(
+                    session_id=session_id,
+                    idempotency_key=body.idempotency_key,
+                    content=body.content,
+                    delivery_mode=body.delivery_mode,
+                    requested_by=_request_interruption_actor(
+                        auth_context,
+                        body.requested_by,
+                    ),
+                )
+            )
+            yield result.event
+
+        return await _accepted_event_stream_response(
+            operation(),
+            cayu_app=cayu_app,
+            session_id=session_id,
+            after_accept=_mutation_acceptance_callback(
+                mutation_id=mutation_id,
+                mutation_kind="session.message.enqueue",
                 session_id=session_id,
             ),
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),

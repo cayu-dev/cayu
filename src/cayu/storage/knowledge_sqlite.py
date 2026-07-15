@@ -37,6 +37,7 @@ from cayu.storage.memory import (
 
 _SEARCH_TOKEN_RE = re.compile(r"\w+")
 _SEARCH_PAGE_SIZE = 500
+_SQLITE_MIN_REQUIRED_REVISION = 18
 
 
 class SQLiteKnowledgeStore(KnowledgeStore):
@@ -60,7 +61,11 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         self._schema_mode = schema_mode
         self._lock = asyncio.Lock()
         self._connection = sqlite_support.connect(db_path)
-        sqlite_support.reconcile_schema(self._connection, schema_mode)
+        sqlite_support.reconcile_schema(
+            self._connection,
+            schema_mode,
+            app_min_supported=_SQLITE_MIN_REQUIRED_REVISION,
+        )
 
     async def put_entry(self, entry: KnowledgeEntry) -> KnowledgeEntry:
         entry = copy_knowledge_entry(entry)

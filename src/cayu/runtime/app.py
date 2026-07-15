@@ -254,6 +254,8 @@ from cayu.runtime.retry_policy import (
 )
 from cayu.runtime.sessions import (
     CompactSessionRequest,
+    EnqueueSessionMessageRequest,
+    EnqueueSessionMessageResult,
     EventOrder,
     EventQuery,
     EventRecord,
@@ -268,13 +270,17 @@ from cayu.runtime.sessions import (
     RunRequest,
     Session,
     SessionIdentity,
+    SessionMessageDeliveryBatch,
     SessionOperationPublication,
     SessionOrder,
     SessionQuery,
+    SessionQueuedMessagesPending,
     SessionStatus,
+    SessionStatusConflict,
     SessionStore,
     _current_session_run_epoch,
     copy_compact_session_request,
+    copy_enqueue_session_message_request,
     copy_fork_session_request,
     copy_incomplete_session_recovery_request,
     copy_incomplete_sessions_recovery_request,
@@ -2483,6 +2489,60 @@ class CayuApp:
             await operation_stream.aclose()
             raise
 
+    async def enqueue_session_message(
+        self,
+        request: EnqueueSessionMessageRequest,
+    ) -> EnqueueSessionMessageResult:
+        """Durably queue user steering for delivery by the active controller."""
+
+        if type(request) is not EnqueueSessionMessageRequest:
+            raise TypeError("Runtime queued input requires an EnqueueSessionMessageRequest.")
+        result = await self.session_store.enqueue_session_message(
+            copy_enqueue_session_message_request(request)
+        )
+        if not result.replayed:
+            await self._event_writer.fan_out_persisted([result.event])
+        return result
+
+    async def _deliver_queued_session_messages(
+        self,
+        *,
+        session_id: str,
+        messages: list[Message],
+        include_on_idle: bool,
+    ) -> list[Event]:
+        delivered_events: list[Event] = []
+        eligible_through: int | None = None
+        while True:
+            try:
+                batch: SessionMessageDeliveryBatch = (
+                    await self.session_store.deliver_queued_session_messages(
+                        session_id,
+                        include_on_idle=include_on_idle,
+                        eligible_through=eligible_through,
+                    )
+                )
+            except SessionStatusConflict:
+                # An interrupt can win after the loop's durable status check,
+                # between bounded delivery batches, or after completion detects
+                # queued work. Preserve that lifecycle result through the normal
+                # interruption finalizer instead of treating the store's delivery
+                # fence as a runtime failure. Unrelated status conflicts still
+                # propagate unchanged.
+                await self._raise_if_session_interrupted(session_id)
+                raise
+            if eligible_through is None:
+                eligible_through = batch.eligible_through
+            messages.extend(
+                Message.text(MessageRole.USER, queued_message.content)
+                for queued_message in batch.messages
+            )
+            if batch.events:
+                await self._event_writer.fan_out_persisted(list(batch.events))
+                delivered_events.extend(batch.events)
+            if not batch.has_more:
+                return delivered_events
+
     async def _compact_session(
         self,
         request: CompactSessionRequest,
@@ -3194,6 +3254,57 @@ class CayuApp:
                 )
             events.append(copy_event(records[0].event))
         return events
+
+    async def _complete_session_if_no_queued_messages(self, session_id: str) -> Session:
+        try:
+            return await self.session_store.transition_status_if_no_queued_messages(
+                session_id,
+                from_statuses={SessionStatus.RUNNING},
+                to_status=SessionStatus.COMPLETED,
+            )
+        except SessionStatusConflict:
+            # An interrupt can win between the final provider response and the
+            # atomic completion transition. Route that race through the normal
+            # interrupt finalizer instead of the generic failure handler.
+            await self._raise_if_session_interrupted(session_id)
+            raise
+
+    async def _handle_queued_messages_before_completion(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        environment_name: str | None,
+        messages: list[Message],
+        step: int,
+        max_steps: int,
+        run_started_at: float,
+        turn_usage_tracker: _SessionUsageTracker,
+        active_run: _ActiveSessionRun | None,
+    ) -> tuple[bool, list[Event]]:
+        if step < max_steps:
+            return True, await self._deliver_queued_session_messages(
+                session_id=session.id,
+                messages=messages,
+                include_on_idle=True,
+            )
+        events = [
+            event
+            async for event in self._stop_session_for_queued_input_step_limit(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                environment_name=environment_name,
+                messages=messages,
+                step=step,
+                max_steps=max_steps,
+                run_started_at=run_started_at,
+                turn_usage_tracker=turn_usage_tracker,
+                active_run=active_run,
+            )
+        ]
+        return False, events
 
     async def _compaction_run_limit_decision(
         self,
@@ -6729,6 +6840,12 @@ class CayuApp:
             )
             for step in range(1, max_steps + 1):
                 await self._raise_if_session_interrupted(session.id)
+                for event in await self._deliver_queued_session_messages(
+                    session_id=session.id,
+                    messages=messages,
+                    include_on_idle=False,
+                ):
+                    yield event
                 async for event in limit_gate.evaluate_budget(messages=messages):
                     yield event
                 if limit_gate.tripped:
@@ -7114,6 +7231,29 @@ class CayuApp:
                                 redactor=self._secret_redactor,
                             )
                         )
+                        try:
+                            session = await self._complete_session_if_no_queued_messages(session.id)
+                        except SessionQueuedMessagesPending:
+                            (
+                                should_continue,
+                                queued_events,
+                            ) = await self._handle_queued_messages_before_completion(
+                                session=session,
+                                registered_agent=registered_agent,
+                                registered_environment=registered_environment,
+                                environment_name=environment_name,
+                                messages=messages,
+                                step=step,
+                                max_steps=max_steps,
+                                run_started_at=run_started_at,
+                                turn_usage_tracker=turn_usage_tracker,
+                                active_run=active_run,
+                            )
+                            for event in queued_events:
+                                yield event
+                            if not should_continue:
+                                return
+                            continue
                         break
                     yield await self._event_writer.emit(
                         _structured_output_event(
@@ -7191,6 +7331,31 @@ class CayuApp:
                                         redactor=self._secret_redactor,
                                     )
                                 )
+                                try:
+                                    session = await self._complete_session_if_no_queued_messages(
+                                        session.id
+                                    )
+                                except SessionQueuedMessagesPending:
+                                    (
+                                        should_continue,
+                                        queued_events,
+                                    ) = await self._handle_queued_messages_before_completion(
+                                        session=session,
+                                        registered_agent=registered_agent,
+                                        registered_environment=registered_environment,
+                                        environment_name=environment_name,
+                                        messages=messages,
+                                        step=step,
+                                        max_steps=max_steps,
+                                        run_started_at=run_started_at,
+                                        turn_usage_tracker=turn_usage_tracker,
+                                        active_run=active_run,
+                                    )
+                                    for event in queued_events:
+                                        yield event
+                                    if not should_continue:
+                                        return
+                                    continue
                                 break
                         else:
                             validation = structured_output_tool_required_validation()
@@ -7325,6 +7490,29 @@ class CayuApp:
                             raise RuntimeError(
                                 f"Before-stop policy failed session: {before_stop_decision.reason}"
                             )
+                    try:
+                        session = await self._complete_session_if_no_queued_messages(session.id)
+                    except SessionQueuedMessagesPending:
+                        (
+                            should_continue,
+                            queued_events,
+                        ) = await self._handle_queued_messages_before_completion(
+                            session=session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            environment_name=environment_name,
+                            messages=messages,
+                            step=step,
+                            max_steps=max_steps,
+                            run_started_at=run_started_at,
+                            turn_usage_tracker=turn_usage_tracker,
+                            active_run=active_run,
+                        )
+                        for event in queued_events:
+                            yield event
+                        if not should_continue:
+                            return
+                        continue
                     break
 
                 async for event in tool_round_runner.run(
@@ -7358,7 +7546,6 @@ class CayuApp:
                         registered_environment=registered_environment,
                     )
                 )
-            session = await self.session_store.update_status(session.id, SessionStatus.COMPLETED)
             yield await self._emit_turn_completed_once(
                 session=session,
                 registered_agent=registered_agent,
@@ -9312,6 +9499,50 @@ class CayuApp:
             session=interrupted_session,
             registered_agent=registered_agent,
             registered_environment=registered_environment,
+        ):
+            yield event
+
+    async def _stop_session_for_queued_input_step_limit(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        environment_name: str | None,
+        messages: list[Message],
+        step: int,
+        max_steps: int,
+        run_started_at: float,
+        turn_usage_tracker: _SessionUsageTracker,
+        active_run: _ActiveSessionRun | None,
+    ) -> AsyncIterator[Event]:
+        usage_summary = session_usage_summary(
+            session.id,
+            await self._session_usage_events(session.id),
+        )
+        decision = StopDecision(
+            limit=StopLimit.MODEL_STEPS,
+            maximum=max_steps,
+            actual=step,
+            message=(
+                "Run limit reached: durable queued input arrived after the final "
+                f"model step ({step} >= {max_steps})."
+            ),
+        )
+        async for event in self._stop_session_for_limit_reached(
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            environment_name=environment_name,
+            decision=decision,
+            usage_summary=usage_summary,
+            cost_summary=None,
+            messages=messages,
+            tool_calls=[],
+            completed_tool_outcomes=[],
+            run_started_at=run_started_at,
+            turn_usage_tracker=turn_usage_tracker,
+            active_run=active_run,
         ):
             yield event
 
