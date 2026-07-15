@@ -12,8 +12,7 @@ def test_package_shipped_authoring_and_diagnostic_guides_are_discoverable(capsys
     assert "An executable allowlist does not authorize its argument protocol" in authoring
     assert "do not replace container or microVM isolation" in authoring
     assert "workflow_tool_names" in authoring
-    assert "prompt_tool_alignment" in authoring
-    assert "registered_tool_names" in authoring
+    assert "registered for that same agent" in authoring
     assert "cannot prove prompt comprehension" in authoring
 
     assert main(["guide", "diagnostics"]) == 0

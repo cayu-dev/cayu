@@ -1,4 +1,4 @@
-"""Deterministic executable-specific selector boundary for benchmark evidence."""
+"""Deterministic executable-specific selector boundary for security regression tests."""
 
 from __future__ import annotations
 

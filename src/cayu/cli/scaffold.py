@@ -357,15 +357,6 @@ instructions, `AgentSpec.workflow_tool_names`, tests, and evals. `cayu check`
 compares the explicit workflow names with that agent's registered tool manifest;
 it never infers names from arbitrary prose.
 
-For a coding-repository one-shot benchmark, write `prompt_tool_alignment` as
-structured JSON. Copy one agent's exact `name` and `workflow_tool_names` from
-`cayu inspect --json`, and derive `registered_tool_names` from that same agent's
-`tools[].name` values. Then record `command`, `exit_code`, `schema_version`,
-`manifest_fingerprint`, and `diagnostics` from a successful
-`cayu check --json`. Never substitute generic or case-specific trajectory-eval
-output; this proves the explicit contract, not prompt comprehension or live
-model tool choice.
-
 Report static inspection, hermetic runtime tests, process-boundary checks, and
 credential-gated live checks separately. Do not claim live verification from
 successful imports, construction, mocks, or scripted providers. A

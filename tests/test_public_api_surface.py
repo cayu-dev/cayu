@@ -41,7 +41,7 @@ REQUIRED_TOP_LEVEL_EXPORTS = (
     "MicrosandboxCleanupError",
 )
 
-ONE_SHOT_TOP_LEVEL_EXPORTS = (
+MANIFEST_TOP_LEVEL_EXPORTS = (
     "AppManifest",
     "DiagnosticSeverity",
     "ProjectCheckReport",
@@ -49,7 +49,7 @@ ONE_SHOT_TOP_LEVEL_EXPORTS = (
     "check_manifest",
 )
 
-ONE_SHOT_RUNTIME_ONLY_EXPORTS = (
+MANIFEST_RUNTIME_ONLY_EXPORTS = (
     "APP_MANIFEST_SCHEMA_VERSION",
     "AVAILABLE_CHECK_TAGS",
     "BUILTIN_DIAGNOSTIC_CODES",
@@ -78,11 +78,11 @@ def test_required_names_are_declared_in_dunder_all() -> None:
         assert name in cayu.__all__, f"{name!r} missing from cayu.__all__"
 
 
-def test_one_shot_api_keeps_structural_types_out_of_the_root_namespace() -> None:
-    for name in ONE_SHOT_TOP_LEVEL_EXPORTS:
+def test_manifest_api_keeps_structural_types_out_of_the_root_namespace() -> None:
+    for name in MANIFEST_TOP_LEVEL_EXPORTS:
         assert hasattr(cayu, name), f"cayu.{name} is a supported entry point"
         assert name in cayu.__all__
-    for name in ONE_SHOT_RUNTIME_ONLY_EXPORTS:
+    for name in MANIFEST_RUNTIME_ONLY_EXPORTS:
         assert hasattr(cayu_runtime, name), f"cayu.runtime.{name} must remain public"
         assert not hasattr(cayu, name), f"cayu.{name} unnecessarily expands the root API"
         assert name not in cayu.__all__

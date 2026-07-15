@@ -16,7 +16,7 @@ import pytest
 from cayu.cli import main
 
 _ROOT = Path(__file__).parents[2]
-_FIXTURE_ROOT = _ROOT / "benchmarks" / "one_shot" / "fixtures" / "coding_repository"
+_FIXTURE_ROOT = _ROOT / "tests" / "fixtures" / "command_selector_boundary"
 _RUNNER = _FIXTURE_ROOT / "safe_selector_check.py"
 _CHECK_PROGRAM = _FIXTURE_ROOT / "fixture_check_program.py"
 _REPOSITORY = _FIXTURE_ROOT / "repository"

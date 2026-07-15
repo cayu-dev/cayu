@@ -1,7 +1,7 @@
 # Safe command-selector regression fixture
 
-This deterministic fixture exercises the coding-repository benchmark's
-selector boundary without a provider, network access, or a real test runner.
+This deterministic fixture exercises Cayu's recommended selector boundary
+without a provider, network access, or a real test runner.
 It is an executable-specific example, not a reusable argv policy language.
 
 The normal, linted `cayu.guides.command_selectors` module is the canonical

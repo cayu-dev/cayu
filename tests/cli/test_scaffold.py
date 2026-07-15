@@ -188,9 +188,7 @@ def test_cayu_new_emits_safe_agent_instructions_and_credential_free_proof(
     assert "cayu generate slice" in instructions
     assert "pytest" in instructions
     assert "cayu eval run evals.assistant:build_eval" in instructions
-    assert "prompt_tool_alignment" in instructions
-    assert "registered_tool_names" in instructions
-    assert "manifest_fingerprint" in instructions
+    assert "registered tool manifest" in instructions
     assert "Do not claim live verification" in instructions
 
 

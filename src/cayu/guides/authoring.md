@@ -239,16 +239,6 @@ scripted trajectory. Optional live-provider evidence may exercise comprehension
 and tool choice, but remains credential-gated and is not required for hermetic
 CI.
 
-For a coding-repository one-shot benchmark, write the
-`prompt_tool_alignment` evidence as schema-valid JSON. Copy one agent's exact
-`name` and `workflow_tool_names` from `cayu inspect --json`, and derive
-`registered_tool_names` from that same agent's `tools[].name` values. Then
-record `command`, `exit_code`, `schema_version`, `manifest_fingerprint`, and
-`diagnostics` from a successful `cayu check --json`. Do not substitute generic
-or case-specific trajectory-eval output. This artifact proves the explicit
-manifest/check contract, not natural language prompt comprehension or live
-model tool choice.
-
 Report evidence in four separate layers:
 
 1. static inspection and structured checks;
