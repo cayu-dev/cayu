@@ -1258,6 +1258,29 @@ A custom `Tool` uses those same services through `ctx`: `await ctx.runner.exec(E
 
 The built-in runner resolution contract is idempotent: `resolve_cwd(resolve_cwd(requested)) == resolve_cwd(requested)`. A relative path is resolved below `default_cwd`; an absolute path is accepted only when its normalized form is the runner root or a child of that root. This acceptance of contained absolute paths exists so the authorized canonical value can cross the tool/runner boundary; it does not permit arbitrary host or guest absolute paths. Custom runners that override `resolve_cwd()` must preserve the same idempotence and containment rules. Attaching a `CommandPolicy` requires that migrated resolver contract for every invocation, including one where the model omitted `cwd`: Cayu deliberately passes the authorized canonical default to `runner.exec(...)` instead of asking the runner to derive the default again after authorization. Existing `CommandPolicy` implementations need no code change if they only inspect `request.cwd`; that field still means the requested form. New or migrated containment logic should inspect `request.canonical_cwd` instead. The field is optional in the Pydantic model solely so previously serialized `CommandRequest` metadata remains loadable; policy requests created by `ExecCommandTool` always contain it.
 
+`ProcessCommandPolicy` is Cayu's reusable deny-by-default implementation of
+that seam. It matches process `argv[0]` against exact configured strings and
+requires the live canonical cwd to be a segment-aware child of a configured
+canonical root. It independently bounds model-supplied environment names and
+values, stdin, and timeout. Shell is a separate capability and remains denied
+when process executables are enabled. Denial and command-approval results name
+only the rejected category; they do not persist argv, environment values,
+stdin, command output, or credentials. `REQUIRE_COMMAND_APPROVAL` is the
+command-policy seam's inline refusal, not the app-level durable approval
+checkpoint. Applications needing durable pause/resume approval should use the
+agent's `ToolPolicy`.
+
+The general process policy deliberately does not interpret executable-specific
+arguments. A specialized policy composes through the existing `CommandPolicy`
+interface by delegating the common process decision, then applying its own
+bounded argv grammar. No generic policy graph, command DSL, runner-capability
+hierarchy, or protocol framework is implied. Programmable allowed executables
+can bypass argv-level intent restrictions after launch, and policy evaluation
+cannot replace operating-system, filesystem, or network isolation. Omitting a
+command policy preserves the unrestricted compatibility path: valid
+model-controlled arguments pass through to the runner subject to tool bounds
+and runner isolation.
+
 The first built-in tools are:
 
 - `read_file`: read text from the active workspace by `path`, capture workspace image/PDF files as artifact snapshots when an artifact store is configured, read text artifacts by `artifact_id`, or return provider-neutral image/PDF attachment references for capable providers

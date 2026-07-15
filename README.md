@@ -2581,28 +2581,29 @@ from configured source tools as untrusted by origin. Cayu derives prior taint
 from durable tool events and also handles a single model round such as
 `read_email` followed by `send_email` before either tool runs.
 
-An `ExecCommandTool` can also carry its own `CommandPolicy` to restrict *which*
-commands the model may run — the guardrail for a QA agent that runs a project's
-tests:
+An `ExecCommandTool` can carry a deny-by-default `ProcessCommandPolicy` to
+restrict *which* model-controlled commands may reach the runner:
 
 ```python
-from cayu import CommandPolicy, CommandPolicyDecision, CommandPolicyResult, ExecCommandTool
+from cayu import ExecCommandTool, ProcessCommandPolicy
 
-class QaCommandPolicy(CommandPolicy):
-    async def evaluate(self, ctx, request):
-        # Use canonical_cwd, not the model's request.cwd spelling, for any
-        # workspace-containment decision. ExecCommandTool runs in this exact path.
-        if request.canonical_cwd is None:  # only possible for legacy serialized metadata
-            return CommandPolicyResult(decision=CommandPolicyDecision.DENY, reason="no cwd")
-        if request.command.kind == "shell":  # no raw shell strings
-            return CommandPolicyResult(
-                decision=CommandPolicyDecision.DENY, reason="use kind='process' with argv"
-            )
-        if not request.command.argv or request.command.argv[0] not in {"pytest", "python3", "npm"}:
-            return CommandPolicyResult(decision=CommandPolicyDecision.DENY, reason="not allowed")
-        return CommandPolicyResult(decision=CommandPolicyDecision.ALLOW)
+policy = ProcessCommandPolicy(
+    # Executable strings match argv[0] exactly. "git" does not allow
+    # "./git", "/usr/bin/git", or a lookalike basename.
+    allowed_executables={"git"},
+    # These are canonical POSIX roots in the runner's namespace.
+    allowed_cwds={"/workspace/repository"},
+    # Model-supplied environment entries are denied unless named here.
+    allowed_env_names={"LANG"},
+    # A named entry can instead be restricted to one exact value.
+    allowed_env_values={"GIT_TERMINAL_PROMPT": "0"},
+    max_env_value_bytes=256,
+    # stdin is denied by default. This example keeps that default.
+    allow_stdin=False,
+    max_timeout_s=30,
+)
 
-tool = ExecCommandTool(policy=QaCommandPolicy())
+tool = ExecCommandTool(policy=policy)
 ```
 
 `request.cwd` preserves the original requested value for audit and policy
@@ -2612,6 +2613,30 @@ including when the request omitted `cwd`. Use the canonical value for containmen
 checks; built-in runners reject escaping relative traversal and absolute paths
 outside their configured root first. Attaching a command policy therefore
 requires a custom runner whose resolver accepts its own canonical output.
+
+The policy authorizes no executable, cwd root, environment name, stdin, or shell
+capability by default. Process executable identities use exact string matching;
+configure an absolute path if the deployment needs absolute invocation. Allowed
+roots use segment-aware containment. Model environment values and stdin are
+UTF-8 byte-bounded and never copied into denial reasons. `max_timeout_s` may be
+stricter than the tool's global 600-second input maximum. Shell source is a
+separate capability: setting `allowed_executables` never enables it. Hosts that
+deliberately need shell execution must set `shell_decision` explicitly, and must
+treat that as permission to execute arbitrary shell code rather than as argv
+authorization.
+
+Allowing a programmable executable such as Python, Node, a shell, a package
+manager, a build system, or a debugger lets that program perform behavior that
+an argv allowlist cannot constrain. This policy is an authorization layer, not
+filesystem, process, or network isolation; keep untrusted coding agents inside
+an appropriate container or microVM. Executable-specific restrictions can
+compose by implementing `CommandPolicy` and delegating the common controls to a
+`ProcessCommandPolicy` before evaluating that executable's argv protocol. Cayu
+does not provide a generic command-rule language.
+
+Without `policy=...`, the compatibility contract is intentionally unchanged:
+model-controlled command, cwd, environment, and stdin arguments pass to the
+runner subject to the tool's input bounds and the runner's own isolation.
 
 A `CommandPolicy` denial surfaces as a `tool.call.failed` event (see the note in
 Contract Rules on blocked-vs-failed). To gate a whole tool behind human approval,

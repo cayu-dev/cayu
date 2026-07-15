@@ -1,5 +1,6 @@
 """Framework-native tools."""
 
+from cayu.tools.command_policy import ProcessCommandPolicy
 from cayu.tools.commands import (
     CommandPolicy,
     CommandPolicyDecision,
@@ -52,6 +53,7 @@ __all__ = [
     "ListFilesTool",
     "ListKnowledgeTool",
     "PdfArtifactReader",
+    "ProcessCommandPolicy",
     "ReadFileOptions",
     "ReadFileTool",
     "ReadKnowledgeTool",
