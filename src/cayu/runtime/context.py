@@ -5,6 +5,7 @@ import json
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from enum import StrEnum
 from typing import Any
 
@@ -38,6 +39,7 @@ from cayu.core.messages import (
 )
 from cayu.core.tools import ToolSpec
 from cayu.providers.base import (
+    ModelContextOverflowError,
     ModelProvider,
     ModelProviderError,
     ModelRequest,
@@ -1766,6 +1768,21 @@ class _CompactionToolCallError(RuntimeError):
         )
 
 
+_COMPACTION_FAILURE_MODEL_COMPLETED_PAYLOADS: ContextVar[list[dict[str, Any]] | None] = ContextVar(
+    "compaction_failure_model_completed_payloads", default=None
+)
+
+
+def _record_compaction_failure_model_completed_payloads(
+    payloads: list[dict[str, Any]],
+) -> None:
+    """Record failed-attempt telemetry for the active runtime compaction call."""
+
+    sink = _COMPACTION_FAILURE_MODEL_COMPLETED_PAYLOADS.get()
+    if sink is not None:
+        sink.extend(copy_json_value(payloads, "model_completed_payloads"))
+
+
 class _PromptCacheCompactionMode(StrEnum):
     EXACT = "exact"
     BOUNDED = "bounded"
@@ -1914,21 +1931,28 @@ class PromptCacheCompactor(ContextCompactor):
                 retry_policy=self.retry_policy,
             )
         except _CompactionToolCallError as exc:
-            bounded_result = await self._compact_bounded(request, model=model)
-            bounded_metadata = copy_json_value(bounded_result.metadata, "bounded_metadata")
-            bounded_metadata["prompt_cache_exact_attempt"] = "rejected_tool_call"
-            return CompactionResult(
-                summary=bounded_result.summary,
-                metadata=bounded_metadata,
-                model_completed_payloads=[
-                    _rejected_compaction_tool_call_payload(
-                        error=exc,
-                        provider=self.provider,
-                        model=model,
-                        compactor=type(self).__name__,
-                    ),
-                    *bounded_result.model_completed_payloads,
-                ],
+            return await self._compact_bounded_after_exact_failure(
+                request,
+                model=model,
+                exact_attempt="rejected_tool_call",
+                exact_attempt_payload=_rejected_compaction_tool_call_payload(
+                    error=exc,
+                    provider=self.provider,
+                    model=model,
+                    compactor=type(self).__name__,
+                ),
+            )
+        except ModelContextOverflowError as exc:
+            return await self._compact_bounded_after_exact_failure(
+                request,
+                model=model,
+                exact_attempt="context_overflow",
+                exact_attempt_payload=_context_overflow_compaction_payload(
+                    error=exc,
+                    provider=self.provider,
+                    model=model,
+                    compactor=type(self).__name__,
+                ),
             )
         return _provider_compaction_result(
             summary=summary,
@@ -1943,6 +1967,30 @@ class PromptCacheCompactor(ContextCompactor):
                     options.get(RESOLVED_FILE_ATTACHMENTS_OPTION, {})
                 ),
             },
+        )
+
+    async def _compact_bounded_after_exact_failure(
+        self,
+        request: CompactionRequest,
+        *,
+        model: str,
+        exact_attempt: str,
+        exact_attempt_payload: dict[str, Any],
+    ) -> CompactionResult:
+        try:
+            bounded_result = await self._compact_bounded(request, model=model)
+        except Exception:
+            _record_compaction_failure_model_completed_payloads([exact_attempt_payload])
+            raise
+        bounded_metadata = copy_json_value(bounded_result.metadata, "bounded_metadata")
+        bounded_metadata["prompt_cache_exact_attempt"] = exact_attempt
+        return CompactionResult(
+            summary=bounded_result.summary,
+            metadata=bounded_metadata,
+            model_completed_payloads=[
+                exact_attempt_payload,
+                *bounded_result.model_completed_payloads,
+            ],
         )
 
     async def _compact_bounded(
@@ -2120,6 +2168,34 @@ def _rejected_compaction_tool_call_payload(
     return payload
 
 
+def _context_overflow_compaction_payload(
+    *,
+    error: ModelContextOverflowError,
+    provider: ModelProvider,
+    model: str,
+    compactor: str,
+) -> dict[str, Any]:
+    payload = _compaction_model_completed_payload(
+        completed_payload={},
+        provider_name=require_clean_nonblank(provider.name, "provider.name"),
+        fallback_model=model,
+        compactor=compactor,
+        usage_dialect=provider.usage_dialect,
+    )
+    payload.update(error.error_payload_fields())
+    payload.update(
+        {
+            "compaction_outcome": "context_overflow",
+            "context_overflow": True,
+            "error_type": type(error).__name__,
+            "usage_unavailable_reason": (
+                "exact prompt-cache compaction overflowed without provider completion usage"
+            ),
+        }
+    )
+    return payload
+
+
 class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
     """Checkpoint-backed context policy for long-running sessions.
 
@@ -2199,6 +2275,7 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
         checkpoint_update = None
         checkpoint_event_payload = None
         compaction_telemetry: list[ContextCompactionTelemetry] = []
+        failure_model_completed_payloads: list[dict[str, Any]] = []
         summary = previous_summary
         if should_compact:
             compaction_started = _compaction_telemetry(
@@ -2239,19 +2316,32 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                         cache_prefix_request = await request.build_cache_prefix_request(
                             extension_messages
                         )
-                result = await self.compactor.compact(
-                    CompactionRequest(
-                        session=request.session,
-                        agent=request.agent,
-                        messages=newly_compactable,
-                        existing_summary=previous_summary,
-                        metadata=request.metadata,
-                        context_messages=context_messages,
-                        cache_prefix_request=cache_prefix_request,
-                        force_bounded_compaction=force_bounded_compaction,
-                    )
+                failure_telemetry_token = _COMPACTION_FAILURE_MODEL_COMPLETED_PAYLOADS.set(
+                    failure_model_completed_payloads
                 )
+                try:
+                    result = await self.compactor.compact(
+                        CompactionRequest(
+                            session=request.session,
+                            agent=request.agent,
+                            messages=newly_compactable,
+                            existing_summary=previous_summary,
+                            metadata=request.metadata,
+                            context_messages=context_messages,
+                            cache_prefix_request=cache_prefix_request,
+                            force_bounded_compaction=force_bounded_compaction,
+                        )
+                    )
+                finally:
+                    _COMPACTION_FAILURE_MODEL_COMPLETED_PAYLOADS.reset(failure_telemetry_token)
             except Exception as exc:
+                compaction_telemetry.extend(
+                    ContextCompactionTelemetry(
+                        event_type=EventType.MODEL_COMPLETED,
+                        payload=payload,
+                    )
+                    for payload in failure_model_completed_payloads
+                )
                 compaction_telemetry.append(
                     _compaction_telemetry(
                         event_type=EventType.CONTEXT_COMPACTION_FAILED,

@@ -82,6 +82,14 @@ drains that provider completion to retain usage when available, records the
 rejected attempt, and makes one bounded request with no tools. If the provider
 does not complete the rejected attempt, its usage remains explicitly unavailable
 and therefore unpriced rather than disappearing from the attempt count.
+If the exact request instead raises a typed context-overflow error, Cayu records
+that exact attempt with `compaction_outcome=context_overflow` and explicitly
+unavailable usage, then makes exactly one bounded request without the cached
+prefix or exact-path tools. For either context-overflow or rejected-tool-call
+degradation, a failure from the bounded request is authoritative and does not
+trigger another fallback loop. The exact-attempt `model.completed` telemetry
+remains durable even when that bounded request fails, so the failed exact call
+does not disappear from usage, cost, budget, or model-step accounting.
 Later bounded calls merge `AgentSpec.provider_options` with the same compactor
 overrides, then remove attachment and structured-output enforcement fields.
 They retain the caller's `compaction_instruction` as their model system prompt

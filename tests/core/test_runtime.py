@@ -24575,12 +24575,364 @@ def test_prompt_cache_compactor_marks_unpriced_exact_tool_call_attempt():
 
     assert result.summary == "bounded summary"
     assert len(provider.requests) == 2
+    assert result.metadata["prompt_cache_exact_attempt"] == "rejected_tool_call"
     assert result.model_completed_payloads[0]["compaction_outcome"] == ("rejected_tool_call")
     assert result.model_completed_payloads[0]["usage_unavailable_reason"] == (
         "compaction tool-call attempt ended without provider completion usage"
     )
     assert "usage_metrics" not in result.model_completed_payloads[0]
     assert result.model_completed_payloads[1]["usage_metrics"]["input_tokens"] == 20
+
+
+def test_prompt_cache_compactor_bounds_exact_context_overflow_once():
+    provider = ContextOverflowProvider(
+        success_events=[
+            ModelStreamEvent.text_delta("bounded summary"),
+            ModelStreamEvent.completed(
+                {
+                    "finish_reason": "stop",
+                    "usage": {"input_tokens": 20, "output_tokens": 5},
+                }
+            ),
+        ]
+    )
+    compactor = PromptCacheCompactor(provider=provider)
+    exact_tool = {
+        "name": "exact_only_tool",
+        "description": "Only present on the cached request.",
+        "input_schema": {"type": "object", "properties": {}},
+    }
+    session = Session(
+        id="sess_prompt_cache_overflow",
+        agent_name="assistant",
+        provider_name=provider.name,
+        model="fake-model",
+    )
+
+    result = asyncio.run(
+        compactor.compact(
+            CompactionRequest(
+                session=session,
+                agent=AgentSpec(
+                    name="assistant",
+                    model="fake-model",
+                    provider_options={
+                        "bounded_only": {"enabled": True},
+                        RESOLVED_FILE_ATTACHMENTS_OPTION: {"remove": True},
+                    },
+                ),
+                messages=[Message.text("user", "bounded transcript only")],
+                context_messages=[Message.text("user", "context projection")],
+                cache_prefix_request=ModelRequest(
+                    model="fake-model",
+                    messages=[Message.text("user", "cached prefix only")],
+                    tools=[exact_tool],
+                    options={
+                        "exact_only": {"enabled": True},
+                        RESOLVED_FILE_ATTACHMENTS_OPTION: {"cached": True},
+                    },
+                ),
+            )
+        )
+    )
+
+    assert result.summary == "bounded summary"
+    assert result.metadata["prompt_cache_exact_attempt"] == "context_overflow"
+    assert len(provider.requests) == 2
+    exact_request, bounded_request = provider.requests
+    assert exact_request.tools == [exact_tool]
+    assert exact_request.options["exact_only"] == {"enabled": True}
+    assert RESOLVED_FILE_ATTACHMENTS_OPTION in exact_request.options
+    assert bounded_request.tools == []
+    assert bounded_request.options == {"bounded_only": {"enabled": True}}
+    bounded_text = "\n".join(
+        part.text
+        for message in bounded_request.messages
+        for part in message.content
+        if isinstance(part, TextPart)
+    )
+    assert "bounded transcript only" in bounded_text
+    assert "cached prefix only" not in bounded_text
+
+    exact_attempt = result.model_completed_payloads[0]
+    assert exact_attempt["compaction_outcome"] == "context_overflow"
+    assert exact_attempt["context_overflow"] is True
+    assert exact_attempt["error_type"] == "ModelContextOverflowError"
+    assert exact_attempt["provider"] == provider.name
+    assert exact_attempt["status_code"] == 400
+    assert exact_attempt["provider_error_code"] == "context_length_exceeded"
+    assert exact_attempt["retryable"] is False
+    assert exact_attempt["usage_unavailable_reason"] == (
+        "exact prompt-cache compaction overflowed without provider completion usage"
+    )
+    assert "usage" not in exact_attempt
+    assert "usage_metrics" not in exact_attempt
+    assert result.model_completed_payloads[1]["usage_metrics"]["input_tokens"] == 20
+
+
+def test_prompt_cache_compactor_surfaces_bounded_failure_after_exact_overflow():
+    provider = ContextOverflowProvider(
+        success_events=[ModelStreamEvent.error("bounded compaction failed")]
+    )
+    compactor = PromptCacheCompactor(provider=provider)
+    session = Session(
+        id="sess_prompt_cache_bounded_failure",
+        agent_name="assistant",
+        provider_name=provider.name,
+        model="fake-model",
+    )
+
+    with pytest.raises(RuntimeError, match="bounded compaction failed") as exc_info:
+        asyncio.run(
+            compactor.compact(
+                CompactionRequest(
+                    session=session,
+                    agent=AgentSpec(name="assistant", model="fake-model"),
+                    messages=[Message.text("user", "bounded transcript")],
+                    context_messages=[Message.text("user", "context projection")],
+                    cache_prefix_request=ModelRequest(
+                        model="fake-model",
+                        messages=[Message.text("user", "cached prefix")],
+                    ),
+                )
+            )
+        )
+
+    assert len(provider.requests) == 2
+    assert type(exc_info.value) is RuntimeError
+    assert str(exc_info.value) == "bounded compaction failed"
+
+
+def test_prompt_cache_compactor_does_not_loop_when_bounded_attempt_also_overflows():
+    provider = ContextOverflowProvider(overflow_requests=2)
+    compactor = PromptCacheCompactor(provider=provider)
+    session = Session(
+        id="sess_prompt_cache_double_overflow",
+        agent_name="assistant",
+        provider_name=provider.name,
+        model="fake-model",
+    )
+
+    with pytest.raises(RuntimeError, match="context too large") as exc_info:
+        asyncio.run(
+            compactor.compact(
+                CompactionRequest(
+                    session=session,
+                    agent=AgentSpec(name="assistant", model="fake-model"),
+                    messages=[Message.text("user", "bounded transcript")],
+                    context_messages=[Message.text("user", "context projection")],
+                    cache_prefix_request=ModelRequest(
+                        model="fake-model",
+                        messages=[Message.text("user", "cached prefix")],
+                    ),
+                )
+            )
+        )
+
+    assert len(provider.requests) == 2
+    assert isinstance(exc_info.value, ModelContextOverflowError)
+    assert exc_info.value.error_code == "context_length_exceeded"
+
+
+def test_prompt_cache_policy_exact_overflow_completes_with_bounded_result():
+    overflow = ModelContextOverflowError(
+        "context too large",
+        provider="fake",
+        status_code=400,
+        error_code="context_length_exceeded",
+    )
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first answer"),
+                ModelStreamEvent.completed({"usage": {"input_tokens": 10, "output_tokens": 2}}),
+            ],
+            [ModelStreamEvent.error(str(overflow), cause=overflow)],
+            [
+                ModelStreamEvent.text_delta("bounded summary"),
+                ModelStreamEvent.completed({"usage": {"input_tokens": 20, "output_tokens": 5}}),
+            ],
+            [
+                ModelStreamEvent.text_delta("second answer"),
+                ModelStreamEvent.completed({"usage": {"input_tokens": 8, "output_tokens": 2}}),
+            ],
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=PromptCacheCompactor(provider=provider),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    first_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_prompt_cache_policy_overflow_success",
+                messages=[Message.text("user", "first request")],
+            ),
+        )
+    )
+    assert first_events[-1].type == EventType.SESSION_COMPLETED
+
+    resume_events = asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_prompt_cache_policy_overflow_success",
+                messages=[Message.text("user", "second request")],
+            ),
+        )
+    )
+
+    assert len(provider.requests) == 4
+    exact_request, bounded_request = provider.requests[1:3]
+    exact_text = "\n".join(
+        part.text
+        for message in exact_request.messages
+        for part in message.content
+        if isinstance(part, TextPart)
+    )
+    assert "first request" in exact_text
+    assert "first answer" in exact_text
+    assert len(exact_request.messages) > 2
+    assert [message.role for message in bounded_request.messages] == [
+        MessageRole.SYSTEM,
+        MessageRole.USER,
+    ]
+    assert bounded_request.tools == []
+
+    compaction_attempts = [
+        event
+        for event in resume_events
+        if event.type == EventType.MODEL_COMPLETED
+        and event.payload.get("purpose") == "context_compaction"
+    ]
+    assert len(compaction_attempts) == 2
+    assert compaction_attempts[0].payload["compaction_outcome"] == "context_overflow"
+    assert "usage_metrics" not in compaction_attempts[0].payload
+    assert compaction_attempts[1].payload["usage_metrics"]["input_tokens"] == 20
+    completed = next(
+        event for event in resume_events if event.type == EventType.CONTEXT_COMPACTION_COMPLETED
+    )
+    assert completed.payload["metadata"]["prompt_cache_exact_attempt"] == "context_overflow"
+    assert EventType.CONTEXT_COMPACTION_FAILED not in [event.type for event in resume_events]
+    assert resume_events[-1].type == EventType.SESSION_COMPLETED
+
+
+def test_prompt_cache_compactor_records_exact_overflow_when_bounded_attempt_fails():
+    overflow = ModelContextOverflowError(
+        "context too large",
+        provider="fake",
+        status_code=400,
+        error_code="context_length_exceeded",
+    )
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first answer"),
+                ModelStreamEvent.completed({"usage": {"input_tokens": 10, "output_tokens": 2}}),
+            ],
+            [ModelStreamEvent.error(str(overflow), cause=overflow)],
+            [ModelStreamEvent.error("bounded compaction failed")],
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=PromptCacheCompactor(provider=provider),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    first_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_prompt_cache_failed_fallback_telemetry",
+                messages=[Message.text("user", "first request")],
+            ),
+        )
+    )
+    assert first_events[-1].type == EventType.SESSION_COMPLETED
+
+    resume_events = asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_prompt_cache_failed_fallback_telemetry",
+                messages=[Message.text("user", "second request")],
+            ),
+        )
+    )
+
+    assert len(provider.requests) == 3
+    compaction_events = [
+        event
+        for event in resume_events
+        if event.type
+        in {
+            EventType.CONTEXT_COMPACTION_STARTED,
+            EventType.MODEL_COMPLETED,
+            EventType.CONTEXT_COMPACTION_FAILED,
+        }
+    ]
+    assert [event.type for event in compaction_events] == [
+        EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.CONTEXT_COMPACTION_FAILED,
+    ]
+    exact_attempt = compaction_events[1]
+    assert exact_attempt.payload["purpose"] == "context_compaction"
+    assert exact_attempt.payload["compaction_outcome"] == "context_overflow"
+    assert exact_attempt.payload["usage_unavailable_reason"] == (
+        "exact prompt-cache compaction overflowed without provider completion usage"
+    )
+    assert "usage_metrics" not in exact_attempt.payload
+    failed_compaction = compaction_events[2]
+    assert failed_compaction.payload["error"] == "bounded compaction failed"
+    assert failed_compaction.payload["error_type"] == "RuntimeError"
+    assert resume_events[-1].type == EventType.SESSION_FAILED
+    assert resume_events[-1].payload == {
+        "error": "bounded compaction failed",
+        "error_type": "RuntimeError",
+    }
+    usage = asyncio.run(app.get_session_usage("sess_prompt_cache_failed_fallback_telemetry"))
+    assert usage.model_steps == 2
+    cost = asyncio.run(
+        app.get_session_cost(
+            "sess_prompt_cache_failed_fallback_telemetry",
+            PriceBook(
+                prices=(
+                    ModelPrice.fixed(
+                        provider_name="fake",
+                        model="fake-model",
+                        input_per_million=Decimal("1"),
+                        output_per_million=Decimal("10"),
+                    ),
+                )
+            ),
+        )
+    )
+    assert cost.model_steps == 2
+    assert cost.priced_model_steps == 1
+    assert cost.unpriced_model_steps == 1
+    assert cost.line_items[0].priced is True
+    assert cost.line_items[1].priced is False
+    assert cost.line_items[1].total_cost == Decimal("0")
+    assert cost.line_items[1].missing_pricing_reason == (
+        "model.completed event has no token usage metrics"
+    )
 
 
 def test_prompt_cache_compactor_fails_on_provider_error():
@@ -24602,6 +24954,8 @@ def test_prompt_cache_compactor_fails_on_provider_error():
                 )
             )
         )
+
+    assert len(provider.requests) == 1
 
 
 def test_prompt_cache_compactor_custom_instruction():

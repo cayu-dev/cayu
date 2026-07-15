@@ -29,6 +29,7 @@ from cayu import (
 from cayu.artifacts import RESOLVED_FILE_ATTACHMENTS_OPTION
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import ModelProvider, ModelProviderError, ModelRequest, ModelStreamEvent
+from cayu.runtime.context import ContextBuildError
 
 
 class RecordingProvider(ModelProvider):
@@ -105,6 +106,32 @@ class ToolCallFailureProvider(ModelProvider):
                 "usage": {"input_tokens": 20, "output_tokens": 5},
             }
         )
+
+
+class ToolThenBoundedProviderErrorProvider(ModelProvider):
+    name = "tool-then-bounded-error"
+
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+        self.bounded_error = ModelProviderError(
+            "bounded provider unavailable",
+            provider=self.name,
+            status_code=503,
+            error_code="service_unavailable",
+            retryable=False,
+            retry_after_s=2.5,
+        )
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            yield ModelStreamEvent.tool_call(
+                id="call_1",
+                name="inspect_report",
+                arguments={},
+            )
+            return
+        raise self.bounded_error
 
 
 class InspectReportTool(Tool):
@@ -538,6 +565,126 @@ def test_prompt_cache_compactor_degrades_when_exact_tool_call_stream_fails(
         "compaction tool-call attempt ended without provider completion usage"
     )
     assert "usage_metrics" not in result.model_completed_payloads[0]
+
+
+def test_prompt_cache_compactor_preserves_bounded_provider_error_after_tool_degradation() -> None:
+    provider = ToolThenBoundedProviderErrorProvider()
+    cached_request = ModelRequest(
+        model="claude-sonnet-4-6",
+        messages=[Message.text("user", "full cached context")],
+        tools=[
+            {
+                "name": "inspect_report",
+                "description": "Inspect a report.",
+                "input_schema": {"type": "object", "properties": {}},
+            }
+        ],
+    )
+
+    with pytest.raises(ModelProviderError) as exc_info:
+        asyncio.run(
+            PromptCacheCompactor(provider=provider).compact(
+                CompactionRequest(
+                    session=Session(
+                        id="prompt-cache-tool-call-bounded-provider-error",
+                        agent_name="assistant",
+                        provider_name=provider.name,
+                        model="claude-sonnet-4-6",
+                    ),
+                    agent=AgentSpec(name="assistant", model="claude-sonnet-4-6"),
+                    messages=[Message.text("user", "newly compactable context")],
+                    context_messages=cached_request.messages,
+                    cache_prefix_request=cached_request,
+                )
+            )
+        )
+
+    assert len(provider.requests) == 2
+    assert provider.requests[1].tools == []
+    assert exc_info.value is provider.bounded_error
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.error_code == "service_unavailable"
+    assert exc_info.value.retryable is False
+    assert exc_info.value.retry_after_s == 2.5
+
+
+def test_prompt_cache_compaction_failure_telemetry_is_invocation_scoped() -> None:
+    provider = ToolThenBoundedProviderErrorProvider()
+    policy = CheckpointCompactionContextPolicy(
+        compactor=PromptCacheCompactor(provider=provider),
+        max_user_turns=1,
+        compact_after_messages=2,
+    )
+    messages = [
+        Message.text("user", "old request"),
+        Message.text("assistant", "old answer"),
+        Message.text("user", "current request"),
+    ]
+
+    async def build_cache_prefix_request(context_messages: list[Message]) -> ModelRequest:
+        return ModelRequest(
+            model="claude-sonnet-4-6",
+            messages=context_messages,
+            tools=[
+                {
+                    "name": "inspect_report",
+                    "description": "Inspect a report.",
+                    "input_schema": {"type": "object", "properties": {}},
+                }
+            ],
+        )
+
+    def context_request(*, force_bounded_compaction: bool) -> ContextRequest:
+        return ContextRequest(
+            session=Session(
+                id="prompt-cache-failure-telemetry-scope",
+                agent_name="assistant",
+                provider_name=provider.name,
+                model="claude-sonnet-4-6",
+            ),
+            agent=AgentSpec(name="assistant", model="claude-sonnet-4-6"),
+            messages=messages,
+            step=1,
+            context_usage=ContextUsageState(
+                last_transcript_cursor=2,
+                last_provider_name=provider.name,
+                last_requested_model="claude-sonnet-4-6",
+            ),
+            build_cache_prefix_request=build_cache_prefix_request,
+            force_bounded_compaction=force_bounded_compaction,
+        )
+
+    with pytest.raises(ContextBuildError) as exact_failure:
+        asyncio.run(
+            policy.build_with_checkpoint(
+                context_request(force_bounded_compaction=False),
+                checkpoint=None,
+            )
+        )
+
+    assert exact_failure.value.cause is provider.bounded_error
+    assert [telemetry.event_type for telemetry in exact_failure.value.compaction_telemetry] == [
+        EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.CONTEXT_COMPACTION_FAILED,
+    ]
+
+    with pytest.raises(ContextBuildError) as bounded_only_failure:
+        asyncio.run(
+            policy.build_with_checkpoint(
+                context_request(force_bounded_compaction=True),
+                checkpoint=None,
+            )
+        )
+
+    assert len(provider.requests) == 3
+    assert bounded_only_failure.value.cause is provider.bounded_error
+    assert [
+        telemetry.event_type for telemetry in bounded_only_failure.value.compaction_telemetry
+    ] == [
+        EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.CONTEXT_COMPACTION_FAILED,
+    ]
 
 
 def test_prompt_cache_compactor_retains_usage_before_post_completion_stream_failure() -> None:
