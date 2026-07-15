@@ -779,9 +779,9 @@ HTTP(S) URLs with embedded credentials are rejected. For untrusted sandbox
 runners, avoid exposing long-lived Git credentials through generic shell access;
 use public repos, trusted host-side credentials, or a dedicated brokered Git tool.
 
-Docker and Docker Sandboxes (`sbx`) do not have dedicated native workspace
-adapters. Use `RunnerWorkspace` as the bound target so workspace file operations
-execute through the runner:
+Docker does not have a dedicated native workspace adapter. Use
+`RunnerWorkspace` as the bound target so workspace file operations execute
+through the runner:
 
 ```python
 from cayu import DockerRunner, RunnerWorkspace, SyncBinding

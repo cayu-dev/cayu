@@ -53,11 +53,6 @@ from cayu.runners.microsandbox import (
     MicrosandboxWorkspaceCapability,
     MicrosandboxWorkspaceEntry,
 )
-from cayu.runners.sbx import (
-    DEFAULT_SBX_CWD,
-    SbxCloseAction,
-    SbxRunner,
-)
 
 __all__ = [
     "DEFAULT_DOCKER_CWD",
@@ -70,7 +65,6 @@ __all__ = [
     "DEFAULT_MICROSANDBOX_REMOVE_TIMEOUT_SECONDS",
     "DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY",
     "DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY",
-    "DEFAULT_SBX_CWD",
     "E2B_SANDBOX_ID_MAX_BYTES",
     "MICROSANDBOX_LIVENESS_TIMEOUT_SECONDS",
     "MICROSANDBOX_NAME_MAX_BYTES",
@@ -101,7 +95,5 @@ __all__ = [
     "RunnerCleanupPolicy",
     "RunnerUnavailableError",
     "RunnerWorkspaceCapability",
-    "SbxCloseAction",
-    "SbxRunner",
     "attach_cancellation_artifacts",
 ]

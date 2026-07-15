@@ -48,7 +48,6 @@ _LIVE_CREDENTIAL_ENV = (
 _SUCCESS_STATUSES = frozenset({STATUS_HERMETIC, STATUS_VERIFIED})
 _PATH_ENV = {
     "docker": "CAYU_DOCKER_PATH",
-    "sbx": "CAYU_SBX_PATH",
 }
 
 
@@ -338,24 +337,6 @@ CHECKS: tuple[VerificationCheck, ...] = (
         requires_structured_evidence=True,
         structured_evidence_on_skip=_egress_scheduler_evidence("docker", STATUS_SKIPPED),
         structured_evidence_on_failure=_egress_scheduler_evidence("docker", STATUS_FAILED),
-    ),
-    VerificationCheck(
-        id="sbx-live-exec",
-        capability="sbx live command interruption",
-        lane="sbx",
-        command=("uv", "run", "python", "examples/sbx_interrupt_live.py"),
-        status_on_success=STATUS_VERIFIED,
-        prerequisites=("sbx CLI",),
-        required_commands=("sbx",),
-    ),
-    VerificationCheck(
-        id="sbx-live-sync",
-        capability="sbx SyncBinding round trip",
-        lane="sbx",
-        command=("uv", "run", "python", "examples/sbx_sync_binding_live.py"),
-        status_on_success=STATUS_VERIFIED,
-        prerequisites=("sbx CLI",),
-        required_commands=("sbx",),
     ),
     VerificationCheck(
         id="microsandbox-live-runner",

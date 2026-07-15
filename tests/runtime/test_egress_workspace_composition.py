@@ -116,7 +116,7 @@ class _LocalE2BFilesystem:
 
 class _LocalE2BSandbox:
     def __init__(self) -> None:
-        self.sandbox_id = "sbx_workspace_composition"
+        self.sandbox_id = "e2b_workspace_composition"
         self.files = _LocalE2BFilesystem()
 
 

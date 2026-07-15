@@ -472,7 +472,7 @@ deliberately *out of scope*:
 
 ## Credential modes on runners
 
-`LocalRunner`/`DockerRunner`/`SbxRunner` take `credential_mode` (default
+`LocalRunner`/`DockerRunner` take `credential_mode` (default
 `raw_env`) and `allow_raw_secret_env` (default `True`, backward-compatible). This
 runner-level mode gates raw injection only: raw `secret_env` is refused when
 `credential_mode` is any non-agent-readable mode (`trusted_tool` or
@@ -549,7 +549,7 @@ custom `EgressPolicy` when you need business-level limits such as spend caps.
 | `microsandbox` | Virtual credentials are enforced with a deny-by-default host policy allowing only the Cayu proxy port. Credentialless routes require a custom session-isolated exposure. |
 | `e2b` | Enforced with a dedicated E2B-reachable, IPv4-literal raw TCP proxy exposure and fail-closed preflight. Credentialless routes additionally require `credentialless_isolated=True`. |
 | `lambda-microvm` | Enforced in the integrated image: a VPC connector limits destinations, while a dedicated agent network namespace has no default route and can reach only a narrow relay to the Cayu proxy. Credentialless routes require a session-isolated exposure. |
-| `local`, `sbx` | Unsupported by the virtual-egress factory. Direct runner construction may still set `credential_mode` for raw-secret checks, but that is not an egress boundary. |
+| `local` | Unsupported by the virtual-egress factory. Direct runner construction may still set `credential_mode` for raw-secret checks, but that is not an egress boundary. |
 
 Notes on the Docker adapter:
 - The broker proxy binds a host-reachable interface so the sidecar can reach it via

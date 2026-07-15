@@ -8,8 +8,8 @@ built against [Modal](https://modal.com) Sandboxes, but the contract is the same
 for any backend.
 
 The built-in runners (`LocalRunner`, `DockerRunner`, `E2BRunner`,
-`MicrosandboxRunner`, `SbxRunner`) all implement this same contract; read their
-source in `src/cayu/runners/` alongside this guide.
+`MicrosandboxRunner`, `LambdaMicroVMRunner`) all implement this same contract;
+read their source in `src/cayu/runners/` alongside this guide.
 
 ## The Runner contract
 

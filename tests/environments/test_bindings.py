@@ -943,7 +943,7 @@ def test_runner_workspace_uses_lambda_microvm_id_as_stable_resource_identity() -
 
 
 def _offline_e2b_runner(default_cwd: str = "/home/user/workspace") -> E2BRunner:
-    return E2BRunner(object(), sandbox_id="sbx_same", default_cwd=default_cwd, e2b_module=object())
+    return E2BRunner(object(), sandbox_id="e2b_same", default_cwd=default_cwd, e2b_module=object())
 
 
 def test_runner_workspace_resource_key_matches_native_e2b_wrapper() -> None:

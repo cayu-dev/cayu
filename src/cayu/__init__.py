@@ -225,7 +225,6 @@ from cayu.runners import (
     DEFAULT_MICROSANDBOX_REMOVE_TIMEOUT_SECONDS,
     DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
     DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
-    DEFAULT_SBX_CWD,
     E2B_SANDBOX_ID_MAX_BYTES,
     MICROSANDBOX_LIVENESS_TIMEOUT_SECONDS,
     MICROSANDBOX_NAME_MAX_BYTES,
@@ -251,8 +250,6 @@ from cayu.runners import (
     RunnerCleanupPolicy,
     RunnerUnavailableError,
     RunnerWorkspaceCapability,
-    SbxCloseAction,
-    SbxRunner,
 )
 from cayu.runtime import (
     ANY_TAINT_LABEL,
@@ -663,7 +660,6 @@ __all__ = [
     "DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY",
     "DEFAULT_RUNNER_WORKSPACE_LIST_LIMIT",
     "DEFAULT_RUNNER_WORKSPACE_READ_LIMIT_BYTES",
-    "DEFAULT_SBX_CWD",
     "DEFAULT_WORKSPACE_INSTRUCTIONS_MAX_BYTES",
     "DEFAULT_WORKSPACE_INSTRUCTION_PATHS",
     "E2B_SANDBOX_ID_MAX_BYTES",
@@ -999,8 +995,6 @@ __all__ = [
     "SQLiteKnowledgeStore",
     "SQLiteSessionStore",
     "SQLiteTaskStore",
-    "SbxCloseAction",
-    "SbxRunner",
     "ScriptedModelProvider",
     "SearchKnowledgeTool",
     "SecretEnv",

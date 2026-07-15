@@ -31,7 +31,6 @@ from cayu.runners import (
     MicrosandboxRunner,
     Runner,
     RunnerCleanupPolicy,
-    SbxRunner,
     attach_cancellation_artifacts,
 )
 from cayu.runners._subprocess import SubprocessCommand, run_subprocess
@@ -96,30 +95,6 @@ async def _docker_cleanup_factory(
             "cayu-conformance",
             default_cwd=str(root),
             docker_path="/conformance/docker",
-            close_action="none",
-            cancellation_cleanup=cleanup_policy,
-            timeout_cleanup=cleanup_policy,
-        ),
-        root,
-    )
-
-
-async def _sbx_factory(root: Path, monkeypatch: pytest.MonkeyPatch) -> RunnerHarness:
-    return await _sbx_cleanup_factory(root, monkeypatch, "command")
-
-
-async def _sbx_cleanup_factory(
-    root: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    cleanup_policy: RunnerCleanupPolicy,
-) -> RunnerHarness:
-    monkeypatch.setattr("cayu.runners.sbx.run_subprocess", _run_cli_guest_locally)
-    return RunnerHarness(
-        SbxRunner(
-            "cayu-conformance",
-            mount_path=str(root),
-            default_cwd=str(root),
-            sbx_path="/conformance/sbx",
             close_action="none",
             cancellation_cleanup=cleanup_policy,
             timeout_cleanup=cleanup_policy,
@@ -827,14 +802,6 @@ DOCKER = RunnerConformanceRegistration(
     cleanup_factory=_docker_cleanup_factory,
 )
 
-SBX = RunnerConformanceRegistration(
-    name="sbx",
-    runner_type=SbxRunner,
-    factory=_sbx_factory,
-    capabilities=CLI_CAPABILITIES,
-    cleanup_factory=_sbx_cleanup_factory,
-)
-
 REMOTE_SANDBOX_CAPABILITIES = RunnerCapabilities(
     command_cleanup=CapabilityClaim.supported(),
     sandbox_cleanup=CapabilityClaim.supported(),
@@ -884,7 +851,7 @@ LAMBDA_MICROVM = RunnerConformanceRegistration(
     suspend_resume_probe=_probe_lambda_microvm_lifecycle,
 )
 
-REGISTRATIONS = (LOCAL, DOCKER, E2B, LAMBDA_MICROVM, MICROSANDBOX, SBX)
+REGISTRATIONS = (LOCAL, DOCKER, E2B, LAMBDA_MICROVM, MICROSANDBOX)
 CLEANUP_CASES = tuple(
     (registration, policy)
     for registration in REGISTRATIONS

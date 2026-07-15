@@ -93,7 +93,7 @@ class FakeE2BFs:
 
 class FakeSandbox:
     def __init__(self, fs: FakeE2BFs) -> None:
-        self.sandbox_id = "sbx_workspace"
+        self.sandbox_id = "e2b_workspace"
         self.files = fs
 
 

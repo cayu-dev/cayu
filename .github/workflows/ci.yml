@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: uv python install 3.11
-      - run: uv sync --frozen --extra dev --extra server --python 3.11
+      - run: uv sync --frozen --extra dev --extra server --extra browser --python 3.11
       - run: uv run ruff check src/ tests/ examples/ scripts/ maintenance/
       - run: uv run ruff format --check src/ tests/ examples/ scripts/ maintenance/
       - run: uv run ty check src/cayu examples maintenance

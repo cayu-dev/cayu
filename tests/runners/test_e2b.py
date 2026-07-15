@@ -120,7 +120,7 @@ class FakeCommands:
 
 
 class FakeSandbox:
-    def __init__(self, sandbox_id: str = "sbx_123") -> None:
+    def __init__(self, sandbox_id: str = "e2b_123") -> None:
         self.sandbox_id = sandbox_id
         self.commands = FakeCommands()
         self.kill_calls = 0
@@ -183,7 +183,7 @@ def test_e2b_runner_create_passes_e2b_lifecycle_options() -> None:
 
     runner = asyncio.run(run())
 
-    assert runner.sandbox_id == "sbx_123"
+    assert runner.sandbox_id == "e2b_123"
     assert runner.default_cwd == DEFAULT_E2B_CWD
     assert runner.close_action == "kill"
     assert FakeAsyncSandbox.created == [
@@ -210,7 +210,7 @@ def test_e2b_runner_from_existing_connects_without_claiming_lifecycle() -> None:
     async def run() -> E2BRunner:
         reset_fake_e2b()
         return await E2BRunner.from_existing(
-            "sbx_existing",
+            "e2b_existing",
             sandbox_timeout_s=300,
             e2b_module=FakeE2BModule,
             api_key="test",
@@ -218,10 +218,10 @@ def test_e2b_runner_from_existing_connects_without_claiming_lifecycle() -> None:
 
     runner = asyncio.run(run())
 
-    assert runner.sandbox_id == "sbx_existing"
+    assert runner.sandbox_id == "e2b_existing"
     assert runner.close_action == "none"
     assert FakeAsyncSandbox.connected == [
-        {"sandbox_id": "sbx_existing", "timeout": 300, "api_key": "test"}
+        {"sandbox_id": "e2b_existing", "timeout": 300, "api_key": "test"}
     ]
     assert runner._sandbox.commands.calls[0] == {
         "cmd": "mkdir -p /home/user/workspace",
@@ -234,14 +234,14 @@ def test_e2b_runner_from_existing_can_skip_default_cwd_setup() -> None:
     async def run() -> E2BRunner:
         reset_fake_e2b()
         return await E2BRunner.from_existing(
-            "sbx_existing",
+            "e2b_existing",
             ensure_default_cwd=False,
             e2b_module=FakeE2BModule,
         )
 
     runner = asyncio.run(run())
 
-    assert runner.sandbox_id == "sbx_existing"
+    assert runner.sandbox_id == "e2b_existing"
     assert runner._sandbox.commands.calls == []
 
 

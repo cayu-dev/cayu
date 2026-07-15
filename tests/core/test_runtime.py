@@ -3359,7 +3359,7 @@ def test_cayu_app_environment_factory_creates_environment_for_session(tmp_path):
         workspace = LocalWorkspace(workspace_root, workspace_id="factory-workspace")
         factory = RecordingEnvironmentFactory(
             Environment(EnvironmentSpec(name="dynamic"), workspace=workspace),
-            metadata={"sandbox_id": "sbx_123"},
+            metadata={"sandbox_id": "sandbox_123"},
         )
         provider = FakeProvider(
             [
@@ -3425,7 +3425,7 @@ def test_cayu_app_environment_factory_creates_environment_for_session(tmp_path):
         "causal_budget_id": "sess_factory",
         "labels": {"project": "alpha"},
         "environment_name": "dynamic",
-        "result_metadata": {"sandbox_id": "sbx_123"},
+        "result_metadata": {"sandbox_id": "sandbox_123"},
         "reconnect_metadata": {},
     }
     assert len(factory.requests) == 1
@@ -3443,7 +3443,7 @@ def test_environment_factory_completion_payload_is_isolated_from_started_event()
     async def run():
         factory = RecordingEnvironmentFactory(
             Environment(EnvironmentSpec(name="dynamic")),
-            metadata={"sandbox_id": "sbx_isolated"},
+            metadata={"sandbox_id": "sandbox_isolated"},
         )
         app = CayuApp(enable_logging=False)
         app.register_provider(
@@ -4538,7 +4538,7 @@ def test_cayu_app_fork_preserves_an_explicit_non_default_environment():
         store = InMemorySessionStore()
         factory = RecordingEnvironmentFactory(
             Environment(EnvironmentSpec(name="optional")),
-            reconnect_metadata={"sandbox_id": "sbx_source"},
+            reconnect_metadata={"sandbox_id": "sandbox_source"},
         )
         provider = FakeProvider(
             [
@@ -4593,7 +4593,7 @@ def test_cayu_app_fork_preserves_an_explicit_non_default_environment():
     assert factory.requests[1].session_id == "sess_non_default_environment_child"
     assert factory.requests[1].parent_session_id == "sess_non_default_environment_source"
     assert factory.requests[1].environment_name == "optional"
-    assert factory.requests[1].reconnect_metadata == {"sandbox_id": "sbx_source"}
+    assert factory.requests[1].reconnect_metadata == {"sandbox_id": "sandbox_source"}
     assert child is not None
     assert child.environment_name == "optional"
     assert fork_events[0].environment_name == "optional"
@@ -4707,7 +4707,7 @@ def test_cayu_app_environment_factory_reconnect_metadata_round_trips_on_resume(t
                 EnvironmentSpec(name="dynamic"),
                 workspace=LocalWorkspace(workspace_root, workspace_id="dynamic-workspace"),
             ),
-            reconnect_metadata={"sandbox_id": "sbx_1"},
+            reconnect_metadata={"sandbox_id": "sandbox_1"},
         )
         provider = FakeProvider(
             [
@@ -4738,7 +4738,7 @@ def test_cayu_app_environment_factory_reconnect_metadata_round_trips_on_resume(t
                 messages=[Message.text("user", "run")],
             ),
         )
-        factory.reconnect_metadata = {"sandbox_id": "sbx_1", "generation": 2}
+        factory.reconnect_metadata = {"sandbox_id": "sandbox_1", "generation": 2}
         resume_events = [
             event
             async for event in app.resume(
@@ -4760,15 +4760,15 @@ def test_cayu_app_environment_factory_reconnect_metadata_round_trips_on_resume(t
     ]
     assert [request.reconnect_metadata for request in factory.requests] == [
         {},
-        {"sandbox_id": "sbx_1"},
+        {"sandbox_id": "sandbox_1"},
     ]
     assert [event.payload["reconnect_metadata"] for event in completed_events] == [
-        {"sandbox_id": "sbx_1"},
-        {"sandbox_id": "sbx_1", "generation": 2},
+        {"sandbox_id": "sandbox_1"},
+        {"sandbox_id": "sandbox_1", "generation": 2},
     ]
     assert checkpoint is not None
     assert checkpoint["environment_factory_reconnect"] == {
-        "dynamic": {"sandbox_id": "sbx_1", "generation": 2}
+        "dynamic": {"sandbox_id": "sandbox_1", "generation": 2}
     }
 
 
@@ -4784,7 +4784,7 @@ def test_cayu_app_environment_factory_reconnect_metadata_survives_context_checkp
                 EnvironmentSpec(name="dynamic"),
                 workspace=LocalWorkspace(workspace_root, workspace_id="dynamic-workspace"),
             ),
-            reconnect_metadata={"sandbox_id": "sbx_compaction"},
+            reconnect_metadata={"sandbox_id": "sandbox_compaction"},
         )
         provider = FakeProvider(
             [
@@ -4846,12 +4846,12 @@ def test_cayu_app_environment_factory_reconnect_metadata_survives_context_checkp
 
     assert first_checkpoint is not None
     assert first_checkpoint["environment_factory_reconnect"] == {
-        "dynamic": {"sandbox_id": "sbx_compaction"}
+        "dynamic": {"sandbox_id": "sandbox_compaction"}
     }
     assert "context_compaction" in first_checkpoint
     assert [request.reconnect_metadata for request in factory.requests] == [
         {},
-        {"sandbox_id": "sbx_compaction"},
+        {"sandbox_id": "sandbox_compaction"},
     ]
 
 
@@ -5515,7 +5515,7 @@ def test_cayu_app_recovery_resolves_factory_before_resume_events(tmp_path):
                 EnvironmentSpec(name="dynamic"),
                 workspace=LocalWorkspace(workspace_root, workspace_id="factory-workspace"),
             ),
-            reconnect_metadata={"sandbox_id": "sbx_recovery"},
+            reconnect_metadata={"sandbox_id": "sandbox_recovery"},
         )
         provider = FakeProvider(
             [
@@ -5571,7 +5571,7 @@ def test_cayu_app_recovery_resolves_factory_before_resume_events(tmp_path):
                 decision=ToolApprovalDecision.APPROVE,
             ),
         )
-        factory.reconnect_metadata = {"sandbox_id": "sbx_recovery", "generation": 2}
+        factory.reconnect_metadata = {"sandbox_id": "sandbox_recovery", "generation": 2}
         recovery_events = await collect_tool_approval_recovery_events(
             app,
             ToolApprovalRecoveryRequest(
@@ -5604,12 +5604,12 @@ def test_cayu_app_recovery_resolves_factory_before_resume_events(tmp_path):
     assert len(factory.requests) == 3
     assert [request.reconnect_metadata for request in factory.requests] == [
         {},
-        {"sandbox_id": "sbx_recovery"},
-        {"sandbox_id": "sbx_recovery"},
+        {"sandbox_id": "sandbox_recovery"},
+        {"sandbox_id": "sandbox_recovery"},
     ]
     assert checkpoint is not None
     assert checkpoint["environment_factory_reconnect"] == {
-        "dynamic": {"sandbox_id": "sbx_recovery", "generation": 2}
+        "dynamic": {"sandbox_id": "sandbox_recovery", "generation": 2}
     }
 
 
