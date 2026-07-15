@@ -113,6 +113,7 @@ from cayu.runtime import (
     IncompleteSessionRecoveryRequest,
     IncompleteSessionsRecoveryRequest,
     InMemoryBudgetLedger,
+    InMemoryBudgetStore,
     InMemoryEventSink,
     InMemorySessionStore,
     InMemoryTaskStore,
@@ -25317,7 +25318,7 @@ def test_prompt_cache_compactor_does_not_loop_when_bounded_attempt_also_overflow
     assert exc_info.value.error_code == "context_length_exceeded"
 
 
-def test_prompt_cache_policy_exact_overflow_completes_with_bounded_result():
+def test_prompt_cache_policy_deduplicates_exact_overflow_and_completes_with_bounded_result():
     overflow = ModelContextOverflowError(
         "context too large",
         provider="fake",
@@ -25397,16 +25398,31 @@ def test_prompt_cache_policy_exact_overflow_completes_with_bounded_result():
         if event.type == EventType.MODEL_COMPLETED
         and event.payload.get("purpose") == "context_compaction"
     ]
+    # The exact attempt is both recorded before fallback and returned by the compactor.
+    # Its preserved internal attempt id must replace, rather than duplicate, that event.
     assert len(compaction_attempts) == 2
+    assert (
+        sum(
+            event.payload.get("compaction_outcome") == "context_overflow"
+            for event in compaction_attempts
+        )
+        == 1
+    )
     assert compaction_attempts[0].payload["compaction_outcome"] == "context_overflow"
+    assert "compaction_attempt_id" not in compaction_attempts[0].payload
     assert "usage_metrics" not in compaction_attempts[0].payload
     assert compaction_attempts[1].payload["usage_metrics"]["input_tokens"] == 20
+    assert "compaction_attempt_id" not in compaction_attempts[1].payload
     completed = next(
         event for event in resume_events if event.type == EventType.CONTEXT_COMPACTION_COMPLETED
     )
     assert completed.payload["metadata"]["prompt_cache_exact_attempt"] == "context_overflow"
     assert EventType.CONTEXT_COMPACTION_FAILED not in [event.type for event in resume_events]
     assert resume_events[-1].type == EventType.SESSION_COMPLETED
+    usage = asyncio.run(app.get_session_usage("sess_prompt_cache_policy_overflow_success"))
+    assert usage.model_steps == 4
+    assert usage.usage.input_tokens == 38
+    assert usage.usage.output_tokens == 9
 
 
 def test_prompt_cache_compactor_records_exact_overflow_when_bounded_attempt_fails():
@@ -25516,6 +25532,100 @@ def test_prompt_cache_compactor_records_exact_overflow_when_bounded_attempt_fail
     assert cost.line_items[1].missing_pricing_reason == (
         "model.completed event has no token usage metrics"
     )
+
+
+def test_prompt_cache_compactor_preserves_attempt_order_after_recovered_invalid_summary():
+    class RecoveringPromptCacheCompactor(PromptCacheCompactor):
+        async def compact(self, request: CompactionRequest) -> CompactionResult:
+            try:
+                await ModelCompactor(
+                    provider=self.provider,
+                    model=request.session.model,
+                ).compact(request)
+            except ValueError:
+                return await super().compact(request)
+            raise AssertionError("the first compaction unexpectedly returned a valid summary")
+
+    overflow = ModelContextOverflowError(
+        "context too large",
+        provider="fake",
+        status_code=400,
+        error_code="context_length_exceeded",
+    )
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first answer"),
+                ModelStreamEvent.completed({"usage": {"input_tokens": 10, "output_tokens": 2}}),
+            ],
+            [ModelStreamEvent.completed({"usage": {"input_tokens": 15, "output_tokens": 0}})],
+            [ModelStreamEvent.error(str(overflow), cause=overflow)],
+            [
+                ModelStreamEvent.text_delta(" \n\t"),
+                ModelStreamEvent.completed({"usage": {"input_tokens": 20, "output_tokens": 1}}),
+            ],
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=RecoveringPromptCacheCompactor(provider=provider),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    first_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_prompt_cache_invalid_bounded_summary",
+                messages=[Message.text("user", "first request")],
+            ),
+        )
+    )
+    assert first_events[-1].type == EventType.SESSION_COMPLETED
+
+    resume_events = asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_prompt_cache_invalid_bounded_summary",
+                messages=[Message.text("user", "second request")],
+            ),
+        )
+    )
+
+    compaction_events = [
+        event
+        for event in resume_events
+        if event.type
+        in {
+            EventType.CONTEXT_COMPACTION_STARTED,
+            EventType.MODEL_COMPLETED,
+            EventType.CONTEXT_COMPACTION_FAILED,
+        }
+    ]
+    assert [event.type for event in compaction_events] == [
+        EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.MODEL_COMPLETED,
+        EventType.MODEL_COMPLETED,
+        EventType.CONTEXT_COMPACTION_FAILED,
+    ]
+    recovered_attempt, exact_attempt, bounded_attempt = compaction_events[1:4]
+    assert recovered_attempt.payload["compaction_outcome"] == "invalid_summary"
+    assert recovered_attempt.payload["usage_metrics"]["input_tokens"] == 15
+    assert exact_attempt.payload["compaction_outcome"] == "context_overflow"
+    assert "usage_metrics" not in exact_attempt.payload
+    assert bounded_attempt.payload["compaction_outcome"] == "invalid_summary"
+    assert bounded_attempt.payload["usage_metrics"]["input_tokens"] == 20
+    assert bounded_attempt.payload["usage_metrics"]["output_tokens"] == 1
+    assert compaction_events[-1].payload["error"] == "`summary` cannot be blank."
+    assert resume_events[-1].type == EventType.SESSION_FAILED
 
 
 def test_prompt_cache_compactor_fails_on_provider_error():
@@ -26024,6 +26134,894 @@ def test_cayu_app_counts_compaction_model_spend_in_session_usage():
     assert summary.usage.input_tokens == 50
     assert summary.usage.output_tokens == 10
     assert summary.usage.total_tokens == 60
+
+
+def test_cayu_app_keeps_invalid_summary_spend_when_custom_compactor_recovers():
+    class RecoveringCompactor(ContextCompactor):
+        def __init__(self, provider: ModelProvider) -> None:
+            self.provider = provider
+
+        async def compact(self, request: CompactionRequest) -> CompactionResult:
+            try:
+                await ModelCompactor(
+                    provider=self.provider,
+                    model="invalid-summary-model",
+                ).compact(request)
+            except ValueError:
+                return CompactionResult(
+                    summary="recovered summary",
+                    model_completed_payloads=[
+                        {
+                            "model": "fallback-summary-model",
+                            "provider_name": "custom",
+                            "requested_model": "fallback-summary-model",
+                            "purpose": "context_compaction",
+                            "compactor": type(self).__name__,
+                            "usage_metrics": {
+                                "provider_name": "custom",
+                                "requested_model": "fallback-summary-model",
+                                "model": "fallback-summary-model",
+                                "input_tokens": 40,
+                                "output_tokens": 2,
+                                "total_tokens": 42,
+                                "reasoning_output_tokens": 0,
+                                "cache": {
+                                    "read_tokens": 0,
+                                    "write_tokens": 0,
+                                    "cached_input_tokens": 0,
+                                    "uncached_input_tokens": 40,
+                                },
+                            },
+                        }
+                    ],
+                )
+            raise AssertionError("the first compaction unexpectedly returned a valid summary")
+
+    store = InMemorySessionStore()
+    budget_store = InMemoryBudgetStore()
+    compactor_provider = FakeProvider(
+        [
+            ModelStreamEvent.completed(
+                {
+                    "model": "invalid-summary-model",
+                    "usage": {"input_tokens": 100, "output_tokens": 0},
+                }
+            )
+        ]
+    )
+    runtime_provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed({"usage": {"input_tokens": 3, "output_tokens": 1}}),
+        ]
+    )
+    app = CayuApp(session_store=store, budget_store=budget_store)
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=RecoveringCompactor(compactor_provider),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_recovered_invalid_compaction_summary",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    completed_events = [event for event in events if event.type == EventType.MODEL_COMPLETED]
+    assert len(completed_events) == 3
+    invalid_attempt, fallback_attempt, runtime_completed = completed_events
+    assert invalid_attempt.payload["compaction_outcome"] == "invalid_summary"
+    assert invalid_attempt.payload["usage_metrics"]["input_tokens"] == 100
+    assert fallback_attempt.payload["requested_model"] == "fallback-summary-model"
+    assert fallback_attempt.payload["usage_metrics"]["input_tokens"] == 40
+    assert "compaction_attempt_id" not in invalid_attempt.payload
+    assert "compaction_attempt_id" not in fallback_attempt.payload
+    assert events[-1].type == EventType.SESSION_COMPLETED
+
+    usage = asyncio.run(app.get_session_usage("sess_recovered_invalid_compaction_summary"))
+    assert usage.model_steps == 3
+    assert usage.usage.input_tokens == 143
+    assert usage.usage.output_tokens == 3
+    budget_events = asyncio.run(
+        budget_store.load_events_for_budget(
+            scope="app",
+            key=None,
+            window=BudgetWindow.all_time(),
+        )
+    )
+    assert [event.id for event in budget_events] == [
+        invalid_attempt.id,
+        fallback_attempt.id,
+        runtime_completed.id,
+    ]
+
+
+def test_cayu_app_keeps_successful_inner_compaction_spend_when_wrapper_fails():
+    class FailingWrapperCompactor(ContextCompactor):
+        def __init__(self, provider: ModelProvider) -> None:
+            self.provider = provider
+
+        async def compact(self, request: CompactionRequest) -> CompactionResult:
+            await ModelCompactor(provider=self.provider, model="summary-model").compact(request)
+            raise RuntimeError("wrapper post-processing failed")
+
+    store = InMemorySessionStore()
+    budget_store = InMemoryBudgetStore()
+    compactor_provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("valid inner summary"),
+            ModelStreamEvent.completed(
+                {
+                    "model": "summary-model",
+                    "usage": {"input_tokens": 10, "output_tokens": 2},
+                }
+            ),
+        ]
+    )
+    runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
+    app = CayuApp(session_store=store, budget_store=budget_store)
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=FailingWrapperCompactor(compactor_provider),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_failed_compaction_wrapper",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.CONTEXT_COMPACTION_FAILED,
+        EventType.TURN_COMPLETED,
+        EventType.SESSION_FAILED,
+    ]
+    completed = events[2]
+    assert completed.payload["usage_metrics"]["input_tokens"] == 10
+    assert completed.payload["usage_metrics"]["output_tokens"] == 2
+    assert events[3].payload["error"] == "wrapper post-processing failed"
+    assert runtime_provider.requests == []
+    usage = asyncio.run(app.get_session_usage("sess_failed_compaction_wrapper"))
+    assert usage.model_steps == 1
+    assert usage.usage.total_tokens == 12
+    budget_events = asyncio.run(
+        budget_store.load_events_for_budget(
+            scope="app",
+            key=None,
+            window=BudgetWindow.all_time(),
+        )
+    )
+    assert [event.id for event in budget_events] == [completed.id]
+
+
+def test_cayu_app_keeps_compaction_completion_when_stream_fails_after_completed():
+    class CompletedThenFailingProvider(ModelProvider):
+        name = "fake"
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            del request
+            yield ModelStreamEvent.text_delta("completed summary")
+            yield ModelStreamEvent.completed(
+                {
+                    "model": "summary-model",
+                    "usage": {"input_tokens": 14, "output_tokens": 2},
+                }
+            )
+            raise RuntimeError("stream teardown failed")
+
+    budget_store = InMemoryBudgetStore()
+    runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
+    app = CayuApp(budget_store=budget_store)
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=CompletedThenFailingProvider(),
+                model="summary-model",
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_compaction_stream_teardown_failure",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    completed_events = [event for event in events if event.type == EventType.MODEL_COMPLETED]
+    assert len(completed_events) == 1
+    completed = completed_events[0]
+    assert completed.payload["usage_metrics"]["input_tokens"] == 14
+    assert completed.payload["usage_metrics"]["output_tokens"] == 2
+    assert "compaction_attempt_id" not in completed.payload
+    failed = next(event for event in events if event.type == EventType.CONTEXT_COMPACTION_FAILED)
+    assert failed.payload["error"] == "stream teardown failed"
+    assert runtime_provider.requests == []
+    usage = asyncio.run(app.get_session_usage("sess_compaction_stream_teardown_failure"))
+    assert usage.model_steps == 1
+    assert usage.usage.total_tokens == 16
+    budget_events = asyncio.run(
+        budget_store.load_events_for_budget(
+            scope="app",
+            key=None,
+            window=BudgetWindow.all_time(),
+        )
+    )
+    assert [event.id for event in budget_events] == [completed.id]
+
+
+def test_cayu_app_preserves_provider_order_when_wrapper_recovers_earlier_draft():
+    class DraftRecoveringCompactor(ContextCompactor):
+        def __init__(self, provider: ModelProvider) -> None:
+            self.provider = provider
+
+        async def compact(self, request: CompactionRequest) -> CompactionResult:
+            draft = await ModelCompactor(
+                provider=self.provider,
+                model="draft-model",
+            ).compact(request)
+            try:
+                await ModelCompactor(
+                    provider=self.provider,
+                    model="refinement-model",
+                ).compact(request)
+            except ValueError:
+                return draft
+            raise AssertionError("the refinement unexpectedly returned a valid summary")
+
+    budget_store = InMemoryBudgetStore()
+    compactor_provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("usable draft"),
+                ModelStreamEvent.completed(
+                    {
+                        "model": "draft-model",
+                        "usage": {"input_tokens": 10, "output_tokens": 1},
+                    }
+                ),
+            ],
+            [
+                ModelStreamEvent.text_delta(" \n\t"),
+                ModelStreamEvent.completed(
+                    {
+                        "model": "refinement-model",
+                        "usage": {"input_tokens": 20, "output_tokens": 2},
+                    }
+                ),
+            ],
+        ]
+    )
+    runtime_provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed({"usage": {"input_tokens": 3, "output_tokens": 1}}),
+        ]
+    )
+    app = CayuApp(budget_store=budget_store)
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=DraftRecoveringCompactor(compactor_provider),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_recovered_compaction_draft",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    completed_events = [event for event in events if event.type == EventType.MODEL_COMPLETED]
+    assert len(completed_events) == 3
+    draft, refinement, runtime_completed = completed_events
+    assert draft.payload["requested_model"] == "draft-model"
+    assert draft.payload["usage_metrics"]["input_tokens"] == 10
+    assert refinement.payload["requested_model"] == "refinement-model"
+    assert refinement.payload["compaction_outcome"] == "invalid_summary"
+    assert refinement.payload["usage_metrics"]["input_tokens"] == 20
+    assert runtime_completed.payload["usage_metrics"]["input_tokens"] == 3
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    usage = asyncio.run(app.get_session_usage("sess_recovered_compaction_draft"))
+    assert usage.model_steps == 3
+    assert usage.usage.input_tokens == 33
+    assert usage.usage.output_tokens == 4
+    budget_events = asyncio.run(
+        budget_store.load_events_for_budget(
+            scope="app",
+            key=None,
+            window=BudgetWindow.all_time(),
+        )
+    )
+    assert [event.id for event in budget_events] == [event.id for event in completed_events]
+
+
+def test_cayu_app_inserts_returned_only_completion_before_anchored_inner_call():
+    class ReturnedFirstCompactor(ContextCompactor):
+        def __init__(self, provider: ModelProvider) -> None:
+            self.provider = provider
+
+        async def compact(self, request: CompactionRequest) -> CompactionResult:
+            inner = await ModelCompactor(
+                provider=self.provider,
+                model="inner-model",
+            ).compact(request)
+            return CompactionResult(
+                summary=inner.summary,
+                model_completed_payloads=[
+                    {
+                        "model": "custom-model",
+                        "provider_name": "custom",
+                        "requested_model": "custom-model",
+                        "purpose": "context_compaction",
+                        "compactor": type(self).__name__,
+                        "usage_metrics": {
+                            "provider_name": "custom",
+                            "requested_model": "custom-model",
+                            "model": "custom-model",
+                            "input_tokens": 10,
+                            "output_tokens": 1,
+                            "total_tokens": 11,
+                            "reasoning_output_tokens": 0,
+                            "cache": {
+                                "read_tokens": 0,
+                                "write_tokens": 0,
+                                "cached_input_tokens": 0,
+                                "uncached_input_tokens": 10,
+                            },
+                        },
+                    },
+                    *inner.model_completed_payloads,
+                ],
+            )
+
+    budget_store = InMemoryBudgetStore()
+    compactor_provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("inner summary"),
+            ModelStreamEvent.completed(
+                {
+                    "model": "inner-model",
+                    "usage": {"input_tokens": 20, "output_tokens": 2},
+                }
+            ),
+        ]
+    )
+    runtime_provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed({"usage": {"input_tokens": 3, "output_tokens": 1}}),
+        ]
+    )
+    app = CayuApp(budget_store=budget_store)
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ReturnedFirstCompactor(compactor_provider),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_returned_completion_before_inner",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    completed_events = [event for event in events if event.type == EventType.MODEL_COMPLETED]
+    assert len(completed_events) == 3
+    returned_only, inner, runtime_completed = completed_events
+    assert returned_only.payload["requested_model"] == "custom-model"
+    assert returned_only.payload["usage_metrics"]["input_tokens"] == 10
+    assert inner.payload["requested_model"] == "inner-model"
+    assert inner.payload["usage_metrics"]["input_tokens"] == 20
+    assert runtime_completed.payload["usage_metrics"]["input_tokens"] == 3
+    usage = asyncio.run(app.get_session_usage("sess_returned_completion_before_inner"))
+    assert usage.model_steps == 3
+    assert usage.usage.input_tokens == 33
+    assert usage.usage.output_tokens == 4
+    budget_events = asyncio.run(
+        budget_store.load_events_for_budget(
+            scope="app",
+            key=None,
+            window=BudgetWindow.all_time(),
+        )
+    )
+    assert [event.id for event in budget_events] == [event.id for event in completed_events]
+
+
+def test_cayu_app_retains_safe_usage_when_completion_metadata_is_not_durable():
+    store = InMemorySessionStore()
+    budget_store = InMemoryBudgetStore()
+    compactor_provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("valid summary"),
+            ModelStreamEvent.completed(
+                {
+                    "model": "summary-model",
+                    "usage": {"input_tokens": 30, "output_tokens": 4},
+                    "provider_note": "invalid\x00metadata",
+                }
+            ),
+        ]
+    )
+    runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
+    app = CayuApp(session_store=store, budget_store=budget_store)
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compactor_provider,
+                model="summary-model",
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_unsafe_compaction_metadata",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.CONTEXT_COMPACTION_FAILED,
+        EventType.TURN_COMPLETED,
+        EventType.SESSION_FAILED,
+    ]
+    completed = events[2]
+    assert completed.payload["provider_name"] == "fake"
+    assert completed.payload["requested_model"] == "summary-model"
+    assert completed.payload["model"] == "summary-model"
+    assert completed.payload["usage_metrics"]["input_tokens"] == 30
+    assert completed.payload["usage_metrics"]["output_tokens"] == 4
+    assert "usage" not in completed.payload
+    assert "provider_note" not in completed.payload
+    assert "compaction_attempt_id" not in completed.payload
+    assert events[3].payload["error_type"] == "ValidationError"
+    assert runtime_provider.requests == []
+    usage = asyncio.run(app.get_session_usage("sess_unsafe_compaction_metadata"))
+    assert usage.model_steps == 1
+    assert usage.usage.total_tokens == 34
+    budget_events = asyncio.run(
+        budget_store.load_events_for_budget(
+            scope="app",
+            key=None,
+            window=BudgetWindow.all_time(),
+        )
+    )
+    assert [event.id for event in budget_events] == [completed.id]
+
+
+@pytest.mark.parametrize(
+    ("summary_events", "expected_error"),
+    [
+        ([], "`summary` cannot be blank."),
+        ([ModelStreamEvent.text_delta(" \n\t")], "`summary` cannot be blank."),
+        (
+            [ModelStreamEvent.text_delta("invalid\x00summary")],
+            "`summary` must not contain NUL characters.",
+        ),
+        (
+            [ModelStreamEvent.text_delta("invalid\ud800summary")],
+            "`summary` must not contain Unicode surrogate code points.",
+        ),
+    ],
+    ids=["blank", "whitespace", "nul", "surrogate"],
+)
+def test_cayu_app_counts_completed_compaction_with_invalid_summary(
+    summary_events: list[ModelStreamEvent],
+    expected_error: str,
+):
+    store = InMemorySessionStore()
+    budget_store = InMemoryBudgetStore()
+    compactor_provider = FakeProvider(
+        [
+            *summary_events,
+            ModelStreamEvent.completed(
+                {
+                    "model": "summary-model",
+                    "usage": {"input_tokens": 100, "output_tokens": 0},
+                }
+            ),
+        ]
+    )
+    runtime_provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("unused"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(session_store=store, budget_store=budget_store)
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compactor_provider,
+                model="summary-model",
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_invalid_compaction_summary",
+                causal_budget_id="job_invalid_compaction_summary",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.CONTEXT_COMPACTION_FAILED,
+        EventType.TURN_COMPLETED,
+        EventType.SESSION_FAILED,
+    ]
+    completed = events[2]
+    assert completed.payload["purpose"] == "context_compaction"
+    assert completed.payload["compactor"] == "ModelCompactor"
+    assert completed.payload["compaction_outcome"] == "invalid_summary"
+    assert completed.payload["provider_name"] == "fake"
+    assert completed.payload["requested_model"] == "summary-model"
+    assert completed.payload["model"] == "summary-model"
+    assert completed.payload["usage"] == {"input_tokens": 100, "output_tokens": 0}
+    assert completed.payload["usage_metrics"] == {
+        "provider_name": "fake",
+        "requested_model": "summary-model",
+        "model": "summary-model",
+        "input_tokens": 100,
+        "output_tokens": 0,
+        "total_tokens": 100,
+        "reasoning_output_tokens": 0,
+        "cache": {
+            "read_tokens": 0,
+            "write_tokens": 0,
+            "cached_input_tokens": 0,
+            "uncached_input_tokens": 100,
+        },
+    }
+    assert events[3].payload["error"] == expected_error
+    assert events[3].payload["error_type"] == "ValueError"
+    assert events[4].payload["step_count"] == 1
+    assert events[4].payload["token_usage"]["input_tokens"] == 100
+    assert events[5].payload == {
+        "error": expected_error,
+        "error_type": "ValueError",
+    }
+    assert runtime_provider.requests == []
+    assert asyncio.run(store.load_checkpoint("sess_invalid_compaction_summary")) is None
+
+    usage = asyncio.run(app.get_session_usage("sess_invalid_compaction_summary"))
+    assert usage.model_steps == 1
+    assert usage.usage.input_tokens == 100
+    assert usage.usage.total_tokens == 100
+    causal_usage = asyncio.run(app.get_causal_budget_usage("job_invalid_compaction_summary"))
+    assert causal_usage.model_steps == 1
+    assert causal_usage.usage.input_tokens == 100
+
+    pricing = PriceBook(
+        prices=(
+            ModelPrice.fixed(
+                provider_name="fake",
+                model="summary-model",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("10"),
+            ),
+        )
+    )
+    cost = asyncio.run(
+        app.get_session_cost(
+            "sess_invalid_compaction_summary",
+            pricing,
+        )
+    )
+    assert cost.model_steps == 1
+    assert cost.priced_model_steps == 1
+    assert cost.total_cost == Decimal("0.0001")
+    causal_cost = asyncio.run(app.get_causal_budget_cost("job_invalid_compaction_summary", pricing))
+    assert causal_cost.model_steps == 1
+    assert causal_cost.priced_model_steps == 1
+    assert causal_cost.total_cost == Decimal("0.0001")
+
+    budget_events = asyncio.run(
+        budget_store.load_events_for_budget(
+            scope="app",
+            key=None,
+            window=BudgetWindow.all_time(),
+        )
+    )
+    assert [event.id for event in budget_events] == [completed.id]
+
+
+def test_cayu_app_counts_completed_compaction_rejected_for_tool_call():
+    store = InMemorySessionStore()
+    budget_store = InMemoryBudgetStore()
+    compactor_provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(
+                id="call_compaction_tool",
+                name="unexpected_tool",
+                arguments={},
+            ),
+            ModelStreamEvent.completed(
+                {
+                    "model": "summary-model",
+                    "finish_reason": "tool_calls",
+                    "usage": {"input_tokens": 80, "output_tokens": 6},
+                }
+            ),
+        ]
+    )
+    runtime_provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("unused"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(session_store=store, budget_store=budget_store)
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compactor_provider,
+                model="summary-model",
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_rejected_compaction_tool_call",
+                causal_budget_id="job_rejected_compaction_tool_call",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.CONTEXT_COMPACTION_FAILED,
+        EventType.TURN_COMPLETED,
+        EventType.SESSION_FAILED,
+    ]
+    completed = events[2]
+    assert completed.payload["purpose"] == "context_compaction"
+    assert completed.payload["compactor"] == "ModelCompactor"
+    assert completed.payload["compaction_outcome"] == "rejected_tool_call"
+    assert completed.payload["finish_reason"] == "tool_calls"
+    assert completed.payload["usage_metrics"]["input_tokens"] == 80
+    assert completed.payload["usage_metrics"]["output_tokens"] == 6
+    assert "compaction_attempt_id" not in completed.payload
+    assert events[3].payload["error"] == "Compaction model must not call tools."
+    assert events[4].payload["step_count"] == 1
+    assert events[4].payload["token_usage"]["total_tokens"] == 86
+    assert events[5].payload["error"] == "Compaction model must not call tools."
+    assert runtime_provider.requests == []
+    assert asyncio.run(store.load_checkpoint("sess_rejected_compaction_tool_call")) is None
+
+    usage = asyncio.run(app.get_session_usage("sess_rejected_compaction_tool_call"))
+    assert usage.model_steps == 1
+    assert usage.usage.input_tokens == 80
+    assert usage.usage.output_tokens == 6
+    causal_usage = asyncio.run(app.get_causal_budget_usage("job_rejected_compaction_tool_call"))
+    assert causal_usage.model_steps == 1
+    assert causal_usage.usage.total_tokens == 86
+
+    pricing = PriceBook(
+        prices=(
+            ModelPrice.fixed(
+                provider_name="fake",
+                model="summary-model",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("10"),
+            ),
+        )
+    )
+    cost = asyncio.run(app.get_session_cost("sess_rejected_compaction_tool_call", pricing))
+    assert cost.model_steps == 1
+    assert cost.priced_model_steps == 1
+    assert cost.total_cost == Decimal("0.00014")
+    budget_events = asyncio.run(
+        budget_store.load_events_for_budget(
+            scope="app",
+            key=None,
+            window=BudgetWindow.all_time(),
+        )
+    )
+    assert [event.id for event in budget_events] == [completed.id]
+
+
+@pytest.mark.parametrize(
+    ("compactor_events", "expected_error"),
+    [
+        (
+            [ModelStreamEvent.text_delta("partial summary")],
+            "Compaction model stream ended without a completed event.",
+        ),
+        (
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_compaction_tool",
+                    name="unexpected_tool",
+                    arguments={},
+                )
+            ],
+            "Compaction model must not call tools.",
+        ),
+    ],
+    ids=["partial-text", "tool-call"],
+)
+def test_cayu_app_does_not_invent_usage_for_unfinished_compaction_stream(
+    compactor_events: list[ModelStreamEvent],
+    expected_error: str,
+):
+    store = InMemorySessionStore()
+    budget_store = InMemoryBudgetStore()
+    compactor_provider = FakeProvider(compactor_events)
+    runtime_provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("unused"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(session_store=store, budget_store=budget_store)
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compactor_provider,
+                model="summary-model",
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_unfinished_compaction",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.CONTEXT_COMPACTION_FAILED,
+        EventType.TURN_COMPLETED,
+        EventType.SESSION_FAILED,
+    ]
+    assert events[2].payload["error"] == expected_error
+    assert events[3].payload["step_count"] == 0
+    assert events[4].payload["error"] == expected_error
+    assert runtime_provider.requests == []
+    assert asyncio.run(store.load_checkpoint("sess_unfinished_compaction")) is None
+
+    usage = asyncio.run(app.get_session_usage("sess_unfinished_compaction"))
+    assert usage.model_steps == 0
+    assert usage.usage.total_tokens == 0
+    budget_events = asyncio.run(
+        budget_store.load_events_for_budget(
+            scope="app",
+            key=None,
+            window=BudgetWindow.all_time(),
+        )
+    )
+    assert budget_events == []
 
 
 def test_cayu_app_emits_compaction_failed_event_before_session_failure():

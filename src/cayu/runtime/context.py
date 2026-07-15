@@ -8,6 +8,7 @@ from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from enum import StrEnum
 from typing import Any
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator
 
@@ -1558,12 +1559,22 @@ class CompactionRequest(BaseModel):
 CompactionPromptBuilder = Callable[[CompactionRequest], str]
 
 
+def _validate_compaction_summary(value: str) -> str:
+    """Validate summary text against the complete durable checkpoint boundary."""
+
+    value = require_nonblank(value, "summary")
+    return require_durable_json_text(value, "summary")
+
+
 class CompactionResult(BaseModel):
     """Compacted representation of older model-facing context.
 
     ``model_completed_payloads`` carries one event-ready ``model.completed``
     payload per provider call the compactor made, so the runtime can account
     for summarization spend in usage, cost, budget, and run-limit tracking.
+    Runtime-created payloads may temporarily carry ``compaction_attempt_id``;
+    wrapping compactors must preserve it so Cayu can correlate recovered calls.
+    Cayu removes the correlation field before emitting public events.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -1575,8 +1586,7 @@ class CompactionResult(BaseModel):
     @field_validator("summary")
     @classmethod
     def validate_summary(cls, value: str) -> str:
-        value = require_nonblank(value, "summary")
-        return require_durable_json_text(value, "summary")
+        return _validate_compaction_summary(value)
 
     @field_validator("metadata", mode="before")
     @classmethod
@@ -1768,11 +1778,33 @@ class ModelCompactor(ContextCompactor):
             tools=[],
             options=self.options,
         )
-        summary, completed_metadata = await _run_compaction_model(
-            provider=self.provider,
-            model_request=model_request,
-            retry_policy=self.retry_policy,
-        )
+        try:
+            summary, completed_metadata = await _run_compaction_model(
+                provider=self.provider,
+                model_request=model_request,
+                retry_policy=self.retry_policy,
+                observe_completion=_compaction_completion_observer(
+                    provider=self.provider,
+                    model=self.model,
+                    compactor=type(self).__name__,
+                ),
+            )
+        except _CompactionToolCallError as exc:
+            # A terminal completion is real provider spend even though the tool-call
+            # protocol violation makes the summary unusable. An unfinished stream has
+            # no authoritative completion payload and must not fabricate usage.
+            if exc.completed_metadata is not None:
+                _record_compaction_model_completed_payloads(
+                    [
+                        _rejected_compaction_tool_call_payload(
+                            error=exc,
+                            provider=self.provider,
+                            model=self.model,
+                            compactor=type(self).__name__,
+                        )
+                    ]
+                )
+            raise
         return _provider_compaction_result(
             summary=summary,
             completed_metadata=completed_metadata,
@@ -1807,19 +1839,100 @@ class _CompactionToolCallError(RuntimeError):
         )
 
 
-_COMPACTION_FAILURE_MODEL_COMPLETED_PAYLOADS: ContextVar[list[dict[str, Any]] | None] = ContextVar(
-    "compaction_failure_model_completed_payloads", default=None
+_COMPACTION_ATTEMPT_ID_KEY = "compaction_attempt_id"
+
+
+class _CompactionCompletionLedger:
+    def __init__(self) -> None:
+        self.completed_payloads: list[dict[str, Any]] = []
+        self.indices_by_attempt_id: dict[str, int] = {}
+
+    def upsert(self, payload: dict[str, Any]) -> dict[str, Any]:
+        identified = copy_json_value(payload, "model_completed_payload")
+        attempt_id = identified.get(_COMPACTION_ATTEMPT_ID_KEY)
+        if type(attempt_id) is not str or attempt_id not in self.indices_by_attempt_id:
+            attempt_id = uuid4().hex
+            identified[_COMPACTION_ATTEMPT_ID_KEY] = attempt_id
+            self.indices_by_attempt_id[attempt_id] = len(self.completed_payloads)
+            self.completed_payloads.append(identified)
+        else:
+            self.completed_payloads[self.indices_by_attempt_id[attempt_id]] = identified
+        return copy_json_value(identified, "model_completed_payload")
+
+    def merge_returned_payloads(
+        self,
+        payloads: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        returned_payloads: list[dict[str, Any]] = []
+        for payload in payloads:
+            identified = copy_json_value(payload, "model_completed_payload")
+            attempt_id = identified.get(_COMPACTION_ATTEMPT_ID_KEY)
+            if type(attempt_id) is not str or attempt_id not in self.indices_by_attempt_id:
+                attempt_id = uuid4().hex
+                identified[_COMPACTION_ATTEMPT_ID_KEY] = attempt_id
+            else:
+                self.completed_payloads[self.indices_by_attempt_id[attempt_id]] = identified
+            returned_payloads.append(identified)
+
+        # The returned list can supply calls that a wrapping compactor observed before
+        # an inner provider-backed compactor registered itself. Insert those payloads
+        # relative to the nearest returned payload already anchored in the ledger,
+        # while retaining observed calls omitted by the wrapper.
+        ordered_ids = [payload[_COMPACTION_ATTEMPT_ID_KEY] for payload in self.completed_payloads]
+        returned_ids = [payload[_COMPACTION_ATTEMPT_ID_KEY] for payload in returned_payloads]
+        returned_by_id = {
+            payload[_COMPACTION_ATTEMPT_ID_KEY]: payload for payload in returned_payloads
+        }
+        for returned_index, attempt_id in enumerate(returned_ids):
+            if attempt_id in ordered_ids:
+                continue
+            previous_id = next(
+                (item for item in reversed(returned_ids[:returned_index]) if item in ordered_ids),
+                None,
+            )
+            next_id = next(
+                (item for item in returned_ids[returned_index + 1 :] if item in ordered_ids),
+                None,
+            )
+            if previous_id is not None:
+                insert_at = ordered_ids.index(previous_id) + 1
+            elif next_id is not None:
+                insert_at = ordered_ids.index(next_id)
+            else:
+                insert_at = len(ordered_ids)
+            ordered_ids.insert(insert_at, attempt_id)
+            self.completed_payloads.insert(insert_at, returned_by_id[attempt_id])
+
+        self.indices_by_attempt_id = {
+            payload[_COMPACTION_ATTEMPT_ID_KEY]: index
+            for index, payload in enumerate(self.completed_payloads)
+        }
+        return copy_json_value(self.completed_payloads, "model_completed_payloads")
+
+
+_COMPACTION_COMPLETION_LEDGER: ContextVar[_CompactionCompletionLedger | None] = ContextVar(
+    "compaction_completion_ledger", default=None
 )
 
 
-def _record_compaction_failure_model_completed_payloads(
+def _record_compaction_model_completed_payloads(
     payloads: list[dict[str, Any]],
-) -> None:
-    """Record failed-attempt telemetry for the active runtime compaction call."""
+) -> list[dict[str, Any]]:
+    """Record provider completions immediately in their observed order."""
 
-    sink = _COMPACTION_FAILURE_MODEL_COMPLETED_PAYLOADS.get()
-    if sink is not None:
-        sink.extend(copy_json_value(payloads, "model_completed_payloads"))
+    ledger = _COMPACTION_COMPLETION_LEDGER.get()
+    if ledger is None:
+        public_payloads = copy_json_value(payloads, "model_completed_payloads")
+        for payload in public_payloads:
+            payload.pop(_COMPACTION_ATTEMPT_ID_KEY, None)
+        return public_payloads
+    return [ledger.upsert(payload) for payload in payloads]
+
+
+def _public_compaction_model_completed_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    public_payload = copy_json_value(payload, "model_completed_payload")
+    public_payload.pop(_COMPACTION_ATTEMPT_ID_KEY, None)
+    return public_payload
 
 
 class _PromptCacheCompactionMode(StrEnum):
@@ -1975,6 +2088,11 @@ class PromptCacheCompactor(ContextCompactor):
                 provider=self.provider,
                 model_request=model_request,
                 retry_policy=self.retry_policy,
+                observe_completion=_compaction_completion_observer(
+                    provider=self.provider,
+                    model=model,
+                    compactor=type(self).__name__,
+                ),
             )
         except _CompactionToolCallError as exc:
             return await self._compact_bounded_after_exact_failure(
@@ -2023,11 +2141,12 @@ class PromptCacheCompactor(ContextCompactor):
         exact_attempt: str,
         exact_attempt_payload: dict[str, Any],
     ) -> CompactionResult:
-        try:
-            bounded_result = await self._compact_bounded(request, model=model)
-        except Exception:
-            _record_compaction_failure_model_completed_payloads([exact_attempt_payload])
-            raise
+        # Record this known-earlier failed attempt before the bounded call so a
+        # later bounded failure is emitted in provider-call order.
+        exact_attempt_payload = _record_compaction_model_completed_payloads(
+            [exact_attempt_payload]
+        )[0]
+        bounded_result = await self._compact_bounded(request, model=model)
         bounded_metadata = copy_json_value(bounded_result.metadata, "bounded_metadata")
         bounded_metadata["prompt_cache_exact_attempt"] = exact_attempt
         return CompactionResult(
@@ -2077,16 +2196,56 @@ def _has_structured_output_tool(tools: list[dict[str, Any]]) -> bool:
     return any(tool.get("name") == STRUCTURED_OUTPUT_TOOL_NAME for tool in tools)
 
 
+def _compaction_completion_observer(
+    *,
+    provider: ModelProvider,
+    model: str,
+    compactor: str,
+) -> Callable[[dict[str, Any]], dict[str, Any]]:
+    provider_name = require_clean_nonblank(provider.name, "provider.name")
+
+    def observe(completed_metadata: dict[str, Any]) -> dict[str, Any]:
+        observed_metadata = copy_json_value(completed_metadata, "completed_metadata")
+        # This correlation key is runtime-owned; provider metadata cannot select or
+        # overwrite another compaction attempt's ledger entry.
+        observed_metadata.pop(_COMPACTION_ATTEMPT_ID_KEY, None)
+        payload = _compaction_model_completed_payload(
+            completed_payload=observed_metadata,
+            provider_name=provider_name,
+            fallback_model=model,
+            compactor=compactor,
+            usage_dialect=provider.usage_dialect,
+        )
+        durable_payload = _durable_compaction_completion_evidence(
+            payload,
+            provider_name=provider_name,
+            fallback_model=model,
+            compactor=compactor,
+        )
+        registered_payload = _record_compaction_model_completed_payloads([durable_payload])[0]
+        attempt_id = registered_payload.get(_COMPACTION_ATTEMPT_ID_KEY)
+        if type(attempt_id) is str:
+            observed_metadata[_COMPACTION_ATTEMPT_ID_KEY] = attempt_id
+        return observed_metadata
+
+    return observe
+
+
 async def _run_compaction_model(
     *,
     provider: ModelProvider,
     model_request: ModelRequest,
     retry_policy: RetryPolicy,
+    observe_completion: Callable[[dict[str, Any]], dict[str, Any]],
 ) -> tuple[str, dict[str, Any]]:
     attempt = 1
     while True:
         try:
-            return await _stream_compaction_model(provider=provider, model_request=model_request)
+            return await _stream_compaction_model(
+                provider=provider,
+                model_request=model_request,
+                observe_completion=observe_completion,
+            )
         except ModelProviderError as exc:
             decision = retry_decision(
                 policy=retry_policy,
@@ -2107,6 +2266,7 @@ async def _stream_compaction_model(
     *,
     provider: ModelProvider,
     model_request: ModelRequest,
+    observe_completion: Callable[[dict[str, Any]], dict[str, Any]],
 ) -> tuple[str, dict[str, Any]]:
     provider_name = require_clean_nonblank(provider.name, "provider.name")
     text_parts: list[str] = []
@@ -2137,16 +2297,12 @@ async def _stream_compaction_model(
                     str(event.payload.get("error") or "Compaction model provider error")
                 )
             elif event.type == ModelStreamEventType.COMPLETED:
-                completed_payload = event.payload
+                completed_payload = observe_completion(_provider_completed_metadata(event.payload))
             else:
                 raise RuntimeError(f"Compaction provider emitted unsupported event: {event.type}")
     except Exception as exc:
         if tool_call_seen:
-            completed_metadata = (
-                None
-                if completed_payload is None
-                else _provider_completed_metadata(completed_payload)
-            )
+            completed_metadata = None if completed_payload is None else completed_payload
             raise _CompactionToolCallError(completed_metadata=completed_metadata) from exc
         raise
 
@@ -2154,10 +2310,10 @@ async def _stream_compaction_model(
         if tool_call_seen:
             raise _CompactionToolCallError(completed_metadata=None)
         raise RuntimeError("Compaction model stream ended without a completed event.")
-    completed_metadata = _provider_completed_metadata(completed_payload)
+    completed_metadata = completed_payload
     if tool_call_seen:
         raise _CompactionToolCallError(completed_metadata=completed_metadata)
-    return require_nonblank("".join(text_parts), "summary"), completed_metadata
+    return "".join(text_parts), completed_metadata
 
 
 def _provider_compaction_result(
@@ -2170,25 +2326,89 @@ def _provider_compaction_result(
     metadata: dict[str, Any],
 ) -> CompactionResult:
     provider_name = require_clean_nonblank(provider.name, "provider.name")
+    # A completed provider call is real spend even when its text is unusable. Build the
+    # attributable payload before validating the summary so the failure path can account for it.
+    model_completed_payload = _compaction_model_completed_payload(
+        completed_payload=completed_metadata,
+        provider_name=provider_name,
+        fallback_model=model,
+        compactor=compactor,
+        usage_dialect=provider.usage_dialect,
+    )
+    ledger_payload = _durable_compaction_completion_evidence(
+        model_completed_payload,
+        provider_name=provider_name,
+        fallback_model=model,
+        compactor=compactor,
+    )
+    registered_payload = _record_compaction_model_completed_payloads([ledger_payload])[0]
+    attempt_id = registered_payload.get(_COMPACTION_ATTEMPT_ID_KEY)
+    if type(attempt_id) is str:
+        model_completed_payload[_COMPACTION_ATTEMPT_ID_KEY] = attempt_id
+    try:
+        validated_summary = _validate_compaction_summary(summary)
+    except ValueError:
+        invalid_summary_payload = copy_json_value(
+            registered_payload,
+            "model_completed_payload",
+        )
+        invalid_summary_payload["compaction_outcome"] = "invalid_summary"
+        _record_compaction_model_completed_payloads([invalid_summary_payload])
+        raise
+    public_completed_metadata = copy_json_value(completed_metadata, "completed_metadata")
+    public_completed_metadata.pop(_COMPACTION_ATTEMPT_ID_KEY, None)
     return CompactionResult(
-        summary=summary,
+        summary=validated_summary,
         metadata={
             "compactor": compactor,
             "provider": provider_name,
             "model": model,
             **copy_json_value(metadata, "metadata"),
-            "completed": completed_metadata,
+            "completed": public_completed_metadata,
         },
-        model_completed_payloads=[
-            _compaction_model_completed_payload(
-                completed_payload=completed_metadata,
-                provider_name=provider_name,
-                fallback_model=model,
-                compactor=compactor,
-                usage_dialect=provider.usage_dialect,
-            )
-        ],
+        model_completed_payloads=[model_completed_payload],
     )
+
+
+def _durable_compaction_completion_evidence(
+    payload: dict[str, Any],
+    *,
+    provider_name: str,
+    fallback_model: str,
+    compactor: str,
+) -> dict[str, Any]:
+    """Retain full durable metadata or a safe normalized accounting projection."""
+
+    copied = copy_json_value(payload, "model_completed_payload")
+    try:
+        require_durable_json_text(copied, "model_completed_payload")
+    except ValueError:
+        resolved_model = copied.get("model")
+        try:
+            resolved_model = require_nonblank(resolved_model, "model")
+            require_durable_json_text(resolved_model, "model")
+        except ValueError:
+            resolved_model = fallback_model
+        safe_payload: dict[str, Any] = {
+            "model": resolved_model,
+            "provider_name": provider_name,
+            "requested_model": fallback_model,
+            "purpose": "context_compaction",
+            "compactor": compactor,
+        }
+        attempt_id = copied.get(_COMPACTION_ATTEMPT_ID_KEY)
+        if type(attempt_id) is str:
+            safe_payload[_COMPACTION_ATTEMPT_ID_KEY] = attempt_id
+        usage_metrics = copied.get("usage_metrics")
+        if type(usage_metrics) is dict:
+            safe_usage_metrics = copy_json_value(usage_metrics, "usage_metrics")
+            safe_usage_metrics["provider_name"] = provider_name
+            safe_usage_metrics["requested_model"] = fallback_model
+            safe_usage_metrics["model"] = resolved_model
+            safe_payload["usage_metrics"] = safe_usage_metrics
+        require_durable_json_text(safe_payload, "model_completed_payload")
+        return safe_payload
+    return copied
 
 
 def _rejected_compaction_tool_call_payload(
@@ -2205,6 +2425,12 @@ def _rejected_compaction_tool_call_payload(
         fallback_model=model,
         compactor=compactor,
         usage_dialect=provider.usage_dialect,
+    )
+    payload = _durable_compaction_completion_evidence(
+        payload,
+        provider_name=require_clean_nonblank(provider.name, "provider.name"),
+        fallback_model=model,
+        compactor=compactor,
     )
     payload["compaction_outcome"] = "rejected_tool_call"
     if error.completed_metadata is None:
@@ -2321,7 +2547,7 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
         checkpoint_update = None
         checkpoint_event_payload = None
         compaction_telemetry: list[ContextCompactionTelemetry] = []
-        failure_model_completed_payloads: list[dict[str, Any]] = []
+        completion_ledger = _CompactionCompletionLedger()
         summary = previous_summary
         if should_compact:
             compaction_started = _compaction_telemetry(
@@ -2362,9 +2588,7 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                         cache_prefix_request = await request.build_cache_prefix_request(
                             extension_messages
                         )
-                failure_telemetry_token = _COMPACTION_FAILURE_MODEL_COMPLETED_PAYLOADS.set(
-                    failure_model_completed_payloads
-                )
+                completion_ledger_token = _COMPACTION_COMPLETION_LEDGER.set(completion_ledger)
                 try:
                     result = await self.compactor.compact(
                         CompactionRequest(
@@ -2379,15 +2603,18 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                             instructions=request.compaction_instructions,
                         )
                     )
+                    completed_payloads = completion_ledger.merge_returned_payloads(
+                        result.model_completed_payloads,
+                    )
                 finally:
-                    _COMPACTION_FAILURE_MODEL_COMPLETED_PAYLOADS.reset(failure_telemetry_token)
+                    _COMPACTION_COMPLETION_LEDGER.reset(completion_ledger_token)
             except Exception as exc:
                 compaction_telemetry.extend(
                     ContextCompactionTelemetry(
                         event_type=EventType.MODEL_COMPLETED,
-                        payload=payload,
+                        payload=_public_compaction_model_completed_payload(payload),
                     )
-                    for payload in failure_model_completed_payloads
+                    for payload in completion_ledger.completed_payloads
                 )
                 compaction_telemetry.append(
                     _compaction_telemetry(
@@ -2413,9 +2640,9 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
             compaction_telemetry.extend(
                 ContextCompactionTelemetry(
                     event_type=EventType.MODEL_COMPLETED,
-                    payload=payload,
+                    payload=_public_compaction_model_completed_payload(payload),
                 )
-                for payload in result.model_completed_payloads
+                for payload in completed_payloads
             )
             summary = result.summary
             checkpoint_update = copy_json_value(checkpoint, "checkpoint")

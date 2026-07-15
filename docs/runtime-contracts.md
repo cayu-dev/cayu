@@ -161,6 +161,20 @@ after the first cache-aware checkpoint. Every
 provider-backed compaction follows the runtime retry/error stream contract and
 emits a `model.completed` payload with `purpose="context_compaction"`, so cache,
 token, cost, budget, and model-step accounting remain durable.
+If a provider completes with usage but its summary fails the durable checkpoint
+boundary (blank, whitespace-only, containing NUL, or containing an unpaired
+Unicode surrogate), Cayu emits that completion with
+`compaction_outcome="invalid_summary"` before failing compaction and leaves the
+checkpoint unchanged. A stream that ends without a provider completion does
+not fabricate usage telemetry. If a custom compactor recovers from the invalid
+summary, Cayu still records the completed failed attempt once, before payloads
+reported only by the returned result.
+Provider-backed compactors register each completion in provider-call order as
+soon as it is observed. Wrapping compactors preserve the internal attempt ID so
+later outcome annotations or returned payloads update that original position
+instead of duplicating or reordering it. If raw completion metadata cannot cross
+the durable JSON boundary, Cayu discards the unsafe raw fields but retains a
+durable provider/model identity and normalized usage payload for accounting.
 
 ## Context Counting
 

@@ -115,12 +115,13 @@ class CompletingProvider(ModelProvider):
 class UsageCompactionProvider(ModelProvider):
     name = "compaction-provider"
 
-    def __init__(self) -> None:
+    def __init__(self, *, summary: str = "provider summary") -> None:
         self.calls = 0
+        self.summary = summary
 
     async def stream(self, request: ModelRequest):
         self.calls += 1
-        yield ModelStreamEvent.text_delta("provider summary")
+        yield ModelStreamEvent.text_delta(self.summary)
         yield ModelStreamEvent.completed({"usage": {"input_tokens": 8, "output_tokens": 2}})
 
 
@@ -1413,6 +1414,106 @@ def test_compact_session_attributes_provider_usage_and_honors_run_limits() -> No
             checkpoint_after_limit["context_compaction"]
             == checkpoint_before_limit["context_compaction"]
         )
+
+    asyncio.run(run())
+
+
+def test_compact_session_preserves_usage_for_durably_invalid_summary() -> None:
+    async def run() -> None:
+        pricing = PriceBook(
+            prices=(
+                ModelPrice.fixed(
+                    provider_name="compaction-provider",
+                    model="summary-model",
+                    input_per_million=Decimal("1"),
+                    output_per_million=Decimal("2"),
+                ),
+            )
+        )
+        provider = UsageCompactionProvider(summary="invalid\x00summary")
+        store = InMemorySessionStore()
+        app = CayuApp(
+            session_store=store,
+            budget_policy=BudgetPolicy(
+                limits=(
+                    BudgetLimit(
+                        scope="app",
+                        max_estimated_cost=Decimal("0.001"),
+                        pricing=pricing,
+                        reservation=BudgetReservation(
+                            max_input_tokens=10,
+                            max_output_tokens=10,
+                        ),
+                    ),
+                )
+            ),
+            enable_logging=False,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(provider=provider, model="summary-model"),
+                max_user_turns=1,
+            ),
+        )
+        created = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_compact_invalid_summary",
+                messages=[Message.text("user", "create only")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        transcript = [
+            Message.text("user", "old request"),
+            Message.text("assistant", "old answer"),
+            Message.text("user", "current request"),
+            Message.text("assistant", "current answer"),
+        ]
+        await store.append_transcript_messages(created.id, transcript)
+        completed = await store.update_status(created.id, SessionStatus.COMPLETED)
+        request = CompactSessionRequest(
+            session_id=created.id,
+            idempotency_key="compact-invalid-summary",
+            expected_run_epoch=completed.run_epoch,
+            expected_transcript_cursor=len(transcript),
+        )
+        first = []
+
+        with pytest.raises(RuntimeError, match="must not contain NUL characters"):
+            async for event in app.compact_session(request):
+                first.append(event)
+        replay = [event async for event in app.compact_session(request)]
+
+        assert [event.type for event in first] == [
+            EventType.CONTEXT_COMPACTION_STARTED,
+            EventType.BUDGET_CHECKED,
+            EventType.BUDGET_RESERVED,
+            EventType.MODEL_COMPLETED,
+            EventType.BUDGET_RECONCILED,
+            EventType.CONTEXT_COMPACTION_FAILED,
+        ]
+        assert [event.id for event in replay] == [event.id for event in first]
+        assert provider.calls == 1
+        usage_event = first[3]
+        assert usage_event.payload["compaction_outcome"] == "invalid_summary"
+        assert usage_event.payload["usage_metrics"]["total_tokens"] == 10
+        assert "compaction_attempt_id" not in usage_event.payload
+        assert first[4].payload["actual_amount"] == "0.000012"
+        assert first[5].payload["error_type"] == "ContextBuildError"
+        usage = await app.get_session_usage(created.id)
+        assert usage.model_steps == 1
+        assert usage.usage.total_tokens == 10
+        cost = await app.get_session_cost(created.id, pricing)
+        assert cost.model_steps == 1
+        assert cost.total_cost == Decimal("0.000012")
+        checkpoint = await store.load_checkpoint(created.id)
+        assert checkpoint is not None
+        assert "context_compaction" not in checkpoint
+        operation = await store.load_session_operation(created.id, request.idempotency_key)
+        assert operation is not None
+        assert operation["status"] == "failed"
+        assert operation["event_ids"] == [event.id for event in first]
 
     asyncio.run(run())
 
