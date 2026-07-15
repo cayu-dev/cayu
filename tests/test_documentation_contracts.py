@@ -77,3 +77,25 @@ def test_readme_knowledge_injection_description_preserves_trust_boundary() -> No
         "`fail_open=True`",
     ):
         assert required in section
+
+
+def test_application_anatomy_guide_is_linked_from_release_facing_docs() -> None:
+    guide = _REPO_ROOT / "src" / "cayu" / "guides" / "application-anatomy.md"
+    assert guide.is_file()
+
+    quickstart = _section(
+        _REPO_ROOT / "README.md",
+        start="## Quickstart",
+        end="## Application console",
+    )
+    assert "application-anatomy.md" in quickstart
+
+    for relative_path in (
+        "docs/console.md",
+        "docs/project-layout.md",
+        "docs/runtime-contracts.md",
+    ):
+        text = (_REPO_ROOT / relative_path).read_text(encoding="utf-8")
+        assert "application-anatomy.md" in text, (
+            f"canonical anatomy guide not linked from {relative_path}"
+        )

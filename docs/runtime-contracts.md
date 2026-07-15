@@ -10,6 +10,21 @@ Payloads, metadata, tool arguments, tool results, model options, checkpoints, ta
 
 Runtime APIs copy framework objects at boundaries. User code should not mutate registered specs, request objects, message parts, event payloads, tool results, or provider events and expect those mutations to change already-registered or already-emitted runtime state. Session stores return isolated transcript copies: messages loaded from a store share no mutable payload state with the stored transcript, and messages passed to append cannot rewrite stored history after the fact.
 
+## Application Construction
+
+A Cayu project declares a synchronous, zero-argument application factory. Each
+process calls that factory and owns the fresh `CayuApp` it returns; configured
+durable stores, not Python object identity, coordinate state across processes.
+Construction, resource acquisition, administrative initialization, and
+active-service startup are distinct responsibilities, but Cayu does not yet
+impose a general application lifecycle protocol. Configured component
+constructors can acquire or initialize resources—for example, SQLite stores open
+their files and ensure schemas—so factory callers such as `cayu inspect` exercise
+that application-owned behavior. The canonical
+[application-anatomy guide](../src/cayu/guides/application-anatomy.md) defines
+these boundaries and the console, script, server-integration,
+worker-integration, and test process roles.
+
 ## ContextPolicy
 
 Builds the model-facing message list immediately before each provider request.

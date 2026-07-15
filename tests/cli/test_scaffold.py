@@ -7,6 +7,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
+from cayu import CayuApp, InMemorySessionStore, InMemoryTaskStore, ScriptedModelProvider
 from cayu.cli import main
 from cayu.cli.project import project_context
 
@@ -28,6 +29,19 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     with project_context(proj):
         spec.loader.exec_module(module)
     assert hasattr(module, "build_app")
+    assert not any(isinstance(value, CayuApp) for value in vars(module).values())
+
+    first_app = module.build_app(
+        provider=ScriptedModelProvider([]),
+        session_store=InMemorySessionStore(),
+        task_store=InMemoryTaskStore(),
+    )
+    second_app = module.build_app(
+        provider=ScriptedModelProvider([]),
+        session_store=InMemorySessionStore(),
+        task_store=InMemoryTaskStore(),
+    )
+    assert first_app is not second_app
 
     pyproject = (proj / "pyproject.toml").read_text(encoding="utf-8")
     assert 'dependencies = ["cayu"]' in pyproject
@@ -36,6 +50,8 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert '[tool.cayu]\nfactory = "app:build_app"' in pyproject
     readme = (proj / "README.md").read_text(encoding="utf-8")
     assert "cayu inspect --json" in readme
+    assert "cayu guide anatomy" in readme
+    assert readme.index("## Application structure") < readme.index("## Setup and prove the project")
     assert "pip install -e '.[console,dev]'" in readme
     assert "uv sync --extra console --extra dev" in readme
     assert "cayu generate slice NAME --tool TOOL --effect EFFECT" in readme
@@ -166,6 +182,7 @@ def test_cayu_new_emits_safe_agent_instructions_and_credential_free_proof(
     assert "ToolEffect.EXTERNAL" not in tool_source
 
     instructions = (project / "AGENTS.md").read_text(encoding="utf-8")
+    assert "cayu guide anatomy" in instructions
     assert "cayu inspect --json" in instructions
     assert "cayu check --json" in instructions
     assert "cayu generate slice" in instructions

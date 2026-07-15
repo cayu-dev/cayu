@@ -106,6 +106,7 @@ def test_every_documented_root_import_is_exported() -> None:
     paths = [_REPO_ROOT / "README.md"]
     for root in ("docs", "examples"):
         paths.extend(sorted((_REPO_ROOT / root).rglob("*")))
+    paths.extend(sorted((_REPO_ROOT / "src" / "cayu" / "guides").glob("*.md")))
     for path in paths:
         if not path.is_file() or path.suffix not in {".md", ".py"}:
             continue

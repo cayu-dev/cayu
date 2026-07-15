@@ -4,6 +4,10 @@
 interactive inspection and administration surface for a project, modeled after
 `rails console`.
 
+The [application-anatomy guide](../src/cayu/guides/application-anatomy.md)
+defines the factory, process ownership, durable-state, and lifecycle boundaries
+that the console follows.
+
 ## Install
 
 IPython is an optional dependency:

@@ -60,6 +60,10 @@ separate behavior. Shared runtime-facing helpers belong under
 
 Default user projects should be Rails-like and easy to understand:
 
+The package-shipped [application-anatomy guide](../src/cayu/guides/application-anatomy.md)
+is the canonical contract for the generated factory, process-scoped app, shared
+durable state, and explicit service ownership described by this layout.
+
 ```text
 invoice-agent/
   pyproject.toml

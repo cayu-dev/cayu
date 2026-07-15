@@ -249,10 +249,22 @@ _README = """# __PROJECT_NAME__
 
 A safe, inspectable Cayu agent scaffold.
 
+## Application structure
+
+`build_app()` returns a fresh process-scoped `CayuApp`. Each script, console,
+server, worker, or test calls the factory for itself. Configured durable stores
+coordinate cross-process state; the Python application object is not a global
+registry or singleton. Importing the project does not construct the app or
+start workers, recovery, schedulers, sessions, models, or tools.
+
+Run `cayu guide anatomy` for the canonical factory, process-role, durable-state,
+and lifecycle contract.
+
 ## Setup and prove the project
 
 ```bash
 pip install -e '.[console,dev]' # or: uv sync --extra console --extra dev
+cayu guide anatomy
 cayu inspect --json
 cayu check --json
 pytest
@@ -269,14 +281,6 @@ not claim that a live provider or execution environment was verified.
 export OPENAI_API_KEY=sk-...
 python run.py
 ```
-
-## Application structure
-
-`build_app()` returns a fresh process-scoped `CayuApp`. Each script, console,
-server, worker, or test calls the factory for itself. Configured durable stores
-coordinate cross-process state; the Python application object is not a global
-registry or singleton. Importing the project does not construct the app or
-start workers, recovery, schedulers, sessions, models, or tools.
 
 The checked-in `AGENTS.md` is the canonical workflow for coding agents. Add a
 reviewable agent/tool/test/eval slice with
@@ -317,6 +321,7 @@ needs. `app.py` is the application factory and explicit registration surface.
 
 - Setup: `pip install -e '.[console,dev]'` or
   `uv sync --extra console --extra dev`.
+- Application contract: `cayu guide anatomy`.
 - Inspect/check: `cayu inspect --json` and `cayu check --json`.
 - Safe generation: `cayu generate slice NAME --tool TOOL --effect EFFECT`.
 - Hermetic proof: `pytest` and `cayu eval run MODULE:build_eval`.
@@ -327,7 +332,8 @@ needs. `app.py` is the application factory and explicit registration surface.
 
 1. Clarify users, jobs, triggers, inputs/outputs, autonomy, state, effects,
    approval boundaries, recovery, environments, artifacts, and eval cases.
-   Read `cayu guide authoring` when choosing Cayu concepts.
+   Read `cayu guide anatomy` for the application contract and
+   `cayu guide authoring` when choosing Cayu concepts.
 2. Run `cayu inspect --json` and `cayu check --json` before editing.
 3. Plan generated edits with
    `cayu generate slice NAME --tool TOOL --effect EFFECT --dry-run --json`.

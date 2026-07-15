@@ -34,6 +34,7 @@ _WHEEL_REQUIRED = {
     "cayu/cli/console.py",
     "cayu/data/__init__.py",
     "cayu/data/default_model_catalog.json",
+    "cayu/guides/application-anatomy.md",
     "cayu/guides/authoring.md",
     "cayu/guides/diagnostics.md",
     "cayu/server/dashboard/index.html",

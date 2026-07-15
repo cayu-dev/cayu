@@ -162,6 +162,7 @@ Start from the generated project when a coding agent is building with Cayu:
 pip install 'cayu[console]' pytest
 cayu new myagent
 cd myagent
+cayu guide anatomy
 cayu guide authoring
 cayu inspect --json
 cayu check --json
@@ -173,7 +174,10 @@ cayu eval run evals.assistant:build_eval
 application factory, a safe explicit-effect tool, and credential-free runtime
 test/eval. The package-shipped [coding-agent authoring guide](src/cayu/guides/authoring.md)
 starts from desired behavior and explains when to omit unneeded workflow, task,
-environment, approval, memory, server, or multi-agent machinery. Use
+environment, approval, memory, server, or multi-agent machinery. The canonical
+[application-anatomy guide](src/cayu/guides/application-anatomy.md) defines the
+factory, process-role, durable-state, and lifecycle boundaries that every
+project follows. Use
 `cayu generate slice NAME --tool TOOL --effect EFFECT --dry-run --json` to plan
 one reviewable vertical slice without importing or changing the project. Apply
 revalidates the plan's preimages and symlink-free project containment, stages

@@ -21,3 +21,21 @@ def test_package_shipped_authoring_and_diagnostic_guides_are_discoverable(capsys
     assert "# Cayu project diagnostics" in diagnostics
     assert "## agent-provider-not-found" in diagnostics
     assert "## agent-workflow-tool-not-registered" in diagnostics
+
+
+def test_package_shipped_application_anatomy_guide_is_discoverable(capsys) -> None:
+    assert main(["guide", "anatomy"]) == 0
+    anatomy = capsys.readouterr().out
+
+    assert "# Cayu application anatomy" in anatomy
+    assert "## Application lifecycle boundaries" in anatomy
+    assert "SQLite store constructors open their files" in anatomy
+    assert "## Process roles" in anatomy
+    for role in (
+        "One-off script",
+        "Interactive console",
+        "Server integration",
+        "Worker integration",
+        "Test",
+    ):
+        assert role in anatomy

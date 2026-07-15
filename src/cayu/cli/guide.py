@@ -5,6 +5,7 @@ from importlib.resources import files
 from typing import Any
 
 _GUIDES = {
+    "anatomy": "application-anatomy.md",
     "authoring": "authoring.md",
     "diagnostics": "diagnostics.md",
 }

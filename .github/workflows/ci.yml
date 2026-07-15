@@ -128,6 +128,7 @@ jobs:
           project_root="$(mktemp -d)"
           .release-venv/bin/cayu new proof --dir "$project_root"
           cd "$project_root/proof"
+          "$GITHUB_WORKSPACE/.release-venv/bin/cayu" guide anatomy >/dev/null
           "$GITHUB_WORKSPACE/.release-venv/bin/cayu" guide authoring >/dev/null
           "$GITHUB_WORKSPACE/.release-venv/bin/cayu" inspect --json >/dev/null
           "$GITHUB_WORKSPACE/.release-venv/bin/cayu" check --json >/dev/null
