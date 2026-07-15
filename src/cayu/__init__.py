@@ -57,6 +57,7 @@ from cayu.core.tools import (
 )
 from cayu.core.workflows import Workflow, WorkflowSpec
 from cayu.egress import (
+    ApprovedEgressDestination,
     CredentialMode,
     HttpEgressPolicy,
 )
@@ -673,6 +674,7 @@ __all__ = [
     "AlwaysRequireApprovalToolPolicy",
     "AnthropicProvider",
     "AppManifest",
+    "ApprovedEgressDestination",
     "ArtifactCreated",
     "ArtifactListResult",
     "ArtifactMetadata",

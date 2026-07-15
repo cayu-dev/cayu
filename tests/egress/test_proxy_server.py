@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import socket
 import ssl
@@ -156,6 +157,98 @@ def test_plain_http_requests_are_rejected_without_broker_call() -> None:
     response, upstream = asyncio.run(run())
 
     assert response.startswith(b"HTTP/1.1 405 Method Not Allowed")
+    assert upstream.sent is None
+
+
+def test_transport_auth_rejects_clients_without_the_sidecar_identity() -> None:
+    async def run() -> tuple[bytes, bytes]:
+        loop = asyncio.get_running_loop()
+        broker, _registry = _broker(_CapturingUpstream())
+        transport_auth_token = b"test-transport-secret"
+        server = TransparentEgressProxyServer(
+            broker,
+            loop=loop,
+            transport_auth_token=transport_auth_token,
+        )
+        port = await server.start()
+
+        request = b"CONNECT api.stripe.com:443 HTTP/1.1\r\nHost: api.stripe.com:443\r\n\r\n"
+
+        def unauthenticated() -> bytes:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=5.0) as conn:
+                    conn.sendall(request)
+                    return conn.recv(1024)
+            except OSError:
+                return b""
+
+        def authenticated() -> bytes:
+            with socket.create_connection(("127.0.0.1", port), timeout=5.0) as conn:
+                encoded = base64.b64encode(b"cayu:" + transport_auth_token)
+                conn.sendall(
+                    b"CONNECT cayu-transport.invalid:443 HTTP/1.0\r\n"
+                    b"Proxy-authorization: Basic " + encoded + b"\r\n\r\n"
+                )
+                outer_response = conn.recv(1024)
+                if not outer_response.startswith(b"HTTP/1.1 200 Connection Established"):
+                    return outer_response
+                conn.sendall(request)
+                return conn.recv(1024)
+
+        try:
+            return await asyncio.to_thread(unauthenticated), await asyncio.to_thread(authenticated)
+        finally:
+            await server.close()
+
+    rejected, accepted = asyncio.run(run())
+
+    assert rejected == b""
+    assert accepted.startswith(b"HTTP/1.1 200 Connection Established")
+
+
+def test_transport_auth_token_requires_nonempty_bytes() -> None:
+    loop = asyncio.new_event_loop()
+    try:
+        broker, _registry = _broker(_CapturingUpstream())
+        with pytest.raises(TypeError, match="must be bytes"):
+            TransparentEgressProxyServer(
+                broker,
+                loop=loop,
+                transport_auth_token="secret",  # type: ignore[arg-type]
+            )
+        with pytest.raises(ValueError, match="must be nonempty"):
+            TransparentEgressProxyServer(
+                broker,
+                loop=loop,
+                transport_auth_token=b"",
+            )
+    finally:
+        loop.close()
+
+
+def test_connect_to_non_https_port_is_rejected_without_broker_call() -> None:
+    async def run() -> tuple[bytes, _CapturingUpstream]:
+        loop = asyncio.get_running_loop()
+        upstream = _CapturingUpstream()
+        broker, _registry = _broker(upstream)
+        server = TransparentEgressProxyServer(broker, loop=loop)
+        port = await server.start()
+
+        def request_non_https_port() -> bytes:
+            with socket.create_connection(("127.0.0.1", port), timeout=5.0) as conn:
+                conn.sendall(
+                    b"CONNECT api.stripe.com:8443 HTTP/1.1\r\nHost: api.stripe.com:8443\r\n\r\n"
+                )
+                return conn.recv(1024)
+
+        try:
+            return await asyncio.to_thread(request_non_https_port), upstream
+        finally:
+            await server.close()
+
+    response, upstream = asyncio.run(run())
+
+    assert response.startswith(b"HTTP/1.1 403 Forbidden")
     assert upstream.sent is None
 
 

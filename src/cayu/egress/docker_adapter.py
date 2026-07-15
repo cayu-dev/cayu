@@ -3,9 +3,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import secrets
 import shutil
+import tempfile
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass, field
 
 from cayu.credentials import CredentialMode
 from cayu.egress.adapter import (
@@ -30,12 +33,83 @@ GUEST_CA_PATH = "/etc/cayu/ca.pem"
 _SIDECAR_LISTEN_PORT = 8080
 _DEFAULT_SIDECAR_IMAGE = "alpine/socat"
 _SESSION_LABEL = "cayu.egress.session"
+_SIDECAR_AUTH_PATH = "/run/cayu/broker.auth"
+_SIDECAR_CONNECTOR_PATH = "/run/cayu/connect-broker"
+_SIDECAR_READY_SCRIPT = (
+    "attempts=0; "
+    'while [ "$(cat /proc/1/comm 2>/dev/null)" != socat ] && '
+    '[ "$attempts" -lt 100 ]; do '
+    "attempts=$((attempts + 1)); sleep 0.05; "
+    "done; "
+    'test "$(cat /proc/1/comm 2>/dev/null)" = socat'
+)
 
 # A docker executor returns (exit_code, stderr) so orchestration can be faked in
 # tests without a real Docker daemon.
 DockerExec = Callable[[Sequence[str]], Awaitable[tuple[int, str]]]
 # A docker STDOUT runner used only for host-interface discovery.
 DockerRun = Callable[[Sequence[str]], Awaitable[tuple[int, str]]]
+
+
+@dataclass(frozen=True)
+class _SidecarTransportAuthorization:
+    directory: str
+    auth_path: str
+    connector_path: str
+    token: bytes = field(repr=False)
+
+    def close(self) -> None:
+        shutil.rmtree(self.directory, ignore_errors=True)
+
+
+def _create_sidecar_transport_authorization() -> _SidecarTransportAuthorization:
+    directory = tempfile.mkdtemp(prefix="cayu-egress-sidecar-")
+    auth_path = os.path.join(directory, "broker.auth")
+    connector_path = os.path.join(directory, "connect-broker")
+    token = secrets.token_urlsafe(32).encode("ascii")
+    try:
+        _write_private(auth_path, b"cayu:" + token, mode=0o600)
+        _write_private(
+            connector_path,
+            b"#!/bin/sh\n"
+            b"set -eu\n"
+            b'if [ "${1:-}" = "listen" ]; then\n'
+            b"  attempts=0\n"
+            b"  bind_ip=\n"
+            b'  while [ "$attempts" -lt 100 ]; do\n'
+            b'    default_if="$(ip route show default | '
+            b"awk 'NR == 1 { print $5 }')\"\n"
+            b'    bind_ip="$(ip -o -4 addr show | '
+            b'awk -v default_if="$default_if" '
+            b'\'$2 != "lo" && $2 != default_if { split($4, address, "/"); '
+            b"print address[1]; exit }')\"\n"
+            b'    [ -n "$bind_ip" ] && break\n'
+            b"    attempts=$((attempts + 1))\n"
+            b"    sleep 0.05\n"
+            b"  done\n"
+            b'  [ -n "$bind_ip" ] || exit 70\n'
+            b'  exec socat "TCP-LISTEN:8080,bind=${bind_ip},fork,reuseaddr" '
+            b'"PROXY:host.docker.internal:cayu-transport.invalid:443,'
+            b'proxyport=${CAYU_BROKER_PORT},proxyauthfile=/run/cayu/broker.auth"\n'
+            b"fi\n"
+            b"exit 64\n",
+            mode=0o700,
+        )
+    except BaseException:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+    return _SidecarTransportAuthorization(
+        directory=directory,
+        auth_path=auth_path,
+        connector_path=connector_path,
+        token=token,
+    )
+
+
+def _write_private(path: str, data: bytes, *, mode: int) -> None:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(data)
 
 
 async def _default_docker_exec(argv: Sequence[str]) -> tuple[int, str]:
@@ -147,9 +221,6 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             if self._proxy_host is not None
             else await self._proxy_bind_host_resolver()
         )
-        server = TransparentEgressProxyServer(broker, loop=loop, host=bind_host)
-        proxy_port = await server.start()
-
         # Resource names use a random token, not the session_id, so distinct
         # sessions can never collide (which would let one teardown remove
         # another live session's network). The session_id rides in a label.
@@ -157,8 +228,20 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         network = f"cayu-egress-net-{token}"
         sidecar = f"cayu-egress-{token}"
         label = f"{_SESSION_LABEL}={session_id}"
+        transport_authorization = _create_sidecar_transport_authorization()
+        try:
+            server = TransparentEgressProxyServer(
+                broker,
+                loop=loop,
+                host=bind_host,
+                transport_auth_token=transport_authorization.token,
+            )
+        except BaseException:
+            transport_authorization.close()
+            raise
 
         try:
+            proxy_port = await server.start()
             await self._run(["network", "create", "--internal", "--label", label, network])
             # Sidecar starts on the default bridge (with host-gateway) so it can
             # reach the host broker, then also joins the internal sandbox network.
@@ -172,15 +255,36 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                     label,
                     "--add-host",
                     "host.docker.internal:host-gateway",
+                    "--mount",
+                    (
+                        f"type=bind,src={transport_authorization.auth_path},"
+                        f"dst={_SIDECAR_AUTH_PATH},readonly"
+                    ),
+                    "--mount",
+                    (
+                        f"type=bind,src={transport_authorization.connector_path},"
+                        f"dst={_SIDECAR_CONNECTOR_PATH},readonly"
+                    ),
+                    "--env",
+                    f"CAYU_BROKER_PORT={proxy_port}",
+                    "--entrypoint",
+                    _SIDECAR_CONNECTOR_PATH,
                     self._sidecar_image,
-                    f"TCP-LISTEN:{_SIDECAR_LISTEN_PORT},fork,reuseaddr",
-                    f"TCP:host.docker.internal:{proxy_port}",
+                    "listen",
                 ]
             )
             await self._run(["network", "connect", network, sidecar])
+            await self._run(["exec", sidecar, "sh", "-c", _SIDECAR_READY_SCRIPT])
         except BaseException as original:
             cleanup_task = asyncio.create_task(
-                self._teardown(server, network, sidecar, broker, grants)
+                self._teardown(
+                    server,
+                    network,
+                    sidecar,
+                    broker,
+                    grants,
+                    transport_authorization,
+                )
             )
             try:
                 await _await_bounded_cleanup_task(
@@ -205,7 +309,14 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         }
 
         async def teardown() -> None:
-            await self._teardown(server, network, sidecar, broker, grants)
+            await self._teardown(
+                server,
+                network,
+                sidecar,
+                broker,
+                grants,
+                transport_authorization,
+            )
 
         return EgressBinding(
             env=env,
@@ -221,6 +332,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                 "network": network,
                 "sidecar": sidecar,
                 "guest_ca_path": GUEST_CA_PATH,
+                "proxy_bind_host": bind_host,
                 "proxy_port": proxy_port,
             },
             teardown=teardown,
@@ -262,13 +374,12 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         sidecar: str,
         broker: TransparentEgressBroker,
         grants: Sequence[VirtualCredentialGrant],
+        transport_authorization: _SidecarTransportAuthorization,
     ) -> None:
         # Revoke before releasing any resource that enforced the grant boundary.
         # EgressBinding.close keeps failures retryable and never marks an
         # incomplete teardown closed.
-        await broker.registry.revoke_values_and_wait(
-            tuple(grant.presented_value for grant in grants)
-        )
+        await broker.revoke_authority_and_wait(tuple(grant.presented_value for grant in grants))
         errors: list[str] = []
         for argv in (["rm", "-f", sidecar], ["network", "rm", network]):
             try:
@@ -281,6 +392,10 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             await server.close()
         except Exception as exc:
             errors.append(f"proxy listener: {type(exc).__name__}")
+        try:
+            transport_authorization.close()
+        except Exception as exc:
+            errors.append(f"sidecar transport authorization: {type(exc).__name__}")
         if errors:
             raise RuntimeError(f"Docker egress teardown incomplete: {'; '.join(errors)}")
 

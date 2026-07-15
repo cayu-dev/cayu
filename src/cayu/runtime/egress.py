@@ -23,6 +23,7 @@ from typing import Any
 from cayu.artifacts import ArtifactStore
 from cayu.core.events import Event, EventType
 from cayu.egress import (
+    ApprovedEgressDestination,
     CredentialKind,
     CredentialMode,
     EgressAdapterRegistry,
@@ -42,6 +43,7 @@ from cayu.egress.adapter import (
     _await_bounded_cleanup_task,
 )
 from cayu.egress.credential_kinds import validate_credential_kind
+from cayu.egress.destinations import validate_approved_destinations
 from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.environments.bindings import (
     BoundWorkspace,
@@ -102,9 +104,10 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
     def __init__(
         self,
         *,
-        resolver: SecretResolver,
         policies: Mapping[str, EgressPolicy],
-        credentials: Sequence[VirtualCredentialSpec],
+        credentials: Sequence[VirtualCredentialSpec] = (),
+        approved_destinations: Sequence[ApprovedEgressDestination] = (),
+        resolver: SecretResolver | None = None,
         image: str = DEFAULT_SANDBOX_IMAGE,
         setup_commands: Sequence[str] = (),
         adapter: SandboxEgressAdapter | None = None,
@@ -116,8 +119,13 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         upstream: EgressUpstream | None = None,
         require_test_mode_credentials: bool = True,
     ) -> None:
-        if not credentials:
-            raise ValueError("VirtualEgressEnvironmentFactory requires at least one credential.")
+        if not credentials and not approved_destinations:
+            raise ValueError(
+                "VirtualEgressEnvironmentFactory requires at least one credential or "
+                "approved destination."
+            )
+        if credentials and resolver is None:
+            raise ValueError("Virtual-egress credentials require a secret resolver.")
         if adapter is not None and adapter_registry is not None:
             raise ValueError("Pass either adapter or adapter_registry, not both.")
         duplicate_env_names = _duplicate_env_names(credentials)
@@ -129,6 +137,9 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         self._resolver = resolver
         self._policies = dict(policies)
         self._credentials = tuple(credentials)
+        self._approved_destinations = validate_approved_destinations(
+            approved_destinations,
+        )
         self._image = image
         self._setup_commands = tuple(setup_commands)
         self._adapter = adapter
@@ -171,11 +182,15 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             registry=registry,
             resolver=self._resolver,
             policies=self._policies,
+            approved_destinations=self._approved_destinations,
             upstream=self._upstream,
             audit=audit,
             require_test_mode_credentials=self._require_test_mode,
         )
-        grant_revoker = _EgressGrantRevoker(registry=registry, grants=grants)
+        authority_revoker = _EgressAuthorityRevoker(
+            grants=grants,
+            broker=broker,
+        )
 
         # From here on, adapter.prepare may return resources (proxy thread +
         # docker network + sidecar) before workspace binding/finalization is
@@ -191,7 +206,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 grants=grants,
                 broker=broker,
             )
-            grant_revoker.teardown_timeout_s = binding.teardown_timeout_s
+            authority_revoker.teardown_timeout_s = binding.teardown_timeout_s
             ca_dir = tempfile.mkdtemp(prefix="cayu-egress-ca-")
             ca_host = os.path.join(ca_dir, "ca.pem")
             with open(ca_host, "wb") as handle:
@@ -208,7 +223,10 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 ca_cert_host_path=ca_host,
                 guest_ca_path=guest_ca_path,
                 setup_commands=self._setup_commands,
-                egress_destinations=tuple(grant.destination for grant in grants),
+                egress_destinations=_ordered_destinations(
+                    grants,
+                    self._approved_destinations,
+                ),
                 session_id=request.session_id,
                 parent_session_id=request.parent_session_id,
                 reconnect_metadata=request.reconnect_metadata,
@@ -221,7 +239,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 adapter=adapter,
                 egress_binding=binding,
                 ca_dir=ca_dir,
-                grant_revoker=grant_revoker,
+                authority_revoker=authority_revoker,
                 audit=audit,
             )
             runner = None
@@ -256,7 +274,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             else:
                 revocation_complete = False
                 try:
-                    await grant_revoker.revoke(
+                    await authority_revoker.revoke(
                         timeout_s=_remaining_before_deadline(
                             deadline,
                             "Virtual-egress rollback timed out before grant revocation.",
@@ -344,6 +362,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                         "credential_mode": CredentialMode.VIRTUAL_EGRESS.value,
                         "runner_kind": runner_kind,
                         "grant_count": len(grants),
+                        "approved_destination_count": len(self._approved_destinations),
                     },
                 )
             )
@@ -359,18 +378,17 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 )
 
 
-class _EgressGrantRevoker:
-    """Disables a session's virtual credentials before slow resource cleanup."""
+class _EgressAuthorityRevoker:
+    """Disables a session's credentialed and credentialless egress authority."""
 
     def __init__(
         self,
         *,
-        registry: VirtualCredentialRegistry,
         grants: Sequence[VirtualCredentialGrant],
+        broker: TransparentEgressBroker,
     ) -> None:
-        self._registry = registry
         self._presented_values = tuple(grant.presented_value for grant in grants)
-        self._grant_ids = tuple(grant.grant_id for grant in grants)
+        self._broker = broker
         self._revoked = False
         self._drained = False
         self._task: asyncio.Task[None] | None = None
@@ -401,10 +419,8 @@ class _EgressGrantRevoker:
 
     async def _revoke_and_wait(self) -> None:
         if not self._revoked:
-            for value in self._presented_values:
-                self._registry.revoke(value)
+            await self._broker.revoke_authority_and_wait(self._presented_values)
             self._revoked = True
-        await self._registry.wait_for_inactive_grants(self._grant_ids)
 
 
 async def _await_cleanup_task(
@@ -481,14 +497,14 @@ class _EgressManagedRunner(Runner):
         adapter: SandboxEgressAdapter,
         egress_binding: EgressBinding,
         ca_dir: str,
-        grant_revoker: _EgressGrantRevoker,
+        authority_revoker: _EgressAuthorityRevoker,
         audit: _EgressAuditBridge | None = None,
     ) -> None:
         self._runner = runner
         self._adapter = adapter
         self._egress_binding = egress_binding
         self._ca_dir = ca_dir
-        self._grant_revoker = grant_revoker
+        self._authority_revoker = authority_revoker
         self._audit = audit
         self._teardown_timeout_s = egress_binding.teardown_timeout_s
         self._runner_close_task: asyncio.Task[None] | None = None
@@ -523,14 +539,14 @@ class _EgressManagedRunner(Runner):
     async def close(self) -> None:
         await self.finalize(outcome=None)
 
-    async def revoke_grants(self) -> bool:
-        return await self._grant_revoker.revoke()
+    async def revoke_authority(self) -> bool:
+        return await self._authority_revoker.revoke()
 
     async def finalize(self, *, outcome: str | None) -> None:
         if self._closed:
             return
         deadline = asyncio.get_running_loop().time() + self._teardown_timeout_s
-        cancelled = await self._grant_revoker.revoke(
+        cancelled = await self._authority_revoker.revoke(
             timeout_s=self._remaining_teardown_time(deadline)
         )
         # Do not release enforcement resources unless revocation completed.
@@ -676,6 +692,7 @@ class _EgressAuditBridge:
                 "grant_id": decision.grant_id,
                 "policy_name": decision.policy_name,
                 "reason": decision.reason,
+                "authorization_kind": decision.authorization_kind,
             },
         )
         emitter = self._emitter
@@ -777,7 +794,7 @@ class _EgressTeardownBinding(WorkspaceBinding):
         try:
             # Disable guest-side authority before workspace commands run. The
             # runner stays alive until the workspace has flushed and unmounted.
-            cancelled = await self._runner.revoke_grants()
+            cancelled = await self._runner.revoke_authority()
         except BaseException as exc:
             cleanup_error = exc
         try:
@@ -860,3 +877,17 @@ def _duplicate_env_names(credentials: Sequence[VirtualCredentialSpec]) -> tuple[
             duplicates.add(credential.env_name)
         seen.add(credential.env_name)
     return tuple(sorted(duplicates))
+
+
+def _ordered_destinations(
+    grants: Sequence[VirtualCredentialGrant],
+    approved_destinations: Sequence[ApprovedEgressDestination],
+) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            [
+                *(grant.destination for grant in grants),
+                *(destination.destination for destination in approved_destinations),
+            ]
+        )
+    )

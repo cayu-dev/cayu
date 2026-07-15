@@ -43,11 +43,22 @@ class HttpProxyEndpoint:
 
 @dataclass
 class ExposedProxy:
-    """A runtime-reachable URL for one in-process Cayu proxy listener."""
+    """A runtime-reachable URL for one in-process Cayu proxy listener.
+
+    ``credentialless_isolated`` is an explicit transport-boundary assertion: the
+    endpoint is reachable only by the intended sandbox and Cayu's trusted host,
+    not by the public internet, a shared tenant network, or another sandbox.
+    Credentialless routes fail closed unless an exposure makes this assertion.
+    """
 
     proxy_url: str
     teardown: Callable[[], Awaitable[None]] | None = None
+    credentialless_isolated: bool = False
     _closed: bool = field(default=False, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if type(self.credentialless_isolated) is not bool:
+            raise TypeError("credentialless_isolated must be a boolean.")
 
     async def close(self) -> None:
         if self._closed:

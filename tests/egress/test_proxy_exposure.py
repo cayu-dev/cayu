@@ -5,7 +5,11 @@ import asyncio
 import pytest
 
 from cayu.egress import UnsupportedEgressError
-from cayu.egress.proxy_exposure import HttpProxyEndpoint, MicrosandboxHostProxyExposure
+from cayu.egress.proxy_exposure import (
+    ExposedProxy,
+    HttpProxyEndpoint,
+    MicrosandboxHostProxyExposure,
+)
 
 
 def test_http_proxy_endpoint_centralizes_url_validation() -> None:
@@ -25,16 +29,24 @@ def test_http_proxy_endpoint_centralizes_url_validation() -> None:
 
 
 def test_microsandbox_host_exposure_advertises_the_runtime_host_gateway() -> None:
-    async def run() -> str:
+    async def run() -> tuple[str, bool]:
         exposed = await MicrosandboxHostProxyExposure().expose(
             local_host="127.0.0.1",
             local_port=8123,
         )
         await exposed.close()
         await exposed.close()
-        return exposed.proxy_url
+        return exposed.proxy_url, exposed.credentialless_isolated
 
-    assert asyncio.run(run()) == "http://host.microsandbox.internal:8123"
+    assert asyncio.run(run()) == ("http://host.microsandbox.internal:8123", False)
+
+
+def test_exposed_proxy_requires_a_real_boolean_isolation_assertion() -> None:
+    with pytest.raises(TypeError, match="credentialless_isolated"):
+        ExposedProxy(
+            proxy_url="http://203.0.113.10:8443",
+            credentialless_isolated=1,  # type: ignore[arg-type]
+        )
 
 
 def test_microsandbox_host_exposure_rejects_non_loopback_listener() -> None:

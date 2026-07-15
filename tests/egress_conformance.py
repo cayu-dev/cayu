@@ -134,7 +134,11 @@ class _DeterministicExposure:
         async def teardown() -> None:
             self._release_probe.observe_release()
 
-        return ExposedProxy(proxy_url="http://203.0.113.10:8443", teardown=teardown)
+        return ExposedProxy(
+            proxy_url="http://203.0.113.10:8443",
+            teardown=teardown,
+            credentialless_isolated=True,
+        )
 
 
 def _deterministic_docker_fixture() -> DeterministicEgressFixture:

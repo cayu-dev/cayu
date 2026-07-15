@@ -94,5 +94,14 @@ def supported_credential_kind_descriptor(
     return SUPPORTED_CREDENTIAL_KINDS.get(credential_kind)
 
 
+def uses_virtual_credential_namespace(value: str) -> bool:
+    """Return whether a value claims any registered Cayu virtual prefix."""
+
+    return any(
+        value.startswith(descriptor.virtual_prefix)
+        for descriptor in SUPPORTED_CREDENTIAL_KINDS.values()
+    )
+
+
 def validate_presented_value(credential_kind: str, value: str) -> None:
     credential_kind_descriptor(credential_kind).validate_presented_value(value)

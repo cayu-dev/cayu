@@ -65,7 +65,8 @@ dual-homed sidecar that forwards to the in-process broker.
 ## API shape
 
 Most apps use the root-level setup API: `CredentialMode`, `HttpEgressPolicy`,
-`VirtualCredentialSpec`, and `VirtualEgressEnvironmentFactory`.
+`ApprovedEgressDestination`, `VirtualCredentialSpec`, and
+`VirtualEgressEnvironmentFactory`.
 
 Lower-level extension points live under `cayu.egress` and `cayu.runtime.egress`:
 custom `EgressPolicy` implementations, `SandboxEgressAdapter` registrations,
@@ -132,10 +133,129 @@ Grant revocation is enforced against in-flight broker requests: teardown marks
 the grant revoked, waits for active request leases to drain, and the broker
 re-checks liveness after vault resolution before forwarding upstream.
 
+### Credentialless approved destinations for coding agents
+
+An approved destination can use the same enforced sandbox network without a
+secret. This is useful when a coding agent needs one public documentation page,
+source archive, or package-registry endpoint but must not receive general
+internet access. `ApprovedEgressDestination` is structurally separate from
+`VirtualCredentialSpec`: it has no `SecretRef`, mints no virtual value, adds no
+guest environment variable, and never calls a resolver.
+
+This complete environment registration permits exactly one Python documentation
+request and denies other hosts, paths, methods, ports, direct IPs, and metadata
+access through the same adapter boundary:
+
+```python
+import asyncio
+
+from cayu import (
+    ApprovedEgressDestination,
+    AgentSpec,
+    CayuApp,
+    EnvironmentSpec,
+    ExecCommandTool,
+    HttpEgressPolicy,
+    Message,
+    OpenAIProvider,
+    RunRequest,
+    VirtualEgressEnvironmentFactory,
+)
+
+app = CayuApp()
+factory = VirtualEgressEnvironmentFactory(
+    policies={
+        "python-asyncio-doc": HttpEgressPolicy(
+            name="python-asyncio-doc",
+            allowed_hosts=["docs.python.org"],
+            allowed_endpoints=[("GET", "/3/library/asyncio.html")],
+        )
+    },
+    approved_destinations=[
+        ApprovedEgressDestination(
+            destination="docs.python.org",
+            policy_name="python-asyncio-doc",
+            protocol="https",
+            port=443,
+        )
+    ],
+    credentials=[],
+    # No resolver is required because this environment has no credentialed route.
+    image="python:3.13",
+)
+app.register_environment_factory(
+    EnvironmentSpec(name="coding-sandbox"),
+    factory,
+    default=True,
+)
+app.register_provider(OpenAIProvider(), default=True)  # reads OPENAI_API_KEY
+app.register_agent(
+    AgentSpec(
+        name="builder",
+        model="gpt-5.4-mini",
+        system_prompt="Use the shell tool to inspect approved public documentation.",
+    ),
+    tools=[ExecCommandTool()],
+)
+
+
+async def main() -> None:
+    request = RunRequest(
+        agent_name="builder",
+        session_id="bounded-docs-demo",
+        messages=[
+            Message.text(
+                "user",
+                "Use python3 and urllib.request to fetch "
+                "https://docs.python.org/3/library/asyncio.html, then show that "
+                "https://example.com is denied.",
+            )
+        ],
+    )
+    async for event in app.run(request):
+        print(event.type, event.payload)
+
+
+asyncio.run(main())
+```
+
+Cayu v1 intentionally supports only broker-terminated HTTPS on port 443 for
+credentialless declarations. A redirect response is returned to the guest
+client normally; if the client follows it, the resulting request passes through
+the broker again and the target must have its own declaration and policy. Cayu
+does not infer or auto-approve mirrors, CDNs, package dependencies, or other
+transitive hosts. Caller-provided headers, including `Authorization`, are
+forwarded unchanged on a credentialless route; Cayu neither invents nor rewrites
+authentication there.
+
+Before the default upstream opens a socket, Cayu resolves the approved hostname
+once, rejects every non-global, loopback, link-local, multicast, reserved, or
+unspecified result, and connects to one validated address while preserving the
+original HTTP `Host` and TLS SNI names. This pins the authorization decision to
+the connection target and prevents DNS rebinding to private networks or cloud
+metadata. Application-owned `HttpxUpstream(routes=...)` mappings are an explicit
+trusted-control-plane override for private service origins; they still reject
+loopback, link-local/metadata, multicast, reserved, and unspecified addresses.
+
+Credentialed and credentialless declarations can be combined in one factory.
+The adapter receives the union of their hostnames for enforcement preflight,
+while only `VirtualCredentialSpec` entries create guest credential values. A
+factory with neither kind is rejected before adapter allocation, so an empty
+configuration opens no proxy or network capability.
+
+Credentialless authorization also requires a session-isolated broker transport.
+Docker provides this automatically: its dual-homed sidecar listens only on the
+random per-session internal network, and authenticates every sidecar-to-broker
+connection through a private host-mounted credential file. That transport
+credential is never mounted or injected into the sandbox. A host/LAN peer cannot
+use the broker listener, and an unrelated container on Docker's shared bridge
+cannot use the sidecar.
+
 Docker is the default runtime path. E2B and Microsandbox use registered
 `SandboxEgressAdapter` implementations that both prepare the proxy and create
-the matching network-restricted runner. If no adapter is registered for the
-requested runner kind, setup fails closed.
+the matching network-restricted runner. Remote/raw proxy exposures have an
+additional credentialless requirement described below. If no adapter is
+registered for the requested runner kind, setup fails closed.
 
 ### Microsandbox
 
@@ -154,6 +274,13 @@ either listener cannot be established.
 The default is deliberately loopback-only. It does not expose the proxy port on
 the host's LAN interfaces. The adapter exposes no bind-host override; paired
 loopback listeners are part of its fixed Microsandbox exposure contract.
+
+The built-in host exposure is shared host infrastructure rather than a
+session-exclusive transport. It therefore supports virtual-credential routes
+but fails closed for credentialless destinations. A custom Microsandbox
+`ProxyExposure` may support them only when its returned `ExposedProxy` truthfully
+sets `credentialless_isolated=True` and the endpoint is unreachable from other
+sandboxes and untrusted peers.
 
 ```python
 from cayu.egress import EgressAdapterRegistry
@@ -192,7 +319,9 @@ from cayu.egress.proxy_exposure import ExposedProxy, ProxyExposure
 
 # Application-owned adapter that exposes the supplied local host/port through
 # a raw TCP tunnel and returns an IPv4-literal endpoint such as
-# ExposedProxy(proxy_url="http://203.0.113.10:8443").
+# ExposedProxy(proxy_url="http://203.0.113.10:8443"). For credentialless
+# destinations the endpoint must be session-exclusive, and the exposure must
+# return ExposedProxy(..., credentialless_isolated=True).
 tunnel = MyE2BProxyExposure()
 
 registry = EgressAdapterRegistry()
@@ -210,7 +339,12 @@ factory = VirtualEgressEnvironmentFactory(
 
 Install with `pip install 'cayu[egress,e2b]'`. A normal HTTP reverse proxy is
 not sufficient: the endpoint must preserve raw HTTP CONNECT and tunneled TLS
-bytes. The adapter refuses to start without an exposure implementation.
+bytes. The adapter refuses to start without an exposure implementation. For a
+credentialless or mixed session, a default/shared/public exposure is also
+refused: `credentialless_isolated=True` is an explicit contract that only the
+intended sandbox and Cayu's trusted host can reach that endpoint. Setting it on
+a shared tunnel does not create isolation; the application-owned exposure must
+enforce the claim with a per-session private route or equivalent boundary.
 
 E2B exposes Firecracker MMDS at `169.254.169.254` inside the guest even when
 external internet access is denied. Before handoff, the adapter installs a root
@@ -244,7 +378,9 @@ With `event_emitter` wired, the session event stream carries secret-free
 telemetry events (payloads never contain the real value): `credential.mode.selected`
 and `egress.grant.minted` at start, `egress.request.authorized` /
 `egress.request.denied` per outbound request, and `egress.grant.revoked` at
-teardown. Request events are emitted best-effort from the proxy path and can lag
+teardown. Request events include `authorization_kind`, which is
+`virtual_credential` or `credentialless`; credentialless records have a null
+`grant_id`. They are emitted best-effort from the proxy path and can lag
 or reorder around terminal session events; the enforcement decision itself is
 still synchronous inside the broker. Payloads carry grant id, destination,
 method, path, policy name, and decision/status.
@@ -265,8 +401,12 @@ deliberately *out of scope*:
   to the narrowest interface the sidecar can still reach — loopback on Docker
   Desktop, the docker bridge gateway on Linux — falling back to `0.0.0.0` (with a
   loud warning) only if neither can be determined. Pass `proxy_host=` to override.
-  The listener is credential-gated (an unguessable virtual credential + policy),
-  so it never exposes a real secret regardless of the bind address.
+  Every connection must first complete a sidecar-only authenticated outer
+  CONNECT, so the listener is not a credentialless generic proxy even when it is
+  host- or LAN-reachable. The sidecar's guest-facing listener binds only its
+  random per-session internal-network address. The transport credential is
+  mounted into that sidecar alone and never enters guest env, files, events,
+  evidence, artifacts, or persisted binding metadata.
 
 ## Credential modes on runners
 
@@ -343,16 +483,24 @@ custom `EgressPolicy` when you need business-level limits such as spend caps.
 
 | Runner | Status |
 | --- | --- |
-| `docker` | Enforced (internal network + sidecar + TLS MITM). |
-| `microsandbox` | Enforced with a deny-by-default host policy allowing only the Cayu proxy port. |
-| `e2b` | Enforced with a dedicated E2B-reachable, IPv4-literal raw TCP proxy exposure and fail-closed preflight. |
-| `lambda-microvm` | Enforced with a VPC egress connector that can reach only the private ECS/Fargate proxy and workspace mount target. |
+| `docker` | Enforced (per-session internal network + sidecar-only broker authentication + TLS MITM), including credentialless routes. |
+| `microsandbox` | Virtual credentials are enforced with a deny-by-default host policy allowing only the Cayu proxy port. Credentialless routes require a custom session-isolated exposure. |
+| `e2b` | Enforced with a dedicated E2B-reachable, IPv4-literal raw TCP proxy exposure and fail-closed preflight. Credentialless routes additionally require `credentialless_isolated=True`. |
+| `lambda-microvm` | Virtual credentials are enforced with a VPC egress connector that can reach only the private ECS/Fargate proxy and workspace mount target. Credentialless routes require a session-isolated exposure. |
 | `local`, `sbx` | Unsupported by the virtual-egress factory. Direct runner construction may still set `credential_mode` for raw-secret checks, but that is not an egress boundary. |
 
 Notes on the Docker adapter:
 - The broker proxy binds a host-reachable interface so the sidecar can reach it via
-  `host.docker.internal` on both Docker Desktop and native Linux; the unguessable virtual
-  credential + destination/policy checks are the trust boundary, not the bind address.
+  `host.docker.internal` on both Docker Desktop and native Linux. A private
+  sidecar-only outer CONNECT authenticates that hop independently of provider or
+  credentialless request authorization.
+- The sidecar discovers the interface without the default route and binds its
+  guest-facing listener only there. Other containers on Docker's shared default
+  bridge cannot turn the sidecar into a credentialless proxy.
+- A custom `sidecar_image=` must provide `/bin/sh`, `ip`, `awk`, `sleep`, and a
+  `socat` build with `PROXY` plus `proxyauthfile` support, as the default
+  `alpine/socat` image does. Startup checks that the authenticated listener
+  reached its ready state and fails closed when the image is incompatible.
 - `setup_commands` run on the enforced network with the egress overlay applied, so they are
   subject to the **same egress policy** as the app. Bake tools that need arbitrary hosts into the
   image rather than installing them from `setup_commands` under `virtual_egress`.
@@ -387,7 +535,9 @@ a private Fargate receiver, and an exact host/method/path egress policy.
   the virtual value, a secret-blind recursive Bloom scan finds no real secret,
   the allowed call succeeds through the session CA with the real key swapped
   only upstream, direct public-IP and metadata egress are blocked, and the
-  credential is rejected after the session closes. This runs in the existing
+  credential is rejected after the session closes. Its credentialless lane also
+  proves that a direct host-broker client lacks the sidecar credential and an
+  unrelated default-bridge container cannot reach the sidecar listener. This runs in the existing
   uncredentialed Docker live CI job and as `docker-live-virtual-egress` in the
   nightly registry.
 - Microsandbox E2E (manual/nightly): set

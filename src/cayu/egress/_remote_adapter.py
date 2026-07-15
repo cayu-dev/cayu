@@ -41,9 +41,7 @@ async def prepare_exposed_proxy_binding(
     async def cleanup() -> None:
         # Grant revocation is the security transition and must complete before
         # the proxy exposure or listener is released.
-        await broker.registry.revoke_values_and_wait(
-            tuple(grant.presented_value for grant in grants)
-        )
+        await broker.revoke_authority_and_wait(tuple(grant.presented_value for grant in grants))
         errors: list[str] = []
         if exposed is not None:
             try:
@@ -60,6 +58,12 @@ async def prepare_exposed_proxy_binding(
     try:
         proxy_port = await server.start()
         exposed = await exposure.expose(local_host=bind_host, local_port=proxy_port)
+        if broker.has_credentialless_destinations and not exposed.credentialless_isolated:
+            raise UnsupportedEgressError(
+                f"{runner_kind} credentialless egress requires a session-isolated "
+                "proxy exposure; shared or public proxy endpoints would be usable "
+                "without a virtual credential."
+            )
         try:
             endpoint = HttpProxyEndpoint.parse(exposed.proxy_url)
         except ValueError as exc:

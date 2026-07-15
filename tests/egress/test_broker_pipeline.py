@@ -27,6 +27,13 @@ from cayu.vaults import ResolvedSecret, SecretRef, StaticVault
 REAL_SECRET = "sk_test_51RealDeadBeefSecretValue"
 
 
+def _destination_resolver(*addresses: str):  # type: ignore[no-untyped-def]
+    async def resolve(_host: str, _port: int) -> tuple[str, ...]:
+        return addresses
+
+    return resolve
+
+
 class _RecordingResolver:
     """Counts resolutions so tests can prove deny-before-resolve."""
 
@@ -288,8 +295,10 @@ def test_upstream_failure_is_sanitized() -> None:
 def test_httpx_upstream_strips_stale_compression_headers_after_decoding() -> None:
     decoded = b'{"ok":true}'
     encoded = gzip.compress(decoded)
+    captured: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
         return httpx.Response(
             200,
             headers={
@@ -302,7 +311,10 @@ def test_httpx_upstream_strips_stale_compression_headers_after_decoding() -> Non
         )
 
     async def run() -> CapturedResponse:
-        upstream = HttpxUpstream(transport=httpx.MockTransport(handler))
+        upstream = HttpxUpstream(
+            transport=httpx.MockTransport(handler),
+            destination_resolver=_destination_resolver("93.184.216.34"),
+        )
         return await upstream.send(
             CapturedRequest(method="GET", host="api.stripe.com", path="/v1/customers")
         )
@@ -313,6 +325,9 @@ def test_httpx_upstream_strips_stale_compression_headers_after_decoding() -> Non
     assert response.headers["content-type"] == "application/json"
     assert "content-encoding" not in {key.lower() for key in response.headers}
     assert "content-length" not in {key.lower() for key in response.headers}
+    assert str(captured[0].url) == "https://93.184.216.34/v1/customers"
+    assert captured[0].headers["host"] == "api.stripe.com"
+    assert captured[0].extensions["sni_hostname"] == "api.stripe.com"
 
 
 def test_httpx_upstream_routes_logical_host_to_private_service() -> None:
@@ -326,6 +341,7 @@ def test_httpx_upstream_routes_logical_host_to_private_service() -> None:
         upstream = HttpxUpstream(
             routes={"receiver.internal": "http://receiver.service.local:8080"},
             transport=httpx.MockTransport(handler),
+            destination_resolver=_destination_resolver("10.0.0.10"),
         )
         return await upstream.send(
             CapturedRequest(
@@ -341,8 +357,46 @@ def test_httpx_upstream_routes_logical_host_to_private_service() -> None:
     response = asyncio.run(run())
 
     assert response.status_code == 202
-    assert str(captured[0].url) == ("http://receiver.service.local:8080/v1/actions?mode=safe")
+    assert str(captured[0].url) == "http://10.0.0.10:8080/v1/actions?mode=safe"
+    assert captured[0].headers["host"] == "receiver.service.local:8080"
     assert captured[0].headers["authorization"] == "Bearer real-secret"
+
+
+@pytest.mark.parametrize(
+    "addresses",
+    [
+        ("169.254.169.254",),
+        ("127.0.0.1",),
+        ("10.0.0.1",),
+        ("93.184.216.34", "169.254.169.254"),
+    ],
+)
+def test_httpx_upstream_rejects_dns_rebinding_before_transport(
+    addresses: tuple[str, ...],
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, request=request)
+
+    async def run() -> None:
+        upstream = HttpxUpstream(
+            transport=httpx.MockTransport(handler),
+            destination_resolver=_destination_resolver(*addresses),
+        )
+        with pytest.raises(ValueError, match="prohibited address"):
+            await upstream.send(
+                CapturedRequest(
+                    method="GET",
+                    host="docs.example.com",
+                    path="/sdk/index.json",
+                )
+            )
+
+    asyncio.run(run())
+
+    assert requests == []
 
 
 @pytest.mark.parametrize(

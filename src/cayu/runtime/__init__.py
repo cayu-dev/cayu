@@ -120,6 +120,7 @@ from cayu.runtime.dispatch import (
 )
 from cayu.runtime.egress import (
     VIRTUAL_EGRESS_EVENT_TYPES,
+    ApprovedEgressDestination,
     VirtualCredentialSpec,
     VirtualEgressEnvironmentFactory,
     VirtualEgressRunnerRequest,
@@ -307,6 +308,7 @@ __all__ = [
     "AlwaysRequireApprovalToolPolicy",
     "AppManifest",
     "ApplicationDefaultsManifest",
+    "ApprovedEgressDestination",
     "BeforeStopAction",
     "BeforeStopContext",
     "BeforeStopDecision",

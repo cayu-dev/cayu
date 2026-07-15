@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from cayu.egress import (
+    ApprovedEgressDestination,
     HttpEgressPolicy,
     TransparentEgressBroker,
     UnsupportedEgressError,
@@ -186,6 +187,45 @@ def _broker_and_grant() -> tuple[TransparentEgressBroker, Any]:
         policy_name="stripe",
     )
     return broker, grant
+
+
+def _credentialless_broker() -> TransparentEgressBroker:
+    return TransparentEgressBroker(
+        registry=VirtualCredentialRegistry(),
+        policies={
+            "public-docs": HttpEgressPolicy(
+                name="public-docs",
+                allowed_hosts=["docs.example.com"],
+                allowed_endpoints=[("GET", "/sdk/index.json")],
+            )
+        },
+        approved_destinations=[
+            ApprovedEgressDestination(
+                destination="docs.example.com",
+                policy_name="public-docs",
+            )
+        ],
+    )
+
+
+def test_default_microsandbox_exposure_fails_closed_for_credentialless_routes() -> None:
+    async def run() -> _FakeProxyServer:
+        _FakeProxyServer.instances = []
+        adapter = MicrosandboxEgressAdapter(
+            microsandbox_module=_FakeMicrosandboxModule,
+            proxy_server_factory=_FakeProxyServer,
+        )
+        with pytest.raises(UnsupportedEgressError, match="session-isolated"):
+            await adapter.prepare(
+                session_id="session-public-docs",
+                grants=[],
+                broker=_credentialless_broker(),
+            )
+        return _FakeProxyServer.instances[0]
+
+    server = asyncio.run(run())
+
+    assert server.closed is True
 
 
 def test_microsandbox_adapter_creates_only_a_proxy_reachable_runner(tmp_path: Path) -> None:

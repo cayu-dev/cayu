@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import datetime as _dt
 import hashlib
+import ipaddress
+import logging
 import os
+import secrets
 import socket
 import ssl
 import tempfile
@@ -24,6 +28,8 @@ _ONE_DAY = _dt.timedelta(days=1)
 _LEAF_VALIDITY = _dt.timedelta(days=825)
 _MAX_REQUEST_BYTES = 8 * 1024 * 1024
 _BROKER_TIMEOUT_S = 60.0
+_TRANSPORT_TUNNEL_TARGET = "cayu-transport.invalid:443"
+_logger = logging.getLogger(__name__)
 
 
 class SessionCertificateAuthority:
@@ -137,6 +143,32 @@ def _leaf_file_stem(host: str) -> str:
     return hashlib.sha256(host.encode("utf-8", "surrogatepass")).hexdigest()
 
 
+def _validated_connect_target(target: str) -> tuple[str, int]:
+    try:
+        split = urlsplit(f"//{target}")
+        port = split.port
+    except ValueError as exc:
+        raise ValueError("CONNECT target has an invalid port.") from exc
+    host = split.hostname
+    if (
+        host is None
+        or split.username is not None
+        or split.password is not None
+        or split.path
+        or split.query
+        or split.fragment
+        or port != 443
+    ):
+        raise ValueError("CONNECT target must be a hostname on port 443.")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("CONNECT target must not be an IP address.")
+    return host.lower().rstrip("."), port
+
+
 class TransparentEgressProxyServer:
     """A threaded HTTP CONNECT proxy that terminates TLS and calls the broker.
 
@@ -156,17 +188,24 @@ class TransparentEgressProxyServer:
         host: str | Sequence[str] = "127.0.0.1",
         port: int = 0,
         max_workers: int = 16,
+        transport_auth_token: bytes | None = None,
     ) -> None:
         listen_hosts = (host,) if isinstance(host, str) else tuple(host)
         if not listen_hosts or any(not item.strip() for item in listen_hosts):
             raise ValueError("Egress proxy listen hosts must be nonblank.")
         if len(set(listen_hosts)) != len(listen_hosts):
             raise ValueError("Egress proxy listen hosts must be unique.")
+        if transport_auth_token is not None:
+            if type(transport_auth_token) is not bytes:
+                raise TypeError("Egress proxy transport authentication token must be bytes.")
+            if not transport_auth_token:
+                raise ValueError("Egress proxy transport authentication token must be nonempty.")
         self._broker = broker
         self._loop = loop
         self._authority = authority or SessionCertificateAuthority()
         self._hosts = listen_hosts
         self._port = port
+        self._transport_auth_token = transport_auth_token
         self._sockets: list[socket.socket] = []
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._accept_threads: list[threading.Thread] = []
@@ -264,6 +303,13 @@ class TransparentEgressProxyServer:
 
     def _handle_connection(self, conn: socket.socket) -> None:
         conn.settimeout(30.0)
+        if self._transport_auth_token is not None:
+            request_line, headers = _read_head(conn)
+            if not self._transport_is_authenticated(request_line, headers):
+                _logger.debug("Rejected unauthenticated egress proxy transport connection.")
+                return
+            _logger.debug("Accepted authenticated egress proxy transport connection.")
+            conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         # Read the head WITHOUT over-reading: for CONNECT, any following bytes are
         # the tunneled TLS ClientHello and must stay in the socket for wrap_socket.
         request_line, _headers = _read_head(conn)
@@ -277,8 +323,34 @@ class TransparentEgressProxyServer:
                 b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             )
 
+    def _transport_is_authenticated(
+        self,
+        request_line: bytes,
+        headers: dict[str, str],
+    ) -> bool:
+        if self._transport_auth_token is None:
+            return True
+        try:
+            method, target, _version = request_line.decode("latin-1").split(" ", 2)
+        except ValueError:
+            return False
+        if method.upper() != "CONNECT" or target != _TRANSPORT_TUNNEL_TARGET:
+            return False
+        presented = next(
+            (value for key, value in headers.items() if key.lower() == "proxy-authorization"),
+            "",
+        )
+        encoded = base64.b64encode(b"cayu:" + self._transport_auth_token).decode("ascii")
+        return secrets.compare_digest(presented, f"Basic {encoded}")
+
     def _handle_connect(self, conn: socket.socket, target: str) -> None:
-        host, _, _port = target.partition(":")
+        try:
+            host, port = _validated_connect_target(target)
+        except ValueError:
+            conn.sendall(
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            return
         conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         context = self._authority.server_ssl_context(host)
         tls = context.wrap_socket(conn, server_side=True)
@@ -293,6 +365,8 @@ class TransparentEgressProxyServer:
                 method=method,
                 host=host,
                 path=split.path or "/",
+                protocol="https",
+                port=port,
                 query=split.query,
                 headers=headers,
                 body=body,

@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from cayu.egress import (
+    ApprovedEgressDestination,
     EgressBinding,
     HttpEgressPolicy,
     TransparentEgressBroker,
@@ -43,9 +44,10 @@ class _FakeProxyServer:
 
 
 class _FakeExposure:
-    def __init__(self) -> None:
+    def __init__(self, *, credentialless_isolated: bool = False) -> None:
         self.calls: list[tuple[str, int]] = []
         self.closed = False
+        self.credentialless_isolated = credentialless_isolated
 
     async def expose(self, *, local_host: str, local_port: int) -> ExposedProxy:
         self.calls.append((local_host, local_port))
@@ -56,6 +58,7 @@ class _FakeExposure:
         return ExposedProxy(
             proxy_url="http://203.0.113.10:8443",
             teardown=teardown,
+            credentialless_isolated=self.credentialless_isolated,
         )
 
 
@@ -194,6 +197,71 @@ def _broker_and_grant() -> tuple[TransparentEgressBroker, Any]:
         policy_name="stripe",
     )
     return broker, grant
+
+
+def _credentialless_broker() -> TransparentEgressBroker:
+    return TransparentEgressBroker(
+        registry=VirtualCredentialRegistry(),
+        policies={
+            "public-docs": HttpEgressPolicy(
+                name="public-docs",
+                allowed_hosts=["docs.example.com"],
+                allowed_endpoints=[("GET", "/sdk/index.json")],
+            )
+        },
+        approved_destinations=[
+            ApprovedEgressDestination(
+                destination="docs.example.com",
+                policy_name="public-docs",
+            )
+        ],
+    )
+
+
+def test_e2b_credentialless_prepare_requires_session_isolated_exposure() -> None:
+    async def run() -> tuple[_FakeExposure, _FakeProxyServer]:
+        _FakeProxyServer.instances = []
+        exposure = _FakeExposure()
+        adapter = E2BEgressAdapter(
+            exposure=exposure,
+            e2b_module=_FakeE2BModule,
+            proxy_server_factory=_FakeProxyServer,
+        )
+        with pytest.raises(UnsupportedEgressError, match="session-isolated"):
+            await adapter.prepare(
+                session_id="session-public-docs",
+                grants=[],
+                broker=_credentialless_broker(),
+            )
+        return exposure, _FakeProxyServer.instances[0]
+
+    exposure, server = asyncio.run(run())
+
+    assert exposure.closed is True
+    assert server.closed is True
+
+
+def test_e2b_credentialless_prepare_accepts_declared_session_isolation() -> None:
+    async def run() -> tuple[Any, _FakeExposure]:
+        _FakeProxyServer.instances = []
+        exposure = _FakeExposure(credentialless_isolated=True)
+        adapter = E2BEgressAdapter(
+            exposure=exposure,
+            e2b_module=_FakeE2BModule,
+            proxy_server_factory=_FakeProxyServer,
+        )
+        binding = await adapter.prepare(
+            session_id="session-public-docs",
+            grants=[],
+            broker=_credentialless_broker(),
+        )
+        await binding.close()
+        return binding, exposure
+
+    binding, exposure = asyncio.run(run())
+
+    assert binding.proxy_url == "http://203.0.113.10:8443"
+    assert exposure.closed is True
 
 
 def test_e2b_adapter_allows_only_the_exposed_cayu_proxy(tmp_path: Path) -> None:

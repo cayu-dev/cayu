@@ -16,6 +16,9 @@ from tests.egress_conformance import (
 )
 
 from cayu.egress import (
+    ApprovedEgressDestination,
+    CapturedRequest,
+    CapturedResponse,
     EgressAdapterRegistry,
     EgressBinding,
     HttpEgressPolicy,
@@ -136,6 +139,83 @@ def test_registration_rejects_cross_session_grants_before_allocating_resources(
 
     with pytest.raises(UnsupportedEgressError, match="requested session"):
         asyncio.run(adapter.prepare(session_id="different-session", grants=[grant], broker=broker))
+
+
+@pytest.mark.parametrize(
+    "registration",
+    EGRESS_CONFORMANCE_REGISTRATIONS,
+    ids=lambda registration: registration.name,
+)
+def test_registered_builtin_enforces_credentialless_broker_without_fake_grants(
+    registration,
+) -> None:  # type: ignore[no-untyped-def]
+    class _Upstream:
+        def __init__(self) -> None:
+            self.requests: list[CapturedRequest] = []
+
+        async def send(self, request: CapturedRequest) -> CapturedResponse:
+            self.requests.append(request)
+            return CapturedResponse(status_code=200, body=b"ok")
+
+    async def run() -> tuple[bool, tuple[CapturedRequest, ...]]:
+        fixture = registration.create_deterministic_fixture()
+        upstream = _Upstream()
+        registry = VirtualCredentialRegistry()
+        cleanup_probe_grant = registry.mint(
+            session_id="probe-only",
+            env_name="PROBE",
+            secret=SecretRef(name="probe"),
+            destination="probe.example.com",
+            credential_kind="opaque_bearer",
+        )
+        fixture.release_probe.arm(registry, cleanup_probe_grant.presented_value)
+        broker = TransparentEgressBroker(
+            registry=registry,
+            policies={
+                "public-docs": HttpEgressPolicy(
+                    name="public-docs",
+                    allowed_hosts=["docs.example.com"],
+                    allowed_endpoints=[("GET", "/sdk/index.json")],
+                )
+            },
+            approved_destinations=[
+                ApprovedEgressDestination(
+                    destination="docs.example.com",
+                    policy_name="public-docs",
+                )
+            ],
+            upstream=upstream,
+        )
+        binding = await fixture.adapter.prepare(
+            session_id="session-a",
+            grants=(),
+            broker=broker,
+        )
+        assert binding.runner_kind == registration.runner_kind
+        response = await broker.handle_request(
+            CapturedRequest(
+                method="GET",
+                host="docs.example.com",
+                path="/sdk/index.json",
+            )
+        )
+        assert response.status_code == 200
+        await binding.close()
+        after_close = await broker.handle_request(
+            CapturedRequest(
+                method="GET",
+                host="docs.example.com",
+                path="/sdk/index.json",
+            )
+        )
+        assert after_close.status_code == 403
+        return binding._closed, tuple(upstream.requests)
+
+    closed, requests = asyncio.run(run())
+
+    assert closed is True
+    assert len(requests) == 1
+    assert requests[0].headers == {}
 
 
 @pytest.mark.parametrize(

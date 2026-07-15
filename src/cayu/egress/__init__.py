@@ -22,6 +22,7 @@ from cayu.egress.broker import (
     TransparentEgressBroker,
 )
 from cayu.egress.credential_kinds import CredentialKind
+from cayu.egress.destinations import ApprovedEgressDestination, EgressProtocol
 from cayu.egress.errors import (
     EgressError,
     UnsupportedEgressError,
@@ -40,6 +41,7 @@ from cayu.egress.policy import (
 from cayu.egress.proxy_exposure import VpcTaskProxyExposure
 
 __all__ = [
+    "ApprovedEgressDestination",
     "CapturedRequest",
     "CapturedResponse",
     "CredentialKind",
@@ -49,6 +51,7 @@ __all__ = [
     "EgressDecision",
     "EgressError",
     "EgressPolicy",
+    "EgressProtocol",
     "EgressRequest",
     "EgressUpstream",
     "HttpEgressPolicy",
