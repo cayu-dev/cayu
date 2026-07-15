@@ -99,6 +99,7 @@ all = [
 
 [dependency-groups]
 nightly = [
+  "packaging>=24",
   "pexpect>=4.9; sys_platform != 'win32' and sys_platform != 'emscripten'",
 ]
 

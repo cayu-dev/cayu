@@ -220,6 +220,7 @@ vertex = [
 
 [package.dev-dependencies]
 nightly = [
+    { name = "packaging" },
     { name = "pexpect", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
 ]
 
@@ -280,7 +281,10 @@ requires-dist = [
 provides-extras = ["dev", "console", "browser", "aws", "postgres", "files", "e2b", "egress", "microsandbox", "otel", "vertex", "server", "all"]
 
 [package.metadata.requires-dev]
-nightly = [{ name = "pexpect", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'", specifier = ">=4.9" }]
+nightly = [
+    { name = "packaging", specifier = ">=24" },
+    { name = "pexpect", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'", specifier = ">=4.9" },
+]
 
 [[package]]
 name = "certifi"

@@ -1381,13 +1381,11 @@ downgrades, or rewrites that database as remediation.
 
 ```python
 from cayu import Environment, EnvironmentSpec, MicrosandboxRunner
-from microsandbox import Network
 
 async with await MicrosandboxRunner.create(
     "agent-session-123",
     image="python:3.13",
     replace=True,
-    network=Network.none(),  # microsandbox SDK object; app-owned policy
 ) as runner:
     environment = Environment(
         EnvironmentSpec(name="sandboxed"),
@@ -1395,11 +1393,37 @@ async with await MicrosandboxRunner.create(
     )
 ```
 
-`MicrosandboxRunner.create(...)` passes extra keyword arguments through to
+When `network` is omitted, `MicrosandboxRunner.create(...)` supplies
+`microsandbox.Network.none()` before sandbox creation or guest setup. Direct
+IPv4 and hostname/DNS egress are therefore unavailable by default. If Cayu
+cannot construct the supported SDK's deny-all policy, creation fails before
+`microsandbox.Sandbox.create(...)`; it never retries without a policy.
+
+Applications that intentionally need unrestricted guest networking must make
+that choice visible:
+
+```python
+from cayu import MicrosandboxRunner
+from microsandbox import Network
+
+runner = await MicrosandboxRunner.create(
+    "trusted-network-client",
+    network=Network.allow_all(),
+)
+```
+
+Do not use the explicit-open form for untrusted model-authored code unless a
+separate enforced egress boundary is in place. A caller-supplied `network`
+value, including a deny policy or Cayu's virtual-egress policy, is forwarded as
+the exact object supplied; Cayu does not replace, merge, or reinterpret it.
+
+`MicrosandboxRunner.create(...)` passes other extra keyword arguments through to
 `microsandbox.Sandbox.create(...)`, so applications can configure images,
 volumes, network policies, resource limits, labels, patches, and Microsandbox
 secret placeholders without Cayu inventing a lossy abstraction over those
-backend-specific controls.
+backend-specific controls. Network policy objects, proxy credentials,
+environment values, and destination configuration are neither copied into
+ordinary runner logs nor persisted as runner diagnostics.
 
 Lifecycle is explicit:
 
@@ -1464,7 +1488,8 @@ Cayu reports confirmed guest-agent unavailability; it does not report OOM unless
 Microsandbox provides explicit OOM evidence.
 
 Use `MicrosandboxRunner.from_existing(...)` when a separate control plane owns
-creation and lifecycle.
+creation and lifecycle. The creator also owns that sandbox's creation-time
+network policy: attaching does not inspect, replace, or strengthen it.
 
 The runner executes all commands under an absolute guest root, `/workspace` by
 default. Per-command `cwd` values may be relative to that root or the already
@@ -1473,9 +1498,10 @@ paths and escaping relative traversal are rejected. `env` values are explicit
 overlays only; host process environment variables are not inherited.
 Vault integrations should resolve only the specific secrets needed at the
 execution boundary and pass them through the runner or Microsandbox's own secret
-placeholder mechanism. A microVM boundary prevents ordinary workspace escape,
-but it does not make broad host mounts, host env inheritance, or unscoped secret
-injection safe.
+placeholder mechanism. A microVM boundary prevents ordinary workspace escape.
+Network denial only removes ambient egress; applications must still constrain
+host mounts, environment inheritance, secret injection, artifact promotion,
+and command/tool authorization.
 
 `LambdaMicroVMRunner` is the AWS-native Firecracker adapter behind the optional `cayu[aws]`
 extra. `create(...)` calls the distinct `lambda-microvms` control API, waits for the authenticated

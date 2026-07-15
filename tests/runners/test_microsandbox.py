@@ -299,12 +299,50 @@ class FakeMicrosandboxError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class FakeNetwork:
+    policy: str
+
+    @classmethod
+    def none(cls) -> FakeNetwork:
+        return cls(policy="none")
+
+
 class FakeMicrosandboxModule:
+    Network = FakeNetwork
     Sandbox = FakeSandboxApi
     SandboxNotFoundError = FakeSandboxNotFoundError
     SandboxNotRunningError = FakeSandboxNotRunningError
     SandboxStillRunningError = FakeSandboxStillRunningError
     MicrosandboxError = FakeMicrosandboxError
+
+
+class FailingNetwork:
+    @classmethod
+    def none(cls) -> FakeNetwork:
+        raise RuntimeError("default network policy unavailable")
+
+
+class FailingNetworkMicrosandboxModule(FakeMicrosandboxModule):
+    Network = FailingNetwork
+
+
+class MalformedNetwork:
+    @classmethod
+    def none(cls) -> None:
+        return None
+
+
+class MalformedNetworkMicrosandboxModule(FakeMicrosandboxModule):
+    Network = MalformedNetwork
+
+
+class UnsupportedNetwork:
+    pass
+
+
+class UnsupportedNetworkMicrosandboxModule(FakeMicrosandboxModule):
+    Network = UnsupportedNetwork
 
 
 def reset_fake_module() -> None:
@@ -333,6 +371,8 @@ def cleanup_diagnostic(error: BaseException) -> dict[str, Any]:
 
 
 def test_microsandbox_runner_create_passes_lifecycle_options() -> None:
+    network = {"policy": "none"}
+
     async def run() -> MicrosandboxRunner:
         reset_fake_module()
         runner = await MicrosandboxRunner.create(
@@ -341,7 +381,7 @@ def test_microsandbox_runner_create_passes_lifecycle_options() -> None:
             liveness_timeout_s=2.5,
             replace=True,
             cpus=2,
-            network={"policy": "none"},
+            network=network,
             sandbox_module=FakeMicrosandboxModule,
         )
         return runner
@@ -364,6 +404,68 @@ def test_microsandbox_runner_create_passes_lifecycle_options() -> None:
             "network": {"policy": "none"},
         }
     ]
+    assert FakeSandboxApi.created[0]["network"] is network
+
+
+def test_microsandbox_runner_create_denies_network_by_default() -> None:
+    async def run() -> MicrosandboxRunner:
+        reset_fake_module()
+        return await MicrosandboxRunner.create(
+            "agent-session",
+            sandbox_module=FakeMicrosandboxModule,
+        )
+
+    runner = asyncio.run(run())
+
+    assert FakeSandboxApi.created == [
+        {
+            "name": "agent-session",
+            "image": "python:3.13",
+            "network": FakeNetwork(policy="none"),
+        }
+    ]
+    assert runner._sandbox.exec_sync_calls == [
+        {"cmd": "mkdir", "args": ["-p", "/workspace"], "cwd": "/"}
+    ]
+
+
+@pytest.mark.parametrize(
+    ("module", "error_type", "match"),
+    [
+        (
+            FailingNetworkMicrosandboxModule,
+            RuntimeError,
+            "default network policy unavailable",
+        ),
+        (
+            MalformedNetworkMicrosandboxModule,
+            TypeError,
+            "returned an invalid network policy",
+        ),
+        (
+            UnsupportedNetworkMicrosandboxModule,
+            RuntimeError,
+            "does not provide Network.none",
+        ),
+    ],
+    ids=("construction-failure", "malformed-policy", "unsupported-sdk"),
+)
+def test_microsandbox_runner_create_fails_closed_for_invalid_default_network(
+    module: type[FakeMicrosandboxModule],
+    error_type: type[Exception],
+    match: str,
+) -> None:
+    async def run() -> None:
+        reset_fake_module()
+        with pytest.raises(error_type, match=match):
+            await MicrosandboxRunner.create(
+                "agent-session",
+                sandbox_module=module,
+            )
+
+    asyncio.run(run())
+
+    assert FakeSandboxApi.created == []
 
 
 def test_microsandbox_runner_executes_process_with_explicit_env_and_bounds_output(

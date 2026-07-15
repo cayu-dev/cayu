@@ -177,9 +177,13 @@ class MicrosandboxRunner(Runner):
     ) -> MicrosandboxRunner:
         """Create a sandbox and return a runner bound to it.
 
-        Extra keyword arguments are passed through to `microsandbox.Sandbox.create`
-        so applications can use provider-specific options such as volumes,
-        network policy, resources, labels, secrets, and replace behavior.
+        Guest networking defaults to `microsandbox.Network.none()`. Pass an
+        explicit provider network policy to opt into another creation-time
+        network contract.
+
+        Other provider-specific options are passed through unchanged, including
+        volumes, resources, labels, secrets, and replace behavior. An explicit
+        network policy is also forwarded unchanged.
         """
 
         module = _microsandbox_module(sandbox_module)
@@ -194,10 +198,22 @@ class MicrosandboxRunner(Runner):
         removal_timeout = _validate_remove_timeout(remove_timeout_s)
         if type(ensure_default_cwd) is not bool:
             raise TypeError("MicrosandboxRunner ensure_default_cwd must be a bool.")
+        create_options = dict(sandbox_options)
+        if "network" not in create_options:
+            network_type = getattr(module, "Network", None)
+            deny_all = getattr(network_type, "none", None)
+            if not isinstance(network_type, type) or not callable(deny_all):
+                raise RuntimeError(
+                    "The supported microsandbox SDK does not provide Network.none()."
+                )
+            network = deny_all()
+            if not isinstance(network, network_type):
+                raise TypeError("microsandbox.Network.none() returned an invalid network policy.")
+            create_options["network"] = network
         sandbox = await module.Sandbox.create(
             sandbox_name,
             image=image,
-            **dict(sandbox_options),
+            **create_options,
         )
         try:
             if ensure_default_cwd:
@@ -251,7 +267,11 @@ class MicrosandboxRunner(Runner):
         env_overlay: Mapping[str, str] | None = None,
         sandbox_module: ModuleType | Any | None = None,
     ) -> MicrosandboxRunner:
-        """Attach to an existing Microsandbox sandbox by name."""
+        """Attach to an existing Microsandbox sandbox by name.
+
+        The sandbox creator owns its creation-time network contract. Attaching
+        does not inspect, replace, or strengthen that network policy.
+        """
 
         module = _microsandbox_module(sandbox_module)
         sandbox_name = _validate_sandbox_name(name)

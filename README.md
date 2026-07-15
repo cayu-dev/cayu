@@ -45,6 +45,7 @@ instead of debugging through framework abstractions.
 | Knowledge | Reviewed memory, indexing, recall tools, pgvector support |
 | Cost control | Usage events, budget policies, causal budget summaries |
 | Provider flexibility | OpenAI, Anthropic, Amazon Bedrock, Vertex, OpenAI-compatible providers |
+| Sandboxed commands | Docker, E2B, AWS Lambda MicroVM, and deny-by-default Microsandbox runners |
 | Evals | Runtime trajectories, assertions, replay, LLM judges |
 
 ## Environments Are The Execution Boundary
@@ -337,6 +338,7 @@ User guides:
 Reference and design docs (deeper, maintainer-facing):
 
 - [Runtime contracts](docs/runtime-contracts.md) — the exhaustive contract reference.
+- [Release notes](docs/release-notes.md) — prerelease behavior changes and migrations.
 - [Architecture](docs/architecture.md) and [project layout](docs/project-layout.md).
 - [Glossary](docs/glossary.md) — naming notes and disambiguations (`Task` vs `asyncio.Task`, `Runner`, the `*Spec` convention…).
 
@@ -396,9 +398,10 @@ src/cayu/
 
 `LocalRunner` is for trusted local development. `MicrosandboxRunner` is available
 behind the optional `cayu[microsandbox]` extra for local microVM-backed command
-execution. The prerelease integration is pinned to Microsandbox 0.6.6; Cayu does
-not support older 0.5.x SDK/runtime combinations. `E2BRunner` and `E2BWorkspace`
-are available behind the optional
+execution. It denies guest networking by default; unrestricted networking
+requires an explicit Microsandbox policy. The prerelease integration is pinned
+to Microsandbox 0.6.6; Cayu does not support older 0.5.x SDK/runtime
+combinations. `E2BRunner` and `E2BWorkspace` are available behind the optional
 `cayu[e2b]` extra for E2B cloud sandbox execution and native E2B filesystem
 access. `LambdaMicroVMRunner` is available behind `cayu[aws]` for AWS-native,
 Firecracker-isolated, stateful execution and composes with `RunnerWorkspace`.
@@ -595,6 +598,11 @@ environment = Environment(
     workspace=MicrosandboxWorkspace(runner, workspace_id="sandbox-workspace"),
 )
 ```
+
+The omitted network policy is intentionally deny-all. Trusted applications
+that require unrestricted guest networking must pass
+`network=microsandbox.Network.allow_all()` explicitly; model-authored code
+should instead remain denied or use an enforced virtual-egress policy.
 
 For E2B execution, use `E2BWorkspace` so file tools read/write/list through
 E2B's native filesystem API while command tools run in the same cloud sandbox:

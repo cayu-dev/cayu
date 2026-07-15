@@ -564,6 +564,26 @@ def test_microsandbox_guest_agent_liveness_is_registered_and_explicitly_gated() 
     assert check.required_env_values == {"CAYU_RUN_MICROSANDBOX_GUEST_AGENT_LIVE": "1"}
 
 
+def test_microsandbox_network_default_is_registered_and_explicitly_gated() -> None:
+    check = next(
+        check for check in nightly.CHECKS if check.id == "microsandbox-live-network-default"
+    )
+
+    assert check.lane == "microsandbox"
+    assert check.command == (
+        "uv",
+        "run",
+        "--group",
+        "nightly",
+        "--extra",
+        "microsandbox",
+        "python",
+        "examples/microsandbox_network_default_live.py",
+    )
+    assert check.required_modules == ("microsandbox",)
+    assert check.required_env_values == {"CAYU_RUN_MICROSANDBOX_NETWORK_LIVE": "1"}
+
+
 def test_virtual_egress_opt_in_flag_must_equal_one(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

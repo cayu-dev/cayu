@@ -410,6 +410,28 @@ CHECKS: tuple[VerificationCheck, ...] = (
         required_env_values={"CAYU_RUN_MICROSANDBOX_GUEST_AGENT_LIVE": "1"},
     ),
     VerificationCheck(
+        id="microsandbox-live-network-default",
+        capability="Microsandbox deny-by-default network policy and explicit-open opt-in",
+        lane="microsandbox",
+        command=(
+            "uv",
+            "run",
+            "--group",
+            "nightly",
+            "--extra",
+            "microsandbox",
+            "python",
+            "examples/microsandbox_network_default_live.py",
+        ),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=(
+            "microsandbox package/runtime",
+            "CAYU_RUN_MICROSANDBOX_NETWORK_LIVE=1",
+        ),
+        required_modules=("microsandbox",),
+        required_env_values={"CAYU_RUN_MICROSANDBOX_NETWORK_LIVE": "1"},
+    ),
+    VerificationCheck(
         id="microsandbox-live-virtual-egress",
         capability="Microsandbox virtual-egress enforcement",
         lane="microsandbox",
