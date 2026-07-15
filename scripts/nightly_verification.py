@@ -71,10 +71,17 @@ class VerificationCheck:
     requires_sigkill: bool = False
     requires_playwright_chromium: bool = False
     requires_structured_evidence: bool = False
+    structured_evidence_on_skip: Mapping[str, Any] | None = None
+    structured_evidence_on_failure: Mapping[str, Any] | None = None
     timeout_s: float | None = DEFAULT_CHECK_TIMEOUT_SECONDS
     reason: str | None = None
 
     def __post_init__(self) -> None:
+        if (
+            self.structured_evidence_on_skip is not None
+            or self.structured_evidence_on_failure is not None
+        ) and not self.requires_structured_evidence:
+            raise ValueError("Structured evidence fallbacks require structured evidence.")
         if self.status_on_success in _SUCCESS_STATUSES:
             return
         if self.status_on_success == STATUS_UNCLAIMED and not self.command:
@@ -176,6 +183,32 @@ def _advanced_provider_portability_checks() -> tuple[VerificationCheck, ...]:
         for provider, key_name in _ADVANCED_PORTABILITY_PROVIDERS
         for check_id, module, capability in _ADVANCED_EXAMPLE_PORTABILITY_SPECS
     )
+
+
+def _egress_scheduler_evidence(adapter: str, status: str) -> dict[str, Any]:
+    if status == STATUS_SKIPPED:
+        cleanup_outcome = "not-applicable"
+        reason = "prerequisites-unavailable"
+    elif status == STATUS_FAILED:
+        cleanup_outcome = "unknown"
+        reason = "check-failed"
+    else:  # pragma: no cover - only the two scheduler outcomes are valid here
+        raise ValueError(f"Unsupported egress scheduler evidence status: {status}")
+    return {
+        "schema": "cayu.egress_conformance.v1",
+        "records": [
+            {
+                "adapter": adapter,
+                "scenario": "live-security-conformance",
+                "status": status,
+                "proof_source": "nightly",
+                "observations": [],
+                "cleanup_outcome": cleanup_outcome,
+                "duration_ms": 0,
+                "reason": reason,
+            }
+        ],
+    }
 
 
 CHECKS: tuple[VerificationCheck, ...] = (
@@ -283,6 +316,28 @@ CHECKS: tuple[VerificationCheck, ...] = (
         requires_docker=True,
     ),
     VerificationCheck(
+        id="docker-live-virtual-egress",
+        capability="Docker virtual-egress real-boundary security conformance",
+        lane="docker",
+        command=(
+            "uv",
+            "run",
+            "pytest",
+            "tests/egress/test_docker_egress_e2e.py",
+            "-q",
+            "-s",
+            "-k",
+            "shared_real_boundary_security_contract",
+        ),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=("Docker daemon",),
+        env={"CAYU_REQUIRE_DOCKER_EGRESS": "1"},
+        requires_docker=True,
+        requires_structured_evidence=True,
+        structured_evidence_on_skip=_egress_scheduler_evidence("docker", STATUS_SKIPPED),
+        structured_evidence_on_failure=_egress_scheduler_evidence("docker", STATUS_FAILED),
+    ),
+    VerificationCheck(
         id="sbx-live-exec",
         capability="sbx live command interruption",
         lane="sbx",
@@ -368,6 +423,9 @@ CHECKS: tuple[VerificationCheck, ...] = (
             "pytest",
             "tests/egress/test_microsandbox_egress_e2e.py",
             "-q",
+            "-s",
+            "-k",
+            "shared_real_boundary_security_contract",
         ),
         status_on_success=STATUS_VERIFIED,
         prerequisites=(
@@ -376,6 +434,9 @@ CHECKS: tuple[VerificationCheck, ...] = (
         ),
         required_env_values={"CAYU_RUN_MICROSANDBOX_EGRESS_E2E": "1"},
         required_modules=("microsandbox",),
+        requires_structured_evidence=True,
+        structured_evidence_on_skip=_egress_scheduler_evidence("microsandbox", STATUS_SKIPPED),
+        structured_evidence_on_failure=_egress_scheduler_evidence("microsandbox", STATUS_FAILED),
     ),
     VerificationCheck(
         id="e2b-live-runner",
@@ -421,6 +482,9 @@ CHECKS: tuple[VerificationCheck, ...] = (
             "pytest",
             "tests/egress/test_e2b_egress_e2e.py",
             "-q",
+            "-s",
+            "-k",
+            "shared_real_boundary_security_contract",
         ),
         status_on_success=STATUS_VERIFIED,
         prerequisites=(
@@ -437,6 +501,9 @@ CHECKS: tuple[VerificationCheck, ...] = (
         ),
         required_env_values={"CAYU_RUN_E2B_EGRESS_E2E": "1"},
         required_modules=("e2b",),
+        requires_structured_evidence=True,
+        structured_evidence_on_skip=_egress_scheduler_evidence("e2b", STATUS_SKIPPED),
+        structured_evidence_on_failure=_egress_scheduler_evidence("e2b", STATUS_FAILED),
     ),
     VerificationCheck(
         id="lambda-microvm-live",
@@ -967,6 +1034,9 @@ def _run_check(
     effective_env = _effective_env(check, environ)
     missing = _missing_prerequisites(check, effective_env)
     if missing:
+        evidence: dict[str, Any] = {}
+        if check.structured_evidence_on_skip is not None:
+            evidence["harness"] = _copy_structured_evidence(check.structured_evidence_on_skip)
         return VerificationResult(
             capability=check.capability,
             check_id=check.id,
@@ -975,6 +1045,7 @@ def _run_check(
             command=check.command,
             prerequisites=check.prerequisites,
             reason="; ".join(missing),
+            evidence=evidence,
         )
 
     if runner is None:
@@ -1012,6 +1083,12 @@ def _run_check(
             reason=check.reason,
             evidence=evidence,
         )
+    if check.requires_structured_evidence:
+        harness_evidence, _evidence_error = _structured_evidence(outcome.stdout)
+        if harness_evidence is not None:
+            evidence["harness"] = harness_evidence
+        elif check.structured_evidence_on_failure is not None:
+            evidence["harness"] = _copy_structured_evidence(check.structured_evidence_on_failure)
     return VerificationResult(
         capability=check.capability,
         check_id=check.id,
@@ -1032,6 +1109,13 @@ def _effective_env(
     for name in check.unset_env:
         effective.pop(name, None)
     return effective
+
+
+def _copy_structured_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    copied = json.loads(json.dumps(dict(evidence)))
+    if type(copied) is not dict:  # pragma: no cover - mappings always encode as objects
+        raise TypeError("Structured evidence fallback must encode as a JSON object.")
+    return copied
 
 
 def _missing_prerequisites(check: VerificationCheck, environ: Mapping[str, str]) -> list[str]:

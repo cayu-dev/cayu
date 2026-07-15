@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import importlib
 from collections.abc import Mapping, Sequence
 from ipaddress import ip_address
@@ -17,9 +16,11 @@ from cayu.egress._remote_adapter import (
     run_setup_commands,
 )
 from cayu.egress.adapter import (
+    DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
     EgressBinding,
     SandboxEgressAdapter,
     VirtualEgressRunnerRequest,
+    _await_bounded_cleanup_task,
 )
 from cayu.egress.broker import TransparentEgressBroker
 from cayu.egress.errors import UnsupportedEgressError
@@ -119,6 +120,7 @@ class E2BEgressAdapter(SandboxEgressAdapter):
     ) -> EgressBinding:
         return await prepare_exposed_proxy_binding(
             runner_kind=self.runner_kind,
+            session_id=session_id,
             broker=broker,
             grants=grants,
             exposure=self._exposure,
@@ -176,23 +178,33 @@ class E2BEgressAdapter(SandboxEgressAdapter):
             )
             await run_setup_commands(runner, request)
             return runner
-        except BaseException:
+        except BaseException as original:
             if runner is not None:
-                with contextlib.suppress(Exception, asyncio.CancelledError):
-                    await runner.close()
+                cleanup_task = asyncio.create_task(runner.close())
+                try:
+                    await _await_bounded_cleanup_task(
+                        cleanup_task,
+                        timeout_s=DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
+                        timeout_message="E2B egress runner rollback timed out.",
+                    )
+                except BaseException as cleanup_error:
+                    original.add_note(
+                        f"E2B egress runner rollback incomplete: {type(cleanup_error).__name__}."
+                    )
             raise
 
     async def _harden_guest(self, runner: E2BRunner) -> None:
         result = await runner._exec_admin(_HARDEN_METADATA_SCRIPT)
         if result.exit_code != 0:
-            detail = (result.stderr or result.stdout).strip()[:500]
             raise UnsupportedEgressError(
-                f"E2B metadata hardening failed during root bootstrap: {detail}"
+                "E2B metadata hardening failed during root bootstrap "
+                f"(exit_code={result.exit_code})."
             )
         verification = await runner._exec_guest_check(_VERIFY_GUEST_HARDENING_SCRIPT)
         if verification.exit_code != 0:
-            detail = (verification.stderr or verification.stdout).strip()[:500]
-            raise UnsupportedEgressError(f"E2B guest could bypass metadata hardening: {detail}")
+            raise UnsupportedEgressError(
+                f"E2B guest could bypass metadata hardening (exit_code={verification.exit_code})."
+            )
 
     def _e2b_module(self) -> ModuleType | Any:
         if self._module is not None:

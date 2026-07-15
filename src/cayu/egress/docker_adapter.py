@@ -9,9 +9,12 @@ from collections.abc import Awaitable, Callable, Sequence
 
 from cayu.credentials import CredentialMode
 from cayu.egress.adapter import (
+    DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
     EgressBinding,
     SandboxEgressAdapter,
     VirtualEgressRunnerRequest,
+    _await_bounded_cleanup_task,
+    validate_grant_scope,
 )
 from cayu.egress.broker import TransparentEgressBroker
 from cayu.egress.errors import UnsupportedEgressError
@@ -137,6 +140,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         grants: Sequence[VirtualCredentialGrant],
         broker: TransparentEgressBroker,
     ) -> EgressBinding:
+        validate_grant_scope(session_id=session_id, grants=grants)
         loop = self._loop or asyncio.get_running_loop()
         bind_host = (
             self._proxy_host
@@ -174,8 +178,20 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                 ]
             )
             await self._run(["network", "connect", network, sidecar])
-        except BaseException:
-            await self._teardown(server, network, sidecar, broker, grants)
+        except BaseException as original:
+            cleanup_task = asyncio.create_task(
+                self._teardown(server, network, sidecar, broker, grants)
+            )
+            try:
+                await _await_bounded_cleanup_task(
+                    cleanup_task,
+                    timeout_s=DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
+                    timeout_message="Docker egress prepare rollback timed out.",
+                )
+            except BaseException as cleanup_error:
+                original.add_note(
+                    f"Docker egress prepare rollback incomplete: {type(cleanup_error).__name__}."
+                )
             raise
 
         proxy_url = f"http://{sidecar}:{_SIDECAR_LISTEN_PORT}"
@@ -233,10 +249,10 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         )
 
     async def _run(self, argv: Sequence[str]) -> None:
-        exit_code, stderr = await self._docker_exec(argv)
+        exit_code, _stderr = await self._docker_exec(argv)
         if exit_code != 0:
             raise UnsupportedEgressError(
-                f"docker {argv[0]} failed while preparing egress: {stderr[:300]}"
+                f"docker {argv[0]} failed while preparing egress (exit_code={exit_code})."
             )
 
     async def _teardown(
@@ -247,14 +263,30 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         broker: TransparentEgressBroker,
         grants: Sequence[VirtualCredentialGrant],
     ) -> None:
-        # Best-effort cleanup: never raise from teardown (it runs in prepare's
-        # failure path, where a teardown error would mask the original cause).
-        with contextlib.suppress(Exception):
-            await broker.registry.revoke_values_and_wait(
-                tuple(grant.presented_value for grant in grants)
-            )
+        # Revoke before releasing any resource that enforced the grant boundary.
+        # EgressBinding.close keeps failures retryable and never marks an
+        # incomplete teardown closed.
+        await broker.registry.revoke_values_and_wait(
+            tuple(grant.presented_value for grant in grants)
+        )
+        errors: list[str] = []
         for argv in (["rm", "-f", sidecar], ["network", "rm", network]):
-            with contextlib.suppress(Exception):
-                await self._docker_exec(argv)
-        with contextlib.suppress(Exception):
+            try:
+                exit_code, stderr = await self._docker_exec(argv)
+                if exit_code != 0 and not _docker_resource_is_absent(stderr):
+                    errors.append(f"docker {argv[0]}: exit code {exit_code}")
+            except Exception as exc:
+                errors.append(f"docker {argv[0]}: {type(exc).__name__}")
+        try:
             await server.close()
+        except Exception as exc:
+            errors.append(f"proxy listener: {type(exc).__name__}")
+        if errors:
+            raise RuntimeError(f"Docker egress teardown incomplete: {'; '.join(errors)}")
+
+
+def _docker_resource_is_absent(stderr: str) -> bool:
+    """Treat an already-removed teardown target as successful convergence."""
+
+    normalized = stderr.lower()
+    return "no such container" in normalized or "not found" in normalized

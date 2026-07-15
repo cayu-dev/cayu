@@ -124,7 +124,10 @@ class _FakeLambdaRunner(Runner):
         self.closed = True
 
 
-def _broker_and_grant() -> tuple[TransparentEgressBroker, Any]:
+def _broker_and_grant(
+    *,
+    session_id: str = "session-1",
+) -> tuple[TransparentEgressBroker, Any]:
     registry = VirtualCredentialRegistry()
     broker = TransparentEgressBroker(
         registry=registry,
@@ -139,7 +142,7 @@ def _broker_and_grant() -> tuple[TransparentEgressBroker, Any]:
         require_test_mode_credentials=False,
     )
     grant = registry.mint(
-        session_id="session-1",
+        session_id=session_id,
         env_name="INTERNAL_TOKEN",
         secret=SecretRef(name="token"),
         destination="receiver.internal",
@@ -353,7 +356,7 @@ def test_lambda_microvm_adapter_fork_ignores_parent_owned_reconnect_metadata(
     monkeypatch.setattr(adapter_module, "LambdaMicroVMRunner", _FakeLambdaRunner)
     _FakeLambdaRunner.created = []
     _FakeLambdaRunner.attached = []
-    broker, grant = _broker_and_grant()
+    broker, grant = _broker_and_grant(session_id="child-session")
     adapter = LambdaMicroVMEgressAdapter(
         region_name="us-east-1",
         egress_network_connector_arn="connector-arn",

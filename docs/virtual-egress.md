@@ -373,14 +373,23 @@ a private Fargate receiver, and an exact host/method/path egress policy.
 
 `tests/egress/` proves non-possession rather than redaction:
 
+- Shared deterministic conformance: one registration contract describes the
+  Docker, E2B, and Microsandbox adapter factories, runner kinds, bounded
+  destinations, live prerequisites, capability proof classes, teardown bounds,
+  and proof sources. It proves fail-closed resolution, runner/binding pairing,
+  grant scoping, cancellation-safe retryable cleanup, revocation-before-release,
+  and that seeded downgrade/cleanup/pairing/revocation defects are detected.
 - Unit tests (no Docker): modes, registry, HTTP policy deny-before-resolve,
   broker pipeline (no secret in any event/response/exception), fail-closed
   adapters, and the in-process TLS interception + credential-swap harness.
 - Adversarial E2E (`tests/egress/test_docker_egress_e2e.py`, gated on a running
   Docker daemon): real containers assert that `env`/`/proc/self/environ` show only
-  the virtual value, a recursive search finds no real secret, the allowed call
-  succeeds with the real key swapped upstream, direct egress is blocked, and the
-  credential is rejected after the session closes.
+  the virtual value, a secret-blind recursive Bloom scan finds no real secret,
+  the allowed call succeeds through the session CA with the real key swapped
+  only upstream, direct public-IP and metadata egress are blocked, and the
+  credential is rejected after the session closes. This runs in the existing
+  uncredentialed Docker live CI job and as `docker-live-virtual-egress` in the
+  nightly registry.
 - Microsandbox E2E (manual/nightly): set
   `CAYU_RUN_MICROSANDBOX_EGRESS_E2E=1`, then run
   `uv run python scripts/nightly_verification.py --check microsandbox-live-virtual-egress --strict`.
@@ -391,7 +400,21 @@ a private Fargate receiver, and an exact host/method/path egress policy.
   `uv run python scripts/nightly_verification.py --check e2b-live-virtual-egress --strict`.
 
 The deterministic adapter, runner, preflight-failure, and teardown tests run in
-normal CI. E2B and Microsandbox E2Es are intentionally opt-in because they need
+normal CI. Live results emit typed bounded evidence with adapter, scenario,
+status, proof source, safe reason/observation tokens, bounded duration, and
+cleanup outcome; the records never contain secrets, headers, provider response
+bodies, or command output. E2B and
+Microsandbox E2Es are intentionally opt-in because they need
 cloud credentials, virtualization, or external tunnel infrastructure. The
 nightly registry reports them as `skipped` when an opt-in flag, runtime, API key,
 or E2B tunnel input is absent; a successful real-runtime run reports `verified`.
+
+The complete managed close path—grant drain, runner stop, adapter binding
+release, and audit drain—is cancellation-safe and bounded by
+`teardown_timeout_s` (15 seconds by default). Grant scope is validated before
+resources are allocated, and revocation completes before adapter resources are
+released. A timeout or resource-release failure leaves the binding open and
+reports a bounded, secret-free error; calling `close()` again resumes or retries
+the same cleanup tasks. Only a completed teardown is marked closed. Prepare and
+factory rollback use the same deadline and annotate the original failure with
+safe cleanup-phase/type evidence if rollback remains incomplete.

@@ -7,6 +7,7 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+from tests.egress_conformance import registration_for
 
 
 def _load_nightly_verification() -> ModuleType:
@@ -490,12 +491,17 @@ def test_virtual_egress_live_checks_are_registered_and_explicitly_gated(
     required_env: tuple[str, ...],
 ) -> None:
     check = next(check for check in nightly.CHECKS if check.id == check_id)
+    registration = registration_for(lane)
 
     assert check.capability.endswith("virtual-egress enforcement")
     assert check.lane == lane
     assert check.command[:2] == ("uv", "run")
     assert test_path in check.command
+    assert "-s" in check.command
+    assert check.command[-2:] == ("-k", "shared_real_boundary_security_contract")
+    assert registration.live_proof_source == test_path
     assert check.status_on_success == nightly.STATUS_VERIFIED
+    assert check.requires_structured_evidence is True
     assert check.required_env == required_env
     assert check.required_env_values == {opt_in_env: "1"}
     assert check.required_modules == (lane,)
@@ -509,6 +515,37 @@ def test_virtual_egress_live_checks_are_registered_and_explicitly_gated(
     assert result.status == nightly.STATUS_SKIPPED
     assert result.reason is not None
     assert f"{opt_in_env} is not set" in result.reason
+    assert result.evidence["harness"] == {
+        "schema": "cayu.egress_conformance.v1",
+        "records": [
+            {
+                "adapter": lane,
+                "scenario": "live-security-conformance",
+                "status": "skipped",
+                "proof_source": "nightly",
+                "observations": [],
+                "cleanup_outcome": "not-applicable",
+                "duration_ms": 0,
+                "reason": "prerequisites-unavailable",
+            }
+        ],
+    }
+
+
+def test_docker_virtual_egress_is_registered_as_uncredentialed_live_verification() -> None:
+    check = next(check for check in nightly.CHECKS if check.id == "docker-live-virtual-egress")
+    registration = registration_for("docker")
+
+    assert check.lane == registration.runner_kind
+    assert registration.live_proof_source in check.command
+    assert check.required_env == ()
+    assert check.required_env_values == {}
+    assert check.requires_docker is True
+    assert check.env == {"CAYU_REQUIRE_DOCKER_EGRESS": "1"}
+    assert check.status_on_success == nightly.STATUS_VERIFIED
+    assert "-s" in check.command
+    assert check.command[-2:] == ("-k", "shared_real_boundary_security_contract")
+    assert check.requires_structured_evidence is True
 
 
 def test_microsandbox_guest_agent_liveness_is_registered_and_explicitly_gated() -> None:
@@ -567,7 +604,17 @@ def test_microsandbox_virtual_egress_runs_when_module_is_present(
     def runner(command, env):
         nonlocal called
         called = True
-        return nightly.CommandOutcome(returncode=0)
+        return nightly.CommandOutcome(
+            returncode=0,
+            stdout=(
+                'CAYU_NIGHTLY_EVIDENCE={"schema":"cayu.egress_conformance.v1",'
+                '"records":[{"adapter":"microsandbox","scenario":"guest-network-'
+                'bypass-denial","status":"verified","proof_source":"live",'
+                '"observations":["public-ip-denied","metadata-service-denied"],'
+                '"cleanup_outcome":"complete","duration_ms":1,'
+                '"reason":"contract-satisfied"}]}\n'
+            ),
+        )
 
     result = nightly.run_checks(
         [check],
@@ -577,6 +624,76 @@ def test_microsandbox_virtual_egress_runs_when_module_is_present(
 
     assert called is True
     assert result.status == nightly.STATUS_VERIFIED
+    assert result.evidence["harness"]["schema"] == "cayu.egress_conformance.v1"
+
+
+def test_virtual_egress_failed_subprocess_preserves_emitted_failure_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    check = next(
+        check for check in nightly.CHECKS if check.id == "microsandbox-live-virtual-egress"
+    )
+    monkeypatch.setattr(nightly, "_module_missing", lambda name: False)
+    emitted = {
+        "schema": "cayu.egress_conformance.v1",
+        "records": [
+            {
+                "adapter": "microsandbox",
+                "scenario": "live-security-conformance",
+                "status": "failed",
+                "proof_source": "live",
+                "observations": [],
+                "cleanup_outcome": "unknown",
+                "duration_ms": 1,
+                "reason": "check-failed",
+            }
+        ],
+    }
+    stdout = (
+        "CAYU_NIGHTLY_EVIDENCE="
+        '{"schema":"cayu.egress_conformance.v1","records":[{"adapter":'
+        '"microsandbox","scenario":"live-security-conformance","status":"failed",'
+        '"proof_source":"live","observations":[],"cleanup_outcome":"unknown",'
+        '"duration_ms":1,"reason":"check-failed"}]}\n'
+    )
+
+    result = nightly.run_checks(
+        [check],
+        environ={"CAYU_RUN_MICROSANDBOX_EGRESS_E2E": "1"},
+        runner=lambda command, env: nightly.CommandOutcome(returncode=1, stdout=stdout),
+    )[0]
+
+    assert result.status == nightly.STATUS_FAILED
+    assert result.evidence["harness"] == emitted
+
+
+def test_virtual_egress_failed_subprocess_without_emission_uses_nightly_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    check = next(
+        check for check in nightly.CHECKS if check.id == "microsandbox-live-virtual-egress"
+    )
+    monkeypatch.setattr(nightly, "_module_missing", lambda name: False)
+
+    result = nightly.run_checks(
+        [check],
+        environ={"CAYU_RUN_MICROSANDBOX_EGRESS_E2E": "1"},
+        runner=lambda command, env: nightly.CommandOutcome(returncode=1),
+    )[0]
+
+    assert result.status == nightly.STATUS_FAILED
+    assert result.evidence["harness"]["records"] == [
+        {
+            "adapter": "microsandbox",
+            "scenario": "live-security-conformance",
+            "status": "failed",
+            "proof_source": "nightly",
+            "observations": [],
+            "cleanup_outcome": "unknown",
+            "duration_ms": 0,
+            "reason": "check-failed",
+        }
+    ]
 
 
 def test_lambda_microvm_live_check_defers_credential_discovery_to_boto3(

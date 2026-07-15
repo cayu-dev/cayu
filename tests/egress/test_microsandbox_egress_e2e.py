@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Any
 
 import pytest
-from tests.egress_e2e_support import (
-    assert_brokered_provider_call,
-    assert_direct_egress_blocked,
-    assert_guest_non_possession,
-    drive_adversarial_egress_contract,
+from tests.egress_conformance import (
+    EgressScenarioEvidence,
+    egress_nightly_failure_boundary,
+    emit_egress_nightly_evidence,
+    registration_for,
 )
+from tests.egress_e2e_support import CapturingEgressAdapter, drive_adversarial_egress_contract
 
 from cayu.egress.microsandbox_adapter import MicrosandboxEgressAdapter
 
@@ -27,45 +27,29 @@ pytestmark = pytest.mark.skipif(
 REAL_SECRET = "sk_test_51MicrosandboxRealSecretNeverInGuest"
 
 
-class _CapturingAdapter(MicrosandboxEgressAdapter):
-    broker: Any = None
-    grant: Any = None
-
-    async def prepare(self, *, session_id, grants, broker):  # type: ignore[no-untyped-def]
-        self.broker = broker
-        self.grant = grants[0]
-        return await super().prepare(session_id=session_id, grants=grants, broker=broker)
-
-
-async def _drive() -> dict[str, Any]:
-    adapter = _CapturingAdapter()
+async def _drive() -> tuple[EgressScenarioEvidence, ...]:
+    adapter = CapturingEgressAdapter(MicrosandboxEgressAdapter())
     return await drive_adversarial_egress_contract(
+        registration=registration_for("microsandbox"),
         adapter=adapter,
         real_secret=REAL_SECRET,
         image=os.environ.get("CAYU_MICROSANDBOX_IMAGE", "python:3.13"),
-        session_prefix="microsandbox-egress",
         search_roots=("/workspace", "/tmp", "/etc/cayu", "/root"),
         response_id="cus_microsandbox",
     )
 
 
 @pytest.fixture(scope="module")
-def e2e() -> dict[str, Any]:
-    return asyncio.run(_drive())
+def e2e() -> tuple[EgressScenarioEvidence, ...]:
+    with egress_nightly_failure_boundary("microsandbox"):
+        return asyncio.run(_drive())
 
 
-def test_microsandbox_guest_possesses_only_virtual_credential(e2e: dict[str, Any]) -> None:
-    assert e2e["env"]["HTTPS_PROXY"].startswith("http://host.microsandbox.internal:")
-    assert_guest_non_possession(e2e, REAL_SECRET)
-
-
-def test_microsandbox_allowed_call_uses_broker_secret(e2e: dict[str, Any]) -> None:
-    assert_brokered_provider_call(
-        e2e,
-        real_secret=REAL_SECRET,
-        response_id="cus_microsandbox",
-    )
-
-
-def test_microsandbox_direct_and_metadata_egress_are_blocked(e2e: dict[str, Any]) -> None:
-    assert_direct_egress_blocked(e2e)
+def test_microsandbox_shared_real_boundary_security_contract(
+    e2e: tuple[EgressScenarioEvidence, ...],
+) -> None:
+    with egress_nightly_failure_boundary("microsandbox"):
+        assert all(item.adapter == "microsandbox" for item in e2e)
+        assert all(item.status == "verified" for item in e2e)
+        assert REAL_SECRET not in repr(e2e)
+        emit_egress_nightly_evidence(e2e)

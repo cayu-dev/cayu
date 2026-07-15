@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from math import isfinite
 from typing import Any
 
 from cayu.egress.broker import TransparentEgressBroker
@@ -10,6 +12,48 @@ from cayu.egress.errors import UnsupportedEgressError
 from cayu.egress.grants import VirtualCredentialGrant
 from cayu.egress.proxy_exposure import HttpProxyEndpoint
 from cayu.runners.base import Runner
+
+DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS = 15.0
+
+
+async def _await_bounded_cleanup_task(
+    task: asyncio.Task[None],
+    *,
+    timeout_s: float,
+    timeout_message: str,
+) -> bool:
+    """Finish one cleanup task despite cancellation, or report a bounded timeout."""
+
+    cancelled = False
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    while not task.done():
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise TimeoutError(timeout_message)
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+        except asyncio.CancelledError:
+            cancelled = True
+        except TimeoutError as exc:
+            if task.done():
+                await task
+                break
+            raise TimeoutError(timeout_message) from exc
+    task.result()
+    return cancelled
+
+
+def validate_grant_scope(
+    *,
+    session_id: str,
+    grants: Sequence[VirtualCredentialGrant],
+) -> None:
+    """Reject grants minted for a different session before allocating resources."""
+
+    if any(grant.session_id != session_id for grant in grants):
+        raise UnsupportedEgressError(
+            "Virtual-egress grants do not belong to the requested session."
+        )
 
 
 @dataclass
@@ -32,8 +76,10 @@ class EgressBinding:
     proxy_port: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     teardown: Callable[[], Awaitable[None]] | None = None
+    teardown_timeout_s: float = DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS
     _closed: bool = field(default=False, init=False, repr=False)
     _proxy_endpoint: HttpProxyEndpoint | None = field(default=None, init=False, repr=False)
+    _teardown_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         for field_name in ("runner_kind", "network", "sidecar", "guest_ca_path"):
@@ -47,6 +93,11 @@ class EgressBinding:
                 self._proxy_endpoint = HttpProxyEndpoint.parse(self.proxy_url)
             except ValueError as exc:
                 raise ValueError(f"proxy_url is invalid: {exc}") from exc
+        if type(self.teardown_timeout_s) not in {int, float}:
+            raise TypeError("teardown_timeout_s must be numeric.")
+        if not isfinite(self.teardown_timeout_s) or self.teardown_timeout_s <= 0:
+            raise ValueError("teardown_timeout_s must be finite and greater than zero.")
+        self.teardown_timeout_s = float(self.teardown_timeout_s)
 
     @property
     def proxy_endpoint(self) -> HttpProxyEndpoint | None:
@@ -55,9 +106,32 @@ class EgressBinding:
     async def close(self) -> None:
         if self._closed:
             return
-        if self.teardown is not None:
-            await self.teardown()
+        if self.teardown is None:
+            self._closed = True
+            return
+        if self._teardown_task is None:
+            teardown = self.teardown
+
+            async def run_teardown() -> None:
+                await teardown()
+
+            self._teardown_task = asyncio.create_task(run_teardown())
+        task = self._teardown_task
+        try:
+            cancelled = await _await_bounded_cleanup_task(
+                task,
+                timeout_s=self.teardown_timeout_s,
+                timeout_message=(
+                    f"Egress teardown did not complete within {self.teardown_timeout_s:g} seconds."
+                ),
+            )
+        except BaseException:
+            if task.done() and self._teardown_task is task:
+                self._teardown_task = None
+            raise
         self._closed = True
+        if cancelled:
+            raise asyncio.CancelledError()
 
 
 @dataclass(frozen=True)

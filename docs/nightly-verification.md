@@ -159,7 +159,7 @@ high level:
 | first-party tool, workspace, context, knowledge, subagent, usage, and budget eval workflows | hermetic | `internal-evals-hermetic` |
 | real project discovery, IPython startup, top-level await, loop reuse, namespace aliases, and EOF exit | hermetic | `console-pty` |
 | Postgres stores, migrations, pgvector, real dispatch claim path | verified when Postgres is available | `postgres-required` |
-| real Docker container exec, timeout cleanup, and sync binding | verified when Docker is available | `docker-runner`, `docker-live-exec`, `docker-live-sync` |
+| real Docker container exec, timeout cleanup, sync binding, and virtual-egress security conformance | verified when Docker is available | `docker-runner`, `docker-live-exec`, `docker-live-sync`, `docker-live-virtual-egress` |
 | real `sbx` command cleanup and sync binding | verified when `sbx` is available | `sbx-live-exec`, `sbx-live-sync` |
 | real microsandbox runner/workspace/runtime/sync binding and opt-in guest-agent liveness | verified when microsandbox is available | `microsandbox-live-*` |
 | real E2B runner/workspace/sync binding | verified when E2B is available | `e2b-live-*` |

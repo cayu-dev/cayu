@@ -59,6 +59,34 @@ class _FakeExposure:
         )
 
 
+class _FlakyCleanupExposure(_FakeExposure):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cleanup_calls = 0
+        self.registry: Any = None
+        self.presented_value: str | None = None
+        self.revoked_before_release = False
+
+    async def expose(self, *, local_host: str, local_port: int) -> ExposedProxy:
+        self.calls.append((local_host, local_port))
+
+        async def teardown() -> None:
+            self.cleanup_calls += 1
+            if self.registry is not None and self.presented_value is not None:
+                try:
+                    self.registry.lookup(self.presented_value)
+                except VirtualCredentialError:
+                    self.revoked_before_release = True
+            if self.cleanup_calls == 1:
+                raise RuntimeError("tunnel still stopping")
+            self.closed = True
+
+        return ExposedProxy(
+            proxy_url="http://203.0.113.10:8443",
+            teardown=teardown,
+        )
+
+
 class _FailingExposure:
     async def expose(self, *, local_host: str, local_port: int) -> ExposedProxy:
         raise RuntimeError("tunnel failed")
@@ -239,6 +267,39 @@ def test_e2b_adapter_allows_only_the_exposed_cayu_proxy(tmp_path: Path) -> None:
     assert _FakeProxyServer.instances[0].closed is True
 
 
+def test_e2b_teardown_failure_is_truthful_and_retryable_after_revocation() -> None:
+    async def run() -> tuple[Any, Any, _FlakyCleanupExposure, bool]:
+        _FakeProxyServer.instances = []
+        exposure = _FlakyCleanupExposure()
+        broker, grant = _broker_and_grant()
+        exposure.registry = broker.registry
+        exposure.presented_value = grant.presented_value
+        adapter = E2BEgressAdapter(
+            exposure=exposure,
+            e2b_module=_FakeE2BModule,
+            proxy_server_factory=_FakeProxyServer,
+        )
+        binding = await adapter.prepare(
+            session_id="session-1",
+            grants=[grant],
+            broker=broker,
+        )
+        with pytest.raises(RuntimeError, match="proxy exposure: RuntimeError"):
+            await binding.close()
+        assert binding._closed is False
+        with pytest.raises(VirtualCredentialError, match="revoked"):
+            broker.registry.lookup(grant.presented_value)
+        await binding.close()
+        return broker.registry, grant, exposure, binding._closed
+
+    registry, grant, exposure, closed = asyncio.run(run())
+    assert registry.was_revoked(grant.grant_id)
+    assert exposure.cleanup_calls == 2
+    assert exposure.revoked_before_release is True
+    assert exposure.closed is True
+    assert closed is True
+
+
 def test_e2b_adapter_rejects_security_options_that_could_bypass_enforcement() -> None:
     for options in (
         {"allow_internet_access": False},
@@ -334,6 +395,40 @@ def test_e2b_adapter_revokes_grant_when_proxy_exposure_fails() -> None:
     with pytest.raises(VirtualCredentialError, match="revoked"):
         registry.lookup(grant.presented_value)
     assert _FakeProxyServer.instances[0].closed is True
+
+
+def test_e2b_prepare_rollback_is_bounded_and_reports_incomplete_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cayu.egress._remote_adapter as remote_adapter
+
+    finish = asyncio.Event()
+
+    class _HangingCloseProxyServer(_FakeProxyServer):
+        async def close(self) -> None:
+            await finish.wait()
+            await super().close()
+
+    async def run() -> BaseException:
+        _FakeProxyServer.instances = []
+        broker, grant = _broker_and_grant()
+        adapter = E2BEgressAdapter(
+            exposure=_FailingExposure(),
+            e2b_module=_FakeE2BModule,
+            proxy_server_factory=_HangingCloseProxyServer,
+        )
+        with pytest.raises(RuntimeError, match="tunnel failed") as exc_info:
+            await adapter.prepare(
+                session_id="session-1",
+                grants=[grant],
+                broker=broker,
+            )
+        return exc_info.value
+
+    monkeypatch.setattr(remote_adapter, "DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS", 0.01)
+    error = asyncio.run(run())
+
+    assert error.__notes__ == ["e2b egress prepare rollback incomplete: TimeoutError."]
 
 
 def test_e2b_adapter_closes_exposure_that_returns_invalid_url() -> None:

@@ -8,24 +8,25 @@ real containers, so they are gated on a responsive Docker daemon.
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import shutil
 import subprocess
-import tempfile
 
 import pytest
+from tests.egress_conformance import (
+    EgressScenarioEvidence,
+    egress_nightly_failure_boundary,
+    emit_egress_nightly_evidence,
+    registration_for,
+)
+from tests.egress_e2e_support import CapturingEgressAdapter, drive_adversarial_egress_contract
 
 from cayu.egress import (
     CapturedRequest,
     CapturedResponse,
     HttpEgressPolicy,
-    TransparentEgressBroker,
-    VirtualCredentialError,
-    VirtualCredentialRegistry,
 )
 from cayu.runners.base import ExecCommand
-from cayu.runners.docker import DockerRunner
 from cayu.vaults import SecretRef, StaticVault
 
 pytest.importorskip("cryptography")
@@ -50,8 +51,12 @@ def _docker_available() -> bool:
     return result.returncode == 0
 
 
+_DOCKER_AVAILABLE = _docker_available()
+if os.environ.get("CAYU_REQUIRE_DOCKER_EGRESS") == "1" and not _DOCKER_AVAILABLE:
+    raise RuntimeError("CAYU_REQUIRE_DOCKER_EGRESS=1 but the Docker daemon is unavailable.")
+
 pytestmark = pytest.mark.skipif(
-    not _docker_available(),
+    not _DOCKER_AVAILABLE,
     reason="Docker daemon not available for virtual-egress E2E.",
 )
 
@@ -79,225 +84,36 @@ def _stripe_example_policy() -> HttpEgressPolicy:
     )
 
 
-def _search_needles_script(*needles: str) -> str:
-    roots = ["/workspace", "/tmp", "/etc", "/root", "/proc/self/environ"]
-    needle_hex = [needle.encode().hex() for needle in needles]
-    return (
-        "import json, os\n"
-        f"needles = [bytes.fromhex(value) for value in {needle_hex!r}]\n"
-        f"roots = {roots!r}\n"
-        "found = {needle.hex(): [] for needle in needles}\n"
-        "def check(path):\n"
-        "    try:\n"
-        "        with open(path, 'rb') as handle:\n"
-        "            data = handle.read()\n"
-        "    except Exception:\n"
-        "        return\n"
-        "    for needle in needles:\n"
-        "        if needle in data:\n"
-        "            found[needle.hex()].append(path)\n"
-        "for root in roots:\n"
-        "    if os.path.isfile(root):\n"
-        "        check(root)\n"
-        "    elif os.path.isdir(root):\n"
-        "        for dirpath, _dirnames, filenames in os.walk(root):\n"
-        "            for filename in filenames:\n"
-        "                check(os.path.join(dirpath, filename))\n"
-        "print(json.dumps({'found': found}))\n"
+async def _drive() -> tuple[EgressScenarioEvidence, ...]:
+    return await drive_adversarial_egress_contract(
+        registration=registration_for("docker"),
+        adapter=CapturingEgressAdapter(DockerEgressAdapter(loop=asyncio.get_running_loop())),
+        real_secret=REAL_SECRET,
+        image=SANDBOX_IMAGE,
+        search_roots=("/workspace", "/tmp", "/etc/cayu", "/root"),
+        response_id="cus_fake123",
     )
-
-
-def _connect_probe_script(host: str, port: int) -> str:
-    return (
-        "import json, socket\n"
-        "socket.setdefaulttimeout(6)\n"
-        "try:\n"
-        f"    sock = socket.create_connection(({host!r}, {port!r}))\n"
-        "    sock.close()\n"
-        "    result = {'connected': True, 'error': None}\n"
-        "except Exception as exc:\n"
-        "    result = {'connected': False, 'error': repr(exc)}\n"
-        "print(json.dumps(result))\n"
-    )
-
-
-def _json_stdout(stdout: str) -> dict[str, object]:
-    return json.loads(stdout.strip().splitlines()[-1])
-
-
-async def _drive() -> dict[str, object]:
-    loop = asyncio.get_running_loop()
-    upstream = _FakeStripe()
-    registry = VirtualCredentialRegistry()
-    broker = TransparentEgressBroker(
-        registry=registry,
-        resolver=StaticVault({"stripe_test_key": REAL_SECRET}),
-        policies={"stripe-example": _stripe_example_policy()},
-        upstream=upstream,
-    )
-    grant = registry.mint(
-        session_id="e2e",
-        env_name="STRIPE_SECRET_KEY",
-        secret=SecretRef(name="stripe_test_key"),
-        destination="api.stripe.com",
-        credential_kind="stripe_bearer",
-        policy_name="stripe-example",
-    )
-
-    adapter = DockerEgressAdapter(loop=loop)
-    binding = await adapter.prepare(session_id="e2e", grants=[grant], broker=broker)
-
-    ca_dir = tempfile.mkdtemp(prefix="cayu-egress-e2e-ca-")
-    ca_host = os.path.join(ca_dir, "ca.pem")
-    with open(ca_host, "wb") as handle:
-        handle.write(binding.ca_cert_pem or b"")
-
-    sandbox_env = {"STRIPE_SECRET_KEY": grant.presented_value}
-    results: dict[str, object] = {"virtual": grant.presented_value}
-    runner = None
-    try:
-        runner = await DockerRunner.create(
-            "cayu-egress-e2e-sandbox",
-            image=SANDBOX_IMAGE,
-            close_action="remove",
-            network=str(binding.network),
-            env_overlay=binding.env,
-            ca_mount=(ca_host, str(binding.guest_ca_path)),
-        )
-
-        env_result = await runner.exec(ExecCommand.process("env"), env=sandbox_env)
-        results["env_stdout"] = env_result.stdout
-
-        proc_result = await runner.exec(
-            ExecCommand.bash("cat /proc/self/environ | tr '\\0' '\\n'"),
-            env=sandbox_env,
-        )
-        results["proc_stdout"] = proc_result.stdout
-
-        search_result = await runner.exec(
-            ExecCommand.process("python3", "-c", _search_needles_script(REAL_SECRET)),
-            env=sandbox_env,
-        )
-        results["secret_search"] = _json_stdout(search_result.stdout)
-
-        call_script = (
-            "import os, urllib.request as u\n"
-            "req = u.Request('https://api.stripe.com/v1/customers', data=b'email=a@b.co',\n"
-            "    headers={'Authorization': 'Bearer ' + os.environ['STRIPE_SECRET_KEY']})\n"
-            "print(u.urlopen(req, timeout=25).read().decode())\n"
-        )
-        call_result = await runner.exec(
-            ExecCommand.process("python3", "-c", call_script),
-            env=sandbox_env,
-            timeout_s=60,
-        )
-        results["call_stdout"] = call_result.stdout
-        results["call_stderr"] = call_result.stderr
-        results["call_exit_code"] = call_result.exit_code
-        results["upstream_authorization"] = upstream.upstream_authorization
-
-        direct_result = await runner.exec(
-            ExecCommand.process("python3", "-c", _connect_probe_script("1.1.1.1", 443)),
-            env=sandbox_env,
-            timeout_s=30,
-        )
-        results["direct_probe"] = _json_stdout(direct_result.stdout)
-
-        # Cloud metadata endpoint must be unreachable (no route on the internal net).
-        metadata_result = await runner.exec(
-            ExecCommand.process("python3", "-c", _connect_probe_script("169.254.169.254", 80)),
-            env=sandbox_env,
-            timeout_s=30,
-        )
-        results["metadata_probe"] = _json_stdout(metadata_result.stdout)
-
-        # Exfil-by-encoding is impossible because the real secret is absent: its
-        # base64/hex encodings cannot be found anywhere the sandbox can read.
-        import base64 as _b64
-
-        b64 = _b64.b64encode(REAL_SECRET.encode()).decode()
-        hexed = REAL_SECRET.encode().hex()
-        encoded_result = await runner.exec(
-            ExecCommand.process("python3", "-c", _search_needles_script(b64, hexed)),
-            env=sandbox_env,
-            timeout_s=30,
-        )
-        results["encoded_search"] = _json_stdout(encoded_result.stdout)
-        results["real_b64"] = b64
-        results["real_hex"] = hexed
-    finally:
-        if runner is not None:
-            await runner.close()
-        await binding.close()
-        shutil.rmtree(ca_dir, ignore_errors=True)
-
-    # Session is closed: the virtual credential must now be rejected.
-    try:
-        registry.lookup(grant.presented_value)
-        results["revoked"] = False
-    except VirtualCredentialError:
-        results["revoked"] = True
-
-    return results
 
 
 @pytest.fixture(scope="module")
-def e2e_results() -> dict[str, object]:
-    return asyncio.run(_drive())
+def e2e_results() -> tuple[EgressScenarioEvidence, ...]:
+    with egress_nightly_failure_boundary("docker"):
+        return asyncio.run(_drive())
 
 
-def test_env_shows_only_virtual_credential(e2e_results: dict[str, object]) -> None:
-    env_stdout = str(e2e_results["env_stdout"])
-    assert str(e2e_results["virtual"]) in env_stdout
-    assert REAL_SECRET not in env_stdout
-    assert "HTTPS_PROXY=" in env_stdout
-
-
-def test_proc_environ_shows_only_virtual(e2e_results: dict[str, object]) -> None:
-    proc_stdout = str(e2e_results["proc_stdout"])
-    assert str(e2e_results["virtual"]) in proc_stdout
-    assert REAL_SECRET not in proc_stdout
-
-
-def test_recursive_search_finds_no_real_secret(e2e_results: dict[str, object]) -> None:
-    search = e2e_results["secret_search"]
-    assert isinstance(search, dict)
-    assert search["found"] == {REAL_SECRET.encode().hex(): []}
-
-
-def test_allowed_call_succeeds_with_swapped_credential(e2e_results: dict[str, object]) -> None:
-    call_stdout = str(e2e_results["call_stdout"])
-    assert e2e_results["call_exit_code"] == 0
-    assert "cus_fake123" in call_stdout  # provider (fake) accepted the request
-    assert REAL_SECRET not in call_stdout
-    # The broker injected the REAL secret only on the upstream leg.
-    assert e2e_results["upstream_authorization"] == f"Bearer {REAL_SECRET}"
-
-
-def test_direct_egress_is_blocked(e2e_results: dict[str, object]) -> None:
-    probe = e2e_results["direct_probe"]
-    assert isinstance(probe, dict)
-    assert probe["connected"] is False
-
-
-def test_cloud_metadata_endpoint_is_blocked(e2e_results: dict[str, object]) -> None:
-    probe = e2e_results["metadata_probe"]
-    assert isinstance(probe, dict)
-    assert probe["connected"] is False
-
-
-def test_encoded_secret_cannot_be_exfiltrated(e2e_results: dict[str, object]) -> None:
-    # The real secret is absent, so its base64/hex forms are absent too.
-    search = e2e_results["encoded_search"]
-    assert isinstance(search, dict)
-    assert search["found"] == {
-        str(e2e_results["real_b64"]).encode().hex(): [],
-        str(e2e_results["real_hex"]).encode().hex(): [],
-    }
-
-
-def test_credential_rejected_after_session_close(e2e_results: dict[str, object]) -> None:
-    assert e2e_results["revoked"] is True
+def test_shared_real_boundary_security_contract(
+    e2e_results: tuple[EgressScenarioEvidence, ...],
+) -> None:
+    with egress_nightly_failure_boundary("docker"):
+        assert {item.scenario for item in e2e_results} == {
+            "brokered-provider-and-session-ca",
+            "guest-network-bypass-denial",
+            "guest-secret-non-possession",
+        }
+        assert all(item.adapter == "docker" for item in e2e_results)
+        assert all(item.status == "verified" for item in e2e_results)
+        assert REAL_SECRET not in repr(e2e_results)
+        emit_egress_nightly_evidence(e2e_results)
 
 
 # --- Full runtime wiring: the VirtualEgressEnvironmentFactory lifecycle. ---

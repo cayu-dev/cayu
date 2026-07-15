@@ -37,6 +37,10 @@ from cayu.egress import (
     VirtualCredentialRegistry,
     VirtualEgressRunnerRequest,
 )
+from cayu.egress.adapter import (
+    DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
+    _await_bounded_cleanup_task,
+)
 from cayu.egress.credential_kinds import validate_credential_kind
 from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.environments.bindings import (
@@ -187,6 +191,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 grants=grants,
                 broker=broker,
             )
+            grant_revoker.teardown_timeout_s = binding.teardown_timeout_s
             ca_dir = tempfile.mkdtemp(prefix="cayu-egress-ca-")
             ca_host = os.path.join(ca_dir, "ca.pem")
             with open(ca_host, "wb") as handle:
@@ -234,22 +239,64 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             )
 
             await self._emit_grant_events(request, grants, runner_kind=runner_kind)
-        except BaseException:
+        except BaseException as original:
+            cleanup_errors: list[tuple[str, BaseException]] = []
+            deadline = asyncio.get_running_loop().time() + (
+                binding.teardown_timeout_s
+                if binding is not None
+                else DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS
+            )
             if managed_runner is not None:
-                with contextlib.suppress(Exception, asyncio.CancelledError):
+                try:
                     await managed_runner.close()
+                except asyncio.CancelledError:
+                    pass
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(("managed runner", cleanup_error))
             else:
-                with contextlib.suppress(Exception, asyncio.CancelledError):
-                    await grant_revoker.revoke()
-                if runner is not None:
-                    with contextlib.suppress(Exception, asyncio.CancelledError):
-                        await runner.close()
-            if binding is not None:
-                with contextlib.suppress(Exception, asyncio.CancelledError):
-                    await binding.close()
+                revocation_complete = False
+                try:
+                    await grant_revoker.revoke(
+                        timeout_s=_remaining_before_deadline(
+                            deadline,
+                            "Virtual-egress rollback timed out before grant revocation.",
+                        )
+                    )
+                    revocation_complete = True
+                except asyncio.CancelledError:
+                    revocation_complete = True
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(("grant revocation", cleanup_error))
+                if runner is not None and revocation_complete:
+                    try:
+                        await _await_rollback_phase(
+                            runner.close,
+                            deadline=deadline,
+                            phase="runner",
+                        )
+                    except asyncio.CancelledError:
+                        pass
+                    except BaseException as cleanup_error:
+                        cleanup_errors.append(("runner", cleanup_error))
+                if binding is not None and revocation_complete:
+                    try:
+                        await _await_rollback_phase(
+                            binding.close,
+                            deadline=deadline,
+                            phase="binding",
+                        )
+                    except asyncio.CancelledError:
+                        pass
+                    except BaseException as cleanup_error:
+                        cleanup_errors.append(("binding", cleanup_error))
             if ca_dir is not None:
                 with contextlib.suppress(Exception, asyncio.CancelledError):
                     shutil.rmtree(ca_dir, ignore_errors=True)
+            if cleanup_errors:
+                details = "; ".join(
+                    f"{phase}: {type(error).__name__}" for phase, error in cleanup_errors
+                )
+                original.add_note(f"Virtual-egress rollback incomplete: {details}.")
             raise
         spec = EnvironmentSpec(
             name=request.environment_name,
@@ -327,13 +374,28 @@ class _EgressGrantRevoker:
         self._revoked = False
         self._drained = False
         self._task: asyncio.Task[None] | None = None
+        self.teardown_timeout_s = DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS
 
-    async def revoke(self) -> bool:
+    async def revoke(self, *, timeout_s: float | None = None) -> bool:
         if self._drained:
             return False
         if self._task is None:
             self._task = asyncio.create_task(self._revoke_and_wait())
-        cancelled = await _await_cleanup_task(self._task)
+        task = self._task
+        effective_timeout_s = self.teardown_timeout_s if timeout_s is None else timeout_s
+        try:
+            cancelled = await _await_cleanup_task(
+                task,
+                timeout_s=effective_timeout_s,
+                timeout_message=(
+                    "Virtual-egress grant revocation did not complete within "
+                    f"{effective_timeout_s:g} seconds."
+                ),
+            )
+        except BaseException:
+            if task.done() and self._task is task:
+                self._task = None
+            raise
         self._drained = True
         return cancelled
 
@@ -345,8 +407,19 @@ class _EgressGrantRevoker:
         await self._registry.wait_for_inactive_grants(self._grant_ids)
 
 
-async def _await_cleanup_task(task: asyncio.Task[None]) -> bool:
+async def _await_cleanup_task(
+    task: asyncio.Task[None],
+    *,
+    timeout_s: float | None = None,
+    timeout_message: str | None = None,
+) -> bool:
     """Wait for cleanup to finish even if the awaiting task is cancelled."""
+    if timeout_s is not None:
+        return await _await_bounded_cleanup_task(
+            task,
+            timeout_s=timeout_s,
+            timeout_message=timeout_message or "Cleanup timed out.",
+        )
     cancelled = False
     while True:
         try:
@@ -364,6 +437,33 @@ async def _await_cleanup(awaitable: Awaitable[None]) -> bool:
         await awaitable
 
     return await _await_cleanup_task(asyncio.create_task(_run()))
+
+
+def _remaining_before_deadline(deadline: float, timeout_message: str) -> float:
+    remaining = deadline - asyncio.get_running_loop().time()
+    if remaining <= 0:
+        raise TimeoutError(timeout_message)
+    return remaining
+
+
+async def _await_rollback_phase(
+    close: Callable[[], Awaitable[None]],
+    *,
+    deadline: float,
+    phase: str,
+) -> bool:
+    timeout_message = f"Virtual-egress {phase} rollback timed out."
+    remaining = _remaining_before_deadline(deadline, timeout_message)
+
+    async def run_close() -> None:
+        await close()
+
+    task = asyncio.create_task(run_close())
+    return await _await_bounded_cleanup_task(
+        task,
+        timeout_s=remaining,
+        timeout_message=timeout_message,
+    )
 
 
 class _EgressManagedRunner(Runner):
@@ -390,6 +490,10 @@ class _EgressManagedRunner(Runner):
         self._ca_dir = ca_dir
         self._grant_revoker = grant_revoker
         self._audit = audit
+        self._teardown_timeout_s = egress_binding.teardown_timeout_s
+        self._runner_close_task: asyncio.Task[None] | None = None
+        self._binding_close_task: asyncio.Task[None] | None = None
+        self._audit_drain_task: asyncio.Task[None] | None = None
         self.isolation = runner.isolation
         self.default_cwd = runner.default_cwd
 
@@ -425,41 +529,103 @@ class _EgressManagedRunner(Runner):
     async def finalize(self, *, outcome: str | None) -> None:
         if self._closed:
             return
-        cancelled = False
-        cleanup_error: BaseException | None = None
-        try:
-            cancelled = await self.revoke_grants()
-        except asyncio.CancelledError as exc:
-            cleanup_error = exc
-        except Exception as exc:
-            cleanup_error = exc
+        deadline = asyncio.get_running_loop().time() + self._teardown_timeout_s
+        cancelled = await self._grant_revoker.revoke(
+            timeout_s=self._remaining_teardown_time(deadline)
+        )
+        # Do not release enforcement resources unless revocation completed.
+        # A revocation error leaves this runner open for a truthful retry.
+        errors: list[tuple[str, Exception]] = []
         try:
             cancelled = (
-                await _await_cleanup(self._adapter.finalize_runner(self._runner, outcome=outcome))
+                await self._await_close_phase(
+                    "_runner_close_task",
+                    lambda: self._adapter.finalize_runner(self._runner, outcome=outcome),
+                    deadline=deadline,
+                    phase="runner",
+                )
                 or cancelled
             )
-        except BaseException as exc:
-            if cleanup_error is None:
-                cleanup_error = exc
+        except TimeoutError:
+            raise
+        except Exception as exc:
+            errors.append(("runner", exc))
         try:
-            cancelled = await _await_cleanup(self._egress_binding.close()) or cancelled
-        except BaseException as exc:
-            if cleanup_error is None:
-                cleanup_error = exc
+            cancelled = (
+                await self._await_close_phase(
+                    "_binding_close_task",
+                    self._egress_binding.close,
+                    deadline=deadline,
+                    phase="binding",
+                )
+                or cancelled
+            )
+        except TimeoutError:
+            raise
+        except Exception as exc:
+            errors.append(("binding", exc))
         if self._audit is not None:
             try:
-                cancelled = await _await_cleanup(self._audit.drain()) or cancelled
-            except BaseException as exc:
-                if cleanup_error is None:
-                    cleanup_error = exc
-        with contextlib.suppress(Exception, asyncio.CancelledError):
+                cancelled = (
+                    await self._await_close_phase(
+                        "_audit_drain_task",
+                        self._audit.drain,
+                        deadline=deadline,
+                        phase="audit",
+                    )
+                    or cancelled
+                )
+            except TimeoutError:
+                raise
+            except Exception as exc:
+                errors.append(("audit", exc))
+        if errors:
+            details = "; ".join(f"{phase}: {type(exc).__name__}: {exc}" for phase, exc in errors)
+            raise RuntimeError(f"Virtual-egress resource cleanup incomplete: {details}")
+        with contextlib.suppress(Exception):
             shutil.rmtree(self._ca_dir, ignore_errors=True)
-        if cleanup_error is None:
-            self._closed = True
-        if cleanup_error is not None:
-            raise cleanup_error
+        self._closed = True
         if cancelled:
             raise asyncio.CancelledError()
+
+    def _remaining_teardown_time(self, deadline: float) -> float:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise TimeoutError(
+                "Virtual-egress teardown did not complete within "
+                f"{self._teardown_timeout_s:g} seconds."
+            )
+        return remaining
+
+    async def _await_close_phase(
+        self,
+        task_field: str,
+        close: Callable[[], Awaitable[None]],
+        *,
+        deadline: float,
+        phase: str,
+    ) -> bool:
+        task = getattr(self, task_field)
+        if task is None:
+
+            async def run_close() -> None:
+                await close()
+
+            task = asyncio.create_task(run_close())
+            setattr(self, task_field, task)
+        try:
+            return await _await_bounded_cleanup_task(
+                task,
+                timeout_s=self._remaining_teardown_time(deadline),
+                timeout_message=(
+                    f"Virtual-egress {phase} cleanup did not complete within "
+                    f"{self._teardown_timeout_s:g} seconds."
+                ),
+            )
+        except BaseException:
+            if task.done() and getattr(self, task_field) is task:
+                setattr(self, task_field, None)
+            raise
 
     def reopen_exec(self) -> None:
         self._runner.reopen_exec()

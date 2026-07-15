@@ -68,6 +68,9 @@ jobs:
       - run: uv run pytest tests/runners/test_docker_live.py -q
         env:
           CAYU_REQUIRE_DOCKER_RUNNER: "1"
+      - run: uv run pytest tests/egress/test_docker_egress_e2e.py -q
+        env:
+          CAYU_REQUIRE_DOCKER_EGRESS: "1"
 
   lockfile:
     name: Lockfile sync

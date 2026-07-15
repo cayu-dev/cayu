@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import importlib
 import posixpath
 from collections.abc import Sequence
@@ -15,9 +14,11 @@ from cayu.egress._remote_adapter import (
     run_setup_commands,
 )
 from cayu.egress.adapter import (
+    DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
     EgressBinding,
     SandboxEgressAdapter,
     VirtualEgressRunnerRequest,
+    _await_bounded_cleanup_task,
 )
 from cayu.egress.broker import TransparentEgressBroker
 from cayu.egress.errors import UnsupportedEgressError
@@ -63,6 +64,7 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
     ) -> EgressBinding:
         return await prepare_exposed_proxy_binding(
             runner_kind=self.runner_kind,
+            session_id=session_id,
             broker=broker,
             grants=grants,
             exposure=self._exposure,
@@ -127,10 +129,20 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
             )
             await run_setup_commands(runner, request)
             return runner
-        except BaseException:
+        except BaseException as original:
             if runner is not None:
-                with contextlib.suppress(Exception, asyncio.CancelledError):
-                    await runner.close()
+                cleanup_task = asyncio.create_task(runner.close())
+                try:
+                    await _await_bounded_cleanup_task(
+                        cleanup_task,
+                        timeout_s=DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
+                        timeout_message="Microsandbox egress runner rollback timed out.",
+                    )
+                except BaseException as cleanup_error:
+                    original.add_note(
+                        "Microsandbox egress runner rollback incomplete: "
+                        f"{type(cleanup_error).__name__}."
+                    )
             raise
 
     def _microsandbox_module(self) -> ModuleType | Any:

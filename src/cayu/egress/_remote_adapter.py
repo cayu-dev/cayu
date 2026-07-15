@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from collections.abc import Callable, Sequence
 
-from cayu.egress.adapter import EgressBinding, VirtualEgressRunnerRequest
+from cayu.egress.adapter import (
+    DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
+    EgressBinding,
+    VirtualEgressRunnerRequest,
+    _await_bounded_cleanup_task,
+    validate_grant_scope,
+)
 from cayu.egress.broker import TransparentEgressBroker
 from cayu.egress.errors import UnsupportedEgressError
 from cayu.egress.grants import VirtualCredentialGrant
@@ -20,6 +25,7 @@ ProxyServerFactory = Callable[..., TransparentEgressProxyServer]
 async def prepare_exposed_proxy_binding(
     *,
     runner_kind: str,
+    session_id: str,
     broker: TransparentEgressBroker,
     grants: Sequence[VirtualCredentialGrant],
     exposure: ProxyExposure,
@@ -27,20 +33,29 @@ async def prepare_exposed_proxy_binding(
     loop: asyncio.AbstractEventLoop | None,
     proxy_server_factory: ProxyServerFactory,
 ) -> EgressBinding:
+    validate_grant_scope(session_id=session_id, grants=grants)
     resolved_loop = loop or asyncio.get_running_loop()
     server = proxy_server_factory(broker, loop=resolved_loop, host=bind_host)
     exposed: ExposedProxy | None = None
 
     async def cleanup() -> None:
-        with contextlib.suppress(Exception, asyncio.CancelledError):
-            await broker.registry.revoke_values_and_wait(
-                tuple(grant.presented_value for grant in grants)
-            )
+        # Grant revocation is the security transition and must complete before
+        # the proxy exposure or listener is released.
+        await broker.registry.revoke_values_and_wait(
+            tuple(grant.presented_value for grant in grants)
+        )
+        errors: list[str] = []
         if exposed is not None:
-            with contextlib.suppress(Exception, asyncio.CancelledError):
+            try:
                 await exposed.close()
-        with contextlib.suppress(Exception, asyncio.CancelledError):
+            except Exception as exc:
+                errors.append(f"proxy exposure: {type(exc).__name__}")
+        try:
             await server.close()
+        except Exception as exc:
+            errors.append(f"proxy listener: {type(exc).__name__}")
+        if errors:
+            raise RuntimeError(f"{runner_kind} egress teardown incomplete: {'; '.join(errors)}")
 
     try:
         proxy_port = await server.start()
@@ -52,8 +67,18 @@ async def prepare_exposed_proxy_binding(
                 f"{runner_kind} proxy exposure returned an invalid HTTP proxy URL: {exc}"
             ) from exc
         proxy_url = endpoint.url
-    except BaseException:
-        await cleanup()
+    except BaseException as original:
+        cleanup_task = asyncio.create_task(cleanup())
+        try:
+            await _await_bounded_cleanup_task(
+                cleanup_task,
+                timeout_s=DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
+                timeout_message=f"{runner_kind} egress prepare rollback timed out.",
+            )
+        except BaseException as cleanup_error:
+            original.add_note(
+                f"{runner_kind} egress prepare rollback incomplete: {type(cleanup_error).__name__}."
+            )
         raise
 
     env = {
@@ -117,11 +142,9 @@ async def run_enforcement_preflight(
         timeout_s=timeout_s,
     )
     if result.exit_code != 0 or result.timed_out:
-        detail = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())[
-            :1000
-        ]
         raise UnsupportedEgressError(
-            f"Runner {request.runner_kind!r} failed virtual-egress preflight: {detail}"
+            f"Runner {request.runner_kind!r} failed virtual-egress preflight "
+            f"(exit_code={result.exit_code}, timed_out={result.timed_out})."
         )
 
 
@@ -129,8 +152,10 @@ async def run_setup_commands(runner: Runner, request: VirtualEgressRunnerRequest
     for command in request.setup_commands:
         result = await runner.exec(ExecCommand.bash(command), timeout_s=300)
         if result.exit_code != 0 or result.timed_out:
-            detail = (result.stderr or result.stdout).strip()[:500]
-            raise RuntimeError(f"{request.runner_kind} setup command failed: {command!r}: {detail}")
+            raise RuntimeError(
+                f"{request.runner_kind} setup command failed "
+                f"(exit_code={result.exit_code}, timed_out={result.timed_out})."
+            )
 
 
 def _preflight_script(

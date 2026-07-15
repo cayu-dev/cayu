@@ -11,16 +11,16 @@ import asyncio
 import contextlib
 import os
 import shlex
-from typing import Any
 from urllib.parse import urlsplit
 
 import pytest
-from tests.egress_e2e_support import (
-    assert_brokered_provider_call,
-    assert_direct_egress_blocked,
-    assert_guest_non_possession,
-    drive_adversarial_egress_contract,
+from tests.egress_conformance import (
+    EgressScenarioEvidence,
+    egress_nightly_failure_boundary,
+    emit_egress_nightly_evidence,
+    registration_for,
 )
+from tests.egress_e2e_support import CapturingEgressAdapter, drive_adversarial_egress_contract
 
 from cayu.egress.e2b_adapter import E2BEgressAdapter
 from cayu.egress.proxy_exposure import ExposedProxy
@@ -97,45 +97,35 @@ class _CommandExposure:
         raise RuntimeError("E2B proxy tunnel did not become reachable within 30 seconds.")
 
 
-class _CapturingAdapter(E2BEgressAdapter):
-    broker: Any = None
-    grant: Any = None
-
-    async def prepare(self, *, session_id, grants, broker):  # type: ignore[no-untyped-def]
-        self.broker = broker
-        self.grant = grants[0]
-        return await super().prepare(session_id=session_id, grants=grants, broker=broker)
-
-
-async def _drive() -> dict[str, Any]:
+async def _drive() -> tuple[EgressScenarioEvidence, ...]:
     assert _TUNNEL_COMMAND is not None
     assert _PROXY_URL is not None
-    adapter = _CapturingAdapter(
-        exposure=_CommandExposure(_TUNNEL_COMMAND, _PROXY_URL),
+    adapter = CapturingEgressAdapter(
+        E2BEgressAdapter(
+            exposure=_CommandExposure(_TUNNEL_COMMAND, _PROXY_URL),
+        )
     )
     return await drive_adversarial_egress_contract(
+        registration=registration_for("e2b"),
         adapter=adapter,
         real_secret=REAL_SECRET,
         image=os.environ.get("CAYU_E2B_TEMPLATE", "base"),
-        session_prefix="e2b-egress",
         search_roots=("/home/user/workspace", "/tmp", "/etc/cayu", "/root"),
         response_id="cus_e2b",
     )
 
 
 @pytest.fixture(scope="module")
-def e2e() -> dict[str, Any]:
-    return asyncio.run(_drive())
+def e2e() -> tuple[EgressScenarioEvidence, ...]:
+    with egress_nightly_failure_boundary("e2b"):
+        return asyncio.run(_drive())
 
 
-def test_e2b_guest_possesses_only_virtual_credential(e2e: dict[str, Any]) -> None:
-    assert e2e["env"]["HTTPS_PROXY"] == _PROXY_URL
-    assert_guest_non_possession(e2e, REAL_SECRET)
-
-
-def test_e2b_allowed_call_uses_broker_secret(e2e: dict[str, Any]) -> None:
-    assert_brokered_provider_call(e2e, real_secret=REAL_SECRET, response_id="cus_e2b")
-
-
-def test_e2b_direct_and_metadata_egress_are_blocked(e2e: dict[str, Any]) -> None:
-    assert_direct_egress_blocked(e2e)
+def test_e2b_shared_real_boundary_security_contract(
+    e2e: tuple[EgressScenarioEvidence, ...],
+) -> None:
+    with egress_nightly_failure_boundary("e2b"):
+        assert all(item.adapter == "e2b" for item in e2e)
+        assert all(item.status == "verified" for item in e2e)
+        assert REAL_SECRET not in repr(e2e)
+        emit_egress_nightly_evidence(e2e)

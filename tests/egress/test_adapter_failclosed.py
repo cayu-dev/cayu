@@ -125,6 +125,62 @@ def test_binding_close_does_not_mark_closed_when_teardown_is_cancelled() -> None
     assert calls["count"] == 2
 
 
+def test_binding_close_finishes_teardown_before_reporting_caller_cancellation() -> None:
+    async def run() -> tuple[list[str], bool]:
+        started = asyncio.Event()
+        finish = asyncio.Event()
+        order: list[str] = []
+
+        async def teardown() -> None:
+            order.append("started")
+            started.set()
+            await finish.wait()
+            order.append("finished")
+
+        binding = EgressBinding(teardown=teardown, teardown_timeout_s=1)
+        close_task = asyncio.create_task(binding.close())
+        await started.wait()
+        close_task.cancel()
+        await asyncio.sleep(0)
+        assert close_task.done() is False
+        finish.set()
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+        await binding.close()
+        return order, binding._closed
+
+    order, closed = asyncio.run(run())
+    assert order == ["started", "finished"]
+    assert closed is True
+
+
+def test_binding_close_timeout_is_bounded_and_retryable() -> None:
+    async def run() -> tuple[int, bool]:
+        started = asyncio.Event()
+        finish = asyncio.Event()
+        calls = 0
+
+        async def teardown() -> None:
+            nonlocal calls
+            calls += 1
+            started.set()
+            await finish.wait()
+
+        binding = EgressBinding(teardown=teardown, teardown_timeout_s=0.01)
+        with pytest.raises(TimeoutError, match="did not complete"):
+            await binding.close()
+        assert started.is_set()
+        assert binding._closed is False
+        finish.set()
+        await binding.close()
+        await binding.close()
+        return calls, binding._closed
+
+    calls, closed = asyncio.run(run())
+    assert calls == 1
+    assert closed is True
+
+
 def test_binding_validates_typed_core_fields() -> None:
     with pytest.raises(ValueError, match="network"):
         EgressBinding(network=" ")
@@ -132,6 +188,8 @@ def test_binding_validates_typed_core_fields() -> None:
         EgressBinding(proxy_port=0)
     with pytest.raises(ValueError, match="proxy_url"):
         EgressBinding(proxy_url="https://cayu-egress.example:8443")
+    with pytest.raises(ValueError, match="teardown_timeout_s"):
+        EgressBinding(teardown_timeout_s=0)
 
     binding = EgressBinding(proxy_url="http://cayu-egress.example:8443")
     assert binding.proxy_url == "http://cayu-egress.example:8443"

@@ -33,6 +33,26 @@ class _FakeDocker:
         return 0, ""
 
 
+class _FlakyCleanupDocker(_FakeDocker):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cleanup_failures = 0
+        self.network_removed = False
+        self.network_absent_seen = False
+
+    async def __call__(self, argv: Sequence[str]) -> tuple[int, str]:
+        self.calls.append(list(argv))
+        if argv[0] == "rm" and self.cleanup_failures == 0:
+            self.cleanup_failures += 1
+            return 1, "sidecar still stopping"
+        if argv[:2] == ["network", "rm"]:
+            if self.network_removed:
+                self.network_absent_seen = True
+                return 1, "Error response from daemon: network not found"
+            self.network_removed = True
+        return 0, ""
+
+
 def _broker_with_grant() -> tuple[
     TransparentEgressBroker,
     VirtualCredentialRegistry,
@@ -98,11 +118,22 @@ def test_prepare_names_are_unique_across_sessions() -> None:
     docker = _FakeDocker()
 
     async def run():
-        broker, _registry, grant = _broker_with_grant()
+        broker, registry, _grant = _broker_with_grant()
+        grants = [
+            registry.mint(
+                session_id="same-id",
+                env_name="STRIPE_SECRET_KEY",
+                secret=SecretRef(name="stripe_test_key"),
+                destination="api.stripe.com",
+                credential_kind="stripe_bearer",
+                policy_name="stripe-example",
+            )
+            for _ in range(2)
+        ]
         adapter = DockerEgressAdapter(docker_exec=docker, proxy_host="127.0.0.1")
-        first = await adapter.prepare(session_id="same-id", grants=[grant], broker=broker)
+        first = await adapter.prepare(session_id="same-id", grants=[grants[0]], broker=broker)
         await first.close()
-        second = await adapter.prepare(session_id="same-id", grants=[grant], broker=broker)
+        second = await adapter.prepare(session_id="same-id", grants=[grants[1]], broker=broker)
         await second.close()
         return first.network, second.network
 
@@ -155,6 +186,28 @@ def test_teardown_revokes_grants_and_removes_resources() -> None:
         registry.lookup(grant.presented_value)
 
 
+def test_teardown_failure_is_truthful_and_retryable_after_revocation() -> None:
+    docker = _FlakyCleanupDocker()
+
+    async def run() -> tuple[VirtualCredentialRegistry, VirtualCredentialGrant, bool]:
+        broker, registry, grant = _broker_with_grant()
+        adapter = DockerEgressAdapter(docker_exec=docker, proxy_host="127.0.0.1")
+        binding = await adapter.prepare(session_id="sess_1", grants=[grant], broker=broker)
+        with pytest.raises(RuntimeError, match="docker rm: exit code 1"):
+            await binding.close()
+        assert binding._closed is False
+        with pytest.raises(VirtualCredentialError, match="revoked"):
+            registry.lookup(grant.presented_value)
+        await binding.close()
+        return registry, grant, binding._closed
+
+    registry, grant, closed = asyncio.run(run())
+    assert registry.was_revoked(grant.grant_id)
+    assert docker.cleanup_failures == 1
+    assert docker.network_absent_seen is True
+    assert closed is True
+
+
 def test_teardown_revokes_all_grants_before_waiting_on_active_lease() -> None:
     docker = _FakeDocker()
 
@@ -174,11 +227,15 @@ def test_teardown_revokes_all_grants_before_waiting_on_active_lease() -> None:
         binding = await adapter.prepare(session_id="sess_1", grants=[first, second], broker=broker)
 
         close_task = asyncio.create_task(binding.close())
-        await asyncio.sleep(0)
-
+        for _ in range(10):
+            try:
+                registry.lookup(second.presented_value)
+            except VirtualCredentialError:
+                break
+            await asyncio.sleep(0)
+        else:
+            raise AssertionError("Second grant was not revoked before teardown wait.")
         assert close_task.done() is False
-        with pytest.raises(VirtualCredentialError, match="revoked"):
-            registry.lookup(second.presented_value)
 
         first_lease.close()
         await close_task

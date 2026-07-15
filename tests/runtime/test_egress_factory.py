@@ -139,7 +139,9 @@ class _RecordingAdapter(SandboxEgressAdapter):
             if self.order is not None:
                 self.order.append("binding_teardown")
 
-        return _egress_binding(self.runner_kind, teardown=teardown, env=self.env)
+        binding = _egress_binding(self.runner_kind, teardown=teardown, env=self.env)
+        self.captured["binding"] = binding
+        return binding
 
     async def create_runner(self, request):  # type: ignore[no-untyped-def]
         self.captured["runner_request"] = request
@@ -547,6 +549,128 @@ def test_runner_close_before_bind_cleans_up_egress_resources() -> None:
     assert adapter.torn_down == 1
 
 
+def test_runner_close_reports_binding_teardown_failure_and_retries() -> None:
+    adapter = _RecordingAdapter()
+
+    async def run() -> tuple[Runner, int]:
+        factory = _virtual_factory(adapter=adapter)
+        result = await factory.create(
+            EnvironmentFactoryRequest(
+                session_id="sess_retry_cleanup",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        runner = result.environment.runner
+        assert runner is not None
+        binding: EgressBinding = adapter.captured["binding"]
+        original_teardown = binding.teardown
+        assert original_teardown is not None
+        calls = 0
+
+        async def flaky_teardown() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("egress resource still stopping")
+            await original_teardown()
+
+        binding.teardown = flaky_teardown
+        with pytest.raises(RuntimeError, match="binding: RuntimeError"):
+            await runner.close()
+        assert runner._closed is False
+        await runner.close()
+        return runner, calls
+
+    runner, calls = asyncio.run(run())
+    assert runner._closed is True
+    assert calls == 2
+
+
+def test_runner_close_retries_when_inner_runner_close_is_cancelled() -> None:
+    async def run() -> tuple[bool, int, int]:
+        class _SelfCancellingCloseRunner(_FakeDockerRunner):
+            close_calls = 0
+
+            async def close(self) -> None:
+                self.close_calls += 1
+                if self.close_calls == 1:
+                    raise asyncio.CancelledError()
+                await super().close()
+
+        inner = _SelfCancellingCloseRunner("runner")
+        adapter = _RecordingAdapter(runner_factory=lambda _request: asyncio.sleep(0, result=inner))
+        factory = _virtual_factory(adapter=adapter)
+        result = await factory.create(
+            EnvironmentFactoryRequest(
+                session_id="sess_cancelled_runner_cleanup",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        managed = result.environment.runner
+        assert managed is not None
+
+        with pytest.raises(asyncio.CancelledError):
+            await managed.close()
+        assert managed._closed is False
+        assert inner.closed is False
+        assert adapter.torn_down == 0
+
+        await managed.close()
+        return inner.closed, inner.close_calls, adapter.torn_down
+
+    inner_closed, close_calls, teardown_calls = asyncio.run(run())
+
+    assert inner_closed is True
+    assert close_calls == 2
+    assert teardown_calls == 1
+
+
+def test_runner_close_bounds_hanging_runner_phase_and_resumes_same_cleanup_task() -> None:
+    async def run() -> tuple[bool, int]:
+        started = asyncio.Event()
+        finish = asyncio.Event()
+
+        class _HangingCloseRunner(_FakeDockerRunner):
+            async def close(self) -> None:
+                started.set()
+                await finish.wait()
+                await super().close()
+
+        adapter = _RecordingAdapter(
+            runner_factory=lambda _request: asyncio.sleep(0, result=_HangingCloseRunner("runner"))
+        )
+        factory = _virtual_factory(adapter=adapter)
+        result = await factory.create(
+            EnvironmentFactoryRequest(
+                session_id="sess_hanging_runner_cleanup",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        managed = result.environment.runner
+        assert managed is not None
+        managed._teardown_timeout_s = 0.01
+        managed._grant_revoker.teardown_timeout_s = 0.01
+        inner: _HangingCloseRunner = adapter.captured["inner_runner"]
+
+        with pytest.raises(TimeoutError, match="runner cleanup did not complete"):
+            await managed.close()
+        assert started.is_set()
+        assert managed._closed is False
+        assert adapter.torn_down == 0
+
+        finish.set()
+        await managed.close()
+        return inner.closed, adapter.torn_down
+
+    inner_closed, teardown_calls = asyncio.run(run())
+
+    assert inner_closed is True
+    assert teardown_calls == 1
+
+
 def test_runner_close_revokes_grants_before_closing_inner_runner() -> None:
     order: list[str] = []
     adapter = _RecordingAdapter("fake", order=order)
@@ -631,6 +755,41 @@ def test_runner_close_defers_cancellation_until_grant_drain() -> None:
 
     assert runner.closed is True
     assert teardown_calls["count"] == 1
+
+
+def test_runner_close_bounds_grant_drain_and_retries_without_releasing_resources() -> None:
+    async def run() -> tuple[_FakeDockerRunner, int]:
+        adapter = _RecordingAdapter("fake")
+        factory = _virtual_factory(adapter=adapter)
+        result = await factory.create(
+            EnvironmentFactoryRequest(
+                session_id="sess_bounded_revoke",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        managed = result.environment.runner
+        assert managed is not None
+        managed._grant_revoker.teardown_timeout_s = 0.01
+        broker: TransparentEgressBroker = adapter.captured["broker"]
+        grant = adapter.captured["grant"]
+        inner_runner: _FakeDockerRunner = adapter.captured["inner_runner"]
+        lease = broker.registry.acquire(grant.presented_value)
+
+        with pytest.raises(TimeoutError, match="grant revocation did not complete"):
+            await managed.close()
+        assert managed._closed is False
+        assert inner_runner.closed is False
+        assert adapter.torn_down == 0
+
+        lease.close()
+        await managed.close()
+        return inner_runner, adapter.torn_down
+
+    runner, teardown_calls = asyncio.run(run())
+
+    assert runner.closed is True
+    assert teardown_calls == 1
 
 
 def test_create_cleans_up_when_grant_event_emit_is_cancelled() -> None:

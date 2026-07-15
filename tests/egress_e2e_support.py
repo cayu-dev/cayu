@@ -2,23 +2,36 @@ from __future__ import annotations
 
 import base64
 import json
-from typing import Any
+import os
+from collections.abc import Sequence
+from time import monotonic
+from typing import Any, Literal
 from uuid import uuid4
 
 from cayu.egress import (
     CapturedRequest,
     CapturedResponse,
+    EgressBinding,
     HttpEgressPolicy,
+    SandboxEgressAdapter,
+    TransparentEgressBroker,
     VirtualCredentialError,
+    VirtualCredentialGrant,
+    VirtualEgressRunnerRequest,
 )
 from cayu.environments import EnvironmentFactoryRequest
-from cayu.runners.base import ExecCommand
+from cayu.runners.base import ExecCommand, Runner
 from cayu.runtime.egress import VirtualCredentialSpec, VirtualEgressEnvironmentFactory
 from cayu.vaults import SecretRef, StaticVault
+from tests.egress_conformance import (
+    EgressConformanceRegistration,
+    EgressScenarioEvidence,
+)
 
 _MASK = (1 << 64) - 1
 _BASE = 257
 _BLOOM_BITS = 1 << 20
+_MISSING = object()
 
 
 class RecordingProviderUpstream:
@@ -34,17 +47,54 @@ class RecordingProviderUpstream:
         )
 
 
+class CapturingEgressAdapter(SandboxEgressAdapter):
+    """Typed test harness that observes lifecycle objects without changing enforcement."""
+
+    def __init__(self, inner: SandboxEgressAdapter) -> None:
+        self._inner = inner
+        self.runner_kind = inner.runner_kind
+        self._broker: TransparentEgressBroker | None = None
+        self._grants: tuple[VirtualCredentialGrant, ...] = ()
+
+    async def prepare(
+        self,
+        *,
+        session_id: str,
+        grants: Sequence[VirtualCredentialGrant],
+        broker: TransparentEgressBroker,
+    ) -> EgressBinding:
+        binding = await self._inner.prepare(
+            session_id=session_id,
+            grants=grants,
+            broker=broker,
+        )
+        self._broker = broker
+        self._grants = tuple(grants)
+        return binding
+
+    async def create_runner(self, request: VirtualEgressRunnerRequest) -> Runner:
+        return await self._inner.create_runner(request)
+
+    def captured_single_grant(
+        self,
+    ) -> tuple[TransparentEgressBroker, VirtualCredentialGrant]:
+        if self._broker is None or len(self._grants) != 1:
+            raise AssertionError("Egress conformance did not capture exactly one prepared grant.")
+        return self._broker, self._grants[0]
+
+
 async def drive_adversarial_egress_contract(
     *,
-    adapter: Any,
+    registration: EgressConformanceRegistration,
+    adapter: CapturingEgressAdapter,
     real_secret: str,
     image: str,
-    session_prefix: str,
     search_roots: tuple[str, ...],
     response_id: str,
-) -> dict[str, Any]:
+) -> tuple[EgressScenarioEvidence, ...]:
     """Exercise the shared non-possession and network-denial runtime contract."""
 
+    started_at = monotonic()
     upstream = RecordingProviderUpstream(response_id)
     factory = VirtualEgressEnvironmentFactory(
         resolver=StaticVault({"stripe": real_secret}),
@@ -67,14 +117,24 @@ async def drive_adversarial_egress_contract(
         adapter=adapter,
         upstream=upstream,
     )
-    session_id = f"{session_prefix}-{uuid4().hex[:12]}"
-    result = await factory.create(
-        EnvironmentFactoryRequest(
-            session_id=session_id,
-            agent_name="e2e",
-            environment_name=session_prefix,
+    session_id = f"{registration.name}-egress-{uuid4().hex[:12]}"
+    host_env_name = "CAYU_EGRESS_HOST_ONLY_SENTINEL"
+    host_env_value = f"host-only-{uuid4().hex}"
+    previous_host_value = os.environ.get(host_env_name, _MISSING)
+    os.environ[host_env_name] = host_env_value
+    try:
+        result = await factory.create(
+            EnvironmentFactoryRequest(
+                session_id=session_id,
+                agent_name="e2e",
+                environment_name=f"{registration.name}-egress",
+            )
         )
-    )
+    finally:
+        if previous_host_value is _MISSING:
+            os.environ.pop(host_env_name, None)
+        else:
+            os.environ[host_env_name] = str(previous_host_value)
     runner = result.environment.runner
     binding = result.environment.binding
     assert runner is not None
@@ -116,6 +176,25 @@ async def drive_adversarial_egress_contract(
         assert search_result.exit_code == 0, search_result.stderr
         observed["search"] = json.loads(search_result.stdout)
 
+        host_search_result = await runner.exec(
+            ExecCommand.process(
+                "python3",
+                "-c",
+                recursive_window_bloom_script(
+                    roots=search_roots,
+                    window_size=len(host_env_value.encode()),
+                ),
+            ),
+            timeout_s=60,
+        )
+        assert host_search_result.exit_code == 0, host_search_result.stderr
+        observed["host_search"] = json.loads(host_search_result.stdout)
+        observed["host_env_name"] = host_env_name
+        observed["host_env_absent"] = not bloom_maybe_contains(
+            observed["host_search"]["bloom"],
+            host_env_value.encode(),
+        )
+
         call_result = await runner.exec(
             ExecCommand.process(
                 "python3",
@@ -131,14 +210,22 @@ async def drive_adversarial_egress_contract(
         observed["call"] = call_result.stdout
 
         direct = await runner.exec(
-            ExecCommand.process("python3", "-c", connect_probe_script("1.1.1.1", 443)),
+            ExecCommand.process(
+                "python3",
+                "-c",
+                connect_probe_script("1.1.1.1", 443, probe_kind="tls"),
+            ),
             timeout_s=15,
         )
         metadata = await runner.exec(
             ExecCommand.process(
                 "python3",
                 "-c",
-                connect_probe_script("169.254.169.254", 80),
+                connect_probe_script(
+                    "169.254.169.254",
+                    80,
+                    probe_kind="metadata",
+                ),
             ),
             timeout_s=15,
         )
@@ -151,15 +238,62 @@ async def drive_adversarial_egress_contract(
         await runner.close()
         raise
 
+    broker, grant = adapter.captured_single_grant()
     observed["upstream_authorization"] = upstream.authorization
-    observed["virtual"] = adapter.grant.presented_value
+    observed["virtual"] = grant.presented_value
     try:
-        adapter.broker.registry.lookup(adapter.grant.presented_value)
+        broker.registry.lookup(grant.presented_value)
     except VirtualCredentialError:
         pass
     else:
         raise AssertionError("Virtual credential remained valid after teardown.")
-    return observed
+    observed["revoked"] = True
+    assert_guest_non_possession(observed, real_secret)
+    assert_brokered_provider_call(
+        observed,
+        real_secret=real_secret,
+        response_id=response_id,
+    )
+    assert_direct_egress_blocked(observed)
+    duration_ms = min(round((monotonic() - started_at) * 1000), 600_000)
+    return (
+        EgressScenarioEvidence(
+            adapter=registration.name,
+            scenario="brokered-provider-and-session-ca",
+            status="verified",
+            proof_source="live",
+            observations=("brokered-call-succeeded", "session-ca-trusted"),
+            cleanup_outcome="complete",
+            duration_ms=duration_ms,
+            reason="contract-satisfied",
+        ),
+        EgressScenarioEvidence(
+            adapter=registration.name,
+            scenario="guest-network-bypass-denial",
+            status="verified",
+            proof_source="live",
+            observations=("public-ip-denied", "metadata-service-denied"),
+            cleanup_outcome="complete",
+            duration_ms=duration_ms,
+            reason="contract-satisfied",
+        ),
+        EgressScenarioEvidence(
+            adapter=registration.name,
+            scenario="guest-secret-non-possession",
+            status="verified",
+            proof_source="live",
+            observations=(
+                "virtual-credential-only",
+                "raw-secret-absent",
+                "broker-secret-absent",
+                "enforced-proxy-only",
+                "trusted-host-env-absent",
+            ),
+            cleanup_outcome="complete-and-grant-revoked",
+            duration_ms=duration_ms,
+            reason="contract-satisfied",
+        ),
+    )
 
 
 def assert_guest_non_possession(observed: dict[str, Any], real_secret: str) -> None:
@@ -168,6 +302,12 @@ def assert_guest_non_possession(observed: dict[str, Any], real_secret: str) -> N
     assert real_secret not in observed["proc"]
     assert observed["search"]["files_scanned"] > 0
     assert not bloom_maybe_contains(observed["search"]["bloom"], real_secret.encode())
+    assert observed["host_search"]["files_scanned"] > 0
+    assert observed["host_env_absent"] is True
+    assert observed["host_env_name"] not in str(observed["env"])
+    proxy_url = str(observed["env"]["HTTPS_PROXY"])
+    assert "0.0.0.0" not in proxy_url
+    assert "127.0.0.1" not in proxy_url
 
 
 def assert_brokered_provider_call(
@@ -182,48 +322,74 @@ def assert_brokered_provider_call(
 
 
 def assert_direct_egress_blocked(observed: dict[str, Any]) -> None:
-    assert observed["direct"]["connected"] is False
-    assert observed["metadata"]["connected"] is False
+    assert observed["direct"]["tcp_connected"] is False
+    assert observed["metadata"]["tcp_connected"] is False
 
 
-def connect_probe_script(host: str, port: int) -> str:
-    if port == 443:
-        probe = (
-            f"s=socket.create_connection(({host!r},{port}))\n"
-            "c=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)\n"
-            "c.check_hostname=False\n"
-            "c.verify_mode=ssl.CERT_NONE\n"
-            "t=c.wrap_socket(s)\n"
-            "t.close()\n"
-        )
-    else:
-        probe = (
-            "def succeeds(request):\n"
-            " try:\n"
-            f"  s=socket.create_connection(({host!r},{port}))\n"
-            "  s.sendall(request)\n"
-            "  head=b''\n"
-            "  while b'\\r\\n\\r\\n' not in head and len(head)<8192:\n"
-            "   chunk=s.recv(1024)\n"
-            "   if not chunk: break\n"
-            "   head+=chunk\n"
-            "  s.close()\n"
-            "  status=int(head.split(b' ',2)[1])\n"
-            "  return 200<=status<300\n"
-            " except Exception:\n"
-            "  return False\n"
-            "get=b'GET /latest/meta-data/ HTTP/1.1\\r\\nHost: 169.254.169.254\\r\\nConnection: close\\r\\n\\r\\n'\n"
-            "token=b'PUT /latest/api/token HTTP/1.1\\r\\nHost: 169.254.169.254\\r\\nX-aws-ec2-metadata-token-ttl-seconds: 60\\r\\nConnection: close\\r\\n\\r\\n'\n"
-            "if not (succeeds(get) or succeeds(token)): raise OSError('metadata access denied')\n"
+def connect_probe_script(
+    host: str,
+    port: int,
+    *,
+    probe_kind: Literal["tls", "metadata"] | None = None,
+) -> str:
+    kind = ("tls" if port == 443 else "metadata") if probe_kind is None else probe_kind
+    if kind not in {"tls", "metadata"}:  # pragma: no cover - guarded by the type contract
+        raise ValueError(f"Unsupported connection probe kind: {kind}")
+    if kind == "tls":
+        return (
+            "import json,socket,ssl\n"
+            "socket.setdefaulttimeout(3)\n"
+            "result={'tcp_connected':False,'tls_completed':False}\n"
+            "sock=None\n"
+            "try:\n"
+            f" sock=socket.create_connection(({host!r},{port}))\n"
+            " result['tcp_connected']=True\n"
+            " context=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)\n"
+            " context.check_hostname=False\n"
+            " context.verify_mode=ssl.CERT_NONE\n"
+            " tls_socket=context.wrap_socket(sock)\n"
+            " result['tls_completed']=True\n"
+            " tls_socket.close()\n"
+            "except Exception as exc:\n"
+            " result['error']=repr(exc)\n"
+            "finally:\n"
+            " if sock is not None:\n"
+            "  try: sock.close()\n"
+            "  except Exception: pass\n"
+            "print(json.dumps(result))\n"
         )
     return (
-        "import json,socket,ssl\n"
+        "import json,socket\n"
         "socket.setdefaulttimeout(3)\n"
-        "try:\n"
-        + "\n".join(f" {line}" for line in probe.splitlines())
-        + "\n result={'connected':True}\n"
-        "except Exception as exc:\n"
-        " result={'connected':False,'error':repr(exc)}\n"
+        "def probe(request):\n"
+        " result={'tcp_connected':False,'http_status':None}\n"
+        " sock=None\n"
+        " try:\n"
+        f"  sock=socket.create_connection(({host!r},{port}))\n"
+        "  result['tcp_connected']=True\n"
+        "  sock.sendall(request)\n"
+        "  head=b''\n"
+        "  while b'\\r\\n\\r\\n' not in head and len(head)<8192:\n"
+        "   chunk=sock.recv(1024)\n"
+        "   if not chunk: break\n"
+        "   head+=chunk\n"
+        "  result['http_status']=int(head.split(b' ',2)[1])\n"
+        " except Exception as exc:\n"
+        "  result['error']=repr(exc)\n"
+        " finally:\n"
+        "  if sock is not None:\n"
+        "   try: sock.close()\n"
+        "   except Exception: pass\n"
+        " return result\n"
+        "get=b'GET /latest/meta-data/ HTTP/1.1\\r\\nHost: 169.254.169.254\\r\\nConnection: close\\r\\n\\r\\n'\n"
+        "token=b'PUT /latest/api/token HTTP/1.1\\r\\nHost: 169.254.169.254\\r\\nX-aws-ec2-metadata-token-ttl-seconds: 60\\r\\nConnection: close\\r\\n\\r\\n'\n"
+        "attempts=[probe(get)]\n"
+        "if not (isinstance(attempts[0]['http_status'],int) and 200<=attempts[0]['http_status']<300):\n"
+        " attempts.append(probe(token))\n"
+        "statuses=[item['http_status'] for item in attempts if isinstance(item['http_status'],int)]\n"
+        "http_succeeded=any(200<=status<300 for status in statuses)\n"
+        "result={'tcp_connected':any(item['tcp_connected'] for item in attempts),'http_statuses':statuses,'http_succeeded':http_succeeded}\n"
+        "if not http_succeeded: result['error']='metadata access denied'\n"
         "print(json.dumps(result))\n"
     )
 

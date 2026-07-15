@@ -132,6 +132,7 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
     ) -> EgressBinding:
         return await prepare_exposed_proxy_binding(
             runner_kind=self.runner_kind,
+            session_id=session_id,
             broker=broker,
             grants=grants,
             exposure=self.exposure,
