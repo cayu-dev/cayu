@@ -21,9 +21,10 @@ from cayu.cli.scaffold import (
     GENERATED_REGISTRATIONS_END,
     GENERATED_REGISTRATIONS_START,
 )
+from cayu.core.agents import AgentAuthoringState
 
 _IDENTIFIER_RE = re.compile(r"[a-z][a-z0-9_]*")
-GENERATOR_PLAN_SCHEMA_VERSION = "1"
+GENERATOR_PLAN_SCHEMA_VERSION = "2"
 
 
 class GeneratorEdit(BaseModel):
@@ -40,11 +41,12 @@ class GeneratorEdit(BaseModel):
 class GeneratorPlan(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: str = GENERATOR_PLAN_SCHEMA_VERSION
+    schema_version: Literal["2"] = GENERATOR_PLAN_SCHEMA_VERSION
     status: Literal["ready", "conflict", "manual_action_required", "already_present"]
     slice_name: str
     tool_name: str
     effect: str
+    authoring_state: AgentAuthoringState = AgentAuthoringState.UNFINISHED_GENERATED_TRACER_BULLET
     edits: tuple[GeneratorEdit, ...]
     conflicts: tuple[dict[str, str], ...] = ()
     verification_commands: tuple[str, ...]
@@ -398,7 +400,7 @@ def _slice_files(*, name: str, tool_name: str, effect: str) -> dict[str, str]:
         eval_assertions = f"""                        SessionCompleted(),
                         ToolCalled({tool_name_constant}),
                         FinalOutputContains("sample"),"""
-    agent = f'''from cayu import AgentSpec
+    agent = f'''from cayu import AgentAuthoringState, AgentSpec
 
 from tools.{tool_name} import {tool_name_constant}
 
@@ -408,6 +410,7 @@ from tools.{tool_name} import {tool_name_constant}
     model="gpt-5.6-luna",
     system_prompt=f"Use {{{tool_name_constant}}} when it directly answers the user's request.",
     workflow_tool_names=({tool_name_constant},),
+    authoring_state=AgentAuthoringState.UNFINISHED_GENERATED_TRACER_BULLET,
 )
 '''
     tool = f'''from cayu import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec

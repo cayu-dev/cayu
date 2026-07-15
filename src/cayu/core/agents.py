@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -11,6 +12,12 @@ from cayu.core.events import Event
 from cayu.core.messages import Message
 from cayu.core.thinking import ThinkingConfig
 from cayu.core.tools import Tool
+
+
+class AgentAuthoringState(StrEnum):
+    """Explicit application-authoring state carried by an agent specification."""
+
+    UNFINISHED_GENERATED_TRACER_BULLET = "unfinished_generated_tracer_bullet"
 
 
 class AgentSpec(BaseModel):
@@ -25,6 +32,8 @@ class AgentSpec(BaseModel):
     # Exact registered tool names used by the agent's machine-checkable workflow.
     # Cayu checks these names against this agent's manifest without parsing prose.
     workflow_tool_names: tuple[str, ...] = ()
+    # Advisory authoring state only. It never changes runtime execution.
+    authoring_state: AgentAuthoringState | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     provider_options: dict[str, Any] = Field(default_factory=dict)
     thinking: ThinkingConfig | None = None

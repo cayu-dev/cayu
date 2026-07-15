@@ -29,7 +29,7 @@ from cayu.artifacts import (
     validate_file_attachment_bytes,
     validate_file_attachment_content_type,
 )
-from cayu.core.agents import Agent, AgentSpec
+from cayu.core.agents import Agent, AgentAuthoringState, AgentSpec
 from cayu.core.events import EVENT_ID_MAX_CHARS, Event, EventType
 from cayu.core.messages import (
     FilePart,
@@ -682,6 +682,7 @@ __all__ = [
     "TRACE_LEVEL",
     "AfterToolCallDecision",
     "Agent",
+    "AgentAuthoringState",
     "AgentSpec",
     "AllowAllToolPolicy",
     "AllowlistProxy",

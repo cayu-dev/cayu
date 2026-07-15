@@ -8,6 +8,23 @@ Run the correction, then rerun `cayu inspect --json` and `cayu check --json`.
 `APP_NO_AGENTS` means the factory returned an app with no registered agent.
 Register an `AgentSpec` with `CayuApp.register_agent()`.
 
+## agent-generated-tracer-bullet-unfinished
+
+`AGENT_GENERATED_TRACER_BULLET_UNFINISHED` means `cayu generate slice` left
+the agent's explicit `authoring_state` marker in place. The generated prompt,
+echo/sample tool behavior, runtime test, and scripted trajectory are a runnable
+wiring proof, not evidence that the requested domain behavior is complete.
+
+Replace the domain system prompt, tool schema and implementation, runtime test
+inputs and assertions, and trajectory eval behavior and assertions. Then remove
+`authoring_state=AgentAuthoringState.UNFINISHED_GENERATED_TRACER_BULLET` and
+the unused import from the generated agent module. Verify with
+`cayu inspect --json && cayu check --fail-on warning --json`.
+
+The marker is an author assertion, not source analysis: Cayu does not scan
+Python or prose for words such as `sample`, `echo`, or `tracer bullet`, and an
+absent marker does not prove domain correctness.
+
 ## agent-provider-not-found
 
 `AGENT_PROVIDER_NOT_FOUND` means an agent's explicit provider is absent, or no

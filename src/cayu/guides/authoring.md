@@ -110,10 +110,18 @@ changes only the delimited machine-owned import/registration regions in
 `app.py`. Missing anchors, conflicting files, or different user content fail
 without partial writes. Repeating a successful invocation is a no-op.
 
-Generated code is a tracer bullet, not finished domain behavior. Replace its
-placeholder tool body and eval prompt with the real domain contract while
-preserving its closed input schema, explicit effect, visible registration,
-runtime test, and trajectory assertion.
+Generated code is a tracer bullet, not finished domain behavior. A generated
+slice carries an explicit `AgentAuthoringState.UNFINISHED_GENERATED_TRACER_BULLET`
+marker, so `cayu check --fail-on warning --json` rejects it as a completed
+submission while its structural inspection, runtime test, and eval remain
+runnable.
+
+Replace the domain system prompt, tool schema and body, runtime test inputs and
+assertions, and trajectory eval behavior and assertions. Only then remove the
+`authoring_state` argument and unused `AgentAuthoringState` import from the
+generated agent module. Cayu deliberately trusts that explicit state instead
+of parsing arbitrary Python, prompts, or test source; clearing it is an author
+claim, not a framework proof of domain correctness.
 
 Generated slices define each tool name once in the tool module and reuse that
 constant in the `ToolSpec`, agent instructions, `workflow_tool_names`, runtime

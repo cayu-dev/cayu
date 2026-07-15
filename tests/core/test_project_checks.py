@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from cayu import (
+    AgentAuthoringState,
     AgentSpec,
     AlwaysRequireApprovalToolPolicy,
     CayuApp,
@@ -55,6 +56,7 @@ class _PermissiveApprovalPolicy(AlwaysRequireApprovalToolPolicy):
 
 def test_builtin_diagnostic_codes_are_unique_and_compatibility_pinned() -> None:
     assert BUILTIN_DIAGNOSTIC_CODES == (
+        "AGENT_GENERATED_TRACER_BULLET_UNFINISHED",
         "AGENT_PROVIDER_AMBIGUOUS",
         "AGENT_PROVIDER_NOT_FOUND",
         "AGENT_WORKFLOW_TOOL_NOT_REGISTERED",
@@ -110,6 +112,78 @@ def test_workflow_tool_references_must_match_that_agents_registered_tools() -> N
     )
     assert "exact registered tool name" in report.diagnostics[0].hint
     assert deploy_report.diagnostics == report.diagnostics
+
+
+def test_generated_tracer_bullet_warning_is_explicit_deterministic_and_deploy_visible() -> None:
+    app = CayuApp(enable_logging=False)
+    app.register_provider(ScriptedModelProvider([], name="scripted"), default=True)
+    app.register_agent(
+        AgentSpec(
+            name="writer",
+            model="test-model",
+            system_prompt="A completed prompt may still say sample, echo, or tracer bullet.",
+        )
+    )
+    for name in ("reviewer", "analyst"):
+        app.register_agent(
+            AgentSpec(
+                name=name,
+                model="test-model",
+                authoring_state=(AgentAuthoringState.UNFINISHED_GENERATED_TRACER_BULLET),
+            )
+        )
+
+    full = check_manifest(app.describe())
+    authoring = check_manifest(app.describe(), tags=frozenset({"authoring"}))
+    deploy = check_manifest(app.describe(), deploy_only=True)
+    providers = check_manifest(app.describe(), tags=frozenset({"providers"}))
+
+    assert [item.subject for item in full.diagnostics] == [
+        "agent:analyst",
+        "agent:reviewer",
+    ]
+    assert authoring.diagnostics == full.diagnostics
+    assert deploy.diagnostics == full.diagnostics
+    assert providers.diagnostics == ()
+    finding = full.diagnostics[0]
+    assert finding.code == "AGENT_GENERATED_TRACER_BULLET_UNFINISHED"
+    assert finding.severity == "warning"
+    assert finding.path == "agents.analyst.authoring_state"
+    assert finding.parameters == {
+        "agent": "analyst",
+        "authoring_state": "unfinished_generated_tracer_bullet",
+    }
+    assert finding.tags == ("authoring", "deploy")
+    assert "unfinished generated tracer bullet" in finding.message
+    assert "remove the authoring_state marker" in finding.hint
+    assert finding.documentation_anchor == (
+        "cayu guide diagnostics#agent-generated-tracer-bullet-unfinished"
+    )
+    assert finding.verification_command == (
+        "cayu inspect --json && cayu check --fail-on warning --json"
+    )
+
+
+def test_generated_tracer_bullet_verification_command_does_not_interpolate_agent_name() -> None:
+    agent_name = "reviewer; echo unsafe"
+    app = CayuApp(enable_logging=False)
+    app.register_provider(ScriptedModelProvider([], name="scripted"), default=True)
+    app.register_agent(
+        AgentSpec(
+            name=agent_name,
+            model="test-model",
+            authoring_state=AgentAuthoringState.UNFINISHED_GENERATED_TRACER_BULLET,
+        )
+    )
+
+    finding = check_manifest(app.describe()).diagnostics[0]
+
+    assert finding.code == "AGENT_GENERATED_TRACER_BULLET_UNFINISHED"
+    assert finding.parameters["agent"] == agent_name
+    assert agent_name not in finding.verification_command
+    assert finding.verification_command == (
+        "cayu inspect --json && cayu check --fail-on warning --json"
+    )
 
 
 def test_check_tags_and_deploy_selection_are_orthogonal() -> None:
@@ -174,6 +248,16 @@ def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
     )
     misaligned_codes = {item.code for item in check_manifest(misaligned.describe()).diagnostics}
 
+    unfinished = CayuApp(enable_logging=False)
+    unfinished.register_agent(
+        AgentSpec(
+            name="unfinished",
+            model="model",
+            authoring_state=AgentAuthoringState.UNFINISHED_GENERATED_TRACER_BULLET,
+        )
+    )
+    unfinished_codes = {item.code for item in check_manifest(unfinished.describe()).diagnostics}
+
     assert (
         empty_codes
         | missing_codes
@@ -181,6 +265,7 @@ def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
         | unsafe_codes
         | unknown_codes
         | misaligned_codes
+        | unfinished_codes
         == set(BUILTIN_DIAGNOSTIC_CODES)
     )
 

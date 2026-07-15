@@ -185,6 +185,7 @@ def test_cayu_new_emits_safe_agent_instructions_and_credential_free_proof(
     assert "cayu guide anatomy" in instructions
     assert "cayu inspect --json" in instructions
     assert "cayu check --json" in instructions
+    assert "cayu check --fail-on warning --json" in instructions
     assert "cayu generate slice" in instructions
     assert "pytest" in instructions
     assert "cayu eval run evals.assistant:build_eval" in instructions

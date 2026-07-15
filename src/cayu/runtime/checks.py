@@ -5,11 +5,13 @@ from types import MappingProxyType
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from cayu.core.agents import AgentAuthoringState
 from cayu.runtime.manifest import AppManifest, FrozenJsonObject
 
 CHECK_REPORT_SCHEMA_VERSION = "1"
 AVAILABLE_CHECK_TAGS = frozenset({"authoring", "configuration", "deploy", "providers", "security"})
 BUILTIN_DIAGNOSTIC_CODES = (
+    "AGENT_GENERATED_TRACER_BULLET_UNFINISHED",
     "AGENT_PROVIDER_AMBIGUOUS",
     "AGENT_PROVIDER_NOT_FOUND",
     "AGENT_WORKFLOW_TOOL_NOT_REGISTERED",
@@ -81,6 +83,35 @@ def check_manifest(
         )
 
     for agent in manifest.agents:
+        if agent.authoring_state is AgentAuthoringState.UNFINISHED_GENERATED_TRACER_BULLET:
+            diagnostics.append(
+                ProjectDiagnostic(
+                    code="AGENT_GENERATED_TRACER_BULLET_UNFINISHED",
+                    severity=DiagnosticSeverity.WARNING,
+                    subject=f"agent:{agent.name}",
+                    path=f"agents.{agent.name}.authoring_state",
+                    message=(
+                        f"Agent '{agent.name}' is still marked as an unfinished generated "
+                        "tracer bullet; generated echo/sample behavior is not domain completion."
+                    ),
+                    hint=(
+                        "Replace the domain system prompt, tool schema and body, runtime test "
+                        "inputs and assertions, and trajectory eval behavior and assertions; "
+                        "then remove the authoring_state marker and its unused import."
+                    ),
+                    tags=("authoring", "deploy"),
+                    parameters={
+                        "agent": agent.name,
+                        "authoring_state": str(agent.authoring_state),
+                    },
+                    documentation_anchor=(
+                        "cayu guide diagnostics#agent-generated-tracer-bullet-unfinished"
+                    ),
+                    verification_command=(
+                        "cayu inspect --json && cayu check --fail-on warning --json"
+                    ),
+                )
+            )
         if agent.provider_resolution == "missing":
             provider_name = agent.configured_provider or "<default>"
             hint = (

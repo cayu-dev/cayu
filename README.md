@@ -183,6 +183,9 @@ project follows. Use
 one reviewable vertical slice without importing or changing the project. Apply
 revalidates the plan's preimages and symlink-free project containment, stages
 every output, and rolls back the whole slice if any filesystem commit fails.
+Each generated slice is explicitly marked as an unfinished tracer bullet until
+its domain prompt, tool contract, runtime test, and trajectory eval are replaced;
+`cayu check --fail-on warning --json` is the completion gate.
 
 The default proof distinguishes structural inspection, hermetic runtime tests,
 process-boundary checks, and optional live checks. It never treats successful

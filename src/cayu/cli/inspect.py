@@ -6,7 +6,7 @@ import sys
 from typing import Any
 
 from cayu.cli.project import ProjectError, build_project_app, project_context, resolve_project
-from cayu.runtime.manifest import AppManifest
+from cayu.runtime.manifest import APP_MANIFEST_SCHEMA_VERSION, AppManifest
 
 
 def add_inspect_parser(subparsers: Any) -> None:
@@ -37,7 +37,7 @@ def run_inspect(args: argparse.Namespace) -> int:
             print(
                 json.dumps(
                     {
-                        "schema_version": "1",
+                        "schema_version": APP_MANIFEST_SCHEMA_VERSION,
                         "error": {
                             "code": "PROJECT_BOOT_FAILED",
                             "message": _project_error_message(exc),
@@ -53,7 +53,12 @@ def run_inspect(args: argparse.Namespace) -> int:
     filtered, error = _filter_manifest(manifest, args)
     if error is not None:
         if args.json:
-            print(json.dumps({"schema_version": "1", "error": error}, sort_keys=True))
+            print(
+                json.dumps(
+                    {"schema_version": APP_MANIFEST_SCHEMA_VERSION, "error": error},
+                    sort_keys=True,
+                )
+            )
         else:
             print(f"error: {error['message']}", file=sys.stderr)
         return 1

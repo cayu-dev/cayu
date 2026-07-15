@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Annotated, Literal, cast
 from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, PlainValidator
 
 from cayu._validation import collision_safe_json_object, copy_json_value
+from cayu.core.agents import AgentAuthoringState
 from cayu.runtime.tool_policy import (
     AllowAllToolPolicy,
     AlwaysRequireApprovalToolPolicy,
@@ -26,7 +27,7 @@ if TYPE_CHECKING:
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime.app import CayuApp
 
-APP_MANIFEST_SCHEMA_VERSION = "1"
+APP_MANIFEST_SCHEMA_VERSION = "2"
 _ABSOLUTE_PATH_PLACEHOLDER = "[ABSOLUTE_PATH]"
 _MEMORY_ADDRESS_PLACEHOLDER = "[MEMORY_ADDRESS]"
 _OBJECT_REPRESENTATION_PLACEHOLDER = "[OBJECT_REPRESENTATION]"
@@ -158,6 +159,7 @@ class AgentManifest(_ManifestModel):
     provider_resolution: Literal["explicit", "model_pattern", "default", "missing", "ambiguous"]
     provider_candidates: tuple[str, ...] = ()
     workflow_tool_names: tuple[str, ...] = ()
+    authoring_state: AgentAuthoringState | None = None
     tools: tuple[ToolManifest, ...] = ()
     tool_policy: str
     context_policy: str
@@ -226,7 +228,7 @@ class RuntimeManifest(_ManifestModel):
 
 
 class AppManifest(_ManifestModel):
-    schema_version: Literal["1"] = APP_MANIFEST_SCHEMA_VERSION
+    schema_version: Literal["2"] = APP_MANIFEST_SCHEMA_VERSION
     fingerprint: str
     agents: tuple[AgentManifest, ...]
     providers: tuple[ProviderManifest, ...]
@@ -372,6 +374,7 @@ def _describe_agent(
         provider_resolution=resolution,
         provider_candidates=candidates,
         workflow_tool_names=spec.workflow_tool_names,
+        authoring_state=spec.authoring_state,
         tools=tuple(
             ToolManifest(
                 name=tool_name,

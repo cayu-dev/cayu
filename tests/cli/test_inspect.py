@@ -66,7 +66,7 @@ def build_app():
     assert main(["inspect", "--json"]) == 0
 
     output = json.loads(capsys.readouterr().out)
-    assert output["schema_version"] == "1"
+    assert output["schema_version"] == "2"
     assert output["agents"][0]["name"] == "reviewer"
     assert output["agents"][0]["resolved_provider"] == "scripted"
     assert output["defaults"]["environment"] is None
@@ -113,8 +113,37 @@ def build_app():
 
     assert main(["inspect", "--environment", "missing", "--json"]) == 1
     error = json.loads(capsys.readouterr().out)
+    assert error["schema_version"] == "2"
     assert error["error"] == {
         "code": "SUBJECT_NOT_FOUND",
         "message": "Environment not found: missing.",
         "path": "environments.missing",
+    }
+
+
+def test_inspect_factory_failure_uses_current_manifest_schema_version(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.cayu]\nfactory = "failed_inspect_project:build_app"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "failed_inspect_project.py").write_text(
+        'def build_app():\n    raise RuntimeError("boot exploded")\n',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    sys.modules.pop("failed_inspect_project", None)
+
+    assert main(["inspect", "--json"]) == 2
+
+    output = json.loads(capsys.readouterr().out)
+    assert output == {
+        "schema_version": "2",
+        "error": {
+            "code": "PROJECT_BOOT_FAILED",
+            "message": "Application factory failed (RuntimeError): boot exploded",
+        },
     }

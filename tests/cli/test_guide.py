@@ -18,6 +18,7 @@ def test_package_shipped_authoring_and_diagnostic_guides_are_discoverable(capsys
     assert main(["guide", "diagnostics"]) == 0
     diagnostics = capsys.readouterr().out
     assert "# Cayu project diagnostics" in diagnostics
+    assert "## agent-generated-tracer-bullet-unfinished" in diagnostics
     assert "## agent-provider-not-found" in diagnostics
     assert "## agent-workflow-tool-not-registered" in diagnostics
 

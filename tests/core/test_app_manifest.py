@@ -6,6 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from cayu import (
+    AgentAuthoringState,
     AgentSpec,
     AppManifest,
     CayuApp,
@@ -147,7 +148,7 @@ def test_describe_returns_a_deterministic_public_application_manifest() -> None:
     manifest = _described_app().describe()
     reversed_manifest = _described_app(reverse=True).describe()
 
-    assert manifest.schema_version == "1"
+    assert manifest.schema_version == "2"
     assert manifest.defaults.provider == "primary"
     assert manifest.defaults.environment == "local"
     assert [agent.name for agent in manifest.agents] == ["reviewer", "writer"]
@@ -156,6 +157,36 @@ def test_describe_returns_a_deterministic_public_application_manifest() -> None:
     assert manifest.model_dump(mode="json") == reversed_manifest.model_dump(mode="json")
     assert manifest.fingerprint == reversed_manifest.fingerprint
     assert len(manifest.fingerprint) == 64
+
+
+def test_agent_authoring_state_is_typed_copied_and_fingerprinted() -> None:
+    spec = AgentSpec(
+        name="generated",
+        model="model",
+        authoring_state=AgentAuthoringState.UNFINISHED_GENERATED_TRACER_BULLET,
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_agent(spec)
+
+    marked = app.describe()
+    spec.authoring_state = None
+
+    assert app.get_agent("generated").spec.authoring_state is (
+        AgentAuthoringState.UNFINISHED_GENERATED_TRACER_BULLET
+    )
+    assert marked.agents[0].authoring_state is (
+        AgentAuthoringState.UNFINISHED_GENERATED_TRACER_BULLET
+    )
+
+    complete = CayuApp(enable_logging=False)
+    complete.register_agent(AgentSpec(name="generated", model="model"))
+    completed_manifest = complete.describe()
+
+    assert completed_manifest.agents[0].authoring_state is None
+    assert marked.fingerprint != completed_manifest.fingerprint
+
+    with pytest.raises(ValidationError, match="authoring_state"):
+        AgentSpec(name="bad", model="model", authoring_state="complete")
 
 
 def test_describe_reports_no_default_for_a_non_default_static_environment() -> None:
@@ -239,7 +270,7 @@ def test_manifest_is_public_versioned_redacted_and_deeply_read_only(tmp_path: Pa
     payload = manifest.model_dump_json()
     schema = AppManifest.model_json_schema(mode="serialization")
 
-    assert schema["properties"]["schema_version"]["const"] == "1"
+    assert schema["properties"]["schema_version"]["const"] == "2"
     assert "manifest-secret" not in payload
     assert str(tmp_path) not in payload
     assert factory.called is False
@@ -348,7 +379,7 @@ def test_manifest_rejects_non_json_schema_payloads() -> None:
     with pytest.raises(ValidationError, match="JSON-compatible"):
         AppManifest.model_validate(
             {
-                "schema_version": "1",
+                "schema_version": "2",
                 "fingerprint": "0" * 64,
                 "agents": [
                     {

@@ -110,11 +110,69 @@ jobs:
           "$GITHUB_WORKSPACE/.release-venv/bin/cayu" inspect --json >/dev/null
           "$GITHUB_WORKSPACE/.release-venv/bin/cayu" check --json >/dev/null
           "$GITHUB_WORKSPACE/.release-venv/bin/cayu" generate slice reviewer --tool assess_submission --effect none
-          "$GITHUB_WORKSPACE/.release-venv/bin/cayu" inspect --json >/dev/null
-          "$GITHUB_WORKSPACE/.release-venv/bin/cayu" check --json >/dev/null
+          "$GITHUB_WORKSPACE/.release-venv/bin/cayu" generate slice reviewer --tool assess_submission --effect none --json > repeated-plan.json
+          "$GITHUB_WORKSPACE/.release-venv/bin/python" - <<'PY'
+          import json
+          from pathlib import Path
+
+          repeated = json.loads(Path("repeated-plan.json").read_text())
+          assert repeated["schema_version"] == "2"
+          assert repeated["status"] == "already_present"
+          assert repeated["edits"] == []
+
+          agent = Path("agents/reviewer.py")
+          source = agent.read_text()
+          source = source.replace(
+              "when it directly answers the user's request",
+              "to assess the submitted proposal against the domain rubric",
+          )
+          agent.write_text(source)
+          PY
+          "$GITHUB_WORKSPACE/.release-venv/bin/cayu" inspect --agent reviewer --json > unfinished-inspect.json
+          "$GITHUB_WORKSPACE/.release-venv/bin/cayu" check --json > unfinished-check.json
+          "$GITHUB_WORKSPACE/.release-venv/bin/python" - <<'PY'
+          import json
+          from pathlib import Path
+
+          inspect = json.loads(Path("unfinished-inspect.json").read_text())
+          assert inspect["schema_version"] == "2"
+          assert inspect["agents"][0]["authoring_state"] == (
+              "unfinished_generated_tracer_bullet"
+          )
+          check = json.loads(Path("unfinished-check.json").read_text())
+          assert [item["code"] for item in check["diagnostics"]] == [
+              "AGENT_GENERATED_TRACER_BULLET_UNFINISHED"
+          ]
+          PY
+          if "$GITHUB_WORKSPACE/.release-venv/bin/cayu" check --fail-on warning --json > warning-gate.json; then
+            echo "unfinished generated slice unexpectedly passed the warning gate"
+            exit 1
+          fi
           "$GITHUB_WORKSPACE/.release-venv/bin/python" -m pytest -q
           "$GITHUB_WORKSPACE/.release-venv/bin/cayu" eval run evals.assistant:build_eval >/dev/null
           "$GITHUB_WORKSPACE/.release-venv/bin/cayu" eval run evals.reviewer:build_eval >/dev/null
+          "$GITHUB_WORKSPACE/.release-venv/bin/python" - <<'PY'
+          from pathlib import Path
+
+          path = Path("agents/reviewer.py")
+          source = path.read_text()
+          marker = (
+              "    authoring_state="
+              "AgentAuthoringState.UNFINISHED_GENERATED_TRACER_BULLET,\n"
+          )
+          assert marker in source
+          source = source.replace("AgentAuthoringState, ", "").replace(marker, "")
+          source += "\n# Completed source may still mention sample, echo, or tracer bullet.\n"
+          path.write_text(source)
+          PY
+          "$GITHUB_WORKSPACE/.release-venv/bin/cayu" check --fail-on warning --json > completed-check.json
+          "$GITHUB_WORKSPACE/.release-venv/bin/python" - <<'PY'
+          import json
+          from pathlib import Path
+
+          check = json.loads(Path("completed-check.json").read_text())
+          assert check["diagnostics"] == []
+          PY
       - run: .release-venv/bin/cayu console --help
       - name: Check optional console dependency guidance
         run: |

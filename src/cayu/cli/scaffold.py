@@ -339,7 +339,10 @@ needs. `app.py` is the application factory and explicit registration surface.
    `cayu generate slice NAME --tool TOOL --effect EFFECT --dry-run --json`.
 4. Apply with `cayu generate slice NAME --tool TOOL --effect EFFECT`; review every changed file.
 5. Run `cayu check --json`, `pytest`, and the relevant
-   `cayu eval run evals.assistant:build_eval` target.
+   `cayu eval run evals.assistant:build_eval` target. Before submitting, clear
+   every generated slice's tracer-bullet marker only after replacing its domain
+   prompt, tool schema/body, runtime test, and trajectory eval, then require
+   `cayu check --fail-on warning --json` to pass.
 6. Exercise optional live boundaries only when credentials and infrastructure
    are explicitly available, then report evidence by verification layer.
 

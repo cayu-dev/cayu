@@ -23,6 +23,7 @@ _ROOT_IMPORT_PATTERN = re.compile(r"from cayu import (\(([^)]*)\)|([^\n(]+))", r
 # The session vocabulary the README's crash-recovery snippet depends on, plus
 # the runtime and workspace capability ABCs builders subclass to extend Cayu.
 REQUIRED_TOP_LEVEL_EXPORTS = (
+    "AgentAuthoringState",
     "BoundedTarReader",
     "Session",
     "SessionStatus",

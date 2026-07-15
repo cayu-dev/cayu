@@ -13243,6 +13243,7 @@ def _validate_agent_spec(spec: AgentSpec) -> AgentSpec:
         provider_name=spec.provider_name,
         system_prompt=spec.system_prompt,
         workflow_tool_names=spec.workflow_tool_names,
+        authoring_state=spec.authoring_state,
         metadata=copy_json_value(spec.metadata, "metadata"),
         provider_options=copy_json_value(spec.provider_options, "provider_options"),
         thinking=spec.thinking,

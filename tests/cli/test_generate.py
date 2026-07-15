@@ -48,8 +48,9 @@ def test_generate_slice_dry_run_is_deterministic_and_write_free(
     second = json.loads(capsys.readouterr().out)
 
     assert first == second
-    assert first["schema_version"] == "1"
+    assert first["schema_version"] == "2"
     assert first["status"] == "ready"
+    assert first["authoring_state"] == "unfinished_generated_tracer_bullet"
     assert [edit["path"] for edit in first["edits"]] == [
         "agents/analyst.py",
         "app.py",
@@ -147,6 +148,7 @@ def test_generate_slice_applies_once_and_passes_public_verification(
     assert [agent["name"] for agent in manifest["agents"]] == ["analyst", "assistant"]
     analyst = next(agent for agent in manifest["agents"] if agent["name"] == "analyst")
     assert analyst["workflow_tool_names"] == ["analyze_document"]
+    assert analyst["authoring_state"] == "unfinished_generated_tracer_bullet"
     agent_source = after_apply["agents/analyst.py"].decode()
     tool_source = after_apply["tools/analyze_document.py"].decode()
     eval_source = after_apply["evals/analyst.py"].decode()
@@ -156,7 +158,11 @@ def test_generate_slice_applies_once_and_passes_public_verification(
     assert "name=ANALYZE_DOCUMENT_TOOL_NAME" in tool_source
     assert "name=ANALYZE_DOCUMENT_TOOL_NAME" in eval_source
     assert main(["check", "--json"]) == 0
-    assert json.loads(capsys.readouterr().out)["diagnostics"] == []
+    diagnostics = json.loads(capsys.readouterr().out)["diagnostics"]
+    assert [item["code"] for item in diagnostics] == ["AGENT_GENERATED_TRACER_BULLET_UNFINISHED"]
+    assert diagnostics[0]["path"] == "agents.analyst.authoring_state"
+    assert main(["check", "--fail-on", "warning", "--json"]) == 1
+    assert json.loads(capsys.readouterr().out)["diagnostics"] == diagnostics
     eval_output = project / "analyst-eval.json"
     assert (
         main(
@@ -184,6 +190,117 @@ def test_generate_slice_applies_once_and_passes_public_verification(
         check=False,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_generate_slice_completion_is_explicit_and_preserves_customized_files(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    monkeypatch.chdir(project)
+    command = [
+        "generate",
+        "slice",
+        "analyst",
+        "--tool",
+        "analyze_document",
+        "--effect",
+        "none",
+    ]
+
+    assert main(command) == 0
+    capsys.readouterr()
+    agent_path = project / "agents" / "analyst.py"
+    tool_path = project / "tools" / "analyze_document.py"
+    test_path = project / "tests" / "test_analyst.py"
+    eval_path = project / "evals" / "analyst.py"
+
+    agent_source = agent_path.read_text(encoding="utf-8").replace(
+        "Use {ANALYZE_DOCUMENT_TOOL_NAME} when it directly answers the user's request.",
+        "Use {ANALYZE_DOCUMENT_TOOL_NAME} to assess the submitted proposal.",
+    )
+    agent_path.write_text(agent_source, encoding="utf-8")
+    for module_name in ("app", "agents.analyst", "agents", "tools.analyze_document", "tools"):
+        sys.modules.pop(module_name, None)
+
+    # Domain-looking source remains unfinished while the explicit marker is present.
+    assert main(["check", "--json"]) == 0
+    marked = json.loads(capsys.readouterr().out)
+    assert [item["code"] for item in marked["diagnostics"]] == [
+        "AGENT_GENERATED_TRACER_BULLET_UNFINISHED"
+    ]
+
+    agent_source = agent_path.read_text(encoding="utf-8")
+    agent_source = agent_source.replace("AgentAuthoringState, ", "")
+    agent_source = agent_source.replace(
+        "    authoring_state=AgentAuthoringState.UNFINISHED_GENERATED_TRACER_BULLET,\n",
+        "",
+    )
+    agent_source += "\n# Completed domain text may still mention sample, echo, or tracer bullet.\n"
+    agent_path.write_text(agent_source, encoding="utf-8")
+
+    tool_source = tool_path.read_text(encoding="utf-8")
+    tool_source = tool_source.replace(
+        "Process one explicit input for the analyst agent.",
+        "Assess one proposal document for the analyst agent.",
+    )
+    tool_source = tool_source.replace('"input"', '"document"')
+    tool_source = tool_source.replace("args['input']", "args['document']")
+    tool_path.write_text(tool_source, encoding="utf-8")
+
+    for path in (test_path, eval_path):
+        source = path.read_text(encoding="utf-8")
+        source = source.replace('"input": "sample"', '"document": "proposal"')
+        source = source.replace("Process sample", "Review proposal")
+        source = source.replace("analyst completed sample.", "analyst completed review.")
+        source = source.replace('FinalOutputContains("sample")', 'FinalOutputContains("review")')
+        path.write_text(source, encoding="utf-8")
+
+    for module_name in ("app", "agents.analyst", "agents", "tools.analyze_document", "tools"):
+        sys.modules.pop(module_name, None)
+
+    assert main(["inspect", "--agent", "analyst", "--json"]) == 0
+    inspected = json.loads(capsys.readouterr().out)
+    assert inspected["agents"][0]["authoring_state"] is None
+    assert main(["check", "--fail-on", "warning", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["diagnostics"] == []
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "pytest", "tests/test_analyst.py", "-q"],
+        cwd=project,
+        env={
+            **os.environ,
+            "PYTHONPATH": str(Path(__file__).parents[2] / "src"),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    eval_output = project / "analyst-completed-eval.json"
+    assert (
+        main(
+            [
+                "eval",
+                "run",
+                "evals.analyst:build_eval",
+                "--output",
+                str(eval_output),
+            ]
+        )
+        == 0
+    )
+    assert json.loads(eval_output.read_text(encoding="utf-8"))["status"] == "passed"
+
+    completed_files = _files(project)
+    assert main([*command, "--json"]) == 1
+    repeated = json.loads(capsys.readouterr().out)
+    assert repeated["status"] == "conflict"
+    assert repeated["authoring_state"] == "unfinished_generated_tracer_bullet"
+    assert _files(project) == completed_files
 
 
 def test_generate_slice_missing_registration_seam_requires_manual_action_without_writes(
