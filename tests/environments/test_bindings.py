@@ -25,7 +25,11 @@ from cayu.environments import (
     copy_bound_workspace,
     copy_workspace_snapshot,
 )
-from cayu.environments.bindings import _reset_workspace_after_failed_clone, _validate_sync_tar
+from cayu.environments.bindings import (
+    _list_workspace_paths,
+    _reset_workspace_after_failed_clone,
+    _validate_sync_tar,
+)
 from cayu.runners import E2BRunner, ExecCommand, ExecResult, LocalRunner, Runner
 from cayu.workspaces import (
     BoundedTarReader,
@@ -81,6 +85,19 @@ class StubRunner(Runner):
         output_limit_bytes: int | None = None,
     ) -> ExecResult:
         return ExecResult(stdout="ok")
+
+
+class TruncatedListWorkspace(StubWorkspace):
+    def __init__(self, result: WorkspaceListResult) -> None:
+        self.result = result
+
+    async def list(
+        self,
+        pattern: str = "**/*",
+        *,
+        limit: int | None = None,
+    ) -> WorkspaceListResult:
+        return self.result
 
 
 def _require_git() -> None:
@@ -836,6 +853,24 @@ def test_sync_binding_allows_custom_workspace_with_distinct_resource_key() -> No
         )
 
     asyncio.run(run())
+
+
+def test_sync_binding_reports_file_count_limit_separately() -> None:
+    workspace = TruncatedListWorkspace(
+        WorkspaceListResult(paths=("a.txt",), total_count=2, truncated=True)
+    )
+
+    with pytest.raises(RuntimeError, match="exceeded max_files=1"):
+        asyncio.run(_list_workspace_paths(workspace, "**/*", limit=1, role="source"))
+
+
+def test_sync_binding_reports_backend_incomplete_list() -> None:
+    workspace = TruncatedListWorkspace(
+        WorkspaceListResult(paths=("a.txt",), total_count=None, truncated=True)
+    )
+
+    with pytest.raises(RuntimeError, match="incomplete.*traversal or transfer bounds"):
+        asyncio.run(_list_workspace_paths(workspace, "**/*", limit=10, role="source"))
 
 
 def test_sync_binding_rejects_local_workspace_aliased_by_runner_workspace(tmp_path) -> None:

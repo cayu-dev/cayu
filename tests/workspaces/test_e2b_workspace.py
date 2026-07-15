@@ -66,14 +66,21 @@ class FakeE2BFs:
             raise RuntimeError("list failed")
         entries: list[FakeEntry] = []
         prefix = path.rstrip("/") + "/"
+
+        def within_depth(candidate: str) -> bool:
+            if not candidate.startswith(prefix) or depth is None:
+                return candidate.startswith(prefix)
+            relative = candidate[len(prefix) :]
+            return len(tuple(part for part in relative.split("/") if part)) <= depth
+
         for directory in self.dirs:
-            if directory != path and directory.startswith(prefix):
+            if directory != path and within_depth(directory):
                 entries.append(FakeEntry(path=directory, type=FakeFileType.DIR))
         for file_path, content in self.files.items():
-            if file_path.startswith(prefix):
+            if within_depth(file_path):
                 entries.append(FakeEntry(path=file_path, type=FakeFileType.FILE, size=len(content)))
         for link_path, target in self.symlinks.items():
-            if link_path.startswith(prefix):
+            if within_depth(link_path):
                 entries.append(
                     FakeEntry(
                         path=link_path,
@@ -205,8 +212,29 @@ def test_e2b_workspace_list_pattern_is_anchored() -> None:
 
     assert top_level.paths == ("root.txt",)
     assert top_level.total_count == 1
+    assert top_level.truncated is False
     assert recursive.paths == ("notes/a.txt", "root.txt")
     assert recursive.total_count == 2
+    assert recursive.truncated is False
+
+
+def test_e2b_workspace_list_marks_depth_boundary_incomplete() -> None:
+    workspace, fs = _workspace()
+    workspace.default_list_depth = 2
+    fs.dirs.update(
+        {
+            "/home/user/workspace/level-one",
+            "/home/user/workspace/level-one/level-two",
+        }
+    )
+    fs.files["/home/user/workspace/visible.txt"] = b"visible"
+    fs.files["/home/user/workspace/level-one/level-two/hidden.txt"] = b"hidden"
+
+    result = asyncio.run(workspace.list("**/*.txt"))
+
+    assert result.paths == ("visible.txt",)
+    assert result.total_count is None
+    assert result.truncated is True
 
 
 def test_e2b_workspace_rejects_path_and_pattern_escape() -> None:

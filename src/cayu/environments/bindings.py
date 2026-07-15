@@ -1017,7 +1017,14 @@ async def _list_workspace_paths(
 ) -> tuple[str, ...]:
     result = await workspace.list(pattern, limit=limit)
     if result.truncated:
-        raise RuntimeError(f"SyncBinding {role} workspace file list exceeded max_files={limit}.")
+        if result.total_count is not None and result.total_count > limit:
+            raise RuntimeError(
+                f"SyncBinding {role} workspace file list exceeded max_files={limit}."
+            )
+        raise RuntimeError(
+            f"SyncBinding {role} workspace file list is incomplete within the backend's "
+            "traversal or transfer bounds."
+        )
     return tuple(result.paths)
 
 

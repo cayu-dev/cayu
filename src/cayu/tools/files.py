@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import mimetypes
@@ -24,6 +25,7 @@ from cayu.artifacts import (
     copy_artifact_read_result,
     file_attachment,
 )
+from cayu.artifacts._images import decode_verified_image_format
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools._errors import (
     invalid_tool_arguments_result,
@@ -679,7 +681,10 @@ class ImageArtifactReader:
                     structured=request.structured,
                     is_error=True,
                 )
-            detected_content_type, validation_error = _detect_image_content_type(source.content)
+            detected_content_type, validation_error = await asyncio.to_thread(
+                _detect_image_content_type,
+                source.content,
+            )
             if validation_error is not None:
                 return ToolResult(
                     content=f"Image '{artifact.filename}' could not be inspected: {validation_error}",
@@ -750,7 +755,10 @@ class ImageArtifactReader:
                     },
                 )
         else:
-            detected_content_type, validation_error = _detect_image_content_type(result.content)
+            detected_content_type, validation_error = await asyncio.to_thread(
+                _detect_image_content_type,
+                result.content,
+            )
             if validation_error is not None:
                 return ToolResult(
                     content=f"Image '{artifact.filename}' could not be inspected: {validation_error}",
@@ -1367,6 +1375,7 @@ def _resize_image_bytes(
     content_type: str,
     max_bytes: int,
 ) -> tuple[bytes, str] | None:
+    """Resize bytes already accepted by the shared bounded image decoder."""
     try:
         image_module = import_module("PIL.Image")
     except ImportError:
@@ -1403,9 +1412,7 @@ def _detect_image_content_type(content: bytes) -> tuple[str | None, str | None]:
         return None, "Install cayu[files] or register a custom image reader."
 
     try:
-        with image_module.open(io.BytesIO(content)) as image:
-            detected_format = image.format
-            image.verify()
+        detected_format = decode_verified_image_format(image_module, content)
     except Exception as exc:
         return None, str(exc)
 

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 import sys
 import time
 
 import pytest
 
+import cayu.runners._subprocess as subprocess_module
 from cayu.runners._subprocess import (
     SubprocessCommand,
     copy_runner_env,
@@ -180,6 +182,353 @@ def test_run_subprocess_times_out_and_returns_partial_output(tmp_path) -> None:
     assert result.stdout == "before\n"
     assert result.timed_out is True
     assert result.exit_code != 0
+
+
+def test_windows_taskkill_runs_off_event_loop_with_timeout(monkeypatch) -> None:
+    observed: dict[str, object] = {}
+
+    def slow_taskkill(argv, *, capture_output, check, timeout):
+        observed.update(
+            argv=argv,
+            capture_output=capture_output,
+            check=check,
+            timeout=timeout,
+        )
+        time.sleep(0.05)
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(subprocess_module.subprocess, "run", slow_taskkill)
+
+    async def run() -> tuple[bool, int]:
+        task = asyncio.create_task(subprocess_module._taskkill_tree(123))
+        ticks = 0
+        while not task.done():
+            ticks += 1
+            await asyncio.sleep(0.005)
+        return await task, ticks
+
+    succeeded, ticks = asyncio.run(run())
+
+    assert succeeded is True
+    assert ticks > 1
+    assert observed == {
+        "argv": ["taskkill", "/F", "/T", "/PID", "123"],
+        "capture_output": True,
+        "check": False,
+        "timeout": subprocess_module._TASKKILL_TIMEOUT_S,
+    }
+
+
+def test_windows_taskkill_timeout_falls_back_to_direct_kill(monkeypatch) -> None:
+    def timed_out(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="taskkill", timeout=2)
+
+    monkeypatch.setattr(subprocess_module.subprocess, "run", timed_out)
+    assert asyncio.run(subprocess_module._taskkill_tree(123)) is False
+
+    class FakeProcess:
+        pid = 123
+
+        def __init__(self) -> None:
+            self.killed = False
+
+        def kill(self) -> None:
+            self.killed = True
+
+    async def failed_tree_kill(pid: int) -> bool:
+        assert pid == 123
+        return False
+
+    process = FakeProcess()
+    monkeypatch.setattr(subprocess_module.os, "name", "nt")
+    monkeypatch.setattr(subprocess_module, "_taskkill_tree", failed_tree_kill)
+
+    asyncio.run(subprocess_module._kill_process(process, process_group=False))  # type: ignore[arg-type]
+
+    assert process.killed is True
+
+
+def test_windows_taskkill_timeout_includes_executor_queue_time(monkeypatch) -> None:
+    worker_started = asyncio.Event()
+    worker_cancelled = asyncio.Event()
+
+    async def queued_to_thread(*_args, **_kwargs):
+        worker_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            worker_cancelled.set()
+            raise
+
+    monkeypatch.setattr(subprocess_module.asyncio, "to_thread", queued_to_thread)
+    monkeypatch.setattr(subprocess_module, "_TASKKILL_TIMEOUT_S", 0.01)
+
+    async def run() -> bool:
+        task = asyncio.create_task(subprocess_module._taskkill_tree(123))
+        await worker_started.wait()
+        return await asyncio.wait_for(task, timeout=0.2)
+
+    assert asyncio.run(run()) is False
+    assert worker_cancelled.is_set()
+
+
+def test_timeout_kill_resists_repeated_cancellation_and_cleans_io_tasks(monkeypatch) -> None:
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.killed = False
+
+        def kill(self) -> None:
+            self.killed = True
+
+    kill_started = asyncio.Event()
+    release_kill = asyncio.Event()
+
+    async def slow_kill(process, *, process_group):
+        assert process_group is False
+        kill_started.set()
+        await release_kill.wait()
+        process.kill()
+
+    monkeypatch.setattr(subprocess_module, "_kill_process", slow_kill)
+
+    async def run() -> tuple[FakeProcess, tuple[asyncio.Task, ...]]:
+        blocker = asyncio.Event()
+        io_tasks = tuple(asyncio.create_task(blocker.wait()) for _ in range(3))
+        wait_task = asyncio.create_task(asyncio.sleep(0, result=0))
+        process = FakeProcess()
+        cleanup_task = asyncio.create_task(
+            subprocess_module._kill_timed_out_process(
+                process,  # type: ignore[arg-type]
+                process_group=False,
+                stdin_task=io_tasks[0],
+                stdout_task=io_tasks[1],
+                stderr_task=io_tasks[2],
+                wait_task=wait_task,
+            )
+        )
+        await kill_started.wait()
+        cleanup_task.cancel()
+        await asyncio.sleep(0)
+        cleanup_task.cancel()
+        release_kill.set()
+        with pytest.raises(asyncio.CancelledError):
+            await cleanup_task
+        return process, (*io_tasks, wait_task)
+
+    process, tasks = asyncio.run(run())
+
+    assert process.killed is True
+    assert all(task.done() for task in tasks)
+    assert all(task.cancelled() for task in tasks[:3])
+
+
+def test_cancelled_process_cleanup_resists_second_cancellation(monkeypatch) -> None:
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.killed = False
+
+        def kill(self) -> None:
+            self.killed = True
+
+    kill_started = asyncio.Event()
+    release_kill = asyncio.Event()
+
+    async def slow_kill(process, *, process_group):
+        assert process_group is False
+        kill_started.set()
+        await release_kill.wait()
+        process.kill()
+
+    monkeypatch.setattr(subprocess_module, "_kill_process", slow_kill)
+
+    async def run() -> tuple[FakeProcess, tuple[asyncio.Task, ...]]:
+        blocker = asyncio.Event()
+        io_tasks = tuple(asyncio.create_task(blocker.wait()) for _ in range(3))
+        wait_task = asyncio.create_task(asyncio.sleep(0, result=0))
+        process = FakeProcess()
+
+        async def operation() -> None:
+            try:
+                await blocker.wait()
+            except asyncio.CancelledError:
+                await subprocess_module._cleanup_cancelled_process(
+                    process,  # type: ignore[arg-type]
+                    process_group=False,
+                    stdin_task=io_tasks[0],
+                    stdout_task=io_tasks[1],
+                    stderr_task=io_tasks[2],
+                    wait_task=wait_task,
+                )
+                raise
+
+        operation_task = asyncio.create_task(operation())
+        await asyncio.sleep(0)
+        operation_task.cancel()
+        await kill_started.wait()
+        operation_task.cancel()
+        release_kill.set()
+        with pytest.raises(asyncio.CancelledError):
+            await operation_task
+        return process, (*io_tasks, wait_task)
+
+    process, tasks = asyncio.run(run())
+
+    assert process.killed is True
+    assert all(task.done() for task in tasks)
+    assert all(task.cancelled() for task in tasks[:3])
+
+
+def test_timeout_kill_failure_cleans_io_tasks_and_propagates(monkeypatch) -> None:
+    async def failed_termination(process, *, process_group, wait_task):
+        assert process_group is False
+        raise RuntimeError("termination failed")
+
+    monkeypatch.setattr(subprocess_module, "_kill_process_and_wait", failed_termination)
+
+    async def run() -> tuple[asyncio.Task, ...]:
+        blocker = asyncio.Event()
+        tasks = tuple(asyncio.create_task(blocker.wait()) for _ in range(4))
+        with pytest.raises(RuntimeError, match="termination failed"):
+            await subprocess_module._kill_timed_out_process(
+                object(),  # type: ignore[arg-type]
+                process_group=False,
+                stdin_task=tasks[0],
+                stdout_task=tasks[1],
+                stderr_task=tasks[2],
+                wait_task=tasks[3],
+            )
+        return tasks
+
+    tasks = asyncio.run(run())
+
+    assert all(task.done() for task in tasks)
+    assert all(task.cancelled() for task in tasks)
+
+
+def test_timeout_kill_preserves_cancellation_when_termination_fails(monkeypatch) -> None:
+    termination_started = asyncio.Event()
+    release_termination = asyncio.Event()
+
+    async def failed_termination(process, *, process_group, wait_task):
+        assert process_group is False
+        termination_started.set()
+        await release_termination.wait()
+        raise RuntimeError("termination failed")
+
+    monkeypatch.setattr(subprocess_module, "_kill_process_and_wait", failed_termination)
+
+    async def run() -> tuple[asyncio.CancelledError, tuple[asyncio.Task, ...]]:
+        blocker = asyncio.Event()
+        tasks = tuple(asyncio.create_task(blocker.wait()) for _ in range(4))
+        cleanup_task = asyncio.create_task(
+            subprocess_module._kill_timed_out_process(
+                object(),  # type: ignore[arg-type]
+                process_group=False,
+                stdin_task=tasks[0],
+                stdout_task=tasks[1],
+                stderr_task=tasks[2],
+                wait_task=tasks[3],
+            )
+        )
+        await termination_started.wait()
+        cleanup_task.cancel("caller cancelled")
+        await asyncio.sleep(0)
+        release_termination.set()
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await cleanup_task
+        return exc_info.value, tasks
+
+    cancellation, tasks = asyncio.run(run())
+
+    assert str(cancellation) == "caller cancelled"
+    assert isinstance(cancellation.__cause__, RuntimeError)
+    assert "termination failed" in "\n".join(cancellation.__notes__)
+    assert all(task.done() for task in tasks)
+    assert all(task.cancelled() for task in tasks)
+
+
+def test_timeout_kill_preserves_cancellation_during_io_cleanup_after_termination_failure(
+    monkeypatch,
+) -> None:
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_io_tasks = subprocess_module._cleanup_io_tasks
+
+    async def failed_termination(process, *, process_group, wait_task):
+        assert process_group is False
+        raise RuntimeError("termination failed")
+
+    async def slow_cleanup(*tasks):
+        cleanup_started.set()
+        await release_cleanup.wait()
+        await cleanup_io_tasks(*tasks)
+
+    monkeypatch.setattr(subprocess_module, "_kill_process_and_wait", failed_termination)
+    monkeypatch.setattr(subprocess_module, "_cleanup_io_tasks", slow_cleanup)
+
+    async def run() -> tuple[asyncio.CancelledError, tuple[asyncio.Task, ...]]:
+        blocker = asyncio.Event()
+        tasks = tuple(asyncio.create_task(blocker.wait()) for _ in range(4))
+        kill_task = asyncio.create_task(
+            subprocess_module._kill_timed_out_process(
+                object(),  # type: ignore[arg-type]
+                process_group=False,
+                stdin_task=tasks[0],
+                stdout_task=tasks[1],
+                stderr_task=tasks[2],
+                wait_task=tasks[3],
+            )
+        )
+        await cleanup_started.wait()
+        kill_task.cancel("caller cancelled during I/O cleanup")
+        await asyncio.sleep(0)
+        release_cleanup.set()
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await kill_task
+        return exc_info.value, tasks
+
+    cancellation, tasks = asyncio.run(run())
+
+    assert str(cancellation) == "caller cancelled during I/O cleanup"
+    assert isinstance(cancellation.__cause__, RuntimeError)
+    assert "termination failed" in "\n".join(cancellation.__notes__)
+    assert all(task.done() for task in tasks)
+    assert all(task.cancelled() for task in tasks)
+
+
+def test_cancelled_process_cleanup_falls_back_when_termination_fails(monkeypatch) -> None:
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.killed = False
+
+        def kill(self) -> None:
+            self.killed = True
+
+    async def failed_termination(process, *, process_group, wait_task):
+        assert process_group is False
+        raise RuntimeError("termination failed")
+
+    monkeypatch.setattr(subprocess_module, "_kill_process_and_wait", failed_termination)
+
+    async def run() -> tuple[FakeProcess, tuple[asyncio.Task, ...]]:
+        blocker = asyncio.Event()
+        tasks = tuple(asyncio.create_task(blocker.wait()) for _ in range(4))
+        process = FakeProcess()
+        await subprocess_module._cleanup_cancelled_process(
+            process,  # type: ignore[arg-type]
+            process_group=False,
+            stdin_task=tasks[0],
+            stdout_task=tasks[1],
+            stderr_task=tasks[2],
+            wait_task=tasks[3],
+        )
+        return process, tasks
+
+    process, tasks = asyncio.run(run())
+
+    assert process.killed is True
+    assert all(task.done() for task in tasks)
+    assert all(task.cancelled() for task in tasks)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="posix session semantics")

@@ -1508,6 +1508,14 @@ portable across custom runners, but the runner image must provide Python 3, or
 `RunnerWorkspace(..., python_executable=...)` must point to an equivalent Python
 executable available inside the runner.
 
+`RunnerWorkspace.list()` caps its serialized guest response at 1 MiB. If the
+requested sorted paths do not fit, it returns the largest sorted prefix that
+does fit with an exact `total_count` and `truncated=true`; path length is not
+estimated through a fixed per-path allowance. `E2BWorkspace.list()` marks a
+result `truncated=true` with `total_count=None` when the native E2B traversal
+reaches `default_list_depth`, because the SDK cannot prove that deeper files
+were not omitted.
+
 Workspace result objects enforce consistent metadata:
 
 - `WorkspaceReadResult`: `truncated` must equal `len(content) < total_bytes`
@@ -1593,7 +1601,7 @@ request = RunRequest(
 )
 ```
 
-`attach_file` infers `content_type` from the filename when omitted, validates kind↔content-type consistency, parses the bytes to confirm they are a valid image/PDF whose detected format matches the declared content type (rejecting e.g. JPEG bytes labeled `image/png`; this requires the optional `cayu[files]` dependencies), and rejects content larger than `max_file_attachment_bytes` (the same 8 MB default per-file cap, configurable on `CayuApp`). Pass the same `session_id` you will use in the `RunRequest` for a session-scoped attachment, since the resolver re-checks scope. `FilePart` is allowed only in user messages. The runtime collects prompt `FilePart`s alongside tool-result attachments and resolves them through the exact same path described above — scope re-check, per-file/total/count limit enforcement, provider-native translation, and conservative token counting toward context pressure — so a prompt-attached file inlines into the user turn as an Anthropic `image`/`document` block, an OpenAI Responses `input_image`/`input_file` item, or a Chat Completions `image_url`/`file` part.
+`attach_file` infers `content_type` from the filename when omitted, validates kind↔content-type consistency, parses the bytes to confirm they are a valid image/PDF whose detected format matches the declared content type (rejecting e.g. JPEG bytes labeled `image/png`; this requires the optional `cayu[files]` dependencies), and rejects content larger than `max_file_attachment_bytes` (the same 8 MB default per-file cap, configurable on `CayuApp`). Image validation rejects Pillow decompression-bomb warnings, fully decodes up to 1,024 frames, caps each decoded raster at a conservative 64 MiB (`width × height × 4`), and caps cumulative decoded raster work at 256 MiB per image; these decoded-image limits are separate from the raw attachment and image-inspection source byte caps. The async `attach_file` and built-in `read_file` paths run this byte validation outside the event-loop thread. Cayu serializes built-in image validation within the process because Pillow warning-filter contexts are process-global on some supported Python builds. Pass the same `session_id` you will use in the `RunRequest` for a session-scoped attachment, since the resolver re-checks scope. `FilePart` is allowed only in user messages. The runtime collects prompt `FilePart`s alongside tool-result attachments and resolves them through the exact same path described above — scope re-check, per-file/total/count limit enforcement, provider-native translation, and conservative token counting toward context pressure — so a prompt-attached file inlines into the user turn as an Anthropic `image`/`document` block, an OpenAI Responses `input_image`/`input_file` item, or a Chat Completions `image_url`/`file` part.
 
 If a prompt attachment reference is missing, syntactically invalid, or no longer belongs to the active session/environment, the runtime replaces that prompt file with an explicit unresolved-file text note. Artifact-store outages and invalid store results fail closed instead: Cayu does not allow the model to answer as though a required file had been available. Tool-result attachments always fail closed when they cannot be resolved.
 

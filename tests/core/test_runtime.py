@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import threading
 import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
@@ -25815,6 +25816,36 @@ def test_attach_file_saves_reference_and_persists_bytes(tmp_path):
     assert read.content == png
 
 
+def test_attach_file_runs_byte_validation_off_event_loop(tmp_path, monkeypatch):
+    app, _ = _app_with_artifact_store(tmp_path)
+    validation_threads: list[int] = []
+
+    def record_validation(**_kwargs: object) -> None:
+        validation_threads.append(threading.get_ident())
+
+    monkeypatch.setattr(
+        runtime_app_module,
+        "validate_file_attachment_bytes",
+        record_validation,
+    )
+
+    async def attach() -> tuple[int, FilePart]:
+        event_loop_thread = threading.get_ident()
+        part = await app.attach_file(
+            b"image bytes",
+            filename="pic.png",
+            kind="image",
+            session_id="sess_attach",
+        )
+        return event_loop_thread, part
+
+    event_loop_thread, part = asyncio.run(attach())
+
+    assert isinstance(part, FilePart)
+    assert validation_threads
+    assert validation_threads[0] != event_loop_thread
+
+
 def test_attach_file_infers_content_type_from_filename(tmp_path):
     app, _ = _app_with_artifact_store(tmp_path)
 
@@ -25847,6 +25878,71 @@ def test_attach_file_rejects_invalid_image_bytes(tmp_path):
     with pytest.raises(ValueError, match="not a valid image"):
         asyncio.run(
             app.attach_file(b"not an image", filename="pic.png", kind="image", session_id="s")
+        )
+
+
+def test_attach_file_rejects_truncated_jpeg_that_passes_header_verification(tmp_path):
+    import io
+
+    from PIL import Image
+
+    app, _ = _app_with_artifact_store(tmp_path)
+    truncated = _valid_jpeg_bytes()[:-1]
+    with Image.open(io.BytesIO(truncated)) as image:
+        image.verify()
+
+    with pytest.raises(ValueError, match="not a valid image"):
+        asyncio.run(
+            app.attach_file(
+                truncated,
+                filename="truncated.jpg",
+                kind="image",
+                session_id="s",
+            )
+        )
+
+
+def test_attach_file_rejects_image_decompression_bomb_warning(tmp_path, monkeypatch):
+    import io
+
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (15, 10), "white").save(buffer, format="PNG")
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 100)
+    app, _ = _app_with_artifact_store(tmp_path)
+
+    with pytest.raises(ValueError, match="not a valid image"):
+        asyncio.run(
+            app.attach_file(
+                buffer.getvalue(),
+                filename="oversized.png",
+                kind="image",
+                session_id="s",
+            )
+        )
+
+
+def test_attach_file_rejects_image_over_decoded_size_limit(tmp_path, monkeypatch):
+    import io
+
+    from PIL import Image
+
+    import cayu.artifacts._images as image_validation_module
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (15, 10), "white").save(buffer, format="PNG")
+    monkeypatch.setattr(image_validation_module, "MAX_IMAGE_DECODED_BYTES", 512)
+    app, _ = _app_with_artifact_store(tmp_path)
+
+    with pytest.raises(ValueError, match="not a valid image"):
+        asyncio.run(
+            app.attach_file(
+                buffer.getvalue(),
+                filename="oversized.png",
+                kind="image",
+                session_id="s",
+            )
         )
 
 

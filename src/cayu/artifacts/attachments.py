@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu.artifacts._images import decode_verified_image_format
 from cayu.artifacts.base import ArtifactReadResult
 
 FILE_ATTACHMENT_TYPE = "cayu.file_attachment.v1"
@@ -241,9 +242,7 @@ def validate_file_attachment_bytes(
                 "Install cayu[files]."
             ) from exc
         try:
-            with image_module.open(BytesIO(content)) as image:
-                detected_format = image.format
-                image.verify()
+            detected_format = decode_verified_image_format(image_module, content)
         except Exception as exc:
             raise ValueError(f"File attachment bytes are not a valid image: {exc}") from exc
         detected_content_type = _IMAGE_FORMAT_CONTENT_TYPES.get(str(detected_format).upper())

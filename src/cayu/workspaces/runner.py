@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from cayu._validation import require_clean_nonblank, require_nonblank
-from cayu.runners import ExecCommand, LocalRunner, Runner
+from cayu.runners import DEFAULT_EXEC_OUTPUT_LIMIT_BYTES, ExecCommand, LocalRunner, Runner
 from cayu.workspaces._tar import tar_archive_size_bound
 from cayu.workspaces.base import (
     BoundedTarReader,
@@ -26,6 +26,7 @@ from cayu.workspaces.base import (
 DEFAULT_RUNNER_WORKSPACE_READ_LIMIT_BYTES = 256 * 1024
 DEFAULT_RUNNER_WORKSPACE_LIST_LIMIT = 500
 RUNNER_WORKSPACE_SCRIPT_OUTPUT_OVERHEAD_BYTES = 4096
+RUNNER_WORKSPACE_LIST_PAYLOAD_LIMIT_BYTES = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES
 
 _READ_SCRIPT = r"""
 import base64
@@ -168,6 +169,7 @@ try:
     pattern_regex = re.compile(sys.argv[1])
     limit_raw = sys.argv[2]
     limit = None if limit_raw == "" else int(limit_raw)
+    payload_limit = int(sys.argv[3])
     root = pathlib.Path.cwd().resolve()
     matches = []
     for path in root.rglob("*"):
@@ -196,7 +198,27 @@ try:
             matches.append(rel_path)
     sorted_matches = sorted(matches)
     paths = sorted_matches if limit is None else sorted_matches[:limit]
-    print(json.dumps({"ok": True, "paths": paths, "total_count": len(matches)}))
+    total_count = len(matches)
+
+    def serialize(path_count):
+        return json.dumps(
+            {"ok": True, "paths": paths[:path_count], "total_count": total_count},
+            separators=(",", ":"),
+        )
+
+    low = 0
+    high = len(paths)
+    while low < high:
+        candidate = (low + high + 1) // 2
+        encoded = (serialize(candidate) + "\n").encode("utf-8")
+        if len(encoded) <= payload_limit:
+            low = candidate
+        else:
+            high = candidate - 1
+    payload = serialize(low) + "\n"
+    if len(payload.encode("utf-8")) > payload_limit:
+        fail("workspace_error", "Workspace list result exceeds its transfer limit.")
+    sys.stdout.write(payload)
 except Exception as exc:
     fail("workspace_error", str(exc))
 """
@@ -444,7 +466,8 @@ class RunnerWorkspace(Workspace, BoundedTarReader, TarWriter):
             _LIST_SCRIPT,
             translate_list_pattern(pattern),
             str(effective_limit),
-            output_limit_bytes=_json_list_output_limit(effective_limit),
+            str(RUNNER_WORKSPACE_LIST_PAYLOAD_LIMIT_BYTES),
+            output_limit_bytes=_json_list_output_limit(),
         )
         paths = result["paths"]
         total_count = result["total_count"]
@@ -603,8 +626,8 @@ def _json_read_output_limit(max_bytes: int) -> int:
     return (4 * ((max_bytes + 2) // 3)) + RUNNER_WORKSPACE_SCRIPT_OUTPUT_OVERHEAD_BYTES
 
 
-def _json_list_output_limit(limit: int) -> int:
-    return (limit * 512) + RUNNER_WORKSPACE_SCRIPT_OUTPUT_OVERHEAD_BYTES
+def _json_list_output_limit() -> int:
+    return RUNNER_WORKSPACE_LIST_PAYLOAD_LIMIT_BYTES + RUNNER_WORKSPACE_SCRIPT_OUTPUT_OVERHEAD_BYTES
 
 
 def _decode_base64(value: Any, field_name: str) -> bytes:

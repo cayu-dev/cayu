@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import io
+import os
 import sys
 import tarfile
 
 import pytest
 
+import cayu.workspaces.runner as runner_workspace_module
 from cayu.core.tools import ToolContext
 from cayu.runners import LocalRunner
 from cayu.tools import ListFilesTool, ReadFileTool, WriteFileTool
@@ -167,6 +169,51 @@ def test_runner_workspace_list_limit_returns_sorted_prefix(tmp_path) -> None:
 
     assert result.paths == ("a.txt", "b.txt")
     assert result.total_count == 3
+    assert result.truncated is True
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires long POSIX filesystem paths")
+def test_runner_workspace_lists_long_paths_without_transport_truncation(tmp_path) -> None:
+    workspace = _workspace(tmp_path)
+    long_directory = tmp_path.joinpath(*("d" * 200 for _ in range(3)))
+    long_directory.mkdir(parents=True)
+    expected: list[str] = []
+    for index in range(500):
+        path = long_directory / f"file-{index:03d}.txt"
+        path.write_bytes(b"")
+        expected.append(path.relative_to(tmp_path).as_posix())
+
+    assert sum(map(len, expected)) / len(expected) > 512
+    result = asyncio.run(workspace.list("**/*.txt", limit=500))
+
+    assert result.paths == tuple(sorted(expected))
+    assert result.total_count == 500
+    assert result.truncated is False
+
+
+def test_runner_workspace_list_returns_sorted_prefix_at_payload_limit(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        runner_workspace_module,
+        "RUNNER_WORKSPACE_LIST_PAYLOAD_LIMIT_BYTES",
+        1024,
+    )
+    workspace = _workspace(tmp_path)
+    directory = tmp_path / ("d" * 100)
+    directory.mkdir()
+    expected: list[str] = []
+    for index in range(20):
+        path = directory / f"{index:02d}-{'f' * 80}.txt"
+        path.write_bytes(b"")
+        expected.append(path.relative_to(tmp_path).as_posix())
+
+    result = asyncio.run(workspace.list("**/*.txt", limit=20))
+
+    assert 0 < len(result.paths) < len(expected)
+    assert result.paths == tuple(sorted(expected)[: len(result.paths)])
+    assert result.total_count == len(expected)
     assert result.truncated is True
 
 

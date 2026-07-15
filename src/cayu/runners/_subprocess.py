@@ -14,6 +14,7 @@ from cayu.runners.base import ExecResult
 # open indefinitely, so the post-kill read tasks would otherwise never see EOF
 # and hang forever, defeating the timeout guarantee.
 _DRAIN_AFTER_KILL_S = 2.0
+_TASKKILL_TIMEOUT_S = 2.0
 
 
 class SubprocessCommand:
@@ -143,21 +144,23 @@ async def run_subprocess(
         timed_out = False
     except TimeoutError:
         timed_out = True
-        _kill_process(process, process_group=use_new_session)
-        try:
-            # Bounded (see _await_process_exit): process.wait() only resolves
-            # once the captured pipes reach EOF, so a pipe-holding descendant
-            # would otherwise hang this await past the wall-clock limit.
-            await _await_process_exit(wait_task)
-        except asyncio.CancelledError:
-            await _cleanup_io_tasks(stdin_task, stdout_task, stderr_task, wait_task)
-            raise
+        await _kill_timed_out_process(
+            process,
+            process_group=use_new_session,
+            stdin_task=stdin_task,
+            stdout_task=stdout_task,
+            stderr_task=stderr_task,
+            wait_task=wait_task,
+        )
     except asyncio.CancelledError:
-        _kill_process(process, process_group=use_new_session)
-        try:
-            await _await_process_exit(wait_task)
-        finally:
-            await _cleanup_io_tasks(stdin_task, stdout_task, stderr_task)
+        await _cleanup_cancelled_process(
+            process,
+            process_group=use_new_session,
+            stdin_task=stdin_task,
+            stdout_task=stdout_task,
+            stderr_task=stderr_task,
+            wait_task=wait_task,
+        )
         raise
     finally:
         await _cleanup_io_tasks(stdin_task)
@@ -239,19 +242,131 @@ def _copy_cwd(cwd: Path | str | None) -> str | None:
     raise TypeError("Subprocess cwd must be a string, Path, or None.")
 
 
-def _kill_process(process: asyncio.subprocess.Process, *, process_group: bool) -> None:
+async def _kill_process(
+    process: asyncio.subprocess.Process,
+    *,
+    process_group: bool,
+) -> None:
     if os.name == "posix" and process_group:
         try:
             os.killpg(process.pid, signal.SIGKILL)
             return
         except ProcessLookupError:
             return
-    if os.name == "nt" and _taskkill_tree(process.pid):
+    if os.name == "nt" and await _taskkill_tree(process.pid):
         return
     process.kill()
 
 
-def _taskkill_tree(pid: int) -> bool:
+async def _kill_timed_out_process(
+    process: asyncio.subprocess.Process,
+    *,
+    process_group: bool,
+    stdin_task: asyncio.Task[None],
+    stdout_task: asyncio.Task[None],
+    stderr_task: asyncio.Task[None],
+    wait_task: asyncio.Task[int],
+) -> None:
+    """Kill a timed-out process without letting cancellation strand its I/O tasks."""
+    termination_task = asyncio.create_task(
+        _kill_process_and_wait(process, process_group=process_group, wait_task=wait_task)
+    )
+    try:
+        cancellation = await _await_task_resisting_cancellation(termination_task)
+    except Exception as termination_error:
+        cancellation = await _cleanup_io_tasks_resisting_cancellation(
+            stdin_task, stdout_task, stderr_task, wait_task
+        )
+        if cancellation is not None:
+            cancellation.add_note(
+                "Process termination failed before cancellation interrupted I/O cleanup: "
+                f"{type(termination_error).__name__}: {termination_error}"
+            )
+            raise cancellation from termination_error
+        raise
+    if cancellation is not None:
+        await _cleanup_io_tasks_resisting_cancellation(
+            stdin_task, stdout_task, stderr_task, wait_task
+        )
+        raise cancellation
+
+
+async def _cleanup_cancelled_process(
+    process: asyncio.subprocess.Process,
+    *,
+    process_group: bool,
+    stdin_task: asyncio.Task[None],
+    stdout_task: asyncio.Task[None],
+    stderr_task: asyncio.Task[None],
+    wait_task: asyncio.Task[int],
+) -> None:
+    """Finish bounded process teardown while preserving the caller's cancellation."""
+    termination_task = asyncio.create_task(
+        _kill_process_and_wait(process, process_group=process_group, wait_task=wait_task)
+    )
+    try:
+        await _await_task_resisting_cancellation(termination_task)
+    except Exception:
+        # Cancellation stays authoritative even if the preferred tree cleanup
+        # fails unexpectedly. Make one final best-effort direct-child kill.
+        with contextlib.suppress(OSError):
+            process.kill()
+    finally:
+        await _cleanup_io_tasks_resisting_cancellation(
+            stdin_task, stdout_task, stderr_task, wait_task
+        )
+
+
+async def _kill_process_and_wait(
+    process: asyncio.subprocess.Process,
+    *,
+    process_group: bool,
+    wait_task: asyncio.Task[int],
+) -> None:
+    await _kill_process(process, process_group=process_group)
+    # Bounded (see _await_process_exit): process.wait() only resolves once the
+    # captured pipes reach EOF, so a pipe-holding descendant cannot hang this.
+    await _await_process_exit(wait_task)
+
+
+async def _await_task_resisting_cancellation(
+    task: asyncio.Task[None],
+) -> asyncio.CancelledError | None:
+    """Let a bounded cleanup task finish, remembering repeated caller cancellation."""
+    cancellation: asyncio.CancelledError | None = None
+    task_exception: BaseException | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            if task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except Exception as exc:
+            task_exception = exc
+            break
+    if task_exception is None:
+        task_exception = task.exception()
+    if task_exception is not None:
+        if cancellation is None:
+            raise task_exception
+        cancellation.add_note(
+            "Cleanup task failed while cancellation was pending: "
+            f"{type(task_exception).__name__}: {task_exception}"
+        )
+        cancellation.__cause__ = task_exception
+    return cancellation
+
+
+async def _cleanup_io_tasks_resisting_cancellation(
+    *tasks: asyncio.Task,
+) -> asyncio.CancelledError | None:
+    cleanup_task = asyncio.create_task(_cleanup_io_tasks(*tasks))
+    return await _await_task_resisting_cancellation(cleanup_task)
+
+
+async def _taskkill_tree(pid: int) -> bool:
     """Kill a Windows process together with its child tree via ``taskkill /T``.
 
     ``Process.kill`` maps to ``TerminateProcess``, which only reaps the direct
@@ -259,12 +374,17 @@ def _taskkill_tree(pid: int) -> bool:
     True when the tree kill was issued successfully.
     """
     try:
-        completed = subprocess.run(
-            ["taskkill", "/F", "/T", "/PID", str(pid)],
-            capture_output=True,
-            check=False,
+        completed = await asyncio.wait_for(
+            asyncio.to_thread(
+                subprocess.run,
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                check=False,
+                timeout=_TASKKILL_TIMEOUT_S,
+            ),
+            timeout=_TASKKILL_TIMEOUT_S,
         )
-    except (OSError, ValueError):
+    except (TimeoutError, OSError, ValueError, subprocess.TimeoutExpired):
         return False
     return completed.returncode == 0
 

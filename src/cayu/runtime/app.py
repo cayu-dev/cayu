@@ -2043,8 +2043,11 @@ class CayuApp:
             kind=resolved_kind,
             content_type=resolved_content_type,
         )
-        validate_file_attachment_bytes(
-            kind=resolved_kind, content=content, content_type=resolved_content_type
+        await asyncio.to_thread(
+            validate_file_attachment_bytes,
+            kind=resolved_kind,
+            content=content,
+            content_type=resolved_content_type,
         )
         registered_environment = self._get_registered_environment(environment_name)
         artifact_store = _artifact_store(registered_environment)

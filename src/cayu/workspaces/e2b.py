@@ -35,7 +35,9 @@ class E2BWorkspace(Workspace):
     the runner's default exec user (the ``user`` override applies only to
     ``list``). ``list`` uses E2B's native filesystem API and is advisory:
     symlinked entries are skipped best-effort, and any subsequent read is
-    re-checked by the guard.
+    re-checked by the guard. If the native traversal reaches
+    ``default_list_depth``, the result is explicitly marked incomplete because
+    the SDK does not report whether deeper entries were omitted.
     """
 
     def __init__(
@@ -149,21 +151,29 @@ class E2BWorkspace(Workspace):
 
         paths: list[str] = []
         total_count = 0
+        depth_incomplete = False
         for entry in entries:
-            if _entry_type(entry) != "file" or _is_symlink(entry):
+            entry_type = _entry_type(entry)
+            if _is_symlink(entry):
                 continue
             guest_path = _entry_guest_path(getattr(entry, "path", None))
             if guest_path is None or not _is_same_or_child(guest_path, self.root):
                 continue
             rel_path = posixpath.relpath(guest_path, self.root)
+            if entry_type == "dir":
+                if _relative_path_depth(rel_path) >= self.default_list_depth:
+                    depth_incomplete = True
+                continue
+            if entry_type != "file":
+                continue
             if matches_list_pattern(rel_path, pattern):
                 total_count += 1
                 if len(paths) < effective_limit:
                     paths.append(rel_path)
         return WorkspaceListResult(
             paths=tuple(sorted(paths)),
-            total_count=total_count,
-            truncated=total_count > len(paths),
+            total_count=None if depth_incomplete else total_count,
+            truncated=depth_incomplete or total_count > len(paths),
         )
 
     def resolve(self, path: str) -> str:
@@ -217,6 +227,12 @@ def _entry_guest_path(entry_path: Any) -> str | None:
     if not posixpath.isabs(entry_path):
         return None
     return posixpath.normpath(entry_path)
+
+
+def _relative_path_depth(path: str) -> int:
+    if path in {"", "."}:
+        return 0
+    return len(tuple(part for part in path.split("/") if part))
 
 
 def _entry_type(entry: Any) -> str | None:

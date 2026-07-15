@@ -4,6 +4,7 @@ import asyncio
 import base64
 import io
 import sys
+import threading
 from collections.abc import AsyncIterator
 from importlib import import_module
 
@@ -717,6 +718,13 @@ def _tiny_pdf_bytes() -> bytes:
     return buffer.getvalue()
 
 
+def _truncated_jpeg_bytes() -> bytes:
+    image_module = import_module("PIL.Image")
+    buffer = io.BytesIO()
+    image_module.new("RGB", (1, 1), "white").save(buffer, format="JPEG")
+    return buffer.getvalue()[:-1]
+
+
 def _multi_page_pdf_bytes(page_count: int) -> bytes:
     pypdf = import_module("pypdf")
     writer = pypdf.PdfWriter()
@@ -926,15 +934,28 @@ def test_read_file_returns_provider_neutral_image_attachment_without_base64(tmp_
         )
     )
     ctx = ToolContext(session_id="sess_1", artifact_store=artifact_store)
+    validation_threads: list[int] = []
+
+    def detect_image_content_type(_content: bytes) -> tuple[str, None]:
+        validation_threads.append(threading.get_ident())
+        return "image/png", None
+
     monkeypatch.setattr(
         files_module,
         "_detect_image_content_type",
-        lambda content: ("image/png", None),
+        detect_image_content_type,
     )
 
-    result = asyncio.run(ReadFileTool().run(ctx, {"artifact_id": artifact.id}))
+    async def read() -> tuple[int, ToolResult]:
+        event_loop_thread = threading.get_ident()
+        result = await ReadFileTool().run(ctx, {"artifact_id": artifact.id})
+        return event_loop_thread, result
+
+    event_loop_thread, result = asyncio.run(read())
 
     assert result.is_error is False
+    assert validation_threads
+    assert validation_threads[0] != event_loop_thread
     assert "Attached image artifact" in result.content
     assert result.structured["artifact_id"] == artifact.id
     assert result.structured["content_type"] == "image/png"
@@ -961,6 +982,78 @@ def test_tiny_png_fixture_is_valid_for_native_image_reader():
 
     assert validation_error is None
     assert detected_content_type == "image/png"
+
+
+def test_read_file_rejects_truncated_jpeg_that_passes_header_verification(tmp_path):
+    image_module = import_module("PIL.Image")
+    truncated = _truncated_jpeg_bytes()
+    with image_module.open(io.BytesIO(truncated)) as image:
+        image.verify()
+
+    artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    artifact = asyncio.run(
+        artifact_store.put_bytes(
+            truncated,
+            filename="truncated.jpg",
+            content_type="image/jpeg",
+            session_id="sess_1",
+        )
+    )
+    ctx = ToolContext(session_id="sess_1", artifact_store=artifact_store)
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"artifact_id": artifact.id}))
+
+    assert result.is_error is True
+    assert result.artifacts == []
+    assert "could not be inspected" in result.content
+
+
+def test_read_file_rejects_image_decompression_bomb_warning(tmp_path, monkeypatch):
+    image_module = import_module("PIL.Image")
+    buffer = io.BytesIO()
+    image_module.new("RGB", (15, 10), "white").save(buffer, format="PNG")
+    monkeypatch.setattr(image_module, "MAX_IMAGE_PIXELS", 100)
+    artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    artifact = asyncio.run(
+        artifact_store.put_bytes(
+            buffer.getvalue(),
+            filename="oversized.png",
+            content_type="image/png",
+            session_id="sess_1",
+        )
+    )
+    ctx = ToolContext(session_id="sess_1", artifact_store=artifact_store)
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"artifact_id": artifact.id}))
+
+    assert result.is_error is True
+    assert result.artifacts == []
+    assert "could not be inspected" in result.content
+
+
+def test_read_file_rejects_image_over_decoded_size_limit(tmp_path, monkeypatch):
+    import cayu.artifacts._images as image_validation_module
+
+    image_module = import_module("PIL.Image")
+    buffer = io.BytesIO()
+    image_module.new("RGB", (15, 10), "white").save(buffer, format="PNG")
+    monkeypatch.setattr(image_validation_module, "MAX_IMAGE_DECODED_BYTES", 512)
+    artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    artifact = asyncio.run(
+        artifact_store.put_bytes(
+            buffer.getvalue(),
+            filename="oversized.png",
+            content_type="image/png",
+            session_id="sess_1",
+        )
+    )
+    ctx = ToolContext(session_id="sess_1", artifact_store=artifact_store)
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"artifact_id": artifact.id}))
+
+    assert result.is_error is True
+    assert result.artifacts == []
+    assert "could not be inspected" in result.content
 
 
 def test_read_file_rejects_mislabeled_image_attachment(tmp_path, monkeypatch):
