@@ -26,9 +26,22 @@ proxy ports (`1024-65535`) and the workspace mount target on NFS port 2049. The
 control API listens on port 800, outside that connector range, and remains
 reachable only through the HTTPS load balancer. The MicroVM has no unrestricted
 connector. At startup Cayu proves that the private proxy works and that direct
-`1.1.1.1:443` access fails. This example disables the link-local metadata probe
-because Lambda's managed sidecar ingress uses the same endpoint; the MicroVM
-execution role is therefore limited to the selected workspace mount.
+`1.1.1.1:443` access fails. The root sidecar retains AWS managed ingress, while
+ordinary commands run in a dedicated network namespace with no default route.
+That namespace can reach only a root-owned relay to the enforced private Cayu
+proxy; an interface-scoped rule denies its access to sidecar port 8080. Agent
+commands also run as UID/GID 1000 with empty capability sets and `no_new_privs`.
+This example therefore configures `metadata_isolation="required"` and proves
+the denial from the agent command profile without blocking sidecar reply
+traffic. The narrowly scoped MicroVM execution role remains defense in depth,
+not a network-isolation claim.
+
+The adapter itself defaults to `metadata_isolation="required"`. In required
+mode a reachable metadata path produces a typed
+`UnsupportedEgressCapabilityError` before setup commands or agent execution;
+the error's `remediation` field names the enforceable-topology and explicit
+fallback choices. The `unverified` mode remains available for custom or legacy
+images that do not install this agent network boundary.
 
 For the internal call, the guest sends:
 
@@ -124,7 +137,35 @@ curl -u "admin:$PASSWORD" -X POST "$URL/api/run" \
   -d '{"agent":"aws-agent","prompt":"Request the reindex internal action"}'
 ```
 
-An interrupted session finalizes the mounted workspace, revokes its grants,
+Run the real metadata-boundary check from outside the VPC. It launches a
+one-off task from the deployed control task definition and verifies required
+mode's scoped proxy request, public-egress and metadata denial,
+the deployed MicroVM execution role, UID/GID 1000, empty capabilities,
+`no_new_privs`, the route-less agent network namespace, denial of the trusted
+sidecar API, process/filesystem/standard-credential inspection, vault-canary
+and AWS-credential non-possession, revocation, a credential-free synced
+workspace release, and MicroVM cleanup. The guest returns bounded keyed HMAC
+fingerprints of observed candidate values; expected vault/server/database
+values remain in the trusted control task and are never passed to guest argv.
+The launcher, trusted control-task probe, and unrestricted guest audit live in
+separate modules so each execution boundary remains explicit:
+
+```bash
+CAYU_AWS_METADATA_ISOLATION_LIVE=1 \
+CAYU_AWS_METADATA_ISOLATION_STACK=cayu-aws-agent \
+AWS_REGION=us-east-1 \
+  uv run --extra aws python -m \
+  examples.aws.lambda_microvm_agent.metadata_isolation_live
+```
+
+The launcher accepts exactly one
+`cayu.aws_lambda_microvm_metadata_isolation.v1` evidence record. Its exact
+schema requires every proxy, metadata, public-egress, execution-role,
+agent-process, namespace/route, sidecar, vault/credential, revocation,
+workspace-release, and cleanup result; missing, extra, or non-verifying fields
+fail the check.
+
+An interrupted session revokes its grants, finalizes the mounted workspace,
 suspends the MicroVM, and persists non-secret reconnect metadata. Resuming
 reattaches the same MicroVM with a new broker/grant/CA and remounts the same
 access point. Completed and failed sessions terminate the MicroVM.

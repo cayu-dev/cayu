@@ -157,7 +157,7 @@ class _AccessPointBinding(WorkspaceBinding):
         return None
 
     async def _is_mounted(self, runner: Runner) -> bool:
-        result = await runner.exec(
+        result = await runner.exec_system(
             ExecCommand.process("mountpoint", "-q", "--", self.path),
             timeout_s=self.mount_timeout_s,
             output_limit_bytes=_COMMAND_OUTPUT_LIMIT_BYTES,
@@ -172,7 +172,7 @@ class _AccessPointBinding(WorkspaceBinding):
         action: str,
         timeout_s: int,
     ) -> ExecResult:
-        result = await runner.exec(
+        result = await runner.exec_system(
             command,
             timeout_s=timeout_s,
             output_limit_bytes=_COMMAND_OUTPUT_LIMIT_BYTES,
@@ -190,7 +190,7 @@ class _AccessPointBinding(WorkspaceBinding):
 
     async def _best_effort_unmount(self, runner: Runner) -> None:
         try:
-            await runner.exec(
+            await runner.exec_system(
                 ExecCommand.process("umount", "--", self.path),
                 timeout_s=self.unmount_timeout_s,
                 output_limit_bytes=_COMMAND_OUTPUT_LIMIT_BYTES,

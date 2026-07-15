@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 from pathlib import Path
 from types import ModuleType
 
 import pytest
+from examples.aws.lambda_microvm_agent.metadata_isolation_task import (
+    REQUIRED_EVIDENCE_VALUES,
+)
 from tests.egress_conformance import registration_for
 
 
@@ -750,6 +754,39 @@ def test_lambda_microvm_live_opt_in_flag_must_equal_one() -> None:
 
     assert result.status == nightly.STATUS_SKIPPED
     assert result.reason == "CAYU_LAMBDA_MICROVM_LIVE must equal '1'"
+
+
+def test_lambda_metadata_isolation_live_check_retains_verified_adapter_evidence() -> None:
+    check = next(
+        check
+        for check in nightly.CHECKS
+        if check.id == "aws-lambda-microvm-metadata-isolation-live"
+    )
+    evidence = {
+        **REQUIRED_EVIDENCE_VALUES,
+        "run_id": "metadata-isolation-nightly-wrapper",
+        "credential_paths_checked": 7,
+        "filesystem_files_inspected": 3,
+        "processes_inspected": 2,
+    }
+
+    result = nightly.run_checks(
+        [check],
+        environ={
+            "CAYU_AWS_METADATA_ISOLATION_LIVE": "1",
+            "CAYU_AWS_METADATA_ISOLATION_STACK": "cayu-aws-agent",
+            "AWS_REGION": "us-east-1",
+        },
+        runner=lambda command, env: nightly.CommandOutcome(
+            returncode=0,
+            stdout="CAYU_NIGHTLY_EVIDENCE=" + json.dumps(evidence),
+        ),
+    )[0]
+
+    assert check.status_on_success == nightly.STATUS_VERIFIED
+    assert "required metadata-isolation" in check.capability
+    assert result.status == nightly.STATUS_VERIFIED
+    assert result.evidence["harness"] == evidence
 
 
 @pytest.mark.parametrize(

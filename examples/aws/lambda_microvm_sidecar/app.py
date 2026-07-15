@@ -8,11 +8,24 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException
 
-from .supervisor import CommandConflictError, CommandRequestError, CommandSupervisor
+from .supervisor import (
+    CommandConflictError,
+    CommandExecutionBoundary,
+    CommandRequestError,
+    CommandSupervisor,
+)
 
 ROOT = os.environ.get("CAYU_MICROVM_WORKSPACE_ROOT", "/workspace")
 PROTOCOL_VERSION = "1"
-SUPERVISOR = CommandSupervisor(root=ROOT)
+AGENT_UID = int(os.environ.get("CAYU_MICROVM_AGENT_UID", "1000"))
+AGENT_GID = int(os.environ.get("CAYU_MICROVM_AGENT_GID", "1000"))
+AGENT_NETNS = os.environ.get("CAYU_MICROVM_AGENT_NETNS", "cayu-agent")
+EXECUTION_BOUNDARY = CommandExecutionBoundary(
+    agent_uid=AGENT_UID,
+    agent_gid=AGENT_GID,
+    agent_netns=AGENT_NETNS,
+)
+SUPERVISOR = CommandSupervisor(root=ROOT, execution_boundary=EXECUTION_BOUNDARY)
 app = FastAPI(title="Cayu Lambda MicroVM sidecar", docs_url=None, redoc_url=None)
 
 
@@ -62,7 +75,7 @@ async def cancel_command(command_id: str) -> dict[str, Any]:
 
 
 @app.post("/aws/lambda-microvms/runtime/v1/run")
-async def run_hook(payload: dict[str, Any] | None = None) -> dict[str, str]:
+async def run_hook(payload: Any = None) -> dict[str, str]:
     del payload
     return {"status": "ok"}
 

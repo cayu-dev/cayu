@@ -669,6 +669,14 @@ timeouts or cancellation. The host also enforces the requested command timeout p
 cleanup grace period if the supervisor remains stuck in `running`. `close_action` accepts
 `"terminate"`, `"suspend"`, or `"none"`.
 
+`LambdaMicroVMEgressAdapter` requires a real guest metadata-isolation probe by
+default. If Lambda's managed ingress exposes the shared link-local path, runner
+creation raises a typed `UnsupportedEgressCapabilityError` before agent
+execution. `metadata_isolation="unverified"` is the explicit fallback; its
+environment capability metadata remains unverified even when the private proxy
+and direct-public-egress checks pass. A narrow execution role is useful defense
+in depth but does not turn that fallback into verified isolation.
+
 See [AWS credentials for Cayu](docs/aws-credentials.md) for secure developer, coding-agent,
 CI, and workload-role setup plus the required Lambda permissions.
 

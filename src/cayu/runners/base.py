@@ -209,6 +209,26 @@ class Runner(ABC):
     ) -> ExecResult:
         """Execute a command and return stdout/stderr/exit metadata."""
 
+    async def exec_system(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ) -> ExecResult:
+        """Execute a trusted lifecycle command, using normal execution by default."""
+        return await self.exec(
+            command,
+            cwd=cwd,
+            env=env,
+            timeout_s=timeout_s,
+            stdin=stdin,
+            output_limit_bytes=output_limit_bytes,
+        )
+
     async def close(self) -> None:
         """Release the runner. The default implementation only marks it closed."""
 

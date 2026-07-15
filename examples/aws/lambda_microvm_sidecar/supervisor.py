@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import ipaddress
 import json
 import os
 import signal
+import socket
 import subprocess
 import threading
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 DEFAULT_OUTPUT_LIMIT_BYTES = 1024 * 1024
 DEFAULT_CANCEL_TIMEOUT_SECONDS = 5.0
@@ -20,6 +23,10 @@ MAX_STDIN_BYTES = 1024 * 1024
 READ_CHUNK_BYTES = 64 * 1024
 
 _TERMINAL_STATES = frozenset({"completed", "cancelled", "failed"})
+_PROXY_ENV_KEYS = ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy")
+_AGENT_PROXY_RELAY_PORT = 18080
+
+ExecutionProfile = Literal["agent", "trusted"]
 
 
 class CommandRequestError(ValueError):
@@ -28,6 +35,170 @@ class CommandRequestError(ValueError):
 
 class CommandConflictError(RuntimeError):
     """A command ID was reused with a different payload."""
+
+
+class _TcpRelay:
+    """Root-namespace TCP relay exposed only on the agent veth gateway."""
+
+    def __init__(self, host: str, port: int, *, listen_host: str = "192.0.2.1") -> None:
+        self.target = (host, port)
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind((listen_host, _AGENT_PROXY_RELAY_PORT))
+        self._listener.listen(32)
+        self._listener.settimeout(0.2)
+        self.proxy_url = f"http://{listen_host}:{self._listener.getsockname()[1]}"
+        self._stop = threading.Event()
+        self._connections: set[socket.socket] = set()
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(
+            target=self._accept,
+            name="cayu-agent-proxy-relay",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def close(self) -> None:
+        self._stop.set()
+        with contextlib.suppress(OSError):
+            self._listener.close()
+        with self._lock:
+            connections = tuple(self._connections)
+        for connection in connections:
+            with contextlib.suppress(OSError):
+                connection.close()
+        self._thread.join(timeout=1)
+
+    def _accept(self) -> None:
+        while not self._stop.is_set():
+            try:
+                client, _address = self._listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            threading.Thread(target=self._bridge, args=(client,), daemon=True).start()
+
+    def _bridge(self, client: socket.socket) -> None:
+        upstream: socket.socket | None = None
+        try:
+            upstream = socket.create_connection(self.target, timeout=5)
+            upstream.settimeout(None)
+            client.settimeout(None)
+            with self._lock:
+                self._connections.update((client, upstream))
+            left = threading.Thread(target=_copy_socket, args=(client, upstream), daemon=True)
+            right = threading.Thread(target=_copy_socket, args=(upstream, client), daemon=True)
+            left.start()
+            right.start()
+            left.join()
+            right.join()
+        except OSError:
+            return
+        finally:
+            with self._lock:
+                self._connections.discard(client)
+                if upstream is not None:
+                    self._connections.discard(upstream)
+            with contextlib.suppress(OSError):
+                client.close()
+            if upstream is not None:
+                with contextlib.suppress(OSError):
+                    upstream.close()
+
+
+class CommandExecutionBoundary:
+    """Separate ordinary agent processes from authenticated system commands."""
+
+    def __init__(
+        self,
+        *,
+        agent_uid: int | None = None,
+        agent_gid: int | None = None,
+        agent_netns: str | None = None,
+        relay_factory: Any | None = None,
+    ) -> None:
+        if (agent_uid is None) != (agent_gid is None):
+            raise ValueError("agent_uid and agent_gid must be configured together")
+        for value, name in ((agent_uid, "agent_uid"), (agent_gid, "agent_gid")):
+            if value is not None and (type(value) is not int or value <= 0):
+                raise ValueError(f"{name} must be a positive integer")
+        self.agent_uid = agent_uid
+        self.agent_gid = agent_gid
+        if agent_netns is not None and (
+            not agent_netns or not agent_netns.replace("-", "").isalnum()
+        ):
+            raise ValueError("agent_netns must contain only letters, digits, and hyphens")
+        self.agent_netns = agent_netns
+        self._relay_factory = relay_factory or _TcpRelay
+        self._relay: Any | None = None
+        self._relay_target: tuple[str, int] | None = None
+        self._relay_lock = threading.Lock()
+
+    def argv_for(
+        self,
+        argv: list[str],
+        *,
+        execution_profile: ExecutionProfile,
+    ) -> list[str]:
+        if execution_profile == "trusted":
+            return list(argv)
+        if self.agent_uid is None or self.agent_gid is None:
+            return list(argv)
+        prefix = (
+            ["/usr/sbin/ip", "netns", "exec", self.agent_netns]
+            if self.agent_netns is not None
+            else []
+        )
+        return [
+            *prefix,
+            "/usr/bin/setpriv",
+            f"--reuid={self.agent_uid}",
+            f"--regid={self.agent_gid}",
+            "--clear-groups",
+            "--no-new-privs",
+            "--inh-caps=-all",
+            "--ambient-caps=-all",
+            "--bounding-set=-all",
+            "--",
+            *argv,
+        ]
+
+    def environment_for(
+        self,
+        environment: dict[str, str],
+        *,
+        execution_profile: ExecutionProfile,
+    ) -> dict[str, str]:
+        copied = dict(environment)
+        if execution_profile == "trusted" or self.agent_netns is None:
+            return copied
+        configured = [copied[key] for key in _PROXY_ENV_KEYS if key in copied]
+        if not configured:
+            return copied
+        targets = {_private_http_proxy(value) for value in configured}
+        if len(targets) != 1:
+            raise CommandRequestError("agent proxy environment must name one private endpoint")
+        target = next(iter(targets))
+        with self._relay_lock:
+            if self._relay is None:
+                self._relay = self._relay_factory(*target)
+                self._relay_target = target
+            elif self._relay_target != target:
+                raise CommandRequestError("agent proxy endpoint changed within one MicroVM")
+            proxy_url = self._relay.proxy_url
+        for key in _PROXY_ENV_KEYS:
+            if key in copied:
+                copied[key] = proxy_url
+        return copied
+
+    def close(self) -> None:
+        with self._relay_lock:
+            relay = self._relay
+            self._relay = None
+            self._relay_target = None
+        if relay is not None:
+            relay.close()
 
 
 @dataclass
@@ -71,6 +242,7 @@ class CommandSupervisor:
         root: str | Path = "/workspace",
         cancel_timeout_s: float = DEFAULT_CANCEL_TIMEOUT_SECONDS,
         result_ttl_s: float = 300.0,
+        execution_boundary: CommandExecutionBoundary | None = None,
     ) -> None:
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
@@ -80,12 +252,17 @@ class CommandSupervisor:
         if type(result_ttl_s) not in {int, float} or result_ttl_s <= 0:
             raise ValueError("result_ttl_s must be greater than zero")
         self.result_ttl_s = float(result_ttl_s)
+        self.execution_boundary = execution_boundary or CommandExecutionBoundary()
         self._records: dict[str, _CommandRecord] = {}
         self._lock = threading.Lock()
 
     def start(self, command_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         identifier = _command_id(command_id)
-        validated = _validated_payload(payload, root=self.root)
+        validated = _validated_payload(
+            payload,
+            root=self.root,
+            execution_boundary=self.execution_boundary,
+        )
         fingerprint = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         self._prune()
         with self._lock:
@@ -150,6 +327,7 @@ class CommandSupervisor:
             command_ids = list(self._records)
         for command_id in command_ids:
             self.cancel(command_id)
+        self.execution_boundary.close()
 
     def _run(self, record: _CommandRecord, payload: dict[str, Any]) -> None:
         stdout = _LimitedBuffer(payload["output_limit_bytes"])
@@ -253,11 +431,17 @@ class CommandSupervisor:
         return {"command_id": record.command_id, "state": record.state}
 
 
-def _validated_payload(payload: object, *, root: Path) -> dict[str, Any]:
+def _validated_payload(
+    payload: object,
+    *,
+    root: Path,
+    execution_boundary: CommandExecutionBoundary,
+) -> dict[str, Any]:
     if type(payload) is not dict:
         raise CommandRequestError("command payload must be an object")
     request = cast("dict[str, Any]", payload)
     kind = request.get("kind")
+    execution_profile = _validated_execution_profile(request.get("execution_profile", "agent"))
     if kind not in {"process", "shell"}:
         raise CommandRequestError("kind must be process or shell")
     if kind == "process":
@@ -268,6 +452,10 @@ def _validated_payload(payload: object, *, root: Path) -> dict[str, Any]:
     else:
         shell = _nonblank_string(request.get("shell"), "shell")
         argv = ["/bin/bash", "-c", shell]
+    argv = execution_boundary.argv_for(
+        argv,
+        execution_profile=execution_profile,
+    )
 
     cwd = Path(_nonblank_string(request.get("cwd"), "cwd")).resolve()
     if not cwd.is_relative_to(root):
@@ -281,6 +469,7 @@ def _validated_payload(payload: object, *, root: Path) -> dict[str, Any]:
     env: dict[str, str] = {}
     for key, value in raw_env.items():
         env[_nonblank_string(key, "env key")] = _string(value, "env value")
+    env = execution_boundary.environment_for(env, execution_profile=execution_profile)
 
     raw_stdin = request.get("stdin_base64")
     if raw_stdin is None:
@@ -310,6 +499,63 @@ def _validated_payload(payload: object, *, root: Path) -> dict[str, Any]:
         "timeout_s": timeout_s,
         "output_limit_bytes": output_limit,
     }
+
+
+def _private_http_proxy(value: str) -> tuple[str, int]:
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise CommandRequestError("agent proxy URL is malformed") from exc
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname is None
+        or port is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise CommandRequestError("agent proxy must be an unauthenticated HTTP origin")
+    try:
+        address = ipaddress.IPv4Address(parsed.hostname)
+    except ipaddress.AddressValueError as exc:
+        raise CommandRequestError("agent proxy host must be a private IPv4 literal") from exc
+    address_value = int(address)
+    if not (
+        int(ipaddress.IPv4Address("10.0.0.0"))
+        <= address_value
+        <= int(ipaddress.IPv4Address("10.255.255.255"))
+        or int(ipaddress.IPv4Address("172.16.0.0"))
+        <= address_value
+        <= int(ipaddress.IPv4Address("172.31.255.255"))
+        or int(ipaddress.IPv4Address("192.168.0.0"))
+        <= address_value
+        <= int(ipaddress.IPv4Address("192.168.255.255"))
+    ):
+        raise CommandRequestError("agent proxy host must be a private IPv4 literal")
+    return str(address), port
+
+
+def _validated_execution_profile(value: object) -> ExecutionProfile:
+    if value not in ("agent", "trusted"):
+        raise CommandRequestError("execution_profile must be agent or trusted")
+    return cast("ExecutionProfile", value)
+
+
+def _copy_socket(source: socket.socket, destination: socket.socket) -> None:
+    try:
+        while True:
+            chunk = source.recv(64 * 1024)
+            if not chunk:
+                return
+            destination.sendall(chunk)
+    except OSError:
+        return
+    finally:
+        with contextlib.suppress(OSError):
+            destination.shutdown(socket.SHUT_WR)
 
 
 def _drain(pipe: Any, output: _LimitedBuffer) -> None:

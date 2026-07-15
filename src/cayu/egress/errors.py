@@ -15,5 +15,26 @@ class UnsupportedEgressError(EgressError):
     """
 
 
+class UnsupportedEgressCapabilityError(UnsupportedEgressError):
+    """A named enforcement capability is unavailable for one runner kind."""
+
+    def __init__(
+        self,
+        *,
+        runner_kind: str,
+        capability: str,
+        reason: str,
+        remediation: str,
+    ) -> None:
+        self.runner_kind = runner_kind
+        self.capability = capability
+        self.reason = reason
+        self.remediation = remediation
+        super().__init__(
+            f"Runner {runner_kind!r} cannot verify required egress capability "
+            f"{capability!r}: {reason}. Remediation: {remediation}."
+        )
+
+
 class VirtualCredentialError(EgressError):
     """A virtual credential was unknown, expired, or revoked at the broker."""

@@ -1532,6 +1532,53 @@ grace period, so a responsive but wedged supervisor cannot poll forever.
 `close_action` is `terminate`, `suspend`, or `none`, and explicit `suspend()` / `resume()` /
 `terminate()` methods support app-owned lifecycle policy.
 
+The first-party AWS image keeps the supervisor in a trusted root profile and
+runs ordinary `exec()` commands in a dedicated network namespace with no
+default route. Its only interface is a point-to-point veth whose root-side
+gateway exposes a narrow relay to the enforced private Cayu proxy; an
+interface-scoped INPUT rule rejects sidecar port 8080. Link-local metadata, the
+managed guest network, and public destinations therefore have no route from
+agent code. Agent commands additionally run through `setpriv` as UID/GID 1000
+with all capability sets empty and `no_new_privs`. Remote sidecar calls are
+separately protected by AWS's JWE endpoint token. `exec_system()` is a
+host-control-plane seam used only for CA installation, operator setup commands,
+and EFS/S3 Files lifecycle operations; it is not exposed through
+`RunnerWorkspace` or agent tools. This preserves the existing non-secret
+reconnect metadata contract.
+
+`LambdaMicroVMEgressAdapter` defaults to
+`metadata_isolation="required"`. Its guest preflight reports a reachable
+link-local metadata path as `UnsupportedEgressCapabilityError` with capability
+`metadata_isolation`, before setup commands or agent execution. The error also
+provides a bounded `remediation` telling callers to supply an enforceable
+topology or explicitly accept the unverified mode. Adapters can
+return JSON-safe `capability_metadata()` after runner creation;
+`VirtualEgressEnvironmentFactory` places that evidence under
+`egress_capabilities` in both the concrete environment spec and factory result
+metadata. The Lambda adapter reports proxy reachability, direct-public-egress
+denial, and either `metadata_isolation: verified` or `unverified`.
+
+The opt-in deployed contract uses the exact
+`cayu.aws_lambda_microvm_metadata_isolation.v1` evidence schema. It runs with
+the configured MicroVM execution role and fails unless the agent command
+reports UID/GID 1000, empty capability sets, `no_new_privs`, a network namespace
+distinct from the trusted sidecar, only the point-to-point relay route, and
+denial of sidecar port 8080. The guest returns bounded keyed HMAC fingerprints
+of candidate values; expected vault/server/database values stay in the trusted
+control task, which alone performs the comparison. Missing, extra, duplicate,
+or non-verifying evidence fails the launcher. These guest observations
+corroborate the deployed contract; the load-bearing `verified` capability still
+comes from the control-plane-observed preflight before agent-submitted code.
+
+The integrated AWS image supports required mode by placing the unprivileged
+agent in a route-less network namespace whose only accepted root-gateway port
+is the fixed relay to the private Cayu proxy. The root sidecar remains in AWS's
+managed namespace. The explicit `metadata_isolation="unverified"` mode remains
+for custom or legacy images that cannot enforce that split. It skips only the
+metadata probe and always records `guest_process_boundary_unverified` as the
+reason. UID and capability dropping plus execution-role scope are defense in
+depth, not substitutes for verified network isolation.
+
 Lambda MicroVM files use the existing `RunnerWorkspace` module rather than a duplicate vendor
 workspace adapter. The first-party sidecar image guarantees `python3` and `/workspace`, so
 `RunnerWorkspace(LambdaMicroVMRunner(...))` keeps file and command operations in the same

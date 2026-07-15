@@ -25,22 +25,142 @@ sys.modules[SPEC.name] = SUPERVISOR_MODULE
 SPEC.loader.exec_module(SUPERVISOR_MODULE)
 CommandSupervisor = SUPERVISOR_MODULE.CommandSupervisor
 CommandConflictError = SUPERVISOR_MODULE.CommandConflictError
+CommandExecutionBoundary = SUPERVISOR_MODULE.CommandExecutionBoundary
 
 
 def test_sidecar_dockerfile_pins_supported_python() -> None:
     dockerfile = (SUPERVISOR_PATH.parent / "Dockerfile").read_text()
 
-    assert "dnf install -y python3.11 python3.11-pip bash" in dockerfile
+    assert "iptables-nft" in dockerfile
+    assert "shadow-utils" in dockerfile
+    assert "util-linux" in dockerfile
     assert "ln -sf /usr/bin/python3.11 /usr/bin/python3" in dockerfile
+    assert "useradd --uid 1000" in dockerfile
+    assert "CAYU_MICROVM_AGENT_UID=1000" in dockerfile
     assert 'CMD ["bash", "/opt/cayu/entrypoint.sh"]' in dockerfile
 
 
 def test_sidecar_entrypoint_forwards_signals_and_reaps_adopted_children() -> None:
     entrypoint = (SUPERVISOR_PATH.parent / "entrypoint.sh").read_text()
 
+    assert 'ip netns add "$CAYU_MICROVM_AGENT_NETNS"' in entrypoint
+    assert "ip link add cayu-root type veth peer name cayu-agent" in entrypoint
+    assert "-i cayu-root" in entrypoint
+    assert "--dport 18080 -j ACCEPT" in entrypoint
+    assert "-i cayu-root -j REJECT" in entrypoint
     assert "trap 'forward_signal TERM' TERM" in entrypoint
     assert "wait -n || true" in entrypoint
     assert 'wait "$child_pid"' in entrypoint
+
+
+def test_agent_execution_boundary_drops_identity_and_capabilities() -> None:
+    boundary = CommandExecutionBoundary(
+        agent_uid=1000,
+        agent_gid=1000,
+        agent_netns="cayu-agent",
+    )
+
+    assert boundary.argv_for(
+        ["python3", "-V"],
+        execution_profile="agent",
+    ) == [
+        "/usr/sbin/ip",
+        "netns",
+        "exec",
+        "cayu-agent",
+        "/usr/bin/setpriv",
+        "--reuid=1000",
+        "--regid=1000",
+        "--clear-groups",
+        "--no-new-privs",
+        "--inh-caps=-all",
+        "--ambient-caps=-all",
+        "--bounding-set=-all",
+        "--",
+        "python3",
+        "-V",
+    ]
+
+
+def test_agent_execution_boundary_relays_only_configured_private_proxy() -> None:
+    relays: list[tuple[str, int]] = []
+
+    class _Relay:
+        proxy_url = "http://192.0.2.1:18080"
+
+        def close(self) -> None:
+            return None
+
+    def relay_factory(host: str, port: int) -> _Relay:
+        relays.append((host, port))
+        return _Relay()
+
+    boundary = CommandExecutionBoundary(
+        agent_uid=1000,
+        agent_gid=1000,
+        agent_netns="cayu-agent",
+        relay_factory=relay_factory,
+    )
+
+    environment = boundary.environment_for(
+        {
+            "HTTPS_PROXY": "http://10.42.3.20:23145",
+            "HTTP_PROXY": "http://10.42.3.20:23145",
+            "NO_PROXY": "localhost",
+        },
+        execution_profile="agent",
+    )
+
+    assert relays == [("10.42.3.20", 23145)]
+    assert environment == {
+        "HTTPS_PROXY": "http://192.0.2.1:18080",
+        "HTTP_PROXY": "http://192.0.2.1:18080",
+        "NO_PROXY": "localhost",
+    }
+
+
+@pytest.mark.parametrize(
+    "proxy_url",
+    [
+        "http://127.0.0.1:8080",
+        "http://169.254.169.254:80",
+        "http://192.0.2.10:8080",
+        "http://8.8.8.8:8080",
+    ],
+)
+def test_agent_execution_boundary_rejects_non_rfc1918_proxy(proxy_url: str) -> None:
+    boundary = CommandExecutionBoundary(
+        agent_uid=1000,
+        agent_gid=1000,
+        agent_netns="cayu-agent",
+    )
+
+    with pytest.raises(ValueError, match="private IPv4 literal"):
+        boundary.environment_for(
+            {"HTTPS_PROXY": proxy_url},
+            execution_profile="agent",
+        )
+
+
+def test_trusted_execution_stays_in_supervisor_profile(tmp_path: Path) -> None:
+    boundary = CommandExecutionBoundary(agent_uid=1000, agent_gid=1000)
+
+    assert boundary.argv_for(["mount", "-a"], execution_profile="trusted") == [
+        "mount",
+        "-a",
+    ]
+
+    supervisor = CommandSupervisor(root=tmp_path, execution_boundary=boundary)
+    with pytest.raises(ValueError, match="execution_profile"):
+        supervisor.start(
+            "invalid-profile",
+            {
+                "kind": "process",
+                "argv": ["python3", "-V"],
+                "cwd": str(tmp_path),
+                "execution_profile": "unknown",
+            },
+        )
 
 
 def test_sidecar_health_reports_protocol_version(

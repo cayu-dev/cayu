@@ -548,7 +548,7 @@ custom `EgressPolicy` when you need business-level limits such as spend caps.
 | `docker` | Enforced (per-session internal network + sidecar-only broker authentication + TLS MITM), including credentialless routes. |
 | `microsandbox` | Virtual credentials are enforced with a deny-by-default host policy allowing only the Cayu proxy port. Credentialless routes require a custom session-isolated exposure. |
 | `e2b` | Enforced with a dedicated E2B-reachable, IPv4-literal raw TCP proxy exposure and fail-closed preflight. Credentialless routes additionally require `credentialless_isolated=True`. |
-| `lambda-microvm` | Virtual credentials are enforced with a VPC egress connector that can reach only the private ECS/Fargate proxy and workspace mount target. Credentialless routes require a session-isolated exposure. |
+| `lambda-microvm` | Enforced in the integrated image: a VPC connector limits destinations, while a dedicated agent network namespace has no default route and can reach only a narrow relay to the Cayu proxy. Credentialless routes require a session-isolated exposure. |
 | `local`, `sbx` | Unsupported by the virtual-egress factory. Direct runner construction may still set `credential_mode` for raw-secret checks, but that is not an egress boundary. |
 
 Notes on the Docker adapter:
@@ -569,11 +569,34 @@ Notes on the Docker adapter:
 
 The Lambda MicroVM adapter uses `VpcTaskProxyExposure` to advertise the trusted
 Fargate task's private IPv4 address. Startup proves the proxy and session CA work
-and that direct public-IP and instance-metadata connections fail. Interrupt
-finalization syncs/unmounts the workspace, revokes the grant, then suspends the
-MicroVM. Terminal outcomes terminate it. Durable reconnect metadata includes
-the owning session id: forks ignore inherited parent metadata and create a new
-MicroVM, while an interrupted child can reattach its own MicroVM.
+and that direct public-IP connections fail. Its default
+`metadata_isolation="required"` mode also probes the link-local metadata path. A
+reachable path raises `UnsupportedEgressCapabilityError` with capability
+`metadata_isolation` before setup commands or agent execution. Its structured
+remediation identifies the enforceable-topology and explicit-unverified paths.
+A successful required probe is recorded as `verified` in the factory
+environment and result metadata.
+
+The integrated image leaves the root sidecar in AWS's managed guest network but
+runs every ordinary command in a dedicated `cayu-agent` network namespace. That
+namespace has only a point-to-point veth and no default route, so link-local
+metadata, the guest's managed network, and public destinations are unreachable.
+A root-owned TCP relay bound to the veth gateway forwards only to the enforced
+private Cayu proxy, and an interface-scoped INPUT rule rejects attempts to reach
+the sidecar's port 8080 through that gateway. Agent commands also run as UID
+1000 through `setpriv`, with no effective, inheritable, ambient, or bounding
+capabilities. Sidecar replies and authenticated lifecycle commands remain in
+the trusted root profile, so managed ingress and EFS/S3 Files mounts continue
+to work. The explicit `metadata_isolation="unverified"` opt-out remains for
+custom or legacy images without that process boundary; it skips the metadata
+probe, records the status and reason under `egress_capabilities`, and can never
+produce a verified claim. Execution-role scope remains defense in depth, not a
+substitute for the network proof.
+
+Interrupt finalization syncs/unmounts the workspace, revokes the grant, then
+suspends the MicroVM. Terminal outcomes terminate it. Durable reconnect metadata
+includes the owning session id: forks ignore inherited parent metadata and
+create a new MicroVM, while an interrupted child can reattach its own MicroVM.
 
 `examples/aws/lambda_microvm_agent` composes this adapter with an EFS access
 point (default), an opt-in S3 Files access point, S3 artifacts, Secrets Manager,
@@ -610,6 +633,19 @@ a private Fargate receiver, and an exact host/method/path egress policy.
   `{host}` and `{port}`), `CAYU_E2B_PROXY_URL`, and
   `CAYU_RUN_E2B_EGRESS_E2E=1`, then run
   `uv run python scripts/nightly_verification.py --check e2b-live-virtual-egress --strict`.
+- Lambda MicroVM metadata boundary (manual/nightly): deploy the integrated AWS
+  example, set `CAYU_AWS_METADATA_ISOLATION_LIVE=1`,
+  `CAYU_AWS_METADATA_ISOLATION_STACK`, and an AWS region, then run
+  `uv run python scripts/nightly_verification.py --check aws-lambda-microvm-metadata-isolation-live`.
+  The check verifies required-mode proxy success, public-egress and metadata
+  denial, process/filesystem/credential inspection, vault-canary and
+  AWS-credential non-possession, revocation, credential-free workspace
+  sync/release, and cleanup. Its structured adapter evidence must report
+  the exact versioned `cayu.aws_lambda_microvm_metadata_isolation.v1` schema,
+  including the deployed execution role, UID/GID and capability boundary,
+  `no_new_privs`, route-less namespace, and sidecar-port denial. The guest
+  returns keyed candidate fingerprints; only the trusted control task compares
+  them with vault/server/database values.
 
 The deterministic adapter, runner, preflight-failure, and teardown tests run in
 normal CI. Live results emit typed bounded evidence with adapter, scenario,

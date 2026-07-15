@@ -429,6 +429,48 @@ class LambdaMicroVMRunner(Runner):
         stdin: str | None = None,
         output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ) -> ExecResult:
+        return await self._exec(
+            command,
+            execution_profile="agent",
+            cwd=cwd,
+            env=env,
+            timeout_s=timeout_s,
+            stdin=stdin,
+            output_limit_bytes=output_limit_bytes,
+        )
+
+    async def exec_system(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ) -> ExecResult:
+        """Run a control-plane lifecycle command outside the unprivileged agent profile."""
+        return await self._exec(
+            command,
+            execution_profile="trusted",
+            cwd=cwd,
+            env=env,
+            timeout_s=timeout_s,
+            stdin=stdin,
+            output_limit_bytes=output_limit_bytes,
+        )
+
+    async def _exec(
+        self,
+        command: ExecCommand,
+        *,
+        execution_profile: Literal["agent", "trusted"],
+        cwd: str | None,
+        env: dict[str, str] | None,
+        timeout_s: int | None,
+        stdin: str | None,
+        output_limit_bytes: int | None,
+    ) -> ExecResult:
         if type(command) is not ExecCommand:
             raise TypeError("LambdaMicroVMRunner command must be an ExecCommand.")
         self._ensure_exec_open()
@@ -442,6 +484,7 @@ class LambdaMicroVMRunner(Runner):
         output_limit = validate_output_limit(output_limit_bytes)
         command_id = f"cmd-{uuid.uuid4()}"
         payload: dict[str, Any] = {
+            "execution_profile": execution_profile,
             "kind": command.kind,
             "cwd": working_dir,
             "env": environment,

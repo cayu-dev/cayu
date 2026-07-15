@@ -19,9 +19,9 @@ from cayu.egress import (
     TransparentEgressBroker,
     VirtualCredentialError,
 )
-from cayu.environments import EnvironmentFactoryRequest
+from cayu.environments import EFSAccessPointBinding, EnvironmentFactoryRequest
 from cayu.environments.bindings import BoundWorkspace, WorkspaceBinding
-from cayu.runners.base import ExecResult, Runner
+from cayu.runners.base import ExecCommand, ExecResult, Runner
 from cayu.vaults import SecretRef, StaticVault
 
 pytest.importorskip("cryptography")
@@ -164,6 +164,15 @@ class _LifecycleRecordingAdapter(_RecordingAdapter):
     async def finalize_runner(self, runner: Runner, *, outcome: str | None) -> None:
         self.finalize_calls.append(outcome)
         await runner.close()
+
+
+class _CapabilityRecordingAdapter(_RecordingAdapter):
+    def capability_metadata(self, runner: Runner) -> dict[str, Any]:
+        return {
+            "proxy_reachability": "verified",
+            "direct_public_egress": "denied",
+            "metadata_isolation": "unverified",
+        }
 
 
 class _RetryingLifecycleAdapter(_RecordingAdapter):
@@ -400,6 +409,33 @@ def test_factory_passes_and_returns_adapter_reconnect_metadata() -> None:
         "endpoint": "mvm.internal",
     }
     assert adapter.finalize_calls == [None]
+
+
+def test_factory_exposes_adapter_capability_metadata() -> None:
+    adapter = _CapabilityRecordingAdapter("lambda-microvm")
+
+    async def run() -> Any:
+        result = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_capabilities",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        runner = result.environment.runner
+        assert runner is not None
+        await runner.close()
+        return result
+
+    result = asyncio.run(run())
+
+    expected = {
+        "proxy_reachability": "verified",
+        "direct_public_egress": "denied",
+        "metadata_isolation": "unverified",
+    }
+    assert result.environment.spec.metadata["egress_capabilities"] == expected
+    assert result.metadata["egress_capabilities"] == expected
 
 
 def test_factory_attaches_durable_artifact_store(tmp_path) -> None:
@@ -869,6 +905,73 @@ def test_finalize_revokes_grants_before_workspace_sync_then_finalizes_runner() -
     assert order == ["inner_finalize", "runner_finalize"]
     assert runner.closed is True
     assert adapter.torn_down == 1
+
+
+def test_factory_preserves_trusted_execution_for_aws_workspace_lifecycle() -> None:
+    class _ProfileRecordingRunner(Runner):
+        isolation = "lambda-microvm"
+        default_cwd = "/workspace"
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, list[str]]] = []
+            self.mountpoint_checks = 0
+
+        async def exec(self, command: ExecCommand, **kwargs: Any) -> ExecResult:
+            return self._record("agent", command)
+
+        async def exec_system(self, command: ExecCommand, **kwargs: Any) -> ExecResult:
+            return self._record("trusted", command)
+
+        def _record(self, profile: str, command: ExecCommand) -> ExecResult:
+            argv = list(command.argv or [])
+            self.calls.append((profile, argv))
+            if argv[:2] == ["mountpoint", "-q"]:
+                self.mountpoint_checks += 1
+                return ExecResult(exit_code=1 if self.mountpoint_checks == 1 else 0)
+            return ExecResult()
+
+    inner = _ProfileRecordingRunner()
+    adapter = _RecordingAdapter(
+        "lambda-microvm",
+        runner_factory=lambda _request: asyncio.sleep(0, result=inner),
+    )
+    workspace_binding = EFSAccessPointBinding(
+        file_system_id="fs-1",
+        access_point_id="fsap-1",
+        mount_target_ip="10.0.0.10",
+    )
+
+    async def run() -> None:
+        result = await _virtual_factory(
+            adapter=adapter,
+            inner_binding=workspace_binding,
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_trusted_workspace",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        binding = result.environment.binding
+        runner = result.environment.runner
+        assert binding is not None
+        assert runner is not None
+        bound = await binding.bind(None, runner, session_id="sess_trusted_workspace")
+        await binding.finalize(bound, outcome="completed")
+
+    asyncio.run(run())
+
+    assert inner.calls
+    assert {profile for profile, _command in inner.calls} == {"trusted"}
+    assert [command[0] for _profile, command in inner.calls] == [
+        "mkdir",
+        "mountpoint",
+        "mount",
+        "mountpoint",
+        "sync",
+        "mountpoint",
+        "umount",
+    ]
 
 
 def test_finalize_surfaces_lifecycle_failure_and_runner_close_retries() -> None:

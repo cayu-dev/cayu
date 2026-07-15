@@ -102,7 +102,7 @@ or in CI.
 | `sbx` runner live | `sbx` CLI/runtime | $0 | `sbx-live-*` |
 | microsandbox live | `cayu[microsandbox]` runtime support; explicit opt-in for network-default, virtual-egress, and guest-agent-liveness checks | $0 | `microsandbox-live-*` |
 | E2B live | `cayu[e2b]`, `E2B_API_KEY`; IPv4-literal raw TCP tunnel inputs and explicit opt-in for virtual egress | E2B quota | `e2b-live-*` |
-| AWS Lambda MicroVM live | `cayu[aws]`, AWS credentials/region, built sidecar image | AWS MicroVM charges | `lambda-microvm-live` |
+| AWS Lambda MicroVM live | `cayu[aws]`, AWS credentials/region, built sidecar image; deployed integrated stack for the metadata-boundary task | AWS MicroVM/Fargate charges | `lambda-microvm-live`, `aws-lambda-microvm-metadata-isolation-live` |
 | Chat Completions live | `GEMINI_API_KEY` | provider-dependent | `gemini-eval`, `chat-completions-contract` |
 | Amazon Bedrock contract | `cayu[aws]`, AWS credentials/region/model | provider-dependent | `bedrock-provider-live` |
 | OpenAI/Anthropic contracts | provider API key; file readers for artifact files | provider-dependent | `context-counting-live`, `artifact-file-live`, `structured-output-live` |
@@ -168,6 +168,7 @@ high level:
 | real Microsandbox virtual-egress enforcement and secret non-possession | verified when the runtime and explicit opt-in are available | `microsandbox-live-virtual-egress` |
 | real E2B virtual-egress enforcement and secret non-possession | verified when the key, tunnel configuration, and explicit opt-in are available | `e2b-live-virtual-egress` |
 | real AWS Lambda MicroVM runner/workspace/cleanup/suspend-resume | verified when AWS and a built sidecar image are available | `lambda-microvm-live` |
+| real AWS Lambda MicroVM required metadata denial plus proxy, public-egress, execution-role, UID/capability/namespace/route/sidecar-port, guest inspection, vault-canary, credential, revocation, workspace-release, and cleanup boundaries | verified only when the integrated agent-network-namespace boundary emits the exact versioned schema and the explicit opt-in is enabled | `aws-lambda-microvm-metadata-isolation-live` |
 | Gemini Chat Completions eval path | verified when `GEMINI_API_KEY` is present | `gemini-eval` |
 | Chat Completions tool-call and structured-output contract | verified when `GEMINI_API_KEY` is present | `chat-completions-contract` |
 | Amazon Bedrock text, tool structured output, usage, and token counting | verified when AWS and a Bedrock model are available | `bedrock-provider-live` |

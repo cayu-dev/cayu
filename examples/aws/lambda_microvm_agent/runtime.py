@@ -95,7 +95,7 @@ def build_runtime(
         egress_network_connector_arn=config.microvm_egress_connector,
         exposure=VpcTaskProxyExposure(config.task_private_ipv4),
         execution_role_arn=config.microvm_execution_role_arn,
-        probe_metadata=False,
+        metadata_isolation="required",
         client=lambda_client,
     )
     factory = VirtualEgressEnvironmentFactory(
@@ -158,6 +158,7 @@ def build_app(
                 "workspace_backend": runtime.config.workspace_backend,
                 "artifact_backend": "s3",
                 "vault_backend": "secrets-manager",
+                "egress_configuration": runtime.egress_adapter.configuration_metadata(),
             },
         ),
         runtime.environment_factory,

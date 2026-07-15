@@ -458,6 +458,7 @@ async def test_lambda_microvm_runner_creates_and_executes_without_host_env_leak(
         }
     ]
     assert transport.start_calls[0]["payload"] == {
+        "execution_profile": "agent",
         "kind": "process",
         "argv": ["python3", "-V"],
         "cwd": "/workspace/src",
@@ -476,6 +477,22 @@ async def test_lambda_microvm_runner_creates_and_executes_without_host_env_leak(
     assert result.stderr_bytes == 7
     assert runner.microvm_id == "mvm-123"
     assert runner.image_version == "7"
+
+
+@pytest.mark.anyio
+async def test_lambda_microvm_runner_marks_trusted_control_commands() -> None:
+    transport = FakeEndpointTransport()
+    runner = LambdaMicroVMRunner(
+        FakeLambdaMicroVMClient(),
+        microvm_id="mvm-123",
+        endpoint="local.test",
+        endpoint_transport=transport,
+        poll_interval_s=0,
+    )
+
+    await runner.exec_system(ExecCommand.process("mount", "-a"))
+
+    assert transport.start_calls[0]["payload"]["execution_profile"] == "trusted"
 
 
 @pytest.mark.anyio

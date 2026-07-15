@@ -11,13 +11,14 @@ from cayu.egress.adapter import (
     validate_grant_scope,
 )
 from cayu.egress.broker import TransparentEgressBroker
-from cayu.egress.errors import UnsupportedEgressError
+from cayu.egress.errors import UnsupportedEgressCapabilityError, UnsupportedEgressError
 from cayu.egress.grants import VirtualCredentialGrant
 from cayu.egress.proxy_exposure import ExposedProxy, HttpProxyEndpoint, ProxyExposure
 from cayu.egress.proxy_server import TransparentEgressProxyServer
 from cayu.runners.base import ExecCommand, Runner
 
 GUEST_CA_PATH = "/etc/cayu/ca.pem"
+_METADATA_ISOLATION_UNSUPPORTED_EXIT_CODE = 42
 
 ProxyServerFactory = Callable[..., TransparentEgressProxyServer]
 
@@ -121,6 +122,8 @@ async def run_enforcement_preflight(
     *,
     timeout_s: int,
     probe_metadata: bool = True,
+    metadata_isolation_reason: str | None = None,
+    metadata_isolation_remediation: str | None = None,
 ) -> None:
     if not request.egress_destinations:
         raise UnsupportedEgressError(
@@ -145,7 +148,27 @@ async def run_enforcement_preflight(
         ExecCommand.process("python3", "-c", script),
         timeout_s=timeout_s,
     )
-    if result.exit_code != 0 or result.timed_out:
+    if result.timed_out:
+        raise UnsupportedEgressError(
+            f"Runner {request.runner_kind!r} failed virtual-egress preflight "
+            f"(exit_code={result.exit_code}, timed_out=True)."
+        )
+    if result.exit_code == _METADATA_ISOLATION_UNSUPPORTED_EXIT_CODE:
+        raise UnsupportedEgressCapabilityError(
+            runner_kind=request.runner_kind,
+            capability="metadata_isolation",
+            reason=metadata_isolation_reason
+            or (
+                "guest-initiated requests reached the link-local metadata endpoint; "
+                "the runner's deny-by-default network boundary was absent or ineffective"
+            ),
+            remediation=metadata_isolation_remediation
+            or (
+                f"restore {request.runner_kind!r} network enforcement so guest commands cannot "
+                "reach link-local metadata, then retry the virtual-egress preflight"
+            ),
+        )
+    if result.exit_code != 0:
         raise UnsupportedEgressError(
             f"Runner {request.runner_kind!r} failed virtual-egress preflight "
             f"(exit_code={result.exit_code}, timed_out={result.timed_out})."
@@ -154,7 +177,7 @@ async def run_enforcement_preflight(
 
 async def run_setup_commands(runner: Runner, request: VirtualEgressRunnerRequest) -> None:
     for command in request.setup_commands:
-        result = await runner.exec(ExecCommand.bash(command), timeout_s=300)
+        result = await runner.exec_system(ExecCommand.bash(command), timeout_s=300)
         if result.exit_code != 0 or result.timed_out:
             raise RuntimeError(
                 f"{request.runner_kind} setup command failed "
@@ -173,10 +196,25 @@ def _preflight_script(
     return f"""
 import socket
 import ssl
+import os
+from urllib.parse import urlsplit
 
 proxy_host = {proxy_host!r}
 proxy_port = {proxy_port}
 destination = {destination!r}
+
+proxy_url = (
+    os.environ.get("HTTPS_PROXY")
+    or os.environ.get("https_proxy")
+    or os.environ.get("HTTP_PROXY")
+    or os.environ.get("http_proxy")
+)
+if proxy_url:
+    parsed_proxy = urlsplit(proxy_url)
+    if parsed_proxy.scheme != "http" or parsed_proxy.hostname is None:
+        raise RuntimeError("preflight proxy environment must be an HTTP URL")
+    proxy_host = parsed_proxy.hostname
+    proxy_port = parsed_proxy.port or 80
 
 sock = socket.create_connection((proxy_host, proxy_port), timeout=5)
 print("preflight: proxy TCP connected", flush=True)
@@ -195,52 +233,54 @@ tls = context.wrap_socket(sock, server_hostname=destination)
 tls.close()
 print("preflight: proxy TLS completed", flush=True)
 
-def tls_reachable(host, port):
+def tcp_reachable(host, port):
     try:
         direct = socket.create_connection((host, port), timeout=2)
-        direct_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        direct_context.check_hostname = False
-        direct_context.verify_mode = ssl.CERT_NONE
-        direct_tls = direct_context.wrap_socket(direct)
-        direct_tls.close()
     except OSError:
         return False
+    direct.close()
     return True
 
-def http_request_succeeds(host, port, request):
+def http_request_reaches(host, port, request):
     try:
         direct = socket.create_connection((host, port), timeout=2)
+    except OSError:
+        return False
+    head = b""
+    try:
         direct.sendall(request)
-        head = b""
         while b"\\r\\n\\r\\n" not in head and len(head) < 8192:
             chunk = direct.recv(1024)
             if not chunk:
                 break
             head += chunk
-        direct.close()
     except OSError:
-        return False
+        pass
+    finally:
+        direct.close()
     try:
         status = int(head.split(b" ", 2)[1])
     except (IndexError, ValueError):
-        return False
-    print(f"preflight: metadata HTTP status {{status}}", flush=True)
-    return 200 <= status < 300
+        status = None
+    if status is not None:
+        print(f"preflight: metadata HTTP status {{status}}", flush=True)
+    return True
 
 def metadata_reachable(host, port):
     get_request = b"GET /latest/meta-data/ HTTP/1.1\\r\\nHost: 169.254.169.254\\r\\nConnection: close\\r\\n\\r\\n"
     token_request = b"PUT /latest/api/token HTTP/1.1\\r\\nHost: 169.254.169.254\\r\\nX-aws-ec2-metadata-token-ttl-seconds: 60\\r\\nConnection: close\\r\\n\\r\\n"
-    return http_request_succeeds(host, port, get_request) or http_request_succeeds(
+    return http_request_reaches(host, port, get_request) or http_request_reaches(
         host, port, token_request
     )
 
-probes = [("1.1.1.1", 443, tls_reachable)]
+print("preflight: probing direct 1.1.1.1:443", flush=True)
+if tcp_reachable("1.1.1.1", 443):
+    raise RuntimeError("direct egress unexpectedly reached 1.1.1.1:443")
 if {probe_metadata!r}:
-    probes.append(("169.254.169.254", 80, metadata_reachable))
-for host, port, probe in probes:
-    print(f"preflight: probing direct {{host}}:{{port}}", flush=True)
-    if probe(host, port):
-        raise RuntimeError(f"direct egress unexpectedly reached {{host}}:{{port}}")
+    print("preflight: probing metadata 169.254.169.254:80", flush=True)
+    if metadata_reachable("169.254.169.254", 80):
+        print("preflight: metadata endpoint reachable", flush=True)
+        raise SystemExit({_METADATA_ISOLATION_UNSUPPORTED_EXIT_CODE})
 print("preflight: direct egress blocked", flush=True)
 """.strip()
 

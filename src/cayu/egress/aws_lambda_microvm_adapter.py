@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import weakref
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
 
 from cayu.egress._remote_adapter import (
     DEFAULT_PROXY_SERVER_FACTORY,
@@ -31,6 +31,9 @@ from cayu.runners import (
 from cayu.runners.aws_lambda_microvm import LambdaMicroVMEndpointTransport
 
 DEFAULT_PREFLIGHT_TIMEOUT_SECONDS = 30
+_METADATA_ISOLATION_UNVERIFIED_REASON = "guest_process_boundary_unverified"
+
+LambdaMicroVMMetadataIsolationMode = Literal["required", "unverified"]
 
 
 class _ReconnectIdentity(TypedDict):
@@ -48,9 +51,11 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
     ECS/Fargate task. The MicroVM receives only virtual credentials, a private
     proxy URL, and an egress connector that can reach the task. A startup
     preflight proves that the broker is reachable while direct internet and
-    metadata paths remain blocked. ``probe_metadata=False`` is available for
-    Lambda configurations whose managed ingress shares the link-local metadata
-    endpoint; callers using it must keep the execution role narrowly scoped.
+    metadata paths remain blocked. The first-party image puts ordinary commands
+    in a route-less network namespace with only a narrow relay to the private
+    Cayu proxy, while the root sidecar retains managed ingress. Custom images may
+    explicitly set ``metadata_isolation="unverified"``, but that mode never
+    reports the capability as verified.
     """
 
     runner_kind = "lambda-microvm"
@@ -71,7 +76,7 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
         loop: asyncio.AbstractEventLoop | None = None,
         proxy_server_factory: ProxyServerFactory = DEFAULT_PROXY_SERVER_FACTORY,
         preflight_timeout_s: int = DEFAULT_PREFLIGHT_TIMEOUT_SECONDS,
-        probe_metadata: bool = True,
+        metadata_isolation: LambdaMicroVMMetadataIsolationMode = "required",
         runner_options: Mapping[str, Any] | None = None,
     ) -> None:
         if not region_name.strip():
@@ -80,8 +85,10 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
             raise ValueError("egress_network_connector_arn must be nonblank.")
         if preflight_timeout_s <= 0:
             raise ValueError("preflight_timeout_s must be positive.")
-        if type(probe_metadata) is not bool:
-            raise TypeError("probe_metadata must be a bool.")
+        if type(metadata_isolation) is not str:
+            raise TypeError("metadata_isolation must be 'required' or 'unverified'.")
+        if metadata_isolation not in {"required", "unverified"}:
+            raise ValueError("metadata_isolation must be 'required' or 'unverified'.")
         self.region_name = region_name
         self.egress_network_connector_arn = egress_network_connector_arn
         self.exposure = exposure
@@ -99,9 +106,12 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
         self.loop = loop
         self.proxy_server_factory = proxy_server_factory
         self.preflight_timeout_s = preflight_timeout_s
-        self.probe_metadata = probe_metadata
+        self.metadata_isolation = metadata_isolation
         self.runner_options = dict(runner_options or {})
         self._runner_session_ids: weakref.WeakKeyDictionary[Runner, str] = (
+            weakref.WeakKeyDictionary()
+        )
+        self._runner_capabilities: weakref.WeakKeyDictionary[Runner, dict[str, str]] = (
             weakref.WeakKeyDictionary()
         )
         reserved = {
@@ -205,7 +215,18 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
                 runner,
                 request,
                 timeout_s=self.preflight_timeout_s,
-                probe_metadata=self.probe_metadata,
+                probe_metadata=self.metadata_isolation == "required",
+                metadata_isolation_reason=(
+                    "guest-initiated requests reached the link-local metadata endpoint; "
+                    "the agent network-namespace boundary was absent or ineffective"
+                ),
+                metadata_isolation_remediation=(
+                    "use the first-party image with its route-less agent network namespace and "
+                    "fixed-port relay, or an equivalent topology that denies guest link-local "
+                    "metadata while preserving managed ingress; otherwise explicitly select "
+                    "metadata_isolation='unverified' and do not treat the environment as fully "
+                    "verified"
+                ),
             )
             await run_setup_commands(runner, request)
         except BaseException:
@@ -215,7 +236,34 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
             with contextlib.suppress(Exception, asyncio.CancelledError):
                 await runner.close()
             raise
+        capabilities = {
+            "proxy_reachability": "verified",
+            "direct_public_egress": "denied",
+            "metadata_isolation": (
+                "verified" if self.metadata_isolation == "required" else "unverified"
+            ),
+        }
+        if self.metadata_isolation == "unverified":
+            capabilities["metadata_isolation_reason"] = _METADATA_ISOLATION_UNVERIFIED_REASON
+        self._runner_capabilities[runner] = capabilities
         return runner
+
+    def capability_metadata(self, runner: Runner) -> dict[str, Any]:
+        if not isinstance(runner, LambdaMicroVMRunner):
+            raise TypeError("Lambda MicroVM adapter received a different runner type.")
+        capabilities = self._runner_capabilities.get(runner)
+        if capabilities is None:
+            raise ValueError("Lambda MicroVM runner has not passed its egress preflight.")
+        return dict(capabilities)
+
+    def configuration_metadata(self) -> dict[str, str]:
+        """Describe configured metadata isolation without claiming runtime proof."""
+        if self.metadata_isolation == "required":
+            return {"metadata_isolation_mode": "required"}
+        return {
+            "metadata_isolation_mode": "unverified",
+            "metadata_isolation_reason": _METADATA_ISOLATION_UNVERIFIED_REASON,
+        }
 
     def reconnect_metadata(self, runner: Runner) -> dict[str, Any]:
         if not isinstance(runner, LambdaMicroVMRunner):
@@ -258,7 +306,7 @@ async def _install_ca(
         "path.write_bytes(sys.stdin.buffer.read()); "
         "os.chmod(path, 0o644)"
     )
-    result = await runner.exec(
+    result = await runner.exec_system(
         ExecCommand.process("python3", "-c", script, request.guest_ca_path),
         stdin=certificate.decode("utf-8"),
         timeout_s=30,

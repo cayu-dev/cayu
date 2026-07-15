@@ -351,7 +351,14 @@ def _runner_resource_key(runner: object) -> tuple[object, ...] | None:
         except TypeError as exc:
             raise TypeError("Runner resource_key must be hashable.") from exc
         return declared_key
-    for attr in ("sandbox_id", "name", "container_name", "sandbox_name", "root"):
+    for attr in (
+        "sandbox_id",
+        "microvm_id",
+        "name",
+        "container_name",
+        "sandbox_name",
+        "root",
+    ):
         value = getattr(runner, attr, None)
         if value is not None:
             return (type(runner), attr, str(value))

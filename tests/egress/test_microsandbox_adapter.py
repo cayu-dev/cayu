@@ -286,7 +286,7 @@ def test_microsandbox_adapter_creates_only_a_proxy_reachable_runner(tmp_path: Pa
     assert "api.stripe.com" in preflight["args"][1]
     assert "1.1.1.1" in preflight["args"][1]
     assert "169.254.169.254" in preflight["args"][1]
-    assert "SSLContext(ssl.PROTOCOL_TLS_CLIENT)" in preflight["args"][1]
+    assert 'tcp_reachable("1.1.1.1", 443)' in preflight["args"][1]
     assert "X-aws-ec2-metadata-token-ttl-seconds" in preflight["args"][1]
     setup = _FakeSandboxApi.sandbox.shell_calls[0]
     assert setup["script"] == "python3 -V"

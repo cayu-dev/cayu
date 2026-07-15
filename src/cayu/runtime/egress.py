@@ -21,6 +21,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from cayu._validation import copy_json_value
 from cayu.artifacts import ArtifactStore
 from cayu.core.events import Event, EventType
 from cayu.egress import (
@@ -217,6 +218,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         runner: Runner | None = None
         managed_runner: _EgressManagedRunner | None = None
         workspace: Workspace | None = None
+        capability_metadata: dict[str, Any] = {}
         try:
             binding = await adapter.prepare(
                 session_id=request.session_id,
@@ -250,6 +252,13 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             )
             runner = await adapter.create_runner(runner_request)
             reconnect_metadata = adapter.reconnect_metadata(runner)
+            raw_capabilities = adapter.capability_metadata(runner)
+            if type(raw_capabilities) is not dict:
+                raise TypeError("Egress adapter capability_metadata must return a dict.")
+            capability_metadata = copy_json_value(
+                raw_capabilities,
+                "egress_capabilities",
+            )
 
             managed_runner = _EgressManagedRunner(
                 runner=runner,
@@ -334,10 +343,15 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 )
                 original.add_note(f"Virtual-egress rollback incomplete: {details}.")
             raise
-        spec = EnvironmentSpec(
-            name=request.environment_name,
-            metadata={"kind": runner_kind, "credential_mode": CredentialMode.VIRTUAL_EGRESS.value},
-        )
+        environment_metadata: dict[str, Any] = {
+            "kind": runner_kind,
+            "credential_mode": CredentialMode.VIRTUAL_EGRESS.value,
+        }
+        result_metadata: dict[str, Any] = {}
+        if capability_metadata:
+            environment_metadata["egress_capabilities"] = capability_metadata
+            result_metadata["egress_capabilities"] = capability_metadata
+        spec = EnvironmentSpec(name=request.environment_name, metadata=environment_metadata)
         environment = Environment(
             spec,
             workspace=workspace,
@@ -347,6 +361,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         )
         return EnvironmentFactoryResult(
             environment=environment,
+            metadata=result_metadata,
             reconnect_metadata=reconnect_metadata,
         )
 
@@ -596,6 +611,26 @@ class _EgressManagedRunner(Runner):
     ) -> ExecResult:
         self._ensure_exec_open()
         return await self._runner.exec(
+            command,
+            cwd=cwd,
+            env=env,
+            timeout_s=timeout_s,
+            stdin=stdin,
+            output_limit_bytes=output_limit_bytes,
+        )
+
+    async def exec_system(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ) -> ExecResult:
+        self._ensure_exec_open()
+        return await self._runner.exec_system(
             command,
             cwd=cwd,
             env=env,

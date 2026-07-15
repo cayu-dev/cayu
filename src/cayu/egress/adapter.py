@@ -184,6 +184,10 @@ class SandboxEgressAdapter(ABC):
         """Return durable identity required to reattach to ``runner``."""
         return {}
 
+    def capability_metadata(self, runner: Runner) -> dict[str, Any]:
+        """Return JSON-safe evidence for capabilities proven by ``runner``."""
+        return {}
+
     async def finalize_runner(self, runner: Runner, *, outcome: str | None) -> None:
         """Map a session outcome to the runner's lifecycle action."""
         await runner.close()

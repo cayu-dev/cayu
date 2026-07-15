@@ -25,6 +25,7 @@ from cayu.egress.credential_kinds import CredentialKind
 from cayu.egress.destinations import ApprovedEgressDestination, EgressProtocol
 from cayu.egress.errors import (
     EgressError,
+    UnsupportedEgressCapabilityError,
     UnsupportedEgressError,
     VirtualCredentialError,
 )
@@ -59,6 +60,7 @@ __all__ = [
     "SandboxEgressAdapter",
     "TransparentEgressBroker",
     "UnsupportedEgressAdapter",
+    "UnsupportedEgressCapabilityError",
     "UnsupportedEgressError",
     "VirtualCredentialError",
     "VirtualCredentialGrant",

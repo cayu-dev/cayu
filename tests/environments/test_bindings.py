@@ -925,6 +925,23 @@ def test_sync_binding_refuses_runner_workspace_with_indeterminate_runner() -> No
         asyncio.run(run())
 
 
+def test_runner_workspace_uses_lambda_microvm_id_as_stable_resource_identity() -> None:
+    class MicrovmRunner(StubRunner):
+        default_cwd = "/workspace"
+
+        def __init__(self, microvm_id: str) -> None:
+            self.microvm_id = microvm_id
+
+    first = RunnerWorkspace(MicrovmRunner("mvm-first"))
+    same = RunnerWorkspace(MicrovmRunner("mvm-first"))
+    other = RunnerWorkspace(MicrovmRunner("mvm-other"))
+
+    assert first.resource_key == same.resource_key
+    assert first.resource_key != other.resource_key
+    assert first.resource_key is not None
+    assert first.resource_key[1][1:] == ("microvm_id", "mvm-first")
+
+
 def _offline_e2b_runner(default_cwd: str = "/home/user/workspace") -> E2BRunner:
     return E2BRunner(object(), sandbox_id="sbx_same", default_cwd=default_cwd, e2b_module=object())
 

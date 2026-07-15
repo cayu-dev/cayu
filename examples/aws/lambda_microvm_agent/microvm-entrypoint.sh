@@ -1,5 +1,20 @@
 #!/usr/bin/env bash
-set -u
+set -euo pipefail
+
+configure_agent_network_boundary() {
+    ip netns add "$CAYU_MICROVM_AGENT_NETNS"
+    ip link add cayu-root type veth peer name cayu-agent
+    ip addr add 192.0.2.1/30 dev cayu-root
+    ip link set cayu-root up
+    ip link set cayu-agent netns "$CAYU_MICROVM_AGENT_NETNS"
+    ip netns exec "$CAYU_MICROVM_AGENT_NETNS" ip addr add 192.0.2.2/30 dev cayu-agent
+    ip netns exec "$CAYU_MICROVM_AGENT_NETNS" ip link set lo up
+    ip netns exec "$CAYU_MICROVM_AGENT_NETNS" ip link set cayu-agent up
+    iptables -w -I INPUT 1 -i cayu-root -j REJECT
+    iptables -w -I INPUT 1 -i cayu-root -p tcp --dport 18080 -j ACCEPT
+}
+
+configure_agent_network_boundary
 
 sidecar_pid=0
 watchdog_pid=0

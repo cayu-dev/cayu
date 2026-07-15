@@ -769,6 +769,16 @@ Resources:
       TaskDefinition: !Ref ControlTaskDefinition
 
 Outputs:
+  ClusterArn:
+    Value: !GetAtt Cluster.Arn
+  ControlTaskDefinitionArn:
+    Value: !Ref ControlTaskDefinition
+  ControlSecurityGroupId:
+    Value: !Ref ControlSecurityGroup
+  PrivateSubnetId:
+    Value: !Ref PrivateSubnetId
+  ControlLogGroupName:
+    Value: !Ref ControlLogGroup
   ControlPlaneUrl:
     Value: !Sub "https://${LoadBalancer.DNSName}"
   ArtifactBucket:
