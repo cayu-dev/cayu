@@ -5,13 +5,12 @@ import posixpath
 from typing import Any
 
 from cayu._validation import require_clean_nonblank
-from cayu.runners import DEFAULT_E2B_CWD, E2BRunner
+from cayu.runners import DEFAULT_E2B_CWD, E2BWorkspaceCapability, Runner
 from cayu.workspaces._guest_guard import guard_delete, guard_read, guard_write
 from cayu.workspaces.base import (
-    Workspace,
+    RunnerBoundWorkspace,
     WorkspaceListResult,
     WorkspaceReadResult,
-    _runner_workspace_resource_key,
     _validate_absolute_guest_root,
     _validate_workspace_positive_limit,
     _validate_workspace_relative_path,
@@ -25,7 +24,7 @@ DEFAULT_E2B_WORKSPACE_LIST_LIMIT = 500
 DEFAULT_E2B_WORKSPACE_LIST_DEPTH = 64
 
 
-class E2BWorkspace(Workspace):
+class E2BWorkspace(RunnerBoundWorkspace):
     """Workspace backed by an E2B sandbox.
 
     ``read_bytes``/``write_bytes``/``delete`` run through a guest-side guard
@@ -43,7 +42,7 @@ class E2BWorkspace(Workspace):
 
     def __init__(
         self,
-        runner: E2BRunner,
+        runner: Runner,
         *,
         root: str = DEFAULT_E2B_CWD,
         workspace_id: str | None = None,
@@ -53,9 +52,13 @@ class E2BWorkspace(Workspace):
         user: str | None = None,
         request_timeout_s: float | None = None,
     ) -> None:
-        if not isinstance(runner, E2BRunner):
-            raise TypeError("E2BWorkspace runner must be an E2BRunner.")
+        if not isinstance(runner, Runner):
+            raise TypeError("E2BWorkspace runner must be a Runner.")
+        capability = runner.workspace_capability(E2BWorkspaceCapability)
+        if capability is None:
+            raise TypeError("E2BWorkspace runner does not expose E2BWorkspaceCapability.")
         self.runner = runner
+        self._capability = capability
         self.root = _validate_guest_root(root)
         self.default_read_limit_bytes = _validate_required_limit(
             default_read_limit_bytes,
@@ -66,13 +69,21 @@ class E2BWorkspace(Workspace):
         self.user = _validate_optional_user(user)
         self.request_timeout_s = _validate_optional_timeout(request_timeout_s)
         if workspace_id is None:
-            self.id = f"e2b:{runner.sandbox_id}:{self.root}"
+            self.id = f"e2b:{capability.sandbox_id}:{self.root}"
         else:
             self.id = require_clean_nonblank(workspace_id, "workspace_id")
 
     @property
     def resource_key(self) -> tuple[object, ...] | None:
-        return _runner_workspace_resource_key(self.runner, str(self.root))
+        return ("runner", self._capability.resource_key, str(self.root))
+
+    @property
+    def bound_runner(self) -> Runner:
+        return self.runner
+
+    @property
+    def bound_runner_resource_key(self) -> tuple[object, ...]:
+        return self._capability.resource_key
 
     def bounded_read_limit(self, max_bytes: int) -> int:
         return min(
@@ -133,17 +144,19 @@ class E2BWorkspace(Workspace):
         *,
         limit: int | None = None,
     ) -> WorkspaceListResult:
+        if self.runner.is_closed:
+            raise RuntimeError(f"{type(self.runner).__name__} is closed.")
         pattern = validate_list_pattern(pattern)
         effective_limit = (
             self.default_list_limit if limit is None else _validate_required_limit(limit, "limit")
         )
         await self._reject_symlink_path(self.root, allow_missing_suffix=False)
         try:
-            entries = await self._filesystem().list(
+            entries = await self._capability.list_entries(
                 self.root,
                 depth=self.default_list_depth,
                 user=self.user,
-                request_timeout=self.request_timeout_s,
+                request_timeout_s=self.request_timeout_s,
             )
         except Exception as exc:
             if _is_path_not_found_error(exc):
@@ -184,9 +197,6 @@ class E2BWorkspace(Workspace):
             raise ValueError("Workspace path escapes the workspace root.")
         return resolved
 
-    def _filesystem(self) -> Any:
-        return self.runner.filesystem()
-
     def _contained_rel_path(self, path: str) -> str:
         return posixpath.relpath(self.resolve(path), self.root)
 
@@ -205,12 +215,11 @@ class E2BWorkspace(Workspace):
         parts = [part for part in guest_path.split("/") if part]
         for part in parts:
             current = posixpath.join(current, part)
-            fs = self._filesystem()
             try:
-                info = await fs.get_info(
+                info = await self._capability.get_info(
                     current,
                     user=self.user,
-                    request_timeout=self.request_timeout_s,
+                    request_timeout_s=self.request_timeout_s,
                 )
             except Exception as exc:
                 if allow_missing_suffix and _is_path_not_found_error(exc):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import io
 import os
 import stat
@@ -327,6 +328,7 @@ def test_every_builtin_workspace_adapter_is_registered() -> None:
         if isinstance((value := getattr(workspaces_module, name)), type)
         and issubclass(value, Workspace)
         and value is not Workspace
+        and not inspect.isabstract(value)
     }
     assert {registration.workspace_type for registration in REGISTRATIONS} == exported_types
 

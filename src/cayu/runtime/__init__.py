@@ -124,6 +124,7 @@ from cayu.runtime.egress import (
     VirtualCredentialSpec,
     VirtualEgressEnvironmentFactory,
     VirtualEgressRunnerRequest,
+    VirtualEgressWorkspaceFactory,
 )
 from cayu.runtime.event_sinks import EventSink, InMemoryEventSink
 from cayu.runtime.event_watchers import (
@@ -499,6 +500,7 @@ __all__ = [
     "VirtualCredentialSpec",
     "VirtualEgressEnvironmentFactory",
     "VirtualEgressRunnerRequest",
+    "VirtualEgressWorkspaceFactory",
     "business_approval_audit",
     "business_approval_routing",
     "business_approval_routing_metadata",

@@ -255,16 +255,18 @@ def test_factory_wires_runner_grants_and_events(monkeypatch: pytest.MonkeyPatch)
 
     runner = result.environment.runner
     assert runner is not None
+    inner_runner = _FakeDockerRunner.last_instance
+    assert inner_runner is not None
     assert result.environment.vault is None  # real vault is broker-side only
     # Runner is created in virtual_egress mode, on the enforced network, with the
     # virtual credential + proxy overlay and the CA mounted.
-    assert runner.kwargs["credential_mode"] is CredentialMode.VIRTUAL_EGRESS
-    assert runner.kwargs["network"].startswith("cayu-egress-net-")
-    overlay = runner.kwargs["env_overlay"]
+    assert inner_runner.kwargs["credential_mode"] is CredentialMode.VIRTUAL_EGRESS
+    assert inner_runner.kwargs["network"].startswith("cayu-egress-net-")
+    overlay = inner_runner.kwargs["env_overlay"]
     assert overlay["STRIPE_SECRET_KEY"].startswith("sk_test_cayu_vc_")
     assert overlay["HTTPS_PROXY"].startswith("http://cayu-egress-")
     assert REAL_SECRET not in str(overlay)
-    assert runner.kwargs["ca_mount"][1] == "/etc/cayu/ca.pem"
+    assert inner_runner.kwargs["ca_mount"][1] == "/etc/cayu/ca.pem"
     assert runner.closed is True  # finalize closed the sandbox
 
     types = [e.type for e in events]

@@ -257,6 +257,29 @@ the matching network-restricted runner. Remote/raw proxy exposures have an
 additional credentialless requirement described below. If no adapter is
 registered for the requested runner kind, setup fails closed.
 
+### Managed runner and workspace composition
+
+Pass `workspace_factory` when tools need files inside the enforced sandbox. The
+factory receives the lifecycle-managed public `Runner`, not the raw provider
+runner, and may return a `Workspace` synchronously or asynchronously. When
+`workspace_factory` is set and `inner_binding` is omitted,
+`VirtualEgressEnvironmentFactory` uses `NativeBinding`: workspace and command
+operations target the same sandbox, and the runtime exposes both through
+`ToolContext`. Cayu verifies that a native workspace is bound to the managed
+runner it supplied. To attach a durable workspace outside the sandbox instead,
+pass an explicit non-native `inner_binding` (for example `SyncBinding`) that
+defines how the two resources compose.
+
+Provider-native workspaces request a narrow typed capability from the managed
+runner. That capability exposes only native filesystem operations and stable
+sandbox identity; it has no `close()` method and cannot bypass environment
+finalization. `workspace.runner` remains the managed runner. Finalization
+revokes grants first, finalizes the workspace binding while enforcement is
+still present, then closes the provider runner, proxy/network, and session CA.
+Applications must finalize the environment binding (the normal `CayuApp`
+lifecycle) or close the managed runner; they must not retain or close a raw
+provider runner.
+
 ### Microsandbox
 
 Microsandbox runs locally and exposes the host as
@@ -283,21 +306,58 @@ sets `credentialless_isolated=True` and the endpoint is unreachable from other
 sandboxes and untrusted peers.
 
 ```python
-from cayu.egress import EgressAdapterRegistry
+from cayu import (
+    CayuApp,
+    EnvironmentSpec,
+    HttpEgressPolicy,
+    MicrosandboxWorkspace,
+    SecretRef,
+    StaticVault,
+    VirtualCredentialSpec,
+    VirtualEgressEnvironmentFactory,
+)
 from cayu.egress.microsandbox_adapter import MicrosandboxEgressAdapter
 
-registry = EgressAdapterRegistry()
-registry.register(MicrosandboxEgressAdapter())
+app = CayuApp()
+vault = StaticVault({"provider_key": "sk_test_..."})
+policies = {
+    "provider": HttpEgressPolicy(
+        name="provider",
+        allowed_hosts=["api.example.com"],
+        allowed_endpoints=[("GET", "/v1/data")],
+    )
+}
+credentials = [
+    VirtualCredentialSpec(
+        env_name="PROVIDER_KEY",
+        secret=SecretRef(name="provider_key"),
+        destination="api.example.com",
+        policy_name="provider",
+        credential_kind="opaque_bearer",
+    )
+]
 
 factory = VirtualEgressEnvironmentFactory(
     resolver=vault,
     policies=policies,
     credentials=credentials,
-    runner_kind="microsandbox",
-    adapter_registry=registry,
+    adapter=MicrosandboxEgressAdapter(),
     image="python:3.13",  # Microsandbox OCI image
+    workspace_factory=MicrosandboxWorkspace,
+)
+
+app.register_environment_factory(
+    EnvironmentSpec(name="microsandbox-egress"),
+    factory,
+    default=True,
 )
 ```
+
+For every session on `microsandbox-egress`, file tools receive a
+`MicrosandboxWorkspace` whose read, write, list, delete, and canonical-path
+operations use the same microVM as command tools. The application never
+constructs `_EgressManagedRunner`, accesses `_runner`, casts to
+`MicrosandboxRunner`, or owns a second cleanup handle.
 
 Install both optional dependencies with
 `pip install 'cayu[egress,microsandbox]'`.
@@ -313,6 +373,7 @@ hostname allowlist cannot act as a transparent raw proxy relay. The adapter
 fails closed on hostname and IPv6 exposures and permits only the IPv4 endpoint.
 
 ```python
+from cayu import E2BWorkspace
 from cayu.egress import EgressAdapterRegistry
 from cayu.egress.e2b_adapter import E2BEgressAdapter
 from cayu.egress.proxy_exposure import ExposedProxy, ProxyExposure
@@ -334,6 +395,7 @@ factory = VirtualEgressEnvironmentFactory(
     runner_kind="e2b",
     adapter_registry=registry,
     image="base",  # E2B template name or id
+    workspace_factory=E2BWorkspace,
 )
 ```
 

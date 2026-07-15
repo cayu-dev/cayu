@@ -21,7 +21,11 @@ from cayu.egress import (
 )
 from cayu.environments import EnvironmentFactoryRequest
 from cayu.runners.base import ExecCommand, Runner
-from cayu.runtime.egress import VirtualCredentialSpec, VirtualEgressEnvironmentFactory
+from cayu.runtime.egress import (
+    VirtualCredentialSpec,
+    VirtualEgressEnvironmentFactory,
+    VirtualEgressWorkspaceFactory,
+)
 from cayu.vaults import SecretRef, StaticVault
 from tests.egress_conformance import (
     EgressConformanceRegistration,
@@ -91,6 +95,7 @@ async def drive_adversarial_egress_contract(
     image: str,
     search_roots: tuple[str, ...],
     response_id: str,
+    workspace_factory: VirtualEgressWorkspaceFactory | None = None,
 ) -> tuple[EgressScenarioEvidence, ...]:
     """Exercise the shared non-possession and network-denial runtime contract."""
 
@@ -116,6 +121,7 @@ async def drive_adversarial_egress_contract(
         image=image,
         adapter=adapter,
         upstream=upstream,
+        workspace_factory=workspace_factory,
     )
     session_id = f"{registration.name}-egress-{uuid4().hex[:12]}"
     host_env_name = "CAYU_EGRESS_HOST_ONLY_SENTINEL"
@@ -136,6 +142,7 @@ async def drive_adversarial_egress_contract(
         else:
             os.environ[host_env_name] = str(previous_host_value)
     runner = result.environment.runner
+    workspace = result.environment.workspace
     binding = result.environment.binding
     assert runner is not None
     assert binding is not None
@@ -232,7 +239,18 @@ async def drive_adversarial_egress_contract(
         observed["direct"] = json.loads(direct.stdout)
         observed["metadata"] = json.loads(metadata.stdout)
 
-        bound = await binding.bind(None, runner, session_id=session_id)
+        if workspace_factory is not None:
+            assert workspace is not None
+            probe_path = ".cayu-egress-workspace-probe.txt"
+            await workspace.write_bytes(probe_path, b"workspace-composition")
+            read = await workspace.read_bytes(probe_path)
+            listing = await workspace.list(probe_path)
+            assert read.content == b"workspace-composition"
+            assert listing.paths == (probe_path,)
+            await workspace.delete(probe_path)
+            observed["workspace"] = "verified"
+
+        bound = await binding.bind(workspace, runner, session_id=session_id)
         await binding.finalize(bound, outcome="completed")
     except BaseException:
         await runner.close()

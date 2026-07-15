@@ -1253,6 +1253,20 @@ Framework-native tools reserve `structured.error="invalid_arguments"` for model-
 
 Framework-native tools receive runtime services through `ToolContext`: workspace, artifact store, runner, vault, credential proxy, knowledge store, and MCP server specs. These references are intentionally runtime-only. They are excluded from `ToolContext.model_dump()` so context metadata can cross storage, event, dashboard, and replay boundaries without serializing live service objects. Serializable service identity fields such as `workspace_id` and `artifact_store_id` may be present when the active environment exposes them.
 
+Virtual-egress environments preserve the same public runner/workspace contract.
+`VirtualEgressEnvironmentFactory(workspace_factory=...)` invokes the factory
+with its lifecycle-managed runner and attaches the returned `Workspace` to the
+session environment. With no explicit `inner_binding`, Cayu uses
+`NativeBinding`; the workspace and runner therefore name the same underlying
+sandbox resource. First-party `MicrosandboxWorkspace` and `E2BWorkspace`
+instances acquire provider-native filesystem behavior through typed
+`RunnerWorkspaceCapability` objects. Those objects expose stable identity and
+native file operations but no runner lifecycle method. Consumers finalize the
+environment binding or close the managed runner; obtaining or closing an
+unmanaged raw provider runner is not part of the contract. Workspace-factory
+failure or cancellation is still environment setup failure and triggers the
+same bounded, idempotent grant, runner, proxy/network, and CA cleanup.
+
 A custom `Tool` uses those same services through `ctx`: `await ctx.runner.exec(ExecCommand.process(...))` runs a command in the environment's runner, while `ctx.workspace.write_bytes(path, data)` and `ctx.workspace.read_bytes(path)` (which returns a `WorkspaceReadResult` carrying `content` / `total_bytes`) write and read files. Guard against a missing service (`if ctx.runner is None: ...`), since not every environment configures one. See [`examples/custom_runner_tool.py`](../examples/custom_runner_tool.py) for a worked tool, and `src/cayu/tools/commands.py` (`ExecCommandTool`) for the framework's own reference.
 
 `ExecCommandTool(policy=...)` resolves the model-requested working directory through the active runner **before** it calls `CommandPolicy.evaluate(...)`. `CommandRequest.cwd` remains the original requested value (`None`, relative, normalized-relative, or contained absolute) for audit messages and backward compatibility. `CommandRequest.canonical_cwd` is the runner-resolved directory; it is always populated by `ExecCommandTool` at policy-evaluation time, and policies must use it for workspace-containment decisions. When a policy allows the request, the tool passes that exact canonical string to `runner.exec(...)`, including the canonical default when the request omitted `cwd`. A denial never reaches `runner.exec(...)`, and resolution failures (blank paths, relative traversal that escapes the root, absolute paths outside the runner root, or runner-specific failures such as a missing local directory) happen before policy evaluation or command execution.

@@ -4,13 +4,16 @@ import posixpath
 from typing import Any
 
 from cayu._validation import require_clean_nonblank
-from cayu.runners import DEFAULT_MICROSANDBOX_CWD, MicrosandboxRunner
+from cayu.runners import (
+    DEFAULT_MICROSANDBOX_CWD,
+    MicrosandboxWorkspaceCapability,
+    Runner,
+)
 from cayu.workspaces._guest_guard import guard_delete, guard_read, guard_write
 from cayu.workspaces.base import (
-    Workspace,
+    RunnerBoundWorkspace,
     WorkspaceListResult,
     WorkspaceReadResult,
-    _runner_workspace_resource_key,
     _validate_absolute_guest_root,
     _validate_workspace_positive_limit,
     _validate_workspace_relative_path,
@@ -23,7 +26,7 @@ DEFAULT_MICROSANDBOX_WORKSPACE_READ_LIMIT_BYTES = 256 * 1024
 DEFAULT_MICROSANDBOX_WORKSPACE_LIST_LIMIT = 500
 
 
-class MicrosandboxWorkspace(Workspace):
+class MicrosandboxWorkspace(RunnerBoundWorkspace):
     """Workspace backed by a Microsandbox sandbox.
 
     ``read_bytes``/``write_bytes``/``delete`` run through a guest-side guard
@@ -37,16 +40,22 @@ class MicrosandboxWorkspace(Workspace):
 
     def __init__(
         self,
-        runner: MicrosandboxRunner,
+        runner: Runner,
         *,
         root: str = DEFAULT_MICROSANDBOX_CWD,
         workspace_id: str | None = None,
         default_read_limit_bytes: int = DEFAULT_MICROSANDBOX_WORKSPACE_READ_LIMIT_BYTES,
         default_list_limit: int = DEFAULT_MICROSANDBOX_WORKSPACE_LIST_LIMIT,
     ) -> None:
-        if not isinstance(runner, MicrosandboxRunner):
-            raise TypeError("MicrosandboxWorkspace runner must be a MicrosandboxRunner.")
+        if not isinstance(runner, Runner):
+            raise TypeError("MicrosandboxWorkspace runner must be a Runner.")
+        capability = runner.workspace_capability(MicrosandboxWorkspaceCapability)
+        if capability is None:
+            raise TypeError(
+                "MicrosandboxWorkspace runner does not expose MicrosandboxWorkspaceCapability."
+            )
         self.runner = runner
+        self._capability = capability
         self.root = _validate_guest_root(root)
         self.default_read_limit_bytes = _validate_required_limit(
             default_read_limit_bytes,
@@ -54,13 +63,21 @@ class MicrosandboxWorkspace(Workspace):
         )
         self.default_list_limit = _validate_required_limit(default_list_limit, "default_list_limit")
         if workspace_id is None:
-            self.id = f"microsandbox:{runner.name}:{self.root}"
+            self.id = f"microsandbox:{capability.sandbox_name}:{self.root}"
         else:
             self.id = require_clean_nonblank(workspace_id, "workspace_id")
 
     @property
     def resource_key(self) -> tuple[object, ...] | None:
-        return _runner_workspace_resource_key(self.runner, str(self.root))
+        return ("runner", self._capability.resource_key, str(self.root))
+
+    @property
+    def bound_runner(self) -> Runner:
+        return self.runner
+
+    @property
+    def bound_runner_resource_key(self) -> tuple[object, ...]:
+        return self._capability.resource_key
 
     def bounded_read_limit(self, max_bytes: int) -> int:
         return min(
@@ -123,14 +140,15 @@ class MicrosandboxWorkspace(Workspace):
         *,
         limit: int | None = None,
     ) -> WorkspaceListResult:
+        if self.runner.is_closed:
+            raise RuntimeError(f"{type(self.runner).__name__} is closed.")
         pattern = validate_list_pattern(pattern)
         effective_limit = (
             self.default_list_limit if limit is None else _validate_required_limit(limit, "limit")
         )
-        fs = self._filesystem()
         await self._require_contained_real_path(self.root)
         collector = _WorkspaceListCollector(effective_limit)
-        async for rel_path in _iter_files(self, fs, self.root):
+        async for rel_path in _iter_files(self, self.root):
             if matches_list_pattern(rel_path, pattern):
                 collector.add(rel_path)
         return collector.result()
@@ -142,15 +160,12 @@ class MicrosandboxWorkspace(Workspace):
             raise ValueError("Workspace path escapes the workspace root.")
         return resolved
 
-    def _filesystem(self) -> Any:
-        return self.runner.filesystem()
-
     def _contained_rel_path(self, path: str) -> str:
         return posixpath.relpath(self.resolve(path), self.root)
 
     async def _require_contained_real_path(self, guest_path: str) -> str:
         try:
-            real_path = await self.runner.real_path(guest_path)
+            real_path = await self._capability.real_path(guest_path)
         except Exception as exc:
             if _is_path_not_found_error(exc):
                 raise FileNotFoundError(f"Workspace path not found: {guest_path}") from exc
@@ -161,7 +176,7 @@ class MicrosandboxWorkspace(Workspace):
         return real_path
 
 
-async def _iter_files(workspace: MicrosandboxWorkspace, fs: Any, root: str):
+async def _iter_files(workspace: MicrosandboxWorkspace, root: str):
     pending = [root]
     seen_dirs: set[str] = set()
     seen_files: set[str] = set()
@@ -171,7 +186,7 @@ async def _iter_files(workspace: MicrosandboxWorkspace, fs: Any, root: str):
             continue
         seen_dirs.add(current)
         try:
-            entries = await fs.list(current)
+            entries = await workspace._capability.list_entries(current)
         except Exception as exc:
             raise RuntimeError(f"Failed to list Microsandbox workspace path: {current}") from exc
         for entry in entries:

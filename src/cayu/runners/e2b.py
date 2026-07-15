@@ -5,9 +5,11 @@ import contextlib
 import importlib
 import posixpath
 import shlex
-from collections.abc import Mapping
+from abc import abstractmethod
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from types import ModuleType
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from cayu._validation import require_clean_nonblank
 from cayu.runners._cleanup import (
@@ -32,6 +34,8 @@ from cayu.runners.base import (
     ExecCommand,
     ExecResult,
     Runner,
+    RunnerWorkspaceCapability,
+    RunnerWorkspaceCapabilityT,
     attach_cancellation_artifacts,
 )
 
@@ -40,6 +44,101 @@ E2B_SANDBOX_ID_MAX_BYTES = 256
 E2B_LATE_START_CLEANUP_TIMEOUT_MULTIPLIER = 4.0
 
 E2BCloseAction = Literal["kill", "detach", "none"]
+
+
+class E2BWorkspaceCapability(RunnerWorkspaceCapability):
+    """Native E2B filesystem access without runner lifecycle authority."""
+
+    @property
+    @abstractmethod
+    def sandbox_id(self) -> str:
+        """Provider sandbox id used for truthful workspace identity."""
+
+    @abstractmethod
+    async def get_info(
+        self,
+        path: str,
+        *,
+        user: str | None,
+        request_timeout_s: float | None,
+    ) -> E2BWorkspaceEntry:
+        """Return a normalized Cayu-owned entry for one guest path."""
+
+    @abstractmethod
+    async def list_entries(
+        self,
+        path: str,
+        *,
+        depth: int,
+        user: str | None,
+        request_timeout_s: float | None,
+    ) -> Sequence[E2BWorkspaceEntry]:
+        """List normalized Cayu-owned entries below one guest path."""
+
+
+class _E2BWorkspaceCapability(E2BWorkspaceCapability):
+    def __init__(self, runner: E2BRunner) -> None:
+        self._runner = runner
+
+    @property
+    def sandbox_id(self) -> str:
+        return self._runner.sandbox_id
+
+    @property
+    def resource_key(self) -> tuple[object, ...]:
+        return ("e2b", self._runner.sandbox_id)
+
+    async def get_info(
+        self,
+        path: str,
+        *,
+        user: str | None,
+        request_timeout_s: float | None,
+    ) -> E2BWorkspaceEntry:
+        entry = await self._runner.filesystem().get_info(
+            path,
+            user=user,
+            request_timeout=request_timeout_s,
+        )
+        return E2BWorkspaceEntry.from_provider_entry(entry)
+
+    async def list_entries(
+        self,
+        path: str,
+        *,
+        depth: int,
+        user: str | None,
+        request_timeout_s: float | None,
+    ) -> Sequence[E2BWorkspaceEntry]:
+        entries = await self._runner.filesystem().list(
+            path,
+            depth=depth,
+            user=user,
+            request_timeout=request_timeout_s,
+        )
+        return tuple(E2BWorkspaceEntry.from_provider_entry(entry) for entry in entries)
+
+
+@dataclass(frozen=True)
+class E2BWorkspaceEntry:
+    """Cayu-owned normalized view of one E2B filesystem entry."""
+
+    path: str | None
+    type: str | None
+    symlink_target: str | None = None
+
+    @classmethod
+    def from_provider_entry(cls, entry: Any) -> E2BWorkspaceEntry:
+        path = getattr(entry, "path", None)
+        entry_type = getattr(entry, "type", None)
+        if type(entry_type) is not str:
+            entry_type = getattr(entry_type, "value", None)
+        symlink_target = getattr(entry, "symlink_target", None)
+        return cls(
+            path=path if type(path) is str else None,
+            type=entry_type if type(entry_type) is str else None,
+            symlink_target=symlink_target if type(symlink_target) is str else None,
+        )
 
 
 class E2BRunner(Runner):
@@ -232,6 +331,19 @@ class E2BRunner(Runner):
             exec_user=exec_user,
             e2b_module=module,
         )
+
+    @property
+    def resource_key(self) -> tuple[object, ...]:
+        return ("e2b", self.sandbox_id)
+
+    def workspace_capability(
+        self,
+        capability_type: type[RunnerWorkspaceCapabilityT],
+    ) -> RunnerWorkspaceCapabilityT | None:
+        if capability_type is E2BWorkspaceCapability:
+            capability = _E2BWorkspaceCapability(self)
+            return cast("RunnerWorkspaceCapabilityT", capability)
+        return super().workspace_capability(capability_type)
 
     async def close(self) -> None:
         """Apply the configured lifecycle action once."""

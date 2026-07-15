@@ -101,6 +101,12 @@ Notes:
   skipped entirely — no `bind`/`finalize` runs and no binding events are emitted (the
   runtime does **not** substitute a default binding). Pass one (e.g. `NativeBinding()`)
   whenever you want the bind/finalize/snapshot lifecycle.
+- `VirtualEgressEnvironmentFactory` adds a `workspace_factory` convenience for
+  provider-native workspaces. It receives the public lifecycle-managed runner;
+  when supplied without `inner_binding`, the virtual-egress factory attaches
+  the workspace with `NativeBinding`. For example,
+  `workspace_factory=MicrosandboxWorkspace` produces a first-party workspace
+  in the enforced microVM without exposing the raw `MicrosandboxRunner`.
 
 ## Workspace bindings
 

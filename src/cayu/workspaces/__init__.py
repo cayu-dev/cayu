@@ -2,6 +2,7 @@
 
 from cayu.workspaces.base import (
     BoundedTarReader,
+    RunnerBoundWorkspace,
     TarWriter,
     Workspace,
     WorkspaceListResult,
@@ -40,6 +41,7 @@ __all__ = [
     "E2BWorkspace",
     "LocalWorkspace",
     "MicrosandboxWorkspace",
+    "RunnerBoundWorkspace",
     "RunnerWorkspace",
     "TarWriter",
     "Workspace",

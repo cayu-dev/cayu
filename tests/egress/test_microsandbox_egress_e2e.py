@@ -15,6 +15,7 @@ from tests.egress_conformance import (
 from tests.egress_e2e_support import CapturingEgressAdapter, drive_adversarial_egress_contract
 
 from cayu.egress.microsandbox_adapter import MicrosandboxEgressAdapter
+from cayu.workspaces import MicrosandboxWorkspace
 
 pytest.importorskip("cryptography")
 pytest.importorskip("microsandbox")
@@ -36,6 +37,7 @@ async def _drive() -> tuple[EgressScenarioEvidence, ...]:
         image=os.environ.get("CAYU_MICROSANDBOX_IMAGE", "python:3.13"),
         search_roots=("/workspace", "/tmp", "/etc/cayu", "/root"),
         response_id="cus_microsandbox",
+        workspace_factory=MicrosandboxWorkspace,
     )
 
 

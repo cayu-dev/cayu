@@ -11,8 +11,8 @@ from cayu.runners import DEFAULT_EXEC_OUTPUT_LIMIT_BYTES, ExecCommand, LocalRunn
 from cayu.workspaces._tar import tar_archive_size_bound
 from cayu.workspaces.base import (
     BoundedTarReader,
+    RunnerBoundWorkspace,
     TarWriter,
-    Workspace,
     WorkspaceListResult,
     WorkspaceReadResult,
     _local_resource_key,
@@ -351,7 +351,7 @@ except Exception as exc:
 """
 
 
-class RunnerWorkspace(Workspace, BoundedTarReader, TarWriter):
+class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
     """Workspace implementation whose file operations execute through a runner."""
 
     def __init__(
@@ -395,6 +395,14 @@ class RunnerWorkspace(Workspace, BoundedTarReader, TarWriter):
         # Key by the runner's resolved absolute working directory so this RunnerWorkspace and the native
         # wrapper (E2BWorkspace / MicrosandboxWorkspace) over the same sandbox directory produce equal keys.
         return ("runner", runner_key, runner.resolve_cwd(self.cwd))
+
+    @property
+    def bound_runner(self) -> Runner:
+        return self.runner
+
+    @property
+    def bound_runner_resource_key(self) -> tuple[object, ...] | None:
+        return _runner_resource_key(self.runner)
 
     def bounded_read_limit(self, max_bytes: int) -> int:
         return min(

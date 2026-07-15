@@ -37,6 +37,7 @@ from cayu.vaults import SecretRef, StaticVault
 pytest.importorskip("cryptography")
 
 from cayu.egress.docker_adapter import DockerEgressAdapter
+from cayu.workspaces import RunnerWorkspace
 
 REAL_SECRET = "sk_test_51E2ERealSecretNeverInSandbox"
 SANDBOX_IMAGE = "python:3.12-slim"
@@ -97,6 +98,7 @@ async def _drive() -> tuple[EgressScenarioEvidence, ...]:
         image=SANDBOX_IMAGE,
         search_roots=("/workspace", "/tmp", "/etc/cayu", "/root"),
         response_id="cus_fake123",
+        workspace_factory=RunnerWorkspace,
     )
 
 

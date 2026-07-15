@@ -246,6 +246,10 @@ class DockerRunner(Runner):
 
     isolation = "docker"
 
+    @property
+    def resource_key(self) -> tuple[object, ...]:
+        return ("docker", self.name)
+
     def __init__(
         self,
         name: str,

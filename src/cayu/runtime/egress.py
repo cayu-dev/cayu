@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
+import inspect
 import os
 import secrets
 import shutil
@@ -47,6 +48,7 @@ from cayu.egress.destinations import validate_approved_destinations
 from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.environments.bindings import (
     BoundWorkspace,
+    NativeBinding,
     NoWorkspaceBinding,
     WorkspaceBinding,
     WorkspaceSnapshot,
@@ -56,10 +58,18 @@ from cayu.environments.factory import (
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
 )
-from cayu.runners.base import DEFAULT_EXEC_OUTPUT_LIMIT_BYTES, ExecCommand, ExecResult, Runner
+from cayu.runners.base import (
+    DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ExecCommand,
+    ExecResult,
+    Runner,
+    RunnerWorkspaceCapabilityT,
+)
 from cayu.vaults import SecretRef, SecretResolver
+from cayu.workspaces import RunnerBoundWorkspace, Workspace
 
 EventEmitter = Callable[[Event], Awaitable[Event]]
+VirtualEgressWorkspaceFactory = Callable[[Runner], Workspace | Awaitable[Workspace]]
 
 DEFAULT_SANDBOX_IMAGE = "python:3.12-slim"
 VIRTUAL_EGRESS_EVENT_TYPES = (
@@ -114,6 +124,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         adapter_registry: EgressAdapterRegistry | None = None,
         runner_kind: str = "docker",
         inner_binding: WorkspaceBinding | None = None,
+        workspace_factory: VirtualEgressWorkspaceFactory | None = None,
         artifact_store: ArtifactStore | None = None,
         event_emitter: EventEmitter | None = None,
         upstream: EgressUpstream | None = None,
@@ -145,7 +156,12 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         self._adapter = adapter
         self._adapter_registry = adapter_registry
         self._runner_kind = adapter.runner_kind if adapter is not None else runner_kind
-        self._inner_binding = inner_binding or NoWorkspaceBinding()
+        if workspace_factory is not None and not callable(workspace_factory):
+            raise TypeError("workspace_factory must be callable or None.")
+        self._workspace_factory = workspace_factory
+        self._inner_binding = inner_binding or (
+            NativeBinding() if workspace_factory is not None else NoWorkspaceBinding()
+        )
         if artifact_store is not None and not isinstance(artifact_store, ArtifactStore):
             raise TypeError("artifact_store must be an ArtifactStore.")
         self._artifact_store = artifact_store
@@ -200,6 +216,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         ca_dir: str | None = None
         runner: Runner | None = None
         managed_runner: _EgressManagedRunner | None = None
+        workspace: Workspace | None = None
         try:
             binding = await adapter.prepare(
                 session_id=request.session_id,
@@ -245,6 +262,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             runner = None
             binding = None
             ca_dir = None
+            workspace = await self._create_workspace(managed_runner)
             teardown_binding = _EgressTeardownBinding(
                 inner=self._inner_binding,
                 runner=managed_runner,
@@ -322,6 +340,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         )
         environment = Environment(
             spec,
+            workspace=workspace,
             artifact_store=self._artifact_store,
             runner=managed_runner,
             binding=teardown_binding,
@@ -330,6 +349,40 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             environment=environment,
             reconnect_metadata=reconnect_metadata,
         )
+
+    async def _create_workspace(self, runner: Runner) -> Workspace | None:
+        if self._workspace_factory is None:
+            return None
+        created = self._workspace_factory(runner)
+        if inspect.isawaitable(created):
+            created = await created
+        if not isinstance(created, Workspace):
+            raise TypeError("workspace_factory must return a Workspace.")
+        if isinstance(self._inner_binding, NativeBinding):
+            if not isinstance(created, RunnerBoundWorkspace):
+                raise TypeError(
+                    "A NativeBinding virtual-egress workspace must implement "
+                    "RunnerBoundWorkspace. Use an explicit non-native inner_binding for an "
+                    "external workspace."
+                )
+            if created.bound_runner is not runner:
+                raise ValueError(
+                    "A NativeBinding virtual-egress workspace must be bound to the managed "
+                    "runner passed to workspace_factory."
+                )
+            runner_key = runner.resource_key
+            workspace_runner_key = created.bound_runner_resource_key
+            if runner_key is None or workspace_runner_key is None:
+                raise ValueError(
+                    "A NativeBinding virtual-egress runner and workspace must expose stable "
+                    "resource identity."
+                )
+            if workspace_runner_key != runner_key:
+                raise ValueError(
+                    "A NativeBinding virtual-egress workspace targets a different runner "
+                    "resource than the managed runner."
+                )
+        return created
 
     def _resolve_adapter(self, loop: asyncio.AbstractEventLoop):
         if self._adapter_registry is not None:
@@ -513,8 +566,23 @@ class _EgressManagedRunner(Runner):
         self.isolation = runner.isolation
         self.default_cwd = runner.default_cwd
 
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._runner, name)
+    @property
+    def resource_key(self) -> tuple[object, ...] | None:
+        return self._runner.resource_key
+
+    @property
+    def closed(self) -> bool:
+        """Report whether managed finalization completed."""
+
+        return self._closed
+
+    def workspace_capability(
+        self,
+        capability_type: type[RunnerWorkspaceCapabilityT],
+    ) -> RunnerWorkspaceCapabilityT | None:
+        """Delegate only the explicit, lifecycle-free workspace capability."""
+
+        return self._runner.workspace_capability(capability_type)
 
     async def exec(
         self,

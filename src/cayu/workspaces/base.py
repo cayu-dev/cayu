@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 from cayu._validation import require_clean_nonblank, require_nonblank
+from cayu.runners.base import Runner
 
 
 @dataclass(frozen=True)
@@ -249,6 +250,26 @@ class Workspace(ABC):
         return None
 
 
+class RunnerBoundWorkspace(Workspace):
+    """Workspace whose operations target one declared runner-owned resource.
+
+    Native bindings use this nominal contract instead of reflecting on an
+    incidental ``runner`` attribute. Implementations identify both the runner
+    object that owns lifecycle and the stable runner resource key their file
+    operations target.
+    """
+
+    @property
+    @abstractmethod
+    def bound_runner(self) -> Runner:
+        """Lifecycle-owning runner used by this workspace."""
+
+    @property
+    @abstractmethod
+    def bound_runner_resource_key(self) -> tuple[object, ...] | None:
+        """Stable runner resource identity used by workspace operations."""
+
+
 class BoundedTarReader(ABC):
     """Nominal capability for preflight-bounded bulk tar reads.
 
@@ -321,6 +342,15 @@ def _runner_resource_key(runner: object) -> tuple[object, ...] | None:
     """
     if runner is None:
         return None
+    declared_key = getattr(runner, "resource_key", None)
+    if declared_key is not None:
+        if type(declared_key) is not tuple or not declared_key:
+            raise TypeError("Runner resource_key must be a non-empty tuple or None.")
+        try:
+            hash(declared_key)
+        except TypeError as exc:
+            raise TypeError("Runner resource_key must be hashable.") from exc
+        return declared_key
     for attr in ("sandbox_id", "name", "container_name", "sandbox_name", "root"):
         value = getattr(runner, attr, None)
         if value is not None:

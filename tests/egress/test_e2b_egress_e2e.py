@@ -24,6 +24,7 @@ from tests.egress_e2e_support import CapturingEgressAdapter, drive_adversarial_e
 
 from cayu.egress.e2b_adapter import E2BEgressAdapter
 from cayu.egress.proxy_exposure import ExposedProxy
+from cayu.workspaces import E2BWorkspace
 
 pytest.importorskip("cryptography")
 pytest.importorskip("e2b")
@@ -112,6 +113,7 @@ async def _drive() -> tuple[EgressScenarioEvidence, ...]:
         image=os.environ.get("CAYU_E2B_TEMPLATE", "base"),
         search_roots=("/home/user/workspace", "/tmp", "/etc/cayu", "/root"),
         response_id="cus_e2b",
+        workspace_factory=E2BWorkspace,
     )
 
 

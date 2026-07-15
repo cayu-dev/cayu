@@ -4,10 +4,12 @@ import asyncio
 import contextlib
 import importlib
 import posixpath
-from collections.abc import Callable, Mapping
+from abc import abstractmethod
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from math import isfinite
 from types import ModuleType
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.runners._cleanup import (
@@ -31,6 +33,8 @@ from cayu.runners.base import (
     ExecResult,
     Runner,
     RunnerUnavailableError,
+    RunnerWorkspaceCapability,
+    RunnerWorkspaceCapabilityT,
     attach_cancellation_artifacts,
 )
 
@@ -48,6 +52,60 @@ _MICROSANDBOX_UNAVAILABLE_REMEDIATION = (
 )
 
 MicrosandboxCloseAction = Literal["remove", "stop", "detach", "none"]
+
+
+class MicrosandboxWorkspaceCapability(RunnerWorkspaceCapability):
+    """Native Microsandbox filesystem access without runner lifecycle authority."""
+
+    @property
+    @abstractmethod
+    def sandbox_name(self) -> str:
+        """Provider sandbox name used for truthful workspace identity."""
+
+    @abstractmethod
+    async def list_entries(self, path: str) -> Sequence[MicrosandboxWorkspaceEntry]:
+        """List normalized Cayu-owned entries for one guest directory."""
+
+    @abstractmethod
+    async def real_path(self, path: str) -> str:
+        """Resolve a canonical guest path through the provider transport."""
+
+
+class _MicrosandboxWorkspaceCapability(MicrosandboxWorkspaceCapability):
+    def __init__(self, runner: MicrosandboxRunner) -> None:
+        self._runner = runner
+
+    @property
+    def sandbox_name(self) -> str:
+        return self._runner.name
+
+    @property
+    def resource_key(self) -> tuple[object, ...]:
+        return ("microsandbox", self._runner.name)
+
+    async def list_entries(self, path: str) -> Sequence[MicrosandboxWorkspaceEntry]:
+        entries = await self._runner.filesystem().list(path)
+        return tuple(MicrosandboxWorkspaceEntry.from_provider_entry(entry) for entry in entries)
+
+    async def real_path(self, path: str) -> str:
+        return await self._runner.real_path(path)
+
+
+@dataclass(frozen=True)
+class MicrosandboxWorkspaceEntry:
+    """Cayu-owned normalized view of one Microsandbox filesystem entry."""
+
+    path: str | None
+    kind: str | None
+
+    @classmethod
+    def from_provider_entry(cls, entry: Any) -> MicrosandboxWorkspaceEntry:
+        path = getattr(entry, "path", None)
+        kind = getattr(entry, "kind", None)
+        return cls(
+            path=path if type(path) is str else None,
+            kind=kind if type(kind) is str else None,
+        )
 
 
 class MicrosandboxCleanupError(RuntimeError):
@@ -298,6 +356,19 @@ class MicrosandboxRunner(Runner):
             env_overlay=env_overlay,
             sandbox_module=module,
         )
+
+    @property
+    def resource_key(self) -> tuple[object, ...]:
+        return ("microsandbox", self.name)
+
+    def workspace_capability(
+        self,
+        capability_type: type[RunnerWorkspaceCapabilityT],
+    ) -> RunnerWorkspaceCapabilityT | None:
+        if capability_type is MicrosandboxWorkspaceCapability:
+            capability = _MicrosandboxWorkspaceCapability(self)
+            return cast("RunnerWorkspaceCapabilityT", capability)
+        return super().workspace_capability(capability_type)
 
     async def close(self) -> None:
         """Apply the configured lifecycle action once."""

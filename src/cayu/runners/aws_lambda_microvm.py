@@ -208,6 +208,11 @@ class LambdaMicroVMRunner(Runner):
     """Execute commands through a Cayu sidecar in an AWS Lambda MicroVM."""
 
     isolation = "lambda-microvm"
+
+    @property
+    def resource_key(self) -> tuple[object, ...]:
+        return ("lambda-microvm", self.microvm_id)
+
     default_cwd = DEFAULT_LAMBDA_MICROVM_CWD
 
     def __init__(

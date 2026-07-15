@@ -22,6 +22,7 @@ from cayu.runners.base import (
     Runner,
     RunnerCancelledError,
     RunnerUnavailableError,
+    RunnerWorkspaceCapability,
     attach_cancellation_artifacts,
 )
 from cayu.runners.docker import (
@@ -35,6 +36,8 @@ from cayu.runners.e2b import (
     E2B_SANDBOX_ID_MAX_BYTES,
     E2BCloseAction,
     E2BRunner,
+    E2BWorkspaceCapability,
+    E2BWorkspaceEntry,
 )
 from cayu.runners.local import LocalRunner
 from cayu.runners.microsandbox import (
@@ -47,6 +50,8 @@ from cayu.runners.microsandbox import (
     MicrosandboxCloseAction,
     MicrosandboxRunner,
     MicrosandboxUnavailableError,
+    MicrosandboxWorkspaceCapability,
+    MicrosandboxWorkspaceEntry,
 )
 from cayu.runners.sbx import (
     DEFAULT_SBX_CWD,
@@ -73,6 +78,8 @@ __all__ = [
     "DockerRunner",
     "E2BCloseAction",
     "E2BRunner",
+    "E2BWorkspaceCapability",
+    "E2BWorkspaceEntry",
     "ExecCommand",
     "ExecResult",
     "HttpxLambdaMicroVMEndpointTransport",
@@ -87,10 +94,13 @@ __all__ = [
     "MicrosandboxCloseAction",
     "MicrosandboxRunner",
     "MicrosandboxUnavailableError",
+    "MicrosandboxWorkspaceCapability",
+    "MicrosandboxWorkspaceEntry",
     "Runner",
     "RunnerCancelledError",
     "RunnerCleanupPolicy",
     "RunnerUnavailableError",
+    "RunnerWorkspaceCapability",
     "SbxCloseAction",
     "SbxRunner",
     "attach_cancellation_artifacts",

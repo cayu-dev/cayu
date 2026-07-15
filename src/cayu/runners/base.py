@@ -4,7 +4,7 @@ import asyncio
 import posixpath
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from typing import Any, Literal, Self
+from typing import Any, Literal, Self, TypeVar
 
 from pydantic import (
     BaseModel,
@@ -20,6 +20,26 @@ from cayu._validation import copy_json_value, require_nonblank
 from cayu.runners._cleanup import RunnerCleanupResult
 
 DEFAULT_EXEC_OUTPUT_LIMIT_BYTES = 1024 * 1024
+
+
+class RunnerWorkspaceCapability(ABC):
+    """Narrow provider capability used by a first-party native workspace.
+
+    Capability objects deliberately do not own runner lifecycle. A managed
+    runner can therefore expose native filesystem behavior without exposing
+    the raw provider runner or a second ``close()`` authority.
+    """
+
+    @property
+    @abstractmethod
+    def resource_key(self) -> tuple[object, ...]:
+        """Stable identity of the sandbox that backs this capability."""
+
+
+RunnerWorkspaceCapabilityT = TypeVar(
+    "RunnerWorkspaceCapabilityT",
+    bound=RunnerWorkspaceCapability,
+)
 
 
 class RunnerUnavailableError(RuntimeError):
@@ -193,6 +213,38 @@ class Runner(ABC):
         """Release the runner. The default implementation only marks it closed."""
 
         self._closed = True
+
+    @property
+    def resource_key(self) -> tuple[object, ...] | None:
+        """Stable identity of the runner-owned execution resource, when known."""
+
+        return None
+
+    @property
+    def is_closed(self) -> bool:
+        """Whether terminal runner finalization has completed."""
+
+        return self._closed
+
+    def workspace_capability(
+        self,
+        capability_type: type[RunnerWorkspaceCapabilityT],
+    ) -> RunnerWorkspaceCapabilityT | None:
+        """Return a narrow native-workspace capability, when supported.
+
+        The returned object has no lifecycle methods. Callers must continue to
+        finalize the owning runner or environment; they cannot close an
+        unmanaged provider runner through this composition path.
+        """
+
+        if not isinstance(capability_type, type) or not issubclass(
+            capability_type,
+            RunnerWorkspaceCapability,
+        ):
+            raise TypeError(
+                "Runner workspace capability type must derive from RunnerWorkspaceCapability."
+            )
+        return None
 
     def reopen_exec(self) -> None:
         """Clear a latched exec-closed state on an otherwise-open runner.
