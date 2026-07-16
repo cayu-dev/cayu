@@ -7,10 +7,11 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import TypeVar
+from typing import Generic, TypeVar
 
 from cayu._validation import require_clean_nonblank
 from cayu.core.events import Event, EventType
+from cayu.providers import ModelProviderError
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._session_queries import query_all_event_records
 from cayu.runtime.budgets import (
@@ -34,7 +35,6 @@ from cayu.runtime.budgets import (
     request_budget_limits_for_session,
 )
 from cayu.runtime.costs import SessionCostSummary, estimate_session_cost
-from cayu.runtime.model_steps import AssistantStepResult
 from cayu.runtime.sessions import EventQuery, EventRecord, Session, SessionStore
 from cayu.runtime.stop_policy import (
     RunLimits,
@@ -55,6 +55,7 @@ UNKNOWN_POST_DISPATCH_BUDGET_REASON = (
 )
 
 _OperationResultT = TypeVar("_OperationResultT")
+_StreamResultT = TypeVar("_StreamResultT")
 
 
 class BudgetReservationLeaseLost(RuntimeError):
@@ -96,8 +97,8 @@ def budget_heartbeat_task_failure(task: asyncio.Task[None]) -> BaseException:
 
 
 async def _next_model_step_item(
-    iterator: AsyncIterator[tuple[Event | None, AssistantStepResult | None]],
-) -> tuple[Event | None, AssistantStepResult | None]:
+    iterator: AsyncIterator[tuple[Event | None, _StreamResultT | None]],
+) -> tuple[Event | None, _StreamResultT | None]:
     return await anext(iterator)
 
 
@@ -187,6 +188,34 @@ class OperationReservationSetup:
 class OperationBudgetCheck:
     limit: BudgetLimit
     check: BudgetCheck
+
+
+@dataclass(frozen=True)
+class BudgetedOperationSucceeded(Generic[_OperationResultT]):
+    result: _OperationResultT
+    events: tuple[Event, ...]
+
+
+@dataclass(frozen=True)
+class BudgetedOperationRejected:
+    failure: BudgetReservationResult
+    events: tuple[Event, ...]
+
+
+@dataclass(frozen=True)
+class BudgetedOperationFailed:
+    error: BaseException
+    cause: BaseException | None
+    events: tuple[Event, ...]
+
+
+@dataclass
+class _BudgetedOperationLifecycle:
+    reservations: list[BudgetStepReservation] = field(default_factory=list)
+    events: list[Event] = field(default_factory=list)
+    provider_dispatch_started: bool = False
+    settled: bool = False
+    predispatch_release_reason: str = "context compaction reservation lost before provider dispatch"
 
 
 @dataclass(frozen=True)
@@ -622,18 +651,12 @@ class RunLimitController:
         budget_policy: BudgetPolicy | None,
         request_budget_limits: tuple[BudgetLimit, ...] = (),
     ) -> BudgetReservationSetup:
-        limits = [
-            limit
-            for limit in (
-                *budget_limits_for_session(
-                    policy=budget_policy,
-                    agent_name=agent_name,
-                    causal_budget_id=session.causal_budget_id,
-                ),
-                *request_budget_limits,
-            )
-            if limit.reservation is not None
-        ]
+        limits = self.provider_reservation_limits(
+            session=session,
+            agent_name=agent_name,
+            budget_policy=budget_policy,
+            request_budget_limits=request_budget_limits,
+        )
         if not limits:
             return BudgetReservationSetup((), None, (), None)
 
@@ -707,6 +730,27 @@ class RunLimitController:
                 reservation_exc,
             )
         return BudgetReservationSetup(tuple(reservations), None, tuple(emitted_events), None)
+
+    def provider_reservation_limits(
+        self,
+        *,
+        session: Session,
+        agent_name: str,
+        budget_policy: BudgetPolicy | None,
+        request_budget_limits: tuple[BudgetLimit, ...] = (),
+    ) -> tuple[BudgetLimit, ...]:
+        return tuple(
+            limit
+            for limit in (
+                *budget_limits_for_session(
+                    policy=budget_policy,
+                    agent_name=agent_name,
+                    causal_budget_id=session.causal_budget_id,
+                ),
+                *request_budget_limits,
+            )
+            if limit.reservation is not None
+        )
 
     async def reconcile_dispatched_reservations(
         self,
@@ -869,11 +913,11 @@ class RunLimitController:
 
     async def model_step_events_with_heartbeat(
         self,
-        model_step_events: AsyncIterator[tuple[Event | None, AssistantStepResult | None]],
+        model_step_events: AsyncIterator[tuple[Event | None, _StreamResultT | None]],
         *,
         reservations: list[BudgetStepReservation],
         lifecycle: BudgetModelStepLifecycle,
-    ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
+    ) -> AsyncIterator[tuple[Event | None, _StreamResultT | None]]:
         ttl_seconds = self._budget_ledger.reservation_ttl_seconds
         if not reservations or ttl_seconds is None:
             async for item in model_step_events:
@@ -888,7 +932,7 @@ class RunLimitController:
             )
         )
         iterator = model_step_events.__aiter__()
-        next_item_task: asyncio.Task[tuple[Event | None, AssistantStepResult | None]] | None = None
+        next_item_task: asyncio.Task[tuple[Event | None, _StreamResultT | None]] | None = None
         exhausted = False
         try:
             while True:
@@ -907,7 +951,7 @@ class RunLimitController:
                 )
                 if heartbeat_task in done:
                     heartbeat_failure = budget_heartbeat_task_failure(heartbeat_task)
-                    completed_item: tuple[Event | None, AssistantStepResult | None] | None = None
+                    completed_item: tuple[Event | None, _StreamResultT | None] | None = None
                     provider_failure: Exception | None = None
                     if not next_item_task.done():
                         next_item_task.cancel()
@@ -1011,15 +1055,15 @@ class RunLimitController:
     ) -> tuple[_OperationResultT, BaseException | None]:
         if not reservations:
             return await operation(), None
+        ttl_seconds = self._budget_ledger.reservation_ttl_seconds
+        if ttl_seconds is None:
+            return await operation(), None
         try:
             await self.renew_reservations(reservations)
         except BudgetReservationLeaseLost as exc:
             raise BudgetReservationLeaseLostBeforeModelDispatch(
                 lease_lost_before_dispatch_message
             ) from exc
-        ttl_seconds = self._budget_ledger.reservation_ttl_seconds
-        if ttl_seconds is None:
-            return await operation(), None
 
         async def await_operation() -> _OperationResultT:
             return await operation()
@@ -1083,6 +1127,359 @@ class RunLimitController:
                 heartbeat_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await heartbeat_task
+
+    async def run_automatic_compaction_dispatch(
+        self,
+        operation: Callable[[], Awaitable[_OperationResultT]],
+        *,
+        completed_events: Callable[[], list[Event]],
+        budget_limits: tuple[BudgetLimit, ...],
+        session: Session,
+        agent_name: str,
+        environment_name: str | None,
+        provider_name: str,
+        model: str,
+        authoritative_failure_types: tuple[type[BaseException], ...],
+    ) -> (
+        BudgetedOperationSucceeded[_OperationResultT]
+        | BudgetedOperationRejected
+        | BudgetedOperationFailed
+    ):
+        """Run one observable compactor dispatch under strict budget accounting."""
+
+        lifecycle = _BudgetedOperationLifecycle()
+        result: _OperationResultT | None = None
+        reservation_failure: BudgetReservationResult | None = None
+        authoritative_failure: BaseException | None = None
+        authoritative_cause: BaseException | None = None
+        lease_failure: BaseException | None = None
+
+        try:
+            setup = await self.reserve_operation_budgets(
+                budget_limits=budget_limits,
+                session_id=session.id,
+                agent_name=agent_name,
+                provider_name=provider_name,
+                model=model,
+                rejection_release_reason="reservation failed",
+                accepted_record_error=(
+                    "Accepted automatic compaction budget reservation has no record."
+                ),
+            )
+            lifecycle.reservations.extend(setup.reservations)
+            for reservation_result in setup.results:
+                lifecycle.events.append(
+                    await self._event_writer.emit(
+                        Event(
+                            type=(
+                                EventType.BUDGET_RESERVED
+                                if reservation_result.accepted
+                                else EventType.BUDGET_RESERVATION_FAILED
+                            ),
+                            session_id=session.id,
+                            agent_name=agent_name,
+                            environment_name=environment_name,
+                            payload=budget_reservation_payload(reservation_result),
+                        )
+                    )
+                )
+            for reconciliation in setup.releases:
+                lifecycle.events.append(
+                    await self._event_writer.emit(
+                        Event(
+                            type=EventType.BUDGET_RESERVATION_RELEASED,
+                            session_id=session.id,
+                            agent_name=agent_name,
+                            environment_name=environment_name,
+                            payload=budget_reconciliation_payload(reconciliation),
+                        )
+                    )
+                )
+            if setup.error is not None:
+                raise setup.error
+            if setup.failure is not None:
+                reservation_failure = setup.failure
+            else:
+
+                async def run_dispatched_operation() -> _OperationResultT:
+                    lifecycle.provider_dispatch_started = True
+                    return await operation()
+
+                result, lease_failure = await self.run_operation_with_reservation_heartbeat(
+                    run_dispatched_operation,
+                    reservations=lifecycle.reservations,
+                    authoritative_failure_types=authoritative_failure_types,
+                    lease_lost_before_dispatch_message=(
+                        "Compaction budget reservation lease was lost before provider dispatch."
+                    ),
+                    authoritative_failure_note=(
+                        "Budget reservation lease was also lost as compaction failed"
+                    ),
+                    concurrent_failure_note=(
+                        "Compactor also failed while reservation lease loss was handled"
+                    ),
+                )
+        except BaseException as exc:
+            authoritative_failure = exc
+            authoritative_cause = exc.__cause__
+            if not lifecycle.provider_dispatch_started:
+                lifecycle.predispatch_release_reason = (
+                    "reservation setup cancelled"
+                    if isinstance(exc, asyncio.CancelledError)
+                    else "reservation setup failed"
+                )
+
+        completion_events: list[Event] = []
+        if lifecycle.provider_dispatch_started:
+            try:
+                completion_events = completed_events()
+            except BaseException as evidence_failure:
+                if authoritative_failure is None:
+                    authoritative_failure = evidence_failure
+                    authoritative_cause = evidence_failure.__cause__
+                else:
+                    authoritative_failure.add_note(
+                        "Automatic compaction completion evidence also failed: "
+                        f"{type(evidence_failure).__name__}: {evidence_failure}"
+                    )
+
+        (
+            settlement_cancellation,
+            settlement_failure,
+        ) = await self._settle_budgeted_operation_resisting_cancellation(
+            lifecycle=lifecycle,
+            completed_events=completion_events,
+            session=session,
+            agent_name=agent_name,
+            environment_name=environment_name,
+        )
+
+        if settlement_cancellation is not None:
+            propagated_cancellation = (
+                authoritative_failure
+                if isinstance(authoritative_failure, asyncio.CancelledError)
+                else settlement_cancellation
+            )
+            cancellation_cause: BaseException | None = None
+            if settlement_failure is not None:
+                propagated_cancellation.add_note(
+                    "Automatic compaction budget settlement also failed: "
+                    f"{type(settlement_failure).__name__}: {settlement_failure}"
+                )
+                cancellation_cause = settlement_failure
+            elif (
+                authoritative_failure is not None
+                and authoritative_failure is not propagated_cancellation
+            ):
+                propagated_cancellation.add_note(
+                    "Automatic compaction had already failed before cancellation: "
+                    f"{type(authoritative_failure).__name__}: {authoritative_failure}"
+                )
+                cancellation_cause = authoritative_failure
+            return BudgetedOperationFailed(
+                error=propagated_cancellation,
+                cause=cancellation_cause,
+                events=tuple(lifecycle.events),
+            )
+
+        if settlement_failure is not None:
+            if authoritative_failure is not None:
+                authoritative_failure.__dict__["_cayu_compaction_budget_settlement_failed"] = True
+                if isinstance(authoritative_failure, ModelProviderError):
+                    authoritative_failure.retryable = False
+                authoritative_failure.add_note(
+                    "Automatic compaction budget settlement also failed: "
+                    f"{type(settlement_failure).__name__}: {settlement_failure}"
+                )
+                return BudgetedOperationFailed(
+                    error=authoritative_failure,
+                    cause=settlement_failure,
+                    events=tuple(lifecycle.events),
+                )
+            return BudgetedOperationFailed(
+                error=settlement_failure,
+                cause=None,
+                events=tuple(lifecycle.events),
+            )
+
+        if authoritative_failure is not None:
+            return BudgetedOperationFailed(
+                error=authoritative_failure,
+                cause=authoritative_cause,
+                events=tuple(lifecycle.events),
+            )
+        if lease_failure is not None:
+            return BudgetedOperationFailed(
+                error=lease_failure,
+                cause=lease_failure.__cause__,
+                events=tuple(lifecycle.events),
+            )
+        if reservation_failure is not None:
+            return BudgetedOperationRejected(
+                failure=reservation_failure,
+                events=tuple(lifecycle.events),
+            )
+        if result is None:
+            return BudgetedOperationFailed(
+                error=RuntimeError("Automatic compaction completed without a result."),
+                cause=None,
+                events=tuple(lifecycle.events),
+            )
+        return BudgetedOperationSucceeded(result=result, events=tuple(lifecycle.events))
+
+    async def _settle_budgeted_operation_resisting_cancellation(
+        self,
+        *,
+        lifecycle: _BudgetedOperationLifecycle,
+        completed_events: list[Event],
+        session: Session,
+        agent_name: str,
+        environment_name: str | None,
+    ) -> tuple[asyncio.CancelledError | None, BaseException | None]:
+        settlement_task = asyncio.create_task(
+            self._settle_budgeted_operation(
+                lifecycle=lifecycle,
+                completed_events=completed_events,
+                session=session,
+                agent_name=agent_name,
+                environment_name=environment_name,
+            )
+        )
+        cancellation: asyncio.CancelledError | None = None
+        settlement_failure: BaseException | None = None
+        while not settlement_task.done():
+            try:
+                await asyncio.shield(settlement_task)
+            except asyncio.CancelledError as exc:
+                if settlement_task.cancelled():
+                    settlement_failure = exc
+                    break
+                if cancellation is None:
+                    cancellation = exc
+            except BaseException as exc:
+                settlement_failure = exc
+                break
+        if settlement_failure is None:
+            try:
+                settlement_task.result()
+            except BaseException as exc:
+                settlement_failure = exc
+        return cancellation, settlement_failure
+
+    async def _settle_budgeted_operation(
+        self,
+        *,
+        lifecycle: _BudgetedOperationLifecycle,
+        completed_events: list[Event],
+        session: Session,
+        agent_name: str,
+        environment_name: str | None,
+    ) -> None:
+        if lifecycle.settled:
+            return
+        if not lifecycle.reservations:
+            lifecycle.settled = True
+            return
+        settlement_failures: list[tuple[str, Exception]] = []
+
+        def raise_settlement_failure() -> None:
+            if not settlement_failures:
+                return
+            first_reservation_id, first_failure = settlement_failures[0]
+            first_failure.add_note(
+                "Automatic compaction budget settlement failed for reservation "
+                f"{first_reservation_id}."
+            )
+            for reservation_id, failure in settlement_failures[1:]:
+                first_failure.add_note(
+                    "Additional automatic compaction budget settlement failure for "
+                    f"reservation {reservation_id}: {type(failure).__name__}: {failure}"
+                )
+            raise first_failure
+
+        if not lifecycle.provider_dispatch_started:
+            for reservation in list(lifecycle.reservations):
+                try:
+                    working_reservations = [reservation]
+                    async for reconciliation in self.release_operation_reservations(
+                        working_reservations,
+                        reason=lifecycle.predispatch_release_reason,
+                    ):
+                        lifecycle.events.append(
+                            await self._event_writer.emit(
+                                Event(
+                                    type=EventType.BUDGET_RESERVATION_RELEASED,
+                                    session_id=session.id,
+                                    agent_name=agent_name,
+                                    environment_name=environment_name,
+                                    payload=budget_reconciliation_payload(reconciliation),
+                                )
+                            )
+                        )
+                except Exception as exc:
+                    settlement_failures.append((reservation.record.reservation_id, exc))
+            lifecycle.settled = True
+            raise_settlement_failure()
+            return
+
+        for reservation in list(lifecycle.reservations):
+            try:
+                priced_actuals = []
+                uncertain_completion_count = 0
+                for event in completed_events:
+                    try:
+                        priced_actuals.append(
+                            budget_actual_cost_for_event(limit=reservation.limit, event=event)
+                        )
+                    except ValueError:
+                        uncertain_completion_count += 1
+                if not completed_events:
+                    actual_amount = reservation.record.reserved_amount
+                    reason = (
+                        "automatic context compaction dispatch has uncertain usage; "
+                        "charged reserved amount"
+                    )
+                else:
+                    actual_amount = sum(
+                        (priced.amount for priced in priced_actuals),
+                        start=(reservation.record.reserved_amount * uncertain_completion_count),
+                    )
+                    if uncertain_completion_count:
+                        reason = (
+                            "automatic context compaction completed with partially uncertain "
+                            "usage; charged known cost plus reserved amount per uncertain "
+                            "completion"
+                        )
+                    else:
+                        reason = "automatic context compaction model completed"
+                reconciliation = await self._budget_ledger.reconcile(
+                    reservation_id=reservation.record.reservation_id,
+                    actual_amount=actual_amount,
+                    reason=reason,
+                    occurred_at=(
+                        completed_events[-1].timestamp if completed_events else self._clock()
+                    ),
+                )
+                if len(completed_events) == 1 and len(priced_actuals) == 1:
+                    reconciliation = budget_reconciliation_with_pricing(
+                        reconciliation,
+                        priced_actuals[0].line_item,
+                    )
+                lifecycle.events.append(
+                    await self._event_writer.emit(
+                        Event(
+                            type=EventType.BUDGET_RECONCILED,
+                            session_id=session.id,
+                            agent_name=agent_name,
+                            environment_name=environment_name,
+                            payload=budget_reconciliation_payload(reconciliation),
+                        )
+                    )
+                )
+            except Exception as exc:
+                settlement_failures.append((reservation.record.reservation_id, exc))
+        lifecycle.settled = True
+        raise_settlement_failure()
 
     async def reserve_operation_budgets(
         self,

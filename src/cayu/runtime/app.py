@@ -131,6 +131,8 @@ from cayu.runtime._model_errors import model_provider_error_from_payload
 from cayu.runtime._run_limits import (
     UNKNOWN_POST_DISPATCH_BUDGET_REASON,
     BudgetDispatchReservationFailed,
+    BudgetedOperationRejected,
+    BudgetedOperationSucceeded,
     BudgetEvaluation,
     BudgetModelStepLifecycle,
     BudgetReservationLeaseLost,
@@ -184,8 +186,11 @@ from cayu.runtime.budgets import (
 )
 from cayu.runtime.context import (
     CheckpointCompactionContextPolicy,
+    CompactionRequest,
+    CompactionResult,
     ContextBuildError,
     ContextCompactionTelemetry,
+    ContextCompactor,
     ContextKnowledgeTelemetry,
     ContextPolicy,
     ContextPressureEstimate,
@@ -194,6 +199,8 @@ from cayu.runtime.context import (
     ContextUsageState,
     DefaultContextPolicy,
     RuntimeManagedContextPolicy,
+    _automatic_compaction_dispatch_runner_scope,
+    _automatic_compaction_runner_scope,
     copy_context_messages,
     estimate_context_pressure,
     estimate_model_request_context_pressure,
@@ -444,6 +451,24 @@ class _ContextPressureObservation:
 
 
 @dataclass(frozen=True)
+class _ModelStepFlowOutcome:
+    assistant_step_result: AssistantStepResult | None = None
+    stop_session: bool = False
+
+    def __post_init__(self) -> None:
+        if self.stop_session == (self.assistant_step_result is not None):
+            raise ValueError(
+                "A model-step flow outcome must contain either a result or a stop signal."
+            )
+
+
+class _AutomaticCompactionBudgetReservationFailed(RuntimeError):
+    def __init__(self, result: BudgetReservationResult) -> None:
+        super().__init__(f"Context compaction budget reservation failed: {result.message}")
+        self.result = result
+
+
+@dataclass(frozen=True)
 class _EnvironmentBindingResult:
     registered_environment: runtime_records.RegisteredEnvironment | None
     events: list[Event]
@@ -507,6 +532,14 @@ _ABANDONED_RUN_REASON = "event_stream_closed"
 # persisted on PendingToolApproval (the historical ToolApprovalRequest default).
 _DEFAULT_APPROVAL_MAX_STEPS = 16
 DEFAULT_MAX_PARALLEL_TOOL_CALLS = 4
+
+
+def _has_provider_backed_context_compaction(
+    compaction_telemetry: list[ContextCompactionTelemetry],
+) -> bool:
+    return any(
+        telemetry.event_type == EventType.MODEL_COMPLETED for telemetry in compaction_telemetry
+    )
 
 
 class _InterruptGuard:
@@ -6437,6 +6470,28 @@ class CayuApp:
                     yield event
                 if limit_evaluation.decision is not None:
                     return
+                compaction_budget_events: list[Event] = []
+
+                async def run_automatic_compaction(
+                    compactor: ContextCompactor,
+                    compaction_request: CompactionRequest,
+                    execute: Callable[[], Awaitable[CompactionResult]],
+                    completed_payloads: Callable[[], list[dict[str, Any]]],
+                    budget_event_buffer: list[Event] = compaction_budget_events,
+                    model_session: Session = session,
+                ) -> CompactionResult:
+                    return await self._run_automatic_compaction_with_budget(
+                        compactor=compactor,
+                        compaction_request=compaction_request,
+                        execute=execute,
+                        completed_payloads=completed_payloads,
+                        budget_events=budget_event_buffer,
+                        session=model_session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        request_budget_limits=budget_limits,
+                    )
+
                 try:
                     (
                         context_messages,
@@ -6484,8 +6539,11 @@ class CayuApp:
                             thinking=effective_thinking,
                             step=step,
                         ),
+                        run_compaction=run_automatic_compaction,
                     )
                 except ContextBuildError as exc:
+                    for budget_event in compaction_budget_events:
+                        yield budget_event
                     for telemetry in exc.compaction_telemetry:
                         yield await self._event_writer.emit(
                             _context_compaction_telemetry_event(
@@ -6522,7 +6580,26 @@ class CayuApp:
                                 payload=exc.checkpoint_event_payload,
                             )
                         )
+                    if isinstance(
+                        exc.cause,
+                        _AutomaticCompactionBudgetReservationFailed,
+                    ):
+                        async for event in self._stop_session_for_budget_reservation_failed(
+                            session=session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            environment_name=environment_name,
+                            result=exc.cause.result,
+                            messages=messages,
+                            run_started_at=run_started_at,
+                            turn_usage_tracker=turn_usage_tracker,
+                            active_run=active_run,
+                        ):
+                            yield event
+                        return
                     raise exc.cause from exc
+                for budget_event in compaction_budget_events:
+                    yield budget_event
                 for telemetry in context_compaction_telemetry:
                     yield await self._event_writer.emit(
                         _context_compaction_telemetry_event(
@@ -6560,6 +6637,39 @@ class CayuApp:
                         )
                     )
                 await self._session_control.raise_if_interrupted(session.id)
+
+                if _has_provider_backed_context_compaction(context_compaction_telemetry):
+                    budget_evaluation = await limit_gate.evaluate_budget(self.budget_policy)
+                    async for event in self._apply_budget_evaluation(
+                        evaluation=budget_evaluation,
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=environment_name,
+                        messages=messages,
+                        run_started_at=run_started_at,
+                        turn_usage_tracker=turn_usage_tracker,
+                        active_run=active_run,
+                    ):
+                        yield event
+                    if budget_evaluation.check is not None:
+                        return
+
+                    limit_evaluation = await limit_gate.evaluate_limits()
+                    async for event in self._apply_limit_evaluation(
+                        evaluation=limit_evaluation,
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=environment_name,
+                        messages=messages,
+                        run_started_at=run_started_at,
+                        turn_usage_tracker=turn_usage_tracker,
+                        active_run=active_run,
+                    ):
+                        yield event
+                    if limit_evaluation.decision is not None:
+                        return
 
                 model_request = await self._build_model_request(
                     session=session,
@@ -6659,13 +6769,13 @@ class CayuApp:
                 budget_model_step_lifecycle = BudgetModelStepLifecycle()
                 budget_model_step_lifecycle.prepare_provider_dispatch(budget_reservations)
 
-                async def prepare_provider_dispatch(
+                async def settle_provider_dispatch(
                     lifecycle: BudgetModelStepLifecycle = budget_model_step_lifecycle,
                     reservations: list[BudgetStepReservation] = budget_reservations,
                     model_session: Session = session,
-                ) -> tuple[list[Event], BudgetReservationResult | None, Exception | None]:
+                ) -> tuple[list[Event], Exception | None]:
                     if lifecycle.pending_reservations is not None:
-                        return [], None, None
+                        return [], None
                     settlement_events: list[Event] = []
                     try:
                         async for (
@@ -6680,6 +6790,18 @@ class CayuApp:
                         ):
                             settlement_events.append(event)
                     except Exception as settlement_error:
+                        return settlement_events, settlement_error
+                    return settlement_events, None
+
+                async def prepare_provider_dispatch(
+                    lifecycle: BudgetModelStepLifecycle = budget_model_step_lifecycle,
+                    reservations: list[BudgetStepReservation] = budget_reservations,
+                    model_session: Session = session,
+                ) -> tuple[list[Event], BudgetReservationResult | None, Exception | None]:
+                    if lifecycle.pending_reservations is not None:
+                        return [], None, None
+                    settlement_events, settlement_error = await settle_provider_dispatch()
+                    if settlement_error is not None:
                         return settlement_events, None, settlement_error
                     retry_setup = await self._run_limit_controller.reserve_for_model_step(
                         session=model_session,
@@ -6715,6 +6837,7 @@ class CayuApp:
                         lifecycle=lifecycle,
                     )
 
+                model_step_flow_outcome: _ModelStepFlowOutcome | None = None
                 try:
                     model_step_events = self._run_model_step_with_context_overflow_recovery(
                         provider=provider,
@@ -6731,9 +6854,16 @@ class CayuApp:
                         request_metadata=request_metadata,
                         step=step,
                         retry_policy=retry_policy,
+                        request_budget_limits=budget_limits,
                         transcript_cursor_before_request=len(messages),
+                        limit_gate=limit_gate,
+                        record_model_completion=budget_model_step_lifecycle.record_model_completion,
+                        settle_provider_dispatch=settle_provider_dispatch,
                         prepare_provider_dispatch=prepare_provider_dispatch,
                         before_provider_dispatch=before_provider_dispatch,
+                        run_started_at=run_started_at,
+                        turn_usage_tracker=turn_usage_tracker,
+                        active_run=active_run,
                     )
                     guarded_model_step_events = (
                         self._run_limit_controller.model_step_events_with_heartbeat(
@@ -6742,15 +6872,19 @@ class CayuApp:
                             lifecycle=budget_model_step_lifecycle,
                         )
                     )
-                    async for event, result in guarded_model_step_events:
+                    async for event, flow_outcome in guarded_model_step_events:
                         if event is not None:
-                            if event.type == EventType.MODEL_COMPLETED:
-                                budget_model_step_lifecycle.record_model_completion(event)
                             yield event
-                        if result is not None:
-                            assistant_step_result = result
-                            assistant_message = result.assistant_message
-                            tool_calls = result.tool_calls
+                        if flow_outcome is not None:
+                            if model_step_flow_outcome is not None:
+                                raise RuntimeError(
+                                    "Model step produced more than one terminal flow outcome."
+                                )
+                            model_step_flow_outcome = flow_outcome
+                            if flow_outcome.assistant_step_result is not None:
+                                assistant_step_result = flow_outcome.assistant_step_result
+                                assistant_message = assistant_step_result.assistant_message
+                                tool_calls = assistant_step_result.tool_calls
                 except GeneratorExit as authoritative_exc:
                     async for _ in self._run_limit_controller.settlement_events_preserving_failure(
                         self._run_limit_controller.settle_after_model_failure(
@@ -6879,6 +7013,10 @@ class CayuApp:
                         unknown_reason=UNKNOWN_POST_DISPATCH_BUDGET_REASON,
                     ):
                         yield event
+                if model_step_flow_outcome is None:
+                    raise RuntimeError("Model step finished without a terminal flow outcome.")
+                if model_step_flow_outcome.stop_session:
+                    return
 
                 pending_tool_round: tool_round_recovery.PendingToolRound | None = None
                 if assistant_message is not None:
@@ -7828,13 +7966,40 @@ class CayuApp:
         request_metadata: dict[str, Any],
         step: int,
         retry_policy: RetryPolicy,
+        request_budget_limits: tuple[BudgetLimit, ...],
         transcript_cursor_before_request: int,
+        limit_gate: RunLimitGate,
+        record_model_completion: Callable[[Event], None],
+        settle_provider_dispatch: Callable[[], Awaitable[tuple[list[Event], Exception | None]]],
         prepare_provider_dispatch: Callable[
             [], Awaitable[tuple[list[Event], BudgetReservationResult | None, Exception | None]]
         ],
         before_provider_dispatch: Callable[[], Awaitable[None]],
-    ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
+        run_started_at: float,
+        turn_usage_tracker: SessionUsageTracker | None,
+        active_run: ActiveSessionRun[SessionUsageTracker] | None,
+    ) -> AsyncIterator[tuple[Event | None, _ModelStepFlowOutcome | None]]:
         overflow_policy = registered_agent.context_overflow_policy
+        compaction_budget_events: list[Event] = []
+
+        async def run_automatic_compaction(
+            compactor: ContextCompactor,
+            compaction_request: CompactionRequest,
+            execute: Callable[[], Awaitable[CompactionResult]],
+            completed_payloads: Callable[[], list[dict[str, Any]]],
+        ) -> CompactionResult:
+            return await self._run_automatic_compaction_with_budget(
+                compactor=compactor,
+                compaction_request=compaction_request,
+                execute=execute,
+                completed_payloads=completed_payloads,
+                budget_events=compaction_budget_events,
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                request_budget_limits=request_budget_limits,
+            )
+
         try:
             async for event, result in self._run_model_step_with_retries(
                 provider=provider,
@@ -7846,10 +8011,18 @@ class CayuApp:
                 step=step,
                 retry_policy=retry_policy,
                 transcript_cursor_before_request=transcript_cursor_before_request,
+                record_model_completion=record_model_completion,
                 prepare_provider_dispatch=prepare_provider_dispatch,
                 before_provider_dispatch=before_provider_dispatch,
             ):
-                yield event, result
+                yield (
+                    event,
+                    (
+                        _ModelStepFlowOutcome(assistant_step_result=result)
+                        if result is not None
+                        else None
+                    ),
+                )
             return
         except ModelContextOverflowError as exc:
             if overflow_policy is None:
@@ -7920,9 +8093,12 @@ class CayuApp:
                     thinking=thinking,
                     step=step,
                 ),
+                run_compaction=run_automatic_compaction,
                 force_bounded_compaction=True,
             )
         except ContextBuildError as build_exc:
+            for budget_event in compaction_budget_events:
+                yield budget_event, None
             for telemetry in build_exc.compaction_telemetry:
                 yield (
                     await self._event_writer.emit(
@@ -7968,6 +8144,29 @@ class CayuApp:
                     ),
                     None,
                 )
+            if isinstance(
+                build_exc.cause,
+                _AutomaticCompactionBudgetReservationFailed,
+            ):
+                settlement_events, settlement_error = await settle_provider_dispatch()
+                for settlement_event in settlement_events:
+                    yield settlement_event, None
+                if settlement_error is not None:
+                    raise settlement_error from build_exc.cause
+                async for event in self._stop_session_for_budget_reservation_failed(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=environment_name,
+                    result=build_exc.cause.result,
+                    messages=messages,
+                    run_started_at=run_started_at,
+                    turn_usage_tracker=turn_usage_tracker,
+                    active_run=active_run,
+                ):
+                    yield event, None
+                yield None, _ModelStepFlowOutcome(stop_session=True)
+                return
             yield (
                 await self._event_writer.emit(
                     Event(
@@ -7987,6 +8186,8 @@ class CayuApp:
                 None,
             )
             raise build_exc.cause from build_exc
+        for budget_event in compaction_budget_events:
+            yield budget_event, None
         for telemetry in context_compaction_telemetry:
             yield (
                 await self._event_writer.emit(
@@ -8031,6 +8232,48 @@ class CayuApp:
                 None,
             )
 
+        await self._session_control.raise_if_interrupted(session.id)
+        if _has_provider_backed_context_compaction(context_compaction_telemetry):
+            settlement_events, settlement_error = await settle_provider_dispatch()
+            for settlement_event in settlement_events:
+                yield settlement_event, None
+            if settlement_error is not None:
+                raise settlement_error
+
+            budget_evaluation = await limit_gate.evaluate_budget(self.budget_policy)
+            async for gate_event in self._apply_budget_evaluation(
+                evaluation=budget_evaluation,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                environment_name=environment_name,
+                messages=messages,
+                run_started_at=run_started_at,
+                turn_usage_tracker=turn_usage_tracker,
+                active_run=active_run,
+            ):
+                yield gate_event, None
+            if budget_evaluation.check is not None:
+                yield None, _ModelStepFlowOutcome(stop_session=True)
+                return
+
+            limit_evaluation = await limit_gate.evaluate_limits()
+            async for gate_event in self._apply_limit_evaluation(
+                evaluation=limit_evaluation,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                environment_name=environment_name,
+                messages=messages,
+                run_started_at=run_started_at,
+                turn_usage_tracker=turn_usage_tracker,
+                active_run=active_run,
+            ):
+                yield gate_event, None
+            if limit_evaluation.decision is not None:
+                yield None, _ModelStepFlowOutcome(stop_session=True)
+                return
+
         recovery_request = await self._build_model_request(
             session=session,
             registered_agent=registered_agent,
@@ -8068,10 +8311,18 @@ class CayuApp:
                 step=step,
                 retry_policy=retry_policy,
                 transcript_cursor_before_request=transcript_cursor_before_request,
+                record_model_completion=record_model_completion,
                 prepare_provider_dispatch=prepare_provider_dispatch,
                 before_provider_dispatch=before_provider_dispatch,
             ):
-                yield event, result
+                yield (
+                    event,
+                    (
+                        _ModelStepFlowOutcome(assistant_step_result=result)
+                        if result is not None
+                        else None
+                    ),
+                )
         except ModelContextOverflowError as exc:
             yield (
                 await self._event_writer.emit(
@@ -8105,6 +8356,7 @@ class CayuApp:
         step: int,
         retry_policy: RetryPolicy,
         transcript_cursor_before_request: int,
+        record_model_completion: Callable[[Event], None],
         prepare_provider_dispatch: Callable[
             [], Awaitable[tuple[list[Event], BudgetReservationResult | None, Exception | None]]
         ],
@@ -8206,6 +8458,8 @@ class CayuApp:
                     before_provider_dispatch=before_provider_dispatch,
                 ):
                     if event is not None:
+                        if event.type == EventType.MODEL_COMPLETED:
+                            record_model_completion(event)
                         yield event, None
                         if (
                             event.type == EventType.MODEL_COMPLETED
@@ -8650,6 +8904,102 @@ class CayuApp:
         if decision.delay_seconds > 0:
             await asyncio.sleep(decision.delay_seconds)
         await self._session_control.raise_if_interrupted(session_id)
+
+    async def _run_automatic_compaction_with_budget(
+        self,
+        *,
+        compactor: ContextCompactor,
+        compaction_request: CompactionRequest,
+        execute: Callable[[], Awaitable[CompactionResult]],
+        completed_payloads: Callable[[], list[dict[str, Any]]],
+        budget_events: list[Event],
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+        request_budget_limits: tuple[BudgetLimit, ...],
+    ) -> CompactionResult:
+        limits = self._run_limit_controller.provider_reservation_limits(
+            session=session,
+            agent_name=registered_agent.spec.name,
+            budget_policy=self.budget_policy,
+            request_budget_limits=request_budget_limits,
+        )
+        if not limits:
+            return await execute()
+
+        try:
+            identity = compactor._provider_budget_identity_for_request(compaction_request)
+        except NotImplementedError as exc:
+            raise RuntimeError(
+                "Automatic compaction with cost reservations requires the "
+                "ContextCompactor to declare provider_budget_identity(session), "
+                "returning provider/model or None for deterministic execution."
+            ) from exc
+        if identity is None:
+            return await execute()
+        if type(identity) is not tuple or len(identity) != 2:
+            raise TypeError(
+                "ContextCompactor.provider_budget_identity must return a "
+                "(provider_name, model) tuple or None."
+            )
+        require_clean_nonblank(identity[0], "compactor_provider_name")
+        require_clean_nonblank(identity[1], "compactor_model")
+        if not compactor._uses_runtime_provider_dispatch_runner_for_request(compaction_request):
+            raise RuntimeError(
+                "Automatic compaction with cost reservations cannot safely run "
+                f"opaque provider-backed compactor {type(compactor).__name__}: "
+                "Cayu cannot reserve each provider dispatch independently. Use an "
+                "unmodified built-in provider compactor or remove reservation-bearing "
+                "cost limits."
+            )
+
+        async def run_provider_dispatch(
+            actual_provider_name: str,
+            actual_model: str,
+            dispatch: Callable[[], Awaitable[tuple[str, dict[str, Any]]]],
+        ) -> tuple[str, dict[str, Any]]:
+            before_count = len(completed_payloads())
+
+            def dispatch_completed_payloads() -> list[dict[str, Any]]:
+                return completed_payloads()[before_count:]
+
+            def dispatch_completed_events() -> list[Event]:
+                return [
+                    Event(
+                        type=EventType.MODEL_COMPLETED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload=payload,
+                    )
+                    for payload in dispatch_completed_payloads()
+                ]
+
+            outcome = await self._run_limit_controller.run_automatic_compaction_dispatch(
+                dispatch,
+                completed_events=dispatch_completed_events,
+                budget_limits=limits,
+                session=session,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                provider_name=require_clean_nonblank(
+                    actual_provider_name,
+                    "compactor_provider_name",
+                ),
+                model=require_clean_nonblank(actual_model, "compactor_model"),
+                authoritative_failure_types=(ContextBuildError,),
+            )
+            budget_events.extend(outcome.events)
+            if isinstance(outcome, BudgetedOperationSucceeded):
+                return cast("tuple[str, dict[str, Any]]", outcome.result)
+            if isinstance(outcome, BudgetedOperationRejected):
+                raise _AutomaticCompactionBudgetReservationFailed(outcome.failure)
+            if outcome.cause is not None:
+                raise outcome.error from outcome.cause
+            raise outcome.error
+
+        with _automatic_compaction_dispatch_runner_scope(run_provider_dispatch):
+            return await execute()
 
     async def _apply_limit_evaluation(
         self,
@@ -13537,6 +13887,18 @@ async def _build_context(
     pressure_overhead: ContextPressureOverhead,
     count_input_tokens: Callable[[list[Message]], Awaitable[int | None]] | None,
     build_cache_prefix_request: Callable[[list[Message]], Awaitable[ModelRequest]] | None,
+    run_compaction: (
+        Callable[
+            [
+                ContextCompactor,
+                CompactionRequest,
+                Callable[[], Awaitable[CompactionResult]],
+                Callable[[], list[dict[str, Any]]],
+            ],
+            Awaitable[CompactionResult],
+        ]
+        | None
+    ) = None,
     force_bounded_compaction: bool = False,
 ) -> tuple[
     list[Message],
@@ -13572,10 +13934,11 @@ async def _build_context(
     )
     if isinstance(context_policy, RuntimeManagedContextPolicy):
         checkpoint = await session_store.load_checkpoint(session.id)
-        result = await context_policy.build_with_checkpoint(
-            request,
-            checkpoint=checkpoint,
-        )
+        with _automatic_compaction_runner_scope(run_compaction):
+            result = await context_policy.build_with_checkpoint(
+                request,
+                checkpoint=checkpoint,
+            )
         context_messages = copy_context_messages(result.messages)
         return (
             context_messages,

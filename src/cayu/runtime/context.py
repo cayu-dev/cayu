@@ -4,7 +4,8 @@ import asyncio
 import json
 import math
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar
 from enum import StrEnum
 from typing import Any
@@ -1608,17 +1609,88 @@ class ContextCompactor(ABC):
         """Declare the provider/model charged by one compaction invocation.
 
         Return ``None`` only for a compactor that never performs provider work.
-        Provider-backed custom compactors must override this method so the
-        runtime can enforce app and request budgets before dispatch.
+        This identity supplies pricing attribution; it does not declare how many
+        provider calls an opaque compactor may make. Automatic compaction with
+        reservation-bearing cost limits therefore also requires Cayu's built-in
+        per-dispatch instrumentation.
         """
 
         raise NotImplementedError(
             f"{type(self).__name__} must declare its provider budget identity."
         )
 
+    def _provider_budget_identity_for_request(
+        self,
+        request: CompactionRequest,
+    ) -> tuple[str, str] | None:
+        """Declare the provider/model actually selected for this invocation."""
+
+        return self.provider_budget_identity(request.session)
+
+    def _uses_runtime_provider_dispatch_runner_for_request(
+        self,
+        request: CompactionRequest,
+    ) -> bool:
+        """Whether every provider dispatch uses Cayu's instrumented model runner."""
+
+        del request
+        return False
+
     @abstractmethod
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         """Return a compact summary for older transcript messages."""
+
+
+_AutomaticCompactionRunner = Callable[
+    [
+        ContextCompactor,
+        CompactionRequest,
+        Callable[[], Awaitable[CompactionResult]],
+        Callable[[], list[dict[str, Any]]],
+    ],
+    Awaitable[CompactionResult],
+]
+_AUTOMATIC_COMPACTION_RUNNER: ContextVar[_AutomaticCompactionRunner | None] = ContextVar(
+    "automatic_compaction_runner",
+    default=None,
+)
+
+_AutomaticCompactionDispatchRunner = Callable[
+    [
+        str,
+        str,
+        Callable[[], Awaitable[tuple[str, dict[str, Any]]]],
+    ],
+    Awaitable[tuple[str, dict[str, Any]]],
+]
+_AUTOMATIC_COMPACTION_DISPATCH_RUNNER: ContextVar[_AutomaticCompactionDispatchRunner | None] = (
+    ContextVar(
+        "automatic_compaction_dispatch_runner",
+        default=None,
+    )
+)
+
+
+@contextmanager
+def _automatic_compaction_runner_scope(
+    runner: _AutomaticCompactionRunner | None,
+) -> Iterator[None]:
+    token = _AUTOMATIC_COMPACTION_RUNNER.set(runner)
+    try:
+        yield
+    finally:
+        _AUTOMATIC_COMPACTION_RUNNER.reset(token)
+
+
+@contextmanager
+def _automatic_compaction_dispatch_runner_scope(
+    runner: _AutomaticCompactionDispatchRunner | None,
+) -> Iterator[None]:
+    token = _AUTOMATIC_COMPACTION_DISPATCH_RUNNER.set(runner)
+    try:
+        yield
+    finally:
+        _AUTOMATIC_COMPACTION_DISPATCH_RUNNER.reset(token)
 
 
 class TranscriptDigestCompactor(ContextCompactor):
@@ -1756,6 +1828,17 @@ class ModelCompactor(ContextCompactor):
 
     def provider_budget_identity(self, session: Session) -> tuple[str, str]:
         return self.provider.name, self.model
+
+    def _uses_runtime_provider_dispatch_runner_for_request(
+        self,
+        request: CompactionRequest,
+    ) -> bool:
+        del request
+        # Subclasses that inherit the built-in implementation retain its
+        # instrumented provider-dispatch boundary. An overridden ``compact``
+        # method is opaque to the runtime and is rejected when reservation-
+        # bearing limits apply.
+        return type(self).compact is ModelCompactor.compact
 
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         if self.prompt_builder is None:
@@ -2036,6 +2119,63 @@ class PromptCacheCompactor(ContextCompactor):
             )
         return self.provider.name, self.model if self.model is not None else session.model
 
+    def _provider_budget_identity_for_request(
+        self,
+        request: CompactionRequest,
+    ) -> tuple[str, str] | None:
+        provider_differs = self.provider.name != request.session.provider_name
+        bounded_model = self.model if self.model is not None else request.session.model
+        if request.existing_summary is not None or request.force_bounded_compaction:
+            return self.provider.name, bounded_model
+        if provider_differs:
+            if self.model is None:
+                raise ValueError(
+                    "model is required when the compactor provider differs from "
+                    "the session provider."
+                )
+            return self.provider.name, bounded_model
+
+        cached_request = request.cache_prefix_request
+        if cached_request is None:
+            if self.model is not None and self.model != request.session.model:
+                return self.provider.name, self.model
+            return self._fallback._provider_budget_identity_for_request(request)
+        cached_model = cached_request.model
+        if cached_model != request.session.model:
+            return self.provider.name, bounded_model
+        if self.model is not None and self.model != cached_model:
+            return self.provider.name, self.model
+        return self.provider.name, self.model if self.model is not None else cached_model
+
+    def _uses_runtime_provider_dispatch_runner_for_request(
+        self,
+        request: CompactionRequest,
+    ) -> bool:
+        if type(self).compact is not PromptCacheCompactor.compact:
+            return False
+        provider_differs = self.provider.name != request.session.provider_name
+        if request.existing_summary is not None or request.force_bounded_compaction:
+            return type(self)._compact_bounded is PromptCacheCompactor._compact_bounded
+        if provider_differs:
+            return type(self)._compact_bounded is PromptCacheCompactor._compact_bounded
+        cached_request = request.cache_prefix_request
+        if cached_request is None:
+            if self.model is not None and self.model != request.session.model:
+                return type(self)._compact_bounded is PromptCacheCompactor._compact_bounded
+            return self._fallback._uses_runtime_provider_dispatch_runner_for_request(request)
+        cached_model = cached_request.model
+        if (
+            cached_model != request.session.model
+            or (self.model is not None and self.model != cached_model)
+            or _has_structured_output_tool(cached_request.tools)
+        ):
+            return type(self)._compact_bounded is PromptCacheCompactor._compact_bounded
+        return (
+            type(self)._compact_bounded_after_exact_failure
+            is PromptCacheCompactor._compact_bounded_after_exact_failure
+            and type(self)._compact_bounded is PromptCacheCompactor._compact_bounded
+        )
+
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         provider_differs = self.provider.name != request.session.provider_name
         if provider_differs and self.model is None:
@@ -2095,6 +2235,8 @@ class PromptCacheCompactor(ContextCompactor):
                 ),
             )
         except _CompactionToolCallError as exc:
+            if getattr(exc, "_cayu_compaction_budget_settlement_failed", False):
+                raise
             return await self._compact_bounded_after_exact_failure(
                 request,
                 model=model,
@@ -2107,6 +2249,8 @@ class PromptCacheCompactor(ContextCompactor):
                 ),
             )
         except ModelContextOverflowError as exc:
+            if getattr(exc, "_cayu_compaction_budget_settlement_failed", False):
+                raise
             return await self._compact_bounded_after_exact_failure(
                 request,
                 model=model,
@@ -2238,14 +2382,20 @@ async def _run_compaction_model(
     retry_policy: RetryPolicy,
     observe_completion: Callable[[dict[str, Any]], dict[str, Any]],
 ) -> tuple[str, dict[str, Any]]:
+    async def dispatch() -> tuple[str, dict[str, Any]]:
+        return await _stream_compaction_model(
+            provider=provider,
+            model_request=model_request,
+            observe_completion=observe_completion,
+        )
+
     attempt = 1
     while True:
         try:
-            return await _stream_compaction_model(
-                provider=provider,
-                model_request=model_request,
-                observe_completion=observe_completion,
-            )
+            run_dispatch = _AUTOMATIC_COMPACTION_DISPATCH_RUNNER.get()
+            if run_dispatch is None:
+                return await dispatch()
+            return await run_dispatch(provider.name, model_request.model, dispatch)
         except ModelProviderError as exc:
             decision = retry_decision(
                 policy=retry_policy,
@@ -2588,24 +2738,44 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                         cache_prefix_request = await request.build_cache_prefix_request(
                             extension_messages
                         )
+                compaction_request = CompactionRequest(
+                    session=request.session,
+                    agent=request.agent,
+                    messages=newly_compactable,
+                    existing_summary=previous_summary,
+                    metadata=request.metadata,
+                    context_messages=context_messages,
+                    cache_prefix_request=cache_prefix_request,
+                    force_bounded_compaction=force_bounded_compaction,
+                    instructions=request.compaction_instructions,
+                )
                 completion_ledger_token = _COMPACTION_COMPLETION_LEDGER.set(completion_ledger)
                 try:
-                    result = await self.compactor.compact(
-                        CompactionRequest(
-                            session=request.session,
-                            agent=request.agent,
-                            messages=newly_compactable,
-                            existing_summary=previous_summary,
-                            metadata=request.metadata,
-                            context_messages=context_messages,
-                            cache_prefix_request=cache_prefix_request,
-                            force_bounded_compaction=force_bounded_compaction,
-                            instructions=request.compaction_instructions,
+
+                    async def execute_compaction() -> CompactionResult:
+                        compaction_result = await self.compactor.compact(compaction_request)
+                        completion_ledger.merge_returned_payloads(
+                            compaction_result.model_completed_payloads,
                         )
-                    )
-                    completed_payloads = completion_ledger.merge_returned_payloads(
-                        result.model_completed_payloads,
-                    )
+                        return compaction_result
+
+                    def completed_payloads_snapshot() -> list[dict[str, Any]]:
+                        return copy_json_value(
+                            completion_ledger.completed_payloads,
+                            "model_completed_payloads",
+                        )
+
+                    run_compaction = _AUTOMATIC_COMPACTION_RUNNER.get()
+                    if run_compaction is None:
+                        result = await execute_compaction()
+                    else:
+                        result = await run_compaction(
+                            self.compactor,
+                            compaction_request,
+                            execute_compaction,
+                            completed_payloads_snapshot,
+                        )
+                    completed_payloads = completed_payloads_snapshot()
                 finally:
                     _COMPACTION_COMPLETION_LEDGER.reset(completion_ledger_token)
             except Exception as exc:

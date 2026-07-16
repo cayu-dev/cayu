@@ -15,6 +15,9 @@ from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import CayuApp
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._run_limits import (
+    BudgetedOperationFailed,
+    BudgetedOperationRejected,
+    BudgetedOperationSucceeded,
     BudgetEvaluation,
     BudgetReservationLeaseLost,
     LimitEvaluation,
@@ -188,6 +191,30 @@ class _CancelFirstHeartbeatLedger(InMemoryBudgetLedger):
     async def release(self, *, reservation_id: str, reason: str):
         self.release_calls += 1
         return await super().release(reservation_id=reservation_id, reason=reason)
+
+
+class _FailSecondReconcileLedger(InMemoryBudgetLedger):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reconcile_calls = 0
+
+    async def reconcile(
+        self,
+        *,
+        reservation_id: str,
+        actual_amount: Decimal,
+        reason: str | None = None,
+        occurred_at: datetime | None = None,
+    ):
+        self.reconcile_calls += 1
+        if self.reconcile_calls == 2:
+            raise RuntimeError("simulated second reconciliation failure")
+        return await super().reconcile(
+            reservation_id=reservation_id,
+            actual_amount=actual_amount,
+            reason=reason,
+            occurred_at=occurred_at,
+        )
 
 
 async def _running_session(store: InMemorySessionStore, session_id: str) -> Session:
@@ -738,3 +765,172 @@ def test_controller_arbitrates_operation_heartbeat_lease_loss():
     asyncio.run(scenario())
 
     assert ledger.heartbeat_calls == 2
+
+
+def test_controller_returns_typed_success_for_budgeted_compactor_dispatch():
+    store = InMemorySessionStore()
+    controller = _controller(store)
+
+    async def scenario():
+        session = await _running_session(store, "sess_budgeted_dispatch_success")
+        completion_events = [
+            Event(
+                type=EventType.MODEL_COMPLETED,
+                session_id=session.id,
+                agent_name="assistant",
+                payload={
+                    "provider_name": "fake",
+                    "model": "fake-model",
+                    "usage": {
+                        "input_tokens": 250_000,
+                        "output_tokens": 0,
+                        "total_tokens": 250_000,
+                    },
+                },
+            ),
+            Event(
+                type=EventType.MODEL_COMPLETED,
+                session_id=session.id,
+                agent_name="assistant",
+                payload={
+                    "provider_name": "fake",
+                    "model": "fake-model",
+                    "usage_unavailable_reason": "provider omitted usage",
+                },
+            ),
+        ]
+        return await controller.run_automatic_compaction_dispatch(
+            lambda: asyncio.sleep(0, result="summary"),
+            completed_events=lambda: completion_events,
+            budget_limits=(_reserved_limit("3"),),
+            session=session,
+            agent_name="assistant",
+            environment_name=None,
+            provider_name="fake",
+            model="fake-model",
+            authoritative_failure_types=(),
+        )
+
+    outcome = asyncio.run(scenario())
+
+    assert isinstance(outcome, BudgetedOperationSucceeded)
+    assert outcome.result == "summary"
+    assert [event.type for event in outcome.events] == [
+        EventType.BUDGET_RESERVED,
+        EventType.BUDGET_RECONCILED,
+    ]
+    assert Decimal(outcome.events[-1].payload["actual_amount"]) == Decimal("1.25")
+    assert outcome.events[-1].payload["reason"] == (
+        "automatic context compaction completed with partially uncertain usage; "
+        "charged known cost plus reserved amount per uncertain completion"
+    )
+
+
+def test_controller_returns_typed_rejection_without_dispatching_compactor():
+    store = InMemorySessionStore()
+    controller = _controller(store)
+    dispatched = False
+
+    async def scenario():
+        session = await _running_session(store, "sess_budgeted_dispatch_rejected")
+
+        async def operation() -> str:
+            nonlocal dispatched
+            dispatched = True
+            return "must not run"
+
+        return await controller.run_automatic_compaction_dispatch(
+            operation,
+            completed_events=list,
+            budget_limits=(_reserved_limit("0.5"),),
+            session=session,
+            agent_name="assistant",
+            environment_name=None,
+            provider_name="fake",
+            model="fake-model",
+            authoritative_failure_types=(),
+        )
+
+    outcome = asyncio.run(scenario())
+
+    assert isinstance(outcome, BudgetedOperationRejected)
+    assert dispatched is False
+    assert outcome.failure.accepted is False
+    assert [event.type for event in outcome.events] == [EventType.BUDGET_RESERVATION_FAILED]
+
+
+def test_controller_settles_partial_setup_before_returning_typed_cancellation():
+    store = InMemorySessionStore()
+    ledger = _CancelSecondReservationLedger()
+    controller = _controller(store, ledger=ledger)
+
+    async def scenario():
+        session = await _running_session(store, "sess_budgeted_dispatch_setup_cancelled")
+        return await controller.run_automatic_compaction_dispatch(
+            lambda: asyncio.sleep(0, result="must not run"),
+            completed_events=list,
+            budget_limits=(_reserved_limit("3"), _reserved_limit("3")),
+            session=session,
+            agent_name="assistant",
+            environment_name=None,
+            provider_name="fake",
+            model="fake-model",
+            authoritative_failure_types=(),
+        )
+
+    outcome = asyncio.run(scenario())
+
+    assert isinstance(outcome, BudgetedOperationFailed)
+    assert isinstance(outcome.error, asyncio.CancelledError)
+    assert [event.type for event in outcome.events] == [
+        EventType.BUDGET_RESERVED,
+        EventType.BUDGET_RESERVATION_RELEASED,
+    ]
+    assert outcome.events[-1].payload["reason"] == "reservation setup cancelled"
+
+
+def test_controller_attempts_every_compactor_settlement_after_one_limit_fails():
+    store = InMemorySessionStore()
+    ledger = _FailSecondReconcileLedger()
+    controller = _controller(store, ledger=ledger)
+
+    async def scenario():
+        session = await _running_session(store, "sess_budgeted_dispatch_partial_settlement")
+        completion_events = [
+            Event(
+                type=EventType.MODEL_COMPLETED,
+                session_id=session.id,
+                agent_name="assistant",
+                payload={
+                    "provider_name": "fake",
+                    "model": "fake-model",
+                    "usage": {
+                        "input_tokens": 250_000,
+                        "output_tokens": 0,
+                        "total_tokens": 250_000,
+                    },
+                },
+            )
+        ]
+        return await controller.run_automatic_compaction_dispatch(
+            lambda: asyncio.sleep(0, result="summary"),
+            completed_events=lambda: completion_events,
+            budget_limits=(
+                _reserved_limit("4"),
+                _reserved_limit("4"),
+                _reserved_limit("4"),
+            ),
+            session=session,
+            agent_name="assistant",
+            environment_name=None,
+            provider_name="fake",
+            model="fake-model",
+            authoritative_failure_types=(),
+        )
+
+    outcome = asyncio.run(scenario())
+
+    assert isinstance(outcome, BudgetedOperationFailed)
+    assert str(outcome.error) == "simulated second reconciliation failure"
+    assert ledger.reconcile_calls == 3
+    assert [event.type for event in outcome.events].count(EventType.BUDGET_RECONCILED) == 2

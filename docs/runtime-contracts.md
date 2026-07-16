@@ -52,6 +52,31 @@ Built-in policies include `RecentTurnsContextPolicy`, `MessageWindowContextPolic
 
 Compaction checkpoints store the summary and `compacted_transcript_cursor`, the provider-neutral transcript position covered by that summary. The model-facing summary is injected as synthetic user context, not as a system instruction, and is not appended to the durable transcript. Compaction events include cursor, compactor, count, error, and provider metadata needed for audit/debugging, but they do not include the summary text.
 
+When reservation-bearing cost budgets apply, automatic provider-backed
+compaction participates in the same atomic ledger as the following model step.
+The runtime reserves before invoking the compactor, renews the reservation lease
+while it runs, and reconciles every observed compaction completion before it can
+reserve the main provider call. Once a dispatch may have spent money, settlement
+finishes despite caller cancellation and attempts every applicable limit even if
+a sibling reconciliation fails. Built-in compactor retries and cache-aware
+fallback calls reserve and settle independently at the provider-stream boundary.
+A dispatched compaction without authoritative priced usage is charged at its
+reserved amount; mixed known and uncertain completions retain the known cost and
+add one reserved amount for each uncertain completion. Failures before a built-in
+compactor reaches provider-controlled stream execution create no reservation.
+Deterministic compactors and context builds that do not compact create no
+compaction reservation. After successful compaction telemetry and its
+checkpoint are durable, the runtime also re-evaluates event-backed budget and
+run/request limits before invoking the main provider. Thus reported compaction
+spend and active or reconciled strict-ledger usage enforce the same boundary,
+including when each component is individually below the configured maximum.
+Provider-backed custom compactors used on this path must declare their charged
+provider and model through `provider_budget_identity(session)`. That identity
+does not declare provider-call cardinality: when reservation-bearing limits
+apply, automatic compaction fails before invoking an opaque custom compactor
+because Cayu cannot reserve each hidden dispatch independently. Such compactors
+remain compatible with event-backed budgets that do not use reservations.
+
 ### Explicit application-requested compaction
 
 `CayuApp.compact_session(CompactSessionRequest(...))` asks the runtime to update
@@ -1214,9 +1239,15 @@ otherwise to its session id. Forked sessions inherit the source session's causal
 budget id, so parent and child sessions can share a single work-item budget.
 
 The runtime checks matching app-policy budget limits before every model step and
-again after each completed model step. A pre-model check also verifies that the
-current requested provider/model has matching pricing unless `allow_unpriced=True`. Each
-app-policy check emits `budget.checked`. If an interrupt budget is reached, the
+again after each completed model step. After a successful provider-backed context
+compaction, Cayu first persists its `model.completed` telemetry and checkpoint,
+then rechecks app-policy budgets and run/request limits before invoking the main
+model. The same boundary applies when model-backed compaction rebuilds context
+after a provider context-overflow response: Cayu reconciles the overflowed
+dispatch before the recheck and does not reserve, announce, or invoke the recovery
+dispatch when a limit stops the session. A pre-model check also verifies that the
+current requested provider/model has matching pricing unless `allow_unpriced=True`.
+Each app-policy check emits `budget.checked`. If an interrupt budget is reached, the
 runtime emits `budget.limit_reached` and then follows the controlled stop path:
 `session.limit_reached`, `session.interrupted`, and a resumable interrupted
 session. If a notify budget is reached, the runtime emits `budget.limit_reached`

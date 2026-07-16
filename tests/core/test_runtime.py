@@ -185,7 +185,12 @@ from cayu.runtime.context import (
     validate_context_messages,
 )
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
-from cayu.storage import InMemoryKnowledgeStore, KnowledgeEntry, SQLiteSessionStore
+from cayu.storage import (
+    InMemoryKnowledgeStore,
+    KnowledgeEntry,
+    SQLiteBudgetLedger,
+    SQLiteSessionStore,
+)
 from cayu.tools import (
     ExecCommandTool,
     SubagentExecutionMode,
@@ -3196,6 +3201,25 @@ def fake_budget_limit(
         scope=scope,
         allow_unpriced=allow_unpriced,
         action=action,
+    )
+
+
+def compaction_price_book() -> PriceBook:
+    return PriceBook(
+        prices=(
+            ModelPrice.fixed(
+                provider_name="fake",
+                model="fake-model",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("10"),
+            ),
+            ModelPrice.fixed(
+                provider_name="fake",
+                model="summary-model",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("10"),
+            ),
+        )
     )
 
 
@@ -26154,9 +26178,33 @@ def test_context_overflow_error_stream_event_without_policy_fails_typed():
 
 
 def test_context_overflow_policy_can_checkpoint_compaction_before_retry():
-    provider = ContextOverflowProvider()
+    provider = ContextOverflowProvider(
+        success_events=[
+            ModelStreamEvent.text_delta("recovered"),
+            ModelStreamEvent.completed({"usage": {"input_tokens": 1, "output_tokens": 0}}),
+        ]
+    )
     compactor = RecordingCompactor()
-    app = CayuApp()
+    app = CayuApp(
+        budget_policy=BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal("10"),
+                    pricing=PriceBook(
+                        prices=(
+                            ModelPrice.fixed(
+                                provider_name="overflow",
+                                model="fake-model",
+                                input_per_million=Decimal("1"),
+                                output_per_million=Decimal("10"),
+                            ),
+                        )
+                    ),
+                ),
+            )
+        )
+    )
     app.register_provider(provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
@@ -26195,6 +26243,9 @@ def test_context_overflow_policy_can_checkpoint_compaction_before_retry():
     )
     assert provider.requests[1].messages[1].content[0].text == "new request"
     assert EventType.SESSION_CHECKPOINTED in [event.type for event in events]
+    # Deterministic compaction has no provider spend, so it must not add a
+    # third budget boundary between the initial check and post-model check.
+    assert [event.type for event in events].count(EventType.BUDGET_CHECKED) == 2
     checkpoint = asyncio.run(
         app.session_store.load_checkpoint("context_overflow_compaction_recovery")
     )
@@ -26206,6 +26257,269 @@ def test_context_overflow_policy_can_checkpoint_compaction_before_retry():
             "metadata": {"request_count": 1},
         }
     }
+
+
+@pytest.mark.parametrize("scope", ["run", "session"])
+def test_context_overflow_model_compaction_stops_before_recovery_at_token_limit(
+    scope: Literal["run", "session"],
+) -> None:
+    store = InMemorySessionStore()
+    runtime_provider = ContextOverflowProvider()
+    compactor_provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("model summary"),
+            ModelStreamEvent.completed(
+                {
+                    "model": "summary-model",
+                    "usage": {"input_tokens": 16, "output_tokens": 4},
+                }
+            ),
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_overflow_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compactor_provider,
+                model="summary-model",
+            ),
+            max_user_turns=1,
+            compact_after_messages=1,
+        ),
+    )
+    session_id = f"context_overflow_compaction_{scope}_token_limit"
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[
+                    Message.text("user", "old request"),
+                    Message.text("user", "new request"),
+                ],
+                limits=RunLimits(max_total_tokens=15, scope=scope),
+            ),
+        )
+    )
+
+    assert len(runtime_provider.requests) == 1
+    assert len(compactor_provider.requests) == 1
+    assert EventType.CONTEXT_OVERFLOW_RECOVERING not in [event.type for event in events]
+    assert [
+        event.type
+        for event in events
+        if event.type
+        in {
+            EventType.CONTEXT_OVERFLOW_DETECTED,
+            EventType.CONTEXT_COMPACTION_STARTED,
+            EventType.MODEL_COMPLETED,
+            EventType.CONTEXT_COMPACTION_COMPLETED,
+            EventType.SESSION_CHECKPOINTED,
+            EventType.SESSION_LIMIT_REACHED,
+            EventType.TURN_COMPLETED,
+            EventType.SESSION_INTERRUPTED,
+        }
+    ] == [
+        EventType.CONTEXT_OVERFLOW_DETECTED,
+        EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.CONTEXT_COMPACTION_COMPLETED,
+        EventType.SESSION_CHECKPOINTED,
+        EventType.SESSION_LIMIT_REACHED,
+        EventType.TURN_COMPLETED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    limit_event = next(event for event in events if event.type == EventType.SESSION_LIMIT_REACHED)
+    assert limit_event.payload["limit"] == "total_tokens"
+    assert limit_event.payload["actual"] == 20
+    assert limit_event.payload["maximum"] == 15
+    checkpoint = asyncio.run(store.load_checkpoint(session_id))
+    assert checkpoint is not None
+    assert checkpoint["context_compaction"]["summary"] == "model summary"
+    usage = asyncio.run(app.get_session_usage(session_id))
+    assert usage.model_steps == 1
+    assert usage.usage.total_tokens == 20
+
+
+def test_context_overflow_model_compaction_settles_dispatch_before_budget_gate() -> None:
+    store = InMemorySessionStore()
+    runtime_provider = ContextOverflowProvider()
+    compactor_provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("model summary"),
+            ModelStreamEvent.completed(
+                {
+                    "model": "summary-model",
+                    "usage": {"input_tokens": 20, "output_tokens": 0},
+                }
+            ),
+        ]
+    )
+    pricing = PriceBook(
+        prices=(
+            ModelPrice.fixed(
+                provider_name="overflow",
+                model="fake-model",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("10"),
+            ),
+            ModelPrice.fixed(
+                provider_name="fake",
+                model="summary-model",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("10"),
+            ),
+        )
+    )
+    app = CayuApp(
+        session_store=store,
+        budget_policy=BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal("0.00002"),
+                    pricing=pricing,
+                    reservation=BudgetReservation(
+                        max_input_tokens=10,
+                        max_output_tokens=0,
+                    ),
+                ),
+            )
+        ),
+    )
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_overflow_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compactor_provider,
+                model="summary-model",
+            ),
+            max_user_turns=1,
+            compact_after_messages=1,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="context_overflow_compaction_budget_limit",
+                messages=[
+                    Message.text("user", "old request"),
+                    Message.text("user", "new request"),
+                ],
+            ),
+        )
+    )
+
+    event_types = [event.type for event in events]
+    assert len(runtime_provider.requests) == 1
+    assert len(compactor_provider.requests) == 1
+    assert event_types.count(EventType.BUDGET_RESERVED) == 2
+    assert EventType.CONTEXT_OVERFLOW_RECOVERING not in event_types
+    checkpoint_index = event_types.index(EventType.SESSION_CHECKPOINTED)
+    reconciliations = [
+        (index, event)
+        for index, event in enumerate(events)
+        if event.type == EventType.BUDGET_RECONCILED
+    ]
+    compaction_reconciliation_index, compaction_reconciliation = reconciliations[0]
+    dispatch_reconciliation_index, dispatch_reconciliation = reconciliations[1]
+    reached_index = event_types.index(EventType.BUDGET_LIMIT_REACHED)
+    assert compaction_reconciliation_index < checkpoint_index
+    assert checkpoint_index < dispatch_reconciliation_index < reached_index
+    assert Decimal(compaction_reconciliation.payload["actual_amount"]) == Decimal("0.00002")
+    assert compaction_reconciliation.payload["reason"] == (
+        "automatic context compaction model completed"
+    )
+    assert Decimal(dispatch_reconciliation.payload["actual_amount"]) == Decimal("0.00001")
+    assert (
+        dispatch_reconciliation.payload["reason"]
+        == "provider usage unknown after dispatch; charged reserved amount"
+    )
+    reached = events[reached_index]
+    assert Decimal(reached.payload["actual"]) == Decimal("0.00002")
+    assert reached.payload["scope"] == "app"
+    assert events[-1].type == EventType.SESSION_INTERRUPTED
+    cost = asyncio.run(app.get_session_cost("context_overflow_compaction_budget_limit", pricing))
+    assert cost.model_steps == 1
+    assert cost.total_cost == Decimal("0.00002")
+
+
+def test_context_overflow_compaction_reservation_denial_settles_before_terminal() -> None:
+    runtime_provider = ContextOverflowProvider()
+    compactor_provider = FakeProvider([ModelStreamEvent.completed({})])
+    pricing = PriceBook(
+        prices=(
+            ModelPrice.fixed(
+                provider_name="overflow",
+                model="fake-model",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("10"),
+            ),
+            ModelPrice.fixed(
+                provider_name="fake",
+                model="summary-model",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("10"),
+            ),
+        )
+    )
+    app = CayuApp(
+        budget_policy=BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal("0.000019"),
+                    pricing=pricing,
+                    reservation=BudgetReservation(
+                        max_input_tokens=10,
+                        max_output_tokens=0,
+                    ),
+                ),
+            )
+        )
+    )
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_overflow_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compactor_provider,
+                model="summary-model",
+            ),
+            max_user_turns=1,
+            compact_after_messages=1,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="context_overflow_compaction_reservation_denied",
+                messages=[
+                    Message.text("user", "old request"),
+                    Message.text("user", "new request"),
+                ],
+            ),
+        )
+    )
+
+    event_types = [event.type for event in events]
+    assert len(runtime_provider.requests) == 1
+    assert compactor_provider.requests == []
+    assert event_types.index(EventType.BUDGET_RECONCILED) < event_types.index(
+        EventType.BUDGET_LIMIT_REACHED
+    )
+    assert events[-1].type == EventType.SESSION_INTERRUPTED
 
 
 def test_prompt_cache_compactor_bounds_context_overflow_recovery() -> None:
@@ -27883,6 +28197,1986 @@ def test_cayu_app_counts_compaction_model_spend_in_session_usage():
     assert summary.usage.input_tokens == 50
     assert summary.usage.output_tokens == 10
     assert summary.usage.total_tokens == 60
+
+
+@pytest.mark.parametrize("scope", ["run", "session"])
+def test_cayu_app_stops_before_main_model_when_compaction_reaches_token_limit(
+    scope: Literal["run", "session"],
+):
+    store = InMemorySessionStore()
+    compactor_provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("model summary"),
+            ModelStreamEvent.completed(
+                {
+                    "model": "summary-model",
+                    "usage": {"input_tokens": 16, "output_tokens": 4},
+                }
+            ),
+        ]
+    )
+    runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
+    app = CayuApp(session_store=store)
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compactor_provider,
+                model="summary-model",
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+    session_id = f"sess_compaction_{scope}_token_limit"
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+                limits=RunLimits(max_total_tokens=15, scope=scope),
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.CONTEXT_COMPACTION_COMPLETED,
+        EventType.SESSION_CHECKPOINTED,
+        EventType.SESSION_LIMIT_REACHED,
+        EventType.TURN_COMPLETED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert events[5].payload["limit"] == "total_tokens"
+    assert events[5].payload["actual"] == 20
+    assert events[5].payload["maximum"] == 15
+    assert events[6].payload["token_usage"]["total_tokens"] == 20
+    assert len(compactor_provider.requests) == 1
+    assert runtime_provider.requests == []
+    checkpoint = asyncio.run(store.load_checkpoint(session_id))
+    assert checkpoint is not None
+    assert checkpoint["context_compaction"]["summary"] == "model summary"
+    usage = asyncio.run(app.get_session_usage(session_id))
+    assert usage.model_steps == 1
+    assert usage.usage.total_tokens == 20
+
+
+def test_cayu_app_stops_before_main_model_when_compaction_reaches_app_budget():
+    store = InMemorySessionStore()
+    pricing = compaction_price_book()
+    compactor_provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("model summary"),
+            ModelStreamEvent.completed(
+                {
+                    "model": "summary-model",
+                    "usage": {"input_tokens": 20, "output_tokens": 0},
+                }
+            ),
+        ]
+    )
+    runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
+    app = CayuApp(
+        session_store=store,
+        budget_policy=BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal("0.00002"),
+                    pricing=pricing,
+                ),
+            )
+        ),
+    )
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compactor_provider,
+                model="summary-model",
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_compaction_app_budget",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.BUDGET_CHECKED,
+        EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.CONTEXT_COMPACTION_COMPLETED,
+        EventType.SESSION_CHECKPOINTED,
+        EventType.BUDGET_CHECKED,
+        EventType.BUDGET_LIMIT_REACHED,
+        EventType.SESSION_LIMIT_REACHED,
+        EventType.TURN_COMPLETED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert Decimal(events[6].payload["actual"]) == Decimal("0.00002")
+    assert events[7].payload["scope"] == "app"
+    assert events[8].payload["limit"] == "estimated_cost"
+    assert runtime_provider.requests == []
+    checkpoint = asyncio.run(store.load_checkpoint("sess_compaction_app_budget"))
+    assert checkpoint is not None
+    cost = asyncio.run(app.get_session_cost("sess_compaction_app_budget", pricing))
+    assert cost.model_steps == 1
+    assert cost.priced_model_steps == 1
+    assert cost.total_cost == Decimal("0.00002")
+
+
+@pytest.mark.parametrize(
+    ("maximum", "main_provider_calls", "terminal_event"),
+    [
+        pytest.param(
+            "0.000029",
+            0,
+            EventType.SESSION_INTERRUPTED,
+            id="combined-reservation-above-cap",
+        ),
+        pytest.param(
+            "0.000030",
+            1,
+            EventType.SESSION_INTERRUPTED,
+            id="combined-reservation-at-cap",
+        ),
+        pytest.param(
+            "0.000031",
+            1,
+            EventType.SESSION_COMPLETED,
+            id="combined-reservation-below-cap",
+        ),
+    ],
+)
+def test_cayu_app_compaction_spend_participates_in_strict_main_admission(
+    maximum: str,
+    main_provider_calls: int,
+    terminal_event: EventType,
+) -> None:
+    compactor_provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("model summary"),
+            ModelStreamEvent.completed(
+                {
+                    "model": "summary-model",
+                    "usage": {"input_tokens": 20, "output_tokens": 0},
+                }
+            ),
+        ]
+    )
+    runtime_provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("final answer"),
+            ModelStreamEvent.completed({"usage": {"input_tokens": 10, "output_tokens": 0}}),
+        ]
+    )
+    app = CayuApp(
+        budget_policy=BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal(maximum),
+                    pricing=compaction_price_book(),
+                    reservation=BudgetReservation(
+                        max_input_tokens=10,
+                        max_output_tokens=0,
+                    ),
+                ),
+            )
+        )
+    )
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compactor_provider,
+                model="summary-model",
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=f"sess_compaction_strict_admission_{maximum}",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    assert len(compactor_provider.requests) == 1
+    assert len(runtime_provider.requests) == main_provider_calls
+    reconciliations = [event for event in events if event.type == EventType.BUDGET_RECONCILED]
+    assert Decimal(reconciliations[0].payload["actual_amount"]) == Decimal("0.00002")
+    if main_provider_calls == 0:
+        failure = next(
+            event for event in events if event.type == EventType.BUDGET_RESERVATION_FAILED
+        )
+        assert Decimal(failure.payload["actual"]) == Decimal("0.00003")
+        assert Decimal(failure.payload["requested"]) == Decimal("0.00001")
+    else:
+        assert [Decimal(event.payload["actual_amount"]) for event in reconciliations] == [
+            Decimal("0.00002"),
+            Decimal("0.00001"),
+        ]
+    assert events[-1].type == terminal_event
+
+
+def test_cayu_app_rejects_automatic_compaction_before_provider_dispatch() -> None:
+    compactor_provider = FakeProvider([ModelStreamEvent.completed({})])
+    runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
+    app = CayuApp(
+        budget_policy=BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal("0.000009"),
+                    pricing=compaction_price_book(),
+                    reservation=BudgetReservation(
+                        max_input_tokens=10,
+                        max_output_tokens=0,
+                    ),
+                ),
+            )
+        )
+    )
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compactor_provider,
+                model="summary-model",
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_compaction_reservation_rejected",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    assert compactor_provider.requests == []
+    assert runtime_provider.requests == []
+    assert EventType.BUDGET_RESERVATION_FAILED in [event.type for event in events]
+    assert EventType.BUDGET_RESERVED not in [event.type for event in events]
+    assert EventType.BUDGET_RECONCILED not in [event.type for event in events]
+    assert events[-1].type == EventType.SESSION_INTERRUPTED
+
+
+def test_cayu_app_automatic_compaction_failure_charges_reserved_amount() -> None:
+    compactor_provider = FakeProvider([ModelStreamEvent.error("compactor unavailable")])
+    runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
+    app = CayuApp(
+        budget_policy=BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal("1"),
+                    pricing=compaction_price_book(),
+                    reservation=BudgetReservation(
+                        max_input_tokens=10,
+                        max_output_tokens=0,
+                    ),
+                ),
+            )
+        )
+    )
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compactor_provider,
+                model="summary-model",
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_compaction_provider_failure_budget",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    assert len(compactor_provider.requests) == 1
+    assert runtime_provider.requests == []
+    reconciliation = next(event for event in events if event.type == EventType.BUDGET_RECONCILED)
+    assert Decimal(reconciliation.payload["actual_amount"]) == Decimal("0.00001")
+    assert reconciliation.payload["reason"] == (
+        "automatic context compaction dispatch has uncertain usage; charged reserved amount"
+    )
+    assert events[-1].type == EventType.SESSION_FAILED
+
+
+def test_automatic_compaction_predispatch_failure_does_not_charge_budget() -> None:
+    compactor_provider = FakeProvider([ModelStreamEvent.completed({})])
+    runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
+
+    def fail_before_request(request: CompactionRequest) -> str:
+        del request
+        raise ValueError("prompt construction failed")
+
+    app = CayuApp(
+        budget_policy=BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal("1"),
+                    pricing=compaction_price_book(),
+                    reservation=BudgetReservation(max_input_tokens=10, max_output_tokens=0),
+                ),
+            )
+        )
+    )
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compactor_provider,
+                model="summary-model",
+                prompt_builder=fail_before_request,
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_compaction_predispatch_failure_budget",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    assert compactor_provider.requests == []
+    assert runtime_provider.requests == []
+    assert EventType.BUDGET_RESERVED not in [event.type for event in events]
+    assert EventType.BUDGET_RECONCILED not in [event.type for event in events]
+    assert EventType.BUDGET_RESERVATION_RELEASED not in [event.type for event in events]
+    assert events[-1].type == EventType.SESSION_FAILED
+
+
+def test_automatic_compaction_supports_non_expiring_custom_ledger() -> None:
+    class NonExpiringLedger(InMemoryBudgetLedger):
+        def __init__(self) -> None:
+            super().__init__(reservation_ttl_seconds=None)
+
+        async def heartbeat(self, *, reservation_id: str) -> bool:
+            del reservation_id
+            raise AssertionError("non-expiring ledgers must not be heartbeated")
+
+    compactor_provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("summary"),
+            ModelStreamEvent.completed({"model": "summary-model", "usage": {"input_tokens": 1}}),
+        ]
+    )
+    runtime_provider = FakeProvider(
+        [ModelStreamEvent.completed({"usage": {"input_tokens": 1, "output_tokens": 0}})]
+    )
+    app = CayuApp(
+        budget_policy=BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal("1"),
+                    pricing=compaction_price_book(),
+                    reservation=BudgetReservation(max_input_tokens=10, max_output_tokens=0),
+                ),
+            )
+        ),
+        budget_ledger=NonExpiringLedger(),
+    )
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compactor_provider,
+                model="summary-model",
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_non_expiring_compaction_budget_ledger",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    assert len(compactor_provider.requests) == 1
+    assert len(runtime_provider.requests) == 1
+    assert events[-1].type == EventType.SESSION_COMPLETED
+
+
+def test_automatic_compaction_cancellation_releases_partial_reservation_setup() -> None:
+    class BlockingSecondReservationLedger(InMemoryBudgetLedger):
+        def __init__(self) -> None:
+            super().__init__(reservation_ttl_seconds=None)
+            self.reserve_calls = 0
+            self.second_reservation_started = asyncio.Event()
+
+        async def reserve(self, **kwargs):
+            self.reserve_calls += 1
+            if self.reserve_calls == 2:
+                self.second_reservation_started.set()
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+            return await super().reserve(**kwargs)
+
+    async def run() -> None:
+        session_id = "sess_compaction_partial_reservation_cancelled"
+        store = InMemorySessionStore()
+        ledger = BlockingSecondReservationLedger()
+        compactor_provider = FakeProvider([ModelStreamEvent.completed({})])
+        runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
+        reservation = BudgetReservation(max_input_tokens=10, max_output_tokens=0)
+        pricing = compaction_price_book()
+        app = CayuApp(
+            session_store=store,
+            budget_policy=BudgetPolicy(
+                limits=(
+                    BudgetLimit(
+                        scope="app",
+                        max_estimated_cost=Decimal("1"),
+                        pricing=pricing,
+                        reservation=reservation,
+                    ),
+                    BudgetLimit(
+                        scope="agent",
+                        key="assistant",
+                        max_estimated_cost=Decimal("1"),
+                        pricing=pricing,
+                        reservation=reservation,
+                    ),
+                )
+            ),
+            budget_ledger=ledger,
+        )
+        app.register_provider(runtime_provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=compactor_provider,
+                    model="summary-model",
+                ),
+                max_user_turns=1,
+                compact_after_messages=2,
+            ),
+        )
+
+        task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[
+                        Message.text("user", "old"),
+                        Message.text("assistant", "old answer"),
+                        Message.text("user", "current"),
+                    ],
+                ),
+            )
+        )
+        await asyncio.wait_for(ledger.second_reservation_started.wait(), timeout=5)
+        task.cancel("cancel reservation setup")
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+
+        records = tuple(ledger._records.values())
+        assert exc_info.value.args == ("cancel reservation setup",)
+        assert len(records) == 1
+        assert records[0].status == "released"
+        assert records[0].reason == "reservation setup cancelled"
+        assert compactor_provider.requests == []
+        assert runtime_provider.requests == []
+        stored_events = await store.load_events(session_id)
+        reserved = [event for event in stored_events if event.type == EventType.BUDGET_RESERVED]
+        assert len(reserved) == 1
+        assert reserved[0].payload["reservation_id"] == records[0].reservation_id
+        released = [
+            event for event in stored_events if event.type == EventType.BUDGET_RESERVATION_RELEASED
+        ]
+        assert len(released) == 1
+        assert released[0].payload["reservation_id"] == records[0].reservation_id
+        assert released[0].payload["reason"] == "reservation setup cancelled"
+
+    asyncio.run(run())
+
+
+def test_automatic_compaction_cancellation_while_persisting_reservation_releases_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        session_id = "sess_compaction_reservation_publish_cancelled"
+        store = InMemorySessionStore()
+        ledger = InMemoryBudgetLedger(reservation_ttl_seconds=None)
+        compactor_provider = FakeProvider([ModelStreamEvent.completed({})])
+        runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
+        app = CayuApp(
+            session_store=store,
+            budget_policy=BudgetPolicy(
+                limits=(
+                    BudgetLimit(
+                        scope="app",
+                        max_estimated_cost=Decimal("1"),
+                        pricing=compaction_price_book(),
+                        reservation=BudgetReservation(
+                            max_input_tokens=10,
+                            max_output_tokens=0,
+                        ),
+                    ),
+                )
+            ),
+            budget_ledger=ledger,
+        )
+        app.register_provider(runtime_provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=compactor_provider,
+                    model="summary-model",
+                ),
+                max_user_turns=1,
+                compact_after_messages=2,
+            ),
+        )
+        reservation_publish_started = asyncio.Event()
+        original_emit = app._event_writer.emit
+        block_reservation_publish = True
+
+        async def block_first_reservation_publish(event: Event) -> Event:
+            nonlocal block_reservation_publish
+            if block_reservation_publish and event.type == EventType.BUDGET_RESERVED:
+                block_reservation_publish = False
+                reservation_publish_started.set()
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+            return await original_emit(event)
+
+        monkeypatch.setattr(app._event_writer, "emit", block_first_reservation_publish)
+        task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[
+                        Message.text("user", "old"),
+                        Message.text("assistant", "old answer"),
+                        Message.text("user", "current"),
+                    ],
+                ),
+            )
+        )
+        await asyncio.wait_for(reservation_publish_started.wait(), timeout=5)
+        task.cancel("cancel reservation event persistence")
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+
+        records = tuple(ledger._records.values())
+        assert exc_info.value.args == ("cancel reservation event persistence",)
+        assert len(records) == 1
+        assert records[0].status == "released"
+        assert records[0].reason == "reservation setup cancelled"
+        assert compactor_provider.requests == []
+        assert runtime_provider.requests == []
+        stored_events = await store.load_events(session_id)
+        assert EventType.BUDGET_RESERVED not in [event.type for event in stored_events]
+        released = [
+            event for event in stored_events if event.type == EventType.BUDGET_RESERVATION_RELEASED
+        ]
+        assert len(released) == 1
+        assert released[0].payload["reservation_id"] == records[0].reservation_id
+        assert released[0].payload["reason"] == "reservation setup cancelled"
+
+    asyncio.run(run())
+
+
+def test_automatic_compaction_cancellation_waits_for_reconciliation() -> None:
+    class BlockingReconciliationLedger(InMemoryBudgetLedger):
+        def __init__(self) -> None:
+            super().__init__(reservation_ttl_seconds=None)
+            self.reconciliation_started = asyncio.Event()
+            self.allow_reconciliation = asyncio.Event()
+
+        async def reconcile(self, **kwargs):
+            self.reconciliation_started.set()
+            await self.allow_reconciliation.wait()
+            return await super().reconcile(**kwargs)
+
+    async def run() -> None:
+        session_id = "sess_compaction_reconciliation_cancelled"
+        store = InMemorySessionStore()
+        ledger = BlockingReconciliationLedger()
+        compactor_provider = FakeProvider(
+            [ModelStreamEvent.completed({"usage": {"input_tokens": 1}})]
+        )
+        runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
+        app = CayuApp(
+            session_store=store,
+            budget_policy=BudgetPolicy(
+                limits=(
+                    BudgetLimit(
+                        scope="app",
+                        max_estimated_cost=Decimal("1"),
+                        pricing=compaction_price_book(),
+                        reservation=BudgetReservation(max_input_tokens=10, max_output_tokens=0),
+                    ),
+                )
+            ),
+            budget_ledger=ledger,
+        )
+        app.register_provider(runtime_provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=compactor_provider,
+                    model="summary-model",
+                ),
+                max_user_turns=1,
+                compact_after_messages=2,
+            ),
+        )
+
+        task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[
+                        Message.text("user", "old"),
+                        Message.text("assistant", "old answer"),
+                        Message.text("user", "current"),
+                    ],
+                ),
+            )
+        )
+        await asyncio.wait_for(ledger.reconciliation_started.wait(), timeout=5)
+        task.cancel("cancel during compaction reconciliation")
+        await asyncio.sleep(0)
+        assert not task.done()
+        task.cancel("repeated cancellation must not abandon settlement")
+        await asyncio.sleep(0)
+        assert not task.done()
+        ledger.allow_reconciliation.set()
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+
+        assert exc_info.value.args == ("cancel during compaction reconciliation",)
+        records = tuple(ledger._records.values())
+        assert len(records) == 1
+        assert records[0].status == "reconciled"
+        assert records[0].actual_amount == Decimal("0.000001")
+        stored_events = await store.load_events(session_id)
+        reconciled = [event for event in stored_events if event.type == EventType.BUDGET_RECONCILED]
+        assert len(reconciled) == 1
+        assert reconciled[0].payload["reservation_id"] == records[0].reservation_id
+        assert len(compactor_provider.requests) == 1
+        assert runtime_provider.requests == []
+
+    asyncio.run(run())
+
+
+def test_automatic_compaction_preserves_provider_cancellation_during_settlement() -> None:
+    class BlockingCompactionProvider(ModelProvider):
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+            self.started = asyncio.Event()
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            self.started.set()
+            await asyncio.Event().wait()
+            yield ModelStreamEvent.completed({})
+
+    class BlockingReconciliationLedger(InMemoryBudgetLedger):
+        def __init__(self) -> None:
+            super().__init__(reservation_ttl_seconds=None)
+            self.reconciliation_started = asyncio.Event()
+            self.allow_reconciliation = asyncio.Event()
+
+        async def reconcile(self, **kwargs):
+            self.reconciliation_started.set()
+            await self.allow_reconciliation.wait()
+            return await super().reconcile(**kwargs)
+
+    async def run() -> None:
+        session_id = "sess_compaction_provider_and_settlement_cancelled"
+        store = InMemorySessionStore()
+        ledger = BlockingReconciliationLedger()
+        compactor_provider = BlockingCompactionProvider()
+        runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
+        app = CayuApp(
+            session_store=store,
+            budget_policy=BudgetPolicy(
+                limits=(
+                    BudgetLimit(
+                        scope="app",
+                        max_estimated_cost=Decimal("1"),
+                        pricing=compaction_price_book(),
+                        reservation=BudgetReservation(max_input_tokens=10, max_output_tokens=0),
+                    ),
+                )
+            ),
+            budget_ledger=ledger,
+        )
+        app.register_provider(runtime_provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=compactor_provider,
+                    model="summary-model",
+                ),
+                max_user_turns=1,
+                compact_after_messages=2,
+            ),
+        )
+
+        task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[
+                        Message.text("user", "old"),
+                        Message.text("assistant", "old answer"),
+                        Message.text("user", "current"),
+                    ],
+                ),
+            )
+        )
+        await asyncio.wait_for(compactor_provider.started.wait(), timeout=5)
+        task.cancel("first cancellation during provider execution")
+        await asyncio.wait_for(ledger.reconciliation_started.wait(), timeout=5)
+        task.cancel("later cancellation during settlement")
+        await asyncio.sleep(0)
+        assert not task.done()
+        ledger.allow_reconciliation.set()
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+
+        assert exc_info.value.args == ("first cancellation during provider execution",)
+        records = tuple(ledger._records.values())
+        assert len(records) == 1
+        assert records[0].status == "reconciled"
+        assert records[0].actual_amount == records[0].reserved_amount
+        stored_events = await store.load_events(session_id)
+        reconciled = [event for event in stored_events if event.type == EventType.BUDGET_RECONCILED]
+        assert len(reconciled) == 1
+        assert reconciled[0].payload["reservation_id"] == records[0].reservation_id
+        assert len(compactor_provider.requests) == 1
+        assert runtime_provider.requests == []
+
+    asyncio.run(run())
+
+
+def test_automatic_compaction_cancellation_waits_for_reconciliation_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        session_id = "sess_compaction_reconciliation_publish_cancelled"
+        store = InMemorySessionStore()
+        ledger = InMemoryBudgetLedger(reservation_ttl_seconds=None)
+        compactor_provider = FakeProvider(
+            [ModelStreamEvent.completed({"usage": {"input_tokens": 1}})]
+        )
+        runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
+        app = CayuApp(
+            session_store=store,
+            budget_policy=BudgetPolicy(
+                limits=(
+                    BudgetLimit(
+                        scope="app",
+                        max_estimated_cost=Decimal("1"),
+                        pricing=compaction_price_book(),
+                        reservation=BudgetReservation(max_input_tokens=10, max_output_tokens=0),
+                    ),
+                )
+            ),
+            budget_ledger=ledger,
+        )
+        app.register_provider(runtime_provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=compactor_provider,
+                    model="summary-model",
+                ),
+                max_user_turns=1,
+                compact_after_messages=2,
+            ),
+        )
+        reconciliation_publish_started = asyncio.Event()
+        allow_reconciliation_publish = asyncio.Event()
+        original_emit = app._event_writer.emit
+
+        async def block_reconciliation_publish(event: Event) -> Event:
+            if event.type == EventType.BUDGET_RECONCILED:
+                reconciliation_publish_started.set()
+                await allow_reconciliation_publish.wait()
+            return await original_emit(event)
+
+        monkeypatch.setattr(app._event_writer, "emit", block_reconciliation_publish)
+        task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[
+                        Message.text("user", "old"),
+                        Message.text("assistant", "old answer"),
+                        Message.text("user", "current"),
+                    ],
+                ),
+            )
+        )
+        await asyncio.wait_for(reconciliation_publish_started.wait(), timeout=5)
+        records = tuple(ledger._records.values())
+        assert len(records) == 1
+        assert records[0].status == "reconciled"
+        task.cancel("cancel reconciliation event persistence")
+        await asyncio.sleep(0)
+        assert not task.done()
+        allow_reconciliation_publish.set()
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+
+        assert exc_info.value.args == ("cancel reconciliation event persistence",)
+        stored_events = await store.load_events(session_id)
+        reconciled = [event for event in stored_events if event.type == EventType.BUDGET_RECONCILED]
+        assert len(reconciled) == 1
+        assert reconciled[0].payload["reservation_id"] == records[0].reservation_id
+        assert len(compactor_provider.requests) == 1
+        assert runtime_provider.requests == []
+
+    asyncio.run(run())
+
+
+def test_automatic_compaction_cancellation_stays_authoritative_if_settlement_fails() -> None:
+    class BlockingFailingReconciliationLedger(InMemoryBudgetLedger):
+        def __init__(self) -> None:
+            super().__init__(reservation_ttl_seconds=None)
+            self.reconciliation_started = asyncio.Event()
+            self.allow_failure = asyncio.Event()
+
+        async def reconcile(self, **kwargs):
+            del kwargs
+            self.reconciliation_started.set()
+            await self.allow_failure.wait()
+            raise RuntimeError("budget ledger unavailable")
+
+    async def run() -> None:
+        ledger = BlockingFailingReconciliationLedger()
+        compactor_provider = FakeProvider([ModelStreamEvent.completed({})])
+        runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
+        app = CayuApp(
+            budget_policy=BudgetPolicy(
+                limits=(
+                    BudgetLimit(
+                        scope="app",
+                        max_estimated_cost=Decimal("1"),
+                        pricing=compaction_price_book(),
+                        reservation=BudgetReservation(max_input_tokens=10, max_output_tokens=0),
+                    ),
+                )
+            ),
+            budget_ledger=ledger,
+        )
+        app.register_provider(runtime_provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=compactor_provider,
+                    model="summary-model",
+                ),
+                max_user_turns=1,
+                compact_after_messages=2,
+            ),
+        )
+
+        task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_compaction_cancelled_settlement_failure",
+                    messages=[
+                        Message.text("user", "old"),
+                        Message.text("assistant", "old answer"),
+                        Message.text("user", "current"),
+                    ],
+                ),
+            )
+        )
+        await asyncio.wait_for(ledger.reconciliation_started.wait(), timeout=5)
+        task.cancel("cancel while settlement fails")
+        ledger.allow_failure.set()
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+
+        assert exc_info.value.args == ("cancel while settlement fails",)
+        assert exc_info.value.__notes__ == [
+            "Automatic compaction budget settlement also failed: "
+            "RuntimeError: budget ledger unavailable"
+        ]
+        assert isinstance(exc_info.value.__cause__, RuntimeError)
+        assert len(compactor_provider.requests) == 1
+        assert runtime_provider.requests == []
+
+    asyncio.run(run())
+
+
+def test_automatic_compaction_settles_other_limits_after_one_reconciliation_fails() -> None:
+    class FailMiddleReconciliationLedger(InMemoryBudgetLedger):
+        def __init__(self) -> None:
+            super().__init__(reservation_ttl_seconds=None)
+            self.reconcile_calls = 0
+
+        async def reconcile(self, **kwargs):
+            self.reconcile_calls += 1
+            if self.reconcile_calls == 2:
+                raise RuntimeError("middle reconciliation failed")
+            return await super().reconcile(**kwargs)
+
+    session_id = "sess_compaction_partial_settlement_failure"
+    ledger = FailMiddleReconciliationLedger()
+    reservation = BudgetReservation(max_input_tokens=10, max_output_tokens=0)
+    pricing = compaction_price_book()
+    compactor_provider = FakeProvider([ModelStreamEvent.completed({"usage": {"input_tokens": 1}})])
+    runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
+    app = CayuApp(
+        budget_policy=BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal("1"),
+                    pricing=pricing,
+                    reservation=reservation,
+                ),
+                BudgetLimit(
+                    scope="agent",
+                    key="assistant",
+                    max_estimated_cost=Decimal("1"),
+                    pricing=pricing,
+                    reservation=reservation,
+                ),
+                BudgetLimit(
+                    scope="causal",
+                    key=session_id,
+                    max_estimated_cost=Decimal("1"),
+                    pricing=pricing,
+                    reservation=reservation,
+                ),
+            )
+        ),
+        budget_ledger=ledger,
+    )
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compactor_provider,
+                model="summary-model",
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    records = tuple(ledger._records.values())
+    assert ledger.reconcile_calls == 3
+    assert [record.status for record in records] == ["reconciled", "active", "reconciled"]
+    reconciled = [event for event in events if event.type == EventType.BUDGET_RECONCILED]
+    assert [event.payload["reservation_id"] for event in reconciled] == [
+        records[0].reservation_id,
+        records[2].reservation_id,
+    ]
+    assert len(compactor_provider.requests) == 1
+    assert runtime_provider.requests == []
+    assert events[-1].type == EventType.SESSION_FAILED
+    assert events[-1].payload["error"] == "middle reconciliation failed"
+
+
+@pytest.mark.parametrize(
+    ("maximum", "compactor_calls", "runtime_calls", "terminal_event"),
+    [
+        pytest.param(
+            "0.000019",
+            1,
+            0,
+            EventType.SESSION_INTERRUPTED,
+            id="retry-reservation-denied",
+        ),
+        pytest.param(
+            "1",
+            2,
+            1,
+            EventType.SESSION_COMPLETED,
+            id="retry-reservation-reconciled",
+        ),
+    ],
+)
+def test_automatic_compaction_retry_requires_an_independent_reservation(
+    maximum: str,
+    compactor_calls: int,
+    runtime_calls: int,
+    terminal_event: EventType,
+) -> None:
+    class InheritedModelCompactor(ModelCompactor):
+        pass
+
+    class RetryCompactionProvider(ModelProvider):
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                raise ModelProviderError(
+                    "provider overloaded",
+                    provider=self.name,
+                    status_code=503,
+                    retryable=True,
+                )
+            yield ModelStreamEvent.text_delta("summary")
+            yield ModelStreamEvent.completed(
+                {"model": "summary-model", "usage": {"input_tokens": 1}}
+            )
+
+    compactor_provider = RetryCompactionProvider()
+    runtime_provider = FakeProvider(
+        [ModelStreamEvent.completed({"usage": {"input_tokens": 1, "output_tokens": 0}})]
+    )
+    app = CayuApp(
+        budget_policy=BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal(maximum),
+                    pricing=compaction_price_book(),
+                    reservation=BudgetReservation(max_input_tokens=10, max_output_tokens=0),
+                ),
+            )
+        )
+    )
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=InheritedModelCompactor(
+                provider=compactor_provider,
+                model="summary-model",
+                retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=f"sess_compaction_retry_budget_{maximum}",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    assert len(compactor_provider.requests) == compactor_calls
+    assert len(runtime_provider.requests) == runtime_calls
+    reconciliations = [event for event in events if event.type == EventType.BUDGET_RECONCILED]
+    assert Decimal(reconciliations[0].payload["actual_amount"]) == Decimal("0.00001")
+    if compactor_calls == 1:
+        failure = next(
+            event for event in events if event.type == EventType.BUDGET_RESERVATION_FAILED
+        )
+        assert Decimal(failure.payload["actual"]) == Decimal("0.00002")
+    else:
+        assert Decimal(reconciliations[1].payload["actual_amount"]) == Decimal("0.000001")
+    assert events[-1].type == terminal_event
+
+
+def test_automatic_compaction_does_not_retry_after_settlement_failure() -> None:
+    class FailingReconcileLedger(InMemoryBudgetLedger):
+        async def reconcile(
+            self,
+            *,
+            reservation_id: str,
+            actual_amount: Decimal,
+            reason: str | None = None,
+            occurred_at: datetime | None = None,
+        ):
+            del reservation_id, actual_amount, reason, occurred_at
+            raise RuntimeError("ledger reconciliation failed")
+
+    class RetryableFailureProvider(ModelProvider):
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            raise ModelProviderError(
+                "provider overloaded",
+                provider=self.name,
+                status_code=503,
+                retryable=True,
+            )
+            yield
+
+    compactor_provider = RetryableFailureProvider()
+    runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
+    app = CayuApp(
+        budget_policy=BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal("1"),
+                    pricing=compaction_price_book(),
+                    reservation=BudgetReservation(max_input_tokens=10, max_output_tokens=0),
+                ),
+            )
+        ),
+        budget_ledger=FailingReconcileLedger(),
+    )
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compactor_provider,
+                model="summary-model",
+                retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_compaction_settlement_failure_no_retry",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    assert len(compactor_provider.requests) == 1
+    assert runtime_provider.requests == []
+    assert events[-1].type == EventType.SESSION_FAILED
+    assert events[-1].payload["error"] == "provider overloaded"
+
+
+def test_prompt_cache_compaction_does_not_fallback_after_settlement_failure() -> None:
+    class FailSecondReconcileLedger(InMemoryBudgetLedger):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reconcile_calls = 0
+
+        async def reconcile(
+            self,
+            *,
+            reservation_id: str,
+            actual_amount: Decimal,
+            reason: str | None = None,
+            occurred_at: datetime | None = None,
+        ):
+            self.reconcile_calls += 1
+            if self.reconcile_calls == 2:
+                raise RuntimeError("ledger reconciliation failed")
+            return await super().reconcile(
+                reservation_id=reservation_id,
+                actual_amount=actual_amount,
+                reason=reason,
+                occurred_at=occurred_at,
+            )
+
+    overflow = ModelContextOverflowError(
+        "context too large",
+        provider="fake",
+        status_code=400,
+        error_code="context_length_exceeded",
+    )
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first answer"),
+                ModelStreamEvent.completed({"usage": {"input_tokens": 1, "output_tokens": 0}}),
+            ],
+            [ModelStreamEvent.error(str(overflow), cause=overflow)],
+        ]
+    )
+    ledger = FailSecondReconcileLedger()
+    app = CayuApp(
+        budget_policy=BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal("1"),
+                    pricing=compaction_price_book(),
+                    reservation=BudgetReservation(max_input_tokens=10, max_output_tokens=0),
+                ),
+            )
+        ),
+        budget_ledger=ledger,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=PromptCacheCompactor(provider=provider),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+    first_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_prompt_cache_settlement_failure",
+                messages=[Message.text("user", "first")],
+            ),
+        )
+    )
+    assert first_events[-1].type == EventType.SESSION_COMPLETED
+
+    resume_events = asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_prompt_cache_settlement_failure",
+                messages=[Message.text("user", "second")],
+            ),
+        )
+    )
+
+    assert len(provider.requests) == 2
+    assert ledger.reconcile_calls == 2
+    assert resume_events[-1].type == EventType.SESSION_FAILED
+    assert resume_events[-1].payload["error"] == "context too large"
+
+
+def test_inherited_prompt_cache_compactor_reserves_exact_fallback_independently() -> None:
+    class InheritedPromptCacheCompactor(PromptCacheCompactor):
+        pass
+
+    overflow = ModelContextOverflowError(
+        "context too large",
+        provider="fake",
+        status_code=400,
+        error_code="context_length_exceeded",
+    )
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first answer"),
+                ModelStreamEvent.completed(
+                    {
+                        "model": "fake-model",
+                        "usage": {"input_tokens": 1, "output_tokens": 0},
+                    }
+                ),
+            ],
+            [ModelStreamEvent.error(str(overflow), cause=overflow)],
+            [
+                ModelStreamEvent.text_delta("bounded summary"),
+                ModelStreamEvent.completed(
+                    {
+                        "model": "fake-model",
+                        "usage": {"input_tokens": 1, "output_tokens": 0},
+                    }
+                ),
+            ],
+        ]
+    )
+    app = CayuApp(
+        budget_policy=BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal("0.000019"),
+                    pricing=compaction_price_book(),
+                    reservation=BudgetReservation(max_input_tokens=10, max_output_tokens=0),
+                ),
+            )
+        )
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=InheritedPromptCacheCompactor(provider=provider),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    first_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_inherited_prompt_cache_budget",
+                messages=[Message.text("user", "first")],
+            ),
+        )
+    )
+    assert first_events[-1].type == EventType.SESSION_COMPLETED
+
+    resume_events = asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_inherited_prompt_cache_budget",
+                messages=[Message.text("user", "second")],
+            ),
+        )
+    )
+
+    assert len(provider.requests) == 2
+    assert [event.type for event in resume_events].count(EventType.BUDGET_RESERVED) == 1
+    failures = [
+        event for event in resume_events if event.type == EventType.BUDGET_RESERVATION_FAILED
+    ]
+    assert len(failures) == 1, [event.type for event in resume_events]
+    failure = failures[0]
+    assert Decimal(failure.payload["actual"]) == Decimal("0.000021")
+    assert resume_events[-1].type == EventType.SESSION_INTERRUPTED
+
+
+@pytest.mark.parametrize(
+    ("reservation", "expected_compactor_calls", "expected_terminal_event"),
+    [
+        pytest.param(
+            BudgetReservation(max_input_tokens=10, max_output_tokens=0),
+            0,
+            EventType.SESSION_FAILED,
+            id="strict-reservation-fails-closed",
+        ),
+        pytest.param(
+            None,
+            1,
+            EventType.SESSION_INTERRUPTED,
+            id="event-backed-budget-remains-supported",
+        ),
+    ],
+)
+def test_automatic_compaction_opaque_multi_dispatch_budget_boundary(
+    reservation: BudgetReservation | None,
+    expected_compactor_calls: int,
+    expected_terminal_event: EventType,
+) -> None:
+    class OpaqueMultiDispatchCompactor(ContextCompactor):
+        def __init__(self, provider: ModelProvider) -> None:
+            self.provider = provider
+            self.calls = 0
+
+        def provider_budget_identity(self, session: Session) -> tuple[str, str]:
+            del session
+            return "fake", "summary-model"
+
+        async def compact(self, request: CompactionRequest) -> CompactionResult:
+            self.calls += 1
+            model_request = ModelRequest(
+                model="summary-model",
+                messages=[Message.text("user", "summarize")],
+            )
+            for _ in range(2):
+                async for _event in self.provider.stream(model_request):
+                    pass
+            return CompactionResult(
+                summary="summary",
+                model_completed_payloads=[
+                    {
+                        "provider_name": "fake",
+                        "requested_model": "summary-model",
+                        "model": "summary-model",
+                        "purpose": "context_compaction",
+                        "usage_metrics": {
+                            "provider_name": "fake",
+                            "requested_model": "summary-model",
+                            "model": "summary-model",
+                            "input_tokens": 10,
+                            "output_tokens": 0,
+                            "total_tokens": 10,
+                        },
+                    },
+                    {
+                        "provider_name": "fake",
+                        "requested_model": "summary-model",
+                        "model": "summary-model",
+                        "purpose": "context_compaction",
+                        "usage_metrics": {
+                            "provider_name": "fake",
+                            "requested_model": "summary-model",
+                            "model": "summary-model",
+                            "input_tokens": 10,
+                            "output_tokens": 0,
+                            "total_tokens": 10,
+                        },
+                    },
+                ],
+            )
+
+    compactor_provider = FakeProvider(
+        [
+            [ModelStreamEvent.completed({"usage": {"input_tokens": 10}})],
+            [ModelStreamEvent.completed({"usage": {"input_tokens": 10}})],
+        ]
+    )
+    compactor = OpaqueMultiDispatchCompactor(compactor_provider)
+    runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
+    app = CayuApp(
+        budget_policy=BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal("0.000019"),
+                    pricing=compaction_price_book(),
+                    reservation=reservation,
+                ),
+            )
+        )
+    )
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=compactor,
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=f"sess_compaction_opaque_budget_{reservation is not None}",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    assert compactor.calls == expected_compactor_calls
+    assert len(compactor_provider.requests) == expected_compactor_calls * 2
+    assert runtime_provider.requests == []
+    assert events[-1].type == expected_terminal_event
+    if reservation is not None:
+        assert EventType.BUDGET_RESERVED not in [event.type for event in events]
+        assert EventType.MODEL_COMPLETED not in [event.type for event in events]
+        assert "cannot safely run opaque provider-backed compactor" in events[-1].payload["error"]
+    else:
+        assert [event.type for event in events].count(EventType.MODEL_COMPLETED) == 2
+        assert EventType.BUDGET_LIMIT_REACHED in [event.type for event in events]
+        budget_limit = next(
+            event for event in events if event.type == EventType.BUDGET_LIMIT_REACHED
+        )
+        assert Decimal(budget_limit.payload["actual"]) == Decimal("0.00002")
+
+
+def test_deterministic_automatic_compaction_does_not_consume_strict_reservation() -> None:
+    class DeterministicRecordingCompactor(RecordingCompactor):
+        def provider_budget_identity(self, session: Session) -> None:
+            del session
+            return None
+
+    compactor = DeterministicRecordingCompactor()
+    runtime_provider = FakeProvider(
+        [ModelStreamEvent.completed({"usage": {"input_tokens": 1, "output_tokens": 0}})]
+    )
+    app = CayuApp(
+        budget_policy=BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal("0.00002"),
+                    pricing=compaction_price_book(),
+                    reservation=BudgetReservation(
+                        max_input_tokens=10,
+                        max_output_tokens=0,
+                    ),
+                ),
+            )
+        )
+    )
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=compactor,
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_deterministic_compaction_strict_budget",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    assert len(compactor.requests) == 1
+    assert len(runtime_provider.requests) == 1
+    assert [event.type for event in events].count(EventType.BUDGET_RESERVED) == 1
+    assert [event.type for event in events].count(EventType.BUDGET_RECONCILED) == 1
+    assert events[-1].type == EventType.SESSION_COMPLETED
+
+
+def test_prompt_cache_deterministic_fallback_does_not_consume_compaction_reservation() -> None:
+    provider = FakeProvider(
+        [ModelStreamEvent.completed({"usage": {"input_tokens": 1, "output_tokens": 0}})]
+    )
+    app = CayuApp(
+        budget_policy=BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal("0.00002"),
+                    pricing=compaction_price_book(),
+                    reservation=BudgetReservation(
+                        max_input_tokens=10,
+                        max_output_tokens=0,
+                    ),
+                ),
+            )
+        )
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=PromptCacheCompactor(provider=provider),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_prompt_cache_deterministic_budget_fallback",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    assert len(provider.requests) == 1
+    assert [event.type for event in events].count(EventType.BUDGET_RESERVED) == 1
+    assert [event.type for event in events].count(EventType.BUDGET_RECONCILED) == 1
+    compaction_completed = next(
+        event for event in events if event.type == EventType.CONTEXT_COMPACTION_COMPLETED
+    )
+    assert compaction_completed.payload["metadata"]["compactor"] == ("TranscriptDigestCompactor")
+    assert events[-1].type == EventType.SESSION_COMPLETED
+
+
+def test_automatic_compaction_reconciliation_survives_sqlite_ledger_reopen(
+    tmp_path,
+) -> None:
+    ledger_path = tmp_path / "automatic-compaction-budget.sqlite"
+    pricing = compaction_price_book()
+    limit = BudgetLimit(
+        scope="app",
+        max_estimated_cost=Decimal("0.000029"),
+        pricing=pricing,
+        reservation=BudgetReservation(max_input_tokens=10, max_output_tokens=0),
+    )
+    compactor_provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("model summary"),
+            ModelStreamEvent.completed(
+                {
+                    "model": "summary-model",
+                    "usage": {"input_tokens": 20, "output_tokens": 0},
+                }
+            ),
+        ]
+    )
+    first_runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
+    first_ledger = SQLiteBudgetLedger(ledger_path)
+    first_app = CayuApp(
+        budget_policy=BudgetPolicy(limits=(limit,)),
+        budget_ledger=first_ledger,
+    )
+    first_app.register_provider(first_runtime_provider, default=True)
+    first_app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compactor_provider,
+                model="summary-model",
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    asyncio.run(
+        collect_events(
+            first_app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_compaction_sqlite_first",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+    asyncio.run(first_ledger.close())
+
+    second_runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
+    second_ledger = SQLiteBudgetLedger(ledger_path)
+    second_app = CayuApp(
+        budget_policy=BudgetPolicy(limits=(limit,)),
+        budget_ledger=second_ledger,
+    )
+    second_app.register_provider(second_runtime_provider, default=True)
+    second_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    second_events = asyncio.run(
+        collect_events(
+            second_app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_compaction_sqlite_second",
+                messages=[Message.text("user", "current")],
+            ),
+        )
+    )
+    asyncio.run(second_ledger.close())
+
+    assert first_runtime_provider.requests == []
+    assert second_runtime_provider.requests == []
+    failure = next(
+        event for event in second_events if event.type == EventType.BUDGET_RESERVATION_FAILED
+    )
+    assert Decimal(failure.payload["actual"]) == Decimal("0.00003")
+    assert second_events[-1].type == EventType.SESSION_INTERRUPTED
+
+
+def test_cayu_app_compaction_request_budget_notify_is_nonblocking_and_deduplicated():
+    compactor_provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("model summary"),
+            ModelStreamEvent.completed(
+                {
+                    "model": "summary-model",
+                    "usage": {"input_tokens": 20, "output_tokens": 0},
+                }
+            ),
+        ]
+    )
+    runtime_provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("final answer"),
+            ModelStreamEvent.completed({"usage": {"input_tokens": 1, "output_tokens": 0}}),
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compactor_provider,
+                model="summary-model",
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_compaction_request_budget_notify",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+                budget_limits=(
+                    BudgetLimit(
+                        scope="run",
+                        max_estimated_cost=Decimal("0.00002"),
+                        pricing=compaction_price_book(),
+                        action="notify",
+                    ),
+                ),
+            ),
+        )
+    )
+
+    notify_events = [event for event in events if event.type == EventType.BUDGET_LIMIT_REACHED]
+    assert len(notify_events) == 1
+    assert notify_events[0].payload["action"] == "notify"
+    assert Decimal(notify_events[0].payload["actual"]) == Decimal("0.00002")
+    assert len(compactor_provider.requests) == 1
+    assert len(runtime_provider.requests) == 1
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    usage = asyncio.run(app.get_session_usage("sess_compaction_request_budget_notify"))
+    assert usage.model_steps == 2
+    assert usage.usage.total_tokens == 21
+
+
+def test_cayu_app_non_model_compaction_does_not_add_budget_boundary():
+    compactor = RecordingCompactor()
+    provider = FakeProvider(
+        [ModelStreamEvent.completed({"usage": {"input_tokens": 1, "output_tokens": 0}})]
+    )
+    app = CayuApp(
+        budget_policy=BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal("10"),
+                    pricing=compaction_price_book(),
+                ),
+            )
+        )
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=compactor,
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_non_model_compaction_budget_boundaries",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.BUDGET_CHECKED,
+        EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.CONTEXT_COMPACTION_COMPLETED,
+        EventType.SESSION_CHECKPOINTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.BUDGET_CHECKED,
+        EventType.TURN_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert len(compactor.requests) == 1
+    assert len(provider.requests) == 1
+
+
+def test_cayu_app_model_compaction_policy_without_compaction_keeps_normal_boundaries():
+    compactor_provider = FakeProvider([ModelStreamEvent.completed({})])
+    runtime_provider = FakeProvider(
+        [ModelStreamEvent.completed({"usage": {"input_tokens": 1, "output_tokens": 0}})]
+    )
+    app = CayuApp(
+        budget_policy=BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal("10"),
+                    pricing=compaction_price_book(),
+                ),
+            )
+        )
+    )
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compactor_provider,
+                model="summary-model",
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_no_compaction_budget_boundaries",
+                messages=[Message.text("user", "current")],
+            ),
+        )
+    )
+
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.BUDGET_CHECKED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.BUDGET_CHECKED,
+        EventType.TURN_COMPLETED,
+        EventType.SESSION_COMPLETED,
+    ]
+    assert compactor_provider.requests == []
+    assert len(runtime_provider.requests) == 1
 
 
 def test_cayu_app_keeps_invalid_summary_spend_when_custom_compactor_recovers():
