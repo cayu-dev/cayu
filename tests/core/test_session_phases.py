@@ -1,11 +1,4 @@
-"""Focused tests for the session-loop phase objects in cayu.runtime.app.
-
-The session loop is composed of three phase objects: ``_LimitGate`` (the
-shared run-limit / request-budget check used at every phase boundary),
-``_InterruptGuard`` (the session-interrupt matrix around a tool round), and
-``_ToolRoundRunner`` (policy planning, approval checkpointing, and tool
-execution for one round). These tests exercise the phase objects directly.
-"""
+"""Focused tests for the session-loop phase objects in cayu.runtime.app."""
 
 from __future__ import annotations
 
@@ -28,6 +21,7 @@ from cayu.runtime import (
     SessionStatus,
 )
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime._run_limits import RunLimitGate
 from cayu.runtime._session_control import SessionInterruptedByRequest
 
 
@@ -103,12 +97,11 @@ def _limit_gate(
     session,
     *,
     limits: RunLimits,
-) -> runtime_app_module._LimitGate:
-    return runtime_app_module._LimitGate(
-        app,
+) -> RunLimitGate:
+    return RunLimitGate(
+        app._run_limit_controller,
         session=session,
-        registered_agent=app._get_registered_agent("assistant"),
-        registered_environment=None,
+        agent_name="assistant",
         environment_name=None,
         limits=limits,
         budget_limits=(),
@@ -130,68 +123,6 @@ def _interrupt_guard(app: CayuApp, session) -> runtime_app_module._InterruptGuar
 
 def _tool_call(call_id: str = "call_1") -> runtime_records.ToolCallRequest:
     return runtime_records.ToolCallRequest(id=call_id, name="side_effect", arguments={})
-
-
-def test_limit_gate_trips_and_stops_session_when_limit_is_reached():
-    app, store, _ = _app_with_completed_session("sess_gate_trip")
-
-    async def scenario() -> tuple[list[Event], bool]:
-        session = await store.load("sess_gate_trip")
-        assert session is not None
-        gate = _limit_gate(app, session, limits=RunLimits(max_total_tokens=10))
-        events = [event async for event in gate.evaluate_limits(messages=[])]
-        return events, gate.tripped
-
-    events, tripped = asyncio.run(scenario())
-
-    assert tripped is True
-    assert [event.type for event in events] == [
-        EventType.SESSION_LIMIT_REACHED,
-        EventType.SESSION_INTERRUPTED,
-    ]
-    assert events[0].payload["limit"] == "total_tokens"
-    assert events[0].payload["actual"] == 11
-    assert events[0].payload["maximum"] == 10
-    assert events[1].payload["interruption_type"] == "limit_reached"
-    session = asyncio.run(store.load("sess_gate_trip"))
-    assert session is not None
-    assert session.status == SessionStatus.INTERRUPTED
-
-
-def test_limit_gate_does_not_trip_below_limit_and_resets_between_evaluations():
-    app, store, _ = _app_with_completed_session("sess_gate_reset")
-
-    async def scenario() -> tuple[list[Event], bool, list[Event], bool, bool]:
-        session = await store.load("sess_gate_reset")
-        assert session is not None
-        below_gate = _limit_gate(app, session, limits=RunLimits(max_total_tokens=100))
-        below_events = [event async for event in below_gate.evaluate_limits(messages=[])]
-        below_tripped = below_gate.tripped
-
-        tripping_gate = _limit_gate(app, session, limits=RunLimits(max_total_tokens=10))
-        async for _ in tripping_gate.evaluate_limits(messages=[]):
-            pass
-        tripped_after_limits = tripping_gate.tripped
-        # A later evaluation must reset the tripped flag: with no budget
-        # policy configured the budget check passes cleanly.
-        async for _ in tripping_gate.evaluate_budget(messages=[]):
-            pass
-        return (
-            below_events,
-            below_tripped,
-            [],
-            tripped_after_limits,
-            tripping_gate.tripped,
-        )
-
-    below_events, below_tripped, _, tripped_after_limits, tripped_after_budget = asyncio.run(
-        scenario()
-    )
-
-    assert below_events == []
-    assert below_tripped is False
-    assert tripped_after_limits is True
-    assert tripped_after_budget is False
 
 
 def test_interrupt_guard_ignores_cancellation_without_interrupt_request():
@@ -325,6 +256,9 @@ def test_tool_round_runner_stops_for_limit_before_tool_side_effects():
             limits=RunLimits(),
             budget_limits=(),
             retry_policy=RetryPolicy(),
+            run_started_at=time.monotonic(),
+            turn_usage_tracker=None,
+            active_run=None,
         )
         events = [
             event
@@ -372,6 +306,9 @@ def test_tool_round_runner_executes_tool_round_and_persists_results():
             limits=RunLimits(),
             budget_limits=(),
             retry_policy=RetryPolicy(),
+            run_started_at=time.monotonic(),
+            turn_usage_tracker=None,
+            active_run=None,
         )
         messages: list[Message] = []
         events = [

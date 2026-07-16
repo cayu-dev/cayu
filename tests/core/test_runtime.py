@@ -109,6 +109,7 @@ from cayu.runtime import (
     DispatchHandle,
     DispatchRequest,
     DispatchStatus,
+    EventOrder,
     EventQuery,
     EventSink,
     ForkSessionRequest,
@@ -26539,14 +26540,12 @@ def test_cayu_app_query_all_event_records_preserves_filters():
 
         # The paginator rebuilds the query field-by-field; a dropped
         # `event_types` would silently widen usage reads (the delta leaks in).
-        await store.append_event(
-            "query_all_b",
-            Event(
-                type=EventType.MODEL_TEXT_DELTA,
-                session_id="query_all_b",
-                payload={"delta": "noise"},
-            ),
+        delta_event = Event(
+            type=EventType.MODEL_TEXT_DELTA,
+            session_id="query_all_b",
+            payload={"delta": "noise"},
         )
+        await store.append_event("query_all_b", delta_event)
         multi_type_records = await app._query_all_event_records(
             EventQuery(
                 session_ids=("query_all_b",),
@@ -26555,6 +26554,55 @@ def test_cayu_app_query_all_event_records_preserves_filters():
             )
         )
         assert [record.event.type for record in multi_type_records] == [EventType.MODEL_COMPLETED]
+
+        descending_records = await app._query_all_event_records(
+            EventQuery(
+                session_id="query_all_b",
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=1,
+            )
+        )
+        assert [record.event.type for record in descending_records] == [
+            EventType.MODEL_TEXT_DELTA,
+            EventType.MODEL_COMPLETED,
+        ]
+
+        multi_session_descending_records = await app._query_all_event_records(
+            EventQuery(
+                session_ids=("query_all_a", "query_all_b"),
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=1,
+            )
+        )
+        assert [record.event.type for record in multi_session_descending_records] == [
+            EventType.MODEL_TEXT_DELTA,
+            EventType.MODEL_COMPLETED,
+            EventType.MODEL_COMPLETED,
+        ]
+        assert [record.event.session_id for record in multi_session_descending_records] == [
+            "query_all_b",
+            "query_all_b",
+            "query_all_a",
+        ]
+
+        bounded_records = await app._query_all_event_records(
+            EventQuery(
+                session_id="query_all_b",
+                before_sequence=descending_records[0].sequence,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=1,
+            )
+        )
+        assert [record.event.type for record in bounded_records] == [EventType.MODEL_COMPLETED]
+
+        event_id_records = await app._query_all_event_records(
+            EventQuery(
+                session_id="query_all_b",
+                event_id=delta_event.id,
+                limit=1,
+            )
+        )
+        assert [record.event.id for record in event_id_records] == [delta_event.id]
 
     asyncio.run(run())
 

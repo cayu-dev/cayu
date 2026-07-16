@@ -165,6 +165,25 @@ class FailingSecondReservationBudgetLedger(InMemoryBudgetLedger):
         return await super().release(**kwargs)
 
 
+class FailingSecondReleaseBudgetLedger(InMemoryBudgetLedger):
+    def __init__(self) -> None:
+        super().__init__()
+        self.release_calls = 0
+        self.reservation_ids: list[str] = []
+
+    async def reserve(self, **kwargs):
+        result = await super().reserve(**kwargs)
+        if result.record is not None:
+            self.reservation_ids.append(result.record.reservation_id)
+        return result
+
+    async def release(self, **kwargs):
+        self.release_calls += 1
+        if self.release_calls == 2:
+            raise RuntimeError("simulated second release failure")
+        return await super().release(**kwargs)
+
+
 class UndeclaredProviderCompactor(ContextCompactor):
     def __init__(self) -> None:
         self.calls = 0
@@ -1855,6 +1874,122 @@ def test_compact_session_releases_partial_reservations_when_later_acquisition_fa
         assert ledger.reserve_calls == 2
         assert ledger.release_calls == 1
         assert not await ledger.heartbeat(reservation_id=reservation_id)
+        assert provider.calls == 0
+
+    asyncio.run(run())
+
+
+def test_compact_session_preserves_partial_cleanup_and_releases_remaining_reservations() -> None:
+    async def run() -> None:
+        pricing = PriceBook(
+            prices=(
+                ModelPrice.fixed(
+                    provider_name="compaction-provider",
+                    model="summary-model",
+                    input_per_million=Decimal("1"),
+                    output_per_million=Decimal("2"),
+                ),
+            )
+        )
+        reservation = BudgetReservation(max_input_tokens=10, max_output_tokens=10)
+        provider = UsageCompactionProvider()
+        ledger = FailingSecondReleaseBudgetLedger()
+        store = InMemorySessionStore()
+        app = CayuApp(
+            session_store=store,
+            budget_policy=BudgetPolicy(
+                limits=(
+                    BudgetLimit(
+                        scope="app",
+                        max_estimated_cost=Decimal("0.001"),
+                        pricing=pricing,
+                        reservation=reservation,
+                    ),
+                    BudgetLimit(
+                        scope="agent",
+                        key="assistant",
+                        max_estimated_cost=Decimal("0.001"),
+                        pricing=pricing,
+                        reservation=reservation,
+                    ),
+                    BudgetLimit(
+                        scope="causal",
+                        key="compact-partial-cleanup-causal",
+                        max_estimated_cost=Decimal("0.001"),
+                        pricing=pricing,
+                        reservation=reservation,
+                    ),
+                )
+            ),
+            budget_ledger=ledger,
+            enable_logging=False,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(provider=provider, model="summary-model"),
+                max_user_turns=1,
+            ),
+        )
+        created = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_compact_partial_cleanup_failure",
+                causal_budget_id="compact-partial-cleanup-causal",
+                messages=[Message.text("user", "create only")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        transcript = [
+            Message.text("user", "old request"),
+            Message.text("assistant", "old answer"),
+            Message.text("user", "current request"),
+            Message.text("assistant", "current answer"),
+        ]
+        await store.append_transcript_messages(created.id, transcript)
+        completed = await store.update_status(created.id, SessionStatus.COMPLETED)
+        events = []
+
+        with pytest.raises(RuntimeError, match="simulated second release failure"):
+            async for event in app.compact_session(
+                CompactSessionRequest(
+                    session_id=created.id,
+                    idempotency_key="compact-partial-cleanup-failure",
+                    expected_run_epoch=completed.run_epoch,
+                    expected_transcript_cursor=len(transcript),
+                    budget_limits=(
+                        BudgetLimit(
+                            scope="app",
+                            max_estimated_cost=Decimal("0.000001"),
+                            pricing=pricing,
+                            reservation=reservation,
+                        ),
+                    ),
+                )
+            ):
+                events.append(event)
+
+        assert [event.type for event in events] == [
+            EventType.CONTEXT_COMPACTION_STARTED,
+            EventType.BUDGET_CHECKED,
+            EventType.BUDGET_CHECKED,
+            EventType.BUDGET_CHECKED,
+            EventType.BUDGET_RESERVED,
+            EventType.BUDGET_RESERVED,
+            EventType.BUDGET_RESERVED,
+            EventType.BUDGET_RESERVATION_FAILED,
+            EventType.BUDGET_RESERVATION_RELEASED,
+            EventType.BUDGET_RESERVATION_RELEASED,
+            EventType.BUDGET_RESERVATION_RELEASED,
+            EventType.CONTEXT_COMPACTION_FAILED,
+        ]
+        assert len(ledger.reservation_ids) == 3
+        assert {event.payload["reservation_id"] for event in events[8:11]} == set(
+            ledger.reservation_ids
+        )
+        assert ledger.release_calls == 4
+        for reservation_id in ledger.reservation_ids:
+            assert not await ledger.heartbeat(reservation_id=reservation_id)
         assert provider.calls == 0
 
     asyncio.run(run())

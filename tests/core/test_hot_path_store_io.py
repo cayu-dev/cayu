@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 
-import cayu.runtime.app as runtime_app_module
 from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
@@ -16,6 +15,7 @@ from cayu.runtime import (
     SessionIdentity,
     SessionStatus,
 )
+from cayu.runtime._run_limits import SessionUsageTracker
 from cayu.runtime.usage import session_usage_summary
 
 
@@ -130,7 +130,6 @@ def test_run_with_limits_does_not_load_full_event_log():
 
 def test_session_usage_tracker_accumulates_tail_events_incrementally():
     store = InMemorySessionStore()
-    app = CayuApp(session_store=store, enable_logging=False)
 
     def usage_event(step: int) -> Event:
         return Event(
@@ -150,7 +149,7 @@ def test_session_usage_tracker_accumulates_tail_events_incrementally():
 
     async def run():
         await _create_running_session(store, "sess_tracker")
-        tracker = runtime_app_module._SessionUsageTracker(app, session_id="sess_tracker")
+        tracker = SessionUsageTracker(store, session_id="sess_tracker")
 
         assert await tracker.usage_events() == []
 
@@ -261,11 +260,10 @@ class _MidRefreshAppendingStore(InMemorySessionStore):
 
 def test_session_usage_tracker_never_skips_events_appended_mid_refresh():
     store = _MidRefreshAppendingStore()
-    app = CayuApp(session_store=store, enable_logging=False)
 
     async def run():
         await _create_running_session(store, "sess_race")
-        tracker = runtime_app_module._SessionUsageTracker(app, session_id="sess_race")
+        tracker = SessionUsageTracker(store, session_id="sess_race")
 
         # First refresh: the store races an append mid-refresh. The refresh
         # must be ONE store query, and must not advance the watermark past
