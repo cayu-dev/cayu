@@ -3534,6 +3534,35 @@ class SQLiteTaskStore(TaskStore):
             updated = self._require_task_unlocked(task_id)
             return updated.model_copy(deep=True)
 
+    async def release_attached_task_worker(self, task_id: str, worker_id: str) -> Task:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        now = datetime.now(UTC)
+        async with self._lock:
+            with self._connection:
+                cursor = self._connection.execute(
+                    """
+                    UPDATE cayu_tasks
+                    SET worker_id = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = ?
+                    WHERE id = ? AND worker_id = ? AND status = ?
+                      AND session_id IS NOT NULL
+                      AND lease_expires_at IS NOT NULL AND lease_expires_at > ?
+                    """,
+                    (
+                        sqlite_support.format_datetime(now),
+                        task_id,
+                        worker_id,
+                        str(TaskStatus.RUNNING),
+                        sqlite_support.format_datetime(now),
+                    ),
+                )
+            if cursor.rowcount != 1:
+                self._raise_attached_task_worker_release_error(task_id, worker_id)
+            updated = self._require_task_unlocked(task_id)
+            return updated.model_copy(deep=True)
+
     async def reclaim_expired(
         self,
         *,
@@ -3786,6 +3815,18 @@ class SQLiteTaskStore(TaskStore):
             raise ValueError(f"Task {task.id} is already attached to session {task.session_id}.")
         if task.status is not TaskStatus.CLAIMED:
             raise ValueError(f"Task {task.id} is not claimed.")
+        self._raise_task_active_lease_error(task_id, worker_id)
+
+    def _raise_attached_task_worker_release_error(
+        self,
+        task_id: str,
+        worker_id: str,
+    ) -> None:
+        task = self._require_task_unlocked(task_id)
+        if task.status is not TaskStatus.RUNNING:
+            raise ValueError(f"Task {task.id} is not running.")
+        if task.session_id is None:
+            raise ValueError(f"Task {task.id} is not attached to a session.")
         self._raise_task_active_lease_error(task_id, worker_id)
 
     def _raise_task_claim_attach_error(self, task_id: str, worker_id: str) -> None:

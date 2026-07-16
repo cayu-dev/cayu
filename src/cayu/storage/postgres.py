@@ -6931,6 +6931,45 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
             await conn.commit()
             return updated.model_copy(deep=True)
 
+    async def release_attached_task_worker(self, task_id: str, worker_id: str) -> Task:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        now = datetime.now(UTC)
+
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    f"""
+                    UPDATE cayu_tasks
+                    SET worker_id = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = %s
+                    WHERE id = %s AND worker_id = %s AND status = %s
+                      AND session_id IS NOT NULL
+                      AND lease_expires_at IS NOT NULL AND lease_expires_at > %s
+                    RETURNING {pg_support.TASK_COLUMNS}
+                    """,
+                    (
+                        now,
+                        task_id,
+                        worker_id,
+                        str(TaskStatus.RUNNING),
+                        now,
+                    ),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    await self._raise_attached_task_worker_release_error(
+                        cur,
+                        task_id,
+                        worker_id,
+                    )
+                assert row is not None
+                updated = pg_support.task_from_row(row)
+            await conn.commit()
+            return updated.model_copy(deep=True)
+
     async def reclaim_expired(
         self,
         *,
@@ -7175,6 +7214,19 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
             raise ValueError(f"Task {task.id} is already attached to session {task.session_id}.")
         if task.status is not TaskStatus.CLAIMED:
             raise ValueError(f"Task {task.id} is not claimed.")
+        await self._raise_task_active_lease_error(cur, task_id, worker_id)
+
+    async def _raise_attached_task_worker_release_error(
+        self,
+        cur: Any,
+        task_id: str,
+        worker_id: str,
+    ) -> None:
+        task = await self._require_task(cur, task_id)
+        if task.status is not TaskStatus.RUNNING:
+            raise ValueError(f"Task {task.id} is not running.")
+        if task.session_id is None:
+            raise ValueError(f"Task {task.id} is not attached to a session.")
         await self._raise_task_active_lease_error(cur, task_id, worker_id)
 
     async def _raise_task_claim_attach_error(

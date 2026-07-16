@@ -675,6 +675,7 @@ A task is not a PM-specific object. It is a generic work item that can represent
 - `claim_task(worker_id, TaskQuery(...), lease_seconds=...)`
 - `heartbeat(task_id, worker_id, extend_seconds=...)`
 - `release_task(task_id, worker_id)`
+- `release_attached_task_worker(task_id, worker_id)`
 - `reclaim_expired(query=..., max_reclaims=...)`
 - `complete_task(task_id, result)`
 - `fail_task(task_id, error)`
@@ -712,6 +713,27 @@ There are two supported task execution modes:
 
 1. **Direct task/session link.** `CayuApp(task_store=...)` can link an agent run to an existing pending task through `RunRequest.task_id`. The runtime starts that task with the created session id, emits `task.started`, and marks the task completed or failed when the run reaches those terminal states. Use this when app code already decided exactly which task and session should run.
 2. **Worker-claimed queue task.** App-owned worker code can atomically claim one unattached pending task with `claim_task(worker_id, query)`. The claim marks the task `claimed`, records `worker_id`, and sets `lease_expires_at`; it does not attach a session or mark the task started. The worker must pass both `task_id` and `task_worker_id` to `RunRequest`; Cayu then calls `attach_task(...)` to move the live owned claim to `running` with the created session id. The worker should call `heartbeat(...)` while it is doing pre-run work or while the agent run is active. It can `release_task(...)` before session attachment if it decides not to process the task. Another worker can call `reclaim_expired(...)` to return abandoned unattached claims to `pending`.
+
+`run_task_worker(...)` normally requires its handler to terminalize the claimed
+task; returning `None` with a claimed or running task fails that task. If the
+handler fully consumes an attached agent run that durably ends with
+`session.interrupted`, it may instead return
+`TaskHandlerOutcome.SESSION_INTERRUPTED`. The helper reloads the public session
+state, requires the linked session to be `interrupted`, and calls
+`release_attached_task_worker(...)`. That store operation atomically clears the
+worker id and lease while preserving the task as `running` and attached to its
+session. The task is not returned to the fresh-work queue. A control-plane
+process may later resolve an approval or user-input request, resume the session,
+or run recovery; the existing session/task link then terminalizes the same task.
+Custom worker loops may call the store operation directly after establishing the
+same durable session boundary.
+
+The explicit outcome is fail-closed. A handler that returns it for an unattached
+task, a missing session, or a session in any state other than `interrupted` does
+not release ownership; the ordinary bounded worker failure path applies while
+the worker still owns a valid lease. If another controller already terminalized
+the task, that terminal state wins. This handoff is not a task retry, task pause,
+session detach, or scheduler state.
 
 Claim queries intentionally do not support `q`, `session_id`, `limit`, or `offset`. Queue claims always pick one unattached pending task; tasks already linked to a session are no longer free queue work. `reclaim_expired(...)` also ignores attached tasks, even if their lease timestamp has passed, because the associated session may still be running or recoverable through session recovery. Once a claimed task is attached to a session, runtime completion/failure owns the task terminal update; the app should observe the session/task events instead of releasing that task back to the queue.
 

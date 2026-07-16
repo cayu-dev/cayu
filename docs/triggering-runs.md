@@ -31,6 +31,7 @@ Minimal `run_task_worker` usage:
 
 ```python
 async def handle(app, task, worker_id):
+    outcome = None
     async for _event in app.run(RunRequest(
         agent_name=task.assigned_agent_name or "assistant",
         session_id=f"job-{task.id}",
@@ -38,7 +39,9 @@ async def handle(app, task, worker_id):
         task_worker_id=worker_id,
         messages=[Message.text("user", task.input["prompt"])],
     )):
-        pass
+        if _event.type == EventType.SESSION_INTERRUPTED:
+            outcome = TaskHandlerOutcome.SESSION_INTERRUPTED
+    return outcome
 
 # Run N of these across processes; the task store's lease + FOR UPDATE SKIP LOCKED
 # claiming (Postgres) keeps workers from colliding.
@@ -50,6 +53,15 @@ The loop owns claim → heartbeat → handle → reclaim-expired-leases, and kee
 going if one task's handler raises or returns without terminalizing its task (it
 marks that task failed). Pass a `stop: asyncio.Event` for graceful shutdown and
 `max_tasks=N` to bound it.
+
+The explicit `SESSION_INTERRUPTED` outcome is the exception to terminal handler
+completion. The helper verifies that the task is attached and its durable
+session state is actually `interrupted`, then clears only the worker identity
+and lease. The task stays `running`, attached, and ineligible for fresh-task
+claim/reclaim while an approval, user-input response, operator resume, or
+recovery process continues the session. Returning `None` preserves the original
+terminal-or-fail behavior; do not return the handoff outcome merely to abandon
+unfinished work.
 
 ## What does *not* trigger a run
 

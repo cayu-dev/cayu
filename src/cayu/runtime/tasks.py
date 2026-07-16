@@ -306,6 +306,10 @@ class TaskStore(ABC):
         """Release a claimed task back to pending and clear worker ownership."""
 
     @abstractmethod
+    async def release_attached_task_worker(self, task_id: str, worker_id: str) -> Task:
+        """Release worker ownership while preserving a running task's session link."""
+
+    @abstractmethod
     async def reclaim_expired(
         self,
         *,
@@ -587,6 +591,27 @@ class InMemoryTaskStore(TaskStore):
             updated = task.model_copy(
                 update={
                     "status": TaskStatus.PENDING,
+                    "worker_id": None,
+                    "lease_expires_at": None,
+                    "updated_at": now,
+                }
+            )
+            self._tasks[task_id] = updated
+            return updated.model_copy(deep=True)
+
+    async def release_attached_task_worker(self, task_id: str, worker_id: str) -> Task:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        async with self._lock:
+            task = self._require_owned_leased_task(task_id, worker_id)
+            if task.status is not TaskStatus.RUNNING:
+                raise ValueError(f"Task {task.id} is not running.")
+            if task.session_id is None:
+                raise ValueError(f"Task {task.id} is not attached to a session.")
+            now = datetime.now(UTC)
+            _ensure_active_task_lease(task, worker_id, now=now)
+            updated = task.model_copy(
+                update={
                     "worker_id": None,
                     "lease_expires_at": None,
                     "updated_at": now,

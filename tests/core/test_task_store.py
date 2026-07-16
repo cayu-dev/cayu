@@ -480,6 +480,124 @@ def test_task_stores_reject_release_after_session_attachment(
 
 
 @pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_task_stores_release_attached_task_worker_without_requeueing(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create_task(
+            TaskCreate(
+                task_id="task_attached_handoff",
+                type="review",
+                parent_task_id="parent_review",
+                assigned_agent_name="reviewer",
+                input={"pull_request": 382},
+                metadata={"tenant": "acme"},
+            )
+        )
+        claimed = await store.claim_task("worker_a", lease_seconds=300)
+        assert claimed is not None
+        attached = await store.attach_task(
+            "task_attached_handoff",
+            session_id="sess_attached_handoff",
+            worker_id="worker_a",
+        )
+
+        released = await store.release_attached_task_worker(
+            "task_attached_handoff",
+            "worker_a",
+        )
+
+        assert released.status == TaskStatus.RUNNING
+        assert released.session_id == "sess_attached_handoff"
+        assert released.worker_id is None
+        assert released.lease_expires_at is None
+        assert released.parent_task_id == "parent_review"
+        assert released.assigned_agent_name == "reviewer"
+        assert released.input == {"pull_request": 382}
+        assert released.metadata == {"tenant": "acme"}
+        assert released.created_at == attached.created_at
+        assert released.started_at == attached.started_at
+        assert released.completed_at is None
+        assert released.updated_at >= attached.updated_at
+
+        assert await store.claim_task("worker_b", TaskQuery(type="review")) is None
+        assert await store.reclaim_expired(query=TaskQuery(type="review")) == []
+
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_task_stores_reject_invalid_attached_worker_release(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        with pytest.raises(KeyError, match="Task not found"):
+            await store.release_attached_task_worker("missing", "worker_a")
+
+        await store.create_task(TaskCreate(task_id="task_unattached", type="review"))
+        await store.claim_task("worker_a", lease_seconds=300)
+        unattached_before = await store.load_task("task_unattached")
+        assert unattached_before is not None
+        with pytest.raises(ValueError, match="not running"):
+            await store.release_attached_task_worker("task_unattached", "worker_a")
+
+        await store.create_task(TaskCreate(task_id="task_wrong_worker", type="review"))
+        await store.claim_task("worker_a", lease_seconds=300)
+        await store.attach_task(
+            "task_wrong_worker",
+            session_id="sess_wrong_worker",
+            worker_id="worker_a",
+        )
+        wrong_worker_before = await store.load_task("task_wrong_worker")
+        assert wrong_worker_before is not None
+        with pytest.raises(ValueError, match="does not own"):
+            await store.release_attached_task_worker("task_wrong_worker", "worker_b")
+
+        await store.create_task(TaskCreate(task_id="task_expired_worker", type="review"))
+        await store.claim_task("worker_a", lease_seconds=1)
+        await store.attach_task(
+            "task_expired_worker",
+            session_id="sess_expired_worker",
+            worker_id="worker_a",
+        )
+        await asyncio.sleep(1.05)
+        expired_before = await store.load_task("task_expired_worker")
+        assert expired_before is not None
+        with pytest.raises(ValueError, match="lease for worker worker_a has expired"):
+            await store.release_attached_task_worker("task_expired_worker", "worker_a")
+
+        await store.create_task(TaskCreate(task_id="task_terminal", type="review"))
+        terminal_before = await store.complete_task(
+            "task_terminal",
+            {"winner": "terminal-state"},
+        )
+        with pytest.raises(ValueError, match="running"):
+            await store.release_attached_task_worker("task_terminal", "worker_a")
+
+        unattached_after = await store.load_task("task_unattached")
+        wrong_worker_after = await store.load_task("task_wrong_worker")
+        expired_after = await store.load_task("task_expired_worker")
+        terminal_after = await store.load_task("task_terminal")
+        assert unattached_after == unattached_before
+        assert wrong_worker_after == wrong_worker_before
+        assert expired_after == expired_before
+        assert terminal_after is not None
+        assert terminal_after == terminal_before
+
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
 def test_task_stores_do_not_reclaim_attached_expired_leases(
     store_factory: StoreFactory,
     tmp_path,

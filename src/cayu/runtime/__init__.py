@@ -252,7 +252,7 @@ from cayu.runtime.structured_output import (
     StructuredOutputStrategy,
     StructuredOutputValidation,
 )
-from cayu.runtime.task_worker import run_task_worker
+from cayu.runtime.task_worker import TaskHandlerOutcome, run_task_worker
 from cayu.runtime.tasks import (
     InMemoryTaskStore,
     Task,
@@ -493,6 +493,7 @@ __all__ = [
     "TaintAwareToolPolicy",
     "Task",
     "TaskCreate",
+    "TaskHandlerOutcome",
     "TaskOrder",
     "TaskQuery",
     "TaskStatus",

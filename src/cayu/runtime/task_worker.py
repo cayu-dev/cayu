@@ -9,9 +9,12 @@ turns a claimed task into an ``app.run(...)``.
 
 The handler owns the task's terminal state: run with ``RunRequest(task_id=...,
 task_worker_id=...)`` so the runtime completes/fails the task, or call
-``task_store.complete_task``/``fail_task`` explicitly. If the handler raises or
-returns while the task is still active, the worker marks the task failed and keeps
-going -- one bad task does not kill it.
+``task_store.complete_task``/``fail_task`` explicitly. A handler whose attached
+session durably stops at an interrupted continuation boundary may return
+``TaskHandlerOutcome.SESSION_INTERRUPTED`` to release worker ownership while a
+control-plane process waits to resume that session. If the handler raises or
+returns ``None`` while the task is still active, the worker marks the task failed
+and keeps going -- one bad task does not kill it.
 """
 
 from __future__ import annotations
@@ -19,14 +22,23 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import Awaitable, Callable
+from enum import StrEnum
 from typing import TYPE_CHECKING
 
+from cayu.runtime.sessions import SessionStatus
 from cayu.runtime.tasks import Task, TaskQuery, TaskStatus, TaskStore
 
 if TYPE_CHECKING:
     from cayu.runtime.app import CayuApp
 
-TaskHandler = Callable[["CayuApp", Task, str], Awaitable[None]]
+
+class TaskHandlerOutcome(StrEnum):
+    """Explicit non-terminal outcomes supported by :func:`run_task_worker`."""
+
+    SESSION_INTERRUPTED = "session_interrupted"
+
+
+TaskHandler = Callable[["CayuApp", Task, str], Awaitable[TaskHandlerOutcome | None]]
 
 
 async def run_task_worker(
@@ -47,7 +59,9 @@ async def run_task_worker(
     For each claimed task, ``handler(app, task, worker_id)`` is awaited while the
     task lease is heartbeated in the background. The handler typically builds a
     ``RunRequest(task_id=task.id, task_worker_id=worker_id, ...)`` and awaits
-    ``app.run(...)`` so the runtime completes/fails the task.
+    ``app.run(...)`` so the runtime completes/fails the task. If that run ends at
+    a durable interrupted boundary, return ``TaskHandlerOutcome.SESSION_INTERRUPTED``
+    so the helper validates the session and releases only the task's worker lease.
 
     - ``query`` scopes which tasks this worker claims (e.g. by type / assigned agent).
     - ``lease_seconds`` is the claim lease; the lease is re-extended at ~1/3 of it.
@@ -90,8 +104,9 @@ async def _handle_with_heartbeat(
         _heartbeat_until(task_store, task.id, worker_id, lease_seconds, stop_heartbeat)
     )
     handler_error: Exception | None = None
+    handler_outcome: TaskHandlerOutcome | None = None
     try:
-        await handler(app, task, worker_id)
+        handler_outcome = await handler(app, task, worker_id)
     except Exception as exc:  # a single bad task must not stop the worker
         handler_error = exc
     finally:
@@ -99,8 +114,69 @@ async def _handle_with_heartbeat(
         await heartbeat_task
     if handler_error is not None:
         await _safe_fail(task_store, task.id, worker_id, handler_error)
+    elif handler_outcome is TaskHandlerOutcome.SESSION_INTERRUPTED:
+        await _handoff_interrupted_session(app, task_store, task.id, worker_id)
+    elif handler_outcome is not None:
+        await _safe_fail(
+            task_store,
+            task.id,
+            worker_id,
+            TypeError(f"Unsupported task handler outcome: {handler_outcome!r}."),
+        )
     else:
         await _safe_fail_unfinished(task_store, task.id, worker_id)
+
+
+async def _handoff_interrupted_session(
+    app: CayuApp,
+    task_store: TaskStore,
+    task_id: str,
+    worker_id: str,
+) -> None:
+    task = await task_store.load_task(task_id)
+    if task is None or task.status in {
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    }:
+        return
+    if task.status is not TaskStatus.RUNNING or task.session_id is None:
+        await _safe_fail(
+            task_store,
+            task_id,
+            worker_id,
+            RuntimeError(
+                "Task handler requested an interrupted-session handoff without a "
+                "running attached task."
+            ),
+        )
+        return
+
+    session = await app.session_store.load_state(task.session_id)
+    if session is None:
+        await _safe_fail(
+            task_store,
+            task_id,
+            worker_id,
+            RuntimeError(f"Attached session not found: {task.session_id}."),
+        )
+        return
+    if session.status is not SessionStatus.INTERRUPTED:
+        await _safe_fail(
+            task_store,
+            task_id,
+            worker_id,
+            RuntimeError(
+                "Task handler requested an interrupted-session handoff while session "
+                f"{task.session_id} was {session.status}."
+            ),
+        )
+        return
+
+    try:
+        await task_store.release_attached_task_worker(task_id, worker_id)
+    except Exception as exc:
+        await _safe_fail(task_store, task_id, worker_id, exc)
 
 
 async def _heartbeat_until(
