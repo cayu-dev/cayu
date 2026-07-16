@@ -389,7 +389,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                     "RunnerBoundWorkspace. Use an explicit non-native inner_binding for an "
                     "external workspace."
                 )
-            if created.bound_runner is not runner:
+            if not created.is_bound_to_runner(runner):
                 raise ValueError(
                     "A NativeBinding virtual-egress workspace must be bound to the managed "
                     "runner passed to workspace_factory."
@@ -589,6 +589,7 @@ class _EgressManagedRunner(Runner):
         self._audit_drain_task: asyncio.Task[None] | None = None
         self.isolation = runner.isolation
         self.default_cwd = runner.default_cwd
+        self.system_execution_mode = runner.system_execution_mode
 
     @property
     def resource_key(self) -> tuple[object, ...] | None:
@@ -647,6 +648,14 @@ class _EgressManagedRunner(Runner):
             stdin=stdin,
             output_limit_bytes=output_limit_bytes,
         )
+
+    def reopen_exec(self) -> None:
+        """Reopen both wrapper and inner execution after out-of-band verification."""
+
+        if self._closed:
+            super().reopen_exec()
+        self._runner.reopen_exec()
+        super().reopen_exec()
 
     async def close(self) -> None:
         await self.finalize(outcome=None)
@@ -754,9 +763,6 @@ class _EgressManagedRunner(Runner):
             if task.done() and getattr(self, task_field) is task:
                 setattr(self, task_field, None)
             raise
-
-    def reopen_exec(self) -> None:
-        self._runner.reopen_exec()
 
     def resolve_cwd(self, cwd: str | None = None) -> str:
         return self._runner.resolve_cwd(cwd)

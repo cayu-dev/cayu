@@ -273,7 +273,8 @@ defines how the two resources compose.
 Provider-native workspaces request a narrow typed capability from the managed
 runner. That capability exposes only native filesystem operations and stable
 sandbox identity; it has no `close()` method and cannot bypass environment
-finalization. `workspace.runner` remains the managed runner. Finalization
+finalization. Runner-backed workspaces retain the managed runner privately and
+prove their binding by identity without publishing a runner accessor. Finalization
 revokes grants first, finalizes the workspace binding while enforcement is
 still present, then closes the provider runner, proxy/network, and session CA.
 Applications must finalize the environment binding (the normal `CayuApp`

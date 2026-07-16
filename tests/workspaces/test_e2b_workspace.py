@@ -116,7 +116,7 @@ def _workspace(root: str | None = None) -> tuple[E2BWorkspace, FakeE2BFs]:
 
 
 def _replace_runner_exec(workspace: E2BWorkspace, func: Any) -> None:
-    runner = cast("Any", workspace.runner)
+    runner = cast("Any", workspace._control_plane_runner())
     runner.exec = func
 
 
@@ -251,7 +251,7 @@ def test_e2b_workspace_rejects_path_and_pattern_escape() -> None:
         asyncio.run(workspace.list("../*"))
 
     with pytest.raises(ValueError, match="absolute"):
-        E2BWorkspace(workspace.runner, root="workspace")
+        E2BWorkspace(workspace._control_plane_runner(), root="workspace")
 
 
 def test_e2b_workspace_rejects_symlink_component_escape(tmp_path: Path) -> None:
@@ -366,7 +366,7 @@ def test_e2b_workspace_rejects_truncated_guard_output() -> None:
 
 def test_e2b_workspace_rejects_closed_runner() -> None:
     workspace, _ = _workspace()
-    workspace.runner._closed = True
+    workspace._control_plane_runner()._closed = True
 
     with pytest.raises(RuntimeError, match="closed"):
         asyncio.run(workspace.list("**/*"))

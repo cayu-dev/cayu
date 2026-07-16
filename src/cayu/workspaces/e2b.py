@@ -57,7 +57,7 @@ class E2BWorkspace(RunnerBoundWorkspace):
         capability = runner.workspace_capability(E2BWorkspaceCapability)
         if capability is None:
             raise TypeError("E2BWorkspace runner does not expose E2BWorkspaceCapability.")
-        self.runner = runner
+        self._runner = runner
         self._capability = capability
         self.root = _validate_guest_root(root)
         self.default_read_limit_bytes = _validate_required_limit(
@@ -77,9 +77,11 @@ class E2BWorkspace(RunnerBoundWorkspace):
     def resource_key(self) -> tuple[object, ...] | None:
         return ("runner", self._capability.resource_key, str(self.root))
 
-    @property
-    def bound_runner(self) -> Runner:
-        return self.runner
+    def is_bound_to_runner(self, runner: Runner) -> bool:
+        return self._runner is runner
+
+    def _control_plane_runner(self) -> Runner:
+        return self._runner
 
     @property
     def bound_runner_resource_key(self) -> tuple[object, ...]:
@@ -99,7 +101,7 @@ class E2BWorkspace(RunnerBoundWorkspace):
     ) -> WorkspaceReadResult:
         rel_path = self._contained_rel_path(path)
         content, total_bytes = await guard_read(
-            self.runner,
+            self._runner,
             root=self.root,
             rel_path=rel_path,
             limit=self._effective_read_limit(max_bytes),
@@ -118,7 +120,7 @@ class E2BWorkspace(RunnerBoundWorkspace):
         if type(content) is not bytes:
             raise TypeError("Workspace write content must be bytes.")
         await guard_write(
-            self.runner,
+            self._runner,
             root=self.root,
             rel_path=rel_path,
             content=content,
@@ -130,7 +132,7 @@ class E2BWorkspace(RunnerBoundWorkspace):
     async def delete(self, path: str) -> None:
         rel_path = self._contained_rel_path(path)
         await guard_delete(
-            self.runner,
+            self._runner,
             root=self.root,
             rel_path=rel_path,
             original_path=path,
@@ -144,8 +146,8 @@ class E2BWorkspace(RunnerBoundWorkspace):
         *,
         limit: int | None = None,
     ) -> WorkspaceListResult:
-        if self.runner.is_closed:
-            raise RuntimeError(f"{type(self.runner).__name__} is closed.")
+        if self._runner.is_closed:
+            raise RuntimeError(f"{type(self._runner).__name__} is closed.")
         pattern = validate_list_pattern(pattern)
         effective_limit = (
             self.default_list_limit if limit is None else _validate_required_limit(limit, "limit")

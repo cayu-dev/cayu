@@ -8,7 +8,7 @@ from typing import Literal
 
 import pytest
 
-from cayu.runners import Runner, RunnerCleanupPolicy
+from cayu.runners import Runner, RunnerCleanupPolicy, RunnerSystemExecutionMode
 
 CapabilityState = Literal["supported", "unsupported", "not_applicable"]
 MAX_CAPABILITY_REASON_LENGTH = 240
@@ -58,6 +58,7 @@ class RunnerHarness:
     runner: Runner
     root: Path
     finalize: Callable[[], Awaitable[None]] | None = None
+    system_execution_profiles: list[str] | None = None
 
     async def aclose(self) -> None:
         try:
@@ -108,6 +109,7 @@ class RunnerConformanceRegistration:
     runner_type: type[Runner]
     factory: RunnerFactory
     capabilities: RunnerCapabilities
+    system_execution_mode: RunnerSystemExecutionMode
     cleanup_factory: CleanupRunnerFactory | None = None
     ambiguous_start_probe: RunnerProbe | None = None
     remote_protocol_probe: RemoteProtocolProbe | None = None
@@ -118,6 +120,8 @@ class RunnerConformanceRegistration:
             raise ValueError("Runner conformance registration name must be nonblank.")
         if not issubclass(self.runner_type, Runner):
             raise TypeError("Runner conformance registration type must implement Runner.")
+        if self.system_execution_mode not in {"shared", "separate"}:
+            raise ValueError("Runner system execution mode must be shared or separate.")
         cleanup_claims = (
             self.capabilities.command_cleanup,
             self.capabilities.sandbox_cleanup,

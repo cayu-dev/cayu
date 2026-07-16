@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 import pytest
+from tests.runners.lambda_microvm_harness import (
+    ConformanceLambdaClient,
+    SupervisorTransport,
+)
 
 from cayu.artifacts import LocalArtifactStore
 from cayu.core.events import Event, EventType
@@ -23,6 +28,7 @@ from cayu.egress import (
 )
 from cayu.environments import EFSAccessPointBinding, EnvironmentFactoryRequest
 from cayu.environments.bindings import BoundWorkspace, WorkspaceBinding
+from cayu.runners import LambdaMicroVMRunner
 from cayu.runners.base import ExecCommand, ExecResult, Runner
 from cayu.vaults import SecretRef, StaticVault
 
@@ -1004,30 +1010,32 @@ def test_finalize_revokes_grants_before_workspace_sync_then_finalizes_runner() -
     assert adapter.torn_down == 1
 
 
-def test_factory_preserves_trusted_execution_for_aws_workspace_lifecycle() -> None:
-    class _ProfileRecordingRunner(Runner):
-        isolation = "lambda-microvm"
-        default_cwd = "/workspace"
+def test_factory_preserves_trusted_execution_for_aws_workspace_lifecycle(
+    tmp_path: Path,
+) -> None:
+    mountpoint_checks = 0
 
-        def __init__(self) -> None:
-            self.calls: list[tuple[str, list[str]]] = []
-            self.mountpoint_checks = 0
+    def scripted_exit_code(payload: dict[str, Any]) -> int:
+        nonlocal mountpoint_checks
+        argv = payload.get("argv", [])
+        if argv[:2] == ["mountpoint", "-q"]:
+            mountpoint_checks += 1
+            return 1 if mountpoint_checks == 1 else 0
+        return 0
 
-        async def exec(self, command: ExecCommand, **kwargs: Any) -> ExecResult:
-            return self._record("agent", command)
-
-        async def exec_system(self, command: ExecCommand, **kwargs: Any) -> ExecResult:
-            return self._record("trusted", command)
-
-        def _record(self, profile: str, command: ExecCommand) -> ExecResult:
-            argv = list(command.argv or [])
-            self.calls.append((profile, argv))
-            if argv[:2] == ["mountpoint", "-q"]:
-                self.mountpoint_checks += 1
-                return ExecResult(exit_code=1 if self.mountpoint_checks == 1 else 0)
-            return ExecResult()
-
-    inner = _ProfileRecordingRunner()
+    transport = SupervisorTransport(tmp_path, scripted_exit_code=scripted_exit_code)
+    inner = LambdaMicroVMRunner(
+        ConformanceLambdaClient(),
+        microvm_id="mvm-factory-composition",
+        endpoint="factory.lambda-microvm.invalid",
+        image_identifier="arn:aws:lambda:us-east-1:123:microvm-image:factory",
+        region_name="us-east-1",
+        default_cwd="/workspace",
+        close_action="none",
+        endpoint_transport=transport,
+        poll_interval_s=0,
+    )
+    assert isinstance(inner, LambdaMicroVMRunner)
     adapter = _RecordingAdapter(
         "lambda-microvm",
         runner_factory=lambda _request: asyncio.sleep(0, result=inner),
@@ -1053,14 +1061,60 @@ def test_factory_preserves_trusted_execution_for_aws_workspace_lifecycle() -> No
         runner = result.environment.runner
         assert binding is not None
         assert runner is not None
+        assert runner.system_execution_mode == "separate"
+        agent_result = await runner.exec(
+            ExecCommand.process("agent-command"),
+            cwd="/workspace/agent",
+            env={"LANE": "agent"},
+            timeout_s=17,
+            stdin="agent-input",
+            output_limit_bytes=321,
+        )
+        assert agent_result.exit_code == 0
+        trusted_result = await runner.exec_system(
+            ExecCommand.process("system-command"),
+            cwd="/workspace/system",
+            env={"LANE": "trusted"},
+            timeout_s=23,
+            stdin="trusted-input",
+            output_limit_bytes=654,
+        )
+        assert trusted_result.exit_code == 0
         bound = await binding.bind(None, runner, session_id="sess_trusted_workspace")
         await binding.finalize(bound, outcome="completed")
+        with pytest.raises(RuntimeError, match="closed"):
+            await runner.exec_system(ExecCommand.process("true"))
 
     asyncio.run(run())
 
-    assert inner.calls
-    assert {profile for profile, _command in inner.calls} == {"trusted"}
-    assert [command[0] for _profile, command in inner.calls] == [
+    assert transport.payloads[:2] == [
+        {
+            "execution_profile": "agent",
+            "kind": "process",
+            "cwd": "/workspace/agent",
+            "env": {"LANE": "agent"},
+            "stdin_base64": "YWdlbnQtaW5wdXQ=",
+            "timeout_s": 17,
+            "output_limit_bytes": 321,
+            "argv": ["agent-command"],
+        },
+        {
+            "execution_profile": "trusted",
+            "kind": "process",
+            "cwd": "/workspace/system",
+            "env": {"LANE": "trusted"},
+            "stdin_base64": "dHJ1c3RlZC1pbnB1dA==",
+            "timeout_s": 23,
+            "output_limit_bytes": 654,
+            "argv": ["system-command"],
+        },
+    ]
+    assert [payload["execution_profile"] for payload in transport.payloads] == ["agent"] + [
+        "trusted"
+    ] * 8
+    assert [payload["argv"][0] for payload in transport.payloads] == [
+        "agent-command",
+        "system-command",
         "mkdir",
         "mountpoint",
         "mount",
@@ -1069,6 +1123,74 @@ def test_factory_preserves_trusted_execution_for_aws_workspace_lifecycle() -> No
         "mountpoint",
         "umount",
     ]
+
+
+def test_managed_wrapper_preserves_trusted_cancellation_and_inner_exec_latch() -> None:
+    class _CancellableSeparateLaneRunner(Runner):
+        isolation = "lambda-microvm"
+        system_execution_mode = "separate"
+
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.cancelled = False
+            self.block_system = True
+
+        async def exec(self, command: ExecCommand, **kwargs: Any) -> ExecResult:
+            del command, kwargs
+            self._ensure_exec_open()
+            return ExecResult()
+
+        async def exec_system(self, command: ExecCommand, **kwargs: Any) -> ExecResult:
+            del command, kwargs
+            self._ensure_exec_open()
+            if not self.block_system:
+                return ExecResult()
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+
+        def latch_exec(self) -> None:
+            self._close_exec("fixture command state is unknown")
+
+    inner = _CancellableSeparateLaneRunner()
+    adapter = _RecordingAdapter(
+        "lambda-microvm",
+        runner_factory=lambda _request: asyncio.sleep(0, result=inner),
+    )
+
+    async def run() -> None:
+        result = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_trusted_state",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        runner = result.environment.runner
+        assert runner is not None
+
+        task = asyncio.create_task(runner.exec_system(ExecCommand.process("wait")))
+        await inner.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert inner.cancelled is True
+
+        inner.latch_exec()
+        with pytest.raises(RuntimeError, match="unknown"):
+            await runner.exec(ExecCommand.process("agent"))
+        with pytest.raises(RuntimeError, match="unknown"):
+            await runner.exec_system(ExecCommand.process("trusted"))
+
+        runner.reopen_exec()
+        inner.block_system = False
+        assert (await runner.exec_system(ExecCommand.process("trusted"))).exit_code == 0
+        await runner.close()
+
+    asyncio.run(run())
 
 
 def test_finalize_surfaces_lifecycle_failure_and_runner_close_retries() -> None:

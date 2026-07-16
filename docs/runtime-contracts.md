@@ -1503,6 +1503,16 @@ Runner commands use `ExecCommand`:
 The framework should not pass a single ambiguous command string to runners. Use process mode unless shell parsing, expansion, and quoting are intentional.
 Runner output capture is bounded by `output_limit_bytes` and returns `stdout_truncated` / `stderr_truncated` flags when output is capped. Direct runner calls default to 1 MiB per stream; the model-facing `exec_command` tool passes its smaller 50,000-byte default into the runner. This limit belongs in the runner, not only in tool post-processing, so commands cannot exhaust runtime memory before the model-facing result is built. Runners continue draining both streams after the capture bound is reached so a child cannot block on a full pipe. `ExecResult.stdout_bytes` and `stderr_bytes` report the total bytes observed before truncation when the adapter can know that value; `None` means the total is unavailable, not zero. The captured strings may therefore be smaller than their total byte counts.
 
+`system_execution_mode` declares whether `exec_system()` intentionally shares
+the ordinary `exec()` lane (`shared`) or selects a separate control-plane lane
+(`separate`). Shared mode does not claim elevated privileges; it means that the
+runner has no second execution boundary. Separate mode is used only when the
+runner implementation can keep lifecycle commands outside the agent lane.
+Cayu-owned runner wrappers must preserve the declaration, full command
+arguments, lifecycle state, cancellation behavior, and `exec_system()`
+dispatch. Trusted execution is not exposed through agent tools or
+`RunnerWorkspace`.
+
 Remote runner command cleanup is bounded. `DockerRunner`, `E2BRunner`, and `MicrosandboxRunner` expose `cancel_timeout_s`, defaulting to 5 seconds, `cancellation_cleanup`, defaulting to `"command"`, and `timeout_cleanup`, defaulting to `"command"`. Built-in runners re-raise the original `asyncio.CancelledError` with cleanup diagnostics attached so asyncio's cancellation bookkeeping is preserved; the runtime accepts the legacy `RunnerCancelledError` subclass from third-party runners as well. E2B delayed-start cleanup may continue briefly in the background after the foreground interruption or timeout cleanup wait; if it cannot resolve the command start, the runner exec path is closed while the sandbox is preserved. Command timeouts return `ExecResult(timed_out=True)`.
 
 Both cleanup fields accept the same three modes:

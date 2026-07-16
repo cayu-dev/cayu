@@ -332,8 +332,10 @@ def test_factory_composes_provider_workspace_without_unwrapping(
 
     managed, workspace, raw_runner = asyncio.run(run())
 
-    assert workspace.runner is managed
-    assert workspace.runner is not raw_runner
+    assert workspace.is_bound_to_runner(managed)
+    assert not workspace.is_bound_to_runner(raw_runner)
+    assert not hasattr(workspace, "runner")
+    assert not hasattr(workspace, "bound_runner")
     with pytest.raises(RuntimeError, match="closed"):
         asyncio.run(managed.exec(ExecCommand.process("true")))
     assert order == ["runner", "binding"]

@@ -366,7 +366,7 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
     ) -> None:
         if not isinstance(runner, Runner):
             raise TypeError("RunnerWorkspace runner must be a Runner.")
-        self.runner = runner
+        self._runner = runner
         self.cwd = _validate_optional_cwd(cwd)
         self.python_executable = require_clean_nonblank(python_executable, "python_executable")
         self.default_read_limit_bytes = _validate_required_limit(
@@ -381,7 +381,7 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
 
     @property
     def resource_key(self) -> tuple[object, ...] | None:
-        runner = self.runner
+        runner = self._runner
         # LocalRunner reads/writes the host filesystem directly, so a RunnerWorkspace over it aliases
         # the same directory a LocalWorkspace addresses. Emit the canonical host-fs key so SyncBinding
         # detects that alias and refuses to clear one view while the other is the source.
@@ -396,13 +396,17 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
         # wrapper (E2BWorkspace / MicrosandboxWorkspace) over the same sandbox directory produce equal keys.
         return ("runner", runner_key, runner.resolve_cwd(self.cwd))
 
-    @property
-    def bound_runner(self) -> Runner:
-        return self.runner
+    def is_bound_to_runner(self, runner: Runner) -> bool:
+        return self._runner is runner
+
+    def _control_plane_runner(self) -> Runner:
+        """Return the runner for Cayu-owned bindings without publishing it to tools."""
+
+        return self._runner
 
     @property
     def bound_runner_resource_key(self) -> tuple[object, ...] | None:
-        return _runner_resource_key(self.runner)
+        return _runner_resource_key(self._runner)
 
     def bounded_read_limit(self, max_bytes: int) -> int:
         return min(
@@ -567,7 +571,7 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
         stdin: str | None = None,
         output_limit_bytes: int,
     ) -> dict[str, Any]:
-        exec_result = await self.runner.exec(
+        exec_result = await self._runner.exec(
             ExecCommand.process(self.python_executable, "-c", script, *args),
             cwd=self.cwd,
             stdin=stdin,

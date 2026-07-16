@@ -20,6 +20,7 @@ from cayu._validation import copy_json_value, require_nonblank
 from cayu.runners._cleanup import RunnerCleanupResult
 
 DEFAULT_EXEC_OUTPUT_LIMIT_BYTES = 1024 * 1024
+RunnerSystemExecutionMode = Literal["shared", "separate"]
 
 
 class RunnerWorkspaceCapability(ABC):
@@ -177,6 +178,9 @@ class Runner(ABC):
 
     Shared lifecycle contract:
 
+    - ``system_execution_mode`` declares whether ``exec_system()`` intentionally
+      shares the ordinary command lane or selects a separate trusted lane.
+      Runner wrappers must preserve both the declaration and dispatch.
     - ``close()`` applies the adapter's configured lifecycle action once;
       further ``exec`` calls fail.
     - Interrupted commands (cancellation/timeout) run cleanup. When command
@@ -191,6 +195,7 @@ class Runner(ABC):
 
     isolation: str = "unknown"
     default_cwd: str = "/"
+    system_execution_mode: RunnerSystemExecutionMode = "shared"
 
     _closed: bool = False
     _exec_closed: bool = False
@@ -219,7 +224,7 @@ class Runner(ABC):
         stdin: str | None = None,
         output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ) -> ExecResult:
-        """Execute a trusted lifecycle command, using normal execution by default."""
+        """Execute a control-plane lifecycle command on the declared system lane."""
         return await self.exec(
             command,
             cwd=cwd,

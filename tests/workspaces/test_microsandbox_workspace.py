@@ -145,7 +145,7 @@ def _workspace(root: str | None = None) -> tuple[MicrosandboxWorkspace, FakeMicr
 
 
 def _replace_runner_exec(workspace: MicrosandboxWorkspace, func: Any) -> None:
-    runner = cast("Any", workspace.runner)
+    runner = cast("Any", workspace._control_plane_runner())
     runner.exec = func
 
 
@@ -244,7 +244,7 @@ def test_microsandbox_workspace_rejects_path_and_pattern_escape() -> None:
         asyncio.run(workspace.list("../*"))
 
     with pytest.raises(ValueError, match="absolute"):
-        MicrosandboxWorkspace(workspace.runner, root="workspace")
+        MicrosandboxWorkspace(workspace._control_plane_runner(), root="workspace")
 
 
 def test_microsandbox_workspace_rejects_symlink_component_escape(tmp_path: Path) -> None:
@@ -354,7 +354,7 @@ def test_microsandbox_workspace_surfaces_missing_guest_python() -> None:
 
 def test_microsandbox_workspace_read_rejects_closed_runner() -> None:
     workspace, _ = _workspace()
-    workspace.runner._closed = True
+    workspace._control_plane_runner()._closed = True
 
     with pytest.raises(RuntimeError, match="closed"):
         asyncio.run(workspace.read_bytes("a.txt"))
@@ -362,7 +362,7 @@ def test_microsandbox_workspace_read_rejects_closed_runner() -> None:
 
 def test_microsandbox_workspace_rejects_closed_runner() -> None:
     workspace, _ = _workspace()
-    workspace.runner._closed = True
+    workspace._control_plane_runner()._closed = True
 
     with pytest.raises(RuntimeError, match="closed"):
         asyncio.run(workspace.list("**/*"))
@@ -386,12 +386,12 @@ def test_microsandbox_real_path_reconnects_after_dropped_session() -> None:
     workspace, fs = _workspace()
     fs.files["/workspace/a.txt"] = b"x"
     # Prime the cached session.
-    asyncio.run(workspace.runner.real_path("/workspace/a.txt"))
+    asyncio.run(workspace._control_plane_runner().real_path("/workspace/a.txt"))
     assert fs.connect_calls == 1
 
     # A dropped session is retried once against a fresh handshake.
     fs.drop_session_once = True
-    resolved = asyncio.run(workspace.runner.real_path("/workspace/a.txt"))
+    resolved = asyncio.run(workspace._control_plane_runner().real_path("/workspace/a.txt"))
 
     assert resolved == "/workspace/a.txt"
     assert fs.connect_calls == 2
@@ -403,14 +403,14 @@ def test_microsandbox_real_path_reconnects_after_dropped_session() -> None:
 def test_microsandbox_close_tears_down_cached_sftp_session() -> None:
     workspace, fs = _workspace()
     fs.files["/workspace/a.txt"] = b"x"
-    asyncio.run(workspace.runner.real_path("/workspace/a.txt"))
+    asyncio.run(workspace._control_plane_runner().real_path("/workspace/a.txt"))
     assert fs.connect_calls == 1
 
-    asyncio.run(workspace.runner.close())
+    asyncio.run(workspace._control_plane_runner().close())
 
     assert fs.closed_clients == 1
     assert fs.closed_sftps == 1
-    assert workspace.runner._sftp is None
+    assert workspace._control_plane_runner()._sftp is None
 
 
 def test_is_path_not_found_error_recognizes_sftp_enoent_message() -> None:

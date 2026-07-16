@@ -11,7 +11,6 @@ from typing import Any
 
 import pytest
 from examples._runner_conformance import verify_bounded_output_drain
-from examples.aws.lambda_microvm_sidecar.supervisor import CommandSupervisor
 from tests.runners.conformance import (
     CapabilityClaim,
     ConformanceEvidence,
@@ -19,7 +18,12 @@ from tests.runners.conformance import (
     RunnerConformanceRegistration,
     RunnerHarness,
 )
+from tests.runners.lambda_microvm_harness import (
+    ConformanceLambdaClient,
+    SupervisorTransport,
+)
 
+import cayu
 import cayu.runners as runners_module
 from cayu.runners import (
     DockerRunner,
@@ -31,6 +35,7 @@ from cayu.runners import (
     MicrosandboxRunner,
     Runner,
     RunnerCleanupPolicy,
+    RunnerSystemExecutionMode,
     attach_cancellation_artifacts,
 )
 from cayu.runners._subprocess import SubprocessCommand, run_subprocess
@@ -404,63 +409,6 @@ async def _microsandbox_cleanup_factory(
     )
 
 
-class _ConformanceLambdaClient:
-    def __init__(self) -> None:
-        self.suspend_calls = 0
-        self.resume_calls = 0
-        self.terminate_calls = 0
-
-    def run_microvm(self, **_kwargs: Any) -> dict[str, Any]:
-        return {
-            "microvmId": "mvm-conformance",
-            "endpoint": "conformance.lambda-microvm.invalid",
-            "state": "PENDING",
-            "imageArn": "arn:aws:lambda:us-east-1:123:microvm-image:conformance",
-            "imageVersion": "1",
-        }
-
-    def create_microvm_auth_token(self, **_kwargs: Any) -> dict[str, Any]:
-        return {"authToken": {"X-aws-proxy-auth": "conformance-token"}}
-
-    def get_microvm(self, **_kwargs: Any) -> dict[str, Any]:
-        return {
-            "microvmId": _kwargs.get("microvmIdentifier", "mvm-conformance"),
-            "endpoint": "conformance.lambda-microvm.invalid",
-            "state": "RUNNING",
-            "imageArn": "arn:aws:lambda:us-east-1:123:microvm-image:conformance",
-            "imageVersion": "1",
-        }
-
-    def suspend_microvm(self, **_kwargs: Any) -> dict[str, Any]:
-        self.suspend_calls += 1
-        return {}
-
-    def resume_microvm(self, **_kwargs: Any) -> dict[str, Any]:
-        self.resume_calls += 1
-        return {}
-
-    def terminate_microvm(self, **_kwargs: Any) -> dict[str, Any]:
-        self.terminate_calls += 1
-        return {}
-
-
-class _SupervisorTransport:
-    def __init__(self, root: Path) -> None:
-        self.supervisor = CommandSupervisor(root=root)
-
-    async def health(self, **_kwargs: Any) -> dict[str, str]:
-        return {"status": "ok", "protocol_version": "1"}
-
-    async def start_command(self, *, command_id: str, payload: dict[str, Any], **_kwargs: Any):
-        return await asyncio.to_thread(self.supervisor.start, command_id, payload)
-
-    async def get_command(self, *, command_id: str, **_kwargs: Any):
-        return await asyncio.to_thread(self.supervisor.get, command_id)
-
-    async def cancel_command(self, *, command_id: str, **_kwargs: Any):
-        return await asyncio.to_thread(self.supervisor.cancel, command_id)
-
-
 async def _lambda_microvm_factory(
     root: Path,
     _monkeypatch: pytest.MonkeyPatch,
@@ -473,21 +421,23 @@ async def _lambda_microvm_cleanup_factory(
     _monkeypatch: pytest.MonkeyPatch,
     cleanup_policy: RunnerCleanupPolicy,
 ) -> RunnerHarness:
+    transport = SupervisorTransport(root)
     return RunnerHarness(
         LambdaMicroVMRunner(
-            _ConformanceLambdaClient(),
+            ConformanceLambdaClient(),
             microvm_id="mvm-conformance",
             endpoint="conformance.lambda-microvm.invalid",
             image_identifier="arn:aws:lambda:us-east-1:123:microvm-image:conformance",
             region_name="us-east-1",
             default_cwd=str(root),
             close_action="none",
-            endpoint_transport=_SupervisorTransport(root),
+            endpoint_transport=transport,
             poll_interval_s=0,
             cancellation_cleanup=cleanup_policy,
             timeout_cleanup=cleanup_policy,
         ),
         root,
+        system_execution_profiles=transport.execution_profiles,
     )
 
 
@@ -575,7 +525,7 @@ async def _probe_microsandbox_ambiguous_start(
     await runner.close()
 
 
-class _DelayedSupervisorTransport(_SupervisorTransport):
+class _DelayedSupervisorTransport(SupervisorTransport):
     def __init__(self, root: Path) -> None:
         super().__init__(root)
         self.start_received = asyncio.Event()
@@ -613,7 +563,7 @@ async def _probe_lambda_microvm_ambiguous_start(
 ) -> None:
     transport = _DelayedSupervisorTransport(root)
     runner = LambdaMicroVMRunner(
-        _ConformanceLambdaClient(),
+        ConformanceLambdaClient(),
         microvm_id="mvm-conformance-ambiguous",
         endpoint="conformance.lambda-microvm.invalid",
         default_cwd=str(root),
@@ -672,7 +622,7 @@ async def _probe_lambda_microvm_protocol(
     _monkeypatch: pytest.MonkeyPatch,
 ) -> dict[str, bool]:
     observed: dict[str, bool] = {}
-    mismatch_client = _ConformanceLambdaClient()
+    mismatch_client = ConformanceLambdaClient()
     try:
         await LambdaMicroVMRunner.create(
             "arn:aws:lambda:us-east-1:123:microvm-image:conformance",
@@ -699,7 +649,7 @@ async def _probe_lambda_microvm_protocol(
         ),
     ):
         runner = LambdaMicroVMRunner(
-            _ConformanceLambdaClient(),
+            ConformanceLambdaClient(),
             microvm_id="mvm-conformance-protocol",
             endpoint="conformance.lambda-microvm.invalid",
             default_cwd=str(root),
@@ -716,7 +666,7 @@ async def _probe_lambda_microvm_protocol(
     return observed
 
 
-class _FailFirstSuspendClient(_ConformanceLambdaClient):
+class _FailFirstSuspendClient(ConformanceLambdaClient):
     def __init__(self) -> None:
         super().__init__()
         self._fail_suspend = True
@@ -758,6 +708,7 @@ LOCAL = RunnerConformanceRegistration(
     name="local",
     runner_type=LocalRunner,
     factory=_local_factory,
+    system_execution_mode="shared",
     capabilities=RunnerCapabilities(
         command_cleanup=CapabilityClaim.not_applicable(
             "LocalRunner owns and kills its subprocess directly."
@@ -798,6 +749,7 @@ DOCKER = RunnerConformanceRegistration(
     name="docker",
     runner_type=DockerRunner,
     factory=_docker_factory,
+    system_execution_mode="shared",
     capabilities=CLI_CAPABILITIES,
     cleanup_factory=_docker_cleanup_factory,
 )
@@ -819,6 +771,7 @@ E2B = RunnerConformanceRegistration(
     name="e2b",
     runner_type=E2BRunner,
     factory=_e2b_factory,
+    system_execution_mode="shared",
     capabilities=REMOTE_SANDBOX_CAPABILITIES,
     cleanup_factory=_e2b_cleanup_factory,
     ambiguous_start_probe=_probe_e2b_ambiguous_start,
@@ -828,6 +781,7 @@ MICROSANDBOX = RunnerConformanceRegistration(
     name="microsandbox",
     runner_type=MicrosandboxRunner,
     factory=_microsandbox_factory,
+    system_execution_mode="shared",
     capabilities=REMOTE_SANDBOX_CAPABILITIES,
     cleanup_factory=_microsandbox_cleanup_factory,
     ambiguous_start_probe=_probe_microsandbox_ambiguous_start,
@@ -837,6 +791,7 @@ LAMBDA_MICROVM = RunnerConformanceRegistration(
     name="lambda-microvm",
     runner_type=LambdaMicroVMRunner,
     factory=_lambda_microvm_factory,
+    system_execution_mode="separate",
     capabilities=RunnerCapabilities(
         command_cleanup=CapabilityClaim.supported(),
         sandbox_cleanup=CapabilityClaim.supported(),
@@ -891,6 +846,55 @@ def test_runner_conformance_registry_covers_every_exported_builtin_runner() -> N
 
     assert registered == exported
     assert len({registration.name for registration in REGISTRATIONS}) == len(REGISTRATIONS)
+
+
+def test_runner_contract_declares_shared_or_separate_system_execution() -> None:
+    assert cayu.RunnerSystemExecutionMode is RunnerSystemExecutionMode
+    assert Runner.system_execution_mode == "shared"
+    assert LocalRunner.system_execution_mode == "shared"
+    assert LambdaMicroVMRunner.system_execution_mode == "separate"
+
+
+@pytest.mark.parametrize("registration", REGISTRATIONS, ids=lambda item: item.name)
+@pytest.mark.anyio
+async def test_runner_conformance_exec_system_preserves_public_command_contract(
+    registration: RunnerConformanceRegistration,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence = ConformanceEvidence(
+        "system-execution",
+        registration.name,
+        registration.system_execution_mode,
+    )
+    with evidence.reporting():
+        harness = await registration.factory(tmp_path, monkeypatch)
+        try:
+            evidence.observed = harness.runner.system_execution_mode
+            assert harness.runner.system_execution_mode == registration.system_execution_mode
+            result = await harness.runner.exec_system(
+                ExecCommand.process(
+                    sys.executable,
+                    "-c",
+                    "import os,sys; print(os.environ['CAYU_LANE']); print(sys.stdin.read())",
+                ),
+                cwd=str(tmp_path),
+                env={"CAYU_LANE": "system"},
+                stdin="forwarded",
+                timeout_s=5,
+                output_limit_bytes=64,
+            )
+            evidence.observed = result.model_dump(mode="json")
+            assert result.exit_code == 0
+            assert result.stdout == "system\nforwarded\n"
+            assert not result.timed_out
+            assert not result.cancelled
+            if registration.system_execution_mode == "separate":
+                assert harness.system_execution_profiles == ["trusted"]
+            else:
+                assert harness.system_execution_profiles is None
+        finally:
+            await harness.aclose()
 
 
 def test_runner_capability_claims_require_bounded_skip_reasons() -> None:
@@ -1580,12 +1584,74 @@ class _BrokenFixtureRunner(Runner):
 
 def _broken_registration(failure: str) -> RunnerConformanceRegistration:
     async def factory(root: Path, _monkeypatch: pytest.MonkeyPatch) -> RunnerHarness:
-        return RunnerHarness(_BrokenFixtureRunner(root, failure), root)
+        runner = _BrokenFixtureRunner(root, failure)
+        return RunnerHarness(runner, root)
 
     return RunnerConformanceRegistration(
         name=f"broken-{failure}",
         runner_type=_BrokenFixtureRunner,
         factory=factory,
+        system_execution_mode="shared",
+        capabilities=RunnerCapabilities(
+            command_cleanup=CapabilityClaim.not_applicable("Seeded broken fixture."),
+            sandbox_cleanup=CapabilityClaim.not_applicable("Seeded broken fixture."),
+            no_cleanup=CapabilityClaim.not_applicable("Seeded broken fixture."),
+            ambiguous_start=CapabilityClaim.not_applicable("Seeded broken fixture."),
+            remote_protocol=CapabilityClaim.not_applicable("Seeded broken fixture."),
+            suspend_resume=CapabilityClaim.not_applicable("Seeded broken fixture."),
+        ),
+    )
+
+
+class _CollapsedSystemExecutionRunner(Runner):
+    """Seeded wrapper that declares two lanes but inherits the collapsing fallback."""
+
+    isolation = "collapsed-system-execution-fixture"
+    system_execution_mode = "separate"
+
+    def __init__(self, root: Path) -> None:
+        self.delegate = LocalRunner(root, inherit_env=False)
+        self.system_execution_profiles: list[str] = []
+
+    async def exec(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = 1024 * 1024,
+    ):
+        self.system_execution_profiles.append("agent")
+        return await self.delegate.exec(
+            command,
+            cwd=cwd,
+            env=env,
+            timeout_s=timeout_s,
+            stdin=stdin,
+            output_limit_bytes=output_limit_bytes,
+        )
+
+    async def close(self) -> None:
+        await self.delegate.close()
+        self._closed = True
+
+
+def _collapsed_system_execution_registration() -> RunnerConformanceRegistration:
+    async def factory(root: Path, _monkeypatch: pytest.MonkeyPatch) -> RunnerHarness:
+        runner = _CollapsedSystemExecutionRunner(root)
+        return RunnerHarness(
+            runner,
+            root,
+            system_execution_profiles=runner.system_execution_profiles,
+        )
+
+    return RunnerConformanceRegistration(
+        name="broken-collapsed-system-execution",
+        runner_type=_CollapsedSystemExecutionRunner,
+        factory=factory,
+        system_execution_mode="separate",
         capabilities=RunnerCapabilities(
             command_cleanup=CapabilityClaim.not_applicable("Seeded broken fixture."),
             sandbox_cleanup=CapabilityClaim.not_applicable("Seeded broken fixture."),
@@ -1604,6 +1670,19 @@ def test_runner_conformance_guard_detects_duplicate_start(
     with pytest.raises(AssertionError):
         test_runner_conformance_executes_each_submitted_command_once(
             _broken_registration("duplicate_start"), tmp_path, monkeypatch
+        )
+
+
+@pytest.mark.anyio
+async def test_runner_conformance_guard_detects_collapsed_system_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(AssertionError, match="system-execution"):
+        await test_runner_conformance_exec_system_preserves_public_command_contract(
+            _collapsed_system_execution_registration(),
+            tmp_path,
+            monkeypatch,
         )
 
 
@@ -1667,6 +1746,7 @@ def test_runner_conformance_guard_detects_protocol_mismatch(
         name="broken-protocol-mismatch",
         runner_type=_BrokenFixtureRunner,
         factory=_broken_registration("protocol_mismatch").factory,
+        system_execution_mode="shared",
         capabilities=RunnerCapabilities(
             command_cleanup=CapabilityClaim.not_applicable("Seeded broken fixture."),
             sandbox_cleanup=CapabilityClaim.not_applicable("Seeded broken fixture."),

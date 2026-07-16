@@ -1442,7 +1442,7 @@ def _git_executor_for_workspace(
         )
     if isinstance(workspace, RunnerWorkspace):
         return _GitWorkspaceExecutor(
-            runner=workspace.runner,
+            runner=workspace._control_plane_runner(),
             cwd=workspace.cwd,
             git_executable=git_executable,
             timeout_s=timeout_s,
@@ -1464,7 +1464,7 @@ async def _require_empty_workspace_for_git_clone(
     if isinstance(workspace, LocalWorkspace):
         nonempty = any(workspace.root.iterdir())
     elif isinstance(workspace, RunnerWorkspace):
-        result = await workspace.runner.exec(
+        result = await workspace._control_plane_runner().exec(
             ExecCommand.process(
                 workspace.python_executable,
                 "-c",
@@ -1511,7 +1511,7 @@ async def _reset_workspace_after_failed_clone(
             # Off the event loop: removing a large partial clone with shutil.rmtree is blocking.
             await asyncio.to_thread(_remove_local_workspace_contents, workspace.root)
         elif isinstance(workspace, RunnerWorkspace):
-            await workspace.runner.exec(
+            await workspace._control_plane_runner().exec(
                 ExecCommand.process(
                     workspace.python_executable,
                     "-c",

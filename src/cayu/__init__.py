@@ -248,6 +248,7 @@ from cayu.runners import (
     Runner,
     RunnerCancelledError,
     RunnerCleanupPolicy,
+    RunnerSystemExecutionMode,
     RunnerUnavailableError,
     RunnerWorkspaceCapability,
 )
@@ -982,6 +983,7 @@ __all__ = [
     "RunnerCancelledError",
     "RunnerCleanupPolicy",
     "RunnerHandle",
+    "RunnerSystemExecutionMode",
     "RunnerUnavailableError",
     "RunnerWorkspace",
     "RunnerWorkspaceCapability",

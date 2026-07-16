@@ -33,6 +33,7 @@ from cayu.runners.base import (
     ExecCommand,
     ExecResult,
     Runner,
+    RunnerSystemExecutionMode,
     attach_cancellation_artifacts,
 )
 
@@ -208,6 +209,7 @@ class LambdaMicroVMRunner(Runner):
     """Execute commands through a Cayu sidecar in an AWS Lambda MicroVM."""
 
     isolation = "lambda-microvm"
+    system_execution_mode: RunnerSystemExecutionMode = "separate"
 
     @property
     def resource_key(self) -> tuple[object, ...]:

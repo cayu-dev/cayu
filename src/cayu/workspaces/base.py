@@ -254,15 +254,18 @@ class RunnerBoundWorkspace(Workspace):
     """Workspace whose operations target one declared runner-owned resource.
 
     Native bindings use this nominal contract instead of reflecting on an
-    incidental ``runner`` attribute. Implementations identify both the runner
-    object that owns lifecycle and the stable runner resource key their file
-    operations target.
+    incidental ``runner`` attribute. Implementations can prove that they target
+    the lifecycle-owning runner without exposing that runner through the
+    workspace's public surface.
     """
 
-    @property
     @abstractmethod
-    def bound_runner(self) -> Runner:
-        """Lifecycle-owning runner used by this workspace."""
+    def is_bound_to_runner(self, runner: Runner) -> bool:
+        """Return whether this workspace targets ``runner`` exactly."""
+
+    @abstractmethod
+    def _control_plane_runner(self) -> Runner:
+        """Return the private runner used by Cayu-owned workspace bindings."""
 
     @property
     @abstractmethod

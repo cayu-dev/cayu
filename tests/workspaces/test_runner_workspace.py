@@ -24,6 +24,16 @@ def _workspace(root) -> RunnerWorkspace:
     )
 
 
+def test_runner_workspace_does_not_publish_control_plane_runner(tmp_path) -> None:
+    runner = LocalRunner(tmp_path, inherit_env=False)
+    workspace = RunnerWorkspace(runner)
+
+    assert workspace.is_bound_to_runner(runner)
+    assert not hasattr(workspace, "runner")
+    assert not hasattr(workspace, "bound_runner")
+    assert not hasattr(workspace, "exec_system")
+
+
 def test_runner_workspace_reads_writes_and_lists_through_runner(tmp_path) -> None:
     workspace = _workspace(tmp_path)
 
