@@ -8,9 +8,9 @@ import json
 import logging
 import mimetypes
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from fnmatch import fnmatchcase
@@ -22,7 +22,6 @@ from typing import Any, cast
 from uuid import uuid4
 
 from cayu._validation import (
-    copy_json_object,
     copy_json_value,
     copy_label_map,
     require_clean_nonblank,
@@ -59,12 +58,8 @@ from cayu.core.thinking import ThinkingConfig, thinking_config_payload
 from cayu.core.tools import (
     _TOOL_POLICY_DENIAL_SOURCE,
     Tool,
-    ToolContext,
-    ToolEffect,
     ToolResult,
     ToolSpec,
-    _bound_policy_denial_result,
-    _bound_policy_denial_text,
 )
 from cayu.environments import (
     BoundWorkspace,
@@ -82,7 +77,6 @@ from cayu.environments import (
     copy_workspace_snapshot,
     load_workspace_instructions,
 )
-from cayu.mcp import McpToolAdapter, McpToolset
 from cayu.providers import (
     InputTokenCountConfidence,
     InputTokenCountMethod,
@@ -100,12 +94,6 @@ from cayu.providers import (
     copy_model_stream_event,
     normalize_model_completion,
 )
-from cayu.proxies import (
-    CredentialProxy,
-    ProxyAuthorizationResult,
-    copy_proxy_authorization_result,
-)
-from cayu.runners import RunnerCancelledError
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_execution as tool_execution
@@ -154,6 +142,15 @@ from cayu.runtime._session_control import (
     interruption_request_id_from_payload,
 )
 from cayu.runtime._session_queries import query_all_event_records
+from cayu.runtime._tool_round_executor import (
+    InterruptedToolRoundRequest,
+    ToolApprovalRequired,
+    ToolRoundExecutor,
+    ToolRoundLimitRequest,
+    UserInputRequired,
+    ordered_tool_result_messages,
+    policy_denial_payload_fields,
+)
 from cayu.runtime.approvals import (
     PendingToolApproval,
     PendingToolCallApproval,
@@ -161,7 +158,6 @@ from cayu.runtime.approvals import (
     ToolApprovalRecoveryOutcome,
     ToolApprovalRecoveryRequest,
     ToolApprovalRequest,
-    copy_pending_tool_approval,
     copy_tool_approval_recovery_request,
     copy_tool_approval_request,
     expiry_resolution_actor,
@@ -241,13 +237,13 @@ from cayu.runtime.event_watchers import (
     run_event_watcher_handler,
 )
 from cayu.runtime.hooks import (
-    AfterToolCallDecision,
-    BeforeToolCallDecision,
-    BeforeToolCallHookContext,
     RuntimeHook,
     RuntimeHookContext,
     RuntimeHookPhase,
-    ToolCallHookContext,
+    _runtime_hook_supports_phase,
+)
+from cayu.runtime.hooks import (
+    _runtime_hook_event as _build_runtime_hook_event,
 )
 from cayu.runtime.loop_policies import (
     BeforeStopAction,
@@ -260,11 +256,7 @@ from cayu.runtime.loop_policies import (
 from cayu.runtime.manifest import AppManifest, describe_app
 from cayu.runtime.mcp_manifest_policy import (
     McpManifestPolicy,
-    McpManifestPolicyAction,
-    McpManifestPolicyDecision,
-    McpManifestPolicyError,
     copy_mcp_manifest_policy,
-    mcp_manifest_policy_payload,
 )
 from cayu.runtime.model_steps import (
     AssistantStepResult,
@@ -350,14 +342,9 @@ from cayu.runtime.tasks import (
     copy_task_create,
 )
 from cayu.runtime.tool_policy import (
-    TAINT_LABELS_METADATA_KEY,
-    TOOL_POLICY_REAUTHORIZATION_METADATA_KEY,
     AllowAllToolPolicy,
-    TaintAwareToolPolicy,
     ToolPolicy,
     ToolPolicyDecision,
-    ToolPolicyRequest,
-    ToolPolicyResult,
     metadata_with_taint_labels,
     taint_labels_from_metadata,
 )
@@ -382,34 +369,17 @@ from cayu.runtime.user_input import (
     PendingUserInput,
     UserInputRecoveryRequest,
     UserInputResponse,
-    copy_pending_user_input,
     copy_user_input_recovery_request,
     copy_user_input_response,
     pending_user_input_from_checkpoint,
 )
 from cayu.storage.memory import KnowledgeStore
 from cayu.vaults import (
-    ResolvedSecret,
     SecretRedactor,
-    SecretRef,
-    copy_resolved_secret,
-    copy_secret_ref,
 )
 
 RegisteredAgent = runtime_records.RegisteredAgent
 RegisteredEnvironment = runtime_records.RegisteredEnvironment
-
-
-class _SessionInterrupted(Exception):
-    def __init__(self, approval: PendingToolApproval) -> None:
-        super().__init__(f"Tool call requires approval: {approval.tool_name}")
-        self.approval = copy_pending_tool_approval(approval)
-
-
-class _UserInputInterrupt(Exception):
-    def __init__(self, pending: PendingUserInput) -> None:
-        super().__init__(f"Tool call awaits user input: {pending.tool_name}")
-        self.pending = copy_pending_user_input(pending)
 
 
 class _SessionCompactionReplay(Exception):
@@ -540,680 +510,6 @@ def _has_provider_backed_context_compaction(
     return any(
         telemetry.event_type == EventType.MODEL_COMPLETED for telemetry in compaction_telemetry
     )
-
-
-class _InterruptGuard:
-    """Applies the session-interrupt matrix around a tool round phase.
-
-    Both interrupt signals — the cooperative ``SessionInterruptedByRequest``
-    and an ``asyncio.CancelledError`` raised while an interrupt request is
-    pending — must close the tool round the same way. Callers catch either
-    exception, drain :meth:`close_tool_round`, and re-raise. A cancellation
-    without a pending interrupt request yields nothing (the cancellation
-    simply propagates).
-    """
-
-    def __init__(
-        self,
-        app: CayuApp,
-        *,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-    ) -> None:
-        self._app = app
-        self._session = session
-        self._registered_agent = registered_agent
-        self._registered_environment = registered_environment
-
-    async def close_tool_round(
-        self,
-        exc: BaseException,
-        *,
-        messages: list[Message],
-        tool_calls: list[runtime_records.ToolCallRequest],
-        tool_outcomes: list[runtime_records.ToolCallOutcome],
-        tool_round_id: str | None,
-        clear_pending_approval: bool = False,
-    ) -> AsyncIterator[Event]:
-        cancellation_artifacts: list[dict[str, Any]] | None = None
-        cancellation_artifacts_by_id: dict[str, list[dict[str, Any]]] | None = None
-        if isinstance(exc, SessionInterruptedByRequest):
-            pass
-        elif isinstance(exc, asyncio.CancelledError):
-            if not await self._app._session_control.interrupt_requested(self._session.id):
-                return
-            clear_current_task_cancellation()
-            cancellation_artifacts = _cancellation_artifacts(exc)
-            # A parallel round records which call produced the artifacts, so attach them to that
-            # call rather than the first unfinished one. Sequential cancellation carries no id and
-            # keeps the first-unfinished fallback (its only in-flight call is that call).
-            producer_id = _cancellation_tool_call_id(exc)
-            if producer_id is not None and cancellation_artifacts:
-                cancellation_artifacts_by_id = {producer_id: cancellation_artifacts}
-                cancellation_artifacts = None
-        else:
-            raise TypeError(f"Unsupported interrupt exception: {type(exc).__name__}")
-        if clear_pending_approval:
-            await self._app._clear_pending_tool_approval_for_tool_round(
-                self._session.id,
-                tool_calls,
-            )
-        async for event in self._app._close_interrupted_tool_round(
-            session=self._session,
-            registered_agent=self._registered_agent,
-            registered_environment=self._registered_environment,
-            messages=messages,
-            tool_calls=tool_calls,
-            tool_outcomes=tool_outcomes,
-            tool_round_id=tool_round_id,
-            cancellation_artifacts=cancellation_artifacts,
-            cancellation_artifacts_by_id=cancellation_artifacts_by_id,
-        ):
-            yield event
-
-
-class _ToolRoundRunner:
-    """Runs one tool round: policy planning, approval checkpointing, execution.
-
-    Yields the round's event stream. When a run limit trips mid-round the
-    runner stops the session through the limit gate and sets
-    ``stopped_for_limit``; callers must return from the session loop when it
-    is True after draining the generator. A pending tool approval raises
-    ``_SessionInterrupted``; interrupt requests propagate after the round is
-    closed by the interrupt guard.
-    """
-
-    def __init__(
-        self,
-        app: CayuApp,
-        *,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        environment_name: str | None,
-        limit_gate: RunLimitGate,
-        interrupt_guard: _InterruptGuard,
-        request_metadata: dict[str, Any],
-        task_id: str | None,
-        structured_output: StructuredOutputSpec | None,
-        thinking: ThinkingConfig | None,
-        max_steps: int,
-        limits: RunLimits,
-        budget_limits: tuple[BudgetLimit, ...],
-        retry_policy: RetryPolicy,
-        run_started_at: float,
-        turn_usage_tracker: SessionUsageTracker | None,
-        active_run: ActiveSessionRun[SessionUsageTracker] | None,
-    ) -> None:
-        self._app = app
-        self._session = session
-        self._registered_agent = registered_agent
-        self._registered_environment = registered_environment
-        self._environment_name = environment_name
-        self._limit_gate = limit_gate
-        self._interrupt_guard = interrupt_guard
-        self._request_metadata = request_metadata
-        self._task_id = task_id
-        self._structured_output = structured_output
-        self._thinking = thinking
-        self._max_steps = max_steps
-        self._limits = limits
-        self._budget_limits = budget_limits
-        self._retry_policy = retry_policy
-        self._run_started_at = run_started_at
-        self._turn_usage_tracker = turn_usage_tracker
-        self._active_run = active_run
-        self.stopped_for_limit = False
-
-    async def run(
-        self,
-        *,
-        messages: list[Message],
-        tool_calls: list[runtime_records.ToolCallRequest],
-        tool_round_id: str | None,
-    ) -> AsyncIterator[Event]:
-        self.stopped_for_limit = False
-        app = self._app
-        session = self._session
-        tool_outcomes: list[runtime_records.ToolCallOutcome] = []
-        try:
-            await app._session_control.raise_if_interrupted(session.id)
-            policy_plan = await app._policy_plan_for_tool_round(
-                session=session,
-                registered_agent=self._registered_agent,
-                registered_environment=self._registered_environment,
-                tool_calls=tool_calls,
-                request_metadata=self._request_metadata,
-            )
-            await app._session_control.raise_if_interrupted(session.id)
-        except (SessionInterruptedByRequest, asyncio.CancelledError) as exc:
-            async for event in self._interrupt_guard.close_tool_round(
-                exc,
-                messages=messages,
-                tool_calls=tool_calls,
-                tool_outcomes=tool_outcomes,
-                tool_round_id=tool_round_id,
-            ):
-                yield event
-            raise
-
-        limit_evaluation = await self._limit_gate.evaluate_limits(
-            pending_tool_calls=len(tool_calls),
-        )
-        async for event in app._apply_limit_evaluation(
-            evaluation=limit_evaluation,
-            session=session,
-            registered_agent=self._registered_agent,
-            registered_environment=self._registered_environment,
-            environment_name=self._environment_name,
-            messages=messages,
-            tool_calls=tool_calls,
-            tool_round_id=tool_round_id,
-            run_started_at=self._run_started_at,
-            turn_usage_tracker=self._turn_usage_tracker,
-            active_run=self._active_run,
-        ):
-            yield event
-        if limit_evaluation.decision is not None:
-            self.stopped_for_limit = True
-            return
-
-        if policy_plan.pending_approval is not None:
-            approval_plan = policy_plan.pending_approval
-            try:
-                approval, checkpoint_event = await app._checkpoint_pending_tool_approval(
-                    session=session,
-                    registered_agent=self._registered_agent,
-                    registered_environment=self._registered_environment,
-                    tool_call=approval_plan.call,
-                    tool_calls=approval_plan.calls,
-                    policy_outcomes=approval_plan.policy_outcomes,
-                    active_taint_by_id=policy_plan.active_taint_labels,
-                    task_id=self._task_id,
-                    policy_result=approval_plan.policy_result,
-                    structured_output=self._structured_output,
-                    thinking=self._thinking,
-                    max_steps=self._max_steps,
-                    limits=self._limits,
-                    budget_limits=self._budget_limits,
-                    retry_policy=self._retry_policy,
-                )
-                yield await app._event_writer.emit(checkpoint_event)
-                yield await app._event_writer.emit(
-                    Event(
-                        type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
-                        session_id=session.id,
-                        agent_name=self._registered_agent.spec.name,
-                        environment_name=self._environment_name,
-                        tool_name=approval.tool_name,
-                        payload={
-                            "approval": approval.model_dump(mode="json"),
-                        },
-                    )
-                )
-            except (SessionInterruptedByRequest, asyncio.CancelledError) as exc:
-                async for event in self._interrupt_guard.close_tool_round(
-                    exc,
-                    messages=messages,
-                    tool_calls=tool_calls,
-                    tool_outcomes=tool_outcomes,
-                    tool_round_id=tool_round_id,
-                    clear_pending_approval=True,
-                ):
-                    yield event
-                raise
-            raise _SessionInterrupted(approval)
-
-        policy_results_by_id = {outcome.call.id: outcome.result for outcome in policy_plan.outcomes}
-        # ask_user pauses the whole round before any tool runs (like approval), so a round
-        # mixing ask_user with other tools loses no outcomes: nothing executes until the caller
-        # resumes with the answer. Approval takes precedence: if the round also needs approval,
-        # the approval pause above wins and, on approval resume, the ask_user call runs as an
-        # ordinary tool and returns an error (v1 limitation — the question is not asked that round).
-        # A DENY'd ask_user is skipped (enforced by normal execution) so a second, allowed ask_user
-        # in the same round can still pause.
-        user_input_pause = _first_user_input_tool_call(
-            self._registered_agent, tool_calls, policy_results_by_id
-        )
-        if user_input_pause is not None:
-            user_input_call, question, options = user_input_pause
-            pending_input, checkpoint_event = await app._checkpoint_pending_user_input(
-                session=session,
-                registered_agent=self._registered_agent,
-                registered_environment=self._registered_environment,
-                tool_call=user_input_call,
-                tool_calls=tool_calls,
-                policy_outcomes=policy_plan.outcomes,
-                active_taint_by_id=policy_plan.active_taint_labels,
-                task_id=self._task_id,
-                structured_output=self._structured_output,
-                thinking=self._thinking,
-                max_steps=self._max_steps,
-                limits=self._limits,
-                budget_limits=self._budget_limits,
-                retry_policy=self._retry_policy,
-                question=question,
-                options=options,
-            )
-            yield await app._event_writer.emit(checkpoint_event)
-            yield await app._event_writer.emit(
-                Event(
-                    type=EventType.SESSION_AWAITING_USER_INPUT,
-                    session_id=session.id,
-                    agent_name=self._registered_agent.spec.name,
-                    environment_name=self._environment_name,
-                    tool_name=user_input_call.name,
-                    payload={
-                        "input_id": pending_input.input_id,
-                        "tool_call_id": pending_input.tool_call_id,
-                        "question": pending_input.question,
-                        "options": list(pending_input.options),
-                    },
-                )
-            )
-            raise _UserInputInterrupt(pending_input)
-
-        segments = self._tool_round_segments(tool_calls)
-        any_parallel = any(run_parallel for run_parallel, _ in segments)
-        try:
-            for run_parallel, segment_calls in segments:
-                if run_parallel:
-                    call_stream = self._run_tool_calls_parallel(
-                        tool_calls=segment_calls,
-                        tool_outcomes=tool_outcomes,
-                        policy_results_by_id=policy_results_by_id,
-                        tool_round_id=tool_round_id,
-                        taint_labels_by_id=policy_plan.active_taint_labels,
-                    )
-                else:
-                    call_stream = self._run_tool_calls_sequential(
-                        messages=messages,
-                        tool_calls=segment_calls,
-                        round_tool_calls=tool_calls,
-                        tool_outcomes=tool_outcomes,
-                        policy_results_by_id=policy_results_by_id,
-                        tool_round_id=tool_round_id,
-                        taint_labels_by_id=policy_plan.active_taint_labels,
-                    )
-                async for event, outcome in call_stream:
-                    yield event
-                    if outcome is not None:
-                        tool_outcomes.append(outcome)
-                if self.stopped_for_limit:
-                    break
-            if self.stopped_for_limit:
-                return
-        except (SessionInterruptedByRequest, asyncio.CancelledError) as exc:
-            async for event in self._interrupt_guard.close_tool_round(
-                exc,
-                messages=messages,
-                tool_calls=tool_calls,
-                tool_outcomes=tool_outcomes,
-                tool_round_id=tool_round_id,
-            ):
-                yield event
-            raise
-
-        # Segments already execute in model order, so tool_outcomes is model-ordered; the ordering
-        # pass is a stable safety net.
-        tool_result_messages = _ordered_tool_result_messages(
-            tool_calls,
-            tool_outcomes,
-            parallel=any_parallel,
-        )
-        messages.extend(tool_result_messages)
-        cleared_checkpoint = await app._checkpoint_without_pending_tool_round(session.id)
-        try:
-            await app.session_store.append_transcript_messages_and_transform_checkpoint(
-                session.id,
-                tool_result_messages,
-                _replace_checkpoint_preserving_runtime_state(cleared_checkpoint),
-            )
-        except asyncio.CancelledError:
-            if await app._session_control.interrupt_requested(session.id):
-                clear_current_task_cancellation()
-                await app.session_store.append_transcript_messages_and_transform_checkpoint(
-                    session.id,
-                    tool_result_messages,
-                    _replace_checkpoint_preserving_runtime_state(cleared_checkpoint),
-                )
-            raise
-
-    def _tool_round_segments(
-        self,
-        tool_calls: list[runtime_records.ToolCallRequest],
-    ) -> list[tuple[bool, list[runtime_records.ToolCallRequest]]]:
-        """Split a round into ordered execution segments preserving the model's tool-call order.
-
-        Concurrency must not reorder side effects: a contiguous run of ``parallel_safe`` calls
-        executes concurrently, but a ``parallel_safe=False`` call is an ordering BARRIER — it runs
-        alone in its position, after everything before it and before everything after it. So
-        ``[safe A, safe B, unsafe C, safe D]`` runs as parallel ``A/B`` → ``C`` → ``D`` (never
-        ``A/B/D`` before ``C``, which would read-after-write). Each returned segment is
-        ``(run_parallel, calls)``; a lone safe call runs sequentially (no concurrency to gain).
-        """
-        if self._app._max_parallel_tool_calls <= 1:
-            return [(False, tool_calls)]
-        segments: list[tuple[bool, list[runtime_records.ToolCallRequest]]] = []
-        safe_run: list[runtime_records.ToolCallRequest] = []
-        for tool_call in tool_calls:
-            if _tool_call_is_parallel_safe(self._registered_agent, tool_call):
-                safe_run.append(tool_call)
-                continue
-            if safe_run:
-                segments.append((len(safe_run) >= 2, safe_run))
-                safe_run = []
-            segments.append((False, [tool_call]))
-        if safe_run:
-            segments.append((len(safe_run) >= 2, safe_run))
-        return segments
-
-    async def _run_tool_calls_sequential(
-        self,
-        *,
-        messages: list[Message],
-        tool_calls: list[runtime_records.ToolCallRequest],
-        tool_outcomes: list[runtime_records.ToolCallOutcome],
-        policy_results_by_id: dict[str, ToolPolicyResult | None],
-        tool_round_id: str | None,
-        round_tool_calls: list[runtime_records.ToolCallRequest] | None = None,
-        taint_labels_by_id: Mapping[str, frozenset[str]] = MappingProxyType({}),
-    ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
-        """Execute tool calls one at a time with per-call limit re-evaluation.
-
-        ``tool_outcomes`` is the caller-owned accumulator; the caller appends
-        yielded outcomes to it, so mid-round limit checks observe completed
-        calls. Sets ``stopped_for_limit`` and returns when a limit trips.
-
-        ``tool_calls`` is the segment to execute; ``round_tool_calls`` is the whole
-        round (defaults to ``tool_calls``). A limit trip closes the round against
-        ``round_tool_calls``, so every un-run call — including later segments — gets a
-        limit-reached result rather than being stranded without a ``tool_result``.
-        """
-        app = self._app
-        session = self._session
-        if round_tool_calls is None:
-            round_tool_calls = tool_calls
-        for tool_call in tool_calls:
-            await app._session_control.raise_if_interrupted(session.id)
-            limit_evaluation = await self._limit_gate.evaluate_limits(
-                pending_tool_calls=1,
-            )
-            async for event in app._apply_limit_evaluation(
-                evaluation=limit_evaluation,
-                session=session,
-                registered_agent=self._registered_agent,
-                registered_environment=self._registered_environment,
-                environment_name=self._environment_name,
-                messages=messages,
-                tool_calls=round_tool_calls,
-                completed_tool_outcomes=tool_outcomes,
-                tool_round_id=tool_round_id,
-                run_started_at=self._run_started_at,
-                turn_usage_tracker=self._turn_usage_tracker,
-                active_run=self._active_run,
-            ):
-                yield event, None
-            if limit_evaluation.decision is not None:
-                self.stopped_for_limit = True
-                return
-            async for event, outcome in app._execute_tool_call(
-                session=session,
-                registered_agent=self._registered_agent,
-                registered_environment=self._registered_environment,
-                tool_call=tool_call,
-                request_metadata=self._request_metadata,
-                task_id=self._task_id,
-                policy_result=policy_results_by_id.get(tool_call.id),
-                tool_round_id=tool_round_id,
-                taint_labels=taint_labels_by_id.get(tool_call.id, frozenset()),
-            ):
-                yield event, outcome
-            await app._session_control.raise_if_interrupted(session.id)
-
-    async def _run_tool_calls_parallel(
-        self,
-        *,
-        tool_calls: list[runtime_records.ToolCallRequest],
-        tool_outcomes: list[runtime_records.ToolCallOutcome],
-        policy_results_by_id: dict[str, ToolPolicyResult | None],
-        tool_round_id: str | None,
-        taint_labels_by_id: Mapping[str, frozenset[str]] = MappingProxyType({}),
-    ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
-        """Execute a multi-call tool round concurrently, capped by a semaphore.
-
-        Each call's events are buffered and yielded in the model's original
-        tool-call order so consumers and the transcript observe the same
-        ordering as sequential execution. The round was gated against run
-        limits as a whole before execution; mid-round re-evaluation is
-        skipped. When the round is interrupted, completed outcomes are
-        flushed into the caller-owned ``tool_outcomes`` accumulator (nothing
-        has been yielded yet) so the interrupt guard preserves finished
-        results, and a child cancellation carrying runner cleanup artifacts
-        is re-raised in place of the bare cancellation.
-        """
-        app = self._app
-        session = self._session
-        semaphore = asyncio.Semaphore(app._max_parallel_tool_calls)
-        buffers: list[list[tuple[Event, runtime_records.ToolCallOutcome | None]]] = [
-            [] for _ in tool_calls
-        ]
-        child_cancellations: list[asyncio.CancelledError | None] = [None] * len(tool_calls)
-
-        async def execute_call(index: int, tool_call: runtime_records.ToolCallRequest) -> None:
-            async with semaphore:
-                await app._session_control.raise_if_interrupted(session.id)
-                try:
-                    async for item in app._execute_tool_call(
-                        session=session,
-                        registered_agent=self._registered_agent,
-                        registered_environment=self._registered_environment,
-                        tool_call=tool_call,
-                        request_metadata=self._request_metadata,
-                        task_id=self._task_id,
-                        policy_result=policy_results_by_id.get(tool_call.id),
-                        tool_round_id=tool_round_id,
-                        taint_labels=taint_labels_by_id.get(tool_call.id, frozenset()),
-                    ):
-                        buffers[index].append(item)
-                except asyncio.CancelledError as exc:
-                    child_cancellations[index] = exc
-                    raise
-
-        def flush_completed_outcomes() -> None:
-            for buffer in buffers:
-                for _, outcome in buffer:
-                    if outcome is not None:
-                        tool_outcomes.append(outcome)
-
-        try:
-            async with asyncio.TaskGroup() as task_group:
-                for index, tool_call in enumerate(tool_calls):
-                    task_group.create_task(execute_call(index, tool_call))
-        except BaseExceptionGroup as exc_group:
-            flush_completed_outcomes()
-            raise _parallel_tool_round_exception(exc_group) from exc_group
-        except asyncio.CancelledError:
-            flush_completed_outcomes()
-            for index, child_exc in enumerate(child_cancellations):
-                if child_exc is not None and _cancellation_artifacts(child_exc):
-                    _set_cancellation_tool_call_id(child_exc, tool_calls[index].id)
-                    raise child_exc from None
-            raise
-        # The TaskGroup completed. A child task that raised CancelledError (e.g. a leaked cancel
-        # scope from an SDK) is absorbed by the TaskGroup as a normal task cancellation — it does
-        # NOT surface as an exception here and does not cancel this run — so its call produced no
-        # terminal outcome. Synthesize an error result for any such un-terminated call so the round
-        # is never left half-open (a dangling assistant tool-call with no matching tool_result
-        # bricks every later step/resume on context validation).
-        for index, tool_call in enumerate(tool_calls):
-            if all(outcome is None for _, outcome in buffers[index]):
-                buffers[index].append(
-                    self._abnormal_tool_termination_item(
-                        tool_call=tool_call, tool_round_id=tool_round_id
-                    )
-                )
-        for buffer in buffers:
-            for item in buffer:
-                yield item
-
-    def _abnormal_tool_termination_item(
-        self,
-        *,
-        tool_call: runtime_records.ToolCallRequest,
-        tool_round_id: str | None,
-    ) -> tuple[Event, runtime_records.ToolCallOutcome]:
-        """Build an error (event, outcome) for a parallel call that never produced a terminal result
-        (its task terminated abnormally while this run was not being cancelled).
-
-        Synchronous by design: it runs after the TaskGroup exits normally, before the buffered
-        outcomes are yielded, so it must not add a suspension point ahead of that flush-safe yield —
-        an external cancellation landing on an ``await`` here would drop the still-un-yielded
-        completed sibling outcomes. The event is streamed like any other buffered parallel event
-        (buffered events are forwarded, not persisted here); the durable record is the ``tool_result``
-        message the caller builds from the returned outcome.
-        """
-        result = ToolResult(
-            content="Tool call did not complete: the parallel task terminated abnormally.",
-            structured={
-                "tool_call_id": tool_call.id,
-                "tool_name": tool_call.name,
-                "abnormal_termination": True,
-            },
-            is_error=True,
-        )
-        payload: dict[str, Any] = {
-            "tool_call_id": tool_call.id,
-            "idempotency_key": tool_execution.tool_idempotency_key(
-                session_id=self._session.id,
-                tool_call_id=tool_call.id,
-                tool_round_id=tool_round_id,
-            ),
-            "abnormal_termination": True,
-            "result": result.model_dump(),
-        }
-        if tool_round_id is not None:
-            payload["tool_round_id"] = tool_round_id
-        event = Event(
-            type=EventType.TOOL_CALL_FAILED,
-            session_id=self._session.id,
-            agent_name=self._registered_agent.spec.name,
-            environment_name=self._environment_name,
-            tool_name=tool_call.name,
-            payload=payload,
-        )
-        return event, runtime_records.ToolCallOutcome(call=tool_call, result=result)
-
-
-def _parallel_tool_round_exception(group: BaseExceptionGroup) -> BaseException:
-    """Pick the exception to surface from a parallel tool round.
-
-    Session interrupts win so the interrupt guard closes the round exactly as
-    in sequential execution; otherwise the first real failure surfaces.
-    """
-    flattened: list[BaseException] = []
-
-    def _flatten(exc: BaseException) -> None:
-        if isinstance(exc, BaseExceptionGroup):
-            for sub_exc in exc.exceptions:
-                _flatten(sub_exc)
-        else:
-            flattened.append(exc)
-
-    _flatten(group)
-    for exc in flattened:
-        if isinstance(exc, SessionInterruptedByRequest | _SessionInterrupted):
-            return exc
-    for exc in flattened:
-        if not isinstance(exc, asyncio.CancelledError):
-            return exc
-    return flattened[0]
-
-
-def _tool_call_is_parallel_safe(
-    registered_agent: runtime_records.RegisteredAgentState,
-    tool_call: runtime_records.ToolCallRequest,
-) -> bool:
-    # An unregistered tool call short-circuits to a failed result with no side effects, so it
-    # is safe to run alongside the concurrent batch.
-    registered_tool = registered_agent.tools.get(tool_call.name)
-    if registered_tool is None:
-        return True
-    return registered_tool.parallel_safe
-
-
-def _tool_effect(
-    registered_agent: runtime_records.RegisteredAgentState,
-    tool_call: runtime_records.ToolCallRequest,
-) -> ToolEffect:
-    registered_tool = registered_agent.tools.get(tool_call.name)
-    if registered_tool is None:
-        return ToolEffect.EXTERNAL
-    return registered_tool.effect
-
-
-def _ordered_tool_result_messages(
-    tool_calls: list[runtime_records.ToolCallRequest],
-    outcomes: list[runtime_records.ToolCallOutcome],
-    *,
-    parallel: bool,
-) -> list[Message]:
-    """Build the tool_result message, ordering the parts by the model's tool-call order.
-
-    Execution runs the round in model order (parallel segments and barriers in place), so
-    ``outcomes`` is already model-ordered and this sort is a stable safety net; on close paths a
-    concurrent segment's completed and interrupted outcomes can still be interleaved, so sorting by
-    the original tool-call index keeps the tool_result parts aligned with the assistant message's
-    tool_call parts. The fallback index keeps any outcome whose call is outside this round stably at
-    the end.
-    """
-    if parallel:
-        order = {tool_call.id: index for index, tool_call in enumerate(tool_calls)}
-        outcomes = sorted(outcomes, key=lambda outcome: order.get(outcome.call.id, len(order)))
-    return transcript_helpers.tool_result_messages(outcomes)
-
-
-def _first_user_input_tool_call(
-    registered_agent: runtime_records.RegisteredAgentState,
-    tool_calls: list[runtime_records.ToolCallRequest],
-    policy_results_by_id: dict[str, ToolPolicyResult | None],
-) -> tuple[runtime_records.ToolCallRequest, str, list[str]] | None:
-    # Recognize a pausing tool (ask_user) by a decoupled marker so the runtime does not
-    # import the tool class (cayu.tools depends on cayu.runtime, not the reverse). Only a
-    # call with a usable question triggers the pause; a malformed call falls through to
-    # normal execution and produces an ordinary error result. Returns the parsed
-    # (question, options) with the call so the caller need not re-parse.
-    for tool_call in tool_calls:
-        registered_tool = registered_agent.tools.get(tool_call.name)
-        if registered_tool is None:
-            continue
-        if not getattr(registered_tool.tool, "pauses_session", False):
-            continue
-        # A DENY'd pausing tool is enforced by normal execution (blocked), not by pausing — skip
-        # it so a later, allowed ask_user in the same round can still pause.
-        policy_result = policy_results_by_id.get(tool_call.id)
-        if policy_result is not None and policy_result.decision == ToolPolicyDecision.DENY:
-            continue
-        question, options = _user_input_prompt(tool_call)
-        if question:
-            return tool_call, question, options
-    return None
-
-
-def _user_input_prompt(
-    tool_call: runtime_records.ToolCallRequest,
-) -> tuple[str, list[str]]:
-    arguments = tool_call.arguments
-    raw_question = arguments.get("question")
-    question = raw_question.strip() if isinstance(raw_question, str) else ""
-    raw_options = arguments.get("options")
-    options: list[str] = []
-    if isinstance(raw_options, list):
-        options = [
-            option.strip() for option in raw_options if isinstance(option, str) and option.strip()
-        ]
-    return question, options
 
 
 class CayuApp:
@@ -1362,6 +658,21 @@ class CayuApp:
         self._default_environment_name: str | None = None
         self._session_control = SessionControl[SessionUsageTracker](
             session_store=self.session_store
+        )
+        self._tool_round_executor = ToolRoundExecutor(
+            session_store=self.session_store,
+            event_writer=self._event_writer,
+            session_control=self._session_control,
+            hook_runtime=self,
+            runtime_hooks=self._runtime_hooks,
+            mcp_manifest_policy=self._mcp_manifest_policy,
+            secret_redactor=self._secret_redactor,
+            tool_timeout_seconds=self._tool_timeout_seconds,
+            max_parallel_tool_calls=self._max_parallel_tool_calls,
+            clock=self._clock,
+            checkpoint_transform=_replace_checkpoint_preserving_runtime_state,
+            apply_limit_evaluation=self._apply_tool_round_limit,
+            close_interrupted_round=self._close_tool_round_after_interrupt,
         )
         self._background_interruption_coordinator = BackgroundInterruptionCoordinator(
             session_store=self.session_store,
@@ -4339,7 +3650,7 @@ class CayuApp:
                     )
                 return None
 
-        inherited_taint_labels = await self._prior_taint_labels_for_policy(
+        inherited_taint_labels = await self._tool_round_executor.prior_taint_labels_for_policy(
             session_id=source_session.id,
             policy=source_registered_agent.tool_policy,
             request_metadata=source_session.metadata,
@@ -4608,7 +3919,10 @@ class CayuApp:
                             payload=started_payload,
                         )
                     )
-                    async for event, outcome in self._emit_tool_call_result_with_hooks(
+                    async for (
+                        event,
+                        outcome,
+                    ) in self._tool_round_executor.emit_tool_call_result_with_hooks(
                         event=Event(
                             type=EventType.TOOL_CALL_COMPLETED,
                             session_id=session.id,
@@ -4640,10 +3954,10 @@ class CayuApp:
                 call_taint_labels = approval_support.taint_labels_from_pending_tool_call(
                     pending_call
                 )
-                # `_execute_tool_call(check_policy=False)` does NOT re-enforce the decision, so a
-                # DENY must be blocked here explicitly (mirroring the approval resume) — otherwise
-                # a policy-denied sibling would execute. REQUIRE_APPROVAL cannot occur: it would
-                # have preempted the ask_user pause with an approval pause.
+                # `ToolRoundExecutor.execute_tool_call(check_policy=False)` does not re-enforce
+                # the decision, so a DENY must be blocked here explicitly (mirroring the approval
+                # resume) — otherwise a policy-denied sibling would execute. REQUIRE_APPROVAL
+                # cannot occur: it would have preempted the ask_user pause with an approval pause.
                 if policy_result is not None and policy_result.decision == ToolPolicyDecision.DENY:
                     reason = tool_execution.policy_denial_reason(policy_result)
                     blocked_result = tool_execution.blocked_tool_result(
@@ -4654,7 +3968,10 @@ class CayuApp:
                         tool_call_id=tool_call.id,
                         pause_id=pending.input_id,
                     )
-                    async for event, outcome in self._emit_tool_call_result_with_hooks(
+                    async for (
+                        event,
+                        outcome,
+                    ) in self._tool_round_executor.emit_tool_call_result_with_hooks(
                         event=Event(
                             type=EventType.TOOL_CALL_BLOCKED,
                             session_id=session.id,
@@ -4664,7 +3981,7 @@ class CayuApp:
                             payload={
                                 "tool_call_id": tool_call.id,
                                 "idempotency_key": idempotency_key,
-                                **_policy_denial_payload_fields(
+                                **policy_denial_payload_fields(
                                     tool_name=tool_call.name,
                                     denied_by=_TOOL_POLICY_DENIAL_SOURCE,
                                     decision=policy_result.decision.value,
@@ -4686,7 +4003,7 @@ class CayuApp:
                             tool_outcomes.append(outcome)
                     continue
 
-                async for event, outcome in self._execute_tool_call(
+                async for event, outcome in self._tool_round_executor.execute_tool_call(
                     session=session,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
@@ -4906,7 +4223,7 @@ class CayuApp:
                 ):
                     yield event
                 return
-            recovery_tool_event, recovered_result = _redact_tool_result_event(
+            recovery_tool_event, recovered_result = tool_results.redact_tool_result_event(
                 event=Event(
                     type=event_type,
                     session_id=session.id,
@@ -4959,7 +4276,7 @@ class CayuApp:
             tool_event = emitted_recovery_events[-1]
             # Manual recovery persists the operator-supplied result before hooks run, so
             # after_tool_call is observe-only here (v1): the threaded modification is ignored.
-            async for event, _modified in self._run_tool_call_hooks(
+            async for event, _modified in self._tool_round_executor.run_tool_call_hooks(
                 session=session,
                 tool_event=tool_event,
                 registered_agent=registered_agent,
@@ -5328,7 +4645,10 @@ class CayuApp:
                         tool_call_id=tool_call.id,
                         approval_id=pending_approval.approval_id,
                     )
-                    async for event, outcome in self._emit_tool_call_result_with_hooks(
+                    async for (
+                        event,
+                        outcome,
+                    ) in self._tool_round_executor.emit_tool_call_result_with_hooks(
                         event=Event(
                             type=EventType.TOOL_CALL_BLOCKED,
                             session_id=session.id,
@@ -5339,7 +4659,7 @@ class CayuApp:
                                 "approval_id": pending_approval.approval_id,
                                 "tool_call_id": tool_call.id,
                                 "idempotency_key": idempotency_key,
-                                **_policy_denial_payload_fields(
+                                **policy_denial_payload_fields(
                                     tool_name=tool_call.name,
                                     denied_by=_TOOL_POLICY_DENIAL_SOURCE,
                                     decision=policy_result.decision.value,
@@ -5399,7 +4719,10 @@ class CayuApp:
                         tool_call_id=tool_call.id,
                         approval_id=pending_approval.approval_id,
                     )
-                    async for event, outcome in self._emit_tool_call_result_with_hooks(
+                    async for (
+                        event,
+                        outcome,
+                    ) in self._tool_round_executor.emit_tool_call_result_with_hooks(
                         event=Event(
                             type=EventType.TOOL_CALL_APPROVAL_DENIED,
                             session_id=session.id,
@@ -5430,7 +4753,7 @@ class CayuApp:
                             tool_outcomes.append(outcome)
                     continue
 
-                async for event, outcome in self._execute_tool_call(
+                async for event, outcome in self._tool_round_executor.execute_tool_call(
                     session=session,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
@@ -5716,7 +5039,7 @@ class CayuApp:
                 ):
                     yield event
                 return
-            recovery_tool_event, recovered_result = _redact_tool_result_event(
+            recovery_tool_event, recovered_result = tool_results.redact_tool_result_event(
                 event=Event(
                     type=event_type,
                     session_id=session.id,
@@ -5767,7 +5090,7 @@ class CayuApp:
             tool_event = emitted_recovery_events[-1]
             # Manual recovery persists the operator-supplied result before hooks run, so
             # after_tool_call is observe-only here (v1): the threaded modification is ignored.
-            async for event, _modified in self._run_tool_call_hooks(
+            async for event, _modified in self._tool_round_executor.run_tool_call_hooks(
                 session=session,
                 tool_event=tool_event,
                 registered_agent=registered_agent,
@@ -6001,7 +5324,7 @@ class CayuApp:
                 ):
                     yield event
                 return
-            recovery_tool_event, recovered_result = _redact_tool_result_event(
+            recovery_tool_event, recovered_result = tool_results.redact_tool_result_event(
                 event=Event(
                     type=event_type,
                     session_id=session.id,
@@ -6055,7 +5378,7 @@ class CayuApp:
             tool_event = emitted_recovery_events[-1]
             # Manual recovery persists the operator-supplied result before hooks run, so
             # after_tool_call is observe-only here (v1): the threaded modification is ignored.
-            async for event, _modified in self._run_tool_call_hooks(
+            async for event, _modified in self._tool_round_executor.run_tool_call_hooks(
                 session=session,
                 tool_event=tool_event,
                 registered_agent=registered_agent,
@@ -6354,7 +5677,7 @@ class CayuApp:
                 yield event
             if binding_result.error is not None:
                 raise binding_result.error
-            async for event in self._emit_mcp_manifest_checks(
+            async for event in self._tool_round_executor.emit_mcp_manifest_checks(
                 session=session,
                 registered_agent=registered_agent,
                 environment_name=environment_name,
@@ -6406,20 +5729,12 @@ class CayuApp:
                 budget_baseline_events=baseline_events,
                 budget_notify_events=request_budget_notify_events,
             )
-            interrupt_guard = _InterruptGuard(
-                self,
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-            )
-            tool_round_runner = _ToolRoundRunner(
-                self,
+            tool_round_runner = self._tool_round_executor.create_run(
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 environment_name=environment_name,
                 limit_gate=limit_gate,
-                interrupt_guard=interrupt_guard,
                 request_metadata=request_metadata,
                 task_id=task_id,
                 structured_output=structured_output,
@@ -7029,7 +6344,7 @@ class CayuApp:
                         (
                             checkpoint,
                             pending_tool_round,
-                        ) = await self._checkpoint_with_pending_tool_round(
+                        ) = await self._tool_round_executor.checkpoint_with_pending_tool_round(
                             session=session,
                             registered_agent=registered_agent,
                             registered_environment=registered_environment,
@@ -7479,7 +6794,7 @@ class CayuApp:
                 registered_environment=registered_environment,
             ):
                 yield event
-        except _SessionInterrupted as exc:
+        except ToolApprovalRequired as exc:
             session = await self.session_store.update_status(session.id, SessionStatus.INTERRUPTED)
             yield await self._emit_turn_completed_once(
                 session=session,
@@ -7507,7 +6822,7 @@ class CayuApp:
                 registered_environment=registered_environment,
             ):
                 yield event
-        except _UserInputInterrupt as exc:
+        except UserInputRequired as exc:
             session = await self.session_store.update_status(session.id, SessionStatus.INTERRUPTED)
             yield await self._emit_turn_completed_once(
                 session=session,
@@ -9001,6 +8316,26 @@ class CayuApp:
         with _automatic_compaction_dispatch_runner_scope(run_provider_dispatch):
             return await execute()
 
+    async def _apply_tool_round_limit(
+        self,
+        request: ToolRoundLimitRequest,
+    ) -> AsyncIterator[Event]:
+        async for event in self._apply_limit_evaluation(
+            evaluation=request.evaluation,
+            session=request.session,
+            registered_agent=request.registered_agent,
+            registered_environment=request.registered_environment,
+            environment_name=request.environment_name,
+            messages=request.messages,
+            tool_calls=request.tool_calls,
+            completed_tool_outcomes=request.completed_tool_outcomes,
+            tool_round_id=request.tool_round_id,
+            run_started_at=request.run_started_at,
+            turn_usage_tracker=request.turn_usage_tracker,
+            active_run=request.active_run,
+        ):
+            yield event
+
     async def _apply_limit_evaluation(
         self,
         *,
@@ -9360,7 +8695,7 @@ class CayuApp:
                     tool_round_id=tool_round_id,
                 )
             )
-        tool_result_messages = _ordered_tool_result_messages(
+        tool_result_messages = ordered_tool_result_messages(
             tool_calls,
             [*completed_tool_outcomes, *skipped_outcomes],
             parallel=True,
@@ -9382,993 +8717,14 @@ class CayuApp:
                 )
             )
         else:
-            cleared_checkpoint = await self._checkpoint_without_pending_tool_round(session.id)
+            cleared_checkpoint = (
+                await self._tool_round_executor.checkpoint_without_pending_tool_round(session.id)
+            )
             await self.session_store.append_transcript_messages_and_transform_checkpoint(
                 session.id,
                 tool_result_messages,
                 _replace_checkpoint_preserving_runtime_state(cleared_checkpoint),
             )
-
-    async def _policy_plan_for_tool_round(
-        self,
-        *,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        tool_calls: list[runtime_records.ToolCallRequest],
-        request_metadata: dict[str, Any],
-    ) -> runtime_records.ToolRoundPolicyPlan:
-        policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] = []
-        approval_policy_result: ToolPolicyResult | None = None
-        approval_tool_call: runtime_records.ToolCallRequest | None = None
-        taint_labels = await self._prior_taint_labels_for_policy(
-            session_id=session.id,
-            policy=registered_agent.tool_policy,
-            request_metadata=request_metadata,
-        )
-        # Capture the taint active for each call at its authorize point (prior + earlier same-round
-        # source labels, before this call folds in its own). Tool execution and pause/resume reuse
-        # this exact per-call set so the value surfaced to the tool matches the value the gate used.
-        active_taint_labels: dict[str, frozenset[str]] = {}
-        for tool_call in tool_calls:
-            active_taint_labels[tool_call.id] = frozenset(taint_labels)
-            if tool_call.name not in registered_agent.tools:
-                policy_outcomes.append(
-                    runtime_records.ToolCallPolicyOutcome(call=tool_call, result=None)
-                )
-                continue
-
-            policy_result = await self._authorize_tool_call(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                tool_call=tool_call,
-                request_metadata=request_metadata,
-                taint_labels=taint_labels,
-            )
-            policy_outcomes.append(
-                runtime_records.ToolCallPolicyOutcome(call=tool_call, result=policy_result)
-            )
-            if (
-                approval_policy_result is None
-                and policy_result.decision == ToolPolicyDecision.REQUIRE_APPROVAL
-            ):
-                approval_policy_result = policy_result
-                approval_tool_call = tool_call
-            taint_labels.update(
-                _taint_labels_for_source_tool(
-                    registered_agent.tool_policy,
-                    tool_call.name,
-                    policy_result=policy_result,
-                )
-            )
-
-        if approval_policy_result is None or approval_tool_call is None:
-            return runtime_records.ToolRoundPolicyPlan(
-                outcomes=policy_outcomes,
-                pending_approval=None,
-                active_taint_labels=active_taint_labels,
-            )
-
-        return runtime_records.ToolRoundPolicyPlan(
-            outcomes=policy_outcomes,
-            active_taint_labels=active_taint_labels,
-            pending_approval=runtime_records.PendingToolApprovalPlan(
-                call=approval_tool_call,
-                calls=[outcome.call for outcome in policy_outcomes],
-                policy_outcomes=policy_outcomes,
-                policy_result=approval_policy_result,
-            ),
-        )
-
-    async def _authorize_tool_call(
-        self,
-        *,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        tool_call: runtime_records.ToolCallRequest,
-        request_metadata: dict[str, Any],
-        taint_labels: Iterable[str] | None = None,
-    ) -> ToolPolicyResult:
-        policy_metadata = request_metadata
-        if taint_labels:
-            policy_metadata = metadata_with_taint_labels(request_metadata, taint_labels)
-        policy_result = await registered_agent.tool_policy.authorize(
-            ToolPolicyRequest(
-                session=session.model_copy(deep=True),
-                agent=_validate_agent_spec(registered_agent.spec),
-                tool_name=tool_call.name,
-                tool_call_id=tool_call.id,
-                tool_effect=_tool_effect(registered_agent, tool_call),
-                arguments=tool_call.arguments,
-                environment_name=_environment_name(registered_environment),
-                workspace_id=_workspace_id(registered_environment),
-                metadata=policy_metadata,
-            )
-        )
-        return tool_execution.validate_tool_policy_result(policy_result)
-
-    async def _prior_taint_labels_for_policy(
-        self,
-        *,
-        session_id: str,
-        policy: ToolPolicy,
-        request_metadata: dict[str, Any],
-    ) -> set[str]:
-        # Seed with labels persisted on the session plus labels supplied for this continuation.
-        # Session metadata is the durable trust boundary used by generic forks; request metadata
-        # remains the per-run path used by explicit subagent spawns.
-        labels: set[str] = set(taint_labels_from_metadata(request_metadata))
-        session = await self.session_store.load(session_id)
-        if session is not None:
-            labels.update(taint_labels_from_metadata(session.metadata))
-        if not isinstance(policy, TaintAwareToolPolicy):
-            return labels
-        for event_type in (EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED):
-            records = await self._query_all_event_records(
-                EventQuery(
-                    session_id=session_id,
-                    event_type=event_type,
-                    limit=5000,
-                )
-            )
-            for record in records:
-                if record.event.tool_name is None:
-                    continue
-                labels.update(policy.labels_for_source_tool(record.event.tool_name))
-        return labels
-
-    async def _execute_tool_call(
-        self,
-        *,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        tool_call: runtime_records.ToolCallRequest,
-        request_metadata: dict[str, Any],
-        task_id: str | None,
-        check_policy: bool = True,
-        emit_started: bool = True,
-        policy_result: ToolPolicyResult | None = None,
-        approval_id: str | None = None,
-        tool_round_id: str | None = None,
-        input_id: str | None = None,
-        taint_labels: frozenset[str] | None = None,
-    ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
-        environment_name = _environment_name(registered_environment)
-        started_event: Event | None = None
-        registered_tool = registered_agent.tools.get(tool_call.name)
-        # Resolve the per-call active taint once so re-authorization, approval checkpointing, and the
-        # ctx.metadata injection below all use the same set. Normal execution and pause/resume pass
-        # the exact labels the policy gated this call with; other callers pass None and we recompute.
-        if taint_labels is None:
-            taint_labels = frozenset(
-                await self._prior_taint_labels_for_policy(
-                    session_id=session.id,
-                    policy=registered_agent.tool_policy,
-                    request_metadata=request_metadata,
-                )
-            )
-        idempotency_key = tool_execution.tool_idempotency_key(
-            session_id=session.id,
-            tool_call_id=tool_call.id,
-            tool_round_id=tool_round_id,
-            approval_id=approval_id,
-            pause_id=input_id,
-        )
-        if emit_started:
-            payload: dict[str, Any] = {
-                "tool_call_id": tool_call.id,
-                "idempotency_key": idempotency_key,
-                "arguments": deepcopy(tool_call.arguments),
-            }
-            if registered_tool is not None:
-                payload["effect"] = registered_tool.effect.value
-            if tool_round_id is not None:
-                payload["tool_round_id"] = tool_round_id
-            if approval_id is not None:
-                payload["approval_id"] = approval_id
-            if input_id is not None:
-                payload["input_id"] = input_id
-            started_event = await self._event_writer.emit(
-                Event(
-                    type=EventType.TOOL_CALL_STARTED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    tool_name=tool_call.name,
-                    payload=payload,
-                )
-            )
-            yield started_event, None
-
-        if registered_tool is None:
-            result = ToolResult(
-                content=f"Tool not registered: {tool_call.name}",
-                is_error=True,
-            )
-            payload = {
-                "tool_call_id": tool_call.id,
-                "idempotency_key": idempotency_key,
-                "result": result.model_dump(),
-            }
-            if tool_round_id is not None:
-                payload["tool_round_id"] = tool_round_id
-            if approval_id is not None:
-                payload["approval_id"] = approval_id
-            if input_id is not None:
-                payload["input_id"] = input_id
-            async for event in self._emit_tool_call_result_with_hooks(
-                event=Event(
-                    type=EventType.TOOL_CALL_FAILED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    tool_name=tool_call.name,
-                    payload=payload,
-                ),
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                tool_call=tool_call,
-                result=result,
-                task_id=task_id,
-            ):
-                yield event
-            return
-
-        if check_policy:
-            if policy_result is None:
-                resolved_policy_result = await self._authorize_tool_call(
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    tool_call=tool_call,
-                    request_metadata=request_metadata,
-                    taint_labels=taint_labels,
-                )
-            else:
-                resolved_policy_result = tool_execution.validate_tool_policy_result(policy_result)
-            if resolved_policy_result.decision == ToolPolicyDecision.DENY:
-                reason = tool_execution.policy_denial_reason(resolved_policy_result)
-                result = tool_execution.blocked_tool_result(resolved_policy_result, reason=reason)
-                payload = {
-                    "tool_call_id": tool_call.id,
-                    "idempotency_key": idempotency_key,
-                    **_policy_denial_payload_fields(
-                        tool_name=tool_call.name,
-                        denied_by=_TOOL_POLICY_DENIAL_SOURCE,
-                        decision=resolved_policy_result.decision.value,
-                        reason=reason,
-                        metadata=resolved_policy_result.metadata,
-                    ),
-                    "result": result.model_dump(),
-                }
-                if tool_round_id is not None:
-                    payload["tool_round_id"] = tool_round_id
-                if approval_id is not None:
-                    payload["approval_id"] = approval_id
-                if input_id is not None:
-                    payload["input_id"] = input_id
-                async for event in self._emit_tool_call_result_with_hooks(
-                    event=Event(
-                        type=EventType.TOOL_CALL_BLOCKED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        tool_name=tool_call.name,
-                        payload=payload,
-                    ),
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    tool_call=tool_call,
-                    result=result,
-                    task_id=task_id,
-                ):
-                    yield event
-                return
-            if resolved_policy_result.decision == ToolPolicyDecision.REQUIRE_APPROVAL:
-                approval, checkpoint_event = await self._checkpoint_pending_tool_approval(
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    tool_call=tool_call,
-                    tool_calls=[tool_call],
-                    policy_outcomes=None,
-                    active_taint_by_id={tool_call.id: taint_labels},
-                    task_id=task_id,
-                    policy_result=resolved_policy_result,
-                    structured_output=None,
-                    thinking=None,
-                    max_steps=None,
-                    limits=None,
-                    budget_limits=None,
-                    retry_policy=None,
-                )
-                yield (await self._event_writer.emit(checkpoint_event), None)
-                yield (
-                    await self._event_writer.emit(
-                        Event(
-                            type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
-                            session_id=session.id,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            tool_name=tool_call.name,
-                            payload={
-                                "approval": approval.model_dump(mode="json"),
-                            },
-                        )
-                    ),
-                    None,
-                )
-                raise _SessionInterrupted(approval)
-            if resolved_policy_result.decision != ToolPolicyDecision.ALLOW:
-                raise ValueError(
-                    f"Unsupported tool policy decision: {resolved_policy_result.decision}"
-                )
-
-        # before_tool_call hooks run after policy authorization, before the tool executes. They can
-        # modify arguments, short-circuit with a synthetic result, or block the call.
-        anchor_event = started_event or Event(
-            type=EventType.TOOL_CALL_STARTED,
-            session_id=session.id,
-            agent_name=registered_agent.spec.name,
-            environment_name=environment_name,
-            tool_name=tool_call.name,
-            payload={"tool_call_id": tool_call.id},
-        )
-        before_resolution = _BeforeToolCallResolution(arguments=deepcopy(tool_call.arguments))
-        async for hook_event in self._run_before_tool_call_hooks(
-            session=session,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            tool_call=tool_call,
-            anchor_event=anchor_event,
-            task_id=task_id,
-            resolution=before_resolution,
-        ):
-            yield hook_event, None
-        # Compute the effective call once, before any branch consumes it: a before-hook may have
-        # rewritten the arguments, and every downstream path (block, short-circuit, re-auth, run)
-        # must see the effective arguments, not the original.
-        effective_tool_call = (
-            tool_call
-            if before_resolution.arguments == tool_call.arguments
-            else replace(tool_call, arguments=before_resolution.arguments)
-        )
-        effective_arguments_payload = (
-            {"effective_arguments": effective_tool_call.arguments}
-            if effective_tool_call is not tool_call
-            else {}
-        )
-        if before_resolution.block_reason is not None:
-            # A block is a gate decision, not a tool outcome: observe-only (allow_modification=False).
-            async for event in self._emit_terminal_tool_result(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                tool_call=effective_tool_call,
-                event_type=EventType.TOOL_CALL_BLOCKED,
-                result=ToolResult(content=before_resolution.block_reason, is_error=True),
-                extra_payload={
-                    "reason": before_resolution.block_reason,
-                    "blocked_by": "before_tool_call_hook",
-                    "idempotency_key": idempotency_key,
-                    **effective_arguments_payload,
-                },
-                task_id=task_id,
-                tool_round_id=tool_round_id,
-                approval_id=approval_id,
-                input_id=input_id,
-                allow_modification=False,
-            ):
-                yield event
-            return
-        if before_resolution.short_circuit_result is not None:
-            short_result = before_resolution.short_circuit_result
-            # A synthetic result stands in for a real tool outcome: after-hooks may modify it.
-            async for event in self._emit_terminal_tool_result(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                tool_call=effective_tool_call,
-                event_type=(
-                    EventType.TOOL_CALL_FAILED
-                    if short_result.is_error
-                    else EventType.TOOL_CALL_COMPLETED
-                ),
-                result=short_result,
-                extra_payload={
-                    "short_circuited_by": "before_tool_call_hook",
-                    "idempotency_key": idempotency_key,
-                    **effective_arguments_payload,
-                },
-                task_id=task_id,
-                tool_round_id=tool_round_id,
-                approval_id=approval_id,
-                input_id=input_id,
-                allow_modification=True,
-            ):
-                yield event
-            return
-
-        # Re-authorize the effective arguments so ToolPolicy always vets what actually runs — a hook
-        # cannot slip modified arguments past the gate. Unchanged arguments skip the second check.
-        if effective_tool_call is not tool_call:
-            reauthorization = await self._authorize_tool_call(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                tool_call=effective_tool_call,
-                # Mark the re-check so stateful policies (rate limiters, counters, audit) can
-                # re-verify the effective args without double-counting a hook-modified call.
-                request_metadata={
-                    **request_metadata,
-                    TOOL_POLICY_REAUTHORIZATION_METADATA_KEY: True,
-                },
-                taint_labels=taint_labels,
-            )
-            if reauthorization.decision != ToolPolicyDecision.ALLOW:
-                # Fail-safe: DENY or REQUIRE_APPROVAL on hook-modified arguments blocks the call.
-                # REQUIRE_APPROVAL is unsupported here in v1 — approval-resume re-runs before-hooks
-                # and would double-apply the modification.
-                if reauthorization.decision == ToolPolicyDecision.DENY:
-                    reason = tool_execution.policy_denial_reason(reauthorization)
-                else:
-                    reason = (
-                        reauthorization.reason
-                        or "Modified tool arguments require approval, which before_tool_call "
-                        "hook modifications do not support."
-                    )
-                async for event in self._emit_terminal_tool_result(
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    tool_call=effective_tool_call,
-                    event_type=EventType.TOOL_CALL_BLOCKED,
-                    result=ToolResult(content=reason, is_error=True),
-                    extra_payload={
-                        **_policy_denial_payload_fields(
-                            tool_name=effective_tool_call.name,
-                            denied_by=_TOOL_POLICY_DENIAL_SOURCE,
-                            decision=reauthorization.decision.value,
-                            reason=reason,
-                            metadata=reauthorization.metadata,
-                        ),
-                        "blocked_by": "tool_policy_reauthorization",
-                        "idempotency_key": idempotency_key,
-                    },
-                    task_id=task_id,
-                    tool_round_id=tool_round_id,
-                    approval_id=approval_id,
-                    input_id=input_id,
-                    allow_modification=False,
-                ):
-                    yield event
-                return
-
-        resolved_proxy_secrets: list[ResolvedSecret] = []
-        proxy_authorizations: list[_ProxyAuthorizationRecord] = []
-        ctx_metadata = tool_execution.context_metadata(
-            request_metadata=request_metadata,
-            tool_call_id=tool_call.id,
-            approval_id=approval_id,
-            idempotency_key=idempotency_key,
-            tool_effect=registered_tool.effect,
-            input_id=input_id,
-        )
-        # Surface the call's active taint labels to the executing tool so taint-aware tools (e.g.
-        # subagent spawns) can propagate them across session boundaries. taint_labels was resolved
-        # at the top of this method (per-call value from planning, or restored on pause/resume).
-        if taint_labels:
-            # ctx_metadata is a freshly copied dict and taint_labels is already validated, so set
-            # the key directly instead of re-deep-copying the whole payload via the helper.
-            ctx_metadata[TAINT_LABELS_METADATA_KEY] = sorted(taint_labels)
-        tool_context = ToolContext(
-            session_id=session.id,
-            agent_name=registered_agent.spec.name,
-            environment_name=environment_name,
-            causal_budget_id=session.causal_budget_id,
-            workspace_id=_workspace_id(registered_environment),
-            artifact_store_id=_artifact_store_id(registered_environment),
-            idempotency_key=idempotency_key,
-            workspace=_workspace(registered_environment),
-            artifact_store=_artifact_store(registered_environment),
-            runner=_runner(registered_environment),
-            vault=_vault(registered_environment),
-            proxy=_proxy(
-                registered_environment,
-                on_resolve=resolved_proxy_secrets.append,
-                on_authorize=proxy_authorizations.append,
-            ),
-            knowledge_store=_knowledge_store(registered_environment),
-            mcp_servers=_mcp_servers(registered_environment),
-            metadata=ctx_metadata,
-        )
-        try:
-            result = await tool_execution.run_tool(
-                tool=registered_tool.tool,
-                ctx=tool_context,
-                # effective_tool_call.arguments is the (re-authorized) private copy to execute.
-                arguments=effective_tool_call.arguments,
-                timeout_seconds=self._tool_timeout_seconds,
-            )
-        except asyncio.CancelledError:
-            if proxy_authorizations and await self._session_control.interrupt_requested(session.id):
-                clear_current_task_cancellation()
-                redactor = _redactor_with_resolved_secrets(
-                    self._secret_redactor,
-                    resolved_proxy_secrets,
-                )
-                async for event in self._emit_proxy_authorization_events(
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    tool_call=tool_call,
-                    records=proxy_authorizations,
-                    tool_round_id=tool_round_id,
-                    approval_id=approval_id,
-                    input_id=input_id,
-                    idempotency_key=idempotency_key,
-                    redactor=redactor,
-                ):
-                    yield event, None
-            raise
-        redactor = _redactor_with_resolved_secrets(
-            self._secret_redactor,
-            resolved_proxy_secrets,
-        )
-        async for event in self._emit_proxy_authorization_events(
-            session=session,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            tool_call=tool_call,
-            records=proxy_authorizations,
-            tool_round_id=tool_round_id,
-            approval_id=approval_id,
-            input_id=input_id,
-            idempotency_key=idempotency_key,
-            redactor=redactor,
-        ):
-            yield event, None
-        # A result produced only because the tool swallowed a delivered
-        # cancellation is a late result: the interrupt matrix already treats
-        # the call as interrupted, so suppress it instead of persisting a
-        # completion the operator raced to prevent.
-        current_task = asyncio.current_task()
-        tool_swallowed_cancellation = current_task is not None and current_task.cancelling() > 0
-        if tool_swallowed_cancellation and await self._session_control.is_interrupting(session.id):
-            raise SessionInterruptedByRequest(session.id)
-        policy_denial = tool_context._policy_denial_for(registered_tool.tool)
-        if policy_denial is not None:
-            # Nested policy refusals are authority outcomes, not failed executions. Their trusted
-            # control metadata travels through the private per-call context signal; the tool still
-            # returns the exact public ToolResult that hooks, transcripts, and direct callers expect.
-            # Exact instance matching is intentional: a nested or delegated tool must not relabel
-            # its registered caller's result without a future explicit delegation contract.
-            async for event in self._emit_terminal_tool_result(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                tool_call=effective_tool_call,
-                event_type=EventType.TOOL_CALL_BLOCKED,
-                result=policy_denial.result,
-                extra_payload={
-                    "idempotency_key": idempotency_key,
-                    **_policy_denial_payload_fields(
-                        tool_name=effective_tool_call.name,
-                        denied_by=policy_denial.denied_by,
-                        decision=policy_denial.decision,
-                        reason=policy_denial.reason,
-                        metadata={},
-                    ),
-                },
-                task_id=task_id,
-                tool_round_id=tool_round_id,
-                approval_id=approval_id,
-                input_id=input_id,
-                allow_modification=False,
-                redactor=redactor,
-            ):
-                yield event
-            return
-        event_type = (
-            EventType.TOOL_CALL_FAILED if result.is_error else EventType.TOOL_CALL_COMPLETED
-        )
-        payload = {
-            "tool_call_id": tool_call.id,
-            "idempotency_key": idempotency_key,
-            "result": result.model_dump(),
-            # A before_tool_call hook may have rewritten the args; record what actually executed so
-            # audit / replay can reconstruct the effective call (TOOL_CALL_STARTED still shows the
-            # model's originally requested arguments). Empty when unchanged.
-            **effective_arguments_payload,
-        }
-        if tool_round_id is not None:
-            payload["tool_round_id"] = tool_round_id
-        if approval_id is not None:
-            payload["approval_id"] = approval_id
-        if input_id is not None:
-            payload["input_id"] = input_id
-        async for event in self._emit_tool_call_result_with_hooks(
-            event=Event(
-                type=event_type,
-                session_id=session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=environment_name,
-                tool_name=tool_call.name,
-                payload=payload,
-            ),
-            session=session,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            tool_call=effective_tool_call,
-            result=result,
-            task_id=task_id,
-            redactor=redactor,
-            allow_modification=True,
-        ):
-            yield event
-        # For a tool that completed normally the cooperative interrupt check
-        # runs only after the terminal tool event has been emitted and the
-        # completed outcome yielded: the tool already ran (possibly with
-        # non-idempotent side effects), so the outcome must be persisted
-        # before the interrupt propagates. Otherwise round-close records the
-        # call as interrupted and recovery reports the outcome as unknown,
-        # inviting an unsafe retry.
-        if await self._session_control.is_interrupting(session.id):
-            raise SessionInterruptedByRequest(session.id)
-
-    async def _emit_mcp_manifest_checks(
-        self,
-        *,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        environment_name: str | None,
-    ) -> AsyncIterator[Event]:
-        seen_toolsets: set[int] = set()
-        prior_records = await self._query_all_event_records(
-            EventQuery(
-                event_type=EventType.MCP_MANIFEST_CHECKED,
-                environment_name=environment_name,
-            )
-        )
-        toolsets = _mcp_toolsets_for_agent(registered_agent)
-        current_server_counts = _mcp_current_server_counts(toolsets)
-        prior_server_counts = _mcp_prior_server_counts(
-            prior_records,
-            environment_name=environment_name,
-        )
-        checks: list[tuple[dict[str, Any], McpManifestPolicyDecision | None]] = []
-        for toolset in toolsets:
-            toolset_key = id(toolset)
-            if toolset_key in seen_toolsets:
-                continue
-            seen_toolsets.add(toolset_key)
-            previous = _latest_mcp_manifest_event(
-                prior_records,
-                manifest_identity=toolset.manifest_identity,
-                environment_name=environment_name,
-            )
-            if (
-                previous is None
-                and current_server_counts.get(toolset.server.name) == 1
-                and prior_server_counts.get(toolset.server.name) == 1
-            ):
-                previous = _latest_mcp_manifest_event_for_server(
-                    prior_records,
-                    server_name=toolset.server.name,
-                    environment_name=environment_name,
-                )
-            status, previous_payload, diff = _mcp_manifest_status(
-                toolset=toolset,
-                previous=previous,
-            )
-            payload: dict[str, Any] = {
-                "server_name": toolset.server.name,
-                "manifest_identity": toolset.manifest_identity,
-                "manifest_hash": toolset.manifest_hash,
-                "server_hash": toolset.manifest_server_hash,
-                "status": status,
-                "tool_count": len(toolset.definitions),
-                "tools": copy_json_value(list(toolset.manifest_tools), "tools"),
-                "server": {
-                    "protocol_version": toolset.initialize_result.protocol_version,
-                    "server_name": toolset.initialize_result.server_name,
-                    "server_version": toolset.initialize_result.server_version,
-                },
-                "previous": previous_payload,
-                "diff": diff,
-            }
-            policy = self._mcp_manifest_policy
-            decision = None
-            if policy is not None:
-                decision = policy.decide(status=status, diff=diff)
-                payload["policy"] = mcp_manifest_policy_payload(decision)
-            checks.append((payload, decision))
-
-        blocked_checks = [
-            (payload, decision)
-            for payload, decision in checks
-            if decision is not None and decision.action == McpManifestPolicyAction.BLOCK
-        ]
-        if blocked_checks:
-            for payload, _ in blocked_checks:
-                yield await self._event_writer.emit(
-                    Event(
-                        type=EventType.MCP_MANIFEST_BLOCKED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        payload=copy_json_value(payload, "payload"),
-                    )
-                )
-            reasons = "; ".join(decision.reason for _, decision in blocked_checks)
-            raise McpManifestPolicyError(reasons)
-
-        for payload, _ in checks:
-            yield await self._event_writer.emit(
-                Event(
-                    type=EventType.MCP_MANIFEST_CHECKED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload=payload,
-                )
-            )
-
-    async def _emit_proxy_authorization_events(
-        self,
-        *,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        tool_call: runtime_records.ToolCallRequest,
-        records: list[_ProxyAuthorizationRecord],
-        tool_round_id: str | None,
-        approval_id: str | None,
-        input_id: str | None,
-        redactor: SecretRedactor,
-        idempotency_key: str | None = None,
-    ) -> AsyncIterator[Event]:
-        for record in records:
-            payload: dict[str, Any] = {
-                "tool_call_id": tool_call.id,
-                "destination": record.destination,
-                "credential": None if record.credential is None else record.credential.name,
-                "action": record.action,
-                "metadata": copy_json_value(record.metadata, "metadata"),
-                "allowed": record.result.allowed,
-                "reason": record.result.reason,
-                "result_metadata": copy_json_value(
-                    record.result.metadata,
-                    "result_metadata",
-                ),
-            }
-            if idempotency_key is not None:
-                payload["idempotency_key"] = idempotency_key
-            if tool_round_id is not None:
-                payload["tool_round_id"] = tool_round_id
-            if approval_id is not None:
-                payload["approval_id"] = approval_id
-            if input_id is not None:
-                payload["input_id"] = input_id
-            if redactor.has_values:
-                redacted_payload = redactor.redact_json(payload)
-                if type(redacted_payload) is not dict:
-                    raise AssertionError(
-                        "Proxy authorization redaction returned non-object payload."
-                    )
-                payload = redacted_payload
-            yield await self._event_writer.emit(
-                Event(
-                    type=EventType.CREDENTIAL_PROXY_CHECKED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=_environment_name(registered_environment),
-                    tool_name=tool_call.name,
-                    payload=payload,
-                )
-            )
-
-    async def _checkpoint_pending_tool_approval(
-        self,
-        *,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        tool_call: runtime_records.ToolCallRequest,
-        tool_calls: list[runtime_records.ToolCallRequest],
-        policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] | None,
-        active_taint_by_id: Mapping[str, frozenset[str]],
-        task_id: str | None,
-        policy_result: ToolPolicyResult,
-        structured_output: StructuredOutputSpec | None,
-        thinking: ThinkingConfig | None,
-        max_steps: int | None,
-        limits: RunLimits | None,
-        budget_limits: tuple[BudgetLimit, ...] | None,
-        retry_policy: RetryPolicy | None,
-    ) -> tuple[PendingToolApproval, Event]:
-        checkpoint = await self.session_store.load_checkpoint(session.id)
-        checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
-        if approval_support.pending_approval_from_checkpoint(checkpoint) is not None:
-            raise RuntimeError("Session already has a pending tool approval.")
-        checkpoint.pop(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY, None)
-
-        # The round resolves as a whole, so any approval-requiring call's TTL
-        # bounds the whole round: take the MINIMUM across the round's policy
-        # results (first-call-wins would silently extend a sibling's shorter
-        # window).
-        round_ttls = [policy_result.approval_expires_in_seconds]
-        if policy_outcomes is not None:
-            round_ttls.extend(
-                outcome.result.approval_expires_in_seconds
-                for outcome in policy_outcomes
-                if outcome.result is not None
-                and outcome.result.decision == ToolPolicyDecision.REQUIRE_APPROVAL
-            )
-        bounded_ttls = [ttl for ttl in round_ttls if ttl is not None]
-        expires_at: datetime | None = None
-        if bounded_ttls:
-            expires_at = self._clock() + timedelta(seconds=min(bounded_ttls))
-        approval = PendingToolApproval(
-            approval_id=str(uuid4()),
-            tool_call_id=tool_call.id,
-            tool_name=tool_call.name,
-            arguments=copy_json_value(tool_call.arguments, "arguments"),
-            agent_name=registered_agent.spec.name,
-            environment_name=_environment_name(registered_environment),
-            workspace_id=_workspace_id(registered_environment),
-            task_id=task_id,
-            reason=policy_result.reason,
-            metadata=copy_json_value(policy_result.metadata, "metadata"),
-            tool_calls=approval_support.pending_tool_call_approvals(
-                tool_calls=tool_calls,
-                policy_outcomes=policy_outcomes,
-                active_taint_by_id=active_taint_by_id,
-                redactor=self._secret_redactor,
-            ),
-            structured_output=copy_structured_output_spec(structured_output),
-            thinking=thinking,
-            max_steps=max_steps,
-            limits=copy_run_limits(limits) if limits is not None else None,
-            budget_limits=(
-                copy_request_budget_limits(budget_limits) if budget_limits is not None else None
-            ),
-            retry_policy=copy_retry_policy(retry_policy) if retry_policy is not None else None,
-            expires_at=expires_at,
-        )
-        checkpoint[approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY] = approval.model_dump(
-            mode="json"
-        )
-        await self.session_store.transform_checkpoint(
-            session.id,
-            _replace_checkpoint_preserving_runtime_state(checkpoint),
-        )
-        return (
-            approval,
-            Event(
-                type=EventType.SESSION_CHECKPOINTED,
-                session_id=session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=_environment_name(registered_environment),
-                payload={
-                    "checkpoint": approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,
-                    "approval_id": approval.approval_id,
-                    "tool_call_id": approval.tool_call_id,
-                },
-            ),
-        )
-
-    async def _checkpoint_pending_user_input(
-        self,
-        *,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        tool_call: runtime_records.ToolCallRequest,
-        tool_calls: list[runtime_records.ToolCallRequest],
-        policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] | None,
-        active_taint_by_id: Mapping[str, frozenset[str]],
-        task_id: str | None,
-        structured_output: StructuredOutputSpec | None,
-        thinking: ThinkingConfig | None,
-        max_steps: int | None,
-        limits: RunLimits | None,
-        budget_limits: tuple[BudgetLimit, ...] | None,
-        retry_policy: RetryPolicy | None,
-        question: str,
-        options: list[str],
-    ) -> tuple[PendingUserInput, Event]:
-        checkpoint = await self.session_store.load_checkpoint(session.id)
-        checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
-        if approval_support.pending_approval_from_checkpoint(checkpoint) is not None:
-            raise RuntimeError("Session already has a pending tool approval.")
-        if pending_user_input_from_checkpoint(checkpoint) is not None:
-            raise RuntimeError("Session already has a pending user input.")
-        checkpoint.pop(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY, None)
-
-        # Expiry is approval-only by design: a pending question waits for its
-        # human indefinitely, so PendingUserInput deliberately has no
-        # expires_at (do not mirror the approval checkpoint's TTL here).
-        pending = PendingUserInput(
-            input_id=str(uuid4()),
-            tool_call_id=tool_call.id,
-            tool_name=tool_call.name,
-            question=question,
-            options=list(options),
-            arguments=copy_json_value(tool_call.arguments, "arguments"),
-            agent_name=registered_agent.spec.name,
-            environment_name=_environment_name(registered_environment),
-            workspace_id=_workspace_id(registered_environment),
-            task_id=task_id,
-            tool_calls=approval_support.pending_tool_call_approvals(
-                tool_calls=tool_calls,
-                policy_outcomes=policy_outcomes,
-                active_taint_by_id=active_taint_by_id,
-                redactor=self._secret_redactor,
-            ),
-            structured_output=copy_structured_output_spec(structured_output),
-            thinking=thinking,
-            max_steps=max_steps,
-            limits=copy_run_limits(limits) if limits is not None else None,
-            budget_limits=(
-                copy_request_budget_limits(budget_limits) if budget_limits is not None else None
-            ),
-            retry_policy=copy_retry_policy(retry_policy) if retry_policy is not None else None,
-        )
-        checkpoint[PENDING_USER_INPUT_CHECKPOINT_KEY] = pending.model_dump(mode="json")
-        await self.session_store.transform_checkpoint(
-            session.id,
-            _replace_checkpoint_preserving_runtime_state(checkpoint),
-        )
-        return (
-            pending,
-            Event(
-                type=EventType.SESSION_CHECKPOINTED,
-                session_id=session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=_environment_name(registered_environment),
-                payload={
-                    "checkpoint": PENDING_USER_INPUT_CHECKPOINT_KEY,
-                    "input_id": pending.input_id,
-                    "tool_call_id": pending.tool_call_id,
-                },
-            ),
-        )
-
-    async def _checkpoint_with_pending_tool_round(
-        self,
-        *,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        tool_calls: list[runtime_records.ToolCallRequest],
-        policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] | None,
-        task_id: str | None,
-        structured_output: StructuredOutputSpec | None,
-    ) -> tuple[dict[str, Any], tool_round_recovery.PendingToolRound]:
-        checkpoint = await self.session_store.load_checkpoint(session.id)
-        return tool_round_recovery.checkpoint_with_pending_tool_round(
-            checkpoint,
-            agent_name=registered_agent.spec.name,
-            environment_name=_environment_name(registered_environment),
-            task_id=task_id,
-            tool_calls=tool_calls,
-            policy_outcomes=policy_outcomes,
-            structured_output=structured_output,
-            redactor=self._secret_redactor,
-        )
-
-    async def _checkpoint_without_pending_tool_round(
-        self,
-        session_id: str,
-    ) -> dict[str, Any]:
-        checkpoint = await self.session_store.load_checkpoint(session_id)
-        return tool_round_recovery.checkpoint_without_pending_tool_round(checkpoint)
 
     async def _clear_pending_tool_round_if_matches(
         self,
@@ -10396,27 +8752,6 @@ class CayuApp:
         checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
         checkpoint.pop(approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY, None)
         return checkpoint
-
-    async def _clear_pending_tool_approval_for_tool_round(
-        self,
-        session_id: str,
-        tool_calls: list[runtime_records.ToolCallRequest],
-    ) -> None:
-        expected_ids = {tool_call.id for tool_call in tool_calls}
-        if not expected_ids:
-            return
-        checkpoint = await self.session_store.load_checkpoint(session_id)
-        if checkpoint is None:
-            return
-        copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
-        pending_approval = approval_support.pending_approval_from_checkpoint(copied_checkpoint)
-        if pending_approval is None or pending_approval.tool_call_id not in expected_ids:
-            return
-        copied_checkpoint.pop(approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY, None)
-        await self.session_store.transform_checkpoint(
-            session_id,
-            _replace_checkpoint_preserving_runtime_state(copied_checkpoint),
-        )
 
     async def _load_pending_session_interrupt_payload(
         self,
@@ -11196,6 +9531,23 @@ class CayuApp:
         finally:
             self._session_control.end_emitting_interrupted(session.id)
 
+    async def _close_tool_round_after_interrupt(
+        self,
+        request: InterruptedToolRoundRequest,
+    ) -> AsyncIterator[Event]:
+        async for event in self._close_interrupted_tool_round(
+            session=request.session,
+            registered_agent=request.registered_agent,
+            registered_environment=request.registered_environment,
+            messages=request.messages,
+            tool_calls=request.tool_calls,
+            tool_outcomes=request.tool_outcomes,
+            tool_round_id=request.tool_round_id,
+            cancellation_artifacts=request.cancellation_artifacts,
+            cancellation_artifacts_by_id=request.cancellation_artifacts_by_id,
+        ):
+            yield event
+
     async def _close_interrupted_tool_round(
         self,
         *,
@@ -11250,11 +9602,13 @@ class CayuApp:
         # Restore the model's tool-call order: a parallel/mixed round's completed outcomes can be
         # in completion order, and the interrupted ones are appended after — sort back to the
         # assistant tool-call order (a no-op for an already-ordered sequential round).
-        interrupted_messages = _ordered_tool_result_messages(
+        interrupted_messages = ordered_tool_result_messages(
             tool_calls, tool_outcomes, parallel=True
         )
         messages.extend(interrupted_messages)
-        cleared_checkpoint = await self._checkpoint_without_pending_tool_round(session.id)
+        cleared_checkpoint = await self._tool_round_executor.checkpoint_without_pending_tool_round(
+            session.id
+        )
         await self.session_store.append_transcript_messages_and_transform_checkpoint(
             session.id,
             interrupted_messages,
@@ -11434,7 +9788,7 @@ class CayuApp:
             event_type = (
                 EventType.TOOL_CALL_FAILED if result.is_error else EventType.TOOL_CALL_COMPLETED
             )
-            async for event, outcome in self._emit_tool_call_result_with_hooks(
+            async for event, outcome in self._tool_round_executor.emit_tool_call_result_with_hooks(
                 event=Event(
                     type=event_type,
                     session_id=session.id,
@@ -11465,7 +9819,9 @@ class CayuApp:
         if insert_at < 0:
             raise RuntimeError("Pending tool round recovery received an invalid tail size.")
         messages[insert_at:insert_at] = tool_result_messages
-        cleared_checkpoint = await self._checkpoint_without_pending_tool_round(session.id)
+        cleared_checkpoint = await self._tool_round_executor.checkpoint_without_pending_tool_round(
+            session.id
+        )
         await self.session_store.append_transcript_messages_and_transform_checkpoint(
             session.id,
             tool_result_messages,
@@ -12110,359 +10466,6 @@ class CayuApp:
             scope="agent",
         ):
             yield hook_event
-
-    async def _emit_terminal_tool_result(
-        self,
-        *,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        tool_call: runtime_records.ToolCallRequest,
-        event_type: EventType,
-        result: ToolResult,
-        extra_payload: dict[str, Any],
-        task_id: str | None,
-        tool_round_id: str | None,
-        approval_id: str | None,
-        input_id: str | None,
-        allow_modification: bool,
-        redactor: SecretRedactor | None = None,
-    ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
-        # Shared emission for the before-hook block / short-circuit terminal results.
-        payload: dict[str, Any] = {
-            "tool_call_id": tool_call.id,
-            **extra_payload,
-            "result": result.model_dump(),
-        }
-        if tool_round_id is not None:
-            payload["tool_round_id"] = tool_round_id
-        if approval_id is not None:
-            payload["approval_id"] = approval_id
-        if input_id is not None:
-            payload["input_id"] = input_id
-        async for event in self._emit_tool_call_result_with_hooks(
-            event=Event(
-                type=event_type,
-                session_id=session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=_environment_name(registered_environment),
-                tool_name=tool_call.name,
-                payload=payload,
-            ),
-            session=session,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            tool_call=tool_call,
-            result=result,
-            task_id=task_id,
-            redactor=redactor,
-            allow_modification=allow_modification,
-        ):
-            yield event
-
-    async def _run_before_tool_call_hooks(
-        self,
-        *,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        tool_call: runtime_records.ToolCallRequest,
-        anchor_event: Event,
-        task_id: str | None,
-        resolution: _BeforeToolCallResolution,
-    ) -> AsyncIterator[Event]:
-        # App-scope then agent-scope, registration order; each hook sees prior hooks' modified
-        # arguments. The first short_circuit/block stops the chain. A raising hook or invalid
-        # decision emits HOOK_FAILED and proceeds unmodified (same isolation as after_tool_call).
-        for hooks, scope in (
-            (self._runtime_hooks, "app"),
-            (registered_agent.runtime_hooks, "agent"),
-        ):
-            for hook in hooks:
-                if not _runtime_hook_supports_phase(
-                    hook=hook,
-                    phase=RuntimeHookPhase.BEFORE_TOOL_CALL,
-                ):
-                    continue
-                hook_name = require_clean_nonblank(hook.name, "runtime_hook.name")
-                yield await self._event_writer.emit(
-                    _runtime_hook_event(
-                        event_type=EventType.HOOK_STARTED,
-                        hook_name=hook_name,
-                        scope=scope,
-                        phase=RuntimeHookPhase.BEFORE_TOOL_CALL,
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        terminal_event=anchor_event,
-                        payload={
-                            "tool_name": tool_call.name,
-                            "tool_call_id": tool_call.id,
-                        },
-                    )
-                )
-                context = BeforeToolCallHookContext(
-                    runtime=self,
-                    hook_name=hook_name,
-                    phase=RuntimeHookPhase.BEFORE_TOOL_CALL,
-                    session=session,
-                    tool_name=tool_call.name,
-                    tool_call_id=tool_call.id,
-                    arguments=resolution.arguments,
-                    task_id=task_id,
-                )
-                try:
-                    decision = await hook.before_tool_call(context)
-                    stop = _resolve_before_tool_call_decision(decision, resolution)
-                except Exception as exc:
-                    yield await self._event_writer.emit(
-                        _runtime_hook_event(
-                            event_type=EventType.HOOK_FAILED,
-                            hook_name=hook_name,
-                            scope=scope,
-                            phase=RuntimeHookPhase.BEFORE_TOOL_CALL,
-                            session=session,
-                            registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                            terminal_event=anchor_event,
-                            payload={
-                                "tool_name": tool_call.name,
-                                "tool_call_id": tool_call.id,
-                                "error": str(exc),
-                                "error_type": type(exc).__name__,
-                                "actions": context.actions,
-                            },
-                        )
-                    )
-                    continue
-                yield await self._event_writer.emit(
-                    _runtime_hook_event(
-                        event_type=EventType.HOOK_COMPLETED,
-                        hook_name=hook_name,
-                        scope=scope,
-                        phase=RuntimeHookPhase.BEFORE_TOOL_CALL,
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        terminal_event=anchor_event,
-                        payload={
-                            "tool_name": tool_call.name,
-                            "tool_call_id": tool_call.id,
-                            "actions": context.actions,
-                        },
-                    )
-                )
-                if stop:
-                    return
-
-    async def _emit_tool_call_result_with_hooks(
-        self,
-        *,
-        event: Event,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        tool_call: runtime_records.ToolCallRequest,
-        result: ToolResult,
-        task_id: str | None,
-        redactor: SecretRedactor | None = None,
-        allow_modification: bool = False,
-    ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
-        resolved_redactor = redactor if redactor is not None else self._secret_redactor
-        # Redact up front so after_tool_call hooks never observe raw secrets. Hooks run BEFORE
-        # persistence so a modify decision (only honored for real tool outcomes via
-        # allow_modification) rewrites the result the transcript keeps and the model sees; the
-        # rewritten result is re-redacted so hook-injected secrets are scrubbed too. `event` is
-        # unpersisted here but carries a stable id, reused when it persists.
-        event, result = _prepare_tool_result_event(
-            event=event,
-            result=result,
-            redactor=resolved_redactor,
-        )
-        final_result = result
-        async for hook_event, modified in self._run_tool_call_hooks(
-            session=session,
-            tool_event=event,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            tool_call=tool_call,
-            result=final_result,
-            task_id=task_id,
-            redactor=resolved_redactor,
-            allow_modification=allow_modification,
-        ):
-            yield hook_event, None
-            if modified is not None:
-                final_result = modified
-        if final_result is not result:
-            payload = dict(event.payload)
-            payload["result"] = final_result.model_dump()
-            event = event.model_copy(update={"payload": payload})
-            event, final_result = _prepare_tool_result_event(
-                event=event,
-                result=final_result,
-                redactor=resolved_redactor,
-            )
-        tool_event = await self._event_writer.emit(event)
-        outcome = runtime_records.ToolCallOutcome(call=tool_call, result=final_result)
-        yield tool_event, outcome
-
-    async def _run_tool_call_hooks(
-        self,
-        *,
-        session: Session,
-        tool_event: Event,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        tool_call: runtime_records.ToolCallRequest,
-        result: ToolResult,
-        task_id: str | None,
-        redactor: SecretRedactor,
-        allow_modification: bool = False,
-    ) -> AsyncIterator[tuple[Event, ToolResult | None]]:
-        # Thread the result across app-scope then agent-scope hooks: each hook's `modify` becomes
-        # the next hook's input. When allow_modification is False (non-execution results, recovery),
-        # after-hooks are observe-only — modifications are neither threaded nor applied.
-        current_result = result
-        for hooks, scope in (
-            (self._runtime_hooks, "app"),
-            (registered_agent.runtime_hooks, "agent"),
-        ):
-            async for hook_event, modified in self._run_scoped_tool_call_hooks(
-                session=session,
-                tool_event=tool_event,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                tool_call=tool_call,
-                result=current_result,
-                task_id=task_id,
-                hooks=hooks,
-                scope=scope,
-                redactor=redactor,
-                allow_modification=allow_modification,
-            ):
-                yield hook_event, modified
-                if modified is not None:
-                    current_result = modified
-
-    async def _run_scoped_tool_call_hooks(
-        self,
-        *,
-        session: Session,
-        tool_event: Event,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        tool_call: runtime_records.ToolCallRequest,
-        result: ToolResult,
-        task_id: str | None,
-        hooks: tuple[RuntimeHook, ...],
-        scope: str,
-        redactor: SecretRedactor,
-        allow_modification: bool = False,
-    ) -> AsyncIterator[tuple[Event, ToolResult | None]]:
-        current_result = result
-        for hook in hooks:
-            if not _runtime_hook_supports_phase(
-                hook=hook,
-                phase=RuntimeHookPhase.AFTER_TOOL_CALL,
-            ):
-                continue
-            hook_name = require_clean_nonblank(hook.name, "runtime_hook.name")
-            yield (
-                await self._event_writer.emit(
-                    _runtime_hook_event(
-                        event_type=EventType.HOOK_STARTED,
-                        hook_name=hook_name,
-                        scope=scope,
-                        phase=RuntimeHookPhase.AFTER_TOOL_CALL,
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        terminal_event=tool_event,
-                        payload={
-                            "tool_name": tool_call.name,
-                            "tool_call_id": tool_call.id,
-                        },
-                    )
-                ),
-                None,
-            )
-            context = ToolCallHookContext(
-                runtime=self,
-                hook_name=hook_name,
-                phase=RuntimeHookPhase.AFTER_TOOL_CALL,
-                session=session,
-                tool_event=tool_event,
-                tool_name=tool_call.name,
-                tool_call_id=tool_call.id,
-                # Redact both fields the after-hook reads — it must never observe raw secrets,
-                # whether in the (possibly effective) arguments or the (possibly prior-hook-modified
-                # or recovery-supplied) result. Only the hook's view is redacted; the threaded
-                # result is re-redacted before persistence.
-                arguments=redactor.redact_json(tool_call.arguments),
-                result=(
-                    current_result
-                    if _is_policy_denial_event(tool_event) and not allow_modification
-                    else _redact_tool_result_for_event(
-                        event=tool_event,
-                        result=current_result,
-                        redactor=redactor,
-                    )
-                ),
-                task_id=task_id,
-            )
-            try:
-                decision = await hook.after_tool_call(context)
-                # Always validate the decision (raises → hook.failed) even on observe-only paths;
-                # only APPLY the modification when allow_modification.
-                resolved = _resolve_after_tool_call_decision(decision)
-                modified = resolved if allow_modification else None
-            except Exception as exc:
-                yield (
-                    await self._event_writer.emit(
-                        _runtime_hook_event(
-                            event_type=EventType.HOOK_FAILED,
-                            hook_name=hook_name,
-                            scope=scope,
-                            phase=RuntimeHookPhase.AFTER_TOOL_CALL,
-                            session=session,
-                            registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                            terminal_event=tool_event,
-                            payload={
-                                "tool_name": tool_call.name,
-                                "tool_call_id": tool_call.id,
-                                "error": str(exc),
-                                "error_type": type(exc).__name__,
-                                "actions": context.actions,
-                            },
-                        )
-                    ),
-                    None,
-                )
-                continue
-            if modified is not None:
-                current_result = modified
-            yield (
-                await self._event_writer.emit(
-                    _runtime_hook_event(
-                        event_type=EventType.HOOK_COMPLETED,
-                        hook_name=hook_name,
-                        scope=scope,
-                        phase=RuntimeHookPhase.AFTER_TOOL_CALL,
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        terminal_event=tool_event,
-                        payload={
-                            "tool_name": tool_call.name,
-                            "tool_call_id": tool_call.id,
-                            "actions": context.actions,
-                        },
-                    )
-                ),
-                modified,
-            )
 
     async def _run_runtime_hooks(
         self,
@@ -14285,31 +12288,6 @@ async def _call_runtime_hook(
     raise ValueError(f"Unsupported runtime hook phase: {phase}")
 
 
-def _runtime_hook_supports_phase(
-    *,
-    hook: RuntimeHook,
-    phase: RuntimeHookPhase,
-) -> bool:
-    method_name = _runtime_hook_method_name(phase)
-    hook_method = getattr(type(hook), method_name)
-    default_method = getattr(RuntimeHook, method_name)
-    return hook_method is not default_method
-
-
-def _runtime_hook_method_name(phase: RuntimeHookPhase) -> str:
-    if phase == RuntimeHookPhase.AFTER_SESSION_COMPLETED:
-        return "after_session_completed"
-    if phase == RuntimeHookPhase.AFTER_SESSION_FAILED:
-        return "after_session_failed"
-    if phase == RuntimeHookPhase.AFTER_SESSION_INTERRUPTED:
-        return "after_session_interrupted"
-    if phase == RuntimeHookPhase.BEFORE_TOOL_CALL:
-        return "before_tool_call"
-    if phase == RuntimeHookPhase.AFTER_TOOL_CALL:
-        return "after_tool_call"
-    raise ValueError(f"Unsupported runtime hook phase: {phase}")
-
-
 def _loop_policy_supports_before_stop(policy: LoopPolicy) -> bool:
     policy_method = type(policy).before_stop
     default_method = LoopPolicy.before_stop
@@ -14508,30 +12486,6 @@ def _limit_reached_tool_round_results(
             )
         )
     return outcomes
-
-
-def _cancellation_artifacts(exc: asyncio.CancelledError) -> list[dict[str, Any]]:
-    if isinstance(exc, RunnerCancelledError):
-        return copy_json_value(exc.artifacts, "artifacts")
-    artifacts = getattr(exc, "artifacts", None)
-    if artifacts is not None:
-        return copy_json_value(artifacts, "artifacts")
-    return []
-
-
-_CANCELLATION_TOOL_CALL_ID_ATTR = "_cayu_cancellation_tool_call_id"
-
-
-def _set_cancellation_tool_call_id(exc: asyncio.CancelledError, tool_call_id: str) -> None:
-    # Record which parallel call produced a cancellation's cleanup artifacts (attached out-of-band,
-    # like runner artifacts) so the interrupt guard attaches them to the matching interrupted
-    # outcome instead of the first-unfinished call in model order.
-    setattr(exc, _CANCELLATION_TOOL_CALL_ID_ATTR, tool_call_id)
-
-
-def _cancellation_tool_call_id(exc: asyncio.CancelledError) -> str | None:
-    value = getattr(exc, _CANCELLATION_TOOL_CALL_ID_ATTR, None)
-    return value if isinstance(value, str) else None
 
 
 def _interrupted_tool_call_event(
@@ -14784,65 +12738,6 @@ def _consume_background_task_result(task: asyncio.Task[Any]) -> None:
         task.result()
 
 
-@dataclass
-class _BeforeToolCallResolution:
-    """Mutable outcome threaded through the before_tool_call hook chain.
-
-    Hooks refine `arguments` (proceed_modified); the first hook to short-circuit or block sets the
-    corresponding result and stops the chain.
-    """
-
-    arguments: dict[str, Any]
-    short_circuit_result: ToolResult | None = None
-    block_reason: str | None = None
-
-
-def _resolve_before_tool_call_decision(
-    decision: BeforeToolCallDecision | None,
-    resolution: _BeforeToolCallResolution,
-) -> bool:
-    """Apply a before_tool_call decision to `resolution`; return True to stop the chain."""
-    if decision is None:
-        return False
-    if type(decision) is not BeforeToolCallDecision:
-        raise TypeError("before_tool_call must return a BeforeToolCallDecision or None.")
-    if decision.action == "proceed":
-        return False
-    if decision.action == "proceed_modified":
-        modified_arguments = decision.modified_arguments
-        if modified_arguments is None:
-            raise TypeError("A proceed_modified decision must carry modified_arguments.")
-        resolution.arguments = copy_json_value(modified_arguments, "modified_arguments")
-        return False
-    if decision.action == "short_circuit":
-        synthetic = decision.synthetic_result
-        if synthetic is None:
-            raise TypeError("A short_circuit decision must carry a synthetic_result.")
-        resolution.short_circuit_result = synthetic.model_copy(deep=True)
-        return True
-    reason = decision.block_reason
-    if reason is None:
-        raise TypeError("A block decision must carry a block_reason.")
-    resolution.block_reason = reason
-    return True
-
-
-def _resolve_after_tool_call_decision(
-    decision: AfterToolCallDecision | None,
-) -> ToolResult | None:
-    """Return the replacement result for an after_tool_call decision, or None to pass through."""
-    if decision is None:
-        return None
-    if type(decision) is not AfterToolCallDecision:
-        raise TypeError("after_tool_call must return an AfterToolCallDecision or None.")
-    if decision.action == "modify":
-        modified = decision.modified_result
-        if modified is None:
-            raise TypeError("An after_tool_call modify decision must carry a modified_result.")
-        return modified.model_copy(deep=True)
-    return None
-
-
 def _runtime_hook_event(
     *,
     event_type: EventType,
@@ -14855,20 +12750,16 @@ def _runtime_hook_event(
     terminal_event: Event,
     payload: dict[str, Any],
 ) -> Event:
-    event_payload = {
-        "hook_name": hook_name,
-        "scope": require_clean_nonblank(scope, "runtime_hook.scope"),
-        "phase": phase.value,
-        "terminal_event_id": terminal_event.id,
-        "terminal_event_type": str(terminal_event.type),
-        **copy_json_value(payload, "payload"),
-    }
-    return Event(
-        type=event_type,
-        session_id=session.id,
+    return _build_runtime_hook_event(
+        event_type=event_type,
+        hook_name=hook_name,
+        scope=scope,
+        phase=phase,
+        session=session,
+        terminal_event=terminal_event,
         agent_name=registered_agent.spec.name,
         environment_name=_environment_name(registered_environment),
-        payload=event_payload,
+        payload=payload,
     )
 
 
@@ -15065,259 +12956,12 @@ def _same_file_attachment_ref(left: FileAttachment, right: FileAttachment) -> bo
     return left.model_dump(mode="json") == right.model_dump(mode="json")
 
 
-def _runner(registered_environment: runtime_records.RegisteredEnvironment | None) -> Any:
-    if registered_environment is None:
-        return None
-    return registered_environment.environment.runner
-
-
-def _vault(registered_environment: runtime_records.RegisteredEnvironment | None) -> Any:
-    if registered_environment is None:
-        return None
-    return registered_environment.environment.vault
-
-
 def _knowledge_store(
     registered_environment: runtime_records.RegisteredEnvironment | None,
 ) -> Any:
     if registered_environment is None:
         return None
     return registered_environment.environment.knowledge_store
-
-
-@dataclass(frozen=True)
-class _ProxyAuthorizationRecord:
-    destination: str
-    credential: SecretRef | None
-    action: str | None
-    metadata: dict[str, Any]
-    result: ProxyAuthorizationResult
-
-
-class _RedactingCredentialProxy(CredentialProxy):
-    def __init__(
-        self,
-        proxy: CredentialProxy,
-        on_resolve: Callable[[ResolvedSecret], None],
-        on_authorize: Callable[[_ProxyAuthorizationRecord], None],
-    ) -> None:
-        if not isinstance(proxy, CredentialProxy):
-            raise TypeError("proxy must be a CredentialProxy.")
-        if not callable(on_resolve):
-            raise TypeError("on_resolve must be callable.")
-        if not callable(on_authorize):
-            raise TypeError("on_authorize must be callable.")
-        self._proxy = proxy
-        self._on_resolve = on_resolve
-        self._on_authorize = on_authorize
-
-    async def resolve(
-        self,
-        ref: SecretRef,
-        *,
-        scope: dict[str, Any] | None = None,
-    ) -> ResolvedSecret:
-        copied_ref = copy_secret_ref(ref)
-        copied_scope = None if scope is None else copy_json_object(scope, "scope")
-        secret = await self._proxy.resolve(
-            copied_ref,
-            scope=None if copied_scope is None else copy_json_object(copied_scope, "scope"),
-        )
-        if type(secret) is not ResolvedSecret:
-            raise TypeError("Proxy secret resolution must return ResolvedSecret.")
-        self._on_resolve(copy_resolved_secret(secret))
-        return copy_resolved_secret(secret)
-
-    async def authorize_request(
-        self,
-        *,
-        destination: str,
-        credential: SecretRef | None = None,
-        action: str | None = None,
-        metadata: dict[str, Any] | None = None,
-    ) -> ProxyAuthorizationResult:
-        copied_destination = require_clean_nonblank(destination, "destination")
-        copied_credential = None if credential is None else copy_secret_ref(credential)
-        copied_action = None if action is None else require_clean_nonblank(action, "action")
-        copied_metadata = {} if metadata is None else copy_json_object(metadata, "metadata")
-        result = await self._proxy.authorize_request(
-            destination=copied_destination,
-            credential=copied_credential,
-            action=copied_action,
-            metadata=copy_json_object(copied_metadata, "metadata"),
-        )
-        if type(result) is not ProxyAuthorizationResult:
-            raise TypeError("Proxy authorization must return ProxyAuthorizationResult.")
-        copied_result = copy_proxy_authorization_result(result)
-        self._on_authorize(
-            _ProxyAuthorizationRecord(
-                destination=copied_destination,
-                credential=copied_credential,
-                action=copied_action,
-                metadata=copied_metadata,
-                result=copied_result,
-            )
-        )
-        return copied_result
-
-
-def _proxy(
-    registered_environment: runtime_records.RegisteredEnvironment | None,
-    *,
-    on_resolve: Callable[[ResolvedSecret], None],
-    on_authorize: Callable[[_ProxyAuthorizationRecord], None],
-) -> Any:
-    if registered_environment is None:
-        return None
-    proxy = registered_environment.environment.proxy
-    if proxy is None:
-        return None
-    return _RedactingCredentialProxy(proxy, on_resolve, on_authorize)
-
-
-def _mcp_servers(
-    registered_environment: runtime_records.RegisteredEnvironment | None,
-) -> tuple[Any, ...]:
-    if registered_environment is None:
-        return ()
-    return registered_environment.environment.mcp_servers
-
-
-def _mcp_toolsets_for_agent(
-    registered_agent: runtime_records.RegisteredAgentState,
-) -> tuple[McpToolset, ...]:
-    toolsets: list[McpToolset] = []
-    for registered_tool in registered_agent.tools.values():
-        tool = registered_tool.tool
-        if isinstance(tool, McpToolAdapter):
-            toolsets.append(tool.toolset)
-    return tuple(toolsets)
-
-
-def _mcp_current_server_counts(toolsets: tuple[McpToolset, ...]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    seen_toolsets: set[int] = set()
-    for toolset in toolsets:
-        toolset_key = id(toolset)
-        if toolset_key in seen_toolsets:
-            continue
-        seen_toolsets.add(toolset_key)
-        counts[toolset.server.name] = counts.get(toolset.server.name, 0) + 1
-    return counts
-
-
-def _mcp_prior_server_counts(
-    records: list[EventRecord],
-    *,
-    environment_name: str | None,
-) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    seen_identities: set[str] = set()
-    for record in records:
-        if record.event.environment_name != environment_name:
-            continue
-        server_name = record.event.payload.get("server_name")
-        manifest_identity = record.event.payload.get("manifest_identity")
-        if not isinstance(server_name, str) or not isinstance(manifest_identity, str):
-            continue
-        if manifest_identity in seen_identities:
-            continue
-        seen_identities.add(manifest_identity)
-        counts[server_name] = counts.get(server_name, 0) + 1
-    return counts
-
-
-def _latest_mcp_manifest_event(
-    records: list[EventRecord],
-    *,
-    manifest_identity: str,
-    environment_name: str | None,
-) -> EventRecord | None:
-    for record in reversed(records):
-        if (
-            record.event.environment_name == environment_name
-            and record.event.payload.get("manifest_identity") == manifest_identity
-        ):
-            return record
-    return None
-
-
-def _latest_mcp_manifest_event_for_server(
-    records: list[EventRecord],
-    *,
-    server_name: str,
-    environment_name: str | None,
-) -> EventRecord | None:
-    for record in reversed(records):
-        if (
-            record.event.environment_name == environment_name
-            and record.event.payload.get("server_name") == server_name
-        ):
-            return record
-    return None
-
-
-def _mcp_manifest_status(
-    *,
-    toolset: McpToolset,
-    previous: EventRecord | None,
-) -> tuple[str, dict[str, Any] | None, dict[str, Any]]:
-    current_tools = _mcp_manifest_tool_hashes(toolset.manifest_tools)
-    empty_diff = {
-        "server_changed": False,
-        "added_tools": [],
-        "removed_tools": [],
-        "changed_tools": [],
-    }
-    if previous is None:
-        return "first_seen", None, empty_diff
-
-    previous_payload = previous.event.payload
-    previous_summary = {
-        "event_id": previous.event.id,
-        "session_id": previous.event.session_id,
-        "sequence": previous.sequence,
-        "manifest_identity": previous_payload.get("manifest_identity"),
-        "manifest_hash": previous_payload.get("manifest_hash"),
-        "server_hash": previous_payload.get("server_hash"),
-        "status": previous_payload.get("status"),
-    }
-    if previous_payload.get("manifest_hash") == toolset.manifest_hash:
-        return "unchanged", previous_summary, empty_diff
-
-    previous_tools = _mcp_manifest_tool_hashes(previous_payload.get("tools"))
-    added = sorted(name for name in current_tools if name not in previous_tools)
-    removed = sorted(name for name in previous_tools if name not in current_tools)
-    changed = sorted(
-        name
-        for name, tool_hash in current_tools.items()
-        if name in previous_tools and previous_tools[name] != tool_hash
-    )
-    return (
-        "changed",
-        previous_summary,
-        {
-            "server_changed": previous_payload.get("server_hash") != toolset.manifest_server_hash,
-            "added_tools": added,
-            "removed_tools": removed,
-            "changed_tools": changed,
-        },
-    )
-
-
-def _mcp_manifest_tool_hashes(value: object) -> dict[str, str]:
-    if not isinstance(value, list | tuple):
-        return {}
-    result: dict[str, str] = {}
-    for item in value:
-        if not isinstance(item, Mapping):
-            continue
-        entry = cast("Mapping[str, object]", item)
-        cayu_name = entry.get("cayu_name")
-        tool_hash = entry.get("hash")
-        if isinstance(cayu_name, str) and isinstance(tool_hash, str):
-            result[cayu_name] = tool_hash
-    return result
 
 
 def _validate_stream_event(value: object) -> ModelStreamEvent:
@@ -15612,19 +13256,6 @@ def _user_tool_call_count(tool_calls: list[runtime_records.ToolCallRequest]) -> 
     return sum(1 for tool_call in tool_calls if tool_call.name != STRUCTURED_OUTPUT_TOOL_NAME)
 
 
-def _taint_labels_for_source_tool(
-    policy: ToolPolicy,
-    tool_name: str,
-    *,
-    policy_result: ToolPolicyResult | None,
-) -> set[str]:
-    if not isinstance(policy, TaintAwareToolPolicy):
-        return set()
-    if policy_result is not None and policy_result.decision != ToolPolicyDecision.ALLOW:
-        return set()
-    return set(policy.labels_for_source_tool(tool_name))
-
-
 def _validate_structured_output_tool_round(
     *,
     tool_calls: list[runtime_records.ToolCallRequest],
@@ -15917,164 +13548,6 @@ def _validate_event_watchers(watchers: Iterable[EventWatcher]) -> tuple[EventWat
     return tuple(watcher_list)
 
 
-def _redact_tool_result_event(
-    *,
-    event: Event,
-    result: ToolResult,
-    redactor: SecretRedactor,
-) -> tuple[Event, ToolResult]:
-    redacted_result = tool_results.redact_tool_result(result, redactor)
-    if not redactor.has_values:
-        return event, redacted_result
-    payload = redactor.redact_json(event.payload)
-    if type(payload) is not dict:
-        raise AssertionError("Event payload redaction returned non-object payload.")
-    payload["result"] = redacted_result.model_dump()
-    return event.model_copy(update={"payload": payload}), redacted_result
-
-
-_POLICY_DENIAL_CONTROL_PAYLOAD_FIELDS = frozenset(
-    {
-        "approval_id",
-        "blocked_by",
-        "decision",
-        "denied_by",
-        "idempotency_key",
-        "input_id",
-        "tool_call_id",
-        "tool_name",
-        "tool_round_id",
-    }
-)
-_POLICY_DENIAL_CONTROL_RESULT_FIELDS = frozenset({"decision", "error"})
-
-
-def _prepare_tool_result_event(
-    *,
-    event: Event,
-    result: ToolResult,
-    redactor: SecretRedactor,
-) -> tuple[Event, ToolResult]:
-    """Redact a terminal result, preserving policy schema before applying its cap."""
-
-    if _is_policy_denial_event(event):
-        event, result = _redact_policy_denial_event(
-            event=event,
-            result=result,
-            redactor=redactor,
-        )
-    else:
-        event, result = _redact_tool_result_event(
-            event=event,
-            result=result,
-            redactor=redactor,
-        )
-    return _bound_policy_denial_event(event=event, result=result)
-
-
-def _redact_tool_result_for_event(
-    *,
-    event: Event,
-    result: ToolResult,
-    redactor: SecretRedactor,
-) -> ToolResult:
-    if _is_policy_denial_event(event):
-        return _redact_policy_denial_result(result, redactor)
-    return tool_results.redact_tool_result(result, redactor)
-
-
-def _is_policy_denial_event(event: Event) -> bool:
-    return event.type == EventType.TOOL_CALL_BLOCKED and "denied_by" in event.payload
-
-
-def _redact_policy_denial_event(
-    *,
-    event: Event,
-    result: ToolResult,
-    redactor: SecretRedactor,
-) -> tuple[Event, ToolResult]:
-    """Redact policy diagnostics without rewriting their protocol keys or control values."""
-
-    redacted_result = _redact_tool_result_for_event(
-        event=event,
-        result=result,
-        redactor=redactor,
-    )
-    if not redactor.has_values:
-        return event, redacted_result
-    payload: dict[str, Any] = {}
-    for key, value in event.payload.items():
-        if key == "result":
-            continue
-        if key in _POLICY_DENIAL_CONTROL_PAYLOAD_FIELDS:
-            payload[key] = copy_json_value(value, key)
-        else:
-            payload[key] = redactor.redact_json(value)
-    payload["result"] = redacted_result.model_dump()
-    return event.model_copy(update={"payload": payload}), redacted_result
-
-
-def _redact_policy_denial_result(
-    result: ToolResult,
-    redactor: SecretRedactor,
-) -> ToolResult:
-    if type(result) is not ToolResult:
-        raise TypeError("Policy denial results must be ToolResult instances.")
-    if not isinstance(redactor, SecretRedactor):
-        raise TypeError("redactor must be a SecretRedactor.")
-    if not redactor.has_values:
-        return result
-    structured = result.structured
-    if structured is not None:
-        structured = {
-            key: (
-                copy_json_value(value, key)
-                if key in _POLICY_DENIAL_CONTROL_RESULT_FIELDS
-                else redactor.redact_json(value)
-            )
-            for key, value in structured.items()
-        }
-    return ToolResult(
-        content=redactor.redact_text(result.content),
-        structured=structured,
-        artifacts=redactor.redact_json(result.artifacts),
-        is_error=result.is_error,
-    )
-
-
-def _bound_policy_denial_event(*, event: Event, result: ToolResult) -> tuple[Event, ToolResult]:
-    """Apply the denial cap after redaction and keep payload/result synchronized."""
-
-    if event.type != EventType.TOOL_CALL_BLOCKED or "denied_by" not in event.payload:
-        return event, result
-    bounded_result = _bound_policy_denial_result(result)
-    payload = dict(event.payload)
-    reason = payload.get("reason")
-    if type(reason) is not str:
-        raise ValueError("`reason` must be a string.")
-    payload["reason"] = _bound_policy_denial_text(require_nonblank(reason, "reason"))
-    payload["result"] = bounded_result.model_dump()
-    return event.model_copy(update={"payload": payload}), bounded_result
-
-
-def _policy_denial_payload_fields(
-    *,
-    tool_name: str,
-    denied_by: str,
-    decision: str,
-    reason: str,
-    metadata: dict[str, Any],
-) -> dict[str, Any]:
-    """Canonical, argument-free attribution for a policy-denied tool call."""
-    return {
-        "tool_name": require_clean_nonblank(tool_name, "tool_name"),
-        "denied_by": require_clean_nonblank(denied_by, "denied_by"),
-        "decision": require_clean_nonblank(decision, "decision"),
-        "reason": require_nonblank(reason, "reason"),
-        "metadata": copy_json_value(metadata, "metadata"),
-    }
-
-
 def _redact_tool_call_outcomes(
     outcomes: list[runtime_records.ToolCallOutcome],
     redactor: SecretRedactor,
@@ -16092,18 +13565,6 @@ def _redact_tool_call_outcome(
         call=outcome.call,
         result=tool_results.redact_tool_result(outcome.result, redactor),
     )
-
-
-def _redactor_with_resolved_secrets(
-    redactor: SecretRedactor,
-    secrets: list[ResolvedSecret],
-) -> SecretRedactor:
-    resolved_redactor = redactor
-    for secret in secrets:
-        if type(secret) is not ResolvedSecret:
-            raise TypeError("Resolved proxy secrets must be ResolvedSecret instances.")
-        resolved_redactor = resolved_redactor.with_secret(secret)
-    return resolved_redactor
 
 
 def _redact_structured_output_validation(

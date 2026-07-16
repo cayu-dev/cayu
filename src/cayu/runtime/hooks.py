@@ -7,7 +7,7 @@ from typing import Any, Literal, Protocol
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from cayu._validation import copy_json_value, require_clean_nonblank
-from cayu.core.events import Event, copy_event
+from cayu.core.events import Event, EventType, copy_event
 from cayu.core.tools import ToolResult
 from cayu.runtime.dispatch import DispatchHandle, DispatchRequest, copy_dispatch_handle
 from cayu.runtime.sessions import ForkSessionRequest, Session, copy_fork_session_request
@@ -370,6 +370,64 @@ class RuntimeHook:
         replace it.
         """
         return None
+
+
+def _runtime_hook_supports_phase(
+    *,
+    hook: RuntimeHook,
+    phase: RuntimeHookPhase,
+) -> bool:
+    """Return whether a hook overrides the method for ``phase``."""
+
+    method_name = _runtime_hook_method_name(phase)
+    hook_method = getattr(type(hook), method_name)
+    default_method = getattr(RuntimeHook, method_name)
+    return hook_method is not default_method
+
+
+def _runtime_hook_event(
+    *,
+    event_type: EventType,
+    hook_name: str,
+    scope: str,
+    phase: RuntimeHookPhase,
+    session: Session,
+    terminal_event: Event,
+    agent_name: str,
+    environment_name: str | None,
+    payload: dict[str, Any],
+) -> Event:
+    """Build the canonical lifecycle event for one runtime-hook invocation."""
+
+    event_payload = {
+        "hook_name": require_clean_nonblank(hook_name, "runtime_hook.name"),
+        "scope": require_clean_nonblank(scope, "runtime_hook.scope"),
+        "phase": phase.value,
+        "terminal_event_id": terminal_event.id,
+        "terminal_event_type": str(terminal_event.type),
+        **copy_json_value(payload, "payload"),
+    }
+    return Event(
+        type=event_type,
+        session_id=session.id,
+        agent_name=require_clean_nonblank(agent_name, "agent_name"),
+        environment_name=environment_name,
+        payload=event_payload,
+    )
+
+
+def _runtime_hook_method_name(phase: RuntimeHookPhase) -> str:
+    if phase == RuntimeHookPhase.AFTER_SESSION_COMPLETED:
+        return "after_session_completed"
+    if phase == RuntimeHookPhase.AFTER_SESSION_FAILED:
+        return "after_session_failed"
+    if phase == RuntimeHookPhase.AFTER_SESSION_INTERRUPTED:
+        return "after_session_interrupted"
+    if phase == RuntimeHookPhase.BEFORE_TOOL_CALL:
+        return "before_tool_call"
+    if phase == RuntimeHookPhase.AFTER_TOOL_CALL:
+        return "after_tool_call"
+    raise ValueError(f"Unsupported runtime hook phase: {phase}")
 
 
 def _copy_tool_result(result: ToolResult) -> ToolResult:

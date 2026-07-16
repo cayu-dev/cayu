@@ -4,6 +4,7 @@ from copy import deepcopy
 from typing import Any
 
 from cayu._validation import copy_json_value
+from cayu.core.events import Event
 from cayu.core.tools import ToolResult
 from cayu.vaults import SecretRedactor
 
@@ -38,6 +39,24 @@ def redact_tool_result(result: ToolResult, redactor: SecretRedactor) -> ToolResu
         artifacts=redactor.redact_json(result.artifacts),
         is_error=result.is_error,
     )
+
+
+def redact_tool_result_event(
+    *,
+    event: Event,
+    result: ToolResult,
+    redactor: SecretRedactor,
+) -> tuple[Event, ToolResult]:
+    """Redact a terminal event payload and keep its result field synchronized."""
+
+    redacted_result = redact_tool_result(result, redactor)
+    if not redactor.has_values:
+        return event, redacted_result
+    payload = redactor.redact_json(event.payload)
+    if type(payload) is not dict:
+        raise AssertionError("Event payload redaction returned non-object payload.")
+    payload["result"] = redacted_result.model_dump()
+    return event.model_copy(update={"payload": payload}), redacted_result
 
 
 def tool_result_from_payload(payload: dict[str, Any]) -> ToolResult:

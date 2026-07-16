@@ -1,4 +1,4 @@
-"""Focused tests for the session-loop phase objects in cayu.runtime.app."""
+"""Focused tests for the extracted tool-round execution boundary."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ from collections.abc import AsyncIterator
 
 import pytest
 
-import cayu.runtime.app as runtime_app_module
 from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
@@ -18,11 +17,13 @@ from cayu.runtime import (
     RetryPolicy,
     RunLimits,
     RunRequest,
+    Session,
     SessionStatus,
 )
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._run_limits import RunLimitGate
 from cayu.runtime._session_control import SessionInterruptedByRequest
+from cayu.runtime._tool_round_executor import ToolRoundRun, _copy_agent_spec
 
 
 class _FakeProvider(ModelProvider):
@@ -112,12 +113,29 @@ def _limit_gate(
     )
 
 
-def _interrupt_guard(app: CayuApp, session) -> runtime_app_module._InterruptGuard:
-    return runtime_app_module._InterruptGuard(
-        app,
+def _tool_round_run(
+    app: CayuApp,
+    session: Session,
+    *,
+    limits: RunLimits,
+) -> ToolRoundRun:
+    return app._tool_round_executor.create_run(
         session=session,
         registered_agent=app._get_registered_agent("assistant"),
         registered_environment=None,
+        environment_name=None,
+        limit_gate=_limit_gate(app, session, limits=limits),
+        request_metadata={},
+        task_id=None,
+        structured_output=None,
+        thinking=None,
+        max_steps=16,
+        limits=RunLimits(),
+        budget_limits=(),
+        retry_policy=RetryPolicy(),
+        run_started_at=time.monotonic(),
+        turn_usage_tracker=None,
+        active_run=None,
     )
 
 
@@ -125,17 +143,25 @@ def _tool_call(call_id: str = "call_1") -> runtime_records.ToolCallRequest:
     return runtime_records.ToolCallRequest(id=call_id, name="side_effect", arguments={})
 
 
-def test_interrupt_guard_ignores_cancellation_without_interrupt_request():
+def test_tool_round_agent_copy_rejects_agent_spec_subclasses() -> None:
+    class _DerivedAgentSpec(AgentSpec):
+        pass
+
+    with pytest.raises(TypeError, match="Agent registration requires an AgentSpec"):
+        _copy_agent_spec(_DerivedAgentSpec(name="assistant", model="fake-model"))
+
+
+def test_tool_round_interrupt_close_ignores_unrequested_cancellation():
     app, store, _ = _app_with_completed_session("sess_guard_cancel")
 
     async def scenario() -> tuple[list[Event], list[Message]]:
         session = await store.load("sess_guard_cancel")
         assert session is not None
-        guard = _interrupt_guard(app, session)
+        runner = _tool_round_run(app, session, limits=RunLimits())
         messages: list[Message] = []
         events = [
             event
-            async for event in guard.close_tool_round(
+            async for event in runner.close_after_interrupt(
                 asyncio.CancelledError(),
                 messages=messages,
                 tool_calls=[_tool_call()],
@@ -153,17 +179,17 @@ def test_interrupt_guard_ignores_cancellation_without_interrupt_request():
     assert [message.role for message in transcript] == ["user", "assistant"]
 
 
-def test_interrupt_guard_closes_tool_round_on_interrupt_request():
+def test_tool_round_interrupt_close_persists_missing_results():
     app, store, _ = _app_with_completed_session("sess_guard_interrupt")
 
     async def scenario() -> tuple[list[Event], list[Message]]:
         session = await store.load("sess_guard_interrupt")
         assert session is not None
-        guard = _interrupt_guard(app, session)
+        runner = _tool_round_run(app, session, limits=RunLimits())
         messages: list[Message] = []
         events = [
             event
-            async for event in guard.close_tool_round(
+            async for event in runner.close_after_interrupt(
                 SessionInterruptedByRequest(session.id),
                 messages=messages,
                 tool_calls=[_tool_call()],
@@ -183,7 +209,7 @@ def test_interrupt_guard_closes_tool_round_on_interrupt_request():
     assert [message.role for message in transcript] == ["user", "assistant", "tool"]
 
 
-def test_interrupt_guard_closes_tool_round_on_cancellation_with_interrupt_request():
+def test_tool_round_interrupt_close_handles_requested_cancellation():
     app, store, _ = _app_with_completed_session("sess_guard_cancel_interrupt")
 
     async def scenario() -> tuple[list[Event], list[Message]]:
@@ -191,11 +217,11 @@ def test_interrupt_guard_closes_tool_round_on_cancellation_with_interrupt_reques
             "sess_guard_cancel_interrupt",
             SessionStatus.INTERRUPTING,
         )
-        guard = _interrupt_guard(app, session)
+        runner = _tool_round_run(app, session, limits=RunLimits())
         messages: list[Message] = []
         events = [
             event
-            async for event in guard.close_tool_round(
+            async for event in runner.close_after_interrupt(
                 asyncio.CancelledError(),
                 messages=messages,
                 tool_calls=[_tool_call()],
@@ -212,14 +238,14 @@ def test_interrupt_guard_closes_tool_round_on_cancellation_with_interrupt_reques
     assert [message.role for message in messages] == ["tool"]
 
 
-def test_interrupt_guard_rejects_unsupported_exceptions():
+def test_tool_round_interrupt_close_rejects_unrelated_exceptions():
     app, store, _ = _app_with_completed_session("sess_guard_type_error")
 
     async def scenario() -> None:
         session = await store.load("sess_guard_type_error")
         assert session is not None
-        guard = _interrupt_guard(app, session)
-        async for _ in guard.close_tool_round(
+        runner = _tool_round_run(app, session, limits=RunLimits())
+        async for _ in runner.close_after_interrupt(
             ValueError("not an interrupt"),
             messages=[],
             tool_calls=[],
@@ -238,27 +264,10 @@ def test_tool_round_runner_stops_for_limit_before_tool_side_effects():
     async def scenario() -> tuple[list[Event], bool]:
         session = await store.load("sess_runner_limit")
         assert session is not None
-        gate = _limit_gate(app, session, limits=RunLimits(max_total_tokens=10))
-        guard = _interrupt_guard(app, session)
-        runner = runtime_app_module._ToolRoundRunner(
+        runner = _tool_round_run(
             app,
-            session=session,
-            registered_agent=app._get_registered_agent("assistant"),
-            registered_environment=None,
-            environment_name=None,
-            limit_gate=gate,
-            interrupt_guard=guard,
-            request_metadata={},
-            task_id=None,
-            structured_output=None,
-            thinking=None,
-            max_steps=16,
-            limits=RunLimits(),
-            budget_limits=(),
-            retry_policy=RetryPolicy(),
-            run_started_at=time.monotonic(),
-            turn_usage_tracker=None,
-            active_run=None,
+            session,
+            limits=RunLimits(max_total_tokens=10),
         )
         events = [
             event
@@ -288,27 +297,10 @@ def test_tool_round_runner_executes_tool_round_and_persists_results():
     async def scenario() -> tuple[list[Event], list[Message], bool]:
         session = await store.load("sess_runner_execute")
         assert session is not None
-        gate = _limit_gate(app, session, limits=RunLimits(max_total_tokens=100))
-        guard = _interrupt_guard(app, session)
-        runner = runtime_app_module._ToolRoundRunner(
+        runner = _tool_round_run(
             app,
-            session=session,
-            registered_agent=app._get_registered_agent("assistant"),
-            registered_environment=None,
-            environment_name=None,
-            limit_gate=gate,
-            interrupt_guard=guard,
-            request_metadata={},
-            task_id=None,
-            structured_output=None,
-            thinking=None,
-            max_steps=16,
-            limits=RunLimits(),
-            budget_limits=(),
-            retry_policy=RetryPolicy(),
-            run_started_at=time.monotonic(),
-            turn_usage_tracker=None,
-            active_run=None,
+            session,
+            limits=RunLimits(max_total_tokens=100),
         )
         messages: list[Message] = []
         events = [
