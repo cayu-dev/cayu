@@ -21,6 +21,14 @@ def _section(path: Path, *, start: str, end: str) -> str:
     return " ".join(section.split(end, 1)[0].split())
 
 
+def _heading_section(path: Path, *, heading: str) -> str:
+    text = path.read_text(encoding="utf-8")
+    marker = f"## {heading}\n"
+    assert marker in text, f"documentation heading not found in {path.name}: {heading}"
+    section = text.split(marker, 1)[1].split("\n## ", 1)[0]
+    return " ".join(section.split())
+
+
 def test_knowledge_injection_runtime_contract_pins_synthetic_tool_round() -> None:
     section = _section(
         _REPO_ROOT / "docs" / "runtime-contracts.md",
@@ -58,37 +66,27 @@ def test_knowledge_injection_runtime_contract_pins_synthetic_tool_round() -> Non
         assert required in section
 
 
-def test_readme_knowledge_injection_description_preserves_trust_boundary() -> None:
-    section = _section(
-        _REPO_ROOT / "README.md",
-        start="`KnowledgeInjectionPolicy` searches the active environment's `knowledge_store`",
-        end="Scope tool authority per agent:",
-    )
-
-    assert "synthetic user context" not in section
+def test_readme_surfaces_reviewed_knowledge_and_links_runtime_contracts() -> None:
+    readme_path = _REPO_ROOT / "README.md"
+    capabilities = _heading_section(readme_path, heading="What Cayu provides")
     for required in (
-        "synthetic assistant call",
-        f"`{_KNOWLEDGE_INJECTION_TOOL_NAME}`",
-        "matching tool result",
-        f"`{_KNOWLEDGE_INJECTION_OPEN_TAG}`",
-        "not user or system instruction",
-        "durable transcript",
-        "fail closed by default",
-        "`fail_open=True`",
+        "Reviewed knowledge",
+        "approval state",
+        "keyword/vector retrieval",
     ):
-        assert required in section
+        assert required in capabilities
+
+    readme = readme_path.read_text(encoding="utf-8")
+    assert "[Runtime contracts](" in readme
+    assert "/docs/runtime-contracts.md" in readme
 
 
 def test_application_anatomy_guide_is_linked_from_release_facing_docs() -> None:
     guide = _REPO_ROOT / "src" / "cayu" / "guides" / "application-anatomy.md"
     assert guide.is_file()
 
-    quickstart = _section(
-        _REPO_ROOT / "README.md",
-        start="## Quickstart",
-        end="## Application console",
-    )
-    assert "application-anatomy.md" in quickstart
+    readme = (_REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "application-anatomy.md" in readme
 
     for relative_path in (
         "docs/console.md",

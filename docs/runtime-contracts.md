@@ -259,13 +259,24 @@ Tool policy is Cayu's first scoped-authority primitive. It is separate from prov
 - tool policy decides whether a registered tool call may execute
 - tools and runners perform the work only after authorization
 
-`AllowAllToolPolicy` is the default so existing simple agents continue to run without extra configuration. `StaticToolPolicy` provides a small allow/deny scope for common cases. Deny rules win over allow rules. `ParameterConstrainedToolPolicy` validates selected tool arguments with per-tool rules before the tool implementation runs. Built-in rules include required fields, optional string allowlists, required string allowlists, and denied regex patterns over dotted JSON argument paths such as `request.url`. Use `RequiredAllowlistRule` for a security-sensitive field that must be present and allowed; it rejects missing, empty, non-string, and disallowed values atomically. `AllowlistRule` preserves the optional-field contract and does not reject a missing path. Violations return either `DENY` or `REQUIRE_APPROVAL`; they never silently rewrite tool arguments, and required-allowlist denials identify the failure as `missing`, `empty`, `wrong_type`, or `disallowed_value` in policy metadata. `TaintAwareToolPolicy` protects sensitive tools after configured untrusted source tools have produced output in the same session. It is origin-based, not a prompt-injection scanner: apps label source tools such as `read_email`, `fetch_url`, or `read_pdf` with taint labels, then protect outbound tools such as `send_email`, `make_payment`, or `execute_sql` from those labels. Cayu derives prior taint from durable terminal tool events and also applies taint within one model tool-call round before any tool implementation runs. A generic `ForkSessionRequest` derives the source session's active labels before creating the child, unions them with any explicitly supplied child labels, and persists the effective set in child metadata. The `session.forked` event reports only the source-derived set as `inherited_taint_labels`; a fork cannot clear source taint merely by omitting request metadata or changing agents. Resume and tool execution seed policy state from that durable session metadata, so the boundary remains enforced after restart. Custom policies implement `authorize(ToolPolicyRequest) -> ToolPolicyResult`.
+`AllowAllToolPolicy` is the default so existing simple agents continue to run without extra configuration. `StaticToolPolicy` provides a small allow/deny scope for common cases. Deny rules win over allow rules. `ParameterConstrainedToolPolicy` validates selected tool arguments with per-tool rules before the tool implementation runs. Built-in rules include `RequiredFieldRule`, `AllowlistRule`, `RequiredAllowlistRule`, and `DenyPatternRule`; they cover required fields, optional string allowlists, required string allowlists, and denied regex patterns over dotted JSON argument paths such as `request.url`. Use `RequiredAllowlistRule` for a security-sensitive field that must be present and allowed; it rejects missing, empty, non-string, and disallowed values atomically. `AllowlistRule` preserves the optional-field contract and does not reject a missing path. Violations return either `DENY` or `REQUIRE_APPROVAL`; they never silently rewrite tool arguments, and required-allowlist denials identify the failure as `missing`, `empty`, `wrong_type`, or `disallowed_value` in policy metadata. `TaintAwareToolPolicy` protects sensitive tools after configured untrusted source tools have produced output in the same session. It is origin-based, not a prompt-injection scanner: apps label source tools such as `read_email`, `fetch_url`, or `read_pdf` with taint labels, then protect outbound tools such as `send_email`, `make_payment`, or `execute_sql` from those labels. Cayu derives prior taint from durable terminal tool events and also applies taint within one model tool-call round before any tool implementation runs. A generic `ForkSessionRequest` derives the source session's active labels before creating the child, unions them with any explicitly supplied child labels, and persists the effective set in child metadata. The `session.forked` event reports only the source-derived set as `inherited_taint_labels`; a fork cannot clear source taint merely by omitting request metadata or changing agents. Resume and tool execution seed policy state from that durable session metadata, so the boundary remains enforced after restart. Custom policies implement `authorize(ToolPolicyRequest) -> ToolPolicyResult`.
 
 Denied tool calls are recoverable by default. The runtime emits `tool.call.started`, then `tool.call.blocked`, does not run the protected operation, appends an error `tool_result` to the provider-neutral transcript, and lets the model continue. This terminal event is canonical for both a direct `ToolPolicy` refusal and the nested `CommandPolicy` used by `ExecCommandTool`: its payload carries `denied_by` (`tool_policy` or `command_policy`), `decision`, a safe `reason`, `metadata`, `tool_name`, `tool_call_id`, optional `tool_round_id`, `idempotency_key`, and the redacted model-facing `result`. `metadata` contains the `ToolPolicyResult` metadata for a tool-policy refusal and is an empty object for a command-policy refusal, whose result type has no metadata surface. Policy-denial reasons and model-facing refusal text are bounded to 4 KiB of UTF-8; longer values end with `[policy denial reason truncated]` without splitting a Unicode scalar. A command refusal never also emits `tool.call.failed`, so event queries, SSE replay, logging, tracing, and recovery count one terminal outcome. The denial payload does not copy command arguments, environment values, stdin, credentials, or hook-modified effective arguments; policy authors must likewise keep reasons and `ToolPolicy.metadata` free of secrets. Configured secret redaction still applies, but bounding is not semantic sanitization. A before-tool hook block still uses `tool.call.blocked` with `blocked_by=before_tool_call_hook`, but it is not a policy refusal and therefore has no `denied_by`. If a before-tool hook modifies arguments and policy reauthorization refuses them, the event remains a policy denial with `denied_by=tool_policy` and also carries `blocked_by=tool_policy_reauthorization` to identify the second gate. Tool policy implementation errors are not policy refusals and retain their existing failure behavior. Existing stored events and checkpoints are not rewritten.
 
 Policies may also return `ToolPolicyDecision.REQUIRE_APPROVAL`. This is a durable interrupt, not an in-memory UI callback. The runtime authorizes the model's whole tool-call round before execution; if any call requires approval, it persists a `pending_tool_approval` checkpoint for the round, emits `session.checkpointed`, emits `tool.call.approval_requested`, marks the session `interrupted`, and emits `session.interrupted` with `interruption_type="tool_approval_required"`. No tool implementation in that round runs before approval.
 
 Callers resolve pending approvals with `CayuApp.resolve_tool_approval(ToolApprovalRequest(...))`. Approval emits `session.resumed`, emits `tool.call.approved` for approval-gated calls, runs executable calls in the stored round, appends the grouped tool-result message, clears the pending checkpoint, and continues the model loop. Denial emits `session.resumed`, does not execute the interrupted round, appends error results for the round, clears the pending checkpoint, and continues the model loop. The grouped tool-result message and cleared checkpoint are persisted through one atomic `SessionStore` update; if that update fails, the session returns to `interrupted` with the pending approval still present so the approval can be retried instead of creating an invalid provider history. Approval retry uses stored terminal tool events for the same approval as the execution ledger: completed, failed, blocked, or approval-denied tool results are reused and never re-executed. If a tool has `tool.call.started` for that approval without a terminal event, Cayu leaves the session `interrupted` with `manual_recovery_required` instead of re-running a side-effecting tool whose outcome is unknown. The caller can then use `CayuApp.recover_tool_approval(ToolApprovalRecoveryRequest(...))` to mark the externally verified outcome as `completed` or `failed` and provide the exact message the model should see. Recovery first claims the interrupted session, then persists the caller-supplied message as the terminal tool result, reuses it as the approval outcome, clears the checkpoint, and continues the model loop without executing the tool again. Cayu does not infer domain facts for recovery. Normal `ResumeRequest` rejects sessions with pending tool approvals because provider histories require the assistant tool-call round to be followed by matching tool results before any later conversation.
+
+The `tool.call.approval_requested` event nests the complete approval under
+`event.payload["approval"]`; it does not expose `approval_id` at the payload
+root. Parse that contract with `PendingToolApproval.from_event(event)`, then use
+the returned `approval_id` and tool-call data to construct the resolution or
+recovery request. The parser validates both the event type and nested payload
+instead of making consumers duplicate the wire-format checks.
+
+`ToolApprovalRequest.decision` uses `ToolApprovalDecision`; manual recovery uses
+`ToolApprovalRecoveryOutcome`. These enums are the public typed values for the
+binary approval and externally verified recovery outcomes described above.
 
 Every resolution and recovery request (approval and user-input alike) accepts an optional typed `resolved_by: ResolutionActor` (`subject`, optional `tenant`, `source`, JSON-safe `claims`) — the audit provenance field, distinct from the caller-claimed free-form `reason`/`metadata`. The actor's `subject`/`tenant`/`source` are stamped inside the resolution event payloads at emission (never derived from app-side state): `session.resumed` for all four resolution/recovery paths, `tool.call.approved`, `tool.call.approval_denied`, both manual-recovery terminal events, and the injected `ask_user` `tool.call.completed`. `claims` stay on the request for in-process use and are never persisted into event payloads — they carry deployment authorization state, and event payloads are not redacted. Policy-attributed `tool.call.blocked` events deliberately carry the policy's attribution, not the resolver's — join via `approval_id`. `source` records how the identity claim was established, and only certain layers may produce each value: `http_auth` is minted exclusively by the server from a verified `AuthContext` (on an auth-configured server, a request body carrying `resolved_by` is rejected with 400); `request` marks caller-asserted identity (direct SDK calls, or dev-mode HTTP bodies, whose `source` the server always re-stamps to `request`); `system` marks runtime-generated actors, and subjects prefixed `cayu:` are reserved for them (mirroring the reserved label namespace). Direct SDK callers are a trusted boundary and may construct system actors; HTTP bodies cannot.
 
@@ -393,6 +404,9 @@ Every `Workspace` implements `bounded_read_limit(max_bytes)`, returning a positi
 
 `InterruptSessionRequest` moves a `pending` or `running` session to `interrupting`, signals registered active work for that session in the current `CayuApp` process, and only then finalizes the session as `interrupted` with a durable `session.interrupted` event. `interrupting` is not resumable; it means provider/tool/runner work is still being stopped or the final transcript repair has not completed. `interrupted` is resumable. If the current process does not own the active run, or the active run is still stopping and repairing its transcript, the interrupt request reports that interruption is still finalizing and leaves the session `interrupting`; callers should retry, poll the session/event store, or subscribe until `session.interrupted` appears. Runtime loops check session status before model requests, after provider responses, before tool-policy planning, and between tool calls. The durable session status remains the cross-worker source of truth. Every `session.interrupted` event includes a normalized `interruption_type`: `operator_requested` for explicit operator/API interruption, `tool_approval_required` for approval pauses, and `runtime_interrupted` for runtime/status-driven interruption repair. Durable explicit and recovery-driven interruption attempts also carry an opaque `interruption_request_id`; terminal-event reconciliation requires that ID to match the pending checkpoint, so an event from before a resume cannot satisfy a later interruption. Explicit operator interruptions also carry optional typed `requested_by` provenance. Direct SDK callers may supply that actor; authenticated HTTP requests derive it from the verified `AuthContext`, reject a body-supplied actor, exclude authorization claims from the durable event, and propagate the same actor to background child interruptions. `CayuApp.recover_incomplete_session(...)` and `CayuApp.recover_incomplete_sessions(...)` are worker-startup recovery helpers, not model continuation APIs. They do not call the model and do not execute tools. They repair pending ordinary tool rounds from durable terminal tool events when possible, preserve pending tool approvals for `resolve_tool_approval(...)`, finalize stale `interrupting` sessions, and mark explicitly selected abandoned `pending`/`running` sessions as `interrupted` so a user or app can resume deliberately later. Batch recovery requires explicit `statuses`; supported values are `interrupting`, `running`, and `pending`. Batch recovery is fault-isolated per session: a session whose agent is not registered in the current process is reported with a `skipped_unregistered_agent` action and left untouched, an unexpected per-session error is reported with a `failed` action carrying the error message, and neither aborts the sweep — only session listing failures and cancellation raise. Apps should include `running` or `pending` only when an external deployment/worker boundary proves those sessions are abandoned. Runner adapters are responsible for cleaning up underlying subprocesses or remote execution when their `exec(...)` coroutine is cancelled. `E2BRunner` and `MicrosandboxRunner` default to `cancellation_cleanup="command"` for user/runtime interruption and `timeout_cleanup="command"` for command timeout, so interactive coding sandboxes keep their workspace after an operator interrupt or ordinary command timeout. Cleanup waits are bounded by `cancel_timeout_s`. If E2B has not yet returned a command handle when interruption or timeout arrives, Cayu first tries to stop the start attempt and resolve the handle within the cleanup window. With `"command"` cleanup, Cayu reports deferred cleanup and keeps waiting in the background for a bounded adapter-owned window. If that delayed command start never resolves, Cayu preserves the sandbox but closes that runner's exec path so later commands do not overlap with an unknown command state. With `"sandbox"` cleanup, Cayu kills the sandbox immediately because the sandbox is the configured cleanup boundary. Cayu preserves `cayu.runner_cleanup.v1` diagnostics on synthetic interrupted tool results or timed-out `ExecResult.artifacts`. Apps that prefer a stronger cleanup boundary can set `cancellation_cleanup="sandbox"` or `timeout_cleanup="sandbox"` explicitly. Interrupting a session does not automatically cancel a linked task; task state remains application/workflow owned. The optional server exposes this as `POST /api/sessions/{session_id}/interrupt`.
 
+Batch recovery accepts `IncompleteSessionsRecoveryRequest`; the explicit
+`statuses` requirement prevents startup code from guessing which work is abandoned.
+
 After the parent's durable `session.interrupted` event is persisted, operator-requested interruption propagates asynchronously through the complete paginated subagent tree: traversal crosses foreground subagent nodes but interrupts only background-subagent descendants, and it never crosses fork or other application lineage. Persisting the parent event before launching propagation ensures the recovery marker cannot be cleared while the parent is still `interrupting`. The parent terminal event is yielded without waiting for the descendant cascade; a slow descendant cannot delay the control-plane response, block its siblings, or turn the parent terminal stream into an error. The runtime suppresses recursive cascade creation while walking that tree and applies one app-wide concurrency limit across simultaneous roots, so nested subagent trees cannot multiply interruption work at each depth. Recovery and retries use the original durable operator payload and therefore preserve its provenance.
 
 Background propagation persists a `pending_interruption_cascade` checkpoint marker until the complete descendant traversal succeeds. A shared app-level worker pool bounds traversal across all roots; workers are not multiplied per parent or tree depth. Root coordinators are bounded by the same limit. Roots whose durable lease belongs to another process move to one deferred supervisor instead of occupying a coordinator. Locally admitted roots waiting for coordinator capacity remain part of the shutdown drain, while external-lease retries do not consume the shutdown grace. A coordinator must atomically acquire a durable, expiring claim and renew it while working; another process cannot start overlapping traversal until that lease expires or is explicitly released. Each new owner also advances a private generation so delayed events from an expired owner can be identified and ignored. Session detail reads the durable marker before applying local scheduling hints, then reports an active lease, a locally queued root, or a newly created marker within its admission grace as `pending`, an expired, recorded-failure, or orphaned marker as `failed`, and no marker as `none`; this prevents a stale external-lease timer from masking completion by another worker. The dashboard shows pending propagation explicitly, exposes Retry only for `failed`, withholds Resume for every outstanding marker, and selects the newest failure generation rather than event arrival order. A retry of a failed cascade emits `session.interruption_cascade_retry_requested` with a unique `retry_request_id` and the retrying actor, reason, and metadata while preserving the original interruption provenance used for descendants. When that retry acquires a generation, its failure or completion event carries the same retry request ID and provenance. Existing-terminal replay and cascade retry use the session's durable agent/environment identity, so an application deployment may remove the historical parent agent without disabling control-plane recovery. If a descendant remains `pending`, `running`, or `interrupting` after an interruption attempt, Cayu releases the claim but retains the marker and emits a bounded `session.interruption_cascade_failed` event on the parent with structured descendant IDs, statuses, and error types; exception messages are not persisted. A later successful retry durably publishes `session.interruption_cascade_completed` before clearing the failed marker, so publication failure leaves retryable state instead of losing the resolution event; first-attempt success clears the marker without adding a redundant event. `CayuApp.resume_pending_interruption_cascades(interrupting_inactive_before=...)` discovers durable work after a process restart through a paginated store query backed by a partial checkpoint index; startup does not scan historical interrupted sessions or load unrelated checkpoints. Interrupted roots are admitted immediately when their claim is available; an `interrupting` parent is filtered by the supplied inactivity threshold and finalized only after the store atomically fences it, preventing a new worker from stealing shutdown from a live owner. Recovery claims existing markers only, so a startup race or repeated idempotent request cannot recreate work another owner already completed. `create_server(...)` uses `recovery_inactive_after_seconds` for this threshold, while `mount_cayu(...)` exposes `interruption_recovery_inactive_after_seconds`; both drain accepted background work during shutdown using the configured grace period, including work scheduled before a later startup-recovery error. Internal timeout and caller cancellation signal claim loss, stop the current worker generation, and detach cancellation-resistant code without extending that grace. Cooperative coordinators may release claims immediately; detached work cannot accept new queue entries and leaves its durable lease to expire for takeover. A hard process loss uses the same lease-expiry recovery boundary.
@@ -408,12 +422,12 @@ then runs the configured child agent through the normal Cayu loop. The child
 agent has its own `AgentSpec`, tools, policies, model, context policy, and
 durable events, but inherits the parent's `environment_name` (it is not
 configurable per subagent). To shape a child's environment differently, branch a
-single `EnvironmentFactory` on `EnvironmentFactoryRequest.agent_name`. Foreground
-subagents wait for the child terminal event; the
-parent receives only a bounded `ToolResult` containing the child session id,
+single `EnvironmentFactory` on `EnvironmentFactoryRequest.agent_name`.
+`SubagentExecutionMode.FOREGROUND` subagents wait for the child terminal
+event; the parent receives only a bounded `ToolResult` containing the child session id,
 status, and model-facing result. `SubagentSpec.result_max_chars` caps the child
-text copied into the parent transcript. Background subagents return after the
-child emits its first runtime event, so the parent receives the child session id
+text copied into the parent transcript. `SubagentExecutionMode.BACKGROUND`
+subagents return after the child emits its first runtime event, so the parent receives the child session id
 without waiting for completion. The active runtime process must keep running for
 in-process background child work to finish; external queue placement remains a
 dispatcher responsibility.
@@ -667,6 +681,26 @@ about transcript positions as message counts. Events remain the source of truth
 for execution chronology; transcript messages are the provider-neutral
 conversation state used by resume, context policy, and compaction.
 
+The optional FastAPI integration is fail-closed outside trusted local
+development. `create_server(...)` and `mount_cayu(...)` require an authentication
+dependency unless `dev=True`; `BasicAuth` is the built-in minimal guard, while an
+application can return its own `AuthContext` from JWT, OIDC, session-cookie, or
+gateway authentication. The packaged dashboard and state-bearing control-plane
+routes share that authentication boundary; the health route remains open for
+load balancers. `dev=True` is not a production configuration.
+
+`create_server(...)` disables `/openapi.json`, `/docs`, and `/redoc` by
+default in an authenticated deployment. `expose_docs=True` deliberately makes
+those generated documentation routes public; the Cayu authentication dependency
+does not guard them. `mount_cayu(...)` neither creates nor configures the host
+FastAPI application's generated documentation routes. Their exposure and access
+control remain the host application's responsibility.
+
+`create_server(...)` serves the API at `/api` and the dashboard at `/cayu`
+by default; `api_path` and `dashboard_path` change those mounts, and
+`dashboard_path=None` disables the dashboard. `mount_cayu(..., path=...)`
+places both surfaces below one application-owned path.
+
 The optional server exposes `GET /api/sessions/{session_id}/summary` for compact
 session health views. It combines session identity/status, storage-backed event
 totals and counts, the latest event, transcript message count, normalized usage,
@@ -805,7 +839,8 @@ They are deliberately separate from runtime hooks and event sinks:
 
 Watchers are trusted application code. The model cannot install arbitrary
 watchers or scripts. A watcher has a stable name, an `EventQuery` filter, and a
-handler. `CayuApp.run_event_watchers([...])` processes matching events with
+handler that receives an `EventWatcherContext`.
+`CayuApp.run_event_watchers([...])` processes matching events with
 ordered at-least-once delivery. The watcher cursor advances only after the
 handler succeeds or the event reaches `max_attempts` and is dead-lettered. If a
 handler fails below the attempt ceiling, the cursor stays on that event and the
@@ -846,7 +881,23 @@ The initial `CayuApp` runtime registers agent specs, model providers, and tools,
 
 The tool calls in one model step run concurrently by default, bounded by a semaphore of size `CayuApp(max_parallel_tool_calls=…)` (default 4); set it to `1` to force fully sequential execution. Concurrency cuts wall-clock time when a step emits several independent, I/O-bound calls. A tool whose `ToolSpec.parallel_safe` is `False` (the default is `True`) is an ordering **barrier** — it runs alone in its model-order position, after everything before it and before everything after it — the opt-out for tools with side effects or single-threaded backends. `parallel_safe` controls ordering only; it is intentionally separate from `ToolSpec.effect`, which describes retry/idempotency semantics. Execution preserves the model's tool-call order: a round is split into ordered segments where each contiguous run of `parallel_safe` calls executes concurrently and each `parallel_safe=False` call runs by itself, so `[safe A, safe B, unsafe C, safe D]` runs as concurrent `A/B`, then `C`, then `D` (never `A/B/D` before `C`, which would read-after-write). The built-in mutating tools (`exec_command`, `write_file`, `remember_knowledge`, and the spawning subagent tool) ship with `parallel_safe=False`; pure readers keep the default ordering. `read_file` is effect-conservative even though it is read-oriented, because workspace image/PDF reads can create artifact snapshots. Approval and `ask_user` are unaffected: policy is evaluated before execution and a round that requires approval or asks the user pauses before any tool runs, so a concurrent segment only ever contains already-authorized calls. The persisted `tool_result` message keeps the model's tool-call order regardless of completion order. A round is projected against `max_tool_calls`, token, and cost limits once before execution begins; because a concurrent batch cannot be stopped part-way, a batch of cost-incurring tools can overshoot a token/cost budget that a cap of `1` would have caught between calls. If a session is interrupted mid-batch, calls that already finished are recorded as completed (not re-run on resume); only unfinished calls are marked interrupted.
 
-`CayuApp.run()` and `CayuApp.resume()` are event-stream APIs. Runtime failures are represented as terminal `session.failed` events rather than re-raised exceptions from the iterator. A stricter programmatic API can be added later on top of the same runtime path.
+`CayuApp.run()` and `CayuApp.resume()` are event-stream APIs. Runtime failures
+are represented as terminal `session.failed` events rather than re-raised
+exceptions from the iterator. `run_to_completion(app, request)` consumes the
+same stream and returns a `RunOutcome` with the terminal status, final text,
+error, and complete event tuple for callers that do not need to process events
+incrementally. Because it retains every event, including streaming deltas, use it
+only for bounded runs; long-lived or high-volume consumers should process
+`CayuApp.run()` incrementally. `RunOutcome.status` is a `SessionStatus` and is
+`COMPLETED`, `FAILED`, or `INTERRUPTED`; `RunOutcome.ok` is true only for
+`COMPLETED`.
+
+When a caller already has a loaded transcript, `final_output_text(transcript)`
+returns the concatenated text from the most recent assistant message that
+contains text, or an empty string when none does. This is intentionally distinct
+from `run_to_completion(...).final_text`, which reports the last completed model
+turn observed in that live stream and can be empty even when an earlier persisted
+assistant message contains text.
 
 ## Model Step Outcomes
 
@@ -902,7 +953,8 @@ retry/completion path so the generic before-stop policy does not compete with
 the runtime final-output contract.
 
 Policies run in deterministic order: app policies, then agent policies, then
-request policies. The first non-`complete` decision wins. Supported decisions:
+request policies. Each policy returns a `BeforeStopDecision`; the first
+non-`complete` decision wins. Supported decisions:
 
 - `complete`: allow normal session completion.
 - `continue`: append the returned user `Message` to the durable transcript and
@@ -910,6 +962,12 @@ request policies. The first non-`complete` decision wins. Supported decisions:
 - `interrupt`: mark the session `interrupted` with a durable
   `session.interrupted` event so the caller can resume later.
 - `fail`: fail the session through the normal `session.failed` path.
+
+Construct these validated results with `BeforeStopDecision.complete(...)`,
+`BeforeStopDecision.continue_with(message, ...)`,
+`BeforeStopDecision.interrupt(reason, ...)`, or
+`BeforeStopDecision.fail(reason, ...)`. `continue_with(...)` requires a user
+`Message`; the other decisions reject a message payload.
 
 Cayu emits durable `custom.loop.before_stop.started`,
 `custom.loop.before_stop.completed`, `custom.loop.before_stop.selected`, and
@@ -920,7 +978,8 @@ belongs in runtime hooks instead.
 
 ## Structured Output
 
-`StructuredOutputSpec` is the contract for final JSON output. It can be
+`StructuredOutputSpec` is the contract for final JSON output. Its `strategy`
+uses `StructuredOutputStrategy` (`tool` or `native`). It can be
 attached to `RunRequest`, `ResumeRequest`, `DispatchRequest`,
 `ToolApprovalRequest`, and `ToolApprovalRecoveryRequest`. The spec contains a
 `json_schema` object, an optional name, a bounded `max_retries`, an optional
@@ -1445,6 +1504,49 @@ Configure OpenAI transport timeouts on the provider. `timeout_s` controls ordina
 ```python
 OpenAIProvider(timeout_s=600, stream_idle_timeout_s=300)
 ```
+
+`ChatCompletionsProvider` targets OpenAI-compatible
+`/v1/chat/completions` services rather than the Responses API. Its `base_url`
+includes the version path and the adapter appends `/chat/completions`.
+`document_encoding="file"` uses the OpenAI/Azure file content part, while
+`document_encoding="image_url"` supports compatible services such as Gemini
+that carry PDFs through an image URL part. Vendor-specific authentication,
+endpoint, streaming-usage, and local HTTP behavior are explicit constructor
+options. Native structured output is not claimed on this generic path; use the
+provider-neutral tool strategy.
+
+`auth_header` and `auth_value_prefix` support schemes such as Azure's
+`api-key`; `endpoint_url` overrides the complete request URL;
+`stream_include_usage=False` supports servers that reject stream options; and
+`allow_http=True` is the explicit opt-in for local HTTP services such as
+Ollama or vLLM. `clean_schemas=True` removes schema keywords commonly rejected
+by compatible services.
+
+`VertexProvider` adapts Anthropic Messages through Google Cloud Vertex AI's
+regional raw-predict endpoint. Install `cayu[vertex]`, pass the GCP project and
+region, and provide explicit Google credentials or use Application Default
+Credentials. Use Vertex model IDs and register pricing under provider
+`vertex`; Vertex pricing and model enablement are deployment concerns, not
+inferred from the direct Anthropic provider.
+
+`credentials`, `service_account_info`, and `service_account_file` are the
+explicit credential inputs; when none is supplied, the adapter resolves
+Application Default Credentials.
+
+`ThinkingConfig` is the provider-neutral reasoning request. Put it on
+`AgentSpec` for the default or on `RunRequest`/`ResumeRequest` for an override.
+`effort` maps to adaptive Anthropic thinking, OpenAI reasoning effort, and the
+compatible Chat Completions `reasoning_effort` field. When `effort` is omitted,
+`max_tokens` (at least 1024) selects Anthropic's legacy budgeted-thinking form.
+`enabled=False` is best effort: Anthropic can disable thinking, while providers
+without a portable disable control may ignore it. Typed thinking settings win
+over conflicting raw provider options.
+
+Readable reasoning streams as `model.thinking.delta` and is persisted as a
+`ThinkingPart`. `include_in_transcript=False` omits newly produced display-only
+reasoning, but does not suppress live deltas or discard opaque provider state
+required to continue a tool-use turn. Reasoning token usage is exposed through
+`usage_metrics.reasoning_output_tokens` when the provider reports it.
 
 `AnthropicProvider` uses server-sent-event streaming and normalizes text,
 thinking, tool-call, completion, usage, and typed failure events behind the same

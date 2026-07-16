@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "cayu"
 version = "0.1.0"
-description = "A Python framework for long-running agents, multi-agent workflows, and sandboxed tool runtimes."
+description = "A Python runtime for production AI agents with durable sessions, controlled tool execution, context management, reviewed knowledge, recovery, evals, and replay."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
