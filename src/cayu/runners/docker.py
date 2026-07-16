@@ -235,7 +235,9 @@ class DockerRunner(Runner):
 
     Isolation is a parameter: pass ``runtime="runsc"`` (gVisor) or ``"kata"``
     (microVM) to ``create`` for a hardened boundary; the default (``runc``) is a
-    convenience tier, **not** a security boundary. The host ``docker`` process
+    convenience tier for trusted development, CI, conformance, and packaging,
+    **not** a security boundary. Cayu never selects it implicitly for untrusted
+    code. The host ``docker`` process
     inherits the host environment (the CLI needs it); the containerized command
     receives only the explicit per-call ``env`` plus declared ``secret_env``,
     carried through a private ``--env-file`` so values are never in

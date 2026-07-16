@@ -2,7 +2,7 @@
 
 Turns the egress library into a first-class, session-lifecycle-managed mode: a
 ``VirtualEgressEnvironmentFactory`` mints per-session grants, stands up the
-broker + an adapter-enforced sandbox, and emits audit events; teardown (revoke +
+broker + an adapter-enforced runner, and emits audit events; teardown (revoke +
 remove runtime network resources + stop proxy) runs from the workspace binding's
 ``finalize`` hook that the runtime already calls at session end.
 """
@@ -38,6 +38,7 @@ from cayu.egress import (
     InvalidEgressReconnectMetadataError,
     SandboxEgressAdapter,
     TransparentEgressBroker,
+    UnsupportedEgressAdapter,
     UnsupportedEgressError,
     UnsupportedEgressReconnectError,
     VirtualCredentialGrant,
@@ -92,7 +93,7 @@ VIRTUAL_EGRESS_EVENT_TYPES = (
 
 @dataclass(frozen=True)
 class VirtualCredentialSpec:
-    """Declares one virtual credential the sandbox should present."""
+    """Declares one virtual credential the runner workload should present."""
 
     env_name: str
     secret: SecretRef
@@ -282,14 +283,15 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
     """Per-session environment factory that enforces virtual egress.
 
     ``create`` mints grants, builds a broker (wired to emit audit events),
-    prepares the selected egress adapter, and returns an ``Environment`` whose
-    runner is on the enforced network and whose binding tears everything down
-    at session end. Unsupported runners fail closed inside the adapter registry.
+    prepares the explicitly selected egress adapter, and returns an
+    ``Environment`` whose runner is on the enforced network and whose binding
+    tears everything down at session end. Omitted and unsupported selections
+    fail at construction before per-session resources exist.
 
-    Scope: virtual egress governs the **sandbox process** credential — the value
-    the sandboxed app can read. It does not govern MCP servers: ``McpServerSpec``
+    Scope: virtual egress governs the **runner process** credential — the value
+    the executed app can read. It does not govern MCP servers: ``McpServerSpec``
     ``secret_env``/``secret_headers`` are resolved *host-side* (into the MCP
-    server subprocess or the host HTTP client), never injected into the sandbox,
+    server subprocess or the host HTTP client), never injected into the runner,
     so they sit at the ``trusted_tool`` boundary and are outside this factory.
     """
 
@@ -304,7 +306,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         setup_commands: Sequence[str] = (),
         adapter: SandboxEgressAdapter | None = None,
         adapter_registry: EgressAdapterRegistry | None = None,
-        runner_kind: str = "docker",
+        runner_kind: str | None = None,
         inner_binding: WorkspaceBinding | None = None,
         workspace_factory: VirtualEgressWorkspaceFactory | None = None,
         artifact_store: ArtifactStore | None = None,
@@ -321,6 +323,35 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             raise ValueError("Virtual-egress credentials require a secret resolver.")
         if adapter is not None and adapter_registry is not None:
             raise ValueError("Pass either adapter or adapter_registry, not both.")
+        if adapter is not None:
+            if isinstance(adapter, UnsupportedEgressAdapter):
+                raise UnsupportedEgressError(
+                    f"Runner {adapter.runner_kind!r} has no enforcing egress adapter."
+                )
+            if runner_kind is not None and adapter.runner_kind != runner_kind:
+                raise ValueError(
+                    f"Explicit adapter runner kind {adapter.runner_kind!r} does not match "
+                    f"runner_kind {runner_kind!r}."
+                )
+            selected_runner_kind = adapter.runner_kind
+        else:
+            if runner_kind is None:
+                raise ValueError(
+                    "VirtualEgressEnvironmentFactory requires an explicit adapter or runner_kind."
+                )
+            selected_runner_kind = runner_kind
+            if adapter_registry is None and selected_runner_kind != "docker":
+                raise UnsupportedEgressError(
+                    f"Runner {selected_runner_kind!r} has no built-in enforcing egress "
+                    "adapter; pass an explicit adapter or adapter_registry."
+                )
+            if adapter_registry is not None:
+                selected_adapter = adapter_registry.resolve(selected_runner_kind)
+                if isinstance(selected_adapter, UnsupportedEgressAdapter):
+                    raise UnsupportedEgressError(
+                        f"Runner {selected_runner_kind!r} has no registered enforcing "
+                        "egress adapter; refusing to fall back to Docker."
+                    )
         duplicate_env_names = _duplicate_env_names(credentials)
         if duplicate_env_names:
             raise ValueError(
@@ -337,7 +368,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         self._setup_commands = tuple(setup_commands)
         self._adapter = adapter
         self._adapter_registry = adapter_registry
-        self._runner_kind = adapter.runner_kind if adapter is not None else runner_kind
+        self._runner_kind = selected_runner_kind
         if workspace_factory is not None and not callable(workspace_factory):
             raise TypeError("workspace_factory must be callable or None.")
         self._workspace_factory = workspace_factory
@@ -1342,7 +1373,7 @@ def _required_binding_field(binding: EgressBinding, field_name: str) -> str:
     if not isinstance(value, str) or not value:
         raise UnsupportedEgressError(
             f"Egress adapter did not return {field_name}; refusing to start "
-            "a virtual-egress sandbox with an incomplete adapter binding."
+            "a virtual-egress runner with an incomplete adapter binding."
         )
     return value
 

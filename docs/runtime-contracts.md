@@ -358,7 +358,7 @@ When an environment has a `WorkspaceBinding`, the runtime emits durable binding 
 
 Every `Workspace` implements `bounded_read_limit(max_bytes)`, returning a positive limit no larger than the caller's hard ceiling or the backend's own default policy. This separate composition hook prevents a safety caller from accidentally increasing a custom backend's ordinary read allowance. Bulk tar export and import are independent nominal contracts. A `BoundedTarReader` implementation must reject logical or conservative raw-archive overflow before allocating or materializing the archive; a `TarWriter` imports caller-validated uncompressed tar bytes. Merely exposing methods with matching names is not sufficient. `RunnerWorkspace` implements both contracts, preflights guest file sizes before allocating its tar buffer, and sizes its runner output allowance from the enforced raw archive ceiling.
 
-`GitRepositoryBinding` is the built-in Git checkout binding. It requires a `LocalWorkspace` or a `RunnerWorkspace` because cloning and fetching require running the `git` executable. For E2B, Microsandbox, and Docker command runners, wrap the runner with `RunnerWorkspace` when the repo should be cloned inside the sandbox. On bind, Cayu clones into an empty workspace or fetches an existing Git work tree, verifies the configured remote URL by default, refuses dirty existing repositories by default, checks out the requested ref, fast-forwards to the fetched remote branch when possible, and records repo/ref/branch/commit/dirty metadata in `bound.metadata["git_repository"]` and the bound snapshot. It does not merge, rebase, or rewrite divergent clean branches; Git failures in those cases are surfaced so the app or agent can decide how to proceed. On finalize, Cayu records the final commit and dirty state in a final Git `WorkspaceSnapshot`. The binding never commits, pushes, creates branches, or creates pull requests; those are explicit agent/tool or trusted app workflows. Because `repo_url` is durable metadata, HTTP(S) URLs with embedded credentials are rejected; private repository access should use trusted app setup, SSH agent configuration, or a credential helper outside the persisted URL. For untrusted sandbox runners, do not expose long-lived Git credentials through generic shell access; use public repositories, trusted host-side credentials, or a dedicated brokered Git tool. App-provided binding metadata must not use the reserved `git_repository` key.
+`GitRepositoryBinding` is the built-in Git checkout binding. It requires a `LocalWorkspace` or a `RunnerWorkspace` because cloning and fetching require running the `git` executable. For E2B, Microsandbox, and Docker command runners, wrap the runner with `RunnerWorkspace` when the repo should be cloned inside the selected runner environment. On bind, Cayu clones into an empty workspace or fetches an existing Git work tree, verifies the configured remote URL by default, refuses dirty existing repositories by default, checks out the requested ref, fast-forwards to the fetched remote branch when possible, and records repo/ref/branch/commit/dirty metadata in `bound.metadata["git_repository"]` and the bound snapshot. It does not merge, rebase, or rewrite divergent clean branches; Git failures in those cases are surfaced so the app or agent can decide how to proceed. On finalize, Cayu records the final commit and dirty state in a final Git `WorkspaceSnapshot`. The binding never commits, pushes, creates branches, or creates pull requests; those are explicit agent/tool or trusted app workflows. Because `repo_url` is durable metadata, HTTP(S) URLs with embedded credentials are rejected; private repository access should use trusted app setup, SSH agent configuration, or a credential helper outside the persisted URL. For untrusted sandbox runners, do not expose long-lived Git credentials through generic shell access; use public repositories, trusted host-side credentials, or a dedicated brokered Git tool. App-provided binding metadata must not use the reserved `git_repository` key.
 
 `Workspace.delete(path)` is part of the workspace contract. It deletes a file if it exists and is used by bindings to propagate removed files. Built-in local, runner-backed, E2B, and Microsandbox workspaces implement it. Workspaces should keep delete path validation as strict as read/write path validation: relative paths only, no root escape, and no deleting directories through the file delete API.
 
@@ -1423,6 +1423,12 @@ Framework-native tools reserve `structured.error="invalid_arguments"` for model-
 Framework-native tools receive runtime services through `ToolContext`: workspace, artifact store, runner, vault, credential proxy, knowledge store, and MCP server specs. These references are intentionally runtime-only. They are excluded from `ToolContext.model_dump()` so context metadata can cross storage, event, dashboard, and replay boundaries without serializing live service objects. Serializable service identity fields such as `workspace_id` and `artifact_store_id` may be present when the active environment exposes them.
 
 Virtual-egress environments preserve the same public runner/workspace contract.
+`VirtualEgressEnvironmentFactory` has no implicit runner default: callers must
+pass an explicit `adapter` or `runner_kind`. Registry-backed runner kinds must
+already be registered. Omitted, conflicting, and unsupported selections fail at
+factory construction, before grants, proxies, runners, or workspaces are
+created. `runner_kind="docker"` is an explicit selection of ordinary container
+execution; it is never a fallback for an unavailable microVM runner.
 `VirtualEgressEnvironmentFactory(workspace_factory=...)` invokes the factory
 with its lifecycle-managed runner and attaches the returned `Workspace` to the
 session environment. With no explicit `inner_binding`, Cayu uses
@@ -1554,7 +1560,14 @@ Cancellation re-raises the original `asyncio.CancelledError` with cleanup diagno
 Remote runners may talk to a runner service inside EC2/ECS/Daytona/etc.
 `LocalRunner` is available for development and trusted local execution. It is not a sandbox. By default it inherits the parent process environment and overlays any explicit `env` values; set `inherit_env=False` when commands should only receive the explicit environment passed to the runner.
 
-`MicrosandboxRunner` is available as an optional microVM-backed runner:
+`DockerRunner` is available for explicitly selected Docker container execution
+in trusted development, CI, conformance, and packaging workflows. A container
+is not a secure sandbox boundary, and Cayu never implicitly selects
+`DockerRunner` for untrusted code or as a fallback when a microVM runner is
+unavailable.
+
+`MicrosandboxRunner` is Cayu's primary local runner for untrusted code and is
+available as an optional microVM-backed runner:
 
 ```bash
 pip install "cayu[microsandbox]"

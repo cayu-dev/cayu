@@ -318,7 +318,9 @@ CHECKS: tuple[VerificationCheck, ...] = (
     ),
     VerificationCheck(
         id="docker-live-virtual-egress",
-        capability="Docker virtual-egress real-boundary security conformance",
+        capability=(
+            "Docker container virtual-egress enforcement conformance (not sandbox isolation)"
+        ),
         lane="docker",
         command=(
             "uv",

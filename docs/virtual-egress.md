@@ -1,17 +1,19 @@
 # Virtual Egress Credentials
 
-A secure sandbox credential path. A sandboxed app (for example a FastAPI app using
-Stripe) is configured with a **virtual credential** that looks normal to the
-app, while a trusted **egress broker outside the sandbox** swaps in the real
-vault secret on the way to the provider. The sandbox never receives the real
-secret — not in env, files, `/proc`, logs, or on the wire.
+A credential-brokering path for isolated runners. An app (for example a FastAPI
+app using Stripe) is configured with a **virtual credential** that looks normal
+to the app, while a trusted **egress broker outside the runner** swaps in the
+real vault secret on the way to the provider. The runner never receives the real
+secret — not in env, files, `/proc`, logs, or on the wire. Isolation strength
+still comes from the explicitly selected runner: ordinary Docker containers are
+not a secure sandbox boundary.
 
 ## Why not just `secret_env`?
 
 `secret_env` (mode `raw_env`) resolves a vault secret and injects the **raw
-value** into the sandbox process environment. Redaction scrubs logs, but the
-secret is still *present* in the sandbox and the agent can read it. That is a
-convenience mode, not a security boundary.
+value** into the runner workload process environment. Redaction scrubs logs,
+but the secret is still *present* in the workload and the agent can read it.
+That is a convenience mode, not a security boundary.
 
 ## Credential modes
 
@@ -29,9 +31,9 @@ backward-compatible; it is simply labeled as *raw secret injection*.
 Stronger than redaction — the property is **non-possession**:
 
 - Vault secret → trusted broker code only.
-- Sandbox env → virtual credential only.
-- Sandbox network → in an enforced adapter, cannot reach the credentialed
-  provider except through the broker.
+- Runner workload env → virtual credential only.
+- Runner workload network → in an enforced adapter, cannot reach the
+  credentialed provider except through the broker.
 - **Fail closed:** the virtual-egress environment factory refuses any runner
   family without a registered enforcing adapter (`UnsupportedEgressError`)
   rather than downgrading to raw injection.
@@ -39,7 +41,7 @@ Stronger than redaction — the property is **non-possession**:
 ## How it works
 
 ```
-Sandbox app                       Host (trusted)
+Docker container                 Host (trusted)
   |  HTTPS to https://api.stripe.com
   |  Authorization: Bearer sk_test_cayu_vc_...
   v
@@ -58,9 +60,11 @@ Egress sidecar  --->  TransparentEgressProxyServer (per-session CA, TLS MITM)
                       api.stripe.com
 ```
 
-Direct egress is blocked by construction: the sandbox joins an `--internal`
+In the explicitly selected Docker topology shown above, direct egress is blocked
+by construction: the container joins an `--internal`
 Docker network with no route to the internet, so the only reachable egress is a
-dual-homed sidecar that forwards to the in-process broker.
+dual-homed sidecar that forwards to the in-process broker. This network control
+does not turn the container into a secure sandbox boundary.
 
 ## API shape
 
@@ -88,8 +92,9 @@ pip install 'cayu[egress]'   # adds cryptography
 
 `virtual_egress` is a first-class, session-lifecycle-managed mode via
 `VirtualEgressEnvironmentFactory` (`cayu.runtime.egress`). Register it as an
-environment factory; per session it mints grants, stands up the broker + enforced
-Docker sandbox, and tears everything down at session end (the workspace binding's
+environment factory; per session it mints grants, stands up the broker plus the
+explicitly selected enforced runner, and tears everything down at session end
+(the workspace binding's
 `finalize` hook — which the runtime already calls — revokes grants, removes the
 network/sidecar, and stops the proxy).
 
@@ -119,6 +124,7 @@ factory = VirtualEgressEnvironmentFactory(
         destination="api.stripe.com",
         policy_name="stripe-example",
     )],
+    runner_kind="docker",                      # explicit trusted container selection
     image="cayu-egress-fastapi-stripe:demo",     # FastAPI + Python HTTP client
     event_emitter=app.scoped_event_emitter(
         event_types=VIRTUAL_EGRESS_EVENT_TYPES,
@@ -127,15 +133,16 @@ factory = VirtualEgressEnvironmentFactory(
 app.register_environment_factory(EnvironmentSpec(name="billing"), factory, default=True)
 ```
 
-Sessions on that environment run in the enforced sandbox with `STRIPE_SECRET_KEY`
-set to the virtual credential; the real key is swapped in only by the broker.
+Sessions on that environment run in the explicitly selected Docker container
+with `STRIPE_SECRET_KEY` set to the virtual credential; the real key is swapped
+in only by the broker.
 Grant revocation is enforced against in-flight broker requests: teardown marks
 the grant revoked, waits for active request leases to drain, and the broker
 re-checks liveness after vault resolution before forwarding upstream.
 
 ### Credentialless approved destinations for coding agents
 
-An approved destination can use the same enforced sandbox network without a
+An approved destination can use the same enforced egress network without a
 secret. This is useful when a coding agent needs one public documentation page,
 source archive, or package-registry endpoint but must not receive general
 internet access. `ApprovedEgressDestination` is structurally separate from
@@ -180,6 +187,7 @@ factory = VirtualEgressEnvironmentFactory(
         )
     ],
     credentials=[],
+    runner_kind="docker",  # explicit trusted container selection
     # No resolver is required because this environment has no credentialed route.
     image="python:3.13",
 )
@@ -247,19 +255,25 @@ Credentialless authorization also requires a session-isolated broker transport.
 Docker provides this automatically: its dual-homed sidecar listens only on the
 random per-session internal network, and authenticates every sidecar-to-broker
 connection through a private host-mounted credential file. That transport
-credential is never mounted or injected into the sandbox. A host/LAN peer cannot
-use the broker listener, and an unrelated container on Docker's shared bridge
-cannot use the sidecar.
+credential is never mounted or injected into the container. A host/LAN peer
+cannot use the broker listener, and an unrelated container on Docker's shared
+bridge cannot use the sidecar.
 
-Docker is the default runtime path. E2B and Microsandbox use registered
-`SandboxEgressAdapter` implementations that both prepare the proxy and create
-the matching network-restricted runner. Remote/raw proxy exposures have an
-additional credentialless requirement described below. If no adapter is
-registered for the requested runner kind, setup fails closed.
+There is no default runtime path. Every factory must receive an explicit
+`adapter` or `runner_kind`; a registry-backed selection must name a registered
+adapter. Omitted and unsupported selections fail before grants, proxies,
+runners, or workspaces are created. `runner_kind="docker"` selects ordinary
+Docker container execution and is intended for trusted development, CI,
+conformance, and packaging. It is never an implicit fallback for untrusted code.
+Microsandbox is Cayu's primary local runner for untrusted code; if that microVM
+runtime is unavailable, setup fails rather than falling back to Docker. E2B and
+Microsandbox use registered `SandboxEgressAdapter` implementations that both
+prepare the proxy and create the matching network-restricted runner. Remote/raw
+proxy exposures have an additional credentialless requirement described below.
 
 ### Managed runner and workspace composition
 
-Pass `workspace_factory` when tools need files inside the enforced sandbox. The
+Pass `workspace_factory` when tools need files inside the enforced runner. The
 factory receives the lifecycle-managed public `Runner`, not the raw provider
 runner, and may return a `Workspace` synchronously or asynchronously. When
 `workspace_factory` is set and `inner_binding` is omitted,
@@ -541,15 +555,15 @@ method, path, policy name, and decision/status.
 
 ## Scope: what virtual egress does and does not cover
 
-Virtual egress governs the **sandbox process credential** — the value the
-sandboxed app can read from its env/files/`/proc`. Two adjacent things are
+Virtual egress governs the **runner workload credential** — the value the
+workload can read from its env/files/`/proc`. Two adjacent things are
 deliberately *out of scope*:
 
 - **MCP server secrets.** `McpServerSpec.secret_env`/`secret_headers` are
   resolved **host-side** — injected into the MCP *server* subprocess or the host
   HTTP client that talks to a remote MCP server — and are **never** placed in the
-  sandbox container. They are the `trusted_tool` (host-side) boundary, so they do
-  not weaken the sandbox non-possession guarantee and are not gated by
+  runner workload. They are the `trusted_tool` (host-side) boundary, so they do
+  not weaken the workload non-possession guarantee and are not gated by
   `credential_mode`.
 - **The broker proxy listener.** `DockerEgressAdapter` binds the in-process proxy
   to the narrowest interface the sidecar can still reach — loopback on Docker
@@ -593,11 +607,11 @@ urllib.request.urlopen(stripe_request, timeout=25)
 ```
 
 The app makes a normal HTTPS call to `https://api.stripe.com`. Because the
-sandbox is on the enforced egress network with the session CA trusted, Python's
-standard HTTP client follows the proxy/CA environment automatically. The broker
-captures the call, authorizes it, swaps in the real key, and returns Stripe's
-response. The agent can print `STRIPE_SECRET_KEY`, grep the filesystem, and read
-`/proc` — it only ever finds the virtual value.
+Docker container is on the enforced egress network with the session CA trusted,
+Python's standard HTTP client follows the proxy/CA environment automatically.
+The broker captures the call, authorizes it, swaps in the real key, and returns
+Stripe's response. The agent can print `STRIPE_SECRET_KEY`, grep the filesystem,
+and read `/proc` — it only ever finds the virtual value.
 
 Run the end-to-end example:
 
@@ -605,9 +619,9 @@ Run the end-to-end example:
 python examples/fastapi_stripe_virtual_egress.py
 ```
 
-It starts the FastAPI service inside the enforced sandbox, calls `/customers`,
-shows the real key was injected only upstream, verifies direct egress is blocked,
-and finalizes the factory-managed environment.
+It starts the FastAPI service inside the explicitly selected Docker container,
+calls `/customers`, shows the real key was injected only upstream, verifies
+direct egress is blocked, and finalizes the factory-managed environment.
 
 ### SDK caveat — env-transparent vs. pinning clients
 
@@ -637,7 +651,7 @@ custom `EgressPolicy` when you need business-level limits such as spend caps.
 
 | Runner | Status |
 | --- | --- |
-| `docker` | Enforced (per-session internal network + sidecar-only broker authentication + TLS MITM), including credentialless routes; reconnect unsupported. |
+| `docker` | Egress enforced (per-session internal network + sidecar-only broker authentication + TLS MITM), including credentialless routes; reconnect unsupported. Container isolation is not a secure sandbox boundary. |
 | `microsandbox` | Virtual credentials are enforced with a deny-by-default host policy allowing only the Cayu proxy port. Credentialless routes require a custom session-isolated exposure; reconnect supported. |
 | `e2b` | Enforced with a dedicated E2B-reachable, IPv4-literal raw TCP proxy exposure and fail-closed preflight. Credentialless routes additionally require `credentialless_isolated=True`; reconnect unsupported. |
 | `lambda-microvm` | Enforced in the integrated image: a VPC connector limits destinations, while a dedicated agent network namespace has no default route and can reach only a narrow relay to the Cayu proxy. Credentialless routes require a session-isolated exposure; virtual-egress factory reconnect unsupported. |

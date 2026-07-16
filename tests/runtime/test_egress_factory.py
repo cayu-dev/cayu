@@ -25,6 +25,8 @@ from cayu.egress import (
     InvalidEgressReconnectMetadataError,
     SandboxEgressAdapter,
     TransparentEgressBroker,
+    UnsupportedEgressAdapter,
+    UnsupportedEgressError,
     UnsupportedEgressReconnectError,
     VirtualCredentialError,
 )
@@ -384,11 +386,49 @@ def test_factory_requires_a_credential() -> None:
         )
 
 
+def test_factory_requires_explicit_runner_selection() -> None:
+    with pytest.raises(ValueError, match="explicit adapter or runner_kind"):
+        _virtual_factory()
+
+
+def test_factory_does_not_fallback_to_docker_for_an_unavailable_microvm() -> None:
+    docker_adapter = _RecordingAdapter("docker")
+    registry = EgressAdapterRegistry()
+    registry.register(docker_adapter)
+
+    with pytest.raises(UnsupportedEgressError, match="microsandbox"):
+        _virtual_factory(
+            adapter_registry=registry,
+            runner_kind="microsandbox",
+        )
+
+    assert docker_adapter.prepare_calls == []
+
+
+def test_factory_rejects_an_unsupported_explicit_runner_without_a_registry() -> None:
+    with pytest.raises(UnsupportedEgressError, match="microsandbox"):
+        _virtual_factory(runner_kind="microsandbox")
+
+
+def test_factory_rejects_conflicting_adapter_and_runner_selection() -> None:
+    with pytest.raises(ValueError, match="does not match"):
+        _virtual_factory(
+            adapter=_RecordingAdapter("docker"),
+            runner_kind="microsandbox",
+        )
+
+
+def test_factory_rejects_an_explicit_unsupported_adapter() -> None:
+    with pytest.raises(UnsupportedEgressError, match="microsandbox"):
+        _virtual_factory(adapter=UnsupportedEgressAdapter("microsandbox"))
+
+
 def test_factory_rejects_duplicate_credential_env_names() -> None:
     with pytest.raises(ValueError, match="env_name values must be unique"):
         VirtualEgressEnvironmentFactory(
             resolver=StaticVault({"stripe_test_key": REAL_SECRET}),
             policies={POLICY_NAME: _provider_example_policy()},
+            runner_kind="docker",
             credentials=[
                 VirtualCredentialSpec(
                     env_name="STRIPE_SECRET_KEY",

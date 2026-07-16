@@ -59,10 +59,10 @@ def validate_grant_scope(
 
 @dataclass
 class EgressBinding:
-    """The result of configuring enforced egress for one sandbox.
+    """The result of configuring enforced egress for one runner workload.
 
-    ``env`` is the overlay the runner must apply to the sandbox process
-    (proxy vars + CA trust). ``ca_cert_pem`` is the per-session CA the sandbox
+    ``env`` is the overlay the runner must apply to the workload process
+    (proxy vars + CA trust). ``ca_cert_pem`` is the per-session CA the workload
     must trust. ``close`` tears everything down (removes networks/sidecars and
     revokes grants) and is idempotent.
     """
@@ -137,7 +137,7 @@ class EgressBinding:
 
 @dataclass(frozen=True)
 class VirtualEgressRunnerRequest:
-    """Inputs an egress adapter needs to start its enforced sandbox."""
+    """Inputs an egress adapter needs to start its enforced runner."""
 
     name: str
     runner_kind: str

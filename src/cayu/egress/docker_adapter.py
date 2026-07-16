@@ -28,7 +28,7 @@ from cayu.runners.docker import DockerRunner
 
 _logger = logging.getLogger(__name__)
 
-#: Where the per-session CA is mounted inside the sandbox and trusted from.
+#: Where the per-session CA is mounted inside the container and trusted from.
 GUEST_CA_PATH = "/etc/cayu/ca.pem"
 _SIDECAR_LISTEN_PORT = 8080
 _DEFAULT_SIDECAR_IMAGE = "alpine/socat"
@@ -179,11 +179,13 @@ async def resolve_proxy_bind_host(run: DockerRun = _run_docker_stdout) -> str:
 class DockerEgressAdapter(SandboxEgressAdapter):
     """Enforced egress for the Docker runner.
 
-    Fail-closed by construction: the sandbox joins an ``--internal`` Docker
-    network with no route to the internet, so the *only* reachable egress is a
-    dual-homed sidecar that forwards to the in-process broker. Direct provider
-    calls cannot leave the sandbox. Returns the network/env the runner must use;
-    ``teardown`` removes the sidecar and network and revokes the grants.
+    Egress enforcement is fail-closed by construction: the container joins an
+    ``--internal`` Docker network with no route to the internet, so the *only*
+    reachable egress is a dual-homed sidecar that forwards to the in-process
+    broker. Direct provider calls cannot leave the container. This egress
+    topology does not make the container a secure sandbox boundary. Returns the
+    network/env the runner must use; ``teardown`` removes the sidecar and network
+    and revokes the grants.
     """
 
     runner_kind = "docker"
@@ -244,7 +246,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             proxy_port = await server.start()
             await self._run(["network", "create", "--internal", "--label", label, network])
             # Sidecar starts on the default bridge (with host-gateway) so it can
-            # reach the host broker, then also joins the internal sandbox network.
+            # reach the host broker, then also joins the internal container network.
             await self._run(
                 [
                     "run",
@@ -347,7 +349,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         if network is None:
             raise UnsupportedEgressError(
                 "Docker egress adapter did not return a network; refusing to start "
-                "a virtual-egress sandbox without enforced routing."
+                "a virtual-egress container without enforced routing."
             )
         return await DockerRunner.create(
             request.name,

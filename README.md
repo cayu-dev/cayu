@@ -45,7 +45,7 @@ instead of debugging through framework abstractions.
 | Knowledge | Reviewed memory, indexing, recall tools, pgvector support |
 | Cost control | Usage events, budget policies, causal budget summaries |
 | Provider flexibility | OpenAI, Anthropic, Amazon Bedrock, Vertex, OpenAI-compatible providers |
-| Sandboxed commands | Docker, E2B, AWS Lambda MicroVM, and deny-by-default Microsandbox runners |
+| Command runners | Docker containers for trusted development and CI, plus E2B, AWS Lambda MicroVM, and deny-by-default Microsandbox |
 | Evals | Runtime trajectories, assertions, replay, LLM judges |
 
 ## Environments Are The Execution Boundary
@@ -399,9 +399,13 @@ src/cayu/
   cli/         developer/admin CLI
 ```
 
-`LocalRunner` is for trusted local development. `MicrosandboxRunner` is available
-behind the optional `cayu[microsandbox]` extra for local microVM-backed command
-execution. It denies guest networking by default; unrestricted networking
+`LocalRunner` is for trusted local development. `DockerRunner` is ordinary
+Docker container execution for trusted development, CI, conformance, and
+packaging; it is not a secure sandbox boundary and Cayu never selects it
+implicitly for untrusted code. `MicrosandboxRunner` is Cayu's primary local
+runner for untrusted code and is available behind the optional
+`cayu[microsandbox]` extra for local microVM-backed command execution. It denies
+guest networking by default; unrestricted networking
 requires an explicit Microsandbox policy. The prerelease integration is pinned
 to Microsandbox 0.6.6; Cayu does not support older 0.5.x SDK/runtime
 combinations. `E2BRunner` and `E2BWorkspace` are available behind the optional
@@ -779,7 +783,8 @@ HTTP(S) URLs with embedded credentials are rejected. For untrusted sandbox
 runners, avoid exposing long-lived Git credentials through generic shell access;
 use public repos, trusted host-side credentials, or a dedicated brokered Git tool.
 
-Docker does not have a dedicated native workspace adapter. Use
+Docker does not have a dedicated native workspace adapter. For explicitly
+selected trusted container execution, use
 `RunnerWorkspace` as the bound target so workspace file operations execute
 through the runner:
 

@@ -1,7 +1,7 @@
 """FastAPI app flow under virtual egress.
 
-Runs a small FastAPI app inside a Docker sandbox created by
-``VirtualEgressEnvironmentFactory``. The app receives a virtual
+Runs a small FastAPI app inside an explicitly selected Docker container created
+by ``VirtualEgressEnvironmentFactory``. The app receives a virtual
 ``STRIPE_SECRET_KEY``; the broker resolves and injects the real vault secret
 only for authorized outbound requests.
 
@@ -153,6 +153,7 @@ async def main() -> None:
                 policy_name=POLICY_NAME,
             )
         ],
+        runner_kind="docker",
         image=IMAGE,
         event_emitter=emit,
         upstream=upstream,
@@ -180,9 +181,9 @@ async def main() -> None:
         await _install_app(runner)
 
         env_result = await runner.exec(ExecCommand.bash("env | grep -E 'STRIPE|PROXY' | sort"))
-        print("\nsandbox env (STRIPE/PROXY):")
+        print("\ncontainer env (STRIPE/PROXY):")
         print(_indent(env_result.stdout))
-        print("real secret present in sandbox env:", DEMO_REAL_SECRET in env_result.stdout)
+        print("real secret present in container env:", DEMO_REAL_SECRET in env_result.stdout)
 
         server_result = await runner.exec(
             ExecCommand.bash(
@@ -198,7 +199,7 @@ async def main() -> None:
         print("\nFastAPI /customers response:")
         print(_indent(app_result.stdout or app_result.stderr))
         print("broker injected upstream Authorization:", upstream.saw_authorization)
-        print("real secret leaked to sandbox output:", DEMO_REAL_SECRET in app_result.stdout)
+        print("real secret leaked to container output:", DEMO_REAL_SECRET in app_result.stdout)
 
         direct = await runner.exec(ExecCommand.bash(_DIRECT_EGRESS), timeout_s=30)
         print("\ndirect egress attempt (should be BLOCKED):")

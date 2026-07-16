@@ -1,6 +1,6 @@
 """Adversarial end-to-end tests for Docker virtual egress.
 
-These prove *non-possession*: the sandbox never receives the real secret, cannot
+These prove *non-possession*: the container never receives the real secret, cannot
 reach the provider directly, and the credential dies with the session. They spin
 real containers, so they are gated on a responsive Docker daemon.
 """
@@ -39,8 +39,8 @@ pytest.importorskip("cryptography")
 from cayu.egress.docker_adapter import DockerEgressAdapter
 from cayu.workspaces import RunnerWorkspace
 
-REAL_SECRET = "sk_test_51E2ERealSecretNeverInSandbox"
-SANDBOX_IMAGE = "python:3.12-slim"
+REAL_SECRET = "sk_test_51E2ERealSecretNeverInContainer"
+CONTAINER_IMAGE = "python:3.12-slim"
 
 
 def _docker_available() -> bool:
@@ -95,7 +95,7 @@ async def _drive() -> tuple[EgressScenarioEvidence, ...]:
         registration=registration_for("docker"),
         adapter=CapturingEgressAdapter(DockerEgressAdapter(loop=asyncio.get_running_loop())),
         real_secret=REAL_SECRET,
-        image=SANDBOX_IMAGE,
+        image=CONTAINER_IMAGE,
         search_roots=("/workspace", "/tmp", "/etc/cayu", "/root"),
         response_id="cus_fake123",
         workspace_factory=RunnerWorkspace,
@@ -152,7 +152,8 @@ async def _drive_factory() -> dict[str, object]:
                 policy_name="stripe-example",
             )
         ],
-        image=SANDBOX_IMAGE,
+        runner_kind="docker",
+        image=CONTAINER_IMAGE,
         event_emitter=emitter,
         upstream=upstream,
     )
@@ -275,7 +276,8 @@ async def _drive_credentialless_factory() -> dict[str, object]:
             )
         ],
         credentials=[],
-        image=SANDBOX_IMAGE,
+        runner_kind="docker",
+        image=CONTAINER_IMAGE,
         event_emitter=emitter,
         upstream=upstream,
     )
@@ -350,7 +352,7 @@ async def _drive_credentialless_factory() -> dict[str, object]:
                         "--rm",
                         "--network",
                         "bridge",
-                        SANDBOX_IMAGE,
+                        CONTAINER_IMAGE,
                         "python3",
                         "-c",
                         (

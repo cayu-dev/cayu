@@ -1,8 +1,9 @@
-"""Virtual egress credentials.
+"""Virtual egress credentials for explicitly selected runners.
 
-A secure sandbox credential path: the sandbox receives only a virtual
-credential while a trusted broker outside the sandbox swaps in the real vault
-secret and enforces per-request egress policy. See ``docs/virtual-egress.md``.
+The runner receives only a virtual credential while a trusted broker outside
+the runner swaps in the real vault secret and enforces per-request egress
+policy. Egress enforcement provides credential non-possession; isolation
+strength comes from the selected runner. See ``docs/virtual-egress.md``.
 """
 
 from cayu.credentials import CredentialMode
