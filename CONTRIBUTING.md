@@ -172,6 +172,13 @@ feat/short-description
 docs/short-description
 ```
 
+### Maintainer releases
+
+PyPI publishing requires external trusted-publisher, environment-protection,
+and immutable-tag configuration in addition to the checked-in workflow. Follow
+[the release runbook](docs/releasing.md) exactly; in particular, do not push a
+release tag until every one-time security prerequisite is active.
+
 ## Reporting issues
 
 Use the issue templates. The short version:

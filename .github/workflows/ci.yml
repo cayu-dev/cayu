@@ -19,8 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - run: uv python install 3.11
       - run: uv sync --frozen --extra dev --extra server --extra browser --python 3.11
       - run: uv run ruff check src/ tests/ examples/ scripts/ maintenance/
@@ -37,8 +37,8 @@ jobs:
       CAYU_REQUIRE_DOCKER_RUNNER: "1"
       CAYU_REQUIRE_DOCKER_EGRESS: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - run: uv python install 3.14
       - run: uv sync --frozen --extra dev --extra server --python 3.14
       - name: Test
@@ -58,9 +58,11 @@ jobs:
     name: Release artifacts
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      prerelease: ${{ steps.release-version.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - run: uv python install 3.11
       # PR and main CI must be deterministic. Freshness is wall-clock policy enforced by
       # scheduled maintenance and release-tag validation; this check validates the committed
@@ -69,6 +71,30 @@ jobs:
       - name: Enforce freshness for release artifacts
         if: startsWith(github.ref, 'refs/tags/v')
         run: uv run python -m maintenance.model_catalog.check
+      - name: Check tag matches project version
+        id: release-version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          uv run --group nightly python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          from packaging.version import Version
+
+          with Path("pyproject.toml").open("rb") as pyproject:
+              version = tomllib.load(pyproject)["project"]["version"]
+          tag = os.environ["GITHUB_REF_NAME"]
+          if tag != f"v{version}":
+              raise SystemExit(
+                  f"tag {tag} does not match pyproject.toml version {version}"
+              )
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+              print(
+                  f"prerelease={str(Version(version).is_prerelease).lower()}",
+                  file=output,
+              )
+          PY
       - run: uv build --out-dir dist/first
       - run: uv build --out-dir dist/second
       - name: Check reproducible archives
@@ -186,6 +212,16 @@ jobs:
         run: |
           expected_version="$(.release-venv/bin/python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
           test "$(.release-venv/bin/cayu version)" = "cayu ${expected_version}"
+      # Publishing consumes these exact bytes: the artifact uploaded here is the
+      # dist/first build that every check above validated. The publish job must
+      # never rebuild.
+      - name: Upload release distribution
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-dist
+          path: dist/first/
+          if-no-files-found: error
 
   dashboard:
     name: Dashboard
@@ -195,8 +231,8 @@ jobs:
       run:
         working-directory: dashboard
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22.18.0
           cache: npm
@@ -205,7 +241,7 @@ jobs:
       - run: npm run lint
       - run: npm run test
       - run: npm run typecheck
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - run: uv python install 3.11
         working-directory: .
       - run: uv sync --frozen --extra dev --extra server --python 3.11
@@ -220,3 +256,75 @@ jobs:
             git -C .. diff --stat -- src/cayu/server/dashboard
             exit 1
           fi
+
+  # Publishes to PyPI via Trusted Publishing (OIDC). Runs ONLY on v* tag pushes
+  # and only after EVERY validation job above has passed on this same commit;
+  # the uploaded bytes are the exact dist/first artifact the package job
+  # validated. The `pypi` environment must be configured with required
+  # reviewers BEFORE any v* tag is pushed (GitHub auto-creates referenced
+  # environments without protection rules). The required trusted-publisher,
+  # environment, immutable-tag, and default-off PYPI_PUBLISH_ENABLED setup is
+  # documented in docs/releasing.md.
+  #
+  # Release ritual:
+  #   1. Land the version bump in pyproject.toml on main.
+  #   2. git tag vX.Y.Z && git push origin vX.Y.Z
+  #   3. Approve the `pypi` environment deployment once this workflow's
+  #      validation jobs are green.
+  publish:
+    name: Publish to PyPI
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') &&
+      vars.PYPI_PUBLISH_ENABLED == 'true'
+    needs: [static, test, package, dashboard]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/cayu/
+    permissions:
+      # Required for PyPI Trusted Publishing; no API token is used.
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-dist
+          path: dist/
+      - uses: ./.github/actions/verify-release-tag
+      - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+
+  github-release:
+    name: Create GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [publish, package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-dist
+          path: dist/
+      - uses: ./.github/actions/verify-release-tag
+      - name: Create release with the published artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_IS_PRERELEASE: ${{ needs.package.outputs.prerelease }}
+        run: |
+          release_flags=(--verify-tag)
+          if test "$RELEASE_IS_PRERELEASE" = "true"; then
+            release_flags+=(--prerelease --latest=false)
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            "${release_flags[@]}"

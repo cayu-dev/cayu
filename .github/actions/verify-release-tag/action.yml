@@ -1,0 +1,16 @@
+name: Verify release tag provenance
+description: Fail unless the release tag still resolves to this workflow's commit.
+
+runs:
+  using: composite
+  steps:
+    - name: Verify tag still resolves to the validated commit
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        resolved="$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_REF_NAME" --jq .sha)"
+        if test "$resolved" != "$GITHUB_SHA"; then
+          echo "tag $GITHUB_REF_NAME moved: now resolves to $resolved but this run validated $GITHUB_SHA"
+          exit 1
+        fi
