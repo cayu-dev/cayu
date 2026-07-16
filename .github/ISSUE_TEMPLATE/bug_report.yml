@@ -1,0 +1,57 @@
+name: 🐛 Bug report
+description: A crash, incorrect behavior, or data loss in Cayu.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report! Before filing, please search **open and closed** issues
+        and PRs — the tracker can lag the code, so also check whether `main` already
+        fixes it.
+
+        **Security issue?** (policy bypass, sandbox escape, secret exposure, egress
+        bypass) — do **not** file or discuss it publicly. Use [private reporting](https://github.com/cayu-dev/cayu/security/advisories/new).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: >-
+        The smallest script or steps that reproduce the problem. A failing test is the
+        best bug report there is.
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: traceback
+    attributes:
+      label: Traceback / logs
+      description: Full traceback or relevant log output. Redact any secrets.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Cayu version
+      description: Release version or commit SHA.
+      placeholder: "0.1.0 / 5110774"
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version and OS
+      placeholder: "3.14 on macOS 15 / 3.12 on Ubuntu 24.04"
+    validations:
+      required: true
+  - type: input
+    id: stack
+    attributes:
+      label: Provider / runner / store in use
+      description: Which model provider, runner, and durable store the session was on, if relevant.
+      placeholder: "AnthropicProvider, DockerRunner, Postgres store"

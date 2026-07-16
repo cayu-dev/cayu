@@ -1,0 +1,53 @@
+name: ✨ Feature request
+description: Propose a new capability or a change to an existing contract.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: search open and closed issues/PRs, and search the source — many
+        requested capabilities already exist in-tree.
+
+        Proposing a **new third-party integration or backend adapter**? Read the
+        [placement policy](https://github.com/cayu-dev/cayu/blob/main/CONTRIBUTING.md#placement-policy-what-lands-in-tree)
+        first — most integrations ship as standalone packages against Cayu's public
+        contracts, and what's needed here is at most a contract widening.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >-
+        What are you trying to do that you can't today? Describe the problem before the
+        solution — it's the part we can't reconstruct later.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How you think it should work. API sketches welcome.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you tried, and why they fall short.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Runtime / sessions / durability
+        - Providers / models
+        - Runners / environments / workspaces
+        - Policies / approvals / budgets / taint
+        - Egress / secrets / vaults
+        - Artifacts / files
+        - Knowledge / memory
+        - Server / dashboard
+        - Evals
+        - Docs / examples
+        - Other
+    validations:
+      required: true

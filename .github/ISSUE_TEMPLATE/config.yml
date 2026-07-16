@@ -1,0 +1,14 @@
+# Intentional: the forms are the default path, but blank issues stay enabled for
+# maintainer/meta issues that don't fit a bug-or-feature form. Revisit if low-quality
+# blank issues become a triage burden.
+blank_issues_enabled: true
+contact_links:
+  - name: 💬 Discord
+    url: https://discord.gg/jWa3kKJ7R8
+    about: Quick questions, show-and-tell, and discussion that isn't an actionable bug or feature yet.
+  - name: 🔒 Report a security vulnerability
+    url: https://github.com/cayu-dev/cayu/security/advisories/new
+    about: Private reporting for policy bypasses, sandbox escapes, secret exposure, and other exploitable issues. Do not disclose details before coordinated disclosure.
+  - name: 🤝 Contributing guide
+    url: https://github.com/cayu-dev/cayu/blob/main/CONTRIBUTING.md
+    about: Read this before submitting a PR — especially the placement policy for new integrations.
