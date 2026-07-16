@@ -108,6 +108,43 @@ _BASELINE_DDL = """
         UNIQUE(session_id, event_id)
     );
 
+    CREATE TABLE IF NOT EXISTS cayu_persisted_event_side_effects (
+        session_id TEXT NOT NULL,
+        event_id TEXT NOT NULL,
+        event_sequence INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        claim_id TEXT,
+        lease_expires_at TEXT,
+        next_attempt_at TEXT,
+        last_error TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (session_id, event_id),
+        FOREIGN KEY (session_id, event_id)
+            REFERENCES cayu_events(session_id, event_id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_cayu_persisted_event_side_effects_delivery
+        ON cayu_persisted_event_side_effects(
+            status, next_attempt_at, lease_expires_at, event_sequence
+        );
+
+    CREATE TRIGGER IF NOT EXISTS cayu_protect_undelivered_event_side_effects
+    BEFORE DELETE ON cayu_events
+    FOR EACH ROW
+    WHEN EXISTS (
+        SELECT 1
+        FROM cayu_persisted_event_side_effects AS delivery
+        WHERE delivery.session_id = OLD.session_id
+          AND delivery.event_id = OLD.event_id
+          AND delivery.status <> 'delivered'
+    ) AND EXISTS (
+        SELECT 1 FROM cayu_sessions WHERE id = OLD.session_id
+    )
+    BEGIN
+        SELECT RAISE(IGNORE);
+    END;
+
     CREATE TABLE IF NOT EXISTS cayu_session_labels (
         session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
         key TEXT NOT NULL,
@@ -514,6 +551,45 @@ _MIGRATION_STEPS: dict[int, str] = {
         CREATE INDEX IF NOT EXISTS idx_cayu_session_message_queue_delivery
             ON cayu_session_message_queue(session_id, status, delivery_mode, ordering_key);
     """,
+    20: """
+        CREATE TABLE IF NOT EXISTS cayu_persisted_event_side_effects (
+            session_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            event_sequence INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            claim_id TEXT,
+            lease_expires_at TEXT,
+            next_attempt_at TEXT,
+            last_error TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (session_id, event_id),
+            FOREIGN KEY (session_id, event_id)
+                REFERENCES cayu_events(session_id, event_id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_cayu_persisted_event_side_effects_delivery
+            ON cayu_persisted_event_side_effects(
+                status, next_attempt_at, lease_expires_at, event_sequence
+            );
+
+        CREATE TRIGGER IF NOT EXISTS cayu_protect_undelivered_event_side_effects
+        BEFORE DELETE ON cayu_events
+        FOR EACH ROW
+        WHEN EXISTS (
+            SELECT 1
+            FROM cayu_persisted_event_side_effects AS delivery
+            WHERE delivery.session_id = OLD.session_id
+              AND delivery.event_id = OLD.event_id
+              AND delivery.status <> 'delivered'
+        ) AND EXISTS (
+            SELECT 1 FROM cayu_sessions WHERE id = OLD.session_id
+        )
+        BEGIN
+            SELECT RAISE(IGNORE);
+        END;
+
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -879,16 +955,17 @@ def _transaction(connection: sqlite3.Connection) -> Iterator[None]:
 
 
 def _iter_statements(script: str) -> Iterator[str]:
-    """Yield the non-empty statements of a semicolon-separated DDL script.
-
-    The migration DDL contains no semicolons inside statements (no triggers or
-    string literals), so a plain split is sufficient and lets each statement run
-    individually inside an explicit transaction.
-    """
-    for raw in script.split(";"):
-        statement = raw.strip()
-        if statement:
-            yield statement
+    """Yield complete statements while preserving trigger bodies and literals."""
+    pending: list[str] = []
+    for line in script.splitlines(keepends=True):
+        pending.append(line)
+        statement = "".join(pending).strip()
+        if statement and sqlite3.complete_statement(statement):
+            yield statement.removesuffix(";").rstrip()
+            pending.clear()
+    trailing = "".join(pending).strip()
+    if trailing:
+        raise ValueError("SQLite migration DDL ended with an incomplete statement")
 
 
 def _add_column_if_missing(

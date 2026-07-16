@@ -2884,6 +2884,15 @@ class CayuApp:
             metadata=request.metadata,
         )
 
+    async def recover_persisted_event_side_effects(self, *, limit: int = 1000) -> list[Event]:
+        """Retry committed event fan-out that was not acknowledged before a crash.
+
+        Delivery is at-least-once and returns only events whose configured
+        budget and sink side effects completed during this sweep. Failed and
+        dead-lettered deliveries remain inspectable through ``session_store``.
+        """
+        return await self._event_writer.recover_persisted_side_effects(limit=limit)
+
     async def recover_incomplete_sessions(
         self,
         request: IncompleteSessionsRecoveryRequest,
@@ -9024,9 +9033,9 @@ class CayuApp:
         """Persist events for one session and fan them out to runtime sinks.
 
         Restricted to the ``workflow.`` and ``custom.`` namespaces: runtime
-        events (e.g. ``model.completed``) carry emission side effects such as
-        budget accounting that only the runtime's own paths apply, so letting
-        them through here would silently skip those.
+        event namespaces encode Cayu-owned lifecycle and accounting evidence,
+        so application callers must not forge them even though every accepted
+        batch uses the same durable budget/sink handoff.
         """
         _validate_workflow_event_batch(events, allow_cayu_internal=False)
         return await self._event_writer.emit_many(session_id, events)

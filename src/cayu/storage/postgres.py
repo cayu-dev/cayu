@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -81,6 +82,10 @@ from cayu.runtime.sessions import (
     PendingActionListResult,
     PendingActionQuery,
     PendingActionSession,
+    PersistedEventSideEffectClaim,
+    PersistedEventSideEffectClaimLost,
+    PersistedEventSideEffectDelivery,
+    PersistedEventSideEffectStatus,
     RunRequest,
     Session,
     SessionIdentity,
@@ -188,8 +193,9 @@ from cayu.storage.memory import (
 # ASCII bytes of "cayuschm" masked to stay positive (signed bigint); its only
 # requirement is being a stable constant unlikely to collide with app locks.
 _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
+_SCHEMA_ADVISORY_LOCK_POLL_SECONDS = 0.25
 _POSTGRES_MIN_REQUIRED_REVISION = 18
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 19
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 20
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="%s",
@@ -602,6 +608,28 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         """,
         "CREATE INDEX IF NOT EXISTS idx_cayu_session_message_queue_delivery "
         "ON cayu_session_message_queue(session_id, status, delivery_mode, ordering_key)",
+    ),
+    20: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_persisted_event_side_effects (
+            session_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            event_sequence BIGINT NOT NULL,
+            status TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            claim_id TEXT,
+            lease_expires_at TIMESTAMPTZ,
+            next_attempt_at TIMESTAMPTZ,
+            last_error TEXT,
+            updated_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (session_id, event_id),
+            FOREIGN KEY (session_id, event_id)
+                REFERENCES cayu_events(session_id, event_id) ON DELETE CASCADE
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_cayu_persisted_event_side_effects_delivery "
+        "ON cayu_persisted_event_side_effects"
+        "(status, next_attempt_at, lease_expires_at, event_sequence)",
     ),
 }
 
@@ -1037,6 +1065,26 @@ async def _disable_prepared_statements(conn: Any) -> None:
     conn.prepare_threshold = None
 
 
+async def _acquire_schema_transaction_lock(conn: Any, cur: Any) -> None:
+    """Acquire the schema lock without leaving a waiting transaction open.
+
+    Concurrent index DDL holds the same key as a session advisory lock. A
+    blocking transaction-lock request would retain its virtual transaction ID
+    while waiting, which ``CREATE INDEX CONCURRENTLY`` can in turn wait on and
+    deadlock. End every unsuccessful try before polling again.
+    """
+    while True:
+        await cur.execute(
+            "SELECT pg_try_advisory_xact_lock(%s)",
+            (_SCHEMA_ADVISORY_LOCK_KEY,),
+        )
+        row = await cur.fetchone()
+        if row is not None and row[0] is True:
+            return
+        await conn.rollback()
+        await asyncio.sleep(_SCHEMA_ADVISORY_LOCK_POLL_SECONDS)
+
+
 class _PostgresStoreBase:
     """Shared async connection-pool management for Postgres-backed stores.
 
@@ -1126,7 +1174,7 @@ class _PostgresStoreBase:
 
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("SELECT pg_advisory_xact_lock(%s)", (_SCHEMA_ADVISORY_LOCK_KEY,))
+                await _acquire_schema_transaction_lock(conn, cur)
                 if self._schema_mode is not schema.SchemaMode.VALIDATE:
                     await cur.execute(pg_support.MIGRATIONS_TABLE_DDL)
                 state = await self._read_schema_state(cur)
@@ -1154,10 +1202,7 @@ class _PostgresStoreBase:
             recorded_indexes: tuple[_ConcurrentIndexMigration, ...] = ()
             async with self._pool.connection() as conn:
                 async with conn.cursor() as cur:
-                    await cur.execute(
-                        "SELECT pg_advisory_xact_lock(%s)",
-                        (_SCHEMA_ADVISORY_LOCK_KEY,),
-                    )
+                    await _acquire_schema_transaction_lock(conn, cur)
                     await cur.execute(pg_support.MIGRATIONS_TABLE_DDL)
                     state = await self._read_schema_state(cur)
                     current = state.revision
@@ -1213,10 +1258,7 @@ class _PostgresStoreBase:
             # valid. A competing migrator may have recorded it while this process
             # built or waited for the same index, so re-read under the xact lock.
             async with self._pool.connection() as conn, conn.cursor() as cur:
-                await cur.execute(
-                    "SELECT pg_advisory_xact_lock(%s)",
-                    (_SCHEMA_ADVISORY_LOCK_KEY,),
-                )
+                await _acquire_schema_transaction_lock(conn, cur)
                 state = await self._read_schema_state(cur)
                 if state.revision < concurrent_revision.revision:
                     await self._record_revision(cur, concurrent_revision)
@@ -1353,7 +1395,7 @@ class _PostgresStoreBase:
                     row = await cur.fetchone()
                     lock_acquired = row is not None and row[0] is True
                 if not lock_acquired:
-                    await asyncio.sleep(0.25)
+                    await asyncio.sleep(_SCHEMA_ADVISORY_LOCK_POLL_SECONDS)
 
             while True:
                 async with conn.cursor() as cur:
@@ -1364,7 +1406,7 @@ class _PostgresStoreBase:
                     if existing == (True, False):
                         return
                     if existing is not None and existing[1]:
-                        await asyncio.sleep(0.25)
+                        await asyncio.sleep(_SCHEMA_ADVISORY_LOCK_POLL_SECONDS)
                         continue
                     if existing is not None:
                         await cur.execute(index.drop_statement)
@@ -4690,6 +4732,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         """,
                         rows,
                     )
+                    await self._enqueue_persisted_event_side_effects(
+                        cur,
+                        session_id,
+                        [event.id for event in copied_events],
+                    )
                 await conn.commit()
             except UniqueViolation as exc:
                 await conn.rollback()
@@ -4704,6 +4751,302 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             except Exception:
                 await conn.rollback()
                 raise
+
+    @staticmethod
+    async def _enqueue_persisted_event_side_effects(
+        cur: Any,
+        session_id: str,
+        event_ids: list[str],
+    ) -> None:
+        if not event_ids:
+            return
+        await cur.execute(
+            """
+            INSERT INTO cayu_persisted_event_side_effects (
+                session_id, event_id, event_sequence, status, attempts, updated_at
+            )
+            SELECT session_id, event_id, sequence, 'pending', 0, timestamp
+            FROM cayu_events
+            WHERE session_id = %s
+              AND event_id = ANY(%s)
+              AND event_type <> 'runtime.sink.failed'
+            """,
+            (session_id, event_ids),
+        )
+
+    async def claim_persisted_event_side_effect(
+        self,
+        *,
+        session_id: str | None = None,
+        event_id: str | None = None,
+        lease_seconds: float = 300.0,
+    ) -> PersistedEventSideEffectClaim | None:
+        if session_id is not None:
+            session_id = require_clean_nonblank(session_id, "session_id")
+        if event_id is not None:
+            event_id = require_clean_nonblank(event_id, "event_id")
+        if (session_id is None) != (event_id is None):
+            raise ValueError("session_id and event_id must be supplied together.")
+        if type(lease_seconds) not in {int, float} or lease_seconds <= 0:
+            raise ValueError("lease_seconds must be greater than 0.")
+        claim_id = str(uuid4())
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    exact_filter = ""
+                    params: list[Any] = []
+                    if session_id is not None and event_id is not None:
+                        exact_filter = (
+                            "AND candidate_delivery.session_id = %s "
+                            "AND candidate_delivery.event_id = %s"
+                        )
+                        params.extend([session_id, event_id])
+                    params.extend([claim_id, float(lease_seconds)])
+                    await cur.execute(
+                        f"""
+                        WITH timing AS MATERIALIZED (
+                            SELECT clock_timestamp() AS now
+                        ), candidate AS (
+                            SELECT candidate_delivery.session_id,
+                                   candidate_delivery.event_id
+                            FROM cayu_persisted_event_side_effects AS candidate_delivery,
+                                 timing
+                            WHERE (
+                                candidate_delivery.status = 'pending'
+                                OR (candidate_delivery.status = 'failed' AND (
+                                    candidate_delivery.next_attempt_at IS NULL
+                                    OR candidate_delivery.next_attempt_at <= timing.now
+                                ))
+                                OR (candidate_delivery.status = 'leased'
+                                    AND candidate_delivery.lease_expires_at <= timing.now)
+                            )
+                            {exact_filter}
+                            ORDER BY candidate_delivery.event_sequence ASC
+                            FOR UPDATE OF candidate_delivery SKIP LOCKED
+                            LIMIT 1
+                        )
+                        UPDATE cayu_persisted_event_side_effects AS delivery
+                        SET status = 'leased', attempts = delivery.attempts + 1,
+                            claim_id = %s,
+                            lease_expires_at = timing.now + (%s * INTERVAL '1 second'),
+                            next_attempt_at = NULL, last_error = NULL,
+                            updated_at = timing.now
+                        FROM candidate, timing
+                        WHERE delivery.session_id = candidate.session_id
+                          AND delivery.event_id = candidate.event_id
+                        RETURNING delivery.session_id, delivery.event_id,
+                                  delivery.event_sequence, delivery.attempts,
+                                  delivery.lease_expires_at
+                        """,
+                        params,
+                    )
+                    row = await cur.fetchone()
+                    if row is None:
+                        await conn.commit()
+                        return None
+                    await cur.execute(
+                        "SELECT event FROM cayu_events WHERE session_id = %s AND event_id = %s",
+                        (row[0], row[1]),
+                    )
+                    event_row = await cur.fetchone()
+                    if event_row is None:
+                        raise RuntimeError("Persisted side-effect delivery lost its source event.")
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return PersistedEventSideEffectClaim(
+            session_id=row[0],
+            event_id=row[1],
+            event_sequence=row[2],
+            event=Event(**_json_obj(event_row[0])),
+            attempt=row[3],
+            claim_id=claim_id,
+            lease_expires_at=pg_support.to_utc(row[4]),
+        )
+
+    async def get_persisted_event_side_effect_delivery(
+        self,
+        *,
+        session_id: str,
+        event_id: str,
+    ) -> PersistedEventSideEffectDelivery | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        event_id = require_clean_nonblank(event_id, "event_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT session_id, event_id, event_sequence, status, attempts,
+                       claim_id, lease_expires_at, next_attempt_at, last_error, updated_at
+                FROM cayu_persisted_event_side_effects
+                WHERE session_id = %s AND event_id = %s
+                """,
+                (session_id, event_id),
+            )
+            row = await cur.fetchone()
+        return None if row is None else _persisted_event_side_effect_delivery_from_row(row)
+
+    async def mark_persisted_event_side_effect_delivered(
+        self,
+        claim: PersistedEventSideEffectClaim,
+    ) -> PersistedEventSideEffectDelivery:
+        claim = PersistedEventSideEffectClaim.model_validate(claim)
+        return await self._finish_persisted_event_side_effect_claim(
+            claim,
+            status=PersistedEventSideEffectStatus.DELIVERED,
+            error=None,
+            retry_delay_seconds=None,
+        )
+
+    async def mark_persisted_event_side_effect_failed(
+        self,
+        claim: PersistedEventSideEffectClaim,
+        *,
+        error: str,
+        max_attempts: int,
+        retry_delay_seconds: float,
+    ) -> PersistedEventSideEffectDelivery:
+        claim = PersistedEventSideEffectClaim.model_validate(claim)
+        if type(error) is not str or not error.strip():
+            raise ValueError("error must be a non-empty string.")
+        if type(max_attempts) is not int or max_attempts < 1:
+            raise ValueError("max_attempts must be an integer greater than or equal to 1.")
+        if (
+            type(retry_delay_seconds) not in {int, float}
+            or not math.isfinite(retry_delay_seconds)
+            or retry_delay_seconds < 0
+        ):
+            raise ValueError("retry_delay_seconds must be a finite non-negative number.")
+        dead_lettered = claim.attempt >= max_attempts
+        return await self._finish_persisted_event_side_effect_claim(
+            claim,
+            status=(
+                PersistedEventSideEffectStatus.DEAD_LETTERED
+                if dead_lettered
+                else PersistedEventSideEffectStatus.FAILED
+            ),
+            error=error,
+            retry_delay_seconds=(None if dead_lettered else float(retry_delay_seconds)),
+        )
+
+    async def _finish_persisted_event_side_effect_claim(
+        self,
+        claim: PersistedEventSideEffectClaim,
+        *,
+        status: PersistedEventSideEffectStatus,
+        error: str | None,
+        retry_delay_seconds: float | None,
+    ) -> PersistedEventSideEffectDelivery:
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        WITH timing AS MATERIALIZED (
+                            SELECT clock_timestamp() AS now
+                        )
+                        UPDATE cayu_persisted_event_side_effects
+                        SET status = %s, claim_id = NULL, lease_expires_at = NULL,
+                            next_attempt_at = CASE
+                                WHEN %s::double precision IS NULL THEN NULL
+                                ELSE timing.now + (%s * INTERVAL '1 second')
+                            END,
+                            last_error = %s, updated_at = timing.now
+                        FROM timing
+                        WHERE session_id = %s AND event_id = %s AND status = 'leased'
+                          AND claim_id = %s AND attempts = %s
+                        RETURNING session_id, event_id, event_sequence, status,
+                                  attempts, claim_id, lease_expires_at, next_attempt_at,
+                                  last_error, updated_at
+                        """,
+                        (
+                            str(status),
+                            retry_delay_seconds,
+                            retry_delay_seconds,
+                            error,
+                            claim.session_id,
+                            claim.event_id,
+                            claim.claim_id,
+                            claim.attempt,
+                        ),
+                    )
+                    row = await cur.fetchone()
+                    if row is None:
+                        await cur.execute(
+                            "SELECT 1 FROM cayu_persisted_event_side_effects "
+                            "WHERE session_id = %s AND event_id = %s",
+                            (claim.session_id, claim.event_id),
+                        )
+                        if await cur.fetchone() is None:
+                            raise ValueError("Persisted event side-effect delivery was not found.")
+                        raise PersistedEventSideEffectClaimLost(
+                            "Persisted event side-effect claim is no longer active."
+                        )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return _persisted_event_side_effect_delivery_from_row(row)
+
+    async def list_persisted_event_side_effect_deliveries(
+        self,
+        *,
+        statuses: set[PersistedEventSideEffectStatus] | None = None,
+        claimable_only: bool = False,
+        after_sequence: int | None = None,
+        limit: int = 100,
+    ) -> list[PersistedEventSideEffectDelivery]:
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000.")
+        if type(claimable_only) is not bool:
+            raise TypeError("claimable_only must be a bool.")
+        if after_sequence is not None and (type(after_sequence) is not int or after_sequence < 0):
+            raise ValueError("after_sequence must be a non-negative integer.")
+        selected_statuses = (
+            None
+            if statuses is None
+            else sorted(str(PersistedEventSideEffectStatus(status)) for status in statuses)
+        )
+        if selected_statuses == []:
+            return []
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            clauses: list[str] = []
+            params: list[Any] = []
+            if after_sequence is not None:
+                clauses.append("event_sequence > %s")
+                params.append(after_sequence)
+            if selected_statuses is not None:
+                clauses.append("status = ANY(%s)")
+                params.append(selected_statuses)
+            if claimable_only:
+                clauses.append(
+                    "(status = 'pending' "
+                    "OR (status = 'failed' AND "
+                    "(next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp())) "
+                    "OR (status = 'leased' AND lease_expires_at <= clock_timestamp()))"
+                )
+            where = "" if not clauses else "WHERE " + " AND ".join(clauses)
+            params.append(limit)
+            await cur.execute(
+                cast(
+                    "LiteralString",
+                    f"""
+                    SELECT session_id, event_id, event_sequence, status, attempts,
+                           claim_id, lease_expires_at, next_attempt_at, last_error, updated_at
+                    FROM cayu_persisted_event_side_effects
+                    {where}
+                    ORDER BY event_sequence ASC
+                    LIMIT %s
+                    """,
+                ),
+                params,
+            )
+            rows = await cur.fetchall()
+        return [_persisted_event_side_effect_delivery_from_row(row) for row in rows]
 
     async def enqueue_session_message(
         self,
@@ -4842,6 +5185,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             projection,
                             projection_bytes,
                         ),
+                    )
+                    await self._enqueue_persisted_event_side_effects(
+                        cur,
+                        request.session_id,
+                        [accepted_event.id],
                     )
                     await cur.execute(
                         f"SELECT {_SESSION_MESSAGE_QUEUE_COLUMNS} "
@@ -5036,6 +5384,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         "pending_action_projection, pending_action_projection_bytes) "
                         "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                         event_rows,
+                    )
+                    await self._enqueue_persisted_event_side_effects(
+                        cur,
+                        session_id,
+                        [event.id for event in delivery_events],
                     )
                     mode_clause = (
                         "delivery_mode IN ('next_turn', 'on_idle')"
@@ -5291,6 +5644,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             )
                             """,
                             rows,
+                        )
+                        await self._enqueue_persisted_event_side_effects(
+                            cur,
+                            session_id,
+                            [event.id for event in copied_events],
                         )
                 await conn.commit()
             except UniqueViolation as exc:
@@ -8015,6 +8373,23 @@ def _event_record_from_row(row: tuple[Any, Any] | None) -> EventRecord | None:
     if row is None:
         return None
     return EventRecord(sequence=row[0], event=Event(**_json_obj(row[1])))
+
+
+def _persisted_event_side_effect_delivery_from_row(
+    row: tuple[Any, ...],
+) -> PersistedEventSideEffectDelivery:
+    return PersistedEventSideEffectDelivery(
+        session_id=row[0],
+        event_id=row[1],
+        event_sequence=row[2],
+        status=PersistedEventSideEffectStatus(row[3]),
+        attempts=row[4],
+        claim_id=row[5],
+        lease_expires_at=pg_support.to_utc_optional(row[6]),
+        next_attempt_at=pg_support.to_utc_optional(row[7]),
+        last_error=row[8],
+        updated_at=pg_support.to_utc(row[9]),
+    )
 
 
 def _event_watcher_state_from_row(row: tuple[Any, ...]) -> EventWatcherState:

@@ -6,6 +6,7 @@ import base64
 import json
 import logging
 import re
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -56,14 +57,17 @@ from cayu.runtime import (
     CheckpointCompactionContextPolicy,
     EventQuery,
     EventRecord,
+    InMemoryEventSink,
     InMemorySessionStore,
     InterruptSessionRequest,
     PendingActionListResult,
+    PersistedEventSideEffectStatus,
     RunRequest,
     SessionIdentity,
     SessionStatus,
     TranscriptDigestCompactor,
 )
+from cayu.runtime.budgets import InMemoryBudgetStore
 from cayu.server import create_server, mount_cayu, mount_dashboard
 from cayu.server.routes import (
     _accepted_event_stream_response,
@@ -102,6 +106,30 @@ class UsageProvider(ModelProvider):
                 }
             }
         )
+
+
+class FailOnceEventSink(InMemoryEventSink):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failures_remaining = 1
+
+    async def emit(self, event: Event) -> None:
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise RuntimeError("sink temporarily unavailable")
+        await super().emit(event)
+
+
+class NeverReturningEventSink(InMemoryEventSink):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancelled = False
+
+    async def emit(self, event: Event) -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.cancelled = True
 
 
 class CountingArtifactStore(ArtifactStore):
@@ -4444,6 +4472,53 @@ def test_mount_cayu_drains_cascades_when_startup_recovery_fails() -> None:
     assert calls == ["recover", "drain"]
 
 
+def test_mount_cayu_recovers_backlog_past_poison_delivery(monkeypatch) -> None:
+    class FailingBudgetStore(InMemoryBudgetStore):
+        async def append_event(self, event: Event) -> None:
+            if event.type == EventType.MODEL_COMPLETED:
+                raise RuntimeError("budget unavailable")
+            await super().append_event(event)
+
+    async def prepare():
+        store = InMemorySessionStore()
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="mounted_side_effect_backlog",
+                messages=[Message.text("user", "go")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        poison = Event(type=EventType.MODEL_COMPLETED, session_id=session.id)
+        healthy = Event(type="custom.healthy", session_id=session.id)
+        await store.append_events(session.id, [poison, healthy])
+        return store, poison, healthy
+
+    store, poison, healthy = asyncio.run(prepare())
+    sink = InMemoryEventSink()
+    cayu_app = CayuApp(
+        session_store=store,
+        budget_store=FailingBudgetStore(),
+        event_sinks=[sink],
+        enable_logging=False,
+    )
+    server = FastAPI()
+    monkeypatch.setattr(
+        "cayu.server._PERSISTED_EVENT_SIDE_EFFECT_RECOVERY_BATCH_SIZE",
+        1,
+    )
+    mount_cayu(server, cayu_app, path="/cayu", dashboard=False, dev=True)
+
+    with TestClient(server):
+        deliveries = asyncio.run(store.list_persisted_event_side_effect_deliveries())
+
+    assert [event.id for event in sink.events] == [healthy.id]
+    assert [(delivery.event_id, delivery.status.value) for delivery in deliveries] == [
+        (poison.id, "failed"),
+        (healthy.id, "delivered"),
+    ]
+
+
 def test_run_rejects_blank_prompt_and_agent_before_runtime() -> None:
     app = CayuApp()
     app.register_provider(OneShotProvider(), default=True)
@@ -7705,6 +7780,11 @@ def test_create_server_startup_recovery_composes_user_lifespan() -> None:
         requests.append(request)
         return []
 
+    async def recover_event_side_effects(*, limit=1000):
+        calls.append("recover_event_side_effects")
+        assert limit == 1000
+        return []
+
     async def drain_background_interruptions(*, timeout_s):
         calls.append("drain")
         assert timeout_s == 10.0
@@ -7716,6 +7796,7 @@ def test_create_server_startup_recovery_composes_user_lifespan() -> None:
         return 0
 
     app.recover_incomplete_sessions = recover
+    app.recover_persisted_event_side_effects = recover_event_side_effects
     app.drain_background_interruptions = drain_background_interruptions
     app.resume_pending_interruption_cascades = resume_pending_interruption_cascades
     server = create_server(
@@ -7731,9 +7812,21 @@ def test_create_server_startup_recovery_composes_user_lifespan() -> None:
     )
 
     with TestClient(server):
-        assert calls == ["user_start", "recover", "resume_cascades"]
+        assert calls == [
+            "user_start",
+            "recover_event_side_effects",
+            "recover",
+            "resume_cascades",
+        ]
 
-    assert calls == ["user_start", "recover", "resume_cascades", "drain", "user_stop"]
+    assert calls == [
+        "user_start",
+        "recover_event_side_effects",
+        "recover",
+        "resume_cascades",
+        "drain",
+        "user_stop",
+    ]
     assert len(requests) == 1
     request = requests[0]
     assert request.statuses == {
@@ -7745,6 +7838,208 @@ def test_create_server_startup_recovery_composes_user_lifespan() -> None:
     assert request.metadata == {"source": "create_server"}
     assert request.inactive_before is not None
     assert request.inactive_before < datetime.now(UTC)
+
+
+def test_create_server_drains_persisted_event_side_effect_backlog() -> None:
+    async def prepare():
+        store = InMemorySessionStore()
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="server_side_effect_backlog",
+                messages=[Message.text("user", "go")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        events = [
+            Event(type="custom.backlog", session_id=session.id, payload={"index": index})
+            for index in range(1001)
+        ]
+        await store.append_events(session.id, events)
+        return store, events
+
+    store, events = asyncio.run(prepare())
+    sink = InMemoryEventSink()
+    app = CayuApp(session_store=store, event_sinks=[sink], enable_logging=False)
+
+    with TestClient(create_server(app, dev=True)):
+        assert [event.id for event in sink.events] == [event.id for event in events]
+
+
+@pytest.mark.parametrize("adapter", ["create_server", "mount_cayu"])
+def test_server_startup_bounds_non_returning_side_effect_recovery(
+    adapter: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def prepare():
+        store = InMemorySessionStore()
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=f"bounded_startup_{adapter}",
+                messages=[Message.text("user", "go")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        event = Event(type="custom.pending", session_id=session.id)
+        await store.append_event(session.id, event)
+        return store, event
+
+    store, event = asyncio.run(prepare())
+    sink = NeverReturningEventSink()
+    app = CayuApp(session_store=store, event_sinks=[sink], enable_logging=False)
+    if adapter == "create_server":
+        server = create_server(
+            app,
+            dev=True,
+            event_side_effect_startup_timeout_seconds=0.01,
+        )
+        health_path = "/api/health"
+    else:
+        server = FastAPI()
+        mount_cayu(
+            server,
+            app,
+            path="/cayu",
+            dashboard=False,
+            dev=True,
+            event_side_effect_startup_timeout_seconds=0.01,
+        )
+        health_path = "/cayu/api/health"
+
+    started = time.monotonic()
+    with (
+        caplog.at_level(logging.WARNING, logger="cayu.server"),
+        TestClient(server) as client,
+    ):
+        assert client.get(health_path).json() == {"ok": True}
+    assert time.monotonic() - started < 2.0
+
+    delivery = asyncio.run(
+        store.get_persisted_event_side_effect_delivery(
+            session_id=event.session_id,
+            event_id=event.id,
+        )
+    )
+    assert sink.cancelled
+    assert delivery is not None
+    assert delivery.status is PersistedEventSideEffectStatus.LEASED
+    assert "startup recovery exceeded" in caplog.text
+
+
+def test_create_server_does_not_swallow_recovery_timeout_error() -> None:
+    app = CayuApp()
+
+    async def fail_recovery(*, limit):
+        raise TimeoutError("session store timed out")
+
+    app.recover_persisted_event_side_effects = fail_recovery
+
+    with (
+        pytest.raises(TimeoutError, match="session store timed out"),
+        TestClient(create_server(app, dev=True)),
+    ):
+        pass
+
+
+def test_create_server_retries_crash_claim_after_lease_expiry(monkeypatch) -> None:
+    async def prepare():
+        store = InMemorySessionStore()
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="server_side_effect_lease",
+                messages=[Message.text("user", "go")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        event = Event(type="custom.leased", session_id=session.id)
+        await store.append_event(session.id, event)
+        claim = await store.claim_persisted_event_side_effect(lease_seconds=0.2)
+        assert claim is not None
+        return store, event
+
+    store, event = asyncio.run(prepare())
+    sink = InMemoryEventSink()
+    app = CayuApp(session_store=store, event_sinks=[sink], enable_logging=False)
+    monkeypatch.setattr(
+        "cayu.server._PERSISTED_EVENT_SIDE_EFFECT_RECOVERY_INTERVAL_SECONDS",
+        0.01,
+    )
+
+    with TestClient(create_server(app, dev=True)):
+        deadline = time.monotonic() + 1.0
+        while not sink.events and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    assert [recovered.id for recovered in sink.events] == [event.id]
+
+
+def test_mount_cayu_retries_crash_claim_after_lease_expiry(monkeypatch) -> None:
+    async def prepare():
+        store = InMemorySessionStore()
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="mounted_side_effect_lease",
+                messages=[Message.text("user", "go")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        event = Event(type="custom.leased", session_id=session.id)
+        await store.append_event(session.id, event)
+        claim = await store.claim_persisted_event_side_effect(lease_seconds=0.2)
+        assert claim is not None
+        return store, event
+
+    store, event = asyncio.run(prepare())
+    sink = InMemoryEventSink()
+    app = CayuApp(session_store=store, event_sinks=[sink], enable_logging=False)
+    server = FastAPI()
+    monkeypatch.setattr(
+        "cayu.server._PERSISTED_EVENT_SIDE_EFFECT_RECOVERY_INTERVAL_SECONDS",
+        0.01,
+    )
+    mount_cayu(server, app, path="/cayu", dashboard=False, dev=True)
+
+    with TestClient(server):
+        deadline = time.monotonic() + 1.0
+        while not sink.events and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    assert [recovered.id for recovered in sink.events] == [event.id]
+
+
+def test_create_server_defers_transient_sink_retry_to_periodic_loop() -> None:
+    async def prepare():
+        store = InMemorySessionStore()
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="server_side_effect_transient_sink",
+                messages=[Message.text("user", "go")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        event = Event(type="custom.transient", session_id=session.id)
+        await store.append_event(session.id, event)
+        return store
+
+    store = asyncio.run(prepare())
+    app = CayuApp(
+        session_store=store,
+        event_sinks=[FailOnceEventSink()],
+        enable_logging=False,
+    )
+
+    with TestClient(create_server(app, dev=True)):
+        deliveries = asyncio.run(store.list_persisted_event_side_effect_deliveries())
+
+    assert [(delivery.status.value, delivery.attempts) for delivery in deliveries] == [
+        ("failed", 1)
+    ]
+    assert deliveries[0].next_attempt_at is not None
+    assert deliveries[0].next_attempt_at > deliveries[0].updated_at
 
 
 def test_create_server_drains_cascades_when_startup_recovery_fails() -> None:
@@ -7782,6 +8077,29 @@ def test_create_server_rejects_invalid_interruption_shutdown_grace(value) -> Non
             dev=True,
             interruption_shutdown_grace_seconds=value,
         )
+
+
+@pytest.mark.parametrize("value", [True, 0, -1, float("inf"), float("nan")])
+@pytest.mark.parametrize("adapter", ["create_server", "mount_cayu"])
+def test_server_rejects_invalid_event_side_effect_startup_timeout(
+    adapter: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValueError, match="event_side_effect_startup_timeout_seconds"):
+        if adapter == "create_server":
+            create_server(
+                CayuApp(),
+                dev=True,
+                event_side_effect_startup_timeout_seconds=value,  # type: ignore[arg-type]
+            )
+        else:
+            mount_cayu(
+                FastAPI(),
+                CayuApp(),
+                dashboard=False,
+                dev=True,
+                event_side_effect_startup_timeout_seconds=value,  # type: ignore[arg-type]
+            )
 
 
 @pytest.mark.parametrize("value", [True, -1, 1.5])

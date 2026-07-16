@@ -65,6 +65,23 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS cayu_persisted_event_side_effects (
+        session_id TEXT NOT NULL,
+        event_id TEXT NOT NULL,
+        event_sequence BIGINT NOT NULL,
+        status TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        claim_id TEXT,
+        lease_expires_at TIMESTAMPTZ,
+        next_attempt_at TIMESTAMPTZ,
+        last_error TEXT,
+        updated_at TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY (session_id, event_id),
+        FOREIGN KEY (session_id, event_id)
+            REFERENCES cayu_events(session_id, event_id) ON DELETE CASCADE
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS cayu_session_labels (
         session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
         key TEXT NOT NULL,
@@ -217,6 +234,9 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
       AND pending_action_lookup_key IS NOT NULL
     """,
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_insert_xid ON cayu_events(insert_xid)",
+    "CREATE INDEX IF NOT EXISTS idx_cayu_persisted_event_side_effects_delivery "
+    "ON cayu_persisted_event_side_effects"
+    "(status, next_attempt_at, lease_expires_at, event_sequence)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_type_timestamp ON cayu_events(event_type, timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_agent_name ON cayu_events(agent_name)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_environment_name ON cayu_events(environment_name)",

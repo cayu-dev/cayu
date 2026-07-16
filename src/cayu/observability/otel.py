@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+from collections import OrderedDict
 from types import ModuleType
 from typing import Any
 
@@ -40,6 +41,9 @@ DEFAULT_TRACER_NAME = "cayu"
 # Safety net against unbounded growth if the runtime ever fails to emit a terminal
 # event for a session (e.g. a bare task cancellation). The real fix is runtime-side.
 _MAX_OPEN_SESSIONS = 10_000
+# At-least-once event fan-out can replay a span event after another sink fails.
+# Keep recent identities bounded while covering ordinary in-process retry bursts.
+_MAX_RECENT_EVENT_IDENTITIES = 100_000
 
 _OPERATION_CHAT = "chat"
 _OPERATION_EXECUTE_TOOL = "execute_tool"
@@ -61,6 +65,18 @@ _TOOL_CALL_ERROR_EVENTS = frozenset(
         EventType.TOOL_CALL_FAILED,
         EventType.TOOL_CALL_BLOCKED,
         EventType.TOOL_CALL_APPROVAL_DENIED,
+    }
+)
+_TRACED_EVENT_TYPES = frozenset(
+    {
+        *_SESSION_START_EVENTS,
+        *_SESSION_END_EVENTS,
+        *_TOOL_CALL_ERROR_EVENTS,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.MODEL_ERROR,
+        EventType.TOOL_CALL_STARTED,
+        EventType.TOOL_CALL_COMPLETED,
     }
 )
 
@@ -145,6 +161,7 @@ class OpenTelemetryEventSink(EventSink):
         self._tracer = tracer if tracer is not None else self._trace.get_tracer(tracer_name)
         self._propagator_instance: Any | None = None
         self._sessions: dict[str, _SessionSpans] = {}
+        self._recent_event_identities: OrderedDict[tuple[str, str], None] = OrderedDict()
         self._evicted_sessions = 0
 
     @property
@@ -161,25 +178,36 @@ class OpenTelemetryEventSink(EventSink):
         if type(event) is not Event:
             raise TypeError("OpenTelemetryEventSink requires Event instances.")
         event_type = event.type
+        if event_type not in _TRACED_EVENT_TYPES:
+            return
+        identity = (event.session_id, event.id)
+        if identity in self._recent_event_identities:
+            self._recent_event_identities.move_to_end(identity)
+            return
+        applied = False
         if event_type in _SESSION_START_EVENTS:
-            self._start_session_span(event)
+            applied = self._start_session_span(event)
         elif event_type in _SESSION_END_EVENTS:
             # Only an outright failure marks the span ERROR; an interrupt is a pause
             # (approval wait / user stop), not a failure, so it stays UNSET.
             error = _error_text(event) if event_type == EventType.SESSION_FAILED else None
-            self._end_session_span(event, error=error)
+            applied = self._end_session_span(event, error=error)
         elif event_type == EventType.MODEL_STARTED:
-            self._start_model_span(event)
+            applied = self._start_model_span(event)
         elif event_type == EventType.MODEL_COMPLETED:
-            self._end_model_span(event, error=None)
+            applied = self._end_model_span(event, error=None)
         elif event_type == EventType.MODEL_ERROR:
-            self._end_model_span(event, error=_error_text(event))
+            applied = self._end_model_span(event, error=_error_text(event))
         elif event_type == EventType.TOOL_CALL_STARTED:
-            self._start_tool_span(event)
+            applied = self._start_tool_span(event)
         elif event_type == EventType.TOOL_CALL_COMPLETED:
-            self._end_tool_span(event, error=None)
+            applied = self._end_tool_span(event, error=None)
         elif event_type in _TOOL_CALL_ERROR_EVENTS:
-            self._end_tool_span(event, error=_tool_error_text(event))
+            applied = self._end_tool_span(event, error=_tool_error_text(event))
+        if applied:
+            self._recent_event_identities[identity] = None
+            if len(self._recent_event_identities) > _MAX_RECENT_EVENT_IDENTITIES:
+                self._recent_event_identities.popitem(last=False)
 
     def traceparent_for(self, session_id: str) -> str | None:
         """Return the W3C ``traceparent`` for an active session's root span.
@@ -196,11 +224,11 @@ class OpenTelemetryEventSink(EventSink):
         self._propagator().inject(carrier, context=context)
         return carrier.get("traceparent")
 
-    def _start_session_span(self, event: Event) -> None:
+    def _start_session_span(self, event: Event) -> bool:
         session_id = event.session_id
         if session_id in self._sessions:
             # Idempotent: a RESUMED after STARTED, or a duplicate, keeps the first span.
-            return
+            return True
         event_ns = _event_time_ns(event)
         if len(self._sessions) >= _MAX_OPEN_SESSIONS:
             # Safety net: a session whose terminal event never arrived would otherwise
@@ -223,11 +251,14 @@ class OpenTelemetryEventSink(EventSink):
         _set_str(span, CAYU_AGENT_NAME, event.agent_name)
         _set_str(span, CAYU_ENVIRONMENT_NAME, event.environment_name)
         self._sessions[session_id] = _SessionSpans(span, event_ns)
+        return True
 
-    def _end_session_span(self, event: Event, *, error: str | None) -> None:
+    def _end_session_span(self, event: Event, *, error: str | None) -> bool:
         state = self._sessions.pop(event.session_id, None)
-        if state is not None:
-            self._close_session_state(state, error=error, end_time=_event_time_ns(event))
+        if state is None:
+            return False
+        self._close_session_state(state, error=error, end_time=_event_time_ns(event))
+        return True
 
     def _close_session_state(
         self,
@@ -249,10 +280,10 @@ class OpenTelemetryEventSink(EventSink):
             self._finish(tool_span, error=None, incomplete=True, end_time=end_time)
         self._finish(state.root, error=error, incomplete=root_incomplete, end_time=end_time)
 
-    def _start_model_span(self, event: Event) -> None:
+    def _start_model_span(self, event: Event) -> bool:
         state = self._sessions.get(event.session_id)
         if state is None:
-            return
+            return False
         event_ns = _event_time_ns(event)
         state.last_activity_ns = event_ns
         if state.model is not None:
@@ -277,11 +308,12 @@ class OpenTelemetryEventSink(EventSink):
         _set_str(span, GEN_AI_REQUEST_MODEL, model)
         _set_int(span, CAYU_MODEL_STEP, payload.get("step"))
         state.model = span
+        return True
 
-    def _end_model_span(self, event: Event, *, error: str | None) -> None:
+    def _end_model_span(self, event: Event, *, error: str | None) -> bool:
         state = self._sessions.get(event.session_id)
         if state is None or state.model is None:
-            return
+            return False
         event_ns = _event_time_ns(event)
         state.last_activity_ns = event_ns
         span = state.model
@@ -309,11 +341,12 @@ class OpenTelemetryEventSink(EventSink):
         else:
             _set_str(span, GEN_AI_RESPONSE_MODEL, payload.get("model"))
         self._finish(span, error=error, end_time=event_ns)
+        return True
 
-    def _start_tool_span(self, event: Event) -> None:
+    def _start_tool_span(self, event: Event) -> bool:
         state = self._sessions.get(event.session_id)
         if state is None:
-            return
+            return False
         event_ns = _event_time_ns(event)
         state.last_activity_ns = event_ns
         tool_call_id = _tool_call_id(event)
@@ -326,6 +359,7 @@ class OpenTelemetryEventSink(EventSink):
             event=event,
             start_time=event_ns,
         )
+        return True
 
     def _new_tool_span(
         self,
@@ -344,10 +378,10 @@ class OpenTelemetryEventSink(EventSink):
         _set_str(span, GEN_AI_TOOL_CALL_ID, _tool_call_id(event))
         return span
 
-    def _end_tool_span(self, event: Event, *, error: str | None) -> None:
+    def _end_tool_span(self, event: Event, *, error: str | None) -> bool:
         state = self._sessions.get(event.session_id)
         if state is None:
-            return
+            return False
         event_ns = _event_time_ns(event)
         state.last_activity_ns = event_ns
         tool_call_id = _tool_call_id(event)
@@ -365,11 +399,13 @@ class OpenTelemetryEventSink(EventSink):
             # represent that authority decision as an instantaneous child span without
             # inventing a runtime TOOL_CALL_STARTED event that would affect accounting.
             span = self._new_tool_span(state=state, event=event, start_time=event_ns)
-        if span is not None:
-            if event.type == EventType.TOOL_CALL_BLOCKED:
-                _set_str(span, CAYU_TOOL_DENIED_BY, denied_by)
-                _set_str(span, CAYU_TOOL_POLICY_DECISION, event.payload.get("decision"))
-            self._finish(span, error=error, end_time=event_ns)
+        if span is None:
+            return False
+        if event.type == EventType.TOOL_CALL_BLOCKED:
+            _set_str(span, CAYU_TOOL_DENIED_BY, denied_by)
+            _set_str(span, CAYU_TOOL_POLICY_DECISION, event.payload.get("decision"))
+        self._finish(span, error=error, end_time=event_ns)
+        return True
 
     def _resolve_parent_context(self, event: Event) -> Any:
         payload = event.payload

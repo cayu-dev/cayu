@@ -18,6 +18,8 @@ from cayu.runtime import (
     EnqueueSessionMessageRequest,
     EventQuery,
     InMemorySessionStore,
+    PersistedEventSideEffectClaimLost,
+    PersistedEventSideEffectStatus,
     ResolutionActor,
     RunRequest,
     Session,
@@ -39,6 +41,7 @@ _POSTGRES_TABLES = (
     "cayu_knowledge_chunks",
     "cayu_knowledge_entries",
     "cayu_event_watcher_state",
+    "cayu_persisted_event_side_effects",
     "cayu_events",
     "cayu_session_labels",
     "cayu_transcript_messages",
@@ -255,6 +258,222 @@ def test_session_store_conformance_explicit_compaction_operation(session_store_c
     asyncio.run(run())
 
 
+def test_session_store_conformance_persisted_event_side_effect_recovery(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_side_effect_recovery",
+                    messages=[Message.text("user", "persist")],
+                ),
+                identity=_identity(),
+            )
+            event = Event(type=EventType.MODEL_COMPLETED, session_id=session.id)
+            await store.append_event(session.id, event)
+            pending = await store.get_persisted_event_side_effect_delivery(
+                session_id=session.id,
+                event_id=event.id,
+            )
+            assert pending is not None
+            assert pending.status is PersistedEventSideEffectStatus.PENDING
+            assert (
+                await store.get_persisted_event_side_effect_delivery(
+                    session_id=session.id,
+                    event_id="missing-event",
+                )
+                is None
+            )
+            await store.append_event(
+                session.id,
+                Event(
+                    type=EventType.RUNTIME_SINK_FAILED,
+                    session_id=session.id,
+                    payload={"event_id": event.id},
+                ),
+            )
+
+            store = await _reopen_store(session_store_case, store)
+            first_claim = await store.claim_persisted_event_side_effect()
+            assert first_claim is not None
+            assert first_claim.event.id == event.id
+            assert first_claim.attempt == 1
+            leased = await store.get_persisted_event_side_effect_delivery(
+                session_id=session.id,
+                event_id=event.id,
+            )
+            assert leased is not None
+            assert leased.status is PersistedEventSideEffectStatus.LEASED
+            failed = await store.mark_persisted_event_side_effect_failed(
+                first_claim,
+                error="sink unavailable",
+                max_attempts=2,
+                retry_delay_seconds=0,
+            )
+            assert failed.status is PersistedEventSideEffectStatus.FAILED
+            loaded_failed = await store.get_persisted_event_side_effect_delivery(
+                session_id=session.id,
+                event_id=event.id,
+            )
+            assert loaded_failed == failed
+
+            store = await _reopen_store(session_store_case, store)
+            second_claim = await store.claim_persisted_event_side_effect()
+            assert second_claim is not None
+            assert second_claim.event.id == event.id
+            assert second_claim.attempt == 2
+            delivered = await store.mark_persisted_event_side_effect_delivered(second_claim)
+            assert delivered.status is PersistedEventSideEffectStatus.DELIVERED
+            loaded_delivered = await store.get_persisted_event_side_effect_delivery(
+                session_id=session.id,
+                event_id=event.id,
+            )
+            assert loaded_delivered == delivered
+            assert await store.claim_persisted_event_side_effect() is None
+            states = await store.list_persisted_event_side_effect_deliveries()
+            assert [(state.event_id, state.status, state.attempts) for state in states] == [
+                (event.id, PersistedEventSideEffectStatus.DELIVERED, 2)
+            ]
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_persisted_event_side_effect_claim_fencing(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_side_effect_fencing",
+                    messages=[Message.text("user", "persist")],
+                ),
+                identity=_identity(),
+            )
+            event = Event(type=EventType.SESSION_STARTED, session_id=session.id)
+            await store.append_event(session.id, event)
+
+            stale = await store.claim_persisted_event_side_effect(lease_seconds=0.05)
+            assert stale is not None
+            pending = Event(type="custom.pending", session_id=session.id)
+            await store.append_event(session.id, pending)
+            claimable = await store.list_persisted_event_side_effect_deliveries(
+                claimable_only=True,
+                limit=1,
+            )
+            assert [delivery.event_id for delivery in claimable] == [pending.id]
+            await asyncio.sleep(0.06)
+            replacement = await store.claim_persisted_event_side_effect()
+            assert replacement is not None
+            assert replacement.event.id == event.id
+            assert replacement.attempt == 2
+            with pytest.raises(PersistedEventSideEffectClaimLost, match="no longer active"):
+                await store.mark_persisted_event_side_effect_delivered(stale)
+            dead_lettered = await store.mark_persisted_event_side_effect_failed(
+                replacement,
+                error="still unavailable",
+                max_attempts=2,
+                retry_delay_seconds=0,
+            )
+            assert dead_lettered.status is PersistedEventSideEffectStatus.DEAD_LETTERED
+            loaded_dead_lettered = await store.get_persisted_event_side_effect_delivery(
+                session_id=session.id,
+                event_id=event.id,
+            )
+            assert loaded_dead_lettered == dead_lettered
+            pending_claim = await store.claim_persisted_event_side_effect()
+            assert pending_claim is not None
+            assert pending_claim.event.id == pending.id
+            await store.mark_persisted_event_side_effect_delivered(pending_claim)
+            assert await store.claim_persisted_event_side_effect() is None
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_persisted_event_side_effect_retry_spacing_and_paging(
+    session_store_case,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_side_effect_retry_spacing",
+                    messages=[Message.text("user", "persist")],
+                ),
+                identity=_identity(),
+            )
+            events = [
+                Event(type=f"custom.page.{index}", session_id=session.id) for index in range(3)
+            ]
+            await store.append_events(session.id, events)
+
+            async def exercise_retry_clock():
+                claim = await store.claim_persisted_event_side_effect(
+                    session_id=session.id,
+                    event_id=events[0].id,
+                )
+                assert claim is not None
+                failed = await store.mark_persisted_event_side_effect_failed(
+                    claim,
+                    error="try later",
+                    max_attempts=3,
+                    retry_delay_seconds=60,
+                )
+                assert failed.next_attempt_at is not None
+                assert failed.next_attempt_at > failed.updated_at
+                assert (
+                    await store.claim_persisted_event_side_effect(
+                        session_id=session.id,
+                        event_id=events[0].id,
+                    )
+                    is None
+                )
+
+            if session_store_case[0] == "postgres":
+
+                class NodeClockMustNotBeRead:
+                    @classmethod
+                    def now(cls, *args, **kwargs):
+                        raise AssertionError("Postgres handoff eligibility must use DB time")
+
+                with monkeypatch.context() as context:
+                    context.setattr("cayu.storage.postgres.datetime", NodeClockMustNotBeRead)
+                    await exercise_retry_clock()
+            else:
+                await exercise_retry_clock()
+
+            claimable = await store.list_persisted_event_side_effect_deliveries(
+                claimable_only=True,
+            )
+            assert [state.event_id for state in claimable] == [events[1].id, events[2].id]
+
+            first_page = await store.list_persisted_event_side_effect_deliveries(limit=2)
+            second_page = await store.list_persisted_event_side_effect_deliveries(
+                after_sequence=first_page[-1].event_sequence,
+                limit=2,
+            )
+            assert [state.event_id for state in [*first_page, *second_page]] == [
+                event.id for event in events
+            ]
+            assert second_page[0].event_sequence > first_page[-1].event_sequence
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
 def test_session_store_conformance_fences_reclaimed_compaction_attempts(
     session_store_case,
 ) -> None:
@@ -346,6 +565,11 @@ def test_session_store_conformance_fences_reclaimed_compaction_attempts(
             assert sum(event.type == EventType.MODEL_COMPLETED for event in durable_events) == 2
             assert len({event.payload["operation_id"] for event in durable_events}) == 1
             assert len({event.payload["attempt_id"] for event in durable_events}) == 2
+            delivery_ids = {
+                delivery.event_id
+                for delivery in await store.list_persisted_event_side_effect_deliveries(limit=1000)
+            }
+            assert {event.id for event in durable_events} <= delivery_ids
             checkpoint = await store.load_checkpoint(created.id)
             assert checkpoint is not None
             assert checkpoint["context_compaction"]["summary"] == "summary from attempt 2"
@@ -547,6 +771,13 @@ def test_session_store_conformance_durable_session_message_queue(session_store_c
             ]
             assert len(queue_events) == 8
             assert all("content" not in event.payload for event in queue_events)
+            deliveries = await store.list_persisted_event_side_effect_deliveries(limit=1000)
+            assert {delivery.event_id for delivery in deliveries} == {
+                event.id for event in queue_events
+            }
+            assert all(
+                delivery.status is PersistedEventSideEffectStatus.PENDING for delivery in deliveries
+            )
         finally:
             await _close_store(store)
 

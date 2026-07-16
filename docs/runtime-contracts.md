@@ -823,6 +823,84 @@ to redact known secret values. Applications can disable the default sink with
 `CayuApp(enable_logging=False)`, pass additional sinks through
 `CayuApp(event_sinks=[...])`.
 
+Every built-in `SessionStore` creates a persisted side-effect handoff in the
+same atomic write as each runtime event. `RuntimeEventWriter` claims that
+handoff before forwarding `model.completed` to the configured `BudgetStore` and
+before emitting to event sinks, then records delivery only after all configured
+side effects succeed. A process crash can therefore delay fan-out, but it cannot
+leave an untracked committed event. `runtime.sink.failed` telemetry is excluded
+from this handoff so a failing sink cannot recursively enqueue failures about
+its own failure events.
+
+Delivery across this handoff is at-least-once. A crash after an external sink or
+budget store accepts an event but before Cayu records delivery can replay the
+same immutable event. `BudgetStore.append_event(...)` implementations must be
+idempotent by `(event.session_id, event.id)` and reject conflicting reuse of
+that identity; the built-in stores follow this contract. If a recovery worker
+wins the handoff claim immediately after the event commit, the live writer also
+forwards `model.completed` to the idempotent budget store so strict shared
+budget accounting cannot miss the committed cost event. Durable event sinks
+should use the same identity as their external idempotency key. Recovery can
+interleave events from different workers, so sinks that require event order
+should order by durable event sequence rather than callback arrival. The
+`InMemoryEventSink` also deduplicates retries by this identity. The built-in
+`OpenTelemetryEventSink` suppresses recent in-process replays with a bounded
+identity cache so a transient sibling-sink failure does not create duplicate or
+incomplete spans. Only events successfully applied to the telemetry state enter
+that cache, so an out-of-order event whose prerequisite span has not arrived
+remains retryable. External durable telemetry pipelines still need the same
+identity for cross-process idempotency. Cayu attempts all configured sinks even
+when one fails, persists one `runtime.sink.failed` event per failed attempt, and
+retains the originating handoff for retry. If every external effect succeeds
+but the final delivery acknowledgement fails, Cayu logs the bookkeeping error,
+leaves the claim leased for recovery, and does not turn the completed runtime
+operation into a failure.
+
+`CayuApp.recover_persisted_event_side_effects(limit=...)` claims a bounded set of
+pending, failed, or expired-lease handoffs after a restart. `create_server(...)`
+runs this sweep automatically during startup, as does `mount_cayu(...)`; both
+bound the initial readiness wait with
+`event_side_effect_startup_timeout_seconds` (30 seconds by default), drain
+additional batches while that budget remains, and keep a lifecycle-managed
+recovery loop running so unfinished work or a crash claim is retried after its
+lease expires. A startup timeout is operationally reported but does not discard
+or acknowledge the durable handoff. This starts before incomplete-session and
+interruption-cascade recovery. Direct SDK processes should call the recovery
+method from their own startup and worker lifecycle.
+Claims are lease-fenced so a stale worker cannot close a replacement claim. A
+failed delivery is retried after a durable 30-second delay, up to three total
+attempts, and then becomes `dead_lettered`. PostgreSQL evaluates lease expiry
+and retry deadlines against the database clock so worker clock skew cannot
+claim work early or late. Operators can inspect
+pending, leased, failed, delivered, and dead-lettered rows with
+`SessionStore.list_persisted_event_side_effect_deliveries(...)`; use
+`after_sequence` with the last returned `event_sequence` for bounded forward
+pagination. Dead-lettering stops automatic retries but does not pretend the
+external effect succeeded. A dead-lettered `model.completed` row means budget
+forwarding did not complete and requires operator investigation or explicit
+idempotent replay before relying on shared-budget totals.
+
+These handoff methods, the retry deadline field, and stale-claim
+`PersistedEventSideEffectClaimLost` result are required parts of the
+`SessionStore` contract. Custom stores must create the handoff atomically with
+event publication, implement claim/finish/exact-lookup/list behavior including
+`retry_delay_seconds` and `after_sequence`, and use a store-wide clock for
+leases and retry eligibility.
+
+SQLite event pruning protects every handoff that is not `delivered`, including
+dead letters, so retention cannot erase recovery evidence. Explicit session
+deletion still removes the session, events, and handoffs together. SQLite and
+PostgreSQL deployments created before this contract must run
+`cayu storage migrate` to install schema revision 20; the revision is additive
+and remains compatible with revision-19 writers during a rolling deployment.
+SQLite revision 20 installs a database guard so a revision-19 retention sweep
+cannot cascade-delete an event whose new handoff is still undelivered.
+The handoff row itself is inserted explicitly by revision-20 store code in the
+event's transaction rather than by a database trigger: an older writer can
+continue its pre-revision-20 live fan-out without leaving a handoff it does not
+know how to acknowledge, while every revision-20 write gets the new recovery
+guarantee.
+
 ## Event Watchers
 
 Event watchers are durable app-side processors for events that were already
@@ -834,7 +912,8 @@ session finishes.
 They are deliberately separate from runtime hooks and event sinks:
 
 - hooks run inside the model/tool loop and can affect runtime decisions;
-- event sinks fan out live events for logs, CLIs, dashboards, or webhooks;
+- event sinks receive the runtime's restart-recoverable, at-least-once fan-out
+  for logs, CLIs, dashboards, or webhooks;
 - event watchers pull durable events later and record delivery state.
 
 Watchers are trusted application code. The model cannot install arbitrary

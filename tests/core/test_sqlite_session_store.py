@@ -4,7 +4,7 @@ import asyncio
 import json
 import sqlite3
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -890,21 +890,23 @@ def test_sqlite_session_store_validate_mode_fails_fast_on_uninitialized(tmp_path
         SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
 
-def test_sqlite_revision_nineteen_migrates_durable_session_message_queue(tmp_path):
+def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
     db_path = tmp_path / "sessions.sqlite"
     store = SQLiteSessionStore(db_path)
     asyncio.run(_close(store))
 
     connection = sqlite3.connect(db_path)
     try:
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 19")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 19")
+        connection.execute("DROP TRIGGER IF EXISTS cayu_protect_undelivered_event_side_effects")
+        connection.execute("DROP TABLE cayu_persisted_event_side_effects")
         connection.execute("DROP TABLE cayu_session_message_queue")
         connection.execute("PRAGMA user_version = 18")
         connection.commit()
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 19"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 20"):
         SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
     task_store = SQLiteTaskStore(
@@ -928,10 +930,29 @@ def test_sqlite_revision_nineteen_migrates_durable_session_message_queue(tmp_pat
         revision = connection.execute(
             "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 19"
         ).fetchone()
+        handoff_table = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'cayu_persisted_event_side_effects'"
+        ).fetchone()
+        handoff_revision = connection.execute(
+            "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 20"
+        ).fetchone()
+        legacy_writer_trigger = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'cayu_events_enqueue_persisted_side_effect'"
+        ).fetchone()
+        retention_guard = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'cayu_protect_undelivered_event_side_effects'"
+        ).fetchone()
     finally:
         connection.close()
     assert table == ("cayu_session_message_queue",)
     assert revision == ("breaking", 19)
+    assert handoff_table == ("cayu_persisted_event_side_effects",)
+    assert handoff_revision == ("additive", 19)
+    assert legacy_writer_trigger is None
+    assert retention_guard == ("cayu_protect_undelivered_event_side_effects",)
 
 
 def test_sqlite_session_store_revision_thirteen_requires_run_fencing_migration(tmp_path):
@@ -961,7 +982,7 @@ def test_sqlite_session_store_revision_thirteen_requires_run_fencing_migration(t
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 19"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 20"):
         SQLiteSessionStore(db_path)
 
     reopened = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
@@ -1000,7 +1021,7 @@ def test_sqlite_session_store_revision_fourteen_requires_cascade_index_migration
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 19"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 20"):
         SQLiteSessionStore(db_path)
 
     reopened = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
@@ -1095,7 +1116,7 @@ def test_sqlite_session_store_revision_sixteen_requires_pending_action_index(tmp
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 19"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 20"):
         SQLiteSessionStore(db_path)
 
     reopened = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
@@ -1281,7 +1302,7 @@ def test_sqlite_revision_seventeen_requires_session_operation_migration(tmp_path
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 19"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 20"):
         SQLiteSessionStore(db_path)
 
     migrated = SQLiteSessionStore(
@@ -1647,7 +1668,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         "status_reason",
         "status_payload_json",
     }.issubset(task_columns)
-    # Revisions 2-7 and 11-16 are additive. Revisions 17-19 change atomic
+    # Revisions 2-7, 11-16, and 20 are additive. Revisions 17-19 change atomic
     # writer/lifecycle contracts and therefore each raises the compatibility floor.
     assert revisions == [(rev.revision, rev.compatible_from) for rev in schema_migrations.REVISIONS]
     assert revisions == [
@@ -1670,6 +1691,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (17, 17),
         (18, 18),
         (19, 19),
+        (20, 19),
     ]
     assert version == schema_migrations.LATEST_REVISION
 
@@ -2251,6 +2273,18 @@ def test_sqlite_prune_events_bounds_growth(tmp_path):
         new = _make_event(session.id, seq=2, timestamp=datetime(2026, 3, 1, tzinfo=UTC))
         await store.append_events(session.id, [old, new])
 
+        # Retention cannot erase an event whose required side effects are still
+        # pending, failed, leased, or dead-lettered.
+        assert (
+            await store.prune_events(before=datetime(2026, 2, 1, tzinfo=UTC), session_id=session.id)
+            == 0
+        )
+        old_claim = await store.claim_persisted_event_side_effect(
+            session_id=session.id,
+            event_id=old.id,
+        )
+        assert old_claim is not None
+        await store.mark_persisted_event_side_effect_delivered(old_claim)
         deleted = await store.prune_events(
             before=datetime(2026, 2, 1, tzinfo=UTC), session_id=session.id
         )
@@ -2265,11 +2299,205 @@ def test_sqlite_prune_events_bounds_growth(tmp_path):
             await store.prune_events(before="2026-02-01")  # type: ignore[arg-type]
 
         # A store-wide prune (no session_id) drops the rest.
+        new_claim = await store.claim_persisted_event_side_effect(
+            session_id=session.id,
+            event_id=new.id,
+        )
+        assert new_claim is not None
+        await store.mark_persisted_event_side_effect_delivered(new_claim)
         assert await store.prune_events(before=datetime(2026, 4, 1, tzinfo=UTC)) == 1
         assert await store.load_events(session.id) == []
         await _close(store)
 
     asyncio.run(run())
+
+
+def test_sqlite_revision_twenty_protects_handoffs_from_revision_nineteen_prune(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "sessions.sqlite"
+    store = SQLiteSessionStore(db_path)
+
+    async def prepare() -> tuple[str, str]:
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_rolling_prune",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=_identity(),
+        )
+        event = _make_event(
+            session.id,
+            seq=1,
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        await store.append_event(session.id, event)
+        await _close(store)
+        return session.id, event.id
+
+    session_id, event_id = asyncio.run(prepare())
+
+    connection = sqlite3.connect(db_path)
+    try:
+        # This is the revision-19 retention shape: it knows nothing about the
+        # revision-20 handoff table. The database trigger must preserve the row.
+        connection.execute(
+            "DELETE FROM cayu_events WHERE timestamp < ?",
+            ("2026-02-01T00:00:00+00:00",),
+        )
+        connection.commit()
+        assert connection.execute(
+            "SELECT event_id FROM cayu_events WHERE session_id = ?",
+            (session_id,),
+        ).fetchall() == [(event_id,)]
+    finally:
+        connection.close()
+
+    reopened = SQLiteSessionStore(db_path)
+
+    async def deliver() -> None:
+        claim = await reopened.claim_persisted_event_side_effect(
+            session_id=session_id,
+            event_id=event_id,
+        )
+        assert claim is not None
+        await reopened.mark_persisted_event_side_effect_delivered(claim)
+        await _close(reopened)
+
+    asyncio.run(deliver())
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(
+            "DELETE FROM cayu_events WHERE timestamp < ?",
+            ("2026-02-01T00:00:00+00:00",),
+        )
+        connection.commit()
+        assert connection.execute("SELECT event_id FROM cayu_events").fetchall() == []
+    finally:
+        connection.close()
+
+
+def test_sqlite_side_effect_deadlines_start_after_write_lock_acquisition(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    class StoreClock(datetime):
+        current = datetime(2026, 7, 16, 10, 0, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current
+
+    db_path = tmp_path / "side-effect-deadlines.sqlite"
+    store = SQLiteSessionStore(db_path)
+
+    async def run() -> None:
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_side_effect_deadlines",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=_identity(),
+        )
+        event = _make_event(session.id, seq=1, timestamp=StoreClock.current)
+        await store.append_event(session.id, event)
+        monkeypatch.setattr("cayu.storage.sqlite.datetime", StoreClock)
+        begin_seen = threading.Event()
+        store._connection.set_trace_callback(
+            lambda statement: begin_seen.set() if statement == "BEGIN IMMEDIATE" else None
+        )
+        blocker = sqlite3.connect(db_path)
+
+        try:
+            blocker.execute("BEGIN IMMEDIATE")
+            claim_task = asyncio.create_task(
+                store.claim_persisted_event_side_effect(
+                    session_id=session.id,
+                    event_id=event.id,
+                    lease_seconds=30,
+                )
+            )
+            assert await asyncio.to_thread(begin_seen.wait, 1)
+            StoreClock.current += timedelta(minutes=1)
+            blocker.commit()
+            claim = await claim_task
+            assert claim is not None
+            assert claim.lease_expires_at == StoreClock.current + timedelta(seconds=30)
+            assert (
+                await store.claim_persisted_event_side_effect(
+                    session_id=session.id,
+                    event_id=event.id,
+                )
+                is None
+            )
+
+            begin_seen.clear()
+            blocker.execute("BEGIN IMMEDIATE")
+            failure_task = asyncio.create_task(
+                store.mark_persisted_event_side_effect_failed(
+                    claim,
+                    error="try later",
+                    max_attempts=3,
+                    retry_delay_seconds=30,
+                )
+            )
+            assert await asyncio.to_thread(begin_seen.wait, 1)
+            StoreClock.current += timedelta(minutes=1)
+            blocker.commit()
+            failed = await failure_task
+            assert failed.updated_at == StoreClock.current
+            assert failed.next_attempt_at == StoreClock.current + timedelta(seconds=30)
+            assert (
+                await store.claim_persisted_event_side_effect(
+                    session_id=session.id,
+                    event_id=event.id,
+                )
+                is None
+            )
+        finally:
+            blocker.rollback()
+            blocker.close()
+            store._connection.set_trace_callback(None)
+            await _close(store)
+
+    asyncio.run(run())
+
+
+def test_sqlite_handoff_protection_allows_session_delete_cascade(tmp_path) -> None:
+    db_path = tmp_path / "sessions.sqlite"
+    store = SQLiteSessionStore(db_path)
+
+    async def run() -> None:
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_handoff_delete",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=_identity(),
+        )
+        await store.append_event(
+            session.id,
+            _make_event(session.id, seq=1, timestamp=datetime(2026, 1, 1, tzinfo=UTC)),
+        )
+        await store.delete_session(session.id)
+        await _close(store)
+
+    asyncio.run(run())
+
+    connection = sqlite3.connect(db_path)
+    try:
+        assert connection.execute("SELECT id FROM cayu_sessions").fetchall() == []
+        assert connection.execute("SELECT event_id FROM cayu_events").fetchall() == []
+        assert (
+            connection.execute("SELECT event_id FROM cayu_persisted_event_side_effects").fetchall()
+            == []
+        )
+    finally:
+        connection.close()
 
 
 def test_sqlite_compact_transcript_keeps_recent_messages(tmp_path):

@@ -92,3 +92,18 @@ def test_revision_nineteen_rejects_pre_queue_session_workers() -> None:
         app_latest=19,
         app_min_supported=19,
     )
+
+
+def test_revision_twenty_side_effect_handoff_is_rolling_deploy_compatible() -> None:
+    state = m.SchemaState(revision=20, compatible_from=19)
+
+    m.validate(
+        state,
+        app_latest=19,
+        app_min_supported=19,
+    )
+    m.validate(
+        state,
+        app_latest=20,
+        app_min_supported=20,
+    )

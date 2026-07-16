@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
 from abc import ABC, abstractmethod
 from bisect import bisect_left, bisect_right
 from collections import deque
 from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any, Literal
 from uuid import uuid4
@@ -61,6 +62,10 @@ class SessionStatusConflict(ValueError):
 
 class SessionRunFenced(RuntimeError):
     """A durable write was rejected because its run no longer owns the session epoch."""
+
+
+class PersistedEventSideEffectClaimLost(RuntimeError):
+    """A side-effect acknowledgement lost ownership to a replacement claim."""
 
 
 class SessionQueuedMessagesPending(RuntimeError):
@@ -1057,6 +1062,78 @@ class EventRecord(BaseModel):
         return copy_event(value)
 
 
+class PersistedEventSideEffectStatus(StrEnum):
+    PENDING = "pending"
+    LEASED = "leased"
+    DELIVERED = "delivered"
+    FAILED = "failed"
+    DEAD_LETTERED = "dead_lettered"
+
+
+class PersistedEventSideEffectClaim(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    event_id: str
+    event_sequence: StrictInt = Field(ge=1)
+    event: Event
+    attempt: StrictInt = Field(ge=1)
+    claim_id: str = Field(default_factory=lambda: str(uuid4()))
+    lease_expires_at: datetime
+
+    @field_validator("session_id", "event_id", "claim_id")
+    @classmethod
+    def validate_clean_strings(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("event")
+    @classmethod
+    def copy_claim_event(cls, value: Event) -> Event:
+        return copy_event(value)
+
+    @field_validator("lease_expires_at")
+    @classmethod
+    def normalize_lease_expires_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("lease_expires_at must be timezone-aware.")
+        return value.astimezone(UTC)
+
+
+class PersistedEventSideEffectDelivery(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    event_id: str
+    event_sequence: StrictInt = Field(ge=1)
+    status: PersistedEventSideEffectStatus
+    attempts: StrictInt = Field(default=0, ge=0)
+    claim_id: str | None = None
+    lease_expires_at: datetime | None = None
+    next_attempt_at: datetime | None = None
+    last_error: str | None = None
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @field_validator("session_id", "event_id", "claim_id", "last_error")
+    @classmethod
+    def validate_optional_strings(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        if info.field_name == "last_error":
+            if not value.strip():
+                raise ValueError("last_error cannot be blank.")
+            return value
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("lease_expires_at", "next_attempt_at", "updated_at")
+    @classmethod
+    def normalize_delivery_timestamp(cls, value: datetime | None, info) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(f"{info.field_name} must be timezone-aware.")
+        return value.astimezone(UTC)
+
+
 class PendingActionQuery(BaseModel):
     """Bounded query for durable control-plane actions blocking a session."""
 
@@ -1805,6 +1882,57 @@ class SessionStore(ABC):
         """Append events to a session in one durable batch."""
 
     @abstractmethod
+    async def claim_persisted_event_side_effect(
+        self,
+        *,
+        session_id: str | None = None,
+        event_id: str | None = None,
+        lease_seconds: float = 300.0,
+    ) -> PersistedEventSideEffectClaim | None:
+        """Claim the oldest eligible persisted event side-effect handoff."""
+
+    @abstractmethod
+    async def get_persisted_event_side_effect_delivery(
+        self,
+        *,
+        session_id: str,
+        event_id: str,
+    ) -> PersistedEventSideEffectDelivery | None:
+        """Load one persisted event side-effect handoff by event identity."""
+
+    @abstractmethod
+    async def mark_persisted_event_side_effect_delivered(
+        self,
+        claim: PersistedEventSideEffectClaim,
+    ) -> PersistedEventSideEffectDelivery:
+        """Mark one claimed event's configured side effects delivered."""
+
+    @abstractmethod
+    async def mark_persisted_event_side_effect_failed(
+        self,
+        claim: PersistedEventSideEffectClaim,
+        *,
+        error: str,
+        max_attempts: int,
+        retry_delay_seconds: float,
+    ) -> PersistedEventSideEffectDelivery:
+        """Release one failed claim for retry or dead-letter it."""
+
+    @abstractmethod
+    async def list_persisted_event_side_effect_deliveries(
+        self,
+        *,
+        statuses: set[PersistedEventSideEffectStatus] | None = None,
+        claimable_only: bool = False,
+        after_sequence: int | None = None,
+        limit: int = 100,
+    ) -> list[PersistedEventSideEffectDelivery]:
+        """Inspect persisted side-effect delivery state in event order.
+
+        ``claimable_only`` excludes terminal deliveries and live leases.
+        """
+
+    @abstractmethod
     async def enqueue_session_message(
         self,
         request: EnqueueSessionMessageRequest,
@@ -2021,6 +2149,9 @@ class InMemorySessionStore(SessionStore):
         self._event_records_by_id: dict[tuple[str, str], EventRecord] = {}
         self._type_event_records: dict[str, list[EventRecord]] = {}
         self._event_ids: dict[str, set[str]] = {}
+        self._persisted_event_side_effect_deliveries: dict[
+            tuple[str, str], PersistedEventSideEffectDelivery
+        ] = {}
         self._next_event_sequence = 1
         self._transcripts: dict[str, list[Message]] = {}
         self._checkpoints: dict[str, dict[str, Any]] = {}
@@ -2276,6 +2407,11 @@ class InMemorySessionStore(SessionStore):
             self._sessions.pop(session_id, None)
             self._events.pop(session_id, None)
             self._event_ids.pop(session_id, None)
+            self._persisted_event_side_effect_deliveries = {
+                key: delivery
+                for key, delivery in self._persisted_event_side_effect_deliveries.items()
+                if key[0] != session_id
+            }
             self._session_event_records.pop(session_id, None)
             self._pending_action_event_records.pop(session_id, None)
             self._pending_action_rebuilt_lookup_ids.pop(session_id, None)
@@ -2563,6 +2699,15 @@ class InMemorySessionStore(SessionStore):
                     by_event_type[event_type] = projected_record
             self._type_event_records.setdefault(event_type, []).append(record)
             existing_ids.add(stored_event.id)
+            if event_type != str(EventType.RUNTIME_SINK_FAILED):
+                self._persisted_event_side_effect_deliveries[(session_id, stored_event.id)] = (
+                    PersistedEventSideEffectDelivery(
+                        session_id=session_id,
+                        event_id=stored_event.id,
+                        event_sequence=record.sequence,
+                        status=PersistedEventSideEffectStatus.PENDING,
+                    )
+                )
         self._next_event_sequence = next_sequence
         if not events:
             return session
@@ -2577,6 +2722,228 @@ class InMemorySessionStore(SessionStore):
                 raise KeyError(f"Session not found: {session_id}")
             _assert_session_run_epoch(session_id, session)
             self._sessions[session_id] = self._append_events_unlocked(session, copied_events)
+
+    async def claim_persisted_event_side_effect(
+        self,
+        *,
+        session_id: str | None = None,
+        event_id: str | None = None,
+        lease_seconds: float = 300.0,
+    ) -> PersistedEventSideEffectClaim | None:
+        if session_id is not None:
+            session_id = require_clean_nonblank(session_id, "session_id")
+        if event_id is not None:
+            event_id = require_clean_nonblank(event_id, "event_id")
+        if (session_id is None) != (event_id is None):
+            raise ValueError("session_id and event_id must be supplied together.")
+        if type(lease_seconds) not in {int, float} or lease_seconds <= 0:
+            raise ValueError("lease_seconds must be greater than 0.")
+        async with self._lock:
+            now = datetime.now(UTC)
+            deliveries = sorted(
+                self._persisted_event_side_effect_deliveries.values(),
+                key=lambda delivery: delivery.event_sequence,
+            )
+            for delivery in deliveries:
+                if session_id is not None and (
+                    delivery.session_id != session_id or delivery.event_id != event_id
+                ):
+                    continue
+                if delivery.status in {
+                    PersistedEventSideEffectStatus.DELIVERED,
+                    PersistedEventSideEffectStatus.DEAD_LETTERED,
+                }:
+                    continue
+                if (
+                    delivery.status is PersistedEventSideEffectStatus.LEASED
+                    and delivery.lease_expires_at is not None
+                    and delivery.lease_expires_at > now
+                ):
+                    continue
+                if (
+                    delivery.status is PersistedEventSideEffectStatus.FAILED
+                    and delivery.next_attempt_at is not None
+                    and delivery.next_attempt_at > now
+                ):
+                    continue
+                record = self._event_records_by_id.get((delivery.session_id, delivery.event_id))
+                if record is None:
+                    raise RuntimeError("Persisted side-effect delivery lost its source event.")
+                claim = PersistedEventSideEffectClaim(
+                    session_id=delivery.session_id,
+                    event_id=delivery.event_id,
+                    event_sequence=delivery.event_sequence,
+                    event=record.event,
+                    attempt=delivery.attempts + 1,
+                    lease_expires_at=now + timedelta(seconds=float(lease_seconds)),
+                )
+                self._persisted_event_side_effect_deliveries[
+                    (delivery.session_id, delivery.event_id)
+                ] = delivery.model_copy(
+                    update={
+                        "status": PersistedEventSideEffectStatus.LEASED,
+                        "attempts": claim.attempt,
+                        "claim_id": claim.claim_id,
+                        "lease_expires_at": claim.lease_expires_at,
+                        "next_attempt_at": None,
+                        "last_error": None,
+                        "updated_at": now,
+                    },
+                    deep=True,
+                )
+                return claim
+            return None
+
+    async def get_persisted_event_side_effect_delivery(
+        self,
+        *,
+        session_id: str,
+        event_id: str,
+    ) -> PersistedEventSideEffectDelivery | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        event_id = require_clean_nonblank(event_id, "event_id")
+        async with self._lock:
+            delivery = self._persisted_event_side_effect_deliveries.get((session_id, event_id))
+            return None if delivery is None else delivery.model_copy(deep=True)
+
+    async def mark_persisted_event_side_effect_delivered(
+        self,
+        claim: PersistedEventSideEffectClaim,
+    ) -> PersistedEventSideEffectDelivery:
+        claim = PersistedEventSideEffectClaim.model_validate(claim)
+        async with self._lock:
+            delivery = self._matching_persisted_event_side_effect_claim_unlocked(claim)
+            updated = delivery.model_copy(
+                update={
+                    "status": PersistedEventSideEffectStatus.DELIVERED,
+                    "claim_id": None,
+                    "lease_expires_at": None,
+                    "next_attempt_at": None,
+                    "last_error": None,
+                    "updated_at": datetime.now(UTC),
+                },
+                deep=True,
+            )
+            self._persisted_event_side_effect_deliveries[(claim.session_id, claim.event_id)] = (
+                updated
+            )
+            return updated.model_copy(deep=True)
+
+    async def mark_persisted_event_side_effect_failed(
+        self,
+        claim: PersistedEventSideEffectClaim,
+        *,
+        error: str,
+        max_attempts: int,
+        retry_delay_seconds: float,
+    ) -> PersistedEventSideEffectDelivery:
+        claim = PersistedEventSideEffectClaim.model_validate(claim)
+        if type(error) is not str or not error.strip():
+            raise ValueError("error must be a non-empty string.")
+        if type(max_attempts) is not int or max_attempts < 1:
+            raise ValueError("max_attempts must be an integer greater than or equal to 1.")
+        if (
+            type(retry_delay_seconds) not in {int, float}
+            or not math.isfinite(retry_delay_seconds)
+            or retry_delay_seconds < 0
+        ):
+            raise ValueError("retry_delay_seconds must be a finite non-negative number.")
+        dead_lettered = claim.attempt >= max_attempts
+        async with self._lock:
+            now = datetime.now(UTC)
+            delivery = self._matching_persisted_event_side_effect_claim_unlocked(claim)
+            updated = delivery.model_copy(
+                update={
+                    "status": (
+                        PersistedEventSideEffectStatus.DEAD_LETTERED
+                        if dead_lettered
+                        else PersistedEventSideEffectStatus.FAILED
+                    ),
+                    "claim_id": None,
+                    "lease_expires_at": None,
+                    "next_attempt_at": (
+                        None
+                        if dead_lettered
+                        else now + timedelta(seconds=float(retry_delay_seconds))
+                    ),
+                    "last_error": error,
+                    "updated_at": now,
+                },
+                deep=True,
+            )
+            self._persisted_event_side_effect_deliveries[(claim.session_id, claim.event_id)] = (
+                updated
+            )
+            return updated.model_copy(deep=True)
+
+    async def list_persisted_event_side_effect_deliveries(
+        self,
+        *,
+        statuses: set[PersistedEventSideEffectStatus] | None = None,
+        claimable_only: bool = False,
+        after_sequence: int | None = None,
+        limit: int = 100,
+    ) -> list[PersistedEventSideEffectDelivery]:
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000.")
+        if type(claimable_only) is not bool:
+            raise TypeError("claimable_only must be a bool.")
+        if after_sequence is not None and (type(after_sequence) is not int or after_sequence < 0):
+            raise ValueError("after_sequence must be a non-negative integer.")
+        selected_statuses = (
+            None
+            if statuses is None
+            else {PersistedEventSideEffectStatus(status) for status in statuses}
+        )
+        async with self._lock:
+            now = datetime.now(UTC)
+            deliveries = sorted(
+                self._persisted_event_side_effect_deliveries.values(),
+                key=lambda delivery: delivery.event_sequence,
+            )
+            return [
+                delivery.model_copy(deep=True)
+                for delivery in deliveries
+                if after_sequence is None or delivery.event_sequence > after_sequence
+                if selected_statuses is None or delivery.status in selected_statuses
+                if not claimable_only
+                or (
+                    delivery.status
+                    in {
+                        PersistedEventSideEffectStatus.PENDING,
+                        PersistedEventSideEffectStatus.FAILED,
+                    }
+                    and (
+                        delivery.status is not PersistedEventSideEffectStatus.FAILED
+                        or delivery.next_attempt_at is None
+                        or delivery.next_attempt_at <= now
+                    )
+                )
+                or (
+                    delivery.status is PersistedEventSideEffectStatus.LEASED
+                    and delivery.lease_expires_at is not None
+                    and delivery.lease_expires_at <= now
+                )
+            ][:limit]
+
+    def _matching_persisted_event_side_effect_claim_unlocked(
+        self,
+        claim: PersistedEventSideEffectClaim,
+    ) -> PersistedEventSideEffectDelivery:
+        delivery = self._persisted_event_side_effect_deliveries.get(
+            (claim.session_id, claim.event_id)
+        )
+        if delivery is None:
+            raise ValueError("Persisted event side-effect delivery was not found.")
+        if (
+            delivery.status is not PersistedEventSideEffectStatus.LEASED
+            or delivery.claim_id != claim.claim_id
+            or delivery.attempts != claim.attempt
+        ):
+            raise PersistedEventSideEffectClaimLost(
+                "Persisted event side-effect claim is no longer active."
+            )
+        return delivery
 
     async def enqueue_session_message(
         self,

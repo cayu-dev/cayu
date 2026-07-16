@@ -21,8 +21,9 @@ Usage::
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from math import isfinite
 from pathlib import Path
@@ -68,6 +69,10 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+_PERSISTED_EVENT_SIDE_EFFECT_RECOVERY_INTERVAL_SECONDS = 30.0
+_PERSISTED_EVENT_SIDE_EFFECT_RECOVERY_BATCH_SIZE = 1000
+_DEFAULT_EVENT_SIDE_EFFECT_STARTUP_TIMEOUT_SECONDS = 30.0
+
 
 def create_server(
     app: CayuApp,
@@ -84,6 +89,9 @@ def create_server(
     replay_idle_timeout_s: float = 300.0,
     startup_recovery_statuses: set[SessionStatus] | None = None,
     recovery_inactive_after_seconds: int = 300,
+    event_side_effect_startup_timeout_seconds: float = (
+        _DEFAULT_EVENT_SIDE_EFFECT_STARTUP_TIMEOUT_SECONDS
+    ),
     interruption_shutdown_grace_seconds: float = 10.0,
     **fastapi_kwargs: Any,
 ) -> Any:
@@ -126,6 +134,9 @@ def create_server(
             ``running`` only when the deployment boundary proves they are abandoned.
         recovery_inactive_after_seconds: Minimum inactivity required before the
             startup sweep atomically fences and recovers a session.
+        event_side_effect_startup_timeout_seconds: Maximum startup wait for
+            persisted event side-effect recovery. Unfinished durable handoffs
+            remain eligible for the lifecycle-managed recovery loop.
         interruption_shutdown_grace_seconds: Maximum server-shutdown wait for
             accepted background interruption cascades.
         **fastapi_kwargs: Additional kwargs passed to FastAPI().
@@ -140,8 +151,13 @@ def create_server(
         )
     if type(recovery_inactive_after_seconds) is not int or recovery_inactive_after_seconds < 0:
         raise ValueError("recovery_inactive_after_seconds must be a non-negative integer.")
-    interruption_shutdown_grace_seconds = _validate_interruption_shutdown_grace_seconds(
-        interruption_shutdown_grace_seconds
+    event_side_effect_startup_timeout_seconds = _validate_positive_seconds(
+        event_side_effect_startup_timeout_seconds,
+        "event_side_effect_startup_timeout_seconds",
+    )
+    interruption_shutdown_grace_seconds = _validate_positive_seconds(
+        interruption_shutdown_grace_seconds,
+        "interruption_shutdown_grace_seconds",
     )
 
     docs_enabled = dev if expose_docs is None else expose_docs
@@ -153,7 +169,11 @@ def create_server(
             statuses=startup_recovery_statuses
         ).statuses
 
-    async def recover_incomplete_sessions() -> None:
+    async def recover_startup_state() -> None:
+        await _recover_persisted_event_side_effects_during_startup(
+            app,
+            timeout_s=event_side_effect_startup_timeout_seconds,
+        )
         if recovery_statuses is not None:
             await app.recover_incomplete_sessions(
                 IncompleteSessionsRecoveryRequest(
@@ -171,11 +191,14 @@ def create_server(
 
     @asynccontextmanager
     async def cayu_lifespan(server):
+        side_effect_recovery_task: asyncio.Task[None] | None = None
         if user_lifespan is None:
             try:
-                await recover_incomplete_sessions()
+                await recover_startup_state()
+                side_effect_recovery_task = _start_persisted_event_side_effect_recovery(app)
                 yield
             finally:
+                await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
                 await _drain_background_interruptions(
                     app,
                     timeout_s=interruption_shutdown_grace_seconds,
@@ -183,9 +206,11 @@ def create_server(
             return
         async with user_lifespan(server) as state:
             try:
-                await recover_incomplete_sessions()
+                await recover_startup_state()
+                side_effect_recovery_task = _start_persisted_event_side_effect_recovery(app)
                 yield state
             finally:
+                await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
                 await _drain_background_interruptions(
                     app,
                     timeout_s=interruption_shutdown_grace_seconds,
@@ -258,6 +283,9 @@ def mount_cayu(
     dev: bool = False,
     dashboard_config: dict[str, Any] | None = None,
     replay_idle_timeout_s: float = 300.0,
+    event_side_effect_startup_timeout_seconds: float = (
+        _DEFAULT_EVENT_SIDE_EFFECT_STARTUP_TIMEOUT_SECONDS
+    ),
     interruption_shutdown_grace_seconds: float = 10.0,
     interruption_recovery_inactive_after_seconds: int = 300,
     name: str = "cayu-dashboard",
@@ -266,10 +294,10 @@ def mount_cayu(
 
     This is the high-level adapter for product apps that already own their
     server. It mounts API routes at ``{path}/api`` and the dashboard shell at
-    ``{path}``, so the browser can use one same-origin product path. Its
-    composed lifespan recovers cascade parents inactive for at least
-    ``interruption_recovery_inactive_after_seconds`` and drains accepted
-    background interruption cascades for up to
+    ``{path}``, so the browser can use one same-origin product path. Its composed
+    lifespan recovers persisted event side effects, then cascade parents
+    inactive for at least ``interruption_recovery_inactive_after_seconds``, and
+    drains accepted background interruption cascades for up to
     ``interruption_shutdown_grace_seconds`` before the host shuts down.
     """
     if auth is None and not dev:
@@ -277,8 +305,13 @@ def mount_cayu(
             "mount_cayu requires auth=... for protected deployments. "
             "Pass dev=True only for local development or tests."
         )
-    interruption_shutdown_grace_seconds = _validate_interruption_shutdown_grace_seconds(
-        interruption_shutdown_grace_seconds
+    event_side_effect_startup_timeout_seconds = _validate_positive_seconds(
+        event_side_effect_startup_timeout_seconds,
+        "event_side_effect_startup_timeout_seconds",
+    )
+    interruption_shutdown_grace_seconds = _validate_positive_seconds(
+        interruption_shutdown_grace_seconds,
+        "interruption_shutdown_grace_seconds",
     )
     if (
         type(interruption_recovery_inactive_after_seconds) is not int
@@ -292,6 +325,7 @@ def mount_cayu(
         app,
         timeout_s=interruption_shutdown_grace_seconds,
         recovery_inactive_after_seconds=interruption_recovery_inactive_after_seconds,
+        side_effect_startup_timeout_s=event_side_effect_startup_timeout_seconds,
     )
 
     mount_path = _normalize_dashboard_path(path, api_path=None)
@@ -367,14 +401,14 @@ def mount_dashboard(
     return True
 
 
-def _validate_interruption_shutdown_grace_seconds(value: float) -> float:
+def _validate_positive_seconds(value: float, field_name: str) -> float:
     if (
         isinstance(value, bool)
         or not isinstance(value, (int, float))
         or not isfinite(value)
         or value <= 0
     ):
-        raise ValueError("interruption_shutdown_grace_seconds must be a finite positive number.")
+        raise ValueError(f"{field_name} must be a finite positive number.")
     return float(value)
 
 
@@ -391,25 +425,98 @@ async def _drain_background_interruptions(app: CayuApp, *, timeout_s: float) -> 
         )
 
 
+async def _recover_persisted_event_side_effects_until_idle(app: CayuApp) -> None:
+    while True:
+        recovered = await app.recover_persisted_event_side_effects(
+            limit=_PERSISTED_EVENT_SIDE_EFFECT_RECOVERY_BATCH_SIZE
+        )
+        # Failed deliveries receive a durable retry deadline and are omitted
+        # from the result. Check the store once more before declaring the
+        # backlog idle so a full page of poison events cannot strand later work.
+        if recovered:
+            continue
+        remaining = await app.session_store.list_persisted_event_side_effect_deliveries(
+            claimable_only=True,
+            limit=1,
+        )
+        if not remaining:
+            return
+
+
+async def _recover_persisted_event_side_effects_during_startup(
+    app: CayuApp,
+    *,
+    timeout_s: float,
+) -> None:
+    timeout = asyncio.timeout(timeout_s)
+    try:
+        async with timeout:
+            await _recover_persisted_event_side_effects_until_idle(app)
+    except TimeoutError:
+        if not timeout.expired():
+            raise
+        logger.warning(
+            "Persisted event side-effect startup recovery exceeded %.3fs; "
+            "unfinished durable handoffs will remain eligible for background recovery.",
+            timeout_s,
+        )
+
+
+async def _recover_persisted_event_side_effects_forever(app: CayuApp) -> None:
+    while True:
+        await asyncio.sleep(_PERSISTED_EVENT_SIDE_EFFECT_RECOVERY_INTERVAL_SECONDS)
+        try:
+            await _recover_persisted_event_side_effects_until_idle(app)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Failed to recover persisted event side effects.")
+
+
+def _start_persisted_event_side_effect_recovery(app: CayuApp) -> asyncio.Task[None]:
+    return asyncio.create_task(
+        _recover_persisted_event_side_effects_forever(app),
+        name="cayu-persisted-event-side-effect-recovery",
+    )
+
+
+async def _stop_persisted_event_side_effect_recovery(
+    task: asyncio.Task[None] | None,
+) -> None:
+    if task is None:
+        return
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+
+
 def _compose_interruption_drain_lifespan(
     server: Any,
     app: CayuApp,
     *,
     timeout_s: float,
     recovery_inactive_after_seconds: int,
+    side_effect_startup_timeout_s: float,
 ) -> None:
     existing_lifespan = server.router.lifespan_context
 
     @asynccontextmanager
     async def lifespan(server_app):
         async with existing_lifespan(server_app) as state:
+            side_effect_recovery_task: asyncio.Task[None] | None = None
             try:
+                await _recover_persisted_event_side_effects_during_startup(
+                    app,
+                    timeout_s=side_effect_startup_timeout_s,
+                )
                 await app.resume_pending_interruption_cascades(
                     interrupting_inactive_before=datetime.now(UTC)
                     - timedelta(seconds=recovery_inactive_after_seconds)
                 )
+                side_effect_recovery_task = _start_persisted_event_side_effect_recovery(app)
                 yield state
             finally:
+                await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
                 await _drain_background_interruptions(app, timeout_s=timeout_s)
 
     server.router.lifespan_context = lifespan

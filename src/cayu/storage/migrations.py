@@ -137,6 +137,12 @@ REVISIONS: tuple[Revision, ...] = (
     # stranding that input. Raise the compatibility floor so mixed-version
     # session workers cannot share a revision-19 database.
     Revision(revision=19, kind=RevisionKind.BREAKING, compatible_from=19),
+    # Persist one delivery handoff beside every new runtime event so budget and
+    # sink fan-out can resume after a process loss. Revision-20 writers insert
+    # it in the event transaction; older writers ignore the new table and keep
+    # their existing live fan-out, so the schema remains additive and preserves
+    # revision 19's compatibility floor.
+    Revision(revision=20, kind=RevisionKind.ADDITIVE, compatible_from=19),
 )
 
 #: The revision an empty database is initialized to.

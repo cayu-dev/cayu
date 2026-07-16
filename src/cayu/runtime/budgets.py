@@ -480,7 +480,12 @@ class BudgetStore(ABC):
 
     @abstractmethod
     async def append_event(self, event: Event) -> None:
-        """Observe one cost-bearing runtime event for budget accounting."""
+        """Observe one cost-bearing event, idempotently by session and event id.
+
+        Runtime delivery is at-least-once across crashes. Implementations must
+        return without adding a second charge when the same immutable event is
+        retried, and reject a conflicting event with the same identity.
+        """
 
     @abstractmethod
     async def load_events_for_budget(
@@ -564,11 +569,22 @@ class InMemoryBudgetStore(BudgetStore):
 
     def __init__(self) -> None:
         self._events: list[Event] = []
+        self._events_by_id: dict[tuple[str, str], Event] = {}
         self._lock = asyncio.Lock()
 
     async def append_event(self, event: Event) -> None:
         copied = copy_event(event)
         async with self._lock:
+            identity = (copied.session_id, copied.id)
+            existing = self._events_by_id.get(identity)
+            if existing is not None:
+                if existing != copied:
+                    raise ValueError(
+                        "Budget event identity was reused with conflicting contents: "
+                        f"{copied.session_id}/{copied.id}"
+                    )
+                return
+            self._events_by_id[identity] = copied
             self._events.append(copied)
 
     async def load_events_for_budget(

@@ -31,9 +31,23 @@ from cayu import (
 from cayu.core import Event, EventType
 from cayu.observability import otel
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.runtime import InMemorySessionStore, SessionIdentity
+from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime.budgets import InMemoryBudgetStore
+from cayu.runtime.event_sinks import EventSink
 
 REMOTE_TRACE_ID = "11111111111111111111111111111111"
 REMOTE_TRACEPARENT = f"00-{REMOTE_TRACE_ID}-2222222222222222-01"
+
+
+class _FailModelStartOnceSink(EventSink):
+    def __init__(self) -> None:
+        self._failed = False
+
+    async def emit(self, event: Event) -> None:
+        if event.type == EventType.MODEL_STARTED and not self._failed:
+            self._failed = True
+            raise RuntimeError("transient sibling sink failure")
 
 
 class FakeProvider(ModelProvider):
@@ -573,6 +587,146 @@ def test_duplicate_model_started_closes_the_previous_span() -> None:
     # Both model spans are closed exactly once (the first on the duplicate START).
     names = sorted(span.name for span in exporter.get_finished_spans())
     assert names == ["cayu.session", "chat a", "chat b"]
+
+
+def test_aggregate_sink_retry_does_not_duplicate_model_span(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "cayu.runtime._event_writer._PERSISTED_SIDE_EFFECT_RETRY_DELAY_SECONDS",
+        0,
+    )
+    exporter, sink = _make_sink()
+
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_retry",
+                messages=[Message.text("user", "go")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        writer = RuntimeEventWriter(
+            session_store=store,
+            budget_store=InMemoryBudgetStore(),
+            event_sinks=[sink, _FailModelStartOnceSink()],
+        )
+        await writer.emit(
+            Event(type=EventType.SESSION_STARTED, session_id="sess_retry", payload={})
+        )
+        started = await writer.emit(
+            Event(
+                type=EventType.MODEL_STARTED,
+                session_id="sess_retry",
+                payload={"model": "fake-model", "step": 0},
+            )
+        )
+        recovered = await writer.recover_persisted_side_effects()
+        assert [event.id for event in recovered] == [started.id]
+        await writer.emit(
+            Event(type=EventType.MODEL_COMPLETED, session_id="sess_retry", payload={})
+        )
+        await writer.emit(
+            Event(type=EventType.SESSION_COMPLETED, session_id="sess_retry", payload={})
+        )
+
+    asyncio.run(scenario())
+
+    spans = exporter.get_finished_spans()
+    assert [span.name for span in spans] == ["chat fake-model", "cayu.session"]
+    assert "cayu.incomplete" not in spans[0].attributes
+
+
+def test_replaying_completed_trace_is_idempotent() -> None:
+    exporter, sink = _make_sink()
+    events = _session_events("sess_replay")
+
+    _drive(sink, [*events, *events])
+
+    assert sorted(span.name for span in exporter.get_finished_spans()) == [
+        "cayu.session assistant",
+        "chat claude-opus-4-8",
+        "execute_tool exec_command",
+    ]
+    assert sink._sessions == {}
+
+
+def test_out_of_order_noop_span_events_remain_retryable() -> None:
+    exporter, sink = _make_sink()
+    session_started = Event(
+        type=EventType.SESSION_STARTED,
+        session_id="sess_out_of_order",
+        agent_name="assistant",
+        payload={},
+    )
+    model_started = Event(
+        type=EventType.MODEL_STARTED,
+        session_id="sess_out_of_order",
+        payload={"model": "fake-model", "step": 0},
+    )
+    model_completed = Event(
+        type=EventType.MODEL_COMPLETED,
+        session_id="sess_out_of_order",
+        payload={},
+    )
+    tool_started = Event(
+        type=EventType.TOOL_CALL_STARTED,
+        session_id="sess_out_of_order",
+        tool_name="exec_command",
+        payload={"tool_call_id": "call_1"},
+    )
+    tool_completed = Event(
+        type=EventType.TOOL_CALL_COMPLETED,
+        session_id="sess_out_of_order",
+        payload={"tool_call_id": "call_1"},
+    )
+    session_completed = Event(
+        type=EventType.SESSION_COMPLETED,
+        session_id="sess_out_of_order",
+        payload={},
+    )
+
+    _drive(
+        sink,
+        [
+            session_completed,
+            model_completed,
+            tool_completed,
+            session_started,
+            model_started,
+            model_completed,
+            tool_started,
+            tool_completed,
+            session_completed,
+        ],
+    )
+
+    spans = exporter.get_finished_spans()
+    assert sorted(span.name for span in spans) == [
+        "cayu.session assistant",
+        "chat fake-model",
+        "execute_tool exec_command",
+    ]
+    assert all("cayu.incomplete" not in span.attributes for span in spans)
+    assert sink._sessions == {}
+
+
+def test_recent_event_identity_cache_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(otel, "_MAX_RECENT_EVENT_IDENTITIES", 2)
+    _, sink = _make_sink()
+    events = [
+        Event(type=EventType.SESSION_STARTED, session_id=f"session_{index}", payload={})
+        for index in range(3)
+    ]
+
+    _drive(sink, events)
+
+    assert list(sink._recent_event_identities) == [
+        (events[1].session_id, events[1].id),
+        (events[2].session_id, events[2].id),
+    ]
 
 
 def test_colon_namespaced_session_ids_do_not_collide() -> None:
