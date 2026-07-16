@@ -133,7 +133,7 @@ class DeployServiceTool(Tool):
             "required": ["service", "release", "expected_version"],
             "additionalProperties": False,
         },
-        effect=ToolEffect.EXTERNAL,
+        effect=ToolEffect.IDEMPOTENT,
     )
 
     def __init__(self, state: DeploymentState) -> None:

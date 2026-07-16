@@ -80,6 +80,12 @@ layer, not the only tool model). You have two composable options:
    `connect_mcp_toolset` — zero custom tool code. See the recipe and the README's
    "Streamable HTTP MCP" section.
 
+`GetPRDiffTool` declares `ToolEffect.NONE` because its GitHub requests only read
+PR state. `PostPRCommentTool` remains `ToolEffect.EXTERNAL`: its per-session
+marker avoids duplicate comments when an earlier comment is already visible,
+but GitHub does not provide an atomic idempotency contract for comment creation.
+Credential and tool policy remain independent authorization boundaries.
+
 ## Making it genuinely cloud
 
 Swap `LocalRunner`/`LocalWorkspace` in `PRReviewWorkspaceFactory` for

@@ -39,6 +39,7 @@ _WHEEL_REQUIRED = {
     "cayu/guides/application-anatomy.md",
     "cayu/guides/authoring.md",
     "cayu/guides/diagnostics.md",
+    "cayu/guides/tool-effects.md",
     "cayu/server/dashboard/index.html",
 }
 _FORBIDDEN_PARTS = {".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".venv", "dist"}

@@ -8,6 +8,7 @@ _GUIDES = {
     "anatomy": "application-anatomy.md",
     "authoring": "authoring.md",
     "diagnostics": "diagnostics.md",
+    "tool-effects": "tool-effects.md",
 }
 _INCLUDES = {
     "<!-- cayu-guide-include:pytest-selector -->": (

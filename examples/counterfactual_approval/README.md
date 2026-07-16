@@ -26,3 +26,8 @@ external mutation, rebuilds the application around the same session store, and
 uses `recover_tool_approval` plus the external receipt to continue without
 executing the protected action twice. Only `resolve_tool_approval` can authorize
 the first execution.
+
+`DeployServiceTool` declares `ToolEffect.IDEMPOTENT` because it passes Cayu's
+stable runtime idempotency key downstream and reuses the receipt for that key.
+Its `AlwaysRequireApprovalToolPolicy` remains independent: replay safety does
+not authorize the first deployment or remove the human approval boundary.

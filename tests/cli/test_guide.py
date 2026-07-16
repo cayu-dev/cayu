@@ -14,6 +14,7 @@ def test_package_shipped_authoring_and_diagnostic_guides_are_discoverable(capsys
     assert "workflow_tool_names" in authoring
     assert "registered for that same agent" in authoring
     assert "cannot prove prompt comprehension" in authoring
+    assert "cayu guide tool-effects" in authoring
 
     assert main(["guide", "diagnostics"]) == 0
     diagnostics = capsys.readouterr().out
@@ -39,3 +40,19 @@ def test_package_shipped_application_anatomy_guide_is_discoverable(capsys) -> No
         "Test",
     ):
         assert role in anatomy
+
+
+def test_package_shipped_tool_effect_guide_renders_canonical_decisions(capsys) -> None:
+    assert main(["guide", "tool-effects"]) == 0
+    guidance = capsys.readouterr().out
+    normalized = guidance.casefold()
+
+    assert "# Choosing a ToolEffect" in guidance
+    assert "public http read" in normalized
+    assert "`NONE`" in guidance
+    assert "paid or logged read" in normalized
+    assert "stable downstream idempotency key" in normalized
+    assert "stable operation identity or equivalent idempotency contract" in normalized
+    assert "durable snapshot or artifact" in normalized
+    assert "outcome is unknown after a timeout" in normalized
+    assert "does not authorize execution" in guidance

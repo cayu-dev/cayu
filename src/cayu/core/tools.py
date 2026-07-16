@@ -24,9 +24,15 @@ from cayu._validation import copy_json_value, require_clean_nonblank, require_no
 class ToolEffect(StrEnum):
     """Declared side-effect semantics for a tool execution.
 
-    The runtime uses this as execution metadata, not as an authorization decision:
-    policy still decides whether a call may run. The values describe whether
-    generic runtime retry logic may treat a failed or ambiguous call as retryable.
+    Classify what replay can do to externally meaningful durable state. ``NONE``
+    does not mutate it, ``IDEMPOTENT`` may mutate it but a stable downstream
+    identity or equivalent contract collapses replay, and ``EXTERNAL`` has a
+    non-idempotent or outcome-ambiguous durable mutation. Transport, billing,
+    observability, and names such as "read" do not determine the value.
+
+    The runtime uses this as execution metadata, not as an authorization
+    decision: policy still decides whether a call may run. Run
+    ``cayu guide tool-effects`` for the canonical decision table.
     """
 
     NONE = "none"

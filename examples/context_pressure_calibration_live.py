@@ -37,6 +37,7 @@ from typing import Any
 from cayu import (
     Message,
     ObservedDeltaContextEstimator,
+    ToolEffect,
     ToolSpec,
     estimate_model_request_context_pressure,
     file_attachment,
@@ -212,6 +213,7 @@ def _mixed_model_request(model: str) -> ModelRequest:
                 },
                 "required": ["query", "namespace"],
             },
+            effect=ToolEffect.NONE,
         ).model_dump(mode="json")
     ]
     return ModelRequest(

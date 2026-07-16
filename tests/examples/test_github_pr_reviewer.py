@@ -22,6 +22,7 @@ from cayu import (
     ScriptedModelProvider,
     Task,
     ToolContext,
+    ToolEffect,
 )
 from cayu.vaults import StaticVault
 
@@ -44,6 +45,11 @@ github_tools_mod = importlib.import_module("examples.github_pr_reviewer.github_t
 worker_mod = importlib.import_module("examples.github_pr_reviewer.worker")
 
 _EXPECTED_TOOLS = {"get_pr_diff", "post_pr_comment", "read_file", "list_files", "exec_command"}
+
+
+def test_github_tools_classify_remote_reads_and_non_atomic_comment_creation() -> None:
+    assert mod.GetPRDiffTool.spec.effect is ToolEffect.NONE
+    assert mod.PostPRCommentTool.spec.effect is ToolEffect.EXTERNAL
 
 
 class _GitHubResponse:

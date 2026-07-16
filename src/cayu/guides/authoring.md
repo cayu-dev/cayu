@@ -134,11 +134,15 @@ independent list in prose or tests.
 
 Every tool declares one effect:
 
-- `none`: no externally observable mutation;
-- `idempotent`: an effect whose replay is safe under the domain's idempotency contract;
-- `external`: an effect that may be observable or ambiguous after failure.
+- `none`: no externally meaningful durable mutation;
+- `idempotent`: may mutate durable state, but a stable downstream idempotency
+  key or equivalent contract collapses replay;
+- `external`: non-idempotent or outcome-ambiguous mutation that generic retry
+  must not assume is safe to repeat.
 
-Declaration is metadata, not authorization. External tools require an
+Use `cayu guide tool-effects` for the canonical decision table. Transport,
+billing, observability, and a name such as "read" do not determine the effect.
+Declaration is replay metadata, not authorization. External tools require an
 enforcing `ToolPolicy`; use an approval policy when a person must decide.
 Comments, prompts, UI confirmation, allowlists that are not consulted by the
 runtime, and tests that bypass policy are not enforcement.

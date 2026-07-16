@@ -19,6 +19,7 @@ from cayu import (
     StructuredOutputSpec,
     Tool,
     ToolContext,
+    ToolEffect,
     ToolResult,
     ToolSpec,
 )
@@ -37,6 +38,7 @@ class EchoTool(Tool):
             "required": ["text"],
             "additionalProperties": False,
         },
+        effect=ToolEffect.NONE,
     )
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:

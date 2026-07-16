@@ -31,6 +31,7 @@ from cayu import (
     ThinkingConfig,
     Tool,
     ToolContext,
+    ToolEffect,
     ToolResult,
     ToolResultPart,
     ToolSpec,
@@ -123,6 +124,7 @@ class LoadStableContextTool(Tool):
             "required": ["topic"],
             "additionalProperties": False,
         },
+        effect=ToolEffect.NONE,
     )
 
     def __init__(self, stable_context: str) -> None:

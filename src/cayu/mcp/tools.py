@@ -394,8 +394,11 @@ def _mcp_tool_effect(definition: McpToolDefinition) -> ToolEffect:
     """Map MCP side-effect hints into Cayu execution semantics.
 
     Non-bool spoofed values are ignored. ``readOnlyHint`` wins because a read-only
-    tool has no external side effect to de-duplicate. ``idempotentHint`` marks
-    side effects the downstream system can collapse via an operation identity.
+    tool declares no externally meaningful durable mutation. ``idempotentHint``
+    marks mutation the downstream system can collapse via a stable identity or
+    equivalent idempotency contract. This is the same mutation-and-recovery
+    boundary documented by ``cayu guide tool-effects``; authorization remains
+    separate.
     """
     if definition.annotations.get("readOnlyHint") is True:
         return ToolEffect.NONE

@@ -248,6 +248,7 @@ class EchoTool(Tool):
             "properties": {"text": {"type": "string"}},
             "required": ["text"],
         },
+        effect=ToolEffect.NONE,
     )
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
@@ -286,6 +287,7 @@ class FailingHealthCheckTool(Tool):
             "properties": {"service": {"type": "string"}},
             "required": ["service"],
         },
+        effect=ToolEffect.NONE,
     )
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:

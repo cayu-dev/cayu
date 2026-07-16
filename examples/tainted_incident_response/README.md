@@ -26,3 +26,11 @@ ANTHROPIC_API_KEY=... uv run python -m examples.tainted_incident_response.app --
 
 The safety assertion is the capability boundary and durable taint state—not
 whether the model voluntarily follows a warning in its prompt.
+
+## Independent safety contracts
+
+Reading the stable ticket and sanitizing in memory declare `ToolEffect.NONE`;
+sending a notification and rotating credentials declare `ToolEffect.EXTERNAL`
+because replay can repeat durable mutation. These declarations do not grant
+authority: `TaintAwareToolPolicy` independently enforces it. Run
+`cayu guide tool-effects` for the canonical decision table.

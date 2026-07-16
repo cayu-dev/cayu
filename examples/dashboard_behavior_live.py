@@ -35,6 +35,7 @@ from cayu import (
     ThinkingPart,
     Tool,
     ToolContext,
+    ToolEffect,
     ToolResult,
     ToolSpec,
 )
@@ -119,6 +120,7 @@ class DashboardContractTool(Tool):
             "properties": {"operation": {"type": "string"}},
             "required": ["operation"],
         },
+        effect=ToolEffect.NONE,
     )
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
@@ -214,6 +216,11 @@ class MutationDisconnectFaults:
 
 
 async def main() -> None:
+    require_equal(
+        DashboardContractTool.spec.effect,
+        ToolEffect.NONE,
+        "dashboard contract tool must remain mutation-free",
+    )
     app, provider, store = await _seed_app()
     server_app = MutationDisconnectFaults(create_server(app, dev=True), provider)
     listener = _loopback_listener()

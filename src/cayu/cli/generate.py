@@ -76,7 +76,7 @@ def add_generate_parser(subparsers: Any) -> None:
         "--effect",
         choices=("none", "idempotent", "external"),
         required=True,
-        help="Declared ToolEffect for the generated tool.",
+        help="Declared ToolEffect. See `cayu guide tool-effects` for the decision table.",
     )
     slice_parser.add_argument("--dry-run", action="store_true", help="Plan without writes.")
     slice_parser.add_argument(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import httpx
 
-from cayu import Tool, ToolContext, ToolResult, ToolSpec
+from cayu import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.vaults import SecretRef
 
 GITHUB_API = "https://api.github.com"
@@ -87,6 +87,7 @@ class GetPRDiffTool(Tool):
             },
             "additionalProperties": False,
         },
+        effect=ToolEffect.NONE,
     )
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
@@ -316,6 +317,7 @@ class PostPRCommentTool(Tool):
             "required": ["body"],
             "additionalProperties": False,
         },
+        effect=ToolEffect.EXTERNAL,
     )
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:

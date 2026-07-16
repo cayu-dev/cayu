@@ -12,6 +12,7 @@ from cayu import (
     RunRequest,
     Tool,
     ToolContext,
+    ToolEffect,
     ToolResult,
     ToolSpec,
 )
@@ -60,6 +61,7 @@ class EchoTool(Tool):
             "properties": {"text": {"type": "string"}},
             "required": ["text"],
         },
+        effect=ToolEffect.NONE,
     )
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:

@@ -183,6 +183,7 @@ def test_cayu_new_emits_safe_agent_instructions_and_credential_free_proof(
 
     instructions = (project / "AGENTS.md").read_text(encoding="utf-8")
     assert "cayu guide anatomy" in instructions
+    assert "cayu guide tool-effects" in instructions
     assert "cayu inspect --json" in instructions
     assert "cayu check --json" in instructions
     assert "cayu check --fail-on warning --json" in instructions

@@ -322,6 +322,8 @@ needs. `app.py` is the application factory and explicit registration surface.
 - Setup: `pip install -e '.[console,dev]'` or
   `uv sync --extra console --extra dev`.
 - Application contract: `cayu guide anatomy`.
+- Authoring concepts: `cayu guide authoring`.
+- Tool replay classification: `cayu guide tool-effects`.
 - Inspect/check: `cayu inspect --json` and `cayu check --json`.
 - Safe generation: `cayu generate slice NAME --tool TOOL --effect EFFECT`.
 - Hermetic proof: `pytest` and `cayu eval run MODULE:build_eval`.
@@ -332,8 +334,8 @@ needs. `app.py` is the application factory and explicit registration surface.
 
 1. Clarify users, jobs, triggers, inputs/outputs, autonomy, state, effects,
    approval boundaries, recovery, environments, artifacts, and eval cases.
-   Read `cayu guide anatomy` for the application contract and
-   `cayu guide authoring` when choosing Cayu concepts.
+   Use the package guides above for application structure, concept selection,
+   and tool replay classification.
 2. Run `cayu inspect --json` and `cayu check --json` before editing.
 3. Plan generated edits with
    `cayu generate slice NAME --tool TOOL --effect EFFECT --dry-run --json`.
@@ -351,9 +353,11 @@ private symbols, import-time application construction, or arbitrary Python
 rewriting. Edit user-owned code normally; generated commands may update only
 their delimited registration regions and independent generated files.
 
-Every tool must declare `ToolEffect`. External-effect tools require an enforcing
-policy such as `AlwaysRequireApprovalToolPolicy`; never treat a comment or UI
-confirmation as authorization. Prefer closed JSON schemas.
+Every tool must declare `ToolEffect`; classify durable mutation and replay
+behavior instead of inferring it from transport, price, or a name such as
+"read". Effect metadata does not authorize execution. External-effect tools
+require an enforcing policy such as `AlwaysRequireApprovalToolPolicy`; never
+treat a comment or UI confirmation as authorization. Prefer closed JSON schemas.
 
 Use one constant for each exact tool name across `ToolSpec`, generated workflow
 instructions, `AgentSpec.workflow_tool_names`, tests, and evals. `cayu check`

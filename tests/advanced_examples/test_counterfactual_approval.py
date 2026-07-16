@@ -4,6 +4,31 @@ import asyncio
 from pathlib import Path
 
 from examples.counterfactual_approval.deterministic import run
+from examples.counterfactual_approval.scenario import DeploymentState, DeployServiceTool
+
+from cayu import ToolEffect
+
+
+def test_counterfactual_deployment_effect_matches_its_stable_receipt_contract() -> None:
+    state = DeploymentState()
+    first = state.deploy(
+        service="payments",
+        release="2026.07.11",
+        expected_version=7,
+        idempotency_key="stable-deployment-key",
+    )
+    replay = state.deploy(
+        service="payments",
+        release="2026.07.11",
+        expected_version=7,
+        idempotency_key="stable-deployment-key",
+    )
+
+    assert DeployServiceTool.spec.effect is ToolEffect.IDEMPOTENT
+    assert first.is_error is False
+    assert replay.structured is not None
+    assert replay.structured["receipt_reused"] is True
+    assert state.mutation_count == 1
 
 
 def test_counterfactual_approval_uses_authority_free_futures_before_one_mutation(

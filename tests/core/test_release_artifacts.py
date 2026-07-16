@@ -29,6 +29,7 @@ def _valid_wheel_names() -> set[str]:
         "cayu/guides/application-anatomy.md",
         "cayu/guides/authoring.md",
         "cayu/guides/diagnostics.md",
+        "cayu/guides/tool-effects.md",
         "cayu/server/dashboard/index.html",
         "cayu/server/dashboard/assets/app.js",
         "cayu/server/dashboard/assets/app.css",
@@ -57,6 +58,16 @@ def test_validate_wheel_requires_application_anatomy_guide(tmp_path) -> None:
         ValueError,
         match=r"missing required wheel files: cayu/guides/application-anatomy\.md",
     ):
+        validate_wheel(wheel)
+
+
+def test_validate_wheel_requires_tool_effect_guide(tmp_path) -> None:
+    wheel = tmp_path / "missing-tool-effects-guide.whl"
+    names = _valid_wheel_names()
+    names.remove("cayu/guides/tool-effects.md")
+    _write_wheel(wheel, names)
+
+    with pytest.raises(ValueError, match="missing required wheel files"):
         validate_wheel(wheel)
 
 

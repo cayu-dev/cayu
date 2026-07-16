@@ -20,6 +20,16 @@ def _files(root: Path) -> dict[str, bytes]:
     }
 
 
+def test_generate_slice_effect_help_routes_to_canonical_guide(capsys) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(["generate", "slice", "--help"])
+
+    assert excinfo.value.code == 0
+    output = capsys.readouterr().out
+    assert "{none,idempotent,external}" in output
+    assert "cayu guide tool-effects" in output
+
+
 def test_generate_slice_dry_run_is_deterministic_and_write_free(
     tmp_path: Path,
     monkeypatch,

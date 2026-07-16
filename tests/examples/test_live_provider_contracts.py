@@ -10,7 +10,7 @@ from types import ModuleType
 import pytest
 from jsonschema import Draft202012Validator
 
-from cayu import Event, EventType, ScriptedModelProvider
+from cayu import Event, EventType, ScriptedModelProvider, ToolEffect
 from cayu.embeddings import (
     TextEmbedding,
     TextEmbeddingProvider,
@@ -61,6 +61,17 @@ DEMO_ONLY_EXAMPLES = (
     "subagent_live",
     "subagent_parallel_live",
 )
+
+
+def test_bedrock_echo_tool_declares_its_pure_effect() -> None:
+    assert bedrock_provider_live.EchoTool.spec.effect is ToolEffect.NONE
+
+
+def test_context_pressure_read_tool_declares_none() -> None:
+    example = _load_example("context_pressure_calibration_live")
+    request = example._mixed_model_request("test-model")
+
+    assert request.tools[0]["effect"] == ToolEffect.NONE.value
 
 
 def test_live_example_imports_do_not_modify_process_module_search_path() -> None:

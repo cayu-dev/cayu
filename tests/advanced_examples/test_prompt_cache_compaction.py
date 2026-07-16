@@ -6,9 +6,13 @@ from pathlib import Path
 from examples._advanced_support.runtime import _runtime_failure_summary
 from examples.prompt_cache_compaction.deterministic import run
 from examples.prompt_cache_compaction.live import _thinking_for_model
-from examples.prompt_cache_compaction.scenario import _usage_snapshot_payload
+from examples.prompt_cache_compaction.scenario import LoadStableContextTool, _usage_snapshot_payload
 
-from cayu import Event, EventType
+from cayu import Event, EventType, ToolEffect
+
+
+def test_stable_context_loader_declares_its_read_only_effect() -> None:
+    assert LoadStableContextTool.spec.effect is ToolEffect.NONE
 
 
 def test_runtime_failure_summary_keeps_provider_diagnostics_without_request_data() -> None:
