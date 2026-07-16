@@ -33,10 +33,21 @@ async def prepare_exposed_proxy_binding(
     bind_host: str,
     loop: asyncio.AbstractEventLoop | None,
     proxy_server_factory: ProxyServerFactory,
+    bind_port: int = 0,
 ) -> EgressBinding:
+    if type(bind_port) is not int or not 0 <= bind_port <= 65535:
+        raise ValueError("bind_port must be an integer between 0 and 65535.")
     validate_grant_scope(session_id=session_id, grants=grants)
     resolved_loop = loop or asyncio.get_running_loop()
-    server = proxy_server_factory(broker, loop=resolved_loop, host=bind_host)
+    if bind_port:
+        server = proxy_server_factory(
+            broker,
+            loop=resolved_loop,
+            host=bind_host,
+            port=bind_port,
+        )
+    else:
+        server = proxy_server_factory(broker, loop=resolved_loop, host=bind_host)
     exposed: ExposedProxy | None = None
 
     async def cleanup() -> None:

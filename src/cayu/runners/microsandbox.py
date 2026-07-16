@@ -41,6 +41,7 @@ from cayu.runners.base import (
 DEFAULT_MICROSANDBOX_IMAGE = "python:3.13"
 DEFAULT_MICROSANDBOX_CWD = "/workspace"
 DEFAULT_MICROSANDBOX_REMOVE_TIMEOUT_SECONDS = 5.0
+DEFAULT_MICROSANDBOX_RECONNECT_TIMEOUT_SECONDS = 15.0
 MICROSANDBOX_NAME_MAX_BYTES = 128
 _MICROSANDBOX_REMOVE_INITIAL_BACKOFF_SECONDS = 0.05
 _MICROSANDBOX_REMOVE_MAX_BACKOFF_SECONDS = 0.5
@@ -52,6 +53,10 @@ _MICROSANDBOX_UNAVAILABLE_REMEDIATION = (
 )
 
 MicrosandboxCloseAction = Literal["remove", "stop", "detach", "none"]
+
+
+class MicrosandboxReconnectIdentityError(ValueError):
+    """The provider handle does not match durable reconnect identity."""
 
 
 class MicrosandboxWorkspaceCapability(RunnerWorkspaceCapability):
@@ -324,6 +329,8 @@ class MicrosandboxRunner(Runner):
         remove_timeout_s: float = DEFAULT_MICROSANDBOX_REMOVE_TIMEOUT_SECONDS,
         env_overlay: Mapping[str, str] | None = None,
         sandbox_module: ModuleType | Any | None = None,
+        reconnect_timeout_s: float = DEFAULT_MICROSANDBOX_RECONNECT_TIMEOUT_SECONDS,
+        expected_created_at: float | None = None,
     ) -> MicrosandboxRunner:
         """Attach to an existing Microsandbox sandbox by name.
 
@@ -341,8 +348,23 @@ class MicrosandboxRunner(Runner):
         timeout_policy = validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
         liveness_timeout = _validate_liveness_timeout(liveness_timeout_s)
         removal_timeout = _validate_remove_timeout(remove_timeout_s)
-        handle = await module.Sandbox.get(sandbox_name)
-        sandbox = await handle.connect()
+        reconnect_timeout = _validate_reconnect_timeout(reconnect_timeout_s)
+        try:
+            async with asyncio.timeout(reconnect_timeout):
+                handle = await module.Sandbox.get(sandbox_name)
+                if expected_created_at is not None:
+                    actual_created_at = _validate_provider_created_at(
+                        getattr(handle, "created_at", None)
+                    )
+                    if actual_created_at != expected_created_at:
+                        raise MicrosandboxReconnectIdentityError(
+                            "Microsandbox reconnect provider incarnation does not match."
+                        )
+                sandbox = await handle.connect()
+        except TimeoutError as exc:
+            raise TimeoutError(
+                f"Microsandbox reconnect did not attach within {reconnect_timeout:g} seconds."
+            ) from exc
         return cls(
             sandbox,
             name=sandbox_name,
@@ -360,6 +382,12 @@ class MicrosandboxRunner(Runner):
     @property
     def resource_key(self) -> tuple[object, ...]:
         return ("microsandbox", self.name)
+
+    @property
+    def closed(self) -> bool:
+        """Whether this runner instance has completed its lifecycle action."""
+
+        return self._closed
 
     def workspace_capability(
         self,
@@ -884,6 +912,22 @@ def _validate_remove_timeout(value: float) -> float:
         raise ValueError("MicrosandboxRunner remove_timeout_s must be finite.")
     if value <= 0:
         raise ValueError("MicrosandboxRunner remove_timeout_s must be greater than zero.")
+    return float(value)
+
+
+def _validate_reconnect_timeout(value: float) -> float:
+    if type(value) not in {int, float}:
+        raise TypeError("Microsandbox reconnect timeout must be numeric.")
+    if not isfinite(value) or value <= 0:
+        raise ValueError("Microsandbox reconnect timeout must be finite and greater than zero.")
+    return float(value)
+
+
+def _validate_provider_created_at(value: Any) -> float:
+    if type(value) not in {int, float} or not isfinite(value) or value <= 0:
+        raise MicrosandboxReconnectIdentityError(
+            "Microsandbox provider created_at must be a positive finite number."
+        )
     return float(value)
 
 

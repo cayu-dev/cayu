@@ -14,6 +14,7 @@ from cayu.egress import (
     TransparentEgressBroker,
     UnsupportedEgressAdapter,
     UnsupportedEgressError,
+    UnsupportedEgressReconnectError,
     VirtualCredentialGrant,
     VirtualCredentialRegistry,
 )
@@ -54,6 +55,21 @@ def test_error_message_names_no_downgrade() -> None:
 
     with pytest.raises(UnsupportedEgressError, match="refuse to downgrade to raw secret injection"):
         asyncio.run(adapter.prepare(session_id="sess_1", grants=(), broker=_broker()))
+
+
+def test_adapter_without_reconnect_contract_fails_closed() -> None:
+    adapter = _FakeEnforcedAdapter()
+
+    with pytest.raises(UnsupportedEgressReconnectError, match="explicitly rebuild"):
+        asyncio.run(
+            adapter.prepare_reconnect(
+                session_id="sess_1",
+                environment_name="egress-env",
+                grants=(),
+                broker=_broker(),
+                reconnect_metadata={"sandbox_id": "sandbox-1"},
+            )
+        )
 
 
 class _FakeEnforcedAdapter(SandboxEgressAdapter):

@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from cayu import EnvironmentFactoryRequest, RunnerWorkspace
+from cayu import EnvironmentFactoryOperation, EnvironmentFactoryRequest, RunnerWorkspace
 from cayu.runners import LambdaMicroVMProtocolError
 
 _EXAMPLE = (
@@ -114,6 +114,7 @@ async def test_lambda_microvm_factory_reconnects_and_applies_terminal_lifecycle(
             session_id="session-1",
             agent_name="assistant",
             environment_name="aws-sandbox",
+            operation=EnvironmentFactoryOperation.RECONNECT,
             reconnect_metadata=created.reconnect_metadata,
         )
     )
@@ -169,6 +170,7 @@ async def test_lambda_microvm_factory_reconnect_uses_durable_region_and_validate
             session_id="session-1",
             agent_name="assistant",
             environment_name="aws-sandbox",
+            operation=EnvironmentFactoryOperation.RECONNECT,
             reconnect_metadata=reconnect_metadata,
         )
     )
@@ -183,6 +185,7 @@ async def test_lambda_microvm_factory_reconnect_uses_durable_region_and_validate
                 session_id="session-1",
                 agent_name="assistant",
                 environment_name="aws-sandbox",
+                operation=EnvironmentFactoryOperation.RECONNECT,
                 reconnect_metadata={**reconnect_metadata, "endpoint": "other.example.test"},
             )
         )

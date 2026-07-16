@@ -333,6 +333,10 @@ async def _create_adapter_runner(
         await binding.close()
 
 
+def test_lambda_microvm_adapter_does_not_claim_virtual_egress_reconnect_support() -> None:
+    assert LambdaMicroVMEgressAdapter.supports_reconnect is False
+
+
 def test_vpc_task_proxy_exposure_advertises_only_private_ipv4() -> None:
     exposure = VpcTaskProxyExposure("10.0.1.20")
 

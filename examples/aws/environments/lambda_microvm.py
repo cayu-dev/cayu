@@ -10,6 +10,7 @@ from cayu import (
     BoundWorkspace,
     Environment,
     EnvironmentFactory,
+    EnvironmentFactoryOperation,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
     EnvironmentSpec,
@@ -114,7 +115,9 @@ class LambdaMicroVMEnvironmentFactory(EnvironmentFactory):
             else None
         )
         reconnect: dict[str, str | None] | None = None
-        if request.parent_session_id is None and request.reconnect_metadata:
+        if request.operation is EnvironmentFactoryOperation.RECONNECT:
+            if not request.reconnect_metadata:
+                raise ValueError("MicroVM reconnect requires durable reconnect metadata")
             reconnect = {
                 "microvm_id": _required_reconnect_string(request.reconnect_metadata, "microvm_id"),
                 "endpoint": _required_reconnect_string(request.reconnect_metadata, "endpoint"),

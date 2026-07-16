@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -14,7 +14,7 @@ from cayu.egress import (
     HttpEgressPolicy,
     SandboxEgressAdapter,
 )
-from cayu.environments import EnvironmentFactoryRequest
+from cayu.environments import EnvironmentFactoryOperation, EnvironmentFactoryRequest
 from cayu.runners import (
     E2BRunner,
     E2BWorkspaceCapability,
@@ -363,6 +363,120 @@ def test_workspace_factory_failure_cleans_up_managed_egress() -> None:
 
     assert order == ["runner", "binding"]
     assert adapter.teardown_calls == 1
+
+
+@pytest.mark.parametrize("failure_type", [RuntimeError, asyncio.CancelledError])
+def test_reconnect_workspace_failure_detaches_and_can_retry(
+    failure_type: type[BaseException],
+) -> None:
+    class _ReconnectWorkspaceAdapter(_WorkspaceAdapter):
+        supports_reconnect = True
+
+        def __init__(self, runner: Runner, order: list[str]) -> None:
+            super().__init__("test", runner, order)
+            self.claimed = False
+            self.attestation_exists = True
+            self.finalize_outcomes: list[str | None] = []
+
+        def validate_reconnect_metadata(
+            self,
+            reconnect_metadata: Mapping[str, Any],
+        ) -> dict[str, Any]:
+            assert reconnect_metadata == {"resource_id": "durable-runner"}
+            return dict(reconnect_metadata)
+
+        def reconnect_metadata(self, runner: Runner) -> dict[str, Any]:
+            assert runner is self.runner
+            return {"resource_id": "durable-runner"}
+
+        async def prepare_reconnect(
+            self,
+            *,
+            session_id: str,
+            environment_name: str,
+            grants: Sequence[Any],
+            broker: Any,
+            reconnect_metadata: Mapping[str, Any],
+        ) -> EgressBinding:
+            self.validate_reconnect_metadata(reconnect_metadata)
+            assert environment_name == "egress-env"
+            assert self.attestation_exists is True
+            assert self.claimed is False
+            self.claimed = True
+            binding = await self.prepare(
+                session_id=session_id,
+                grants=grants,
+                broker=broker,
+            )
+            original_teardown = binding.teardown
+
+            async def teardown() -> None:
+                if original_teardown is not None:
+                    await original_teardown()
+                self.claimed = False
+
+            binding.teardown = teardown
+            return binding
+
+        async def finalize_runner(self, runner: Runner, *, outcome: str | None) -> None:
+            self.finalize_outcomes.append(outcome)
+            if outcome == "interrupted":
+                self.order.append("runner")
+                return
+            self.attestation_exists = False
+            await super().finalize_runner(runner, outcome=outcome)
+
+    order: list[str] = []
+    inner = _IdentifiedRunner()
+    adapter = _ReconnectWorkspaceAdapter(inner, order)
+    request = EnvironmentFactoryRequest(
+        session_id="sess_workspace_reconnect",
+        agent_name="agent",
+        environment_name="egress-env",
+        operation=EnvironmentFactoryOperation.RECONNECT,
+        reconnect_metadata={
+            "version": 1,
+            "runner_kind": "test",
+            "session_id": "sess_workspace_reconnect",
+            "environment_name": "egress-env",
+            "capability": "supported",
+            "identity": {"resource_id": "durable-runner"},
+        },
+    )
+
+    async def fail(_runner: Runner) -> Any:
+        raise failure_type("workspace setup failed")
+
+    async def run() -> Any:
+        with pytest.raises(failure_type, match="workspace setup failed"):
+            await _factory(adapter, fail).create(request)
+
+        assert adapter.finalize_outcomes == ["interrupted"]
+        assert inner.closed is False
+        assert adapter.claimed is False
+        assert adapter.attestation_exists is True
+
+        result = await _factory(adapter, RunnerWorkspace).create(request)
+        environment = result.environment
+        assert isinstance(environment.workspace, RunnerWorkspace)
+        assert environment.runner is not None
+        assert environment.binding is not None
+        bound = await environment.binding.bind(
+            environment.workspace,
+            environment.runner,
+            session_id=request.session_id,
+        )
+        await environment.binding.finalize(bound, outcome="completed")
+        return environment.runner
+
+    managed = asyncio.run(run())
+
+    assert managed.closed is True
+    assert inner.closed is True
+    assert adapter.claimed is False
+    assert adapter.attestation_exists is False
+    assert adapter.finalize_outcomes == ["interrupted", "completed"]
+    assert order == ["runner", "binding", "runner", "binding"]
 
 
 def test_workspace_factory_rejects_non_workspace_and_cleans_up() -> None:

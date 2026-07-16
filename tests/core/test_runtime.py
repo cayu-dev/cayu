@@ -46,6 +46,8 @@ from cayu.environments import (
     BoundWorkspace,
     Environment,
     EnvironmentFactory,
+    EnvironmentFactoryOperation,
+    EnvironmentFactoryReleaseAction,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
     EnvironmentSpec,
@@ -174,6 +176,7 @@ from cayu.runtime import (
 )
 from cayu.runtime import _interruption_coordinator as interruption_coordinator_module
 from cayu.runtime import _tool_execution as tool_execution
+from cayu.runtime._binding_cleanup import record_binding_cleanup_failure
 from cayu.runtime.app import _require_native_structured_output_support
 from cayu.runtime.context import (
     ContextBuildResult,
@@ -181,7 +184,7 @@ from cayu.runtime.context import (
     validate_context_messages,
 )
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
-from cayu.storage import InMemoryKnowledgeStore, KnowledgeEntry
+from cayu.storage import InMemoryKnowledgeStore, KnowledgeEntry, SQLiteSessionStore
 from cayu.tools import (
     ExecCommandTool,
     SubagentExecutionMode,
@@ -811,11 +814,15 @@ class RecordingEnvironmentFactory(EnvironmentFactory):
         fail_create: bool = False,
         metadata: dict[str, Any] | None = None,
         reconnect_metadata: dict[str, Any] | None = None,
+        release: Any = None,
+        release_timeout_s: float = 15.0,
     ) -> None:
         self.environment = environment
         self.fail_create = fail_create
         self.metadata = metadata or {}
         self.reconnect_metadata = reconnect_metadata or {}
+        self.release = release
+        self.release_timeout_s = release_timeout_s
         self.requests: list[EnvironmentFactoryRequest] = []
 
     async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
@@ -826,6 +833,8 @@ class RecordingEnvironmentFactory(EnvironmentFactory):
             environment=self.environment,
             metadata=self.metadata,
             reconnect_metadata=self.reconnect_metadata,
+            release=self.release,
+            release_timeout_s=self.release_timeout_s,
         )
 
 
@@ -3432,6 +3441,7 @@ def test_cayu_app_environment_factory_creates_environment_for_session(tmp_path):
     assert factory.requests[0].session_id == "sess_factory"
     assert factory.requests[0].agent_name == "assistant"
     assert factory.requests[0].environment_name == "dynamic"
+    assert factory.requests[0].operation is EnvironmentFactoryOperation.CREATE
     assert factory.requests[0].labels == {"project": "alpha"}
     assert factory.requests[0].metadata == {"owner": "test"}
 
@@ -4327,13 +4337,19 @@ def test_cayu_app_environment_factory_workspace_instruction_failure_runs_hooks(t
 def test_cayu_app_environment_factory_result_name_must_match_registration(tmp_path):
     async def run():
         store = InMemorySessionStore()
+        release_actions: list[EnvironmentFactoryReleaseAction] = []
+
+        async def release(action: EnvironmentFactoryReleaseAction) -> None:
+            release_actions.append(action)
+
         workspace_root = tmp_path / "factory"
         workspace_root.mkdir()
         factory = RecordingEnvironmentFactory(
             Environment(
                 EnvironmentSpec(name="different"),
                 workspace=LocalWorkspace(workspace_root, workspace_id="factory-workspace"),
-            )
+            ),
+            release=release,
         )
         app = CayuApp(session_store=store, enable_logging=False)
         app.register_provider(FakeProvider([]), default=True)
@@ -4353,9 +4369,9 @@ def test_cayu_app_environment_factory_result_name_must_match_registration(tmp_pa
             ),
         )
         session = await store.load("sess_factory_name_mismatch")
-        return events, session
+        return events, session, release_actions
 
-    events, session = asyncio.run(run())
+    events, session, release_actions = asyncio.run(run())
 
     assert session is not None
     assert session.status == SessionStatus.FAILED
@@ -4365,6 +4381,466 @@ def test_cayu_app_environment_factory_result_name_must_match_registration(tmp_pa
         EventType.SESSION_FAILED,
     ]
     assert "different environment name" in events[1].payload["error"]
+    assert events[1].payload["environment_factory_release"] == {
+        "action": "discard",
+        "callback_provided": True,
+        "completed": True,
+    }
+    assert (
+        events[2].payload["environment_factory_release"]
+        == events[1].payload["environment_factory_release"]
+    )
+    assert release_actions == [EnvironmentFactoryReleaseAction.DISCARD]
+
+
+def test_environment_factory_result_release_is_bounded(tmp_path):
+    async def run():
+        store = InMemorySessionStore()
+        release_cancelled = asyncio.Event()
+
+        async def release(_action: EnvironmentFactoryReleaseAction) -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                release_cancelled.set()
+                raise
+
+        workspace_root = tmp_path / "factory-release-timeout"
+        workspace_root.mkdir()
+        factory = RecordingEnvironmentFactory(
+            Environment(
+                EnvironmentSpec(name="different"),
+                workspace=LocalWorkspace(workspace_root),
+            ),
+            release=release,
+            release_timeout_s=0.01,
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_factory_release_timeout",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        await asyncio.wait_for(release_cancelled.wait(), timeout=1)
+        return events
+
+    events = asyncio.run(run())
+
+    expected_release = {
+        "action": "discard",
+        "callback_provided": True,
+        "completed": False,
+        "error": "Environment factory result release did not complete within 0.01 seconds.",
+        "error_type": "TimeoutError",
+        "timeout_s": 0.01,
+    }
+    factory_failed = next(
+        event for event in events if event.type is EventType.ENVIRONMENT_FACTORY_FAILED
+    )
+    session_failed = next(event for event in events if event.type is EventType.SESSION_FAILED)
+    assert factory_failed.payload["environment_factory_release"] == expected_release
+    assert session_failed.payload["environment_factory_release"] == expected_release
+
+
+def test_cancellation_waits_for_factory_result_release_then_propagates(tmp_path):
+    async def run() -> None:
+        store = InMemorySessionStore()
+        release_started = asyncio.Event()
+        finish_release = asyncio.Event()
+        release_completed = asyncio.Event()
+
+        async def release(_action: EnvironmentFactoryReleaseAction) -> None:
+            release_started.set()
+            await finish_release.wait()
+            release_completed.set()
+
+        workspace_root = tmp_path / "factory-release-cancel"
+        workspace_root.mkdir()
+        factory = RecordingEnvironmentFactory(
+            Environment(
+                EnvironmentSpec(name="different"),
+                workspace=LocalWorkspace(workspace_root),
+            ),
+            release=release,
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        run_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_factory_release_cancel",
+                    messages=[Message.text("user", "run")],
+                ),
+            )
+        )
+        await asyncio.wait_for(release_started.wait(), timeout=1)
+        run_task.cancel()
+        await asyncio.sleep(0)
+        assert run_task.done() is False
+        finish_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await run_task
+        assert release_completed.is_set()
+
+    asyncio.run(run())
+
+
+def test_environment_factory_fallback_release_is_bounded(tmp_path):
+    class HangingRunner(ProvisionedTestRunner):
+        def __init__(self) -> None:
+            self.cancelled = asyncio.Event()
+
+        async def close(self) -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+
+    async def run():
+        store = InMemorySessionStore()
+        runner = HangingRunner()
+        workspace_root = tmp_path / "factory-fallback-timeout"
+        workspace_root.mkdir()
+        factory = RecordingEnvironmentFactory(
+            Environment(
+                EnvironmentSpec(name="different"),
+                workspace=LocalWorkspace(workspace_root),
+                runner=runner,
+            ),
+            release_timeout_s=0.01,
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_factory_fallback_timeout",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        await asyncio.wait_for(runner.cancelled.wait(), timeout=1)
+        return events
+
+    events = asyncio.run(run())
+
+    factory_failed = next(
+        event for event in events if event.type is EventType.ENVIRONMENT_FACTORY_FAILED
+    )
+    assert factory_failed.payload["environment_factory_release"] == {
+        "action": "discard",
+        "callback_provided": False,
+        "completed": False,
+        "error": "Environment factory result release did not complete within 0.01 seconds.",
+        "error_type": "TimeoutError",
+        "timeout_s": 0.01,
+    }
+
+
+def test_cancellation_waits_for_factory_fallback_release_then_propagates(tmp_path):
+    class BlockingRunner(ProvisionedTestRunner):
+        def __init__(self) -> None:
+            self.close_started = asyncio.Event()
+            self.finish_close = asyncio.Event()
+            self.close_completed = asyncio.Event()
+
+        async def close(self) -> None:
+            self.close_started.set()
+            await self.finish_close.wait()
+            self.close_completed.set()
+
+    async def run() -> None:
+        store = InMemorySessionStore()
+        runner = BlockingRunner()
+        workspace_root = tmp_path / "factory-fallback-cancel"
+        workspace_root.mkdir()
+        factory = RecordingEnvironmentFactory(
+            Environment(
+                EnvironmentSpec(name="different"),
+                workspace=LocalWorkspace(workspace_root),
+                runner=runner,
+            )
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        run_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_factory_fallback_cancel",
+                    messages=[Message.text("user", "run")],
+                ),
+            )
+        )
+        await asyncio.wait_for(runner.close_started.wait(), timeout=1)
+        run_task.cancel()
+        await asyncio.sleep(0)
+        assert run_task.done() is False
+        runner.finish_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await run_task
+        assert runner.close_completed.is_set()
+
+    asyncio.run(run())
+
+
+def test_cancelled_factory_checkpoint_reports_fallback_cleanup_failure(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class FailingCloseRunner(ProvisionedTestRunner):
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            raise RuntimeError("runner close failed")
+
+    async def run() -> tuple[asyncio.CancelledError, FailingCloseRunner]:
+        store = InMemorySessionStore()
+        runner = FailingCloseRunner()
+        workspace_root = tmp_path / "factory-checkpoint-cancel"
+        workspace_root.mkdir()
+        factory = RecordingEnvironmentFactory(
+            Environment(
+                EnvironmentSpec(name="dynamic"),
+                workspace=LocalWorkspace(workspace_root),
+                runner=runner,
+            ),
+            reconnect_metadata={"sandbox_id": "sbx_uncommitted"},
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        checkpoint_started = asyncio.Event()
+
+        async def block_checkpoint(**_kwargs: Any) -> None:
+            checkpoint_started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(
+            app,
+            "_checkpoint_environment_factory_reconnect_metadata",
+            block_checkpoint,
+        )
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        run_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_factory_checkpoint_cancel",
+                    messages=[Message.text("user", "run")],
+                ),
+            )
+        )
+        await asyncio.wait_for(checkpoint_started.wait(), timeout=1)
+        run_task.cancel()
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await run_task
+        return exc_info.value, runner
+
+    cancellation, runner = asyncio.run(run())
+
+    assert runner.close_calls == 1
+    assert any(
+        note
+        == (
+            "Environment factory fallback release incomplete after discard: "
+            "runner: RuntimeError: runner close failed."
+        )
+        for note in cancellation.__notes__
+    )
+
+
+def test_cancelled_factory_checkpoint_read_discards_uncommitted_allocation(tmp_path):
+    class BlockingCheckpointReadStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.block_next_checkpoint_read = False
+            self.checkpoint_read_started = asyncio.Event()
+
+        async def load_checkpoint(self, session_id: str) -> dict[str, Any] | None:
+            if self.block_next_checkpoint_read:
+                self.block_next_checkpoint_read = False
+                self.checkpoint_read_started.set()
+                await asyncio.Event().wait()
+            return await super().load_checkpoint(session_id)
+
+    async def run() -> tuple[list[EnvironmentFactoryReleaseAction], dict[str, Any] | None]:
+        store = BlockingCheckpointReadStore()
+        release_actions: list[EnvironmentFactoryReleaseAction] = []
+
+        async def release(action: EnvironmentFactoryReleaseAction) -> None:
+            release_actions.append(action)
+
+        class BlockingReadFactory(RecordingEnvironmentFactory):
+            async def create(
+                self,
+                request: EnvironmentFactoryRequest,
+            ) -> EnvironmentFactoryResult:
+                result = await super().create(request)
+                store.block_next_checkpoint_read = True
+                return result
+
+        workspace_root = tmp_path / "checkpoint-read-workspace"
+        workspace_root.mkdir()
+        factory = BlockingReadFactory(
+            Environment(
+                EnvironmentSpec(name="dynamic"),
+                workspace=LocalWorkspace(workspace_root),
+            ),
+            reconnect_metadata={"sandbox_id": "sandbox_never_checkpointed"},
+            release=release,
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        run_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_cancelled_factory_checkpoint_read",
+                    messages=[Message.text("user", "run")],
+                ),
+            )
+        )
+        await asyncio.wait_for(store.checkpoint_read_started.wait(), timeout=1)
+        run_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run_task
+        checkpoint = await store.load_checkpoint("sess_cancelled_factory_checkpoint_read")
+        return release_actions, checkpoint
+
+    release_actions, checkpoint = asyncio.run(run())
+
+    assert release_actions == [EnvironmentFactoryReleaseAction.DISCARD]
+    assert "environment_factory_reconnect" not in (checkpoint or {})
+
+
+def test_cancelled_sqlite_factory_checkpoint_preserves_committed_allocation(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    async def run() -> tuple[list[EnvironmentFactoryReleaseAction], dict[str, Any]]:
+        store = SQLiteSessionStore(tmp_path / "sessions.sqlite")
+        transform_started = threading.Event()
+        allow_transform_return = threading.Event()
+        original_transform_checkpoint = store.transform_checkpoint
+
+        async def delayed_transform_checkpoint(session_id, checkpoint_transform) -> None:
+            def delayed_transform(session, checkpoint):
+                transformed = checkpoint_transform(session, checkpoint)
+                transform_started.set()
+                if not allow_transform_return.wait(timeout=5):
+                    raise TimeoutError("test did not release the checkpoint transform")
+                return transformed
+
+            await original_transform_checkpoint(session_id, delayed_transform)
+
+        monkeypatch.setattr(store, "transform_checkpoint", delayed_transform_checkpoint)
+        release_actions: list[EnvironmentFactoryReleaseAction] = []
+
+        async def release(action: EnvironmentFactoryReleaseAction) -> None:
+            release_actions.append(action)
+
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        factory = RecordingEnvironmentFactory(
+            Environment(
+                EnvironmentSpec(name="dynamic"),
+                workspace=LocalWorkspace(workspace_root),
+            ),
+            reconnect_metadata={"sandbox_id": "sandbox_committed_after_cancel"},
+            release=release,
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        run_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_cancelled_sqlite_factory_checkpoint",
+                    messages=[Message.text("user", "run")],
+                ),
+            )
+        )
+        await asyncio.wait_for(asyncio.to_thread(transform_started.wait), timeout=2)
+        run_task.cancel()
+        allow_transform_return.set()
+        with pytest.raises(asyncio.CancelledError):
+            await run_task
+
+        checkpoint = await store.load_checkpoint("sess_cancelled_sqlite_factory_checkpoint")
+        await store.close()
+        assert checkpoint is not None
+        return release_actions, checkpoint
+
+    release_actions, checkpoint = asyncio.run(run())
+
+    assert release_actions == [EnvironmentFactoryReleaseAction.PRESERVE]
+    assert checkpoint["environment_factory_reconnect"] == {
+        "dynamic": {"sandbox_id": "sandbox_committed_after_cancel"}
+    }
+    assert checkpoint["environment_factory_allocation_owner"] == {
+        "dynamic": "sess_cancelled_sqlite_factory_checkpoint"
+    }
 
 
 def test_cayu_app_environment_factory_output_composes_with_workspace_binding(tmp_path):
@@ -4593,12 +5069,135 @@ def test_cayu_app_fork_preserves_an_explicit_non_default_environment():
     assert factory.requests[1].session_id == "sess_non_default_environment_child"
     assert factory.requests[1].parent_session_id == "sess_non_default_environment_source"
     assert factory.requests[1].environment_name == "optional"
+    assert factory.requests[1].operation is EnvironmentFactoryOperation.CREATE
     assert factory.requests[1].reconnect_metadata == {"sandbox_id": "sandbox_source"}
     assert child is not None
     assert child.environment_name == "optional"
     assert fork_events[0].environment_name == "optional"
     assert child_events[0].type == EventType.ENVIRONMENT_FACTORY_STARTED
     assert {event.environment_name for event in child_events} == {"optional"}
+
+
+def test_fork_reconnects_child_allocation_checkpointed_before_completion_event():
+    async def run():
+        store = InMemorySessionStore()
+        release_actions: list[EnvironmentFactoryReleaseAction] = []
+
+        async def release(action: EnvironmentFactoryReleaseAction) -> None:
+            release_actions.append(action)
+
+        factory = RecordingEnvironmentFactory(
+            Environment(EnvironmentSpec(name="dynamic")),
+            reconnect_metadata={"sandbox_id": "sbx_source"},
+            release=release,
+        )
+        provider = FakeProvider(
+            [
+                [
+                    ModelStreamEvent.text_delta("source done"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("child done"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(EnvironmentSpec(name="dynamic"), factory, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_crash_source",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        await collect_fork_events(
+            app,
+            ForkSessionRequest(
+                source_session_id="sess_crash_source",
+                session_id="sess_crash_child",
+            ),
+        )
+        factory.reconnect_metadata = {"sandbox_id": "sbx_child"}
+        original_emit = app._event_writer.emit
+        completion_failed = False
+
+        async def fail_child_completion_once(event: Event) -> Event:
+            nonlocal completion_failed
+            if (
+                not completion_failed
+                and event.session_id == "sess_crash_child"
+                and event.type is EventType.ENVIRONMENT_FACTORY_COMPLETED
+            ):
+                completion_failed = True
+                raise RuntimeError("simulated factory completion persistence failure")
+            return await original_emit(event)
+
+        app._event_writer.emit = fail_child_completion_once
+        first_resume_events = await collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_crash_child",
+                messages=[Message.text("user", "first attempt")],
+            ),
+        )
+        app._event_writer.emit = original_emit
+        child_checkpoint = await store.load_checkpoint("sess_crash_child")
+        child_events_before_resume = await store.load_events("sess_crash_child")
+        assert completion_failed is True
+        assert EventType.ENVIRONMENT_FACTORY_FAILED in {event.type for event in first_resume_events}
+        factory_failed = next(
+            event
+            for event in first_resume_events
+            if event.type is EventType.ENVIRONMENT_FACTORY_FAILED
+        )
+        session_failed = next(
+            event for event in first_resume_events if event.type is EventType.SESSION_FAILED
+        )
+        assert factory_failed.payload["environment_factory_release"] == {
+            "action": "preserve",
+            "callback_provided": True,
+            "completed": True,
+        }
+        assert (
+            session_failed.payload["environment_factory_release"]
+            == factory_failed.payload["environment_factory_release"]
+        )
+        assert not any(
+            event.type is EventType.ENVIRONMENT_FACTORY_COMPLETED
+            for event in child_events_before_resume
+        )
+        await collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_crash_child",
+                messages=[Message.text("user", "continue")],
+            ),
+        )
+        return factory, child_checkpoint, release_actions
+
+    factory, child_checkpoint, release_actions = asyncio.run(run())
+
+    assert child_checkpoint is not None
+    assert child_checkpoint["environment_factory_reconnect"] == {
+        "dynamic": {"sandbox_id": "sbx_child"}
+    }
+    assert child_checkpoint["environment_factory_allocation_owner"] == {
+        "dynamic": "sess_crash_child"
+    }
+    first_child_request, retried_child_request = factory.requests[-2:]
+    assert first_child_request.session_id == "sess_crash_child"
+    assert first_child_request.operation is EnvironmentFactoryOperation.CREATE
+    assert first_child_request.reconnect_metadata == {"sandbox_id": "sbx_source"}
+    assert retried_child_request.session_id == "sess_crash_child"
+    assert retried_child_request.operation is EnvironmentFactoryOperation.RECONNECT
+    assert retried_child_request.reconnect_metadata == {"sandbox_id": "sbx_child"}
+    assert release_actions == [EnvironmentFactoryReleaseAction.PRESERVE]
 
 
 def test_cayu_app_resume_and_fork_do_not_invent_a_later_default_environment():
@@ -4762,6 +5361,10 @@ def test_cayu_app_environment_factory_reconnect_metadata_round_trips_on_resume(t
         {},
         {"sandbox_id": "sandbox_1"},
     ]
+    assert [request.operation for request in factory.requests] == [
+        EnvironmentFactoryOperation.CREATE,
+        EnvironmentFactoryOperation.RECONNECT,
+    ]
     assert [event.payload["reconnect_metadata"] for event in completed_events] == [
         {"sandbox_id": "sandbox_1"},
         {"sandbox_id": "sandbox_1", "generation": 2},
@@ -4847,6 +5450,9 @@ def test_cayu_app_environment_factory_reconnect_metadata_survives_context_checkp
     assert first_checkpoint is not None
     assert first_checkpoint["environment_factory_reconnect"] == {
         "dynamic": {"sandbox_id": "sandbox_compaction"}
+    }
+    assert first_checkpoint["environment_factory_allocation_owner"] == {
+        "dynamic": "sess_factory_reconnect_compaction"
     }
     assert "context_compaction" in first_checkpoint
     assert [request.reconnect_metadata for request in factory.requests] == [
@@ -5126,6 +5732,90 @@ def test_cayu_app_binding_failure_fails_session_before_start_event():
     assert events[3].payload["error_type"] == "RuntimeError"
     assert len(binding.bind_calls) == 1
     assert binding.finalize_calls == []
+    assert provider.requests == []
+
+
+@pytest.mark.parametrize("retry_fails", [False, True])
+def test_cayu_app_reports_and_retries_incomplete_binding_cleanup(retry_fails: bool):
+    class CleanupRetryRunner(ProvisionedTestRunner):
+        def __init__(self) -> None:
+            self.cleanup_retry_calls = 0
+
+        async def close(self) -> None:
+            raise AssertionError("runtime must use the binding-owned cleanup retry")
+
+    class CleanupFailingBinding(WorkspaceBinding):
+        async def bind(self, workspace, runner, **kwargs):  # type: ignore[no-untyped-def]
+            bind_error = RuntimeError("bind failed")
+            cleanup_error = RuntimeError("binding rollback failed")
+
+            async def retry() -> None:
+                runner.cleanup_retry_calls += 1
+                if retry_fails:
+                    raise RuntimeError("runner cleanup retry failed")
+
+            record_binding_cleanup_failure(bind_error, cleanup_error, retry=retry)
+            raise bind_error
+
+        async def finalize(self, bound, *, outcome=None, metadata=None):  # type: ignore[no-untyped-def]
+            raise AssertionError("finalize should not run")
+
+    async def run():
+        store = InMemorySessionStore()
+        runner = CleanupRetryRunner()
+        provider = FakeProvider(
+            [
+                ModelStreamEvent.text_delta("unreached"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                runner=runner,
+                binding=CleanupFailingBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=f"sess_binding_cleanup_retry_{retry_fails}",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        return events, runner, provider
+
+    events, runner, provider = asyncio.run(run())
+
+    expected_cleanup: dict[str, Any] = {
+        "incomplete": retry_fails,
+        "initial_error": "binding rollback failed",
+        "initial_error_type": "RuntimeError",
+        "retry_attempted": True,
+        "retry_completed": not retry_fails,
+    }
+    if retry_fails:
+        expected_cleanup.update(
+            {
+                "retry_error": "runner cleanup retry failed",
+                "retry_error_type": "RuntimeError",
+            }
+        )
+    binding_failed = next(
+        event for event in events if event.type is EventType.ENVIRONMENT_BINDING_FAILED
+    )
+    session_failed = next(event for event in events if event.type is EventType.SESSION_FAILED)
+    assert binding_failed.payload["binding_cleanup"] == expected_cleanup
+    assert session_failed.payload["binding_cleanup"] == expected_cleanup
+    assert binding_failed.payload["error"] == "bind failed"
+    assert session_failed.payload["error"] == "bind failed"
+    assert runner.cleanup_retry_calls == 1
     assert provider.requests == []
 
 

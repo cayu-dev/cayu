@@ -70,6 +70,8 @@ from cayu.environments import (
     BoundWorkspace,
     Environment,
     EnvironmentFactory,
+    EnvironmentFactoryOperation,
+    EnvironmentFactoryReleaseAction,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
     EnvironmentSpec,
@@ -110,6 +112,10 @@ from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
+from cayu.runtime._binding_cleanup import (
+    binding_cleanup_payload,
+    binding_cleanup_status,
+)
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._interruption_coordinator import (
     BackgroundInterruptionCoordinator,
@@ -584,6 +590,11 @@ _ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY = "environment_factory_reconnect"
 _SESSION_OPERATIONS_CHECKPOINT_KEY = "session_operations"
 _CONTEXT_COMPACTION_OPERATION_KIND = "context_compaction"
 _SESSION_OPERATION_CLAIM_LEASE = timedelta(minutes=5)
+_ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY = "environment_factory_allocation_owner"
+_ENVIRONMENT_FACTORY_CHECKPOINT_COMMIT_UNCERTAIN_ATTRIBUTE = (
+    "_cayu_environment_factory_checkpoint_commit_uncertain"
+)
+_ENVIRONMENT_FACTORY_RELEASE_ERROR_ATTRIBUTE = "_cayu_environment_factory_release"
 _INTERRUPTION_TYPE_OPERATOR_REQUESTED = "operator_requested"
 _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED = "runtime_interrupted"
 _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED = "tool_approval_required"
@@ -2303,6 +2314,7 @@ class CayuApp:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 started_event=factory_started_event,
+                operation=EnvironmentFactoryOperation.CREATE,
             )
             registered_environment = resolution.registered_environment
             for event in resolution.events:
@@ -2325,10 +2337,7 @@ class CayuApp:
                 if task_failure_event is not None:
                     yield task_failure_event
                 session = await self.session_store.update_status(session.id, SessionStatus.FAILED)
-                failure_payload: dict[str, Any] = {
-                    "error": str(resolution.error),
-                    "error_type": type(resolution.error).__name__,
-                }
+                failure_payload = _exception_failure_payload(resolution.error)
                 if task_failure_error is not None:
                     failure_payload["task_update_error"] = str(task_failure_error)
                     failure_payload["task_update_error_type"] = type(task_failure_error).__name__
@@ -2380,10 +2389,7 @@ class CayuApp:
             if task_failure_event is not None:
                 yield task_failure_event
             session = await self.session_store.update_status(session.id, SessionStatus.FAILED)
-            failure_payload = {
-                "error": str(exc),
-                "error_type": type(exc).__name__,
-            }
+            failure_payload = _exception_failure_payload(exc)
             if task_failure_error is not None:
                 failure_payload["task_update_error"] = str(task_failure_error)
                 failure_payload["task_update_error_type"] = type(task_failure_error).__name__
@@ -4942,6 +4948,7 @@ class CayuApp:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 started_event=factory_started_event,
+                operation=EnvironmentFactoryOperation.RECONNECT,
             )
             registered_environment = factory_resolution.registered_environment
             environment_name = _environment_name(registered_environment)
@@ -5194,10 +5201,9 @@ class CayuApp:
                 # Carry the failure so a caller can distinguish "your answer failed, retry" from a
                 # fresh pause (whose interrupted event has no error fields).
                 payload: dict[str, Any] = {
+                    **_exception_failure_payload(exc),
                     "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
                     "user_input": pending.model_dump(mode="json"),
-                    "error": str(exc),
-                    "error_type": type(exc).__name__,
                 }
                 if isinstance(exc, approval_support.RoundToolManualRecoveryRequired):
                     payload["manual_recovery_required"] = True
@@ -5311,6 +5317,7 @@ class CayuApp:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 started_event=factory_started_event,
+                operation=EnvironmentFactoryOperation.RECONNECT,
             )
             registered_environment = factory_resolution.registered_environment
             environment_name = _environment_name(registered_environment)
@@ -5602,6 +5609,7 @@ class CayuApp:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 started_event=factory_started_event,
+                operation=EnvironmentFactoryOperation.RECONNECT,
             )
             registered_environment = factory_resolution.registered_environment
             environment_name = _environment_name(registered_environment)
@@ -5958,10 +5966,9 @@ class CayuApp:
                         agent_name=registered_agent.spec.name,
                         environment_name=environment_name,
                         payload={
+                            **_exception_failure_payload(exc),
                             "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
                             "approval": pending_approval.model_dump(mode="json"),
-                            "error": str(exc),
-                            "error_type": type(exc).__name__,
                             "approval_id": pending_approval.approval_id,
                             "tool_call_id": exc.tool_call_id,
                             "tool_name": exc.tool_name,
@@ -5988,10 +5995,9 @@ class CayuApp:
                         agent_name=registered_agent.spec.name,
                         environment_name=environment_name,
                         payload={
+                            **_exception_failure_payload(exc),
                             "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
                             "approval": pending_approval.model_dump(mode="json"),
-                            "error": str(exc),
-                            "error_type": type(exc).__name__,
                         },
                     ),
                     phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
@@ -6027,8 +6033,7 @@ class CayuApp:
                     task_failure_error = task_exc
             session = await self.session_store.update_status(session.id, SessionStatus.FAILED)
             payload: dict[str, Any] = {
-                "error": str(exc),
-                "error_type": type(exc).__name__,
+                **_exception_failure_payload(exc),
                 "approval_id": pending_approval.approval_id,
                 "tool_call_id": pending_approval.tool_call_id,
             }
@@ -6126,6 +6131,7 @@ class CayuApp:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 started_event=factory_started_event,
+                operation=EnvironmentFactoryOperation.RECONNECT,
             )
             registered_environment = factory_resolution.registered_environment
             environment_name = _environment_name(registered_environment)
@@ -6411,6 +6417,7 @@ class CayuApp:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 started_event=factory_started_event,
+                operation=EnvironmentFactoryOperation.RECONNECT,
             )
             registered_environment = factory_resolution.registered_environment
             environment_name = _environment_name(registered_environment)
@@ -6756,6 +6763,11 @@ class CayuApp:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 started_event=factory_started_event,
+                operation=(
+                    EnvironmentFactoryOperation.CREATE
+                    if start_event_type is EventType.SESSION_STARTED
+                    else EnvironmentFactoryOperation.RECONNECT
+                ),
             )
             registered_environment = factory_resolution.registered_environment
             environment_name = _environment_name(registered_environment)
@@ -7880,10 +7892,7 @@ class CayuApp:
                 except Exception as task_exc:
                     task_failure_error = task_exc
             session = await self.session_store.update_status(session.id, SessionStatus.FAILED)
-            payload: dict[str, Any] = {
-                "error": str(exc),
-                "error_type": type(exc).__name__,
-            }
+            payload = _exception_failure_payload(exc)
             if task_failure_error is not None:
                 payload["task_update_error"] = str(task_failure_error)
                 payload["task_update_error_type"] = type(task_failure_error).__name__
@@ -12247,6 +12256,7 @@ class CayuApp:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         started_event: Event | None,
+        operation: EnvironmentFactoryOperation,
     ) -> _EnvironmentFactoryResolutionResult:
         if registered_environment is None or registered_environment.factory is None:
             if started_event is not None:
@@ -12267,19 +12277,47 @@ class CayuApp:
         events: list[Event] = []
         result: EnvironmentFactoryResult | None = None
         environment: Environment | None = None
+        allocation_checkpointed = False
+        allocation_checkpoint_commit_uncertain = False
+        effective_operation = operation
         try:
+            (
+                reconnect_metadata,
+                allocation_owner,
+            ) = await self._load_environment_factory_reconnect_state(
+                session_id=session.id,
+                environment_name=environment_name,
+            )
+            if (
+                operation is EnvironmentFactoryOperation.RECONNECT
+                and session.parent_session_id is not None
+                and allocation_owner != session.id
+            ):
+                completed_for_child = False
+                if allocation_owner is None:
+                    # Compatibility for checkpoints written before allocation
+                    # provenance was persisted atomically with reconnect state.
+                    prior_events = await self.session_store.load_events(session.id)
+                    completed_for_child = any(
+                        event.type is EventType.ENVIRONMENT_FACTORY_COMPLETED
+                        and event.environment_name == environment_name
+                        for event in prior_events
+                    )
+                if not completed_for_child:
+                    # A fork inherits its parent's checkpoint as context, but
+                    # its first factory allocation belongs to the child. Only
+                    # later child resumes reconnect that child allocation.
+                    effective_operation = EnvironmentFactoryOperation.CREATE
             request = EnvironmentFactoryRequest(
                 session_id=session.id,
                 agent_name=registered_agent.spec.name,
                 environment_name=environment_name,
+                operation=effective_operation,
                 parent_session_id=session.parent_session_id,
                 causal_budget_id=session.causal_budget_id,
                 labels=session.labels,
                 metadata=session.metadata,
-                reconnect_metadata=await self._load_environment_factory_reconnect_metadata(
-                    session_id=session.id,
-                    environment_name=environment_name,
-                ),
+                reconnect_metadata=reconnect_metadata,
             )
             result = await factory.create(request)
             if type(result) is not EnvironmentFactoryResult:
@@ -12294,11 +12332,25 @@ class CayuApp:
                 result.reconnect_metadata,
                 "reconnect_metadata",
             )
-            await self._checkpoint_environment_factory_reconnect_metadata(
-                session_id=session.id,
-                environment_name=environment_name,
-                reconnect_metadata=reconnect_metadata,
-            )
+            try:
+                await self._checkpoint_environment_factory_reconnect_metadata(
+                    session_id=session.id,
+                    environment_name=environment_name,
+                    reconnect_metadata=reconnect_metadata,
+                )
+            except asyncio.CancelledError as exc:
+                # The checkpoint helper marks only cancellation during the
+                # transactional write as uncertain; a preliminary read cancellation
+                # still proves that no reconnect identity was committed.
+                allocation_checkpoint_commit_uncertain = bool(
+                    getattr(
+                        exc,
+                        _ENVIRONMENT_FACTORY_CHECKPOINT_COMMIT_UNCERTAIN_ATTRIBUTE,
+                        False,
+                    )
+                )
+                raise
+            allocation_checkpointed = True
             events.append(
                 await self._event_writer.emit(
                     Event(
@@ -12317,7 +12369,18 @@ class CayuApp:
             )
         except BaseException as exc:
             if result is not None:
-                await _close_unclaimed_factory_environment(result.environment)
+                release_payload = await _release_unclaimed_factory_result(
+                    result,
+                    action=(
+                        EnvironmentFactoryReleaseAction.PRESERVE
+                        if allocation_checkpointed
+                        or allocation_checkpoint_commit_uncertain
+                        or effective_operation is EnvironmentFactoryOperation.RECONNECT
+                        else EnvironmentFactoryReleaseAction.DISCARD
+                    ),
+                    original_error=exc,
+                )
+                setattr(exc, _ENVIRONMENT_FACTORY_RELEASE_ERROR_ATTRIBUTE, release_payload)
             if not isinstance(exc, Exception):
                 raise
             events.append(
@@ -12329,8 +12392,7 @@ class CayuApp:
                         environment_name=environment_name,
                         payload={
                             **base_payload,
-                            "error": str(exc),
-                            "error_type": type(exc).__name__,
+                            **_exception_failure_payload(exc),
                         },
                     )
                 )
@@ -12351,26 +12413,39 @@ class CayuApp:
             events=events,
         )
 
-    async def _load_environment_factory_reconnect_metadata(
+    async def _load_environment_factory_reconnect_state(
         self,
         *,
         session_id: str,
         environment_name: str,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], str | None]:
         checkpoint = await self.session_store.load_checkpoint(session_id)
         if checkpoint is None:
-            return {}
+            return {}, None
         state = checkpoint.get(_ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY)
         if state is None:
-            return {}
-        if type(state) is not dict:
-            raise ValueError("Environment factory reconnect checkpoint must be an object.")
-        metadata = state.get(environment_name)
-        if metadata is None:
-            return {}
-        if type(metadata) is not dict:
-            raise ValueError("Environment factory reconnect metadata must be an object.")
-        return copy_json_value(metadata, "reconnect_metadata")
+            metadata: dict[str, Any] = {}
+        else:
+            if type(state) is not dict:
+                raise ValueError("Environment factory reconnect checkpoint must be an object.")
+            candidate_metadata = state.get(environment_name)
+            if candidate_metadata is None:
+                metadata = {}
+            elif type(candidate_metadata) is not dict:
+                raise ValueError("Environment factory reconnect metadata must be an object.")
+            else:
+                metadata = copy_json_value(candidate_metadata, "reconnect_metadata")
+        owners = checkpoint.get(_ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY)
+        if owners is None:
+            return metadata, None
+        if type(owners) is not dict:
+            raise ValueError("Environment factory allocation owners must be an object.")
+        owner = owners.get(environment_name)
+        if owner is None:
+            return metadata, None
+        if not isinstance(owner, str) or not owner:
+            raise ValueError("Environment factory allocation owner must be a nonblank string.")
+        return metadata, owner
 
     async def _checkpoint_environment_factory_reconnect_metadata(
         self,
@@ -12390,10 +12465,29 @@ class CayuApp:
             state = copy_json_value(state, "environment_factory_reconnect")
         state[environment_name] = copy_json_value(reconnect_metadata, "reconnect_metadata")
         copied_checkpoint[_ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY] = state
-        await self.session_store.transform_checkpoint(
-            session_id,
-            _replace_checkpoint_preserving_runtime_state(copied_checkpoint),
-        )
+        owners = copied_checkpoint.get(_ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY)
+        if owners is None:
+            owners = {}
+        elif type(owners) is not dict:
+            raise ValueError("Environment factory allocation owners must be an object.")
+        else:
+            owners = copy_json_value(owners, "environment_factory_allocation_owner")
+        owners[environment_name] = session_id
+        copied_checkpoint[_ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY] = owners
+        try:
+            await self.session_store.transform_checkpoint(
+                session_id,
+                _replace_checkpoint_preserving_runtime_state(copied_checkpoint),
+            )
+        except asyncio.CancelledError as exc:
+            current_task = asyncio.current_task()
+            if current_task is not None and current_task.cancelling() > 0:
+                setattr(
+                    exc,
+                    _ENVIRONMENT_FACTORY_CHECKPOINT_COMMIT_UNCERTAIN_ATTRIBUTE,
+                    True,
+                )
+            raise
 
     async def _checkpoint_preserving_runtime_state(
         self,
@@ -12402,23 +12496,21 @@ class CayuApp:
         checkpoint: dict[str, Any],
     ) -> None:
         copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
-        if _ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY not in copied_checkpoint:
+        runtime_keys = (
+            _ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY,
+            _ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
+        )
+        if any(key not in copied_checkpoint for key in runtime_keys):
             current_checkpoint = await self.session_store.load_checkpoint(session_id)
             if current_checkpoint is not None:
-                reconnect_state = current_checkpoint.get(
-                    _ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY
-                )
-                if reconnect_state is not None:
-                    if type(reconnect_state) is not dict:
-                        raise ValueError(
-                            "Environment factory reconnect checkpoint must be an object."
-                        )
-                    copied_checkpoint[_ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY] = (
-                        copy_json_value(
-                            reconnect_state,
-                            "environment_factory_reconnect",
-                        )
-                    )
+                for key in runtime_keys:
+                    if key in copied_checkpoint:
+                        continue
+                    state = current_checkpoint.get(key)
+                    if state is not None:
+                        if type(state) is not dict:
+                            raise ValueError(f"{key} checkpoint state must be an object.")
+                        copied_checkpoint[key] = copy_json_value(state, key)
         await self.session_store.transform_checkpoint(
             session_id,
             _replace_checkpoint_preserving_runtime_state(copied_checkpoint),
@@ -12490,7 +12582,19 @@ class CayuApp:
                 agent_name=registered_agent.spec.name,
                 environment_name=environment_name,
             )
-        except Exception as exc:
+        except BaseException as exc:
+            cleanup_status = binding_cleanup_status(exc)
+            if cleanup_status is not None:
+                cleanup_status.retry_attempted = True
+                try:
+                    await cleanup_status.retry()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as cleanup_exc:
+                    cleanup_status.retry_error = cleanup_exc
+            if not isinstance(exc, Exception):
+                raise
+            failure_payload = {**base_payload, **_exception_failure_payload(exc)}
             events.append(
                 await self._event_writer.emit(
                     Event(
@@ -12498,11 +12602,7 @@ class CayuApp:
                         session_id=session.id,
                         agent_name=registered_agent.spec.name,
                         environment_name=environment_name,
-                        payload={
-                            **base_payload,
-                            "error": str(exc),
-                            "error_type": type(exc).__name__,
-                        },
+                        payload=failure_payload,
                     )
                 )
             )
@@ -14687,6 +14787,23 @@ def _workspace_object_id(workspace: Any) -> str | None:
     return workspace_id if isinstance(workspace_id, str) else None
 
 
+def _exception_failure_payload(error: BaseException) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "error": str(error),
+        "error_type": type(error).__name__,
+    }
+    cleanup_payload = binding_cleanup_payload(error)
+    if cleanup_payload is not None:
+        payload["binding_cleanup"] = cleanup_payload
+    factory_release = getattr(error, _ENVIRONMENT_FACTORY_RELEASE_ERROR_ATTRIBUTE, None)
+    if isinstance(factory_release, dict):
+        payload["environment_factory_release"] = copy_json_value(
+            factory_release,
+            "environment_factory_release",
+        )
+    return payload
+
+
 def _binding_outcome_for_terminal_event(event_type: EventType | str) -> str:
     if event_type == EventType.SESSION_COMPLETED:
         return "completed"
@@ -15349,19 +15466,166 @@ async def _collect_through_event_type(
     raise RuntimeError(missing_message)
 
 
-async def _close_unclaimed_factory_environment(environment: Environment) -> None:
-    runner = environment.runner
-    if runner is not None:
-        with contextlib.suppress(Exception, asyncio.CancelledError):
-            await runner.close()
+async def _release_unclaimed_factory_result(
+    result: EnvironmentFactoryResult,
+    *,
+    action: EnvironmentFactoryReleaseAction,
+    original_error: BaseException,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "action": action.value,
+        "callback_provided": result.release is not None,
+    }
+    if result.release is not None:
+        release = result.release
 
-    binding = environment.binding
-    close = getattr(binding, "close", None)
-    if callable(close):
-        with contextlib.suppress(Exception, asyncio.CancelledError):
-            result = close()
-            if inspect.isawaitable(result):
-                await result
+        async def run_release() -> None:
+            await release(action)
+
+        release_task = asyncio.create_task(run_release())
+        try:
+            cancelled = await _await_bounded_environment_factory_release(
+                release_task,
+                timeout_s=result.release_timeout_s,
+            )
+        except BaseException as cleanup_error:
+            payload.update(
+                {
+                    "completed": False,
+                    "error": str(cleanup_error),
+                    "error_type": type(cleanup_error).__name__,
+                    "timeout_s": result.release_timeout_s,
+                }
+            )
+            original_error.add_note(
+                "Environment factory result release failed after "
+                f"{action.value}: {type(cleanup_error).__name__}: {cleanup_error}."
+            )
+            current_task = asyncio.current_task()
+            if current_task is not None and current_task.cancelling():
+                cancellation = asyncio.CancelledError()
+                cancellation.add_note(
+                    "Environment factory result release failed while cancellation was pending: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}."
+                )
+                raise cancellation from cleanup_error
+        else:
+            payload["completed"] = True
+            if cancelled:
+                raise asyncio.CancelledError()
+        return payload
+    if action is EnvironmentFactoryReleaseAction.PRESERVE:
+        payload.update(
+            {
+                "completed": False,
+                "error": "Durable factory result has no release callback.",
+                "error_type": "MissingEnvironmentFactoryRelease",
+            }
+        )
+        original_error.add_note(
+            "Environment factory result has durable reconnect state but no release callback; "
+            "the runtime left the live allocation untouched rather than closing it terminally."
+        )
+        return payload
+
+    cleanup_errors: list[tuple[str, Exception]] = []
+
+    async def run_fallback_release() -> None:
+        runner = result.environment.runner
+        if runner is not None:
+            try:
+                await runner.close()
+            except Exception as cleanup_error:
+                cleanup_errors.append(("runner", cleanup_error))
+
+        binding = result.environment.binding
+        close = getattr(binding, "close", None)
+        if callable(close):
+            try:
+                close_result = close()
+                if inspect.isawaitable(close_result):
+                    await close_result
+            except Exception as cleanup_error:
+                cleanup_errors.append(("binding", cleanup_error))
+
+    fallback_task = asyncio.create_task(run_fallback_release())
+    try:
+        cancelled = await _await_bounded_environment_factory_release(
+            fallback_task,
+            timeout_s=result.release_timeout_s,
+        )
+    except BaseException as cleanup_error:
+        payload.update(
+            {
+                "completed": False,
+                "error": str(cleanup_error),
+                "error_type": type(cleanup_error).__name__,
+                "timeout_s": result.release_timeout_s,
+            }
+        )
+        current_task = asyncio.current_task()
+        if current_task is not None and current_task.cancelling():
+            cancellation = asyncio.CancelledError()
+            cancellation.add_note(
+                "Environment factory fallback release failed while cancellation was pending: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}."
+            )
+            raise cancellation from cleanup_error
+        return payload
+    if cancelled:
+        raise asyncio.CancelledError()
+    payload["completed"] = not cleanup_errors
+    if cleanup_errors:
+        details = "; ".join(
+            f"{phase}: {type(error).__name__}: {error}" for phase, error in cleanup_errors
+        )
+        payload["error"] = details
+        payload["error_type"] = type(cleanup_errors[0][1]).__name__
+        original_error.add_note(
+            f"Environment factory fallback release incomplete after {action.value}: {details}."
+        )
+    return payload
+
+
+async def _await_bounded_environment_factory_release(
+    task: asyncio.Task[None],
+    *,
+    timeout_s: float,
+) -> bool:
+    """Finish a factory release despite cancellation, within its declared bound."""
+
+    cancelled = False
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    while not task.done():
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            task.cancel()
+            task.add_done_callback(_consume_background_task_result)
+            raise TimeoutError(
+                f"Environment factory result release did not complete within {timeout_s:g} seconds."
+            )
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+        except asyncio.CancelledError:
+            if task.done():
+                task.result()
+            cancelled = True
+        except TimeoutError as exc:
+            if task.done():
+                task.result()
+                break
+            task.cancel()
+            task.add_done_callback(_consume_background_task_result)
+            raise TimeoutError(
+                f"Environment factory result release did not complete within {timeout_s:g} seconds."
+            ) from exc
+    task.result()
+    return cancelled
+
+
+def _consume_background_task_result(task: asyncio.Task[Any]) -> None:
+    with contextlib.suppress(BaseException):
+        task.result()
 
 
 @dataclass

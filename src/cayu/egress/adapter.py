@@ -9,7 +9,7 @@ from typing import Any
 
 from cayu.egress.broker import TransparentEgressBroker
 from cayu.egress.capabilities import EgressCapabilityEvidence
-from cayu.egress.errors import UnsupportedEgressError
+from cayu.egress.errors import UnsupportedEgressError, UnsupportedEgressReconnectError
 from cayu.egress.grants import VirtualCredentialGrant
 from cayu.egress.proxy_exposure import HttpProxyEndpoint
 from cayu.runners.base import Runner
@@ -151,6 +151,7 @@ class VirtualEgressRunnerRequest:
     session_id: str | None = None
     parent_session_id: str | None = None
     reconnect_metadata: Mapping[str, Any] = field(default_factory=dict)
+    environment_name: str | None = None
 
 
 class SandboxEgressAdapter(ABC):
@@ -166,6 +167,8 @@ class SandboxEgressAdapter(ABC):
 
     #: Identifier of the runner family this adapter enforces.
     runner_kind: str
+    #: True only when same-sandbox reconnect has durable single-owner semantics.
+    supports_reconnect: bool = False
 
     @abstractmethod
     async def prepare(
@@ -181,6 +184,22 @@ class SandboxEgressAdapter(ABC):
     async def create_runner(self, request: VirtualEgressRunnerRequest) -> Runner:
         """Create a runner that applies this adapter's binding without downgrade."""
 
+    async def prepare_reconnect(
+        self,
+        *,
+        session_id: str,
+        environment_name: str,
+        grants: Sequence[VirtualCredentialGrant],
+        broker: TransparentEgressBroker,
+        reconnect_metadata: Mapping[str, Any],
+    ) -> EgressBinding:
+        """Re-establish enforcement for an existing sandbox or fail closed."""
+        del session_id, environment_name, grants, broker, reconnect_metadata
+        raise UnsupportedEgressReconnectError(
+            f"Runner {self.runner_kind!r} does not support virtual-egress reconnect. "
+            "The application must explicitly rebuild the environment."
+        )
+
     def reconnect_metadata(self, runner: Runner) -> dict[str, Any]:
         """Return durable identity required to reattach to ``runner``."""
         return {}
@@ -192,6 +211,17 @@ class SandboxEgressAdapter(ABC):
     def configuration_metadata(self) -> dict[str, Any]:
         """Return JSON-safe configured intent without claiming runtime proof."""
         return {}
+
+    def validate_reconnect_metadata(
+        self,
+        reconnect_metadata: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Allowlist and normalize this adapter's non-secret durable identity."""
+        del reconnect_metadata
+        raise UnsupportedEgressReconnectError(
+            f"Runner {self.runner_kind!r} does not support virtual-egress reconnect. "
+            "The application must explicitly rebuild the environment."
+        )
 
     async def finalize_runner(self, runner: Runner, *, outcome: str | None) -> None:
         """Map a session outcome to the runner's lifecycle action."""

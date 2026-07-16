@@ -36,5 +36,25 @@ class UnsupportedEgressCapabilityError(UnsupportedEgressError):
         )
 
 
+class EgressReconnectError(EgressError):
+    """Base error for a fail-closed virtual-egress reconnect attempt."""
+
+
+class InvalidEgressReconnectMetadataError(EgressReconnectError):
+    """Durable reconnect metadata is malformed, stale, or out of scope."""
+
+
+class UnsupportedEgressReconnectError(EgressReconnectError):
+    """The selected adapter cannot safely re-establish enforced egress."""
+
+
+class EgressReconnectConflictError(EgressReconnectError):
+    """Another owner already holds the reconnectable sandbox boundary."""
+
+
+class EgressReconnectNotFoundError(EgressReconnectError):
+    """The sandbox named by durable reconnect metadata no longer exists."""
+
+
 class VirtualCredentialError(EgressError):
     """A virtual credential was unknown, expired, or revoked at the broker."""

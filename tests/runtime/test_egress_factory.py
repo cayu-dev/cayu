@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +12,7 @@ from tests.runners.lambda_microvm_harness import (
 )
 
 from cayu.artifacts import LocalArtifactStore
-from cayu.core.events import Event, EventType
+from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.egress import (
     CapturedRequest,
     CapturedResponse,
@@ -22,19 +22,29 @@ from cayu.egress import (
     EgressCapabilityClaim,
     EgressCapabilityEvidence,
     HttpEgressPolicy,
+    InvalidEgressReconnectMetadataError,
     SandboxEgressAdapter,
     TransparentEgressBroker,
+    UnsupportedEgressReconnectError,
     VirtualCredentialError,
 )
-from cayu.environments import EFSAccessPointBinding, EnvironmentFactoryRequest
+from cayu.environments import (
+    EFSAccessPointBinding,
+    EnvironmentFactoryOperation,
+    EnvironmentFactoryReleaseAction,
+    EnvironmentFactoryRequest,
+)
 from cayu.environments.bindings import BoundWorkspace, WorkspaceBinding
+from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runners import LambdaMicroVMRunner
 from cayu.runners.base import ExecCommand, ExecResult, Runner
+from cayu.runtime import CayuApp, InMemorySessionStore, RunRequest
 from cayu.vaults import SecretRef, StaticVault
 
 pytest.importorskip("cryptography")
 
 from cayu.egress.docker_adapter import GUEST_CA_PATH
+from cayu.runtime._binding_cleanup import binding_cleanup_payload
 from cayu.runtime.egress import (
     VirtualCredentialSpec,
     VirtualEgressEnvironmentFactory,
@@ -162,12 +172,50 @@ class _RecordingAdapter(SandboxEgressAdapter):
 
 
 class _LifecycleRecordingAdapter(_RecordingAdapter):
+    supports_reconnect = True
+
     def __init__(self) -> None:
         super().__init__("lambda-microvm")
         self.finalize_calls: list[str | None] = []
 
     def reconnect_metadata(self, runner: Runner) -> dict[str, Any]:
         return {"microvm_id": "mvm-123", "endpoint": "mvm.internal"}
+
+    def validate_reconnect_metadata(
+        self,
+        reconnect_metadata: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if set(reconnect_metadata) - {"microvm_id", "endpoint"}:
+            raise InvalidEgressReconnectMetadataError(
+                "Test adapter reconnect identity contains unsupported fields."
+            )
+        microvm_id = reconnect_metadata.get("microvm_id")
+        if not isinstance(microvm_id, str) or not microvm_id:
+            raise InvalidEgressReconnectMetadataError(
+                "Test adapter reconnect identity requires microvm_id."
+            )
+        endpoint = reconnect_metadata.get("endpoint")
+        if endpoint is not None and (not isinstance(endpoint, str) or not endpoint):
+            raise InvalidEgressReconnectMetadataError(
+                "Test adapter reconnect endpoint must be nonblank when set."
+            )
+        result = {"microvm_id": microvm_id}
+        if endpoint is not None:
+            result["endpoint"] = endpoint
+        return result
+
+    async def prepare_reconnect(
+        self,
+        *,
+        session_id: str,
+        environment_name: str,
+        grants: Sequence[Any],
+        broker: Any,
+        reconnect_metadata: Mapping[str, Any],
+    ) -> EgressBinding:
+        self.captured["reconnect_identity"] = reconnect_metadata
+        self.captured["reconnect_environment_name"] = environment_name
+        return await self.prepare(session_id=session_id, grants=grants, broker=broker)
 
     async def finalize_runner(self, runner: Runner, *, outcome: str | None) -> None:
         self.finalize_calls.append(outcome)
@@ -214,6 +262,14 @@ class _RetryingLifecycleAdapter(_RecordingAdapter):
     async def finalize_runner(self, runner: Runner, *, outcome: str | None) -> None:
         self.finalize_calls += 1
         if self.finalize_calls == 1:
+            raise RuntimeError("suspend failed")
+        await runner.close()
+
+
+class _RetryingReconnectAdapter(_LifecycleRecordingAdapter):
+    async def finalize_runner(self, runner: Runner, *, outcome: str | None) -> None:
+        self.finalize_calls.append(outcome)
+        if len(self.finalize_calls) == 1:
             raise RuntimeError("suspend failed")
         await runner.close()
 
@@ -418,7 +474,15 @@ def test_factory_passes_and_returns_adapter_reconnect_metadata() -> None:
                 session_id="sess_resume",
                 agent_name="agent",
                 environment_name="egress-env",
-                reconnect_metadata={"microvm_id": "mvm-old", "endpoint": "old.internal"},
+                operation=EnvironmentFactoryOperation.RECONNECT,
+                reconnect_metadata={
+                    "version": 1,
+                    "runner_kind": "lambda-microvm",
+                    "session_id": "sess_resume",
+                    "environment_name": "egress-env",
+                    "capability": "supported",
+                    "identity": {"microvm_id": "mvm-old", "endpoint": "old.internal"},
+                },
             )
         )
         request = adapter.captured["runner_request"]
@@ -435,9 +499,17 @@ def test_factory_passes_and_returns_adapter_reconnect_metadata() -> None:
         "microvm_id": "mvm-old",
         "endpoint": "old.internal",
     }
+    assert adapter.captured["reconnect_identity"] == runner_request.reconnect_metadata
     assert result.reconnect_metadata == {
-        "microvm_id": "mvm-123",
-        "endpoint": "mvm.internal",
+        "version": 1,
+        "runner_kind": "lambda-microvm",
+        "session_id": "sess_resume",
+        "environment_name": "egress-env",
+        "capability": "supported",
+        "identity": {
+            "microvm_id": "mvm-123",
+            "endpoint": "mvm.internal",
+        },
     }
     assert adapter.finalize_calls == [None]
 
@@ -539,6 +611,259 @@ def test_factory_rejects_untyped_capability_evidence_and_cleans_up() -> None:
     inner: Runner = adapter.captured["inner_runner"]
     assert inner.closed is True
     assert adapter.torn_down == 1
+
+
+def test_factory_reconnect_operation_refuses_missing_durable_metadata() -> None:
+    adapter = _LifecycleRecordingAdapter()
+
+    async def run() -> None:
+        with pytest.raises(InvalidEgressReconnectMetadataError, match="requires durable"):
+            await _virtual_factory(adapter=adapter).create(
+                EnvironmentFactoryRequest(
+                    session_id="sess_missing_reconnect",
+                    agent_name="agent",
+                    environment_name="egress-env",
+                    operation=EnvironmentFactoryOperation.RECONNECT,
+                )
+            )
+
+    asyncio.run(run())
+    assert adapter.prepare_calls == []
+
+
+def test_factory_create_operation_refuses_same_session_reconnect_metadata() -> None:
+    adapter = _LifecycleRecordingAdapter()
+
+    async def run() -> None:
+        with pytest.raises(InvalidEgressReconnectMetadataError, match="explicit reconnect"):
+            await _virtual_factory(adapter=adapter).create(
+                EnvironmentFactoryRequest(
+                    session_id="sess_accidental_attach",
+                    agent_name="agent",
+                    environment_name="egress-env",
+                    reconnect_metadata={
+                        "version": 1,
+                        "runner_kind": "lambda-microvm",
+                        "session_id": "sess_accidental_attach",
+                        "environment_name": "egress-env",
+                        "capability": "supported",
+                        "identity": {"microvm_id": "mvm-old"},
+                    },
+                )
+            )
+
+    asyncio.run(run())
+    assert adapter.prepare_calls == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("version", 2, "version"),
+        ("runner_kind", "microsandbox", "runner kind"),
+        ("session_id", "other-session", "different session"),
+        ("environment_name", "other-environment", "different environment"),
+        ("capability", "mystery", "capability"),
+        ("identity", {}, "non-empty object"),
+    ],
+)
+def test_factory_rejects_invalid_reconnect_scope_before_adapter_prepare(
+    field: str,
+    value: Any,
+    message: str,
+) -> None:
+    adapter = _LifecycleRecordingAdapter()
+    metadata = {
+        "version": 1,
+        "runner_kind": "lambda-microvm",
+        "session_id": "sess_resume",
+        "environment_name": "egress-env",
+        "capability": "supported",
+        "identity": {"microvm_id": "mvm-old"},
+    }
+    metadata[field] = value
+
+    async def run() -> None:
+        with pytest.raises(InvalidEgressReconnectMetadataError, match=message):
+            await _virtual_factory(adapter=adapter).create(
+                EnvironmentFactoryRequest(
+                    session_id="sess_resume",
+                    agent_name="agent",
+                    environment_name="egress-env",
+                    operation=EnvironmentFactoryOperation.RECONNECT,
+                    reconnect_metadata=metadata,
+                )
+            )
+
+    asyncio.run(run())
+
+    assert adapter.prepare_calls == []
+    assert "runner_request" not in adapter.captured
+
+
+@pytest.mark.parametrize(
+    "authority_field",
+    [
+        "token",
+        "authToken",
+        "authorization",
+        "client_secret_value",
+        "cookie",
+        "apiKey",
+        "xApiKeyValue",
+        "caPrivateKeyPem",
+        "proxy-authorization",
+    ],
+)
+def test_factory_rejects_replayable_authority_in_reconnect_metadata(
+    authority_field: str,
+) -> None:
+    adapter = _LifecycleRecordingAdapter()
+
+    async def run() -> None:
+        with pytest.raises(InvalidEgressReconnectMetadataError, match="replayable authority"):
+            await _virtual_factory(adapter=adapter).create(
+                EnvironmentFactoryRequest(
+                    session_id="sess_resume",
+                    agent_name="agent",
+                    environment_name="egress-env",
+                    operation=EnvironmentFactoryOperation.RECONNECT,
+                    reconnect_metadata={
+                        "version": 1,
+                        "runner_kind": "lambda-microvm",
+                        "session_id": "sess_resume",
+                        "environment_name": "egress-env",
+                        "capability": "supported",
+                        "identity": {"microvm_id": "mvm-old", authority_field: "replay-me"},
+                    },
+                )
+            )
+
+    asyncio.run(run())
+
+    assert adapter.prepare_calls == []
+
+
+def test_factory_rejects_adapter_reconnect_authority_and_rolls_back() -> None:
+    class _UnsafeMetadataAdapter(_LifecycleRecordingAdapter):
+        def reconnect_metadata(self, runner: Runner) -> dict[str, Any]:
+            del runner
+            return {"microvm_id": "mvm-1", "token": "replay-me"}
+
+    adapter = _UnsafeMetadataAdapter()
+
+    async def run() -> None:
+        with pytest.raises(InvalidEgressReconnectMetadataError, match="unsupported fields"):
+            await _virtual_factory(adapter=adapter).create(
+                EnvironmentFactoryRequest(
+                    session_id="sess_create",
+                    agent_name="agent",
+                    environment_name="egress-env",
+                )
+            )
+
+    asyncio.run(run())
+
+    assert adapter.captured["inner_runner"].closed is True
+    assert adapter.torn_down == 1
+
+
+def test_factory_rejects_malformed_reconnect_schema() -> None:
+    adapter = _LifecycleRecordingAdapter()
+
+    async def run() -> None:
+        with pytest.raises(InvalidEgressReconnectMetadataError, match="invalid schema"):
+            await _virtual_factory(adapter=adapter).create(
+                EnvironmentFactoryRequest(
+                    session_id="sess_resume",
+                    agent_name="agent",
+                    environment_name="egress-env",
+                    operation=EnvironmentFactoryOperation.RECONNECT,
+                    reconnect_metadata={
+                        "version": 1,
+                        "runner_kind": "lambda-microvm",
+                        "session_id": "sess_resume",
+                        "capability": "supported",
+                        "identity": {"microvm_id": "mvm-old"},
+                        "unexpected": True,
+                    },
+                )
+            )
+
+    asyncio.run(run())
+
+    assert adapter.prepare_calls == []
+
+
+def test_factory_fails_closed_when_adapter_cannot_reconnect() -> None:
+    adapter = _RecordingAdapter("docker")
+
+    async def run() -> dict[str, Any]:
+        created = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_resume",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        runner = created.environment.runner
+        assert runner is not None
+        await runner.close()
+        metadata = created.reconnect_metadata
+        adapter.prepare_calls = []
+        adapter.captured = {}
+        with pytest.raises(UnsupportedEgressReconnectError, match="explicitly rebuild"):
+            await _virtual_factory(adapter=adapter).create(
+                EnvironmentFactoryRequest(
+                    session_id="sess_resume",
+                    agent_name="agent",
+                    environment_name="egress-env",
+                    operation=EnvironmentFactoryOperation.RECONNECT,
+                    reconnect_metadata=metadata,
+                )
+            )
+        return metadata
+
+    metadata = asyncio.run(run())
+
+    assert metadata["capability"] == "unsupported"
+    assert metadata["runner_kind"] == "docker"
+    assert "identity" not in metadata
+    assert adapter.prepare_calls == []
+    assert "runner_request" not in adapter.captured
+
+
+def test_factory_fork_ignores_valid_parent_reconnect_identity() -> None:
+    adapter = _LifecycleRecordingAdapter()
+
+    async def run() -> Any:
+        result = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="child-session",
+                parent_session_id="parent-session",
+                agent_name="agent",
+                environment_name="egress-env",
+                reconnect_metadata={
+                    "version": 1,
+                    "runner_kind": "lambda-microvm",
+                    "session_id": "parent-session",
+                    "environment_name": "egress-env",
+                    "capability": "supported",
+                    "identity": {"microvm_id": "parent-mvm"},
+                },
+            )
+        )
+        runner = result.environment.runner
+        assert runner is not None
+        await runner.close()
+        return result
+
+    result = asyncio.run(run())
+
+    assert adapter.prepare_calls[0]["session_id"] == "child-session"
+    assert "reconnect_identity" not in adapter.captured
+    assert adapter.captured["runner_request"].reconnect_metadata == {}
+    assert result.reconnect_metadata["session_id"] == "child-session"
 
 
 def test_factory_attaches_durable_artifact_store(tmp_path) -> None:
@@ -666,6 +991,329 @@ def test_bind_failure_cleans_up_egress_resources() -> None:
 
     assert runner.closed is True
     assert adapter.torn_down == 1
+
+
+def test_bind_failure_detaches_a_reconnected_environment() -> None:
+    adapter = _LifecycleRecordingAdapter()
+
+    class _FailingBindBinding(WorkspaceBinding):
+        async def bind(self, workspace, runner, **kwargs):  # type: ignore[no-untyped-def]
+            raise RuntimeError("bind failed")
+
+        async def finalize(self, bound, *, outcome=None, metadata=None):  # type: ignore[no-untyped-def]
+            raise AssertionError("finalize should not run")
+
+    async def run() -> None:
+        result = await _virtual_factory(
+            adapter=adapter,
+            inner_binding=_FailingBindBinding(),
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_bind_reconnect",
+                agent_name="agent",
+                environment_name="egress-env",
+                operation=EnvironmentFactoryOperation.RECONNECT,
+                reconnect_metadata={
+                    "version": 1,
+                    "runner_kind": "lambda-microvm",
+                    "session_id": "sess_bind_reconnect",
+                    "environment_name": "egress-env",
+                    "capability": "supported",
+                    "identity": {"microvm_id": "mvm-old"},
+                },
+            )
+        )
+        binding = result.environment.binding
+        runner = result.environment.runner
+        assert binding is not None and runner is not None
+        with pytest.raises(RuntimeError, match="bind failed"):
+            await binding.bind(None, runner, session_id="sess_bind_reconnect")
+
+    asyncio.run(run())
+    assert adapter.finalize_calls == ["interrupted"]
+    assert adapter.torn_down == 1
+
+
+def test_bind_failure_reports_incomplete_cleanup_without_false_revoked_event() -> None:
+    adapter = _RetryingLifecycleAdapter()
+    events: list[Event] = []
+
+    class _FailingBindBinding(WorkspaceBinding):
+        async def bind(self, workspace, runner, **kwargs):  # type: ignore[no-untyped-def]
+            raise RuntimeError("bind failed")
+
+        async def finalize(self, bound, *, outcome=None, metadata=None):  # type: ignore[no-untyped-def]
+            raise AssertionError("finalize should not run")
+
+    async def emit(event: Event) -> Event:
+        events.append(event)
+        return event
+
+    async def run() -> None:
+        result = await _virtual_factory(
+            adapter=adapter,
+            inner_binding=_FailingBindBinding(),
+            event_emitter=emit,
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_bind_cleanup_failure",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        binding = result.environment.binding
+        runner = result.environment.runner
+        assert binding is not None and runner is not None
+        with pytest.raises(RuntimeError, match="bind failed") as exc_info:
+            await binding.bind(None, runner, session_id="sess_bind_cleanup_failure")
+        assert any("bind rollback incomplete" in note for note in exc_info.value.__notes__)
+        assert binding_cleanup_payload(exc_info.value) == {
+            "incomplete": True,
+            "initial_error": (
+                "Virtual-egress resource cleanup incomplete: runner: RuntimeError: suspend failed"
+            ),
+            "initial_error_type": "RuntimeError",
+            "retry_attempted": False,
+        }
+        assert adapter.torn_down == 0
+        assert EventType.EGRESS_GRANT_REVOKED not in {event.type for event in events}
+
+        await runner.close()
+        assert adapter.torn_down == 1
+
+    asyncio.run(run())
+
+
+def test_app_retries_reconnected_binding_cleanup_without_removing_sandbox() -> None:
+    adapter = _RetryingReconnectAdapter()
+    egress_events: list[Event] = []
+
+    class _FailingBindBinding(WorkspaceBinding):
+        async def bind(self, workspace, runner, **kwargs):  # type: ignore[no-untyped-def]
+            raise RuntimeError("bind failed")
+
+        async def finalize(self, bound, *, outcome=None, metadata=None):  # type: ignore[no-untyped-def]
+            raise AssertionError("finalize should not run")
+
+    class _UnreachedProvider(ModelProvider):
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    async def emit(event: Event) -> Event:
+        egress_events.append(event)
+        return event
+
+    async def run() -> tuple[list[Event], _UnreachedProvider]:
+        store = InMemorySessionStore()
+        provider = _UnreachedProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        result = await _virtual_factory(
+            adapter=adapter,
+            inner_binding=_FailingBindBinding(),
+            event_emitter=emit,
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_bind_cleanup_app_retry",
+                agent_name="assistant",
+                environment_name="egress-env",
+                operation=EnvironmentFactoryOperation.RECONNECT,
+                reconnect_metadata={
+                    "version": 1,
+                    "runner_kind": "lambda-microvm",
+                    "session_id": "sess_bind_cleanup_app_retry",
+                    "environment_name": "egress-env",
+                    "capability": "supported",
+                    "identity": {"microvm_id": "mvm-old"},
+                },
+            )
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment(result.environment, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        _ = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_bind_cleanup_app_retry",
+                    messages=[Message.text("user", "run")],
+                )
+            )
+        ]
+        return await store.load_events("sess_bind_cleanup_app_retry"), provider
+
+    events, provider = asyncio.run(run())
+
+    binding_failed = next(
+        event for event in events if event.type is EventType.ENVIRONMENT_BINDING_FAILED
+    )
+    session_failed = next(event for event in events if event.type is EventType.SESSION_FAILED)
+    expected_cleanup = {
+        "incomplete": False,
+        "initial_error": (
+            "Virtual-egress resource cleanup incomplete: runner: RuntimeError: suspend failed"
+        ),
+        "initial_error_type": "RuntimeError",
+        "retry_attempted": True,
+        "retry_completed": True,
+    }
+    assert binding_failed.payload["binding_cleanup"] == expected_cleanup
+    assert session_failed.payload["binding_cleanup"] == expected_cleanup
+    assert sum(event.type is EventType.EGRESS_GRANT_REVOKED for event in egress_events) == 1
+    assert adapter.finalize_calls == ["interrupted", "interrupted"]
+    assert adapter.torn_down == 1
+    assert provider.requests == []
+
+
+def test_app_retries_reconnected_binding_cleanup_during_cancellation() -> None:
+    adapter = _RetryingReconnectAdapter()
+    bind_started = asyncio.Event()
+
+    class _CancelledBindBinding(WorkspaceBinding):
+        async def bind(self, workspace, runner, **kwargs):  # type: ignore[no-untyped-def]
+            bind_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("cancelled bind unexpectedly resumed")
+
+        async def finalize(self, bound, *, outcome=None, metadata=None):  # type: ignore[no-untyped-def]
+            raise AssertionError("finalize should not run")
+
+    class _UnreachedProvider(ModelProvider):
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    async def run() -> _UnreachedProvider:
+        store = InMemorySessionStore()
+        provider = _UnreachedProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        result = await _virtual_factory(
+            adapter=adapter,
+            inner_binding=_CancelledBindBinding(),
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_cancelled_bind_cleanup_retry",
+                agent_name="assistant",
+                environment_name="egress-env",
+                operation=EnvironmentFactoryOperation.RECONNECT,
+                reconnect_metadata={
+                    "version": 1,
+                    "runner_kind": "lambda-microvm",
+                    "session_id": "sess_cancelled_bind_cleanup_retry",
+                    "environment_name": "egress-env",
+                    "capability": "supported",
+                    "identity": {"microvm_id": "mvm-old"},
+                },
+            )
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment(result.environment, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        async def run_app() -> list[Event]:
+            return [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id="sess_cancelled_bind_cleanup_retry",
+                        messages=[Message.text("user", "run")],
+                    )
+                )
+            ]
+
+        run_task = asyncio.create_task(run_app())
+        await asyncio.wait_for(bind_started.wait(), timeout=1)
+        run_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run_task
+        return provider
+
+    provider = asyncio.run(run())
+
+    assert adapter.finalize_calls == ["interrupted", "interrupted"]
+    assert adapter.torn_down == 1
+    assert provider.requests == []
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_outcome"),
+    [
+        (EnvironmentFactoryReleaseAction.PRESERVE, "interrupted"),
+        (EnvironmentFactoryReleaseAction.DISCARD, None),
+    ],
+)
+def test_factory_release_is_idempotent_under_concurrent_calls(
+    action: EnvironmentFactoryReleaseAction,
+    expected_outcome: str | None,
+) -> None:
+    adapter = _LifecycleRecordingAdapter()
+    events: list[Event] = []
+
+    async def emit(event: Event) -> Event:
+        events.append(event)
+        return event
+
+    async def run() -> None:
+        result = await _virtual_factory(adapter=adapter, event_emitter=emit).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_factory_release_preserve",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        assert result.release is not None
+        await asyncio.gather(result.release(action), result.release(action))
+        await result.release(action)
+
+    asyncio.run(run())
+
+    assert adapter.finalize_calls == [expected_outcome]
+    assert adapter.torn_down == 1
+    assert sum(event.type is EventType.EGRESS_GRANT_REVOKED for event in events) == 1
+
+
+def test_concurrent_factory_release_escalates_preserve_to_discard_once() -> None:
+    adapter = _LifecycleRecordingAdapter()
+    events: list[Event] = []
+
+    async def emit(event: Event) -> Event:
+        events.append(event)
+        return event
+
+    async def run() -> None:
+        result = await _virtual_factory(adapter=adapter, event_emitter=emit).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_factory_release_escalation",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        assert result.release is not None
+        await asyncio.gather(
+            result.release(EnvironmentFactoryReleaseAction.PRESERVE),
+            result.release(EnvironmentFactoryReleaseAction.DISCARD),
+        )
+        await result.release(EnvironmentFactoryReleaseAction.DISCARD)
+
+    asyncio.run(run())
+
+    assert adapter.finalize_calls[-1] is None
+    assert len(adapter.finalize_calls) <= 2
+    assert adapter.torn_down == 1
+    assert sum(event.type is EventType.EGRESS_GRANT_REVOKED for event in events) == 1
 
 
 def test_runner_close_before_bind_cleans_up_egress_resources() -> None:
@@ -1220,6 +1868,149 @@ def test_finalize_surfaces_lifecycle_failure_and_runner_close_retries() -> None:
 
     assert runner.closed is True
     assert adapter.finalize_calls == 2
+
+
+def test_runner_failure_keeps_binding_ownership_claim_for_retry() -> None:
+    adapter = _RetryingLifecycleAdapter()
+
+    async def run() -> None:
+        result = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_claim_retry",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        runner = result.environment.runner
+        assert runner is not None
+        with pytest.raises(RuntimeError, match="runner: RuntimeError"):
+            await runner.close()
+        assert adapter.torn_down == 0
+        await runner.close()
+
+    asyncio.run(run())
+    assert adapter.torn_down == 1
+
+
+def test_terminal_retry_escalates_a_completed_interrupted_detach() -> None:
+    adapter = _LifecycleRecordingAdapter()
+
+    async def run() -> None:
+        result = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_escalate_cleanup",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        runner = result.environment.runner
+        assert runner is not None
+        binding: EgressBinding = adapter.captured["binding"]
+        original_teardown = binding.teardown
+        assert original_teardown is not None
+        calls = 0
+
+        async def flaky_teardown() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("claim release failed")
+            await original_teardown()
+
+        binding.teardown = flaky_teardown
+        with pytest.raises(RuntimeError, match="binding: RuntimeError"):
+            await runner.finalize(outcome="interrupted")
+        await runner.close()
+
+    asyncio.run(run())
+    assert adapter.finalize_calls == ["interrupted", None]
+    assert adapter.torn_down == 1
+
+
+def test_concurrent_terminal_escalation_keeps_claim_until_remove_completes() -> None:
+    detach_started = asyncio.Event()
+    allow_detach = asyncio.Event()
+    remove_started = asyncio.Event()
+    allow_remove = asyncio.Event()
+
+    class _CoordinatedAdapter(_LifecycleRecordingAdapter):
+        async def finalize_runner(self, runner: Runner, *, outcome: str | None) -> None:
+            self.finalize_calls.append(outcome)
+            if outcome == "interrupted":
+                detach_started.set()
+                await allow_detach.wait()
+                return
+            remove_started.set()
+            await allow_remove.wait()
+            await runner.close()
+
+    adapter = _CoordinatedAdapter()
+
+    async def run() -> None:
+        result = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_concurrent_escalation",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        runner = result.environment.runner
+        assert runner is not None
+
+        interrupted = asyncio.create_task(runner.finalize(outcome="interrupted"))
+        await detach_started.wait()
+        terminal = asyncio.create_task(runner.close())
+        await asyncio.sleep(0)
+        allow_detach.set()
+        await remove_started.wait()
+        assert adapter.torn_down == 0
+        allow_remove.set()
+        await asyncio.gather(interrupted, terminal)
+
+    asyncio.run(run())
+    assert adapter.finalize_calls == ["interrupted", None]
+    assert adapter.torn_down == 1
+
+
+def test_revocation_failure_stops_before_workspace_finalize_and_claim_release() -> None:
+    adapter = _RecordingAdapter()
+    inner_finalized = False
+
+    class _TrackingBinding(WorkspaceBinding):
+        async def bind(self, workspace, runner, **kwargs):  # type: ignore[no-untyped-def]
+            return BoundWorkspace(runner=runner)
+
+        async def finalize(self, bound, *, outcome=None, metadata=None):  # type: ignore[no-untyped-def]
+            nonlocal inner_finalized
+            inner_finalized = True
+            return None
+
+    async def run() -> None:
+        result = await _virtual_factory(
+            adapter=adapter,
+            inner_binding=_TrackingBinding(),
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_revoke_failure",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        binding = result.environment.binding
+        runner = result.environment.runner
+        assert binding is not None and runner is not None
+        bound = await binding.bind(None, runner, session_id="sess_revoke_failure")
+
+        async def fail_revoke() -> bool:
+            raise RuntimeError("revocation failed")
+
+        runner.revoke_authority = fail_revoke  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="revocation failed"):
+            await binding.finalize(bound, outcome="failed")
+
+    asyncio.run(run())
+    assert inner_finalized is False
+    assert adapter.torn_down == 0
 
 
 def test_finalize_cleans_up_egress_when_inner_finalize_fails() -> None:

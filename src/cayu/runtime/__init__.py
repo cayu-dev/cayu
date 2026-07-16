@@ -120,6 +120,7 @@ from cayu.runtime.dispatch import (
 )
 from cayu.runtime.egress import (
     VIRTUAL_EGRESS_EVENT_TYPES,
+    VIRTUAL_EGRESS_RECONNECT_VERSION,
     ApprovedEgressDestination,
     VirtualCredentialSpec,
     VirtualEgressEnvironmentFactory,
@@ -312,6 +313,7 @@ __all__ = [
     "TAINT_LABELS_METADATA_KEY",
     "TOOL_POLICY_REAUTHORIZATION_METADATA_KEY",
     "VIRTUAL_EGRESS_EVENT_TYPES",
+    "VIRTUAL_EGRESS_RECONNECT_VERSION",
     "AfterToolCallDecision",
     "AgentManifest",
     "AllowAllToolPolicy",

@@ -1731,6 +1731,35 @@ def test_microsandbox_runner_from_existing_can_remove_with_bounded_retry() -> No
     assert diagnostic["status"] == "removed"
 
 
+@pytest.mark.parametrize("phase", ["get", "connect"])
+def test_microsandbox_runner_bounds_existing_sandbox_reattach(phase: str) -> None:
+    class HangingHandle:
+        async def connect(self) -> FakeSandbox:
+            await asyncio.Event().wait()
+            raise AssertionError
+
+    class HangingSandboxApi:
+        @classmethod
+        async def get(cls, name: str) -> HangingHandle:
+            del name
+            if phase == "get":
+                await asyncio.Event().wait()
+            return HangingHandle()
+
+    class HangingModule(FakeMicrosandboxModule):
+        Sandbox = HangingSandboxApi
+
+    async def run() -> None:
+        with pytest.raises(TimeoutError, match="did not attach"):
+            await MicrosandboxRunner.from_existing(
+                "existing",
+                reconnect_timeout_s=0.01,
+                sandbox_module=HangingModule,
+            )
+
+    asyncio.run(run())
+
+
 def test_microsandbox_runner_kills_command_on_cancellation_by_default() -> None:
     async def run() -> tuple[FakeSandbox, BlockingHandle, int]:
         sandbox = FakeSandbox("runner")

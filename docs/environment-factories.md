@@ -93,8 +93,26 @@ first registered environment is not made the default automatically.
 Notes:
 
 - `EnvironmentFactoryRequest` carries the durable session context: `session_id`,
-  `agent_name`, `environment_name`, `parent_session_id`, `causal_budget_id`, `labels`,
-  `metadata`, `reconnect_metadata`. Key your per-session resources off `session_id`.
+  `agent_name`, `environment_name`, `operation`, `parent_session_id`,
+  `causal_budget_id`, `labels`, `metadata`, and `reconnect_metadata`. `operation`
+  is `CREATE` for new sessions and a fork's first child allocation, and
+  `RECONNECT` for resume/recovery. A reconnect operation must fail closed when
+  its durable metadata is missing; it must never silently allocate a replacement.
+  Key per-session resources off `session_id`.
+- `EnvironmentFactoryResult.reconnect_metadata` is checkpointed automatically.
+  It must be versioned, JSON-safe, non-secret identity only. A fresh factory must
+  either attach the exact resource named by that metadata or return a typed
+  unsupported/invalid result; silently creating a replacement is not reconnect.
+- A result that owns live resources represented by `reconnect_metadata` should
+  provide `EnvironmentFactoryResult.release`. The runtime calls it with
+  `DISCARD` when a new allocation fails before the durable checkpoint and
+  `PRESERVE` for a reconnect or when a new allocation was checkpointed but its
+  completion event could not be persisted. `PRESERVE` must detach/release
+  host-side handles without deleting
+  the reconnectable resource; the callback should be idempotent. Cayu's virtual
+  egress factory supplies this callback automatically. Release callbacks are
+  cancellation-safe and bounded to 15 seconds by default; set
+  `release_timeout_s` on the result when the provider needs a different bound.
 - `EnvironmentFactoryResult.environment` must be **exactly** an `Environment` (not a
   subclass) — build one and set `workspace`, `runner`, and `binding` on it.
 - The `binding` is attached to the `Environment`. If you omit it, the binding step is

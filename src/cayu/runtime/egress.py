@@ -14,6 +14,7 @@ import concurrent.futures
 import contextlib
 import inspect
 import os
+import re
 import secrets
 import shutil
 import tempfile
@@ -34,9 +35,11 @@ from cayu.egress import (
     EgressDecision,
     EgressPolicy,
     EgressUpstream,
+    InvalidEgressReconnectMetadataError,
     SandboxEgressAdapter,
     TransparentEgressBroker,
     UnsupportedEgressError,
+    UnsupportedEgressReconnectError,
     VirtualCredentialGrant,
     VirtualCredentialRegistry,
     VirtualEgressRunnerRequest,
@@ -57,6 +60,8 @@ from cayu.environments.bindings import (
 )
 from cayu.environments.factory import (
     EnvironmentFactory,
+    EnvironmentFactoryOperation,
+    EnvironmentFactoryReleaseAction,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
 )
@@ -67,6 +72,7 @@ from cayu.runners.base import (
     Runner,
     RunnerWorkspaceCapabilityT,
 )
+from cayu.runtime._binding_cleanup import record_binding_cleanup_failure
 from cayu.vaults import SecretRef, SecretResolver
 from cayu.workspaces import RunnerBoundWorkspace, Workspace
 
@@ -74,6 +80,7 @@ EventEmitter = Callable[[Event], Awaitable[Event]]
 VirtualEgressWorkspaceFactory = Callable[[Runner], Workspace | Awaitable[Workspace]]
 
 DEFAULT_SANDBOX_IMAGE = "python:3.12-slim"
+VIRTUAL_EGRESS_RECONNECT_VERSION = 1
 VIRTUAL_EGRESS_EVENT_TYPES = (
     EventType.CREDENTIAL_MODE_SELECTED,
     EventType.EGRESS_GRANT_MINTED,
@@ -96,6 +103,179 @@ class VirtualCredentialSpec:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "credential_kind", validate_credential_kind(self.credential_kind))
+
+
+_RECONNECT_COMMON_FIELDS = {
+    "version",
+    "runner_kind",
+    "session_id",
+    "environment_name",
+    "capability",
+}
+_SUPPORTED_RECONNECT_FIELDS = _RECONNECT_COMMON_FIELDS | {"identity"}
+_UNSUPPORTED_RECONNECT_FIELDS = _RECONNECT_COMMON_FIELDS | {"reason"}
+_REPLAYABLE_AUTHORITY_KEY_PARTS = {
+    "auth",
+    "authorization",
+    "bearer",
+    "cookie",
+    "credential",
+    "credentials",
+    "passwd",
+    "password",
+    "secret",
+    "secrets",
+    "token",
+    "tokens",
+}
+_REPLAYABLE_AUTHORITY_COMPACT_KEYS = {
+    "accesstoken",
+    "apikey",
+    "caprivatekey",
+    "presentedvalue",
+    "privatekey",
+    "proxyauthorization",
+}
+
+
+def _parse_reconnect_metadata(
+    request: EnvironmentFactoryRequest,
+    *,
+    runner_kind: str,
+) -> dict[str, Any] | None:
+    metadata = request.reconnect_metadata
+    if request.operation is EnvironmentFactoryOperation.RECONNECT and not metadata:
+        raise InvalidEgressReconnectMetadataError(
+            "Virtual-egress reconnect requires durable reconnect metadata; refusing to "
+            "create a replacement environment during recovery."
+        )
+    if request.operation is EnvironmentFactoryOperation.CREATE and not metadata:
+        return None
+    fields = set(metadata)
+    capability = metadata.get("capability")
+    if capability == "supported":
+        expected_fields = _SUPPORTED_RECONNECT_FIELDS
+    elif capability == "unsupported":
+        expected_fields = _UNSUPPORTED_RECONNECT_FIELDS
+    else:
+        raise InvalidEgressReconnectMetadataError(
+            "Virtual-egress reconnect metadata capability must be supported or unsupported."
+        )
+    missing = expected_fields - fields
+    unexpected = fields - expected_fields
+    if missing or unexpected:
+        details: list[str] = []
+        if missing:
+            details.append(f"missing {', '.join(sorted(missing))}")
+        if unexpected:
+            details.append(f"unexpected {', '.join(sorted(unexpected))}")
+        raise InvalidEgressReconnectMetadataError(
+            f"Virtual-egress reconnect metadata has an invalid schema ({'; '.join(details)})."
+        )
+    version = metadata["version"]
+    if type(version) is not int or version != VIRTUAL_EGRESS_RECONNECT_VERSION:
+        raise InvalidEgressReconnectMetadataError(
+            "Virtual-egress reconnect metadata version is unsupported; "
+            "the application must explicitly rebuild the environment."
+        )
+    if metadata["runner_kind"] != runner_kind:
+        raise InvalidEgressReconnectMetadataError(
+            "Virtual-egress reconnect metadata belongs to a different runner kind."
+        )
+    if metadata["environment_name"] != request.environment_name:
+        raise InvalidEgressReconnectMetadataError(
+            "Virtual-egress reconnect metadata belongs to a different environment."
+        )
+    identity: dict[str, Any] | None = None
+    if capability == "supported":
+        candidate_identity = metadata["identity"]
+        if not isinstance(candidate_identity, dict) or not candidate_identity:
+            raise InvalidEgressReconnectMetadataError(
+                "Virtual-egress reconnect metadata identity must be a non-empty object."
+            )
+        _reject_replayable_authority(candidate_identity)
+        identity = candidate_identity
+    else:
+        candidate_reason = metadata["reason"]
+        if not isinstance(candidate_reason, str) or not candidate_reason.strip():
+            raise InvalidEgressReconnectMetadataError(
+                "Virtual-egress unsupported reconnect metadata requires a nonblank reason."
+            )
+    owner_session_id = metadata["session_id"]
+    if request.operation is EnvironmentFactoryOperation.CREATE:
+        if request.parent_session_id is not None and owner_session_id == request.parent_session_id:
+            return None
+        raise InvalidEgressReconnectMetadataError(
+            "Virtual-egress create operations cannot attach reconnect metadata; use an "
+            "explicit reconnect operation."
+        )
+    if owner_session_id != request.session_id:
+        raise InvalidEgressReconnectMetadataError(
+            "Virtual-egress reconnect metadata belongs to a different session."
+        )
+    if capability == "unsupported":
+        raise UnsupportedEgressReconnectError(
+            f"Runner {runner_kind!r} does not support virtual-egress reconnect. "
+            "The application must explicitly rebuild the environment."
+        )
+    assert identity is not None
+    return copy_json_value(identity, "reconnect_metadata.identity")
+
+
+def _build_reconnect_metadata(
+    request: EnvironmentFactoryRequest,
+    *,
+    runner_kind: str,
+    identity: dict[str, Any],
+    supported: bool,
+) -> dict[str, Any]:
+    if not isinstance(identity, dict):
+        raise TypeError("Egress adapter reconnect metadata must be a dictionary.")
+    common = {
+        "version": VIRTUAL_EGRESS_RECONNECT_VERSION,
+        "runner_kind": runner_kind,
+        "session_id": request.session_id,
+        "environment_name": request.environment_name,
+    }
+    if not supported:
+        return {
+            **common,
+            "capability": "unsupported",
+            "reason": (
+                f"Runner {runner_kind!r} does not support virtual-egress reconnect. "
+                "The application must explicitly rebuild the environment."
+            ),
+        }
+    if not identity:
+        raise InvalidEgressReconnectMetadataError(
+            f"Runner {runner_kind!r} declared reconnect support without durable identity."
+        )
+    copied_identity = copy_json_value(identity, "adapter reconnect metadata")
+    _reject_replayable_authority(copied_identity)
+    return {
+        **common,
+        "capability": "supported",
+        "identity": copied_identity,
+    }
+
+
+def _reject_replayable_authority(value: Any, *, path: str = "identity") -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key.strip())
+            parts = tuple(part for part in re.split(r"[^A-Za-z0-9]+", separated.lower()) if part)
+            compact = "".join(parts)
+            if any(part in _REPLAYABLE_AUTHORITY_KEY_PARTS for part in parts) or any(
+                marker in compact for marker in _REPLAYABLE_AUTHORITY_COMPACT_KEYS
+            ):
+                raise InvalidEgressReconnectMetadataError(
+                    f"Virtual-egress reconnect metadata cannot contain replayable authority at "
+                    f"{path}.{key}."
+                )
+            _reject_replayable_authority(item, path=f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _reject_replayable_authority(item, path=f"{path}[{index}]")
 
 
 class VirtualEgressEnvironmentFactory(EnvironmentFactory):
@@ -182,6 +362,12 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             raw_configuration,
             "egress_configuration",
         )
+        reconnect_identity = _parse_reconnect_metadata(
+            request,
+            runner_kind=runner_kind,
+        )
+        if reconnect_identity is not None:
+            reconnect_identity = adapter.validate_reconnect_metadata(reconnect_identity)
         registry = VirtualCredentialRegistry()
         grants = [
             registry.mint(
@@ -228,11 +414,20 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         workspace: Workspace | None = None
         capability_metadata: dict[str, Any]
         try:
-            binding = await adapter.prepare(
-                session_id=request.session_id,
-                grants=grants,
-                broker=broker,
-            )
+            if reconnect_identity is None:
+                binding = await adapter.prepare(
+                    session_id=request.session_id,
+                    grants=grants,
+                    broker=broker,
+                )
+            else:
+                binding = await adapter.prepare_reconnect(
+                    session_id=request.session_id,
+                    environment_name=request.environment_name,
+                    grants=grants,
+                    broker=broker,
+                    reconnect_metadata=reconnect_identity,
+                )
             authority_revoker.teardown_timeout_s = binding.teardown_timeout_s
             ca_dir = tempfile.mkdtemp(prefix="cayu-egress-ca-")
             ca_host = os.path.join(ca_dir, "ca.pem")
@@ -255,11 +450,23 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                     self._approved_destinations,
                 ),
                 session_id=request.session_id,
+                environment_name=request.environment_name,
                 parent_session_id=request.parent_session_id,
-                reconnect_metadata=request.reconnect_metadata,
+                reconnect_metadata=reconnect_identity or {},
             )
             runner = await adapter.create_runner(runner_request)
-            reconnect_metadata = adapter.reconnect_metadata(runner)
+            if adapter.supports_reconnect:
+                adapter_reconnect_metadata = adapter.validate_reconnect_metadata(
+                    adapter.reconnect_metadata(runner)
+                )
+            else:
+                adapter_reconnect_metadata = {}
+            reconnect_metadata = _build_reconnect_metadata(
+                request,
+                runner_kind=runner_kind,
+                identity=adapter_reconnect_metadata,
+                supported=adapter.supports_reconnect,
+            )
             evidence = adapter.capability_evidence(runner)
             if not isinstance(evidence, EgressCapabilityEvidence):
                 raise TypeError(
@@ -288,6 +495,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 session_id=request.session_id,
                 agent_name=request.agent_name,
                 environment_name=request.environment_name,
+                reconnected=reconnect_identity is not None,
             )
 
             await self._emit_grant_events(request, grants, runner_kind=runner_kind)
@@ -300,7 +508,9 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             )
             if managed_runner is not None:
                 try:
-                    await managed_runner.close()
+                    await managed_runner.finalize(
+                        outcome="interrupted" if reconnect_identity is not None else None
+                    )
                 except asyncio.CancelledError:
                     pass
                 except BaseException as cleanup_error:
@@ -322,7 +532,12 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 if runner is not None and revocation_complete:
                     try:
                         await _await_rollback_phase(
-                            runner.close,
+                            lambda: adapter.finalize_runner(
+                                runner,
+                                outcome=(
+                                    "interrupted" if reconnect_identity is not None else "failed"
+                                ),
+                            ),
                             deadline=deadline,
                             phase="runner",
                         )
@@ -368,10 +583,19 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             runner=managed_runner,
             binding=teardown_binding,
         )
+
+        async def release(action: EnvironmentFactoryReleaseAction) -> None:
+            await teardown_binding.release_unbound(
+                outcome=(
+                    "interrupted" if action is EnvironmentFactoryReleaseAction.PRESERVE else None
+                )
+            )
+
         return EnvironmentFactoryResult(
             environment=environment,
             metadata=result_metadata,
             reconnect_metadata=reconnect_metadata,
+            release=release,
         )
 
     async def _create_workspace(self, runner: Runner) -> Workspace | None:
@@ -585,8 +809,14 @@ class _EgressManagedRunner(Runner):
         self._audit = audit
         self._teardown_timeout_s = egress_binding.teardown_timeout_s
         self._runner_close_task: asyncio.Task[None] | None = None
+        self._runner_close_action: str | None = None
+        self._completed_runner_action: str | None = None
         self._binding_close_task: asyncio.Task[None] | None = None
         self._audit_drain_task: asyncio.Task[None] | None = None
+        self._finalize_lock = asyncio.Lock()
+        self._requested_runner_action: str | None = None
+        self._requested_terminal_outcome: str | None = None
+        self._binding_release_started = False
         self.isolation = runner.isolation
         self.default_cwd = runner.default_cwd
         self.system_execution_mode = runner.system_execution_mode
@@ -664,8 +894,20 @@ class _EgressManagedRunner(Runner):
         return await self._authority_revoker.revoke()
 
     async def finalize(self, *, outcome: str | None) -> None:
-        if self._closed:
-            return
+        requested_action = "detach" if outcome == "interrupted" else "remove"
+        # Register an escalation before the first await so an in-flight detach
+        # coordinator sees it before releasing the ownership claim.
+        if not self._binding_release_started:
+            self._register_runner_action(requested_action, outcome=outcome)
+        async with self._finalize_lock:
+            self._register_runner_action(requested_action, outcome=outcome)
+            if self._closed and self._completed_runner_action == self._requested_runner_action:
+                return
+            if self._closed:
+                self._closed = False
+            await self._finalize_serialized()
+
+    async def _finalize_serialized(self) -> None:
         deadline = asyncio.get_running_loop().time() + self._teardown_timeout_s
         cancelled = await self._authority_revoker.revoke(
             timeout_s=self._remaining_teardown_time(deadline)
@@ -674,33 +916,52 @@ class _EgressManagedRunner(Runner):
         # A revocation error leaves this runner open for a truthful retry.
         errors: list[tuple[str, Exception]] = []
         try:
+            runner_outcome = (
+                "interrupted"
+                if self._requested_runner_action == "detach"
+                else self._requested_terminal_outcome
+            )
             cancelled = (
-                await self._await_close_phase(
-                    "_runner_close_task",
-                    lambda: self._adapter.finalize_runner(self._runner, outcome=outcome),
-                    deadline=deadline,
-                    phase="runner",
-                )
+                await self._await_runner_close(outcome=runner_outcome, deadline=deadline)
                 or cancelled
             )
+            self._completed_runner_action = self._runner_close_action
+            # A terminal caller may have registered while detach was pending.
+            if (
+                self._completed_runner_action == "detach"
+                and self._requested_runner_action == "remove"
+            ):
+                cancelled = (
+                    await self._await_runner_close(
+                        outcome=self._requested_terminal_outcome,
+                        deadline=deadline,
+                    )
+                    or cancelled
+                )
+                self._completed_runner_action = self._runner_close_action
         except TimeoutError:
             raise
         except Exception as exc:
             errors.append(("runner", exc))
-        try:
-            cancelled = (
-                await self._await_close_phase(
-                    "_binding_close_task",
-                    self._egress_binding.close,
-                    deadline=deadline,
-                    phase="binding",
+        # The binding owns the provider ownership claim. Never release it while
+        # runner finalization is incomplete: another process could otherwise
+        # attach to a sandbox that is still executable under this owner.
+        if not errors:
+            self._binding_release_started = True
+            try:
+                cancelled = (
+                    await self._await_close_phase(
+                        "_binding_close_task",
+                        self._egress_binding.close,
+                        deadline=deadline,
+                        phase="binding",
+                    )
+                    or cancelled
                 )
-                or cancelled
-            )
-        except TimeoutError:
-            raise
-        except Exception as exc:
-            errors.append(("binding", exc))
+            except TimeoutError:
+                raise
+            except Exception as exc:
+                errors.append(("binding", exc))
         if self._audit is not None:
             try:
                 cancelled = (
@@ -724,6 +985,67 @@ class _EgressManagedRunner(Runner):
         self._closed = True
         if cancelled:
             raise asyncio.CancelledError()
+
+    def _register_runner_action(self, action: str, *, outcome: str | None) -> None:
+        if action == "remove":
+            self._requested_runner_action = "remove"
+            self._requested_terminal_outcome = outcome
+        elif self._requested_runner_action is None:
+            self._requested_runner_action = "detach"
+
+    async def _await_runner_close(self, *, outcome: str | None, deadline: float) -> bool:
+        action = "detach" if outcome == "interrupted" else "remove"
+        cancelled = False
+        current = self._runner_close_task
+        if current is not None and self._runner_close_action != action:
+            # Never overlap provider lifecycle calls. Finish the in-flight
+            # action before escalating detach -> remove, and never downgrade a
+            # completed terminal removal back to detach.
+            if self._runner_close_action == "remove":
+                action = "remove"
+            else:
+                try:
+                    cancelled = await _await_bounded_cleanup_task(
+                        current,
+                        timeout_s=self._remaining_teardown_time(deadline),
+                        timeout_message=(
+                            "Virtual-egress runner cleanup did not complete within "
+                            f"{self._teardown_timeout_s:g} seconds."
+                        ),
+                    )
+                except BaseException:
+                    if current.done() and self._runner_close_task is current:
+                        self._runner_close_task = None
+                        self._runner_close_action = None
+                    raise
+                self._runner_close_task = None
+                self._runner_close_action = None
+        if self._runner_close_task is None:
+
+            async def close_runner() -> None:
+                effective_outcome = "interrupted" if action == "detach" else outcome
+                await self._adapter.finalize_runner(self._runner, outcome=effective_outcome)
+
+            self._runner_close_task = asyncio.create_task(close_runner())
+            self._runner_close_action = action
+        task = self._runner_close_task
+        try:
+            return (
+                await _await_bounded_cleanup_task(
+                    task,
+                    timeout_s=self._remaining_teardown_time(deadline),
+                    timeout_message=(
+                        "Virtual-egress runner cleanup did not complete within "
+                        f"{self._teardown_timeout_s:g} seconds."
+                    ),
+                )
+                or cancelled
+            )
+        except BaseException:
+            if task.done() and self._runner_close_task is task:
+                self._runner_close_task = None
+                self._runner_close_action = None
+            raise
 
     def _remaining_teardown_time(self, deadline: float) -> float:
         remaining = deadline - asyncio.get_running_loop().time()
@@ -851,6 +1173,7 @@ class _EgressTeardownBinding(WorkspaceBinding):
         session_id: str,
         agent_name: str,
         environment_name: str,
+        reconnected: bool,
     ) -> None:
         self._inner = inner
         self._runner = runner
@@ -860,6 +1183,9 @@ class _EgressTeardownBinding(WorkspaceBinding):
         self._session_id = session_id
         self._agent_name = agent_name
         self._environment_name = environment_name
+        self._reconnected = reconnected
+        self._revocation_emit_lock = asyncio.Lock()
+        self._revocation_emitted = False
 
     async def bind(
         self,
@@ -880,23 +1206,54 @@ class _EgressTeardownBinding(WorkspaceBinding):
                 environment_name=environment_name,
                 metadata=metadata,
             )
-        except BaseException:
+        except BaseException as bind_error:
             # Runtime does not call finalize() after bind failure, so the
             # virtual-egress resources must be released here.
             cancelled = False
+            cleanup_error: BaseException | None = None
             try:
-                await self._close_resources()
+                await self._close_resources(outcome="interrupted" if self._reconnected else None)
             except asyncio.CancelledError:
                 cancelled = True
-            except Exception:
-                # Preserve the binding failure; there is no successfully
-                # returned runner/binding handle for the caller to retry.
-                pass
+            except BaseException as exc:
+                cleanup_error = exc
             await self._drain_audit()
-            await self._emit_revoked()
+            if cleanup_error is None:
+                await self._emit_revoked()
+            else:
+                record_binding_cleanup_failure(
+                    bind_error,
+                    cleanup_error,
+                    retry=self._retry_bind_cleanup,
+                )
+                bind_error.add_note(
+                    "Virtual-egress bind rollback incomplete: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}. "
+                    "The runtime will retry the binding-owned cleanup."
+                )
             if cancelled:
                 raise asyncio.CancelledError() from None
             raise
+
+    async def _retry_bind_cleanup(self) -> None:
+        """Retry the binding-owned rollback and emit revocation only on success."""
+
+        await self.release_unbound(
+            outcome="interrupted" if self._reconnected else None,
+        )
+
+    async def release_unbound(self, *, outcome: str | None) -> None:
+        """Release a pre-adoption environment with explicit preserve semantics."""
+
+        cleanup_error: BaseException | None = None
+        try:
+            await self._close_resources(outcome=outcome)
+        except BaseException as exc:
+            cleanup_error = exc
+        await self._drain_audit()
+        if cleanup_error is not None:
+            raise cleanup_error
+        await self._emit_revoked()
 
     async def finalize(
         self,
@@ -907,18 +1264,16 @@ class _EgressTeardownBinding(WorkspaceBinding):
     ) -> WorkspaceSnapshot | None:
         snapshot: WorkspaceSnapshot | None = None
         inner_error: BaseException | None = None
-        cleanup_error: BaseException | None = None
         cancelled = False
-        try:
-            # Disable guest-side authority before workspace commands run. The
-            # runner stays alive until the workspace has flushed and unmounted.
-            cancelled = await self._runner.revoke_authority()
-        except BaseException as exc:
-            cleanup_error = exc
+        # Disable guest-side authority before workspace commands run. If this
+        # fails, leave both the workspace and ownership claim untouched so a
+        # truthful retry can resume from the same safety boundary.
+        cancelled = await self._runner.revoke_authority()
         try:
             snapshot = await self._inner.finalize(bound, outcome=outcome, metadata=metadata)
         except BaseException as exc:
             inner_error = exc
+        cleanup_error: BaseException | None = None
         try:
             # Workspace sync/unmount must finish before an interrupted MicroVM
             # is suspended or a terminal MicroVM is terminated.
@@ -952,19 +1307,24 @@ class _EgressTeardownBinding(WorkspaceBinding):
             await self._audit.drain()
 
     async def _emit_revoked(self) -> None:
-        if self._emitter is None:
-            return
-        with contextlib.suppress(Exception):
+        async with self._revocation_emit_lock:
+            if self._revocation_emitted:
+                return
+            if self._emitter is None:
+                self._revocation_emitted = True
+                return
             for grant in self._grants:
-                await self._emitter(
-                    Event(
-                        type=EventType.EGRESS_GRANT_REVOKED,
-                        session_id=self._session_id,
-                        agent_name=self._agent_name,
-                        environment_name=self._environment_name,
-                        payload=_grant_payload(grant),
+                with contextlib.suppress(Exception):
+                    await self._emitter(
+                        Event(
+                            type=EventType.EGRESS_GRANT_REVOKED,
+                            session_id=self._session_id,
+                            agent_name=self._agent_name,
+                            environment_name=self._environment_name,
+                            payload=_grant_payload(grant),
+                        )
                     )
-                )
+            self._revocation_emitted = True
 
 
 def _grant_payload(grant: VirtualCredentialGrant) -> dict[str, Any]:

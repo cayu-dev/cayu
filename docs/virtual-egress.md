@@ -363,6 +363,97 @@ constructs `_EgressManagedRunner`, accesses `_runner`, casts to
 Install both optional dependencies with
 `pip install 'cayu[egress,microsandbox]'`.
 
+### Durable reconnect
+
+`VirtualEgressEnvironmentFactory` returns a versioned, JSON-safe reconnect
+envelope for adapters that can securely reattach a sandbox. `CayuApp` writes
+that envelope to the session checkpoint and passes it back to a newly
+constructed factory on resume or recovery; applications should not persist a
+live runner, broker, or adapter object themselves.
+
+For Microsandbox, the durable identity is the sandbox name plus immutable
+numeric provider creation timestamp, the original host listener port, the
+guest-visible proxy endpoint port, a non-secret ownership id, and the attested
+owner session and environment:
+
+```json
+{
+  "version": 1,
+  "runner_kind": "microsandbox",
+  "session_id": "sess_...",
+  "environment_name": "billing",
+  "capability": "supported",
+  "identity": {
+    "sandbox_name": "cayu-egress-sandbox-...",
+    "sandbox_created_at": 1752582896.789,
+    "proxy_listener_port": 43127,
+    "proxy_endpoint_port": 43127,
+    "ownership_id": "9f2d9a6f7a2c4e32a624b37d104ca4f1",
+    "owner_session_id": "sess_...",
+    "owner_environment_name": "billing"
+  }
+}
+```
+
+The guest endpoint port is part of the sandbox's immutable deny-by-default
+network policy, while the listener port identifies the host socket that must be
+reclaimed. Recording both permits a session-isolated exposure to map one to the
+other without confusing the two during reconnect. A host-local, mode-`0600`
+attestation and process-independent lock bind every identity field to the
+sandbox name, so concurrent callers cannot evade the single-owner rule by
+presenting a different port. The provider creation timestamp prevents a
+removed-and-recreated same-name sandbox from being accepted as the original
+incarnation. Attested session and environment ownership prevents a valid inner
+identity from being rewrapped in an envelope for another runtime scope. The
+default attestation
+directory is stable across Cayu process restarts; deployments may set
+`reconnect_state_dir` to a private host-local runtime directory. Reconnect must
+validate the attestation, reclaim that exact listener, and reproduce the
+recorded guest endpoint before attaching. A custom exposure whose mapping is
+not stable across calls fails closed before the sandbox is attached. It
+then creates a fresh credential registry, broker, grants, proxy, and session
+CA; attaches the recorded sandbox; replaces the guest CA; and reruns the
+positive proxy/TLS and negative direct-egress preflight before any agent
+command can run. The old
+virtual credential is unknown to the fresh registry and cannot authorize a
+request through the new broker. A second concurrent owner receives
+`EgressReconnectConflictError` before a proxy is opened or the sandbox is
+mutated.
+
+An interrupted Microsandbox session detaches rather than removes its sandbox so
+the checkpoint can be resumed. Completed, failed, cancelled, or explicitly
+closed sessions remove it. Reconnected teardown keeps the normal ordering:
+revoke and drain grants, release the runner, then close the proxy boundary.
+
+The envelope never contains real or virtual credential values, proxy bearer
+authority, or CA private material. The factory validates version, runner kind,
+session, environment, exact adapter-owned identity allowlists, and common
+replayable-authority field-name variants before attaching. Custom adapters that
+declare reconnect support are trusted extension code and must reject every
+identity field they do not own; the framework's generic scan is defense in
+depth, not a substitute for that allowlist. Missing sandboxes and ownership or
+port conflicts have typed, actionable errors. Parent checkpoint metadata copied
+into a fork is recognized as parent-owned and ignored so the child creates a
+new isolated sandbox; other cross-session metadata is rejected.
+
+Reconnect support is explicit by adapter:
+
+| Adapter | Virtual-egress reconnect |
+| --- | --- |
+| Microsandbox | Supported; attested single-owner sandbox plus host-listener and guest-endpoint ports, fresh grants/broker/CA, full preflight. |
+| Lambda MicroVM | Unsupported until a durable external single-owner claim is available; lower-level runner reattach is not sufficient. |
+| Docker | Unsupported; raises `UnsupportedEgressReconnectError`. Rebuild explicitly. |
+| E2B | Unsupported; raises `UnsupportedEgressReconnectError`. Rebuild explicitly. |
+
+Unsupported adapters never interpret reconnect metadata as a request to create
+a replacement sandbox. Their initial factory result contains a versioned
+`"capability": "unsupported"` marker and a non-secret reason instead of a fake
+runner identity. If that checkpoint later returns on resume, the factory raises
+`UnsupportedEgressReconnectError` before preparing an adapter or creating a
+runner. Catch it in trusted application code if an explicit
+Git/artifact/memory reconstruction flow is appropriate; do not label that
+rebuild as a reconnect.
+
 ### E2B
 
 E2B sandboxes run in E2B's cloud, so they cannot reach a loopback listener in
@@ -546,10 +637,10 @@ custom `EgressPolicy` when you need business-level limits such as spend caps.
 
 | Runner | Status |
 | --- | --- |
-| `docker` | Enforced (per-session internal network + sidecar-only broker authentication + TLS MITM), including credentialless routes. |
-| `microsandbox` | Virtual credentials are enforced with a deny-by-default host policy allowing only the Cayu proxy port. Credentialless routes require a custom session-isolated exposure. |
-| `e2b` | Enforced with a dedicated E2B-reachable, IPv4-literal raw TCP proxy exposure and fail-closed preflight. Credentialless routes additionally require `credentialless_isolated=True`. |
-| `lambda-microvm` | Enforced in the integrated image: a VPC connector limits destinations, while a dedicated agent network namespace has no default route and can reach only a narrow relay to the Cayu proxy. Credentialless routes require a session-isolated exposure. |
+| `docker` | Enforced (per-session internal network + sidecar-only broker authentication + TLS MITM), including credentialless routes; reconnect unsupported. |
+| `microsandbox` | Virtual credentials are enforced with a deny-by-default host policy allowing only the Cayu proxy port. Credentialless routes require a custom session-isolated exposure; reconnect supported. |
+| `e2b` | Enforced with a dedicated E2B-reachable, IPv4-literal raw TCP proxy exposure and fail-closed preflight. Credentialless routes additionally require `credentialless_isolated=True`; reconnect unsupported. |
+| `lambda-microvm` | Enforced in the integrated image: a VPC connector limits destinations, while a dedicated agent network namespace has no default route and can reach only a narrow relay to the Cayu proxy. Credentialless routes require a session-isolated exposure; virtual-egress factory reconnect unsupported. |
 | `local` | Unsupported by the virtual-egress factory. Direct runner construction may still set `credential_mode` for raw-secret checks, but that is not an egress boundary. |
 
 Notes on the Docker adapter:
@@ -607,10 +698,16 @@ probe, records an `unverified` claim with bounded reason/remediation codes, and
 can never produce a verified claim. Execution-role scope remains defense in
 depth, not a substitute for the network proof.
 
-Interrupt finalization syncs/unmounts the workspace, revokes the grant, then
+Interrupt finalization revokes the grant, syncs/unmounts the workspace, then
 suspends the MicroVM. Terminal outcomes terminate it. Durable reconnect metadata
-includes the owning session id: forks ignore inherited parent metadata and
-create a new MicroVM, while an interrupted child can reattach its own MicroVM.
+includes the owning session id for trusted application-specific recovery. The
+lower-level runner adapter can
+reattach a known MicroVM for trusted application-specific flows, but the
+virtual-egress factory reports reconnect as unsupported because Cayu does not
+yet have a durable external claim that prevents two orchestrators from
+simultaneously reconfiguring the same MicroVM. Applications must choose an
+explicit rebuild or trusted recovery flow instead of treating that attach as a
+secure virtual-egress reconnect.
 
 `examples/aws/lambda_microvm_agent` composes this adapter with an EFS access
 point (default), an opt-in S3 Files access point, S3 artifacts, Secrets Manager,

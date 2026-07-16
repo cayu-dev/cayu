@@ -1,11 +1,33 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from enum import StrEnum
+from math import isfinite
 from typing import Any
 
 from cayu._validation import copy_json_value, copy_label_map, require_clean_nonblank
 from cayu.environments.base import Environment, copy_environment
+
+DEFAULT_ENVIRONMENT_FACTORY_RELEASE_TIMEOUT_SECONDS = 15.0
+
+
+class EnvironmentFactoryOperation(StrEnum):
+    """Whether a factory must allocate a new environment or reconnect one."""
+
+    CREATE = "create"
+    RECONNECT = "reconnect"
+
+
+class EnvironmentFactoryReleaseAction(StrEnum):
+    """How an unadopted factory result must release its live resources."""
+
+    DISCARD = "discard"
+    PRESERVE = "preserve"
+
+
+EnvironmentFactoryRelease = Callable[[EnvironmentFactoryReleaseAction], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -20,8 +42,11 @@ class EnvironmentFactoryRequest:
     labels: dict[str, str] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
     reconnect_metadata: dict[str, Any] = field(default_factory=dict)
+    operation: EnvironmentFactoryOperation = EnvironmentFactoryOperation.CREATE
 
     def __post_init__(self) -> None:
+        if not isinstance(self.operation, EnvironmentFactoryOperation):
+            raise TypeError("operation must be an EnvironmentFactoryOperation.")
         object.__setattr__(
             self, "session_id", require_clean_nonblank(self.session_id, "session_id")
         )
@@ -61,10 +86,21 @@ class EnvironmentFactoryResult:
     environment: Environment
     metadata: dict[str, Any] = field(default_factory=dict)
     reconnect_metadata: dict[str, Any] = field(default_factory=dict)
+    release: EnvironmentFactoryRelease | None = None
+    release_timeout_s: float = DEFAULT_ENVIRONMENT_FACTORY_RELEASE_TIMEOUT_SECONDS
 
     def __post_init__(self) -> None:
         if not isinstance(self.environment, Environment):
             raise TypeError("EnvironmentFactoryResult.environment must be an Environment.")
+        if self.release is not None and not callable(self.release):
+            raise TypeError("EnvironmentFactoryResult.release must be callable or None.")
+        if type(self.release_timeout_s) not in {int, float}:
+            raise TypeError("EnvironmentFactoryResult.release_timeout_s must be numeric.")
+        if not isfinite(self.release_timeout_s) or self.release_timeout_s <= 0:
+            raise ValueError(
+                "EnvironmentFactoryResult.release_timeout_s must be finite and greater than zero."
+            )
+        object.__setattr__(self, "release_timeout_s", float(self.release_timeout_s))
         object.__setattr__(self, "environment", copy_environment(self.environment))
         object.__setattr__(self, "metadata", copy_json_value(self.metadata, "metadata"))
         object.__setattr__(
@@ -91,6 +127,7 @@ def copy_environment_factory_request(
         session_id=request.session_id,
         agent_name=request.agent_name,
         environment_name=request.environment_name,
+        operation=request.operation,
         parent_session_id=request.parent_session_id,
         causal_budget_id=request.causal_budget_id,
         labels=request.labels,
@@ -106,4 +143,6 @@ def copy_environment_factory_result(result: EnvironmentFactoryResult) -> Environ
         environment=result.environment,
         metadata=result.metadata,
         reconnect_metadata=result.reconnect_metadata,
+        release=result.release,
+        release_timeout_s=result.release_timeout_s,
     )

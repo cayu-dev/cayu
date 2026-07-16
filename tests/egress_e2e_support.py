@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from time import monotonic
 from typing import Any, Literal
 from uuid import uuid4
@@ -57,8 +57,10 @@ class CapturingEgressAdapter(SandboxEgressAdapter):
     def __init__(self, inner: SandboxEgressAdapter) -> None:
         self._inner = inner
         self.runner_kind = inner.runner_kind
+        self.supports_reconnect = inner.supports_reconnect
         self._broker: TransparentEgressBroker | None = None
         self._grants: tuple[VirtualCredentialGrant, ...] = ()
+        self._binding: EgressBinding | None = None
 
     async def prepare(
         self,
@@ -74,10 +76,44 @@ class CapturingEgressAdapter(SandboxEgressAdapter):
         )
         self._broker = broker
         self._grants = tuple(grants)
+        self._binding = binding
         return binding
 
     async def create_runner(self, request: VirtualEgressRunnerRequest) -> Runner:
         return await self._inner.create_runner(request)
+
+    async def prepare_reconnect(
+        self,
+        *,
+        session_id: str,
+        environment_name: str,
+        grants: Sequence[VirtualCredentialGrant],
+        broker: TransparentEgressBroker,
+        reconnect_metadata: Mapping[str, Any],
+    ) -> EgressBinding:
+        binding = await self._inner.prepare_reconnect(
+            session_id=session_id,
+            environment_name=environment_name,
+            grants=grants,
+            broker=broker,
+            reconnect_metadata=reconnect_metadata,
+        )
+        self._broker = broker
+        self._grants = tuple(grants)
+        self._binding = binding
+        return binding
+
+    def reconnect_metadata(self, runner: Runner) -> dict[str, Any]:
+        return self._inner.reconnect_metadata(runner)
+
+    def validate_reconnect_metadata(
+        self,
+        reconnect_metadata: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return self._inner.validate_reconnect_metadata(reconnect_metadata)
+
+    async def finalize_runner(self, runner: Runner, *, outcome: str | None) -> None:
+        await self._inner.finalize_runner(runner, outcome=outcome)
 
     def captured_single_grant(
         self,
@@ -85,6 +121,11 @@ class CapturingEgressAdapter(SandboxEgressAdapter):
         if self._broker is None or len(self._grants) != 1:
             raise AssertionError("Egress conformance did not capture exactly one prepared grant.")
         return self._broker, self._grants[0]
+
+    def captured_binding(self) -> EgressBinding:
+        if self._binding is None:
+            raise AssertionError("Egress conformance did not capture a prepared binding.")
+        return self._binding
 
 
 async def drive_adversarial_egress_contract(

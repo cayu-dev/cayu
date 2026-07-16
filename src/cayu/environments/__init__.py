@@ -28,7 +28,11 @@ from cayu.environments.bindings import (
     copy_workspace_snapshot,
 )
 from cayu.environments.factory import (
+    DEFAULT_ENVIRONMENT_FACTORY_RELEASE_TIMEOUT_SECONDS,
     EnvironmentFactory,
+    EnvironmentFactoryOperation,
+    EnvironmentFactoryRelease,
+    EnvironmentFactoryReleaseAction,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
     copy_environment_factory_request,
@@ -36,12 +40,16 @@ from cayu.environments.factory import (
 )
 
 __all__ = [
+    "DEFAULT_ENVIRONMENT_FACTORY_RELEASE_TIMEOUT_SECONDS",
     "DEFAULT_WORKSPACE_INSTRUCTIONS_MAX_BYTES",
     "DEFAULT_WORKSPACE_INSTRUCTION_PATHS",
     "BoundWorkspace",
     "EFSAccessPointBinding",
     "Environment",
     "EnvironmentFactory",
+    "EnvironmentFactoryOperation",
+    "EnvironmentFactoryRelease",
+    "EnvironmentFactoryReleaseAction",
     "EnvironmentFactoryRequest",
     "EnvironmentFactoryResult",
     "EnvironmentSpec",
