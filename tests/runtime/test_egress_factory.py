@@ -14,6 +14,8 @@ from cayu.egress import (
     CredentialMode,
     EgressAdapterRegistry,
     EgressBinding,
+    EgressCapabilityClaim,
+    EgressCapabilityEvidence,
     HttpEgressPolicy,
     SandboxEgressAdapter,
     TransparentEgressBroker,
@@ -167,12 +169,35 @@ class _LifecycleRecordingAdapter(_RecordingAdapter):
 
 
 class _CapabilityRecordingAdapter(_RecordingAdapter):
-    def capability_metadata(self, runner: Runner) -> dict[str, Any]:
-        return {
-            "proxy_reachability": "verified",
-            "direct_public_egress": "denied",
-            "metadata_isolation": "unverified",
-        }
+    def capability_evidence(self, runner: Runner) -> EgressCapabilityEvidence:
+        return EgressCapabilityEvidence(
+            adapter="lambda-microvm",
+            claims=(
+                EgressCapabilityClaim(
+                    capability="proxy_reachability",
+                    state="verified",
+                    proof_source="agent_preflight",
+                    observation="reachable",
+                ),
+                EgressCapabilityClaim(
+                    capability="direct_public_egress",
+                    state="verified",
+                    proof_source="agent_preflight",
+                    observation="denied",
+                ),
+                EgressCapabilityClaim(
+                    capability="metadata_isolation",
+                    state="unverified",
+                    proof_source="operator_opt_out",
+                    observation="not_probed",
+                    reason_code="guest_process_boundary_unverified",
+                    remediation_code="supply_enforceable_guest_boundary",
+                ),
+            ),
+        )
+
+    def configuration_metadata(self) -> dict[str, Any]:
+        return {"metadata_isolation_mode": "unverified"}
 
 
 class _RetryingLifecycleAdapter(_RecordingAdapter):
@@ -411,7 +436,7 @@ def test_factory_passes_and_returns_adapter_reconnect_metadata() -> None:
     assert adapter.finalize_calls == [None]
 
 
-def test_factory_exposes_adapter_capability_metadata() -> None:
+def test_factory_exposes_typed_capability_evidence_separately_from_configuration() -> None:
     adapter = _CapabilityRecordingAdapter("lambda-microvm")
 
     async def run() -> Any:
@@ -429,13 +454,85 @@ def test_factory_exposes_adapter_capability_metadata() -> None:
 
     result = asyncio.run(run())
 
-    expected = {
-        "proxy_reachability": "verified",
-        "direct_public_egress": "denied",
-        "metadata_isolation": "unverified",
+    expected_evidence = {
+        "schema": "cayu.egress_capabilities.v1",
+        "adapter": "lambda-microvm",
+        "claims": [
+            {
+                "capability": "direct_public_egress",
+                "state": "verified",
+                "proof_source": "agent_preflight",
+                "observation": "denied",
+            },
+            {
+                "capability": "metadata_isolation",
+                "state": "unverified",
+                "proof_source": "operator_opt_out",
+                "observation": "not_probed",
+                "reason_code": "guest_process_boundary_unverified",
+                "remediation_code": "supply_enforceable_guest_boundary",
+            },
+            {
+                "capability": "proxy_reachability",
+                "state": "verified",
+                "proof_source": "agent_preflight",
+                "observation": "reachable",
+            },
+        ],
     }
-    assert result.environment.spec.metadata["egress_capabilities"] == expected
-    assert result.metadata["egress_capabilities"] == expected
+    expected_configuration = {"metadata_isolation_mode": "unverified"}
+    assert result.environment.spec.metadata["egress_capabilities"] == expected_evidence
+    assert result.metadata["egress_capabilities"] == expected_evidence
+    assert result.environment.spec.metadata["egress_configuration"] == expected_configuration
+    assert result.metadata["egress_configuration"] == expected_configuration
+
+
+def test_factory_exposes_explicit_unclaimed_evidence_for_adapter_without_claims() -> None:
+    async def run() -> Any:
+        result = await _virtual_factory(adapter=_RecordingAdapter("docker")).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_unclaimed_capabilities",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        runner = result.environment.runner
+        assert runner is not None
+        await runner.close()
+        return result
+
+    result = asyncio.run(run())
+
+    assert result.metadata["egress_capabilities"] == {
+        "schema": "cayu.egress_capabilities.v1",
+        "adapter": "docker",
+        "claims": [],
+        "unclaimed_reason_code": "adapter_capabilities_unclaimed",
+    }
+
+
+def test_factory_rejects_untyped_capability_evidence_and_cleans_up() -> None:
+    class _MalformedEvidenceAdapter(_RecordingAdapter):
+        def capability_evidence(self, runner: Runner) -> Any:
+            return {"metadata_isolation": "verified"}
+
+    adapter = _MalformedEvidenceAdapter("lambda-microvm")
+
+    async def run() -> None:
+        with pytest.raises(TypeError, match="EgressCapabilityEvidence"):
+            await _virtual_factory(adapter=adapter).create(
+                EnvironmentFactoryRequest(
+                    session_id="sess_malformed_capabilities",
+                    agent_name="agent",
+                    environment_name="egress-env",
+                )
+            )
+
+    asyncio.run(run())
+
+    inner: Runner = adapter.captured["inner_runner"]
+    assert inner.closed is True
+    assert adapter.torn_down == 1
 
 
 def test_factory_attaches_durable_artifact_store(tmp_path) -> None:

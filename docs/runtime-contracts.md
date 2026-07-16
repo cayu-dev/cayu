@@ -1701,14 +1701,46 @@ reconnect metadata contract.
 `LambdaMicroVMEgressAdapter` defaults to
 `metadata_isolation="required"`. Its guest preflight reports a reachable
 link-local metadata path as `UnsupportedEgressCapabilityError` with capability
-`metadata_isolation`, before setup commands or agent execution. The error also
+`metadata_isolation`, after trusted setup commands and before agent execution.
+The preflight is the final guest mutation before handoff, so setup cannot make a
+previous observation stale. The error also
 provides a bounded `remediation` telling callers to supply an enforceable
 topology or explicitly accept the unverified mode. Adapters can
-return JSON-safe `capability_metadata()` after runner creation;
-`VirtualEgressEnvironmentFactory` places that evidence under
-`egress_capabilities` in both the concrete environment spec and factory result
-metadata. The Lambda adapter reports proxy reachability, direct-public-egress
-denial, and either `metadata_isolation: verified` or `unverified`.
+return typed `EgressCapabilityEvidence` after runner creation.
+`VirtualEgressEnvironmentFactory` publishes its stable
+`cayu.egress_capabilities.v1` JSON projection under `egress_capabilities` in
+both the concrete environment spec and factory result metadata. Each claim has
+a bounded capability token and fixed-vocabulary proof state, proof source,
+observation, and safe reason/remediation references. Configuration tokens and
+arbitrary secret-shaped strings are not members of those proof vocabularies.
+Adapter/capability identities and per-claim adapter-detail names reject common
+secret-shaped forms. Evidence is bounded to 64 unique claims; adapter details
+are bounded to 16 unique boolean or JSON-safe integer
+facts, with integers restricted to `[-(2^53 - 1), 2^53 - 1]`. String detail
+values are not accepted. Claims and details are sorted and unique. Adapters
+that publish no runtime claims emit an explicit empty envelope with
+`unclaimed_reason_code`; missing claims evaluate as `unclaimed`, never
+`verified`.
+
+The v1 proof-source vocabulary is `adapter_declaration`, `agent_preflight`,
+`external_live_verification`, and `operator_opt_out`. Observations are
+`denied`, `not_probed`, `reachable`, `supported`, or `unavailable`. Safe reason
+references are `capability_unsupported` and
+`guest_process_boundary_unverified`; remediation references are
+`supply_enforceable_guest_boundary` and `use_supported_configuration`.
+The allowed proof matrix is closed: `verified` uses an observed source
+(`agent_preflight` or `external_live_verification`) with `denied`, `reachable`,
+or `supported`; `unverified` uses `operator_opt_out` with `not_probed`; and
+`unsupported` uses `adapter_declaration` with `unavailable`.
+
+Configured intent is a separate interface. JSON-safe `configuration_metadata()`
+is published under `egress_configuration`, so tokens such as `required` cannot
+occupy a runtime proof field. Reconnect and fork paths run adapter creation and
+preflight again; configuration or inherited reconnect metadata cannot create a
+fresh verified claim. A required capability that cannot be established still
+fails before environment creation with `UnsupportedEgressCapabilityError`.
+The Lambda adapter claims proxy reachability, direct-public-egress denial, and
+either verified or explicitly unverified metadata isolation.
 
 The opt-in deployed contract uses the exact
 `cayu.aws_lambda_microvm_metadata_isolation.v1` evidence schema. It runs with

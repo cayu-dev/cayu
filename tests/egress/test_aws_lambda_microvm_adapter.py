@@ -227,6 +227,55 @@ class _ExecutingPreflightLambdaRunner(_FakeLambdaRunner):
         return ExecResult(stdout=stdout.getvalue())
 
 
+class _SetupMutationLambdaRunner(_ExecutingPreflightLambdaRunner):
+    setup_command = ExecCommand.bash("mutate-network-boundary")
+
+    async def exec(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = None,
+    ) -> ExecResult:
+        if command == self.setup_command:
+            self.metadata_mode = "connected-reset"
+        return await super().exec(
+            command,
+            cwd=cwd,
+            env=env,
+            timeout_s=timeout_s,
+            stdin=stdin,
+            output_limit_bytes=output_limit_bytes,
+        )
+
+
+def _expected_lambda_capability_evidence(
+    metadata_isolation_claim: dict[str, str],
+) -> dict[str, Any]:
+    return {
+        "schema": "cayu.egress_capabilities.v1",
+        "adapter": "lambda-microvm",
+        "claims": [
+            {
+                "capability": "direct_public_egress",
+                "state": "verified",
+                "proof_source": "agent_preflight",
+                "observation": "denied",
+            },
+            metadata_isolation_claim,
+            {
+                "capability": "proxy_reachability",
+                "state": "verified",
+                "proof_source": "agent_preflight",
+                "observation": "reachable",
+            },
+        ],
+    }
+
+
 def _broker_and_grant(
     *,
     session_id: str = "session-1",
@@ -364,20 +413,62 @@ def test_lambda_microvm_adapter_creates_private_vpc_enforced_runner(
     ca_install = runner.calls[0]
     assert ca_install["command"].argv[-1] == "/etc/cayu/ca.pem"
     assert ca_install["stdin"] == "session-ca"
-    preflight = runner.calls[1]["command"].argv[-1]
+    assert runner.calls[1]["command"] == ExecCommand.bash("python3 -V")
+    preflight = runner.calls[2]["command"].argv[-1]
     assert "receiver.internal" in preflight
     assert "1.1.1.1" in preflight
     assert "169.254.169.254" in preflight
-    assert runner.calls[2]["command"] == ExecCommand.bash("python3 -V")
-    assert adapter.capability_metadata(runner) == {
-        "proxy_reachability": "verified",
-        "direct_public_egress": "denied",
-        "metadata_isolation": "verified",
-    }
+    assert adapter.capability_evidence(runner).to_metadata() == (
+        _expected_lambda_capability_evidence(
+            {
+                "capability": "metadata_isolation",
+                "state": "verified",
+                "proof_source": "agent_preflight",
+                "observation": "denied",
+            }
+        )
+    )
 
     asyncio.run(binding.close())
     assert exposure.closed is True
     assert _FakeProxyServer.instances[0].closed is True
+
+
+def test_lambda_microvm_adapter_verifies_enforcement_after_setup_mutations(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        adapter_module,
+        "LambdaMicroVMRunner",
+        _SetupMutationLambdaRunner,
+    )
+    _FakeLambdaRunner.created = []
+    _SetupMutationLambdaRunner.last_instance = None
+    broker, grant = _broker_and_grant()
+    adapter = LambdaMicroVMEgressAdapter(
+        region_name="us-east-1",
+        egress_network_connector_arn="connector-arn",
+        exposure=_PrivateExposure(),
+        client=object(),
+        proxy_server_factory=_FakeProxyServer,
+    )
+
+    with pytest.raises(UnsupportedEgressCapabilityError, match="metadata"):
+        asyncio.run(
+            _create_adapter_runner(
+                adapter,
+                broker,
+                grant,
+                tmp_path,
+                setup_commands=("mutate-network-boundary",),
+            )
+        )
+
+    runner = _SetupMutationLambdaRunner.last_instance
+    assert runner is not None
+    assert runner.terminated is True
+    assert runner.closed is True
 
 
 def test_lambda_microvm_adapter_rejects_public_proxy_exposure(
@@ -458,7 +549,8 @@ def test_lambda_microvm_adapter_fails_typed_when_metadata_isolation_is_unsupport
 
     assert runner.terminated is True
     assert runner.closed is True
-    assert all(call["command"] != ExecCommand.bash("python3 -V") for call in runner.calls)
+    assert runner.calls[1]["command"] == ExecCommand.bash("python3 -V")
+    assert "preflight: proxy CONNECT accepted" in runner.calls[2]["command"].argv[-1]
 
 
 def test_shared_metadata_failure_does_not_offer_lambda_only_opt_out(tmp_path: Path) -> None:
@@ -548,12 +640,18 @@ def test_lambda_microvm_adapter_marks_explicit_metadata_opt_out_unverified(
 
     runner = asyncio.run(run())
 
-    assert adapter.capability_metadata(runner) == {
-        "proxy_reachability": "verified",
-        "direct_public_egress": "denied",
-        "metadata_isolation": "unverified",
-        "metadata_isolation_reason": "guest_process_boundary_unverified",
-    }
+    assert adapter.capability_evidence(runner).to_metadata() == (
+        _expected_lambda_capability_evidence(
+            {
+                "capability": "metadata_isolation",
+                "state": "unverified",
+                "proof_source": "operator_opt_out",
+                "observation": "not_probed",
+                "reason_code": "guest_process_boundary_unverified",
+                "remediation_code": "supply_enforceable_guest_boundary",
+            }
+        )
+    )
 
 
 @pytest.mark.parametrize("value", [False, None, "verified", "best-effort"])
@@ -586,7 +684,7 @@ def test_lambda_microvm_adapter_reattaches_and_maps_lifecycle(
         runner_options={"poll_interval_s": 0},
     )
 
-    async def run() -> tuple[_FakeLambdaRunner, dict[str, Any]]:
+    async def run() -> tuple[_FakeLambdaRunner, dict[str, Any], str]:
         binding = await adapter.prepare(session_id="session-1", grants=[grant], broker=broker)
         ca_path = tmp_path / "ca.pem"
         ca_path.write_bytes(binding.ca_cert_pem or b"")
@@ -610,15 +708,23 @@ def test_lambda_microvm_adapter_reattaches_and_maps_lifecycle(
                     "image_identifier": "image-arn",
                     "image_version": "7",
                     "session_id": "session-1",
+                    "egress_configuration": {"metadata_isolation_mode": "unverified"},
+                    "egress_capabilities": {
+                        "schema": "cayu.egress_capabilities.v1",
+                        "adapter": "lambda-microvm",
+                        "claims": [],
+                        "unclaimed_reason_code": "adapter_capabilities_unclaimed",
+                    },
                 },
             )
         )
         metadata = adapter.reconnect_metadata(runner)
+        metadata_isolation = adapter.capability_evidence(runner).state_for("metadata_isolation")
         await adapter.finalize_runner(runner, outcome="interrupted")
         await binding.close()
-        return runner, metadata  # type: ignore[return-value]
+        return runner, metadata, metadata_isolation  # type: ignore[return-value]
 
-    runner, metadata = asyncio.run(run())
+    runner, metadata, metadata_isolation = asyncio.run(run())
 
     assert _FakeLambdaRunner.created == []
     assert len(_FakeLambdaRunner.attached) == 1
@@ -637,6 +743,7 @@ def test_lambda_microvm_adapter_reattaches_and_maps_lifecycle(
         "image_version": "7",
         "session_id": "session-1",
     }
+    assert metadata_isolation == "verified"
     assert runner.suspended is True
     assert runner.terminated is False
     assert runner.closed is True
@@ -658,7 +765,7 @@ def test_lambda_microvm_adapter_fork_ignores_parent_owned_reconnect_metadata(
         proxy_server_factory=_FakeProxyServer,
     )
 
-    async def run() -> _FakeLambdaRunner:
+    async def run() -> tuple[_FakeLambdaRunner, str]:
         binding = await adapter.prepare(session_id="child-session", grants=[grant], broker=broker)
         ca_path = tmp_path / "ca.pem"
         ca_path.write_bytes(binding.ca_cert_pem or b"")
@@ -682,17 +789,26 @@ def test_lambda_microvm_adapter_fork_ignores_parent_owned_reconnect_metadata(
                     "image_identifier": "image-arn",
                     "image_version": "7",
                     "session_id": "parent-session",
+                    "egress_configuration": {"metadata_isolation_mode": "unverified"},
+                    "egress_capabilities": {
+                        "schema": "cayu.egress_capabilities.v1",
+                        "adapter": "lambda-microvm",
+                        "claims": [],
+                        "unclaimed_reason_code": "adapter_capabilities_unclaimed",
+                    },
                 },
             )
         )
+        metadata_isolation = adapter.capability_evidence(runner).state_for("metadata_isolation")
         await binding.close()
-        return runner  # type: ignore[return-value]
+        return runner, metadata_isolation  # type: ignore[return-value]
 
-    runner = asyncio.run(run())
+    runner, metadata_isolation = asyncio.run(run())
 
     assert len(_FakeLambdaRunner.created) == 1
     assert _FakeLambdaRunner.attached == []
     assert adapter.reconnect_metadata(runner)["session_id"] == "child-session"
+    assert metadata_isolation == "verified"
 
 
 def test_lambda_microvm_adapter_does_not_terminate_existing_vm_on_setup_failure(

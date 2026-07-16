@@ -68,6 +68,7 @@ REQUIRED_EVIDENCE_VALUES = {
     "proxy_reachability": "verified",
     "required_metadata_isolation": "verified",
     "revocation": "verified",
+    "runtime_capability_schema": "cayu.egress_capabilities.v1",
     "schema": EVIDENCE_SCHEMA,
     "scoped_request": "verified",
     "sidecar": "verified",
@@ -183,7 +184,16 @@ async def _verified_boundary_probe(
                 )
             )
             microvm_id = adapter.reconnect_metadata(runner)["microvm_id"]
-            capabilities = adapter.capability_metadata(runner)
+            capability_evidence = adapter.capability_evidence(runner)
+            direct_public_egress = capability_evidence.claim_for("direct_public_egress")
+            metadata_isolation = capability_evidence.claim_for("metadata_isolation")
+            proxy_reachability = capability_evidence.claim_for("proxy_reachability")
+            if (
+                direct_public_egress is None
+                or metadata_isolation is None
+                or proxy_reachability is None
+            ):
+                raise RuntimeError("Lambda MicroVM capability evidence is incomplete.")
 
             source_root = boundary.ca_path.parent / "trusted-workspace"
             source_root.mkdir()
@@ -261,7 +271,7 @@ async def _verified_boundary_probe(
                 "aws_credential_material": "absent",
                 "cleanup": cleanup,
                 "credential_paths_checked": observations["credential_paths_checked"],
-                "direct_public_egress": capabilities["direct_public_egress"],
+                "direct_public_egress": direct_public_egress.observation,
                 "execution_role": "configured",
                 "filesystem_files_inspected": observations["filesystem_files_inspected"],
                 "metadata_credentials": (
@@ -270,11 +280,12 @@ async def _verified_boundary_probe(
                 "metadata_endpoint": (
                     "reachable" if observations["metadata_network_reachable"] else "denied"
                 ),
-                "metadata_isolation": capabilities["metadata_isolation"],
+                "metadata_isolation": metadata_isolation.state,
                 "processes_inspected": observations["processes_inspected"],
                 "proof_source": "real-aws",
-                "proxy_reachability": capabilities["proxy_reachability"],
+                "proxy_reachability": proxy_reachability.state,
                 "revocation": "verified",
+                "runtime_capability_schema": capability_evidence.schema_version,
                 "run_id": run_id,
                 "schema": EVIDENCE_SCHEMA,
                 "scoped_request": "verified",

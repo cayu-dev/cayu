@@ -30,6 +30,7 @@ from cayu.egress import (
     CredentialMode,
     EgressAdapterRegistry,
     EgressBinding,
+    EgressCapabilityEvidence,
     EgressDecision,
     EgressPolicy,
     EgressUpstream,
@@ -174,6 +175,13 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         loop = asyncio.get_running_loop()
         adapter = self._adapter or self._resolve_adapter(loop)
         runner_kind = adapter.runner_kind
+        raw_configuration = adapter.configuration_metadata()
+        if type(raw_configuration) is not dict:
+            raise TypeError("Egress adapter configuration_metadata must return a dict.")
+        configuration_metadata = copy_json_value(
+            raw_configuration,
+            "egress_configuration",
+        )
         registry = VirtualCredentialRegistry()
         grants = [
             registry.mint(
@@ -218,7 +226,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         runner: Runner | None = None
         managed_runner: _EgressManagedRunner | None = None
         workspace: Workspace | None = None
-        capability_metadata: dict[str, Any] = {}
+        capability_metadata: dict[str, Any]
         try:
             binding = await adapter.prepare(
                 session_id=request.session_id,
@@ -252,13 +260,12 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             )
             runner = await adapter.create_runner(runner_request)
             reconnect_metadata = adapter.reconnect_metadata(runner)
-            raw_capabilities = adapter.capability_metadata(runner)
-            if type(raw_capabilities) is not dict:
-                raise TypeError("Egress adapter capability_metadata must return a dict.")
-            capability_metadata = copy_json_value(
-                raw_capabilities,
-                "egress_capabilities",
-            )
+            evidence = adapter.capability_evidence(runner)
+            if not isinstance(evidence, EgressCapabilityEvidence):
+                raise TypeError(
+                    "Egress adapter capability_evidence must return EgressCapabilityEvidence."
+                )
+            capability_metadata = evidence.to_metadata()
 
             managed_runner = _EgressManagedRunner(
                 runner=runner,
@@ -348,9 +355,11 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             "credential_mode": CredentialMode.VIRTUAL_EGRESS.value,
         }
         result_metadata: dict[str, Any] = {}
-        if capability_metadata:
-            environment_metadata["egress_capabilities"] = capability_metadata
-            result_metadata["egress_capabilities"] = capability_metadata
+        environment_metadata["egress_capabilities"] = capability_metadata
+        result_metadata["egress_capabilities"] = capability_metadata
+        if configuration_metadata:
+            environment_metadata["egress_configuration"] = configuration_metadata
+            result_metadata["egress_configuration"] = configuration_metadata
         spec = EnvironmentSpec(name=request.environment_name, metadata=environment_metadata)
         environment = Environment(
             spec,

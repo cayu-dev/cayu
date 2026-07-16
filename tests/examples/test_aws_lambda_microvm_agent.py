@@ -142,6 +142,7 @@ def _complete_metadata_isolation_evidence() -> dict[str, Any]:
         "proxy_reachability": "verified",
         "required_metadata_isolation": "verified",
         "revocation": "verified",
+        "runtime_capability_schema": "cayu.egress_capabilities.v1",
         "run_id": "metadata-isolation-abcdef123456",
         "schema": "cayu.aws_lambda_microvm_metadata_isolation.v1",
         "scoped_request": "verified",

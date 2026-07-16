@@ -572,10 +572,23 @@ Fargate task's private IPv4 address. Startup proves the proxy and session CA wor
 and that direct public-IP connections fail. Its default
 `metadata_isolation="required"` mode also probes the link-local metadata path. A
 reachable path raises `UnsupportedEgressCapabilityError` with capability
-`metadata_isolation` before setup commands or agent execution. Its structured
-remediation identifies the enforceable-topology and explicit-unverified paths.
-A successful required probe is recorded as `verified` in the factory
-environment and result metadata.
+`metadata_isolation` after trusted setup commands and before agent execution.
+Running the probe last ensures setup cannot invalidate the boundary after it
+was verified. Its structured remediation identifies the enforceable-topology
+and explicit-unverified paths.
+A successful required probe produces a typed claim in the versioned
+`cayu.egress_capabilities.v1` projection stored in factory environment and
+result metadata. Configured mode is stored separately under
+`egress_configuration`; it is never treated as observed proof. Adapters without
+runtime claims emit an explicit unclaimed envelope rather than an ambiguous
+empty dictionary. Version 1 proof sources, observations, reasons, and
+remediations use documented closed vocabularies so configuration tokens and
+secret-shaped values cannot be smuggled into evidence fields.
+The closed vocabularies are defined by `EgressCapabilityClaim`; capability and
+adapter identity remain bounded extensible tokens that reject common
+secret-shaped forms. An envelope may carry up to 64 claims, and each claim may
+carry up to 16 uniquely named adapter-specific boolean or JSON-safe integer
+facts. Arbitrary string detail values and free-form text are not evidence.
 
 The integrated image leaves the root sidecar in AWS's managed guest network but
 runs every ordinary command in a dedicated `cayu-agent` network namespace. That
@@ -589,9 +602,9 @@ capabilities. Sidecar replies and authenticated lifecycle commands remain in
 the trusted root profile, so managed ingress and EFS/S3 Files mounts continue
 to work. The explicit `metadata_isolation="unverified"` opt-out remains for
 custom or legacy images without that process boundary; it skips the metadata
-probe, records the status and reason under `egress_capabilities`, and can never
-produce a verified claim. Execution-role scope remains defense in depth, not a
-substitute for the network proof.
+probe, records an `unverified` claim with bounded reason/remediation codes, and
+can never produce a verified claim. Execution-role scope remains defense in
+depth, not a substitute for the network proof.
 
 Interrupt finalization syncs/unmounts the workspace, revokes the grant, then
 suspends the MicroVM. Terminal outcomes terminate it. Durable reconnect metadata

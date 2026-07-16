@@ -8,6 +8,7 @@ from math import isfinite
 from typing import Any
 
 from cayu.egress.broker import TransparentEgressBroker
+from cayu.egress.capabilities import EgressCapabilityEvidence
 from cayu.egress.errors import UnsupportedEgressError
 from cayu.egress.grants import VirtualCredentialGrant
 from cayu.egress.proxy_exposure import HttpProxyEndpoint
@@ -184,8 +185,12 @@ class SandboxEgressAdapter(ABC):
         """Return durable identity required to reattach to ``runner``."""
         return {}
 
-    def capability_metadata(self, runner: Runner) -> dict[str, Any]:
-        """Return JSON-safe evidence for capabilities proven by ``runner``."""
+    def capability_evidence(self, runner: Runner) -> EgressCapabilityEvidence:
+        """Return typed runtime evidence for capabilities proven by ``runner``."""
+        return EgressCapabilityEvidence.unclaimed(self.runner_kind)
+
+    def configuration_metadata(self) -> dict[str, Any]:
+        """Return JSON-safe configured intent without claiming runtime proof."""
         return {}
 
     async def finalize_runner(self, runner: Runner, *, outcome: str | None) -> None:

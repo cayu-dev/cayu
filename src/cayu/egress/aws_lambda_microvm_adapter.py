@@ -19,6 +19,7 @@ from cayu.egress.adapter import (
     VirtualEgressRunnerRequest,
 )
 from cayu.egress.broker import TransparentEgressBroker
+from cayu.egress.capabilities import EgressCapabilityClaim, EgressCapabilityEvidence
 from cayu.egress.errors import UnsupportedEgressError
 from cayu.egress.grants import VirtualCredentialGrant
 from cayu.egress.proxy_exposure import ProxyExposure, VpcTaskProxyExposure
@@ -111,9 +112,10 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
         self._runner_session_ids: weakref.WeakKeyDictionary[Runner, str] = (
             weakref.WeakKeyDictionary()
         )
-        self._runner_capabilities: weakref.WeakKeyDictionary[Runner, dict[str, str]] = (
-            weakref.WeakKeyDictionary()
-        )
+        self._runner_capabilities: weakref.WeakKeyDictionary[
+            Runner,
+            EgressCapabilityEvidence,
+        ] = weakref.WeakKeyDictionary()
         reserved = {
             "region_name",
             "profile_name",
@@ -211,6 +213,7 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
             self._runner_session_ids[runner] = request.session_id
         try:
             await _install_ca(runner, request)
+            await run_setup_commands(runner, request)
             await run_enforcement_preflight(
                 runner,
                 request,
@@ -228,7 +231,6 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
                     "verified"
                 ),
             )
-            await run_setup_commands(runner, request)
         except BaseException:
             if created_new:
                 with contextlib.suppress(Exception, asyncio.CancelledError):
@@ -236,25 +238,50 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
             with contextlib.suppress(Exception, asyncio.CancelledError):
                 await runner.close()
             raise
-        capabilities = {
-            "proxy_reachability": "verified",
-            "direct_public_egress": "denied",
-            "metadata_isolation": (
-                "verified" if self.metadata_isolation == "required" else "unverified"
+        metadata_claim = (
+            EgressCapabilityClaim(
+                capability="metadata_isolation",
+                state="verified",
+                proof_source="agent_preflight",
+                observation="denied",
+            )
+            if self.metadata_isolation == "required"
+            else EgressCapabilityClaim(
+                capability="metadata_isolation",
+                state="unverified",
+                proof_source="operator_opt_out",
+                observation="not_probed",
+                reason_code=_METADATA_ISOLATION_UNVERIFIED_REASON,
+                remediation_code="supply_enforceable_guest_boundary",
+            )
+        )
+        self._runner_capabilities[runner] = EgressCapabilityEvidence(
+            adapter=self.runner_kind,
+            claims=(
+                EgressCapabilityClaim(
+                    capability="proxy_reachability",
+                    state="verified",
+                    proof_source="agent_preflight",
+                    observation="reachable",
+                ),
+                EgressCapabilityClaim(
+                    capability="direct_public_egress",
+                    state="verified",
+                    proof_source="agent_preflight",
+                    observation="denied",
+                ),
+                metadata_claim,
             ),
-        }
-        if self.metadata_isolation == "unverified":
-            capabilities["metadata_isolation_reason"] = _METADATA_ISOLATION_UNVERIFIED_REASON
-        self._runner_capabilities[runner] = capabilities
+        )
         return runner
 
-    def capability_metadata(self, runner: Runner) -> dict[str, Any]:
+    def capability_evidence(self, runner: Runner) -> EgressCapabilityEvidence:
         if not isinstance(runner, LambdaMicroVMRunner):
             raise TypeError("Lambda MicroVM adapter received a different runner type.")
         capabilities = self._runner_capabilities.get(runner)
         if capabilities is None:
             raise ValueError("Lambda MicroVM runner has not passed its egress preflight.")
-        return dict(capabilities)
+        return capabilities
 
     def configuration_metadata(self) -> dict[str, str]:
         """Describe configured metadata isolation without claiming runtime proof."""
