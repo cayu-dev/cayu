@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from cayu import CayuApp
-from cayu.cli import main
+from cayu.cli import _version, main
 
 
 def test_console_discovers_project_and_opens_booted_namespace(
@@ -73,7 +73,7 @@ def build_app():
     assert "console_project_app" not in sys.modules
 
     output = capsys.readouterr().out
-    assert "Cayu 0.1.0 console" in output
+    assert f"Cayu {_version()} console" in output
     assert f"Project: {project}" in output
     assert "Factory: console_project_app:build_app" in output
     assert "Agents: reviewer" in output
@@ -318,4 +318,4 @@ def test_other_cli_commands_work_without_ipython(monkeypatch, capsys) -> None:
 
     assert main(["version"]) == 0
 
-    assert capsys.readouterr().out == "cayu 0.1.0\n"
+    assert capsys.readouterr().out == f"cayu {_version()}\n"
