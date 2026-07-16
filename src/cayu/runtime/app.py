@@ -18,7 +18,7 @@ from importlib.metadata import PackageNotFoundError, version
 from math import isfinite
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, cast
+from typing import Any
 from uuid import uuid4
 
 from cayu._validation import (
@@ -32,15 +32,9 @@ from cayu.artifacts import (
     DEFAULT_MAX_FILE_ATTACHMENT_BYTES,
     DEFAULT_MAX_FILE_ATTACHMENTS_PER_REQUEST,
     DEFAULT_MAX_TOTAL_FILE_ATTACHMENT_BYTES,
-    RESOLVED_FILE_ATTACHMENTS_OPTION,
     ArtifactScope,
-    FileAttachment,
     FileAttachmentKind,
-    InvalidArtifactIdError,
-    copy_artifact_read_result,
     file_attachment,
-    file_attachment_from_payload,
-    resolved_file_attachment,
     validate_file_attachment_bytes,
     validate_file_attachment_content_type,
 )
@@ -50,11 +44,10 @@ from cayu.core.messages import (
     FilePart,
     Message,
     MessageRole,
-    ProviderStatePart,
     ToolCallPart,
     ToolResultPart,
 )
-from cayu.core.thinking import ThinkingConfig, thinking_config_payload
+from cayu.core.thinking import ThinkingConfig
 from cayu.core.tools import (
     _TOOL_POLICY_DENIAL_SOURCE,
     Tool,
@@ -78,21 +71,7 @@ from cayu.environments import (
     load_workspace_instructions,
 )
 from cayu.providers import (
-    InputTokenCountConfidence,
-    InputTokenCountMethod,
-    InputTokenCountResult,
-    ModelCompletion,
-    ModelContextOverflowError,
-    ModelContextPressureProfile,
     ModelProvider,
-    ModelProviderError,
-    ModelRequest,
-    ModelStreamEvent,
-    ModelStreamEventType,
-    copy_input_token_count_result,
-    copy_model_context_pressure_profile,
-    copy_model_stream_event,
-    normalize_model_completion,
 )
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
@@ -115,14 +94,16 @@ from cayu.runtime._interruption_coordinator import (
     interruption_cascade_suppressed,
     suppress_interruption_cascade,
 )
-from cayu.runtime._model_errors import model_provider_error_from_payload
+from cayu.runtime._model_step_executor import (
+    ModelStepBudgetEvaluationRequest,
+    ModelStepBudgetReservationFailureRequest,
+    ModelStepExecutor,
+    ModelStepFlowOutcome,
+    ModelStepLimitEvaluationRequest,
+    _session_agent_spec,
+)
 from cayu.runtime._run_limits import (
-    UNKNOWN_POST_DISPATCH_BUDGET_REASON,
-    BudgetDispatchReservationFailed,
-    BudgetedOperationRejected,
-    BudgetedOperationSucceeded,
     BudgetEvaluation,
-    BudgetModelStepLifecycle,
     BudgetReservationLeaseLost,
     BudgetReservationLeaseLostBeforeModelDispatch,
     BudgetStepReservation,
@@ -182,29 +163,14 @@ from cayu.runtime.budgets import (
 )
 from cayu.runtime.context import (
     CheckpointCompactionContextPolicy,
-    CompactionRequest,
-    CompactionResult,
     ContextBuildError,
     ContextCompactionTelemetry,
-    ContextCompactor,
-    ContextKnowledgeTelemetry,
     ContextPolicy,
-    ContextPressureEstimate,
-    ContextPressureOverhead,
     ContextRequest,
-    ContextUsageState,
     DefaultContextPolicy,
-    RuntimeManagedContextPolicy,
-    _automatic_compaction_dispatch_runner_scope,
-    _automatic_compaction_runner_scope,
-    copy_context_messages,
-    estimate_context_pressure,
-    estimate_model_request_context_pressure,
-    noteify_unresolvable_prompt_files,
 )
 from cayu.runtime.context_counting import (
     ContextCountingConfig,
-    ContextCountingMode,
     copy_context_counting_config,
 )
 from cayu.runtime.costs import (
@@ -261,23 +227,16 @@ from cayu.runtime.mcp_manifest_policy import (
 from cayu.runtime.model_steps import (
     AssistantStepResult,
     StepClassification,
-    assistant_text_content,
     classify_assistant_step,
-    provider_state_count,
-    thinking_count,
 )
 from cayu.runtime.retry_policy import (
-    RetryDecision,
     RetryPolicy,
     copy_retry_policy,
-    retry_decision,
-    retry_event_payload,
 )
 from cayu.runtime.sessions import (
     CompactSessionRequest,
     EnqueueSessionMessageRequest,
     EnqueueSessionMessageResult,
-    EventOrder,
     EventQuery,
     EventRecord,
     ForkSessionRequest,
@@ -326,10 +285,7 @@ from cayu.runtime.structured_output import (
     copy_structured_output_spec,
     structured_output_repair_lead,
     structured_output_repair_prompt,
-    structured_output_spec_payload,
-    structured_output_tool_instruction,
     structured_output_tool_required_validation,
-    structured_output_tool_spec,
     validate_structured_output_text,
     validate_structured_output_tool_arguments,
 )
@@ -359,10 +315,8 @@ from cayu.runtime.usage import (
     SessionUsageSummary,
     UsageMetrics,
     causal_budget_usage_summary,
-    normalize_usage_metrics,
     session_usage_summary,
     usage_metrics_from_event_payload,
-    usage_metrics_payload,
 )
 from cayu.runtime.user_input import (
     PENDING_USER_INPUT_CHECKPOINT_KEY,
@@ -390,52 +344,6 @@ class _SessionCompactionReplay(Exception):
 
 class SessionCompactionAttemptSuperseded(RuntimeError):
     """A recovered compaction attempt owns the durable operation claim."""
-
-
-class _ModelAttemptFailed(Exception):
-    def __init__(
-        self,
-        *,
-        message: str,
-        payload: dict[str, Any],
-        emitted_error_event: bool,
-        cause: Exception | None = None,
-    ) -> None:
-        self.message = require_nonblank(message, "message")
-        self.payload = copy_json_value(payload, "payload")
-        self.emitted_error_event = emitted_error_event
-        self.cause = cause
-        super().__init__(self.message)
-
-
-@dataclass(frozen=True)
-class _ContextCountObservation:
-    result: InputTokenCountResult
-    observation_id: str
-
-
-@dataclass(frozen=True)
-class _ContextPressureObservation:
-    estimate: ContextPressureEstimate
-    observation_id: str
-
-
-@dataclass(frozen=True)
-class _ModelStepFlowOutcome:
-    assistant_step_result: AssistantStepResult | None = None
-    stop_session: bool = False
-
-    def __post_init__(self) -> None:
-        if self.stop_session == (self.assistant_step_result is not None):
-            raise ValueError(
-                "A model-step flow outcome must contain either a result or a stop signal."
-            )
-
-
-class _AutomaticCompactionBudgetReservationFailed(RuntimeError):
-    def __init__(self, result: BudgetReservationResult) -> None:
-        super().__init__(f"Context compaction budget reservation failed: {result.message}")
-        self.result = result
 
 
 @dataclass(frozen=True)
@@ -502,14 +410,6 @@ _ABANDONED_RUN_REASON = "event_stream_closed"
 # persisted on PendingToolApproval (the historical ToolApprovalRequest default).
 _DEFAULT_APPROVAL_MAX_STEPS = 16
 DEFAULT_MAX_PARALLEL_TOOL_CALLS = 4
-
-
-def _has_provider_backed_context_compaction(
-    compaction_telemetry: list[ContextCompactionTelemetry],
-) -> bool:
-    return any(
-        telemetry.event_type == EventType.MODEL_COMPLETED for telemetry in compaction_telemetry
-    )
 
 
 class CayuApp:
@@ -658,6 +558,22 @@ class CayuApp:
         self._default_environment_name: str | None = None
         self._session_control = SessionControl[SessionUsageTracker](
             session_store=self.session_store
+        )
+        self._model_step_executor = ModelStepExecutor(
+            session_store=self.session_store,
+            event_writer=self._event_writer,
+            session_control=self._session_control,
+            run_limit_controller=self._run_limit_controller,
+            context_counting=self._context_counting,
+            max_file_attachment_bytes=self._max_file_attachment_bytes,
+            max_total_file_attachment_bytes=self._max_total_file_attachment_bytes,
+            max_file_attachments_per_request=self._max_file_attachments_per_request,
+            checkpoint_session=self._checkpoint_model_step_session,
+            apply_budget_evaluation=self._apply_model_step_budget_evaluation,
+            apply_limit_evaluation=self._apply_model_step_limit_evaluation,
+            stop_for_budget_reservation_failure=(
+                self._stop_for_model_step_budget_reservation_failure
+            ),
         )
         self._tool_round_executor = ToolRoundExecutor(
             session_store=self.session_store,
@@ -5747,6 +5663,25 @@ class CayuApp:
                 turn_usage_tracker=turn_usage_tracker,
                 active_run=active_run,
             )
+            model_step_run = self._model_step_executor.create_run(
+                provider=provider,
+                session=session,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                registered_environment=registered_environment,
+                environment_name=environment_name,
+                structured_output=structured_output,
+                thinking=effective_thinking,
+                knowledge_store=_knowledge_store(registered_environment),
+                request_metadata=request_metadata,
+                retry_policy=retry_policy,
+                request_budget_limits=budget_limits,
+                limit_gate=limit_gate,
+                budget_policy=self.budget_policy,
+                run_started_at=run_started_at,
+                turn_usage_tracker=turn_usage_tracker,
+                active_run=active_run,
+            )
             for step in range(1, max_steps + 1):
                 await self._session_control.raise_if_interrupted(session.id)
                 for event in await self._deliver_queued_session_messages(
@@ -5785,409 +5720,13 @@ class CayuApp:
                     yield event
                 if limit_evaluation.decision is not None:
                     return
-                compaction_budget_events: list[Event] = []
-
-                async def run_automatic_compaction(
-                    compactor: ContextCompactor,
-                    compaction_request: CompactionRequest,
-                    execute: Callable[[], Awaitable[CompactionResult]],
-                    completed_payloads: Callable[[], list[dict[str, Any]]],
-                    budget_event_buffer: list[Event] = compaction_budget_events,
-                    model_session: Session = session,
-                ) -> CompactionResult:
-                    return await self._run_automatic_compaction_with_budget(
-                        compactor=compactor,
-                        compaction_request=compaction_request,
-                        execute=execute,
-                        completed_payloads=completed_payloads,
-                        budget_events=budget_event_buffer,
-                        session=model_session,
-                        registered_agent=registered_agent,
-                        environment_name=environment_name,
-                        request_budget_limits=budget_limits,
-                    )
-
-                try:
-                    (
-                        context_messages,
-                        checkpoint_update,
-                        checkpoint_event_payload,
-                        context_compaction_telemetry,
-                        context_knowledge_telemetry,
-                    ) = await _build_context(
-                        context_policy=registered_agent.context_policy,
-                        session_store=self.session_store,
-                        session=session,
-                        agent_spec=_session_agent_spec(
-                            registered_agent=registered_agent,
-                            session=session,
-                        ),
-                        messages=messages,
-                        step=step,
-                        environment_name=environment_name,
-                        knowledge_store=_knowledge_store(registered_environment),
-                        request_metadata=request_metadata,
-                        pressure_overhead=_context_pressure_overhead(
-                            profile=_provider_context_pressure_profile(registered_provider),
-                            registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                            structured_output=structured_output,
-                            thinking=effective_thinking,
-                            step=step,
-                        ),
-                        count_input_tokens=_context_input_token_counter(
-                            app=self,
-                            provider=provider,
-                            session=session,
-                            registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                            structured_output=structured_output,
-                            thinking=effective_thinking,
-                            step=step,
-                        ),
-                        build_cache_prefix_request=_cache_prefix_request_builder(
-                            app=self,
-                            session=session,
-                            registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                            structured_output=structured_output,
-                            thinking=effective_thinking,
-                            step=step,
-                        ),
-                        run_compaction=run_automatic_compaction,
-                    )
-                except ContextBuildError as exc:
-                    for budget_event in compaction_budget_events:
-                        yield budget_event
-                    for telemetry in exc.compaction_telemetry:
-                        yield await self._event_writer.emit(
-                            _context_compaction_telemetry_event(
-                                telemetry=telemetry,
-                                session=session,
-                                registered_agent=registered_agent,
-                                environment_name=environment_name,
-                            )
-                        )
-                    for telemetry in exc.knowledge_telemetry:
-                        yield await self._event_writer.emit(
-                            _context_knowledge_telemetry_event(
-                                telemetry=telemetry,
-                                session=session,
-                                registered_agent=registered_agent,
-                                environment_name=environment_name,
-                            )
-                        )
-                    if exc.checkpoint_event_payload is not None:
-                        if exc.checkpoint is None:
-                            raise RuntimeError(
-                                "Context checkpoint event payload requires checkpoint state."
-                            ) from exc
-                        await self._checkpoint_preserving_runtime_state(
-                            session_id=session.id,
-                            checkpoint=exc.checkpoint,
-                        )
-                        yield await self._event_writer.emit(
-                            Event(
-                                type=EventType.SESSION_CHECKPOINTED,
-                                session_id=session.id,
-                                agent_name=registered_agent.spec.name,
-                                environment_name=environment_name,
-                                payload=exc.checkpoint_event_payload,
-                            )
-                        )
-                    if isinstance(
-                        exc.cause,
-                        _AutomaticCompactionBudgetReservationFailed,
-                    ):
-                        async for event in self._stop_session_for_budget_reservation_failed(
-                            session=session,
-                            registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                            environment_name=environment_name,
-                            result=exc.cause.result,
-                            messages=messages,
-                            run_started_at=run_started_at,
-                            turn_usage_tracker=turn_usage_tracker,
-                            active_run=active_run,
-                        ):
-                            yield event
-                        return
-                    raise exc.cause from exc
-                for budget_event in compaction_budget_events:
-                    yield budget_event
-                for telemetry in context_compaction_telemetry:
-                    yield await self._event_writer.emit(
-                        _context_compaction_telemetry_event(
-                            telemetry=telemetry,
-                            session=session,
-                            registered_agent=registered_agent,
-                            environment_name=environment_name,
-                        )
-                    )
-                for telemetry in context_knowledge_telemetry:
-                    yield await self._event_writer.emit(
-                        _context_knowledge_telemetry_event(
-                            telemetry=telemetry,
-                            session=session,
-                            registered_agent=registered_agent,
-                            environment_name=environment_name,
-                        )
-                    )
-                if checkpoint_event_payload is not None:
-                    if checkpoint_update is None:
-                        raise RuntimeError(
-                            "Context checkpoint event payload requires checkpoint state."
-                        )
-                    await self._checkpoint_preserving_runtime_state(
-                        session_id=session.id,
-                        checkpoint=checkpoint_update,
-                    )
-                    yield await self._event_writer.emit(
-                        Event(
-                            type=EventType.SESSION_CHECKPOINTED,
-                            session_id=session.id,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            payload=checkpoint_event_payload,
-                        )
-                    )
-                await self._session_control.raise_if_interrupted(session.id)
-
-                if _has_provider_backed_context_compaction(context_compaction_telemetry):
-                    budget_evaluation = await limit_gate.evaluate_budget(self.budget_policy)
-                    async for event in self._apply_budget_evaluation(
-                        evaluation=budget_evaluation,
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        environment_name=environment_name,
-                        messages=messages,
-                        run_started_at=run_started_at,
-                        turn_usage_tracker=turn_usage_tracker,
-                        active_run=active_run,
-                    ):
-                        yield event
-                    if budget_evaluation.check is not None:
-                        return
-
-                    limit_evaluation = await limit_gate.evaluate_limits()
-                    async for event in self._apply_limit_evaluation(
-                        evaluation=limit_evaluation,
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        environment_name=environment_name,
-                        messages=messages,
-                        run_started_at=run_started_at,
-                        turn_usage_tracker=turn_usage_tracker,
-                        active_run=active_run,
-                    ):
-                        yield event
-                    if limit_evaluation.decision is not None:
-                        return
-
-                model_request = await self._build_model_request(
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    context_messages=context_messages,
-                    structured_output=structured_output,
-                    thinking=effective_thinking,
+                model_step_flow_outcome: ModelStepFlowOutcome | None = None
+                model_step_events = model_step_run.execute(
                     step=step,
+                    messages=messages,
                 )
-
-                reservation_setup = await self._run_limit_controller.reserve_for_model_step(
-                    session=session,
-                    agent_name=registered_agent.spec.name,
-                    provider_name=registered_provider.name,
-                    environment_name=environment_name,
-                    budget_policy=self.budget_policy,
-                    request_budget_limits=budget_limits,
-                )
-                budget_reservations = list(reservation_setup.reservations)
                 try:
-                    for event in reservation_setup.events:
-                        yield event
-                except (GeneratorExit, asyncio.CancelledError) as authoritative_exc:
-                    if reservation_setup.failure is None and reservation_setup.error is None:
-                        async for (
-                            _
-                        ) in self._run_limit_controller.settlement_events_preserving_failure(
-                            self._run_limit_controller.release_reservations(
-                                budget_reservations,
-                                session=session,
-                                agent_name=registered_agent.spec.name,
-                                environment_name=environment_name,
-                                reason="model step abandoned before provider dispatch",
-                            ),
-                            authoritative_failure=authoritative_exc,
-                        ):
-                            pass
-                    raise
-                if reservation_setup.error is not None:
-                    raise reservation_setup.error
-                if reservation_setup.failure is not None:
-                    async for event in self._stop_session_for_budget_reservation_failed(
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        environment_name=environment_name,
-                        result=reservation_setup.failure,
-                        messages=messages,
-                        run_started_at=run_started_at,
-                        turn_usage_tracker=turn_usage_tracker,
-                        active_run=active_run,
-                    ):
-                        yield event
-                    return
-
-                if (
-                    budget_reservations
-                    and self._run_limit_controller.reservation_ttl_seconds is not None
-                ):
-                    try:
-                        await self._run_limit_controller.renew_reservations(budget_reservations)
-                    except asyncio.CancelledError as authoritative_exc:
-                        async for (
-                            event
-                        ) in self._run_limit_controller.settlement_events_preserving_failure(
-                            self._run_limit_controller.release_reservations(
-                                budget_reservations,
-                                session=session,
-                                agent_name=registered_agent.spec.name,
-                                environment_name=environment_name,
-                                reason="model step cancelled before provider dispatch",
-                            ),
-                            authoritative_failure=authoritative_exc,
-                        ):
-                            yield event
-                        raise
-                    except BudgetReservationLeaseLost as authoritative_exc:
-                        async for (
-                            event
-                        ) in self._run_limit_controller.settlement_events_preserving_failure(
-                            self._run_limit_controller.release_reservations(
-                                budget_reservations,
-                                session=session,
-                                agent_name=registered_agent.spec.name,
-                                environment_name=environment_name,
-                                reason="reservation lease expired before model step",
-                            ),
-                            authoritative_failure=authoritative_exc,
-                        ):
-                            yield event
-                        raise
-
-                assistant_message: Message | None = None
-                assistant_step_result: AssistantStepResult | None = None
-                tool_calls: list[runtime_records.ToolCallRequest] = []
-                budget_model_step_lifecycle = BudgetModelStepLifecycle()
-                budget_model_step_lifecycle.prepare_provider_dispatch(budget_reservations)
-
-                async def settle_provider_dispatch(
-                    lifecycle: BudgetModelStepLifecycle = budget_model_step_lifecycle,
-                    reservations: list[BudgetStepReservation] = budget_reservations,
-                    model_session: Session = session,
-                ) -> tuple[list[Event], Exception | None]:
-                    if lifecycle.pending_reservations is not None:
-                        return [], None
-                    settlement_events: list[Event] = []
-                    try:
-                        async for (
-                            event
-                        ) in self._run_limit_controller.reconcile_dispatched_reservations(
-                            reservations,
-                            lifecycle=lifecycle,
-                            session=model_session,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            unknown_reason=UNKNOWN_POST_DISPATCH_BUDGET_REASON,
-                        ):
-                            settlement_events.append(event)
-                    except Exception as settlement_error:
-                        return settlement_events, settlement_error
-                    return settlement_events, None
-
-                async def prepare_provider_dispatch(
-                    lifecycle: BudgetModelStepLifecycle = budget_model_step_lifecycle,
-                    reservations: list[BudgetStepReservation] = budget_reservations,
-                    model_session: Session = session,
-                ) -> tuple[list[Event], BudgetReservationResult | None, Exception | None]:
-                    if lifecycle.pending_reservations is not None:
-                        return [], None, None
-                    settlement_events, settlement_error = await settle_provider_dispatch()
-                    if settlement_error is not None:
-                        return settlement_events, None, settlement_error
-                    retry_setup = await self._run_limit_controller.reserve_for_model_step(
-                        session=model_session,
-                        agent_name=registered_agent.spec.name,
-                        provider_name=registered_provider.name,
-                        environment_name=environment_name,
-                        budget_policy=self.budget_policy,
-                        request_budget_limits=budget_limits,
-                    )
-                    if retry_setup.error is not None:
-                        return (
-                            settlement_events + list(retry_setup.events),
-                            None,
-                            retry_setup.error,
-                        )
-                    if retry_setup.failure is not None:
-                        return (
-                            settlement_events + list(retry_setup.events),
-                            retry_setup.failure,
-                            None,
-                        )
-                    retry_reservations = list(retry_setup.reservations)
-                    reservations.extend(retry_reservations)
-                    lifecycle.prepare_provider_dispatch(retry_reservations)
-                    return settlement_events + list(retry_setup.events), None, None
-
-                async def before_provider_dispatch(
-                    reservations: list[BudgetStepReservation] = budget_reservations,
-                    lifecycle: BudgetModelStepLifecycle = budget_model_step_lifecycle,
-                ) -> None:
-                    await self._run_limit_controller.before_provider_dispatch(
-                        reservations,
-                        lifecycle=lifecycle,
-                    )
-
-                model_step_flow_outcome: _ModelStepFlowOutcome | None = None
-                try:
-                    model_step_events = self._run_model_step_with_context_overflow_recovery(
-                        provider=provider,
-                        model_request=model_request,
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_provider=registered_provider,
-                        registered_environment=registered_environment,
-                        environment_name=environment_name,
-                        messages=messages,
-                        structured_output=structured_output,
-                        thinking=effective_thinking,
-                        knowledge_store=_knowledge_store(registered_environment),
-                        request_metadata=request_metadata,
-                        step=step,
-                        retry_policy=retry_policy,
-                        request_budget_limits=budget_limits,
-                        transcript_cursor_before_request=len(messages),
-                        limit_gate=limit_gate,
-                        record_model_completion=budget_model_step_lifecycle.record_model_completion,
-                        settle_provider_dispatch=settle_provider_dispatch,
-                        prepare_provider_dispatch=prepare_provider_dispatch,
-                        before_provider_dispatch=before_provider_dispatch,
-                        run_started_at=run_started_at,
-                        turn_usage_tracker=turn_usage_tracker,
-                        active_run=active_run,
-                    )
-                    guarded_model_step_events = (
-                        self._run_limit_controller.model_step_events_with_heartbeat(
-                            model_step_events,
-                            reservations=budget_reservations,
-                            lifecycle=budget_model_step_lifecycle,
-                        )
-                    )
-                    async for event, flow_outcome in guarded_model_step_events:
+                    async for event, flow_outcome in model_step_events:
                         if event is not None:
                             yield event
                         if flow_outcome is not None:
@@ -6196,142 +5735,17 @@ class CayuApp:
                                     "Model step produced more than one terminal flow outcome."
                                 )
                             model_step_flow_outcome = flow_outcome
-                            if flow_outcome.assistant_step_result is not None:
-                                assistant_step_result = flow_outcome.assistant_step_result
-                                assistant_message = assistant_step_result.assistant_message
-                                tool_calls = assistant_step_result.tool_calls
-                except GeneratorExit as authoritative_exc:
-                    async for _ in self._run_limit_controller.settlement_events_preserving_failure(
-                        self._run_limit_controller.settle_after_model_failure(
-                            budget_reservations,
-                            lifecycle=budget_model_step_lifecycle,
-                            session=session,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            release_reason="model step abandoned before provider dispatch",
-                        ),
-                        authoritative_failure=authoritative_exc,
-                    ):
-                        pass
-                    raise
-                except BudgetDispatchReservationFailed as exc:
-                    async for event in self._run_limit_controller.settle_after_model_failure(
-                        budget_reservations,
-                        lifecycle=budget_model_step_lifecycle,
-                        session=session,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        release_reason="retry reservation failed before provider dispatch",
-                    ):
-                        yield event
-                    async for event in self._stop_session_for_budget_reservation_failed(
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        environment_name=environment_name,
-                        result=exc.result,
-                        messages=messages,
-                        run_started_at=run_started_at,
-                        turn_usage_tracker=turn_usage_tracker,
-                        active_run=active_run,
-                    ):
-                        yield event
-                    return
-                except BudgetReservationLeaseLostBeforeModelDispatch as authoritative_exc:
-                    async for (
-                        event
-                    ) in self._run_limit_controller.settlement_events_preserving_failure(
-                        self._run_limit_controller.release_reservations(
-                            budget_reservations,
-                            session=session,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            reason="reservation lease expired before model dispatch",
-                        ),
-                        authoritative_failure=authoritative_exc,
-                    ):
-                        yield event
-                    raise
-                except BudgetReservationLeaseLost as authoritative_exc:
-                    async for (
-                        event
-                    ) in self._run_limit_controller.settlement_events_preserving_failure(
-                        self._run_limit_controller.settle_after_model_failure(
-                            budget_reservations,
-                            lifecycle=budget_model_step_lifecycle,
-                            session=session,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            release_reason="reservation heartbeat lost before provider dispatch",
-                            unknown_reason="reservation heartbeat lost; charged reserved amount",
-                        ),
-                        authoritative_failure=authoritative_exc,
-                    ):
-                        yield event
-                    raise
-                except SessionInterruptedByRequest as authoritative_exc:
-                    async for (
-                        event
-                    ) in self._run_limit_controller.settlement_events_preserving_failure(
-                        self._run_limit_controller.settle_after_model_failure(
-                            budget_reservations,
-                            lifecycle=budget_model_step_lifecycle,
-                            session=session,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            release_reason="session interrupted before provider dispatch",
-                        ),
-                        authoritative_failure=authoritative_exc,
-                    ):
-                        yield event
-                    raise
-                except asyncio.CancelledError as authoritative_exc:
-                    async for (
-                        event
-                    ) in self._run_limit_controller.settlement_events_preserving_failure(
-                        self._run_limit_controller.settle_after_model_failure(
-                            budget_reservations,
-                            lifecycle=budget_model_step_lifecycle,
-                            session=session,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            release_reason="model step cancelled before provider dispatch",
-                        ),
-                        authoritative_failure=authoritative_exc,
-                    ):
-                        yield event
-                    raise
-                except Exception as provider_exc:
-                    async for (
-                        event
-                    ) in self._run_limit_controller.settlement_events_preserving_failure(
-                        self._run_limit_controller.settle_after_model_failure(
-                            budget_reservations,
-                            lifecycle=budget_model_step_lifecycle,
-                            session=session,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            release_reason="model step failed before provider dispatch",
-                        ),
-                        authoritative_failure=provider_exc,
-                    ):
-                        yield event
-                    raise
-
-                if budget_model_step_lifecycle.dispatches:
-                    async for event in self._run_limit_controller.reconcile_dispatched_reservations(
-                        budget_reservations,
-                        lifecycle=budget_model_step_lifecycle,
-                        session=session,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        unknown_reason=UNKNOWN_POST_DISPATCH_BUDGET_REASON,
-                    ):
-                        yield event
+                finally:
+                    await _close_async_iterator(model_step_events)
                 if model_step_flow_outcome is None:
                     raise RuntimeError("Model step finished without a terminal flow outcome.")
                 if model_step_flow_outcome.stop_session:
                     return
+                assistant_step_result = model_step_flow_outcome.assistant_step_result
+                if assistant_step_result is None:
+                    raise RuntimeError("Successful model step finished without a result.")
+                assistant_message = assistant_step_result.assistant_message
+                tool_calls = assistant_step_result.tool_calls
 
                 pending_tool_round: tool_round_recovery.PendingToolRound | None = None
                 if assistant_message is not None:
@@ -7185,1136 +6599,78 @@ class CayuApp:
             },
         )
 
-    async def _build_model_request(
-        self,
-        *,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        context_messages: list[Message],
-        structured_output: StructuredOutputSpec | None,
-        thinking: ThinkingConfig | None,
-        step: int,
-    ) -> ModelRequest:
-        model_tools = [
-            {
-                "name": tool.name,
-                "description": tool.description,
-                "input_schema": deepcopy(tool.schema),
-            }
-            for tool in registered_agent.tools.values()
-        ]
-        model_messages = context_messages
-        if (
-            structured_output is not None
-            and structured_output.strategy == StructuredOutputStrategy.TOOL
-        ):
-            model_tools.append(structured_output_tool_spec(structured_output))
-            model_messages = _with_structured_output_tool_instruction(
-                context_messages,
-                structured_output,
-            )
-
-        resolved_attachments, unresolvable_prompt_ids = await _resolved_file_attachments(
-            messages=model_messages,
-            session=session,
-            registered_environment=registered_environment,
-            max_file_attachment_bytes=self._max_file_attachment_bytes,
-            max_total_file_attachment_bytes=self._max_total_file_attachment_bytes,
-            max_file_attachments_per_request=self._max_file_attachments_per_request,
-        )
-        if unresolvable_prompt_ids:
-            # Fail open: a live prompt file that cannot be resolved is projected to a text note so
-            # the run proceeds instead of failing forever, but the misconfiguration stays visible.
-            model_messages = noteify_unresolvable_prompt_files(
-                model_messages, unresolvable_prompt_ids
-            )
-            logger.warning(
-                "Prompt file attachment(s) could not be resolved and were omitted from the "
-                "provider request (check the session_id used at attach time, or whether the "
-                "artifact still exists): %s",
-                ", ".join(sorted(unresolvable_prompt_ids)),
-            )
-
-        request_options: dict[str, Any] = {
-            **copy_json_value(
-                registered_agent.spec.provider_options,
-                "provider_options",
-            ),
-            "agent_metadata": deepcopy(registered_agent.spec.metadata),
-            "environment_metadata": (
-                deepcopy(registered_environment.spec.metadata)
-                if registered_environment is not None
-                else {}
-            ),
-            "step": step,
-            "structured_output": (
-                structured_output_spec_payload(structured_output)
-                if structured_output is not None
-                else None
-            ),
-            RESOLVED_FILE_ATTACHMENTS_OPTION: resolved_attachments,
-        }
-        if thinking is not None:
-            request_options["thinking"] = thinking_config_payload(thinking)
-        return ModelRequest(
-            model=session.model,
-            messages=model_messages,
-            tools=model_tools,
-            options=request_options,
-        )
-
-    async def _run_model_step_with_context_overflow_recovery(
-        self,
-        *,
-        provider: ModelProvider,
-        model_request: ModelRequest,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_provider: runtime_records.RegisteredProvider,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        environment_name: str | None,
-        messages: list[Message],
-        structured_output: StructuredOutputSpec | None,
-        thinking: ThinkingConfig | None,
-        knowledge_store: Any,
-        request_metadata: dict[str, Any],
-        step: int,
-        retry_policy: RetryPolicy,
-        request_budget_limits: tuple[BudgetLimit, ...],
-        transcript_cursor_before_request: int,
-        limit_gate: RunLimitGate,
-        record_model_completion: Callable[[Event], None],
-        settle_provider_dispatch: Callable[[], Awaitable[tuple[list[Event], Exception | None]]],
-        prepare_provider_dispatch: Callable[
-            [], Awaitable[tuple[list[Event], BudgetReservationResult | None, Exception | None]]
-        ],
-        before_provider_dispatch: Callable[[], Awaitable[None]],
-        run_started_at: float,
-        turn_usage_tracker: SessionUsageTracker | None,
-        active_run: ActiveSessionRun[SessionUsageTracker] | None,
-    ) -> AsyncIterator[tuple[Event | None, _ModelStepFlowOutcome | None]]:
-        overflow_policy = registered_agent.context_overflow_policy
-        compaction_budget_events: list[Event] = []
-
-        async def run_automatic_compaction(
-            compactor: ContextCompactor,
-            compaction_request: CompactionRequest,
-            execute: Callable[[], Awaitable[CompactionResult]],
-            completed_payloads: Callable[[], list[dict[str, Any]]],
-        ) -> CompactionResult:
-            return await self._run_automatic_compaction_with_budget(
-                compactor=compactor,
-                compaction_request=compaction_request,
-                execute=execute,
-                completed_payloads=completed_payloads,
-                budget_events=compaction_budget_events,
-                session=session,
-                registered_agent=registered_agent,
-                environment_name=environment_name,
-                request_budget_limits=request_budget_limits,
-            )
-
-        try:
-            async for event, result in self._run_model_step_with_retries(
-                provider=provider,
-                model_request=model_request,
-                session=session,
-                registered_agent=registered_agent,
-                registered_provider=registered_provider,
-                environment_name=environment_name,
-                step=step,
-                retry_policy=retry_policy,
-                transcript_cursor_before_request=transcript_cursor_before_request,
-                record_model_completion=record_model_completion,
-                prepare_provider_dispatch=prepare_provider_dispatch,
-                before_provider_dispatch=before_provider_dispatch,
-            ):
-                yield (
-                    event,
-                    (
-                        _ModelStepFlowOutcome(assistant_step_result=result)
-                        if result is not None
-                        else None
-                    ),
-                )
-            return
-        except ModelContextOverflowError as exc:
-            if overflow_policy is None:
-                raise
-
-            yield (
-                await self._event_writer.emit(
-                    Event(
-                        type=EventType.CONTEXT_OVERFLOW_DETECTED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        payload=_context_overflow_event_payload(
-                            exc,
-                            step=step,
-                            phase="initial",
-                            original_message_count=len(model_request.messages),
-                        ),
-                    )
-                ),
-                None,
-            )
-
-        try:
-            (
-                recovery_context_messages,
-                checkpoint_update,
-                checkpoint_event_payload,
-                context_compaction_telemetry,
-                context_knowledge_telemetry,
-            ) = await _build_context(
-                context_policy=overflow_policy,
-                session_store=self.session_store,
-                session=session,
-                agent_spec=_session_agent_spec(
-                    registered_agent=registered_agent,
-                    session=session,
-                ),
-                messages=messages,
-                step=step,
-                environment_name=environment_name,
-                knowledge_store=knowledge_store,
-                request_metadata=request_metadata,
-                pressure_overhead=_context_pressure_overhead(
-                    profile=_provider_context_pressure_profile(registered_provider),
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    structured_output=structured_output,
-                    thinking=thinking,
-                    step=step,
-                ),
-                count_input_tokens=_context_input_token_counter(
-                    app=self,
-                    provider=provider,
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    structured_output=structured_output,
-                    thinking=thinking,
-                    step=step,
-                ),
-                build_cache_prefix_request=_cache_prefix_request_builder(
-                    app=self,
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    structured_output=structured_output,
-                    thinking=thinking,
-                    step=step,
-                ),
-                run_compaction=run_automatic_compaction,
-                force_bounded_compaction=True,
-            )
-        except ContextBuildError as build_exc:
-            for budget_event in compaction_budget_events:
-                yield budget_event, None
-            for telemetry in build_exc.compaction_telemetry:
-                yield (
-                    await self._event_writer.emit(
-                        _context_compaction_telemetry_event(
-                            telemetry=telemetry,
-                            session=session,
-                            registered_agent=registered_agent,
-                            environment_name=environment_name,
-                        )
-                    ),
-                    None,
-                )
-            for telemetry in build_exc.knowledge_telemetry:
-                yield (
-                    await self._event_writer.emit(
-                        _context_knowledge_telemetry_event(
-                            telemetry=telemetry,
-                            session=session,
-                            registered_agent=registered_agent,
-                            environment_name=environment_name,
-                        )
-                    ),
-                    None,
-                )
-            if build_exc.checkpoint_event_payload is not None:
-                if build_exc.checkpoint is None:
-                    raise RuntimeError(
-                        "Context checkpoint event payload requires checkpoint state."
-                    ) from build_exc
-                await self._checkpoint_preserving_runtime_state(
-                    session_id=session.id,
-                    checkpoint=build_exc.checkpoint,
-                )
-                yield (
-                    await self._event_writer.emit(
-                        Event(
-                            type=EventType.SESSION_CHECKPOINTED,
-                            session_id=session.id,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            payload=build_exc.checkpoint_event_payload,
-                        )
-                    ),
-                    None,
-                )
-            if isinstance(
-                build_exc.cause,
-                _AutomaticCompactionBudgetReservationFailed,
-            ):
-                settlement_events, settlement_error = await settle_provider_dispatch()
-                for settlement_event in settlement_events:
-                    yield settlement_event, None
-                if settlement_error is not None:
-                    raise settlement_error from build_exc.cause
-                async for event in self._stop_session_for_budget_reservation_failed(
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    environment_name=environment_name,
-                    result=build_exc.cause.result,
-                    messages=messages,
-                    run_started_at=run_started_at,
-                    turn_usage_tracker=turn_usage_tracker,
-                    active_run=active_run,
-                ):
-                    yield event, None
-                yield None, _ModelStepFlowOutcome(stop_session=True)
-                return
-            yield (
-                await self._event_writer.emit(
-                    Event(
-                        type=EventType.CONTEXT_OVERFLOW_FAILED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        payload={
-                            "step": step,
-                            "phase": "context_build",
-                            "error": str(build_exc.cause),
-                            "error_type": type(build_exc.cause).__name__,
-                            "policy": type(overflow_policy).__name__,
-                        },
-                    )
-                ),
-                None,
-            )
-            raise build_exc.cause from build_exc
-        for budget_event in compaction_budget_events:
-            yield budget_event, None
-        for telemetry in context_compaction_telemetry:
-            yield (
-                await self._event_writer.emit(
-                    _context_compaction_telemetry_event(
-                        telemetry=telemetry,
-                        session=session,
-                        registered_agent=registered_agent,
-                        environment_name=environment_name,
-                    )
-                ),
-                None,
-            )
-        for telemetry in context_knowledge_telemetry:
-            yield (
-                await self._event_writer.emit(
-                    _context_knowledge_telemetry_event(
-                        telemetry=telemetry,
-                        session=session,
-                        registered_agent=registered_agent,
-                        environment_name=environment_name,
-                    )
-                ),
-                None,
-            )
-        if checkpoint_event_payload is not None:
-            if checkpoint_update is None:
-                raise RuntimeError("Context checkpoint event payload requires checkpoint state.")
-            await self._checkpoint_preserving_runtime_state(
-                session_id=session.id,
-                checkpoint=checkpoint_update,
-            )
-            yield (
-                await self._event_writer.emit(
-                    Event(
-                        type=EventType.SESSION_CHECKPOINTED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        payload=checkpoint_event_payload,
-                    )
-                ),
-                None,
-            )
-
-        await self._session_control.raise_if_interrupted(session.id)
-        if _has_provider_backed_context_compaction(context_compaction_telemetry):
-            settlement_events, settlement_error = await settle_provider_dispatch()
-            for settlement_event in settlement_events:
-                yield settlement_event, None
-            if settlement_error is not None:
-                raise settlement_error
-
-            budget_evaluation = await limit_gate.evaluate_budget(self.budget_policy)
-            async for gate_event in self._apply_budget_evaluation(
-                evaluation=budget_evaluation,
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                environment_name=environment_name,
-                messages=messages,
-                run_started_at=run_started_at,
-                turn_usage_tracker=turn_usage_tracker,
-                active_run=active_run,
-            ):
-                yield gate_event, None
-            if budget_evaluation.check is not None:
-                yield None, _ModelStepFlowOutcome(stop_session=True)
-                return
-
-            limit_evaluation = await limit_gate.evaluate_limits()
-            async for gate_event in self._apply_limit_evaluation(
-                evaluation=limit_evaluation,
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                environment_name=environment_name,
-                messages=messages,
-                run_started_at=run_started_at,
-                turn_usage_tracker=turn_usage_tracker,
-                active_run=active_run,
-            ):
-                yield gate_event, None
-            if limit_evaluation.decision is not None:
-                yield None, _ModelStepFlowOutcome(stop_session=True)
-                return
-
-        recovery_request = await self._build_model_request(
-            session=session,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            context_messages=recovery_context_messages,
-            structured_output=structured_output,
-            thinking=thinking,
-            step=step,
-        )
-        yield (
-            await self._event_writer.emit(
-                Event(
-                    type=EventType.CONTEXT_OVERFLOW_RECOVERING,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload={
-                        "step": step,
-                        "original_message_count": len(model_request.messages),
-                        "recovery_message_count": len(recovery_request.messages),
-                        "policy": type(overflow_policy).__name__,
-                    },
-                )
-            ),
-            None,
-        )
-        try:
-            async for event, result in self._run_model_step_with_retries(
-                provider=provider,
-                model_request=recovery_request,
-                session=session,
-                registered_agent=registered_agent,
-                registered_provider=registered_provider,
-                environment_name=environment_name,
-                step=step,
-                retry_policy=retry_policy,
-                transcript_cursor_before_request=transcript_cursor_before_request,
-                record_model_completion=record_model_completion,
-                prepare_provider_dispatch=prepare_provider_dispatch,
-                before_provider_dispatch=before_provider_dispatch,
-            ):
-                yield (
-                    event,
-                    (
-                        _ModelStepFlowOutcome(assistant_step_result=result)
-                        if result is not None
-                        else None
-                    ),
-                )
-        except ModelContextOverflowError as exc:
-            yield (
-                await self._event_writer.emit(
-                    Event(
-                        type=EventType.CONTEXT_OVERFLOW_FAILED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        payload=_context_overflow_event_payload(
-                            exc,
-                            step=step,
-                            phase="recovery",
-                            original_message_count=len(model_request.messages),
-                            recovery_message_count=len(recovery_request.messages),
-                        ),
-                    )
-                ),
-                None,
-            )
-            raise
-
-    async def _run_model_step_with_retries(
-        self,
-        *,
-        provider: ModelProvider,
-        model_request: ModelRequest,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_provider: runtime_records.RegisteredProvider,
-        environment_name: str | None,
-        step: int,
-        retry_policy: RetryPolicy,
-        transcript_cursor_before_request: int,
-        record_model_completion: Callable[[Event], None],
-        prepare_provider_dispatch: Callable[
-            [], Awaitable[tuple[list[Event], BudgetReservationResult | None, Exception | None]]
-        ],
-        before_provider_dispatch: Callable[[], Awaitable[None]],
-    ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
-        retry_policy = copy_retry_policy(retry_policy)
-        attempt = 1
-        prior_retry_failure: _ModelAttemptFailed | None = None
-        while True:
-            try:
-                (
-                    reservation_events,
-                    reservation_failure,
-                    preparation_error,
-                ) = await prepare_provider_dispatch()
-            except Exception as accounting_exc:
-                reservation_events = []
-                reservation_failure = None
-                preparation_error = accounting_exc
-            for reservation_event in reservation_events:
-                yield reservation_event, None
-            if preparation_error is not None:
-                if prior_retry_failure is None:
-                    raise preparation_error
-                authoritative_failure = prior_retry_failure.cause
-                if authoritative_failure is None:
-                    authoritative_failure = RuntimeError(prior_retry_failure.message)
-                add_budget_failure_note(
-                    authoritative_failure,
-                    operation="retry preparation",
-                    accounting_failure=preparation_error,
-                )
-                raise authoritative_failure from prior_retry_failure
-            prior_retry_failure = None
-            if reservation_failure is not None:
-                raise BudgetDispatchReservationFailed(reservation_failure)
-            (
-                context_pressure_observation,
-                context_pressure_event,
-            ) = await self._observe_model_request_context_pressure(
-                model_request=model_request,
-                session=session,
-                registered_agent=registered_agent,
-                registered_provider=registered_provider,
-                environment_name=environment_name,
-                step=step,
-                attempt=attempt,
-                max_attempts=retry_policy.max_attempts,
-            )
-            if context_pressure_event is not None:
-                yield context_pressure_event, None
-            (
-                context_count_observation,
-                context_count_event,
-            ) = await self._observe_model_request_context_count(
-                provider=provider,
-                model_request=model_request,
-                session=session,
-                registered_agent=registered_agent,
-                registered_provider=registered_provider,
-                environment_name=environment_name,
-                step=step,
-                attempt=attempt,
-                max_attempts=retry_policy.max_attempts,
-            )
-            if context_count_event is not None:
-                yield context_count_event, None
-            yield (
-                await self._event_writer.emit(
-                    Event(
-                        type=EventType.MODEL_STARTED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        payload={
-                            "model": session.model,
-                            "provider": registered_provider.name,
-                            "step": step,
-                            "attempt": attempt,
-                            "max_attempts": retry_policy.max_attempts,
-                        },
-                        environment_name=environment_name,
-                    )
-                ),
-                None,
-            )
-            try:
-                result: AssistantStepResult | None = None
-                async for event, step_result in self._run_model_step_once(
-                    provider=provider,
-                    model_request=model_request,
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_provider=registered_provider,
-                    environment_name=environment_name,
-                    step=step,
-                    attempt=attempt,
-                    max_attempts=retry_policy.max_attempts,
-                    transcript_cursor_before_request=transcript_cursor_before_request,
-                    before_provider_dispatch=before_provider_dispatch,
-                ):
-                    if event is not None:
-                        if event.type == EventType.MODEL_COMPLETED:
-                            record_model_completion(event)
-                        yield event, None
-                        if (
-                            event.type == EventType.MODEL_COMPLETED
-                            and context_pressure_observation is not None
-                        ):
-                            yield (
-                                await self._event_writer.emit(
-                                    _context_pressure_reconciled_event(
-                                        event,
-                                        observation=context_pressure_observation,
-                                        session=session,
-                                        registered_agent=registered_agent,
-                                        registered_provider=registered_provider,
-                                        environment_name=environment_name,
-                                        step=step,
-                                        attempt=attempt,
-                                        max_attempts=retry_policy.max_attempts,
-                                    )
-                                ),
-                                None,
-                            )
-                        if (
-                            event.type == EventType.MODEL_COMPLETED
-                            and context_count_observation is not None
-                        ):
-                            yield (
-                                await self._event_writer.emit(
-                                    _context_count_reconciled_event(
-                                        event,
-                                        observation=context_count_observation,
-                                        session=session,
-                                        registered_agent=registered_agent,
-                                        registered_provider=registered_provider,
-                                        environment_name=environment_name,
-                                        step=step,
-                                        attempt=attempt,
-                                        max_attempts=retry_policy.max_attempts,
-                                    )
-                                ),
-                                None,
-                            )
-                    if step_result is not None:
-                        result = step_result
-                if result is None:
-                    raise RuntimeError("Model step finished without a result.")
-                yield None, result
-                return
-            except _ModelAttemptFailed as exc:
-                status_code, retryable, retry_after_s = _typed_retry_fields(exc)
-                decision = retry_decision(
-                    policy=retry_policy,
-                    attempt=attempt,
-                    error=exc.message,
-                    status_code=status_code,
-                    retryable=retryable,
-                    retry_after_s=retry_after_s,
-                )
-                if decision.reason is not None and not exc.emitted_error_event:
-                    yield (
-                        await self._event_writer.emit(
-                            Event(
-                                type=EventType.MODEL_ERROR,
-                                session_id=session.id,
-                                agent_name=registered_agent.spec.name,
-                                environment_name=environment_name,
-                                payload=_retry_attempt_payload(
-                                    exc.payload,
-                                    step=step,
-                                    attempt=attempt,
-                                    max_attempts=retry_policy.max_attempts,
-                                ),
-                            )
-                        ),
-                        None,
-                    )
-                if not decision.retry:
-                    if exc.cause is not None:
-                        raise exc.cause from exc
-                    raise RuntimeError(exc.message) from exc
-                yield (
-                    await self._event_writer.emit(
-                        _model_retry_event(
-                            session=session,
-                            registered_agent=registered_agent,
-                            environment_name=environment_name,
-                            registered_provider=registered_provider,
-                            step=step,
-                            decision=decision,
-                            error=exc.message,
-                        )
-                    ),
-                    None,
-                )
-                # The failed attempt may have already streamed partial text /
-                # thinking deltas. Mark them discardable so consumers rebuilding
-                # output from the event stream drop this attempt's deltas before
-                # the retry emits fresh ones.
-                yield (
-                    await self._event_writer.emit(
-                        _model_attempt_discarded_event(
-                            session=session,
-                            registered_agent=registered_agent,
-                            environment_name=environment_name,
-                            registered_provider=registered_provider,
-                            step=step,
-                            decision=decision,
-                        )
-                    ),
-                    None,
-                )
-                await self._sleep_before_retry(session.id, decision)
-                prior_retry_failure = exc
-                attempt += 1
-
-    async def _observe_model_request_context_pressure(
-        self,
-        *,
-        model_request: ModelRequest,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_provider: runtime_records.RegisteredProvider,
-        environment_name: str | None,
-        step: int,
-        attempt: int,
-        max_attempts: int,
-    ) -> tuple[_ContextPressureObservation | None, Event | None]:
-        if self._context_counting.mode == ContextCountingMode.OFF:
-            return None, None
-        observation_id = str(uuid4())
-        profile = _provider_context_pressure_profile(registered_provider)
-        estimate = estimate_model_request_context_pressure(
-            model_request=model_request,
-            image_min_tokens=profile.image_min_tokens,
-            document_min_tokens=profile.document_min_tokens,
-            document_bytes_per_token=profile.document_bytes_per_token,
-            tool_schema_chars_per_token=profile.tool_schema_chars_per_token,
-        )
-        observation = _ContextPressureObservation(
-            estimate=estimate,
-            observation_id=observation_id,
-        )
-        event = await self._event_writer.emit(
-            Event(
-                type=EventType.CONTEXT_PRESSURE_ESTIMATED,
-                session_id=session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=environment_name,
-                payload={
-                    **_context_count_base_payload(
-                        model_request=model_request,
-                        provider_name=registered_provider.name,
-                        step=step,
-                        attempt=attempt,
-                        max_attempts=max_attempts,
-                        observation_id=observation_id,
-                    ),
-                    "estimate": estimate.model_dump(mode="json"),
-                },
-            )
-        )
-        return observation, event
-
-    async def _observe_model_request_context_count(
-        self,
-        *,
-        provider: ModelProvider,
-        model_request: ModelRequest,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_provider: runtime_records.RegisteredProvider,
-        environment_name: str | None,
-        step: int,
-        attempt: int,
-        max_attempts: int,
-    ) -> tuple[_ContextCountObservation | None, Event | None]:
-        if self._context_counting.mode == ContextCountingMode.OFF:
-            return None, None
-        observation_id = str(uuid4())
-        base_payload = _context_count_base_payload(
-            model_request=model_request,
-            provider_name=registered_provider.name,
-            step=step,
-            attempt=attempt,
-            max_attempts=max_attempts,
-            observation_id=observation_id,
-        )
-        try:
-            provider_result = await provider.count_input_tokens(
-                _copy_model_request_for_counting(model_request)
-            )
-            provider_result = copy_input_token_count_result(provider_result)
-            result = (
-                provider_result
-                if provider_result is not None
-                else InputTokenCountResult(
-                    input_tokens=None,
-                    method=InputTokenCountMethod.UNAVAILABLE,
-                    confidence=InputTokenCountConfidence.UNAVAILABLE,
-                )
-            )
-        except Exception as exc:
-            event = await self._event_writer.emit(
-                Event(
-                    type=EventType.CONTEXT_COUNT_FAILED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload={
-                        **base_payload,
-                        "error": str(exc),
-                        "error_type": type(exc).__name__,
-                    },
-                )
-            )
-            return None, event
-
-        observation = _ContextCountObservation(
-            result=result,
-            observation_id=observation_id,
-        )
-        event = await self._event_writer.emit(
-            Event(
-                type=EventType.CONTEXT_COUNTED,
-                session_id=session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=environment_name,
-                payload={
-                    **base_payload,
-                    "count": result.model_dump(mode="json"),
-                },
-            )
-        )
-        return observation, event
-
-    async def _run_model_step_once(
-        self,
-        *,
-        provider: ModelProvider,
-        model_request: ModelRequest,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_provider: runtime_records.RegisteredProvider,
-        environment_name: str | None,
-        step: int,
-        attempt: int,
-        max_attempts: int,
-        transcript_cursor_before_request: int,
-        before_provider_dispatch: Callable[[], Awaitable[None]],
-    ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
-        assistant_parts: list[
-            transcript_helpers.AssistantTextPart
-            | transcript_helpers.AssistantThinkingPart
-            | ToolCallPart
-        ] = []
-        thinking_options = model_request.options.get("thinking")
-        include_thinking_in_transcript = (
-            thinking_options.get("include_in_transcript", True)
-            if isinstance(thinking_options, dict)
-            else True
-        )
-        tool_calls: list[runtime_records.ToolCallRequest] = []
-        provider_state_parts: list[ProviderStatePart] = []
-        completed_stream_event: ModelStreamEvent | None = None
-        step_result: AssistantStepResult | None = None
-        model_completed = False
-        profile = _provider_context_pressure_profile(registered_provider)
-        context_pressure_estimate = estimate_model_request_context_pressure(
-            model_request=model_request,
-            image_min_tokens=profile.image_min_tokens,
-            document_min_tokens=profile.document_min_tokens,
-            document_bytes_per_token=profile.document_bytes_per_token,
-            tool_schema_chars_per_token=profile.tool_schema_chars_per_token,
-        )
-        interrupt_poll = self._session_control.stream_interrupt_poll(session.id)
-        # This is the accounting boundary: once the callback returns, the next
-        # expression enters provider-controlled code and Cayu can no longer prove
-        # that the attempt did not consume billable work.
-        await before_provider_dispatch()
-        try:
-            async for raw_stream_event in provider.stream(model_request):
-                stream_event = _validate_stream_event(raw_stream_event)
-                await interrupt_poll.raise_if_interrupted()
-                if model_completed:
-                    raise _ModelAttemptFailed(
-                        message=(
-                            f"Model provider emitted event after completed: {stream_event.type}"
-                        ),
-                        payload={
-                            "error": (
-                                f"Model provider emitted event after completed: {stream_event.type}"
-                            ),
-                            "error_type": "RuntimeError",
-                        },
-                        emitted_error_event=False,
-                        cause=RuntimeError(
-                            f"Model provider emitted event after completed: {stream_event.type}"
-                        ),
-                    )
-
-                if stream_event.type == ModelStreamEventType.TOOL_CALL:
-                    tool_call = transcript_helpers.parse_tool_call(stream_event.payload)
-                    tool_calls.append(tool_call)
-                    assistant_parts.append(transcript_helpers.tool_call_part(tool_call))
-                    continue
-
-                if stream_event.type == ModelStreamEventType.TEXT_DELTA:
-                    transcript_helpers.append_assistant_text_delta(
-                        assistant_parts, stream_event.delta
-                    )
-                elif stream_event.type == ModelStreamEventType.THINKING:
-                    transcript_helpers.append_assistant_thinking_delta(
-                        assistant_parts,
-                        stream_event.delta,
-                        provider_state=stream_event.payload.get("provider_state"),
-                        include=include_thinking_in_transcript,
-                    )
-                    if not stream_event.delta:
-                        # Redacted thinking carries only opaque state; don't emit an
-                        # empty delta event (the text path suppresses empties too).
-                        continue
-                elif stream_event.type == ModelStreamEventType.COMPLETED:
-                    model_completed = True
-                    completed_stream_event = stream_event
-                    provider_state_parts = transcript_helpers.provider_state_parts(
-                        stream_event.payload,
-                    )
-                    assistant_message = transcript_helpers.assistant_message(
-                        content_parts=assistant_parts,
-                        provider_state_parts=provider_state_parts,
-                    )
-                    step_result = _assistant_step_result(
-                        session_id=session.id,
-                        step=step,
-                        assistant_message=assistant_message,
-                        tool_calls=tool_calls,
-                        completion=_stream_event_completion(completed_stream_event),
-                    )
-                    classification = classify_assistant_step(step_result)
-                    event = _model_stream_event_to_runtime_event(
-                        stream_event,
-                        session=session,
-                        registered_agent=registered_agent,
-                        environment_name=environment_name,
-                        provider_name=registered_provider.name,
-                        step=step,
-                        attempt=attempt,
-                        max_attempts=max_attempts,
-                        classification=classification.payload(),
-                        context_pressure_estimate=context_pressure_estimate,
-                        transcript_cursor_after_completion=(
-                            transcript_cursor_before_request
-                            + (1 if assistant_message is not None else 0)
-                        ),
-                        usage_dialect=registered_provider.provider.usage_dialect,
-                    )
-                    yield await self._event_writer.emit(event), None
-                    continue
-
-                if stream_event.type == ModelStreamEventType.ERROR:
-                    provider_error = model_provider_error_from_payload(
-                        stream_event.payload,
-                        fallback_provider=registered_provider.name,
-                    )
-                    if isinstance(provider_error, ModelContextOverflowError):
-                        # A provider flattened a context overflow into an error
-                        # event instead of raising it. Rehydrate the typed
-                        # exception so overflow recovery can shrink context and
-                        # retry instead of burning generic retries on a request
-                        # that can never fit.
-                        raise provider_error
-
-                event = _model_stream_event_to_runtime_event(
-                    stream_event,
-                    session=session,
-                    registered_agent=registered_agent,
-                    environment_name=environment_name,
-                    provider_name=registered_provider.name,
-                    step=step,
-                    attempt=attempt,
-                    max_attempts=max_attempts,
-                    usage_dialect=registered_provider.provider.usage_dialect,
-                )
-                emitted_event = await self._event_writer.emit(event)
-                if stream_event.type == ModelStreamEventType.ERROR:
-                    message = str(stream_event.payload.get("error") or "Model provider error")
-                    provider_error = model_provider_error_from_payload(
-                        stream_event.payload,
-                        fallback_provider=registered_provider.name,
-                        fallback_message=message,
-                    )
-                    yield emitted_event, None
-                    raise _ModelAttemptFailed(
-                        message=message,
-                        payload=copy_json_value(stream_event.payload, "payload"),
-                        emitted_error_event=True,
-                        cause=provider_error or RuntimeError(message),
-                    )
-                yield emitted_event, None
-        except SessionInterruptedByRequest:
-            raise
-        except asyncio.CancelledError:
-            raise
-        except _ModelAttemptFailed:
-            raise
-        except ModelContextOverflowError:
-            raise
-        except Exception as exc:
-            raise _ModelAttemptFailed(
-                message=str(exc),
-                payload={
-                    "error": str(exc),
-                    "error_type": type(exc).__name__,
-                },
-                emitted_error_event=False,
-                cause=exc,
-            ) from exc
-
-        if not model_completed:
-            message = "Model provider stream ended without a completed event."
-            raise _ModelAttemptFailed(
-                message=message,
-                payload={
-                    "error": message,
-                    "error_type": "RuntimeError",
-                },
-                emitted_error_event=False,
-                cause=RuntimeError(message),
-            )
-        await self._session_control.raise_if_interrupted(session.id)
-        if completed_stream_event is None:
-            raise RuntimeError("Model provider completed without completion metadata.")
-        if step_result is None:
-            raise RuntimeError("Model provider completed without an assistant step result.")
-        yield None, step_result
-
-    async def _sleep_before_retry(
+    async def _checkpoint_model_step_session(
         self,
         session_id: str,
-        decision: RetryDecision,
+        checkpoint: dict[str, Any],
     ) -> None:
-        await self._session_control.raise_if_interrupted(session_id)
-        if decision.delay_seconds > 0:
-            await asyncio.sleep(decision.delay_seconds)
-        await self._session_control.raise_if_interrupted(session_id)
-
-    async def _run_automatic_compaction_with_budget(
-        self,
-        *,
-        compactor: ContextCompactor,
-        compaction_request: CompactionRequest,
-        execute: Callable[[], Awaitable[CompactionResult]],
-        completed_payloads: Callable[[], list[dict[str, Any]]],
-        budget_events: list[Event],
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        environment_name: str | None,
-        request_budget_limits: tuple[BudgetLimit, ...],
-    ) -> CompactionResult:
-        limits = self._run_limit_controller.provider_reservation_limits(
-            session=session,
-            agent_name=registered_agent.spec.name,
-            budget_policy=self.budget_policy,
-            request_budget_limits=request_budget_limits,
+        await self._checkpoint_preserving_runtime_state(
+            session_id=session_id,
+            checkpoint=checkpoint,
         )
-        if not limits:
-            return await execute()
 
+    async def _apply_model_step_budget_evaluation(
+        self,
+        request: ModelStepBudgetEvaluationRequest,
+    ) -> AsyncIterator[Event]:
+        events = self._apply_budget_evaluation(
+            evaluation=request.evaluation,
+            session=request.session,
+            registered_agent=request.registered_agent,
+            registered_environment=request.registered_environment,
+            environment_name=request.environment_name,
+            messages=request.messages,
+            run_started_at=request.run_started_at,
+            turn_usage_tracker=request.turn_usage_tracker,
+            active_run=request.active_run,
+        )
         try:
-            identity = compactor._provider_budget_identity_for_request(compaction_request)
-        except NotImplementedError as exc:
-            raise RuntimeError(
-                "Automatic compaction with cost reservations requires the "
-                "ContextCompactor to declare provider_budget_identity(session), "
-                "returning provider/model or None for deterministic execution."
-            ) from exc
-        if identity is None:
-            return await execute()
-        if type(identity) is not tuple or len(identity) != 2:
-            raise TypeError(
-                "ContextCompactor.provider_budget_identity must return a "
-                "(provider_name, model) tuple or None."
-            )
-        require_clean_nonblank(identity[0], "compactor_provider_name")
-        require_clean_nonblank(identity[1], "compactor_model")
-        if not compactor._uses_runtime_provider_dispatch_runner_for_request(compaction_request):
-            raise RuntimeError(
-                "Automatic compaction with cost reservations cannot safely run "
-                f"opaque provider-backed compactor {type(compactor).__name__}: "
-                "Cayu cannot reserve each provider dispatch independently. Use an "
-                "unmodified built-in provider compactor or remove reservation-bearing "
-                "cost limits."
-            )
+            async for event in events:
+                yield event
+        finally:
+            await _close_async_iterator(events)
 
-        async def run_provider_dispatch(
-            actual_provider_name: str,
-            actual_model: str,
-            dispatch: Callable[[], Awaitable[tuple[str, dict[str, Any]]]],
-        ) -> tuple[str, dict[str, Any]]:
-            before_count = len(completed_payloads())
+    async def _apply_model_step_limit_evaluation(
+        self,
+        request: ModelStepLimitEvaluationRequest,
+    ) -> AsyncIterator[Event]:
+        events = self._apply_limit_evaluation(
+            evaluation=request.evaluation,
+            session=request.session,
+            registered_agent=request.registered_agent,
+            registered_environment=request.registered_environment,
+            environment_name=request.environment_name,
+            messages=request.messages,
+            run_started_at=request.run_started_at,
+            turn_usage_tracker=request.turn_usage_tracker,
+            active_run=request.active_run,
+        )
+        try:
+            async for event in events:
+                yield event
+        finally:
+            await _close_async_iterator(events)
 
-            def dispatch_completed_payloads() -> list[dict[str, Any]]:
-                return completed_payloads()[before_count:]
-
-            def dispatch_completed_events() -> list[Event]:
-                return [
-                    Event(
-                        type=EventType.MODEL_COMPLETED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        payload=payload,
-                    )
-                    for payload in dispatch_completed_payloads()
-                ]
-
-            outcome = await self._run_limit_controller.run_automatic_compaction_dispatch(
-                dispatch,
-                completed_events=dispatch_completed_events,
-                budget_limits=limits,
-                session=session,
-                agent_name=registered_agent.spec.name,
-                environment_name=environment_name,
-                provider_name=require_clean_nonblank(
-                    actual_provider_name,
-                    "compactor_provider_name",
-                ),
-                model=require_clean_nonblank(actual_model, "compactor_model"),
-                authoritative_failure_types=(ContextBuildError,),
-            )
-            budget_events.extend(outcome.events)
-            if isinstance(outcome, BudgetedOperationSucceeded):
-                return cast("tuple[str, dict[str, Any]]", outcome.result)
-            if isinstance(outcome, BudgetedOperationRejected):
-                raise _AutomaticCompactionBudgetReservationFailed(outcome.failure)
-            if outcome.cause is not None:
-                raise outcome.error from outcome.cause
-            raise outcome.error
-
-        with _automatic_compaction_dispatch_runner_scope(run_provider_dispatch):
-            return await execute()
+    async def _stop_for_model_step_budget_reservation_failure(
+        self,
+        request: ModelStepBudgetReservationFailureRequest,
+    ) -> AsyncIterator[Event]:
+        events = self._stop_session_for_budget_reservation_failed(
+            session=request.session,
+            registered_agent=request.registered_agent,
+            registered_environment=request.registered_environment,
+            environment_name=request.environment_name,
+            result=request.result,
+            messages=request.messages,
+            run_started_at=request.run_started_at,
+            turn_usage_tracker=request.turn_usage_tracker,
+            active_run=request.active_run,
+        )
+        try:
+            async for event in events:
+                yield event
+        finally:
+            await _close_async_iterator(events)
 
     async def _apply_tool_round_limit(
         self,
@@ -11709,24 +10065,6 @@ def _runtime_version() -> str | None:
         return None
 
 
-def _session_agent_spec(
-    *,
-    registered_agent: runtime_records.RegisteredAgentState,
-    session: Session,
-) -> AgentSpec:
-    return AgentSpec(
-        name=registered_agent.spec.name,
-        model=session.model,
-        provider_name=session.provider_name,
-        system_prompt=registered_agent.spec.system_prompt,
-        metadata=copy_json_value(registered_agent.spec.metadata, "metadata"),
-        provider_options=copy_json_value(
-            registered_agent.spec.provider_options,
-            "provider_options",
-        ),
-    )
-
-
 async def _load_registered_workspace_instructions(
     registered_environment: runtime_records.RegisteredEnvironment | None,
 ) -> WorkspaceInstructions | None:
@@ -11757,261 +10095,6 @@ def _render_initial_system_prompt(
     if not agent_prompt:
         return workspace_section
     return f"[Agent instructions]\n{agent_prompt}\n\n{workspace_section}"
-
-
-def _provider_context_pressure_profile(
-    registered_provider: runtime_records.RegisteredProvider,
-) -> ModelContextPressureProfile:
-    return copy_model_context_pressure_profile(
-        registered_provider.provider.context_pressure_profile
-    )
-
-
-def _context_pressure_overhead(
-    *,
-    profile: ModelContextPressureProfile,
-    registered_agent: runtime_records.RegisteredAgentState,
-    registered_environment: runtime_records.RegisteredEnvironment | None,
-    structured_output: StructuredOutputSpec | None,
-    thinking: ThinkingConfig | None,
-    step: int,
-) -> ContextPressureOverhead:
-    tools = [
-        {
-            "name": tool.name,
-            "description": tool.description,
-            "input_schema": deepcopy(tool.schema),
-        }
-        for tool in registered_agent.tools.values()
-    ]
-    structured_output_instruction: str | None = None
-    if (
-        structured_output is not None
-        and structured_output.strategy == StructuredOutputStrategy.TOOL
-    ):
-        tools.append(structured_output_tool_spec(structured_output))
-        structured_output_instruction = structured_output_tool_instruction(structured_output)
-
-    request_options: dict[str, Any] = {
-        **copy_json_value(
-            registered_agent.spec.provider_options,
-            "provider_options",
-        ),
-        "agent_metadata": deepcopy(registered_agent.spec.metadata),
-        "environment_metadata": (
-            deepcopy(registered_environment.spec.metadata)
-            if registered_environment is not None
-            else {}
-        ),
-        "step": step,
-        "structured_output": (
-            structured_output_spec_payload(structured_output)
-            if structured_output is not None
-            else None
-        ),
-    }
-    if thinking is not None:
-        request_options["thinking"] = thinking_config_payload(thinking)
-    return ContextPressureOverhead(
-        tools=tools,
-        structured_output_instruction=structured_output_instruction,
-        request_options=request_options,
-        image_min_tokens=profile.image_min_tokens,
-        document_min_tokens=profile.document_min_tokens,
-        document_bytes_per_token=profile.document_bytes_per_token,
-        tool_schema_chars_per_token=profile.tool_schema_chars_per_token,
-    )
-
-
-def _context_input_token_counter(
-    *,
-    app: CayuApp,
-    provider: ModelProvider,
-    session: Session,
-    registered_agent: runtime_records.RegisteredAgentState,
-    registered_environment: runtime_records.RegisteredEnvironment | None,
-    structured_output: StructuredOutputSpec | None,
-    thinking: ThinkingConfig | None,
-    step: int,
-) -> Callable[[list[Message]], Awaitable[int | None]]:
-    async def count_input_tokens(context_messages: list[Message]) -> int | None:
-        model_request = await app._build_model_request(
-            session=session,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            context_messages=copy_context_messages(context_messages),
-            structured_output=structured_output,
-            thinking=thinking,
-            step=step,
-        )
-        result = await provider.count_input_tokens(model_request)
-        if result is None:
-            return None
-        return result.input_tokens
-
-    return count_input_tokens
-
-
-def _cache_prefix_request_builder(
-    *,
-    app: CayuApp,
-    session: Session,
-    registered_agent: runtime_records.RegisteredAgentState,
-    registered_environment: runtime_records.RegisteredEnvironment | None,
-    structured_output: StructuredOutputSpec | None,
-    thinking: ThinkingConfig | None,
-    step: int,
-) -> Callable[[list[Message]], Awaitable[ModelRequest]]:
-    async def build_cache_prefix_request(context_messages: list[Message]) -> ModelRequest:
-        return await app._build_model_request(
-            session=session,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            context_messages=copy_context_messages(context_messages),
-            structured_output=structured_output,
-            thinking=thinking,
-            step=step,
-        )
-
-    return build_cache_prefix_request
-
-
-async def _build_context(
-    *,
-    context_policy: ContextPolicy,
-    session_store: SessionStore,
-    session: Session,
-    agent_spec: AgentSpec,
-    messages: list[Message],
-    step: int,
-    environment_name: str | None,
-    knowledge_store: Any,
-    request_metadata: dict[str, Any],
-    pressure_overhead: ContextPressureOverhead,
-    count_input_tokens: Callable[[list[Message]], Awaitable[int | None]] | None,
-    build_cache_prefix_request: Callable[[list[Message]], Awaitable[ModelRequest]] | None,
-    run_compaction: (
-        Callable[
-            [
-                ContextCompactor,
-                CompactionRequest,
-                Callable[[], Awaitable[CompactionResult]],
-                Callable[[], list[dict[str, Any]]],
-            ],
-            Awaitable[CompactionResult],
-        ]
-        | None
-    ) = None,
-    force_bounded_compaction: bool = False,
-) -> tuple[
-    list[Message],
-    dict[str, Any] | None,
-    dict[str, Any] | None,
-    list[ContextCompactionTelemetry],
-    list[ContextKnowledgeTelemetry],
-]:
-    context_usage = await _context_usage_state_for_session(
-        session_store=session_store,
-        session_id=session.id,
-    )
-    context_usage = estimate_context_pressure(
-        usage=context_usage,
-        messages=messages,
-        image_min_tokens=pressure_overhead.image_min_tokens,
-        document_min_tokens=pressure_overhead.document_min_tokens,
-        document_bytes_per_token=pressure_overhead.document_bytes_per_token,
-    )
-    request = ContextRequest(
-        session=session.model_copy(deep=True),
-        agent=agent_spec.model_copy(deep=True),
-        messages=[message.model_copy(deep=True) for message in messages],
-        step=step,
-        environment_name=environment_name,
-        knowledge_store=knowledge_store,
-        metadata=copy_json_value(request_metadata, "metadata"),
-        context_usage=context_usage,
-        pressure_overhead=pressure_overhead,
-        count_input_tokens=count_input_tokens,
-        build_cache_prefix_request=build_cache_prefix_request,
-        force_bounded_compaction=force_bounded_compaction,
-    )
-    if isinstance(context_policy, RuntimeManagedContextPolicy):
-        checkpoint = await session_store.load_checkpoint(session.id)
-        with _automatic_compaction_runner_scope(run_compaction):
-            result = await context_policy.build_with_checkpoint(
-                request,
-                checkpoint=checkpoint,
-            )
-        context_messages = copy_context_messages(result.messages)
-        return (
-            context_messages,
-            copy_json_value(result.checkpoint, "checkpoint"),
-            result.checkpoint_event_payload,
-            [telemetry.model_copy(deep=True) for telemetry in result.compaction_telemetry],
-            [telemetry.model_copy(deep=True) for telemetry in result.knowledge_telemetry],
-        )
-
-    result = await context_policy.build(request)
-    return copy_context_messages(result), None, None, [], []
-
-
-async def _context_usage_state_for_session(
-    *,
-    session_store: SessionStore,
-    session_id: str,
-) -> ContextUsageState:
-    records = await session_store.query_events(
-        EventQuery(
-            session_id=session_id,
-            event_type=EventType.MODEL_COMPLETED,
-            limit=1,
-            order_by=EventOrder.SEQUENCE_DESC,
-        )
-    )
-    if not records:
-        return ContextUsageState()
-    return _context_usage_state_from_model_completed_event(records[0].event)
-
-
-def _context_usage_state_from_model_completed_event(
-    event: Event,
-) -> ContextUsageState:
-    if event.type != EventType.MODEL_COMPLETED:
-        return ContextUsageState()
-    metrics = usage_metrics_from_event_payload(event.payload)
-    if metrics is None:
-        return ContextUsageState(
-            last_transcript_cursor=_transcript_cursor_from_model_completed_event(event)
-        )
-    return ContextUsageState(
-        last_input_tokens=metrics.input_tokens,
-        last_output_tokens=metrics.output_tokens,
-        last_total_tokens=metrics.total_tokens,
-        last_transcript_cursor=_transcript_cursor_from_model_completed_event(event),
-        last_context_overhead_input_tokens=(
-            _context_overhead_input_tokens_from_model_completed_event(event)
-        ),
-        last_provider_name=metrics.provider_name,
-        last_requested_model=metrics.requested_model,
-        last_model=metrics.model,
-    )
-
-
-def _transcript_cursor_from_model_completed_event(event: Event) -> int | None:
-    cursor = event.payload.get("transcript_cursor")
-    if type(cursor) is not int or cursor < 0:
-        return None
-    return cursor
-
-
-def _context_overhead_input_tokens_from_model_completed_event(event: Event) -> int | None:
-    pressure = event.payload.get("context_pressure")
-    if type(pressure) is not dict:
-        return None
-    tokens = pressure.get("estimated_request_overhead_input_tokens")
-    if type(tokens) is not int or tokens < 0:
-        return None
-    return tokens
 
 
 def _with_environment_name(request: RunRequest, environment_name: str) -> RunRequest:
@@ -12153,121 +10236,6 @@ def _binding_outcome_for_terminal_event(event_type: EventType | str) -> str:
     if event_type == EventType.SESSION_INTERRUPTED:
         return "interrupted"
     return str(event_type)
-
-
-def _context_compaction_telemetry_event(
-    *,
-    telemetry: ContextCompactionTelemetry,
-    session: Session,
-    registered_agent: runtime_records.RegisteredAgentState,
-    environment_name: str | None,
-) -> Event:
-    if type(telemetry) is not ContextCompactionTelemetry:
-        raise TypeError(
-            "Context compaction telemetry must be ContextCompactionTelemetry instances."
-        )
-    return Event(
-        type=telemetry.event_type,
-        session_id=session.id,
-        agent_name=registered_agent.spec.name,
-        environment_name=environment_name,
-        payload=copy_json_value(telemetry.payload, "payload"),
-    )
-
-
-def _context_knowledge_telemetry_event(
-    *,
-    telemetry: ContextKnowledgeTelemetry,
-    session: Session,
-    registered_agent: runtime_records.RegisteredAgentState,
-    environment_name: str | None,
-) -> Event:
-    if type(telemetry) is not ContextKnowledgeTelemetry:
-        raise TypeError("Context knowledge telemetry must be ContextKnowledgeTelemetry instances.")
-    return Event(
-        type=telemetry.event_type,
-        session_id=session.id,
-        agent_name=registered_agent.spec.name,
-        environment_name=environment_name,
-        payload=copy_json_value(telemetry.payload, "payload"),
-    )
-
-
-def _model_retry_event(
-    *,
-    session: Session,
-    registered_agent: runtime_records.RegisteredAgentState,
-    environment_name: str | None,
-    registered_provider: runtime_records.RegisteredProvider,
-    step: int,
-    decision: RetryDecision,
-    error: str,
-) -> Event:
-    return Event(
-        type=EventType.MODEL_RETRY,
-        session_id=session.id,
-        agent_name=registered_agent.spec.name,
-        environment_name=environment_name,
-        payload=retry_event_payload(
-            decision=decision,
-            provider_name=registered_provider.name,
-            model=session.model,
-            step=step,
-            error=error,
-        ),
-    )
-
-
-def _model_attempt_discarded_event(
-    *,
-    session: Session,
-    registered_agent: runtime_records.RegisteredAgentState,
-    environment_name: str | None,
-    registered_provider: runtime_records.RegisteredProvider,
-    step: int,
-    decision: RetryDecision,
-) -> Event:
-    return Event(
-        type=EventType.MODEL_ATTEMPT_DISCARDED,
-        session_id=session.id,
-        agent_name=registered_agent.spec.name,
-        environment_name=environment_name,
-        payload={
-            "provider": registered_provider.name,
-            "model": session.model,
-            "step": step,
-            "attempt": decision.attempt,
-            "next_attempt": decision.next_attempt,
-            "max_attempts": decision.max_attempts,
-            "reason": None if decision.reason is None else decision.reason.value,
-            "status_code": decision.status_code,
-        },
-    )
-
-
-def _typed_retry_fields(
-    exc: _ModelAttemptFailed,
-) -> tuple[int | None, bool | None, float | None]:
-    """Extract typed retry-classification fields from a failed model attempt.
-
-    Prefers the structured `ModelProviderError` cause; falls back to the typed
-    keys a provider surfaced on the error-event payload (`error_payload_fields`)
-    so classification survives whether the failure was raised or flattened into
-    a `ModelStreamEvent.error`.
-    """
-
-    cause = exc.cause
-    if isinstance(cause, ModelProviderError):
-        return cause.status_code, cause.retryable, cause.retry_after_s
-    payload = exc.payload
-    status_code = payload.get("status_code")
-    retryable = payload.get("retryable")
-    retry_after_s = payload.get("retry_after_s")
-    return (
-        status_code if type(status_code) is int else None,
-        retryable if type(retryable) is bool else None,
-        float(retry_after_s) if type(retry_after_s) in {int, float} else None,
-    )
 
 
 async def _call_runtime_hook(
@@ -12822,428 +10790,12 @@ def _artifact_store(registered_environment: runtime_records.RegisteredEnvironmen
     return registered_environment.environment.artifact_store
 
 
-class _FileAttachmentUnavailable(RuntimeError):
-    """A file attachment reference cannot be resolved to bytes (missing / wrong scope / drifted)."""
-
-
-async def _resolved_file_attachments(
-    *,
-    messages: list[Message],
-    session: Session,
-    registered_environment: runtime_records.RegisteredEnvironment | None,
-    max_file_attachment_bytes: int,
-    max_total_file_attachment_bytes: int,
-    max_file_attachments_per_request: int,
-) -> tuple[dict[str, dict[str, Any]], set[str]]:
-    # Returns (resolved, unresolvable_prompt_ids). A prompt file part whose reference is missing,
-    # malformed, or no longer accessible in this scope fails open: it is reported back so the
-    # caller can project it to a text note instead of failing the run forever. Store outages and
-    # invalid store results fail closed so the model cannot answer without a required file.
-    # Tool-result attachments also stay fail-closed, and an id referenced by BOTH a prompt file and
-    # a tool result stays fail-closed (the tool-result path would otherwise brick on a missing
-    # resolved entry).
-    attachment_refs, prompt_file_artifact_ids, tool_result_artifact_ids = _file_attachment_refs(
-        messages
-    )
-    if not attachment_refs:
-        return {}, set()
-    if len(attachment_refs) > max_file_attachments_per_request:
-        raise RuntimeError(
-            "File attachment count exceeds the runtime attachment limit: "
-            f"{len(attachment_refs)} > {max_file_attachments_per_request}"
-        )
-    artifact_store = _artifact_store(registered_environment)
-    if artifact_store is None:
-        raise RuntimeError("File attachments require an artifact store.")
-
-    environment_name = _environment_name(registered_environment)
-    resolved: dict[str, dict[str, Any]] = {}
-    unresolvable_prompt_ids: set[str] = set()
-    total_attachment_bytes = 0
-    for attachment in attachment_refs:
-        if attachment.size_bytes > max_file_attachment_bytes:
-            raise RuntimeError(
-                "File attachment exceeds the runtime attachment byte limit: "
-                f"{attachment.artifact_id}"
-            )
-        total_attachment_bytes += attachment.size_bytes
-        if total_attachment_bytes > max_total_file_attachment_bytes:
-            raise RuntimeError("File attachments exceed the runtime total attachment byte limit.")
-        if attachment.artifact_id in resolved or attachment.artifact_id in unresolvable_prompt_ids:
-            continue
-        try:
-            result = copy_artifact_read_result(
-                await artifact_store.read_bytes(
-                    attachment.artifact_id,
-                    max_bytes=attachment.size_bytes,
-                ),
-                expected_artifact_id=attachment.artifact_id,
-                max_content_bytes=attachment.size_bytes,
-            )
-            artifact = result.metadata
-            if artifact.scope.value == "session" and artifact.session_id != session.id:
-                raise _FileAttachmentUnavailable(
-                    "File attachment is not available in this session."
-                )
-            if (
-                artifact.scope.value == "environment"
-                and artifact.environment_name != environment_name
-            ):
-                raise _FileAttachmentUnavailable(
-                    "File attachment is not available in this environment."
-                )
-            if artifact.content_type != attachment.content_type:
-                raise _FileAttachmentUnavailable(
-                    "File attachment content type changed before provider request."
-                )
-            if artifact.size_bytes != attachment.size_bytes:
-                raise _FileAttachmentUnavailable(
-                    "File attachment size changed before provider request."
-                )
-        except (FileNotFoundError, InvalidArtifactIdError, _FileAttachmentUnavailable):
-            # Fail open only for files that are EXCLUSIVELY prompt attachments. A tool-result
-            # reference (including an id shared with a prompt file) stays fail-closed, because the
-            # provider builder raises on a tool-result part whose artifact is not resolved.
-            is_exclusively_prompt = (
-                attachment.artifact_id in prompt_file_artifact_ids
-                and attachment.artifact_id not in tool_result_artifact_ids
-            )
-            if not is_exclusively_prompt:
-                raise
-            unresolvable_prompt_ids.add(attachment.artifact_id)
-            continue
-        resolved[attachment.artifact_id] = resolved_file_attachment(attachment, result)
-    return resolved, unresolvable_prompt_ids
-
-
-def _file_attachment_refs(
-    messages: list[Message],
-) -> tuple[tuple[FileAttachment, ...], set[str], set[str]]:
-    # Single pass over the messages, returning (ordered refs, prompt-file artifact ids, tool-result
-    # artifact ids). The two id sets carry provenance so resolution can fail open only for files that
-    # are exclusively prompt attachments.
-    refs: dict[str, FileAttachment] = {}
-    ordered_refs: list[FileAttachment] = []
-    prompt_artifact_ids: set[str] = set()
-    tool_result_artifact_ids: set[str] = set()
-    for message in messages:
-        for part in message.content:
-            if type(part) is ToolResultPart:
-                payloads: list[dict[str, Any]] = part.artifacts
-                origin_ids = tool_result_artifact_ids
-            elif type(part) is FilePart:
-                payloads = [part.attachment]
-                origin_ids = prompt_artifact_ids
-            else:
-                continue
-            for payload in payloads:
-                attachment = file_attachment_from_payload(payload)
-                if attachment is None:
-                    continue
-                origin_ids.add(attachment.artifact_id)
-                existing = refs.get(attachment.artifact_id)
-                if existing is not None and not _same_file_attachment_ref(existing, attachment):
-                    raise RuntimeError(
-                        "Conflicting file attachment references for artifact: "
-                        f"{attachment.artifact_id}"
-                    )
-                refs[attachment.artifact_id] = attachment
-                ordered_refs.append(attachment)
-    return tuple(ordered_refs), prompt_artifact_ids, tool_result_artifact_ids
-
-
-def _same_file_attachment_ref(left: FileAttachment, right: FileAttachment) -> bool:
-    return left.model_dump(mode="json") == right.model_dump(mode="json")
-
-
 def _knowledge_store(
     registered_environment: runtime_records.RegisteredEnvironment | None,
 ) -> Any:
     if registered_environment is None:
         return None
     return registered_environment.environment.knowledge_store
-
-
-def _validate_stream_event(value: object) -> ModelStreamEvent:
-    if type(value) is not ModelStreamEvent:
-        raise TypeError("Model providers must yield ModelStreamEvent instances.")
-    return copy_model_stream_event(value)
-
-
-def _copy_model_request_for_counting(request: ModelRequest) -> ModelRequest:
-    if type(request) is not ModelRequest:
-        raise TypeError("request must be a ModelRequest.")
-    return ModelRequest(
-        model=request.model,
-        messages=request.messages,
-        tools=request.tools,
-        options=request.options,
-    )
-
-
-def _context_count_base_payload(
-    *,
-    model_request: ModelRequest,
-    provider_name: str,
-    step: int,
-    attempt: int,
-    max_attempts: int,
-    observation_id: str,
-) -> dict[str, Any]:
-    roles: list[str] = []
-    for message in model_request.messages:
-        role = message.role
-        roles.append(role.value if isinstance(role, MessageRole) else str(role))
-    return {
-        "model": model_request.model,
-        "provider": provider_name,
-        "step": step,
-        "attempt": attempt,
-        "max_attempts": max_attempts,
-        "observation_id": observation_id,
-        "messages": {
-            "count": len(model_request.messages),
-            "roles": roles,
-        },
-        "tools": {
-            "count": len(model_request.tools),
-        },
-        "options": {
-            "keys": sorted(model_request.options.keys()),
-        },
-    }
-
-
-def _context_count_reconciled_event(
-    model_completed_event: Event,
-    *,
-    observation: _ContextCountObservation,
-    session: Session,
-    registered_agent: runtime_records.RegisteredAgentState,
-    registered_provider: runtime_records.RegisteredProvider,
-    environment_name: str | None,
-    step: int,
-    attempt: int,
-    max_attempts: int,
-) -> Event:
-    if model_completed_event.type != EventType.MODEL_COMPLETED:
-        raise ValueError("Context count reconciliation requires a model.completed event.")
-    actual_input_tokens = _actual_input_tokens_from_completed_event(model_completed_event)
-    estimated_input_tokens = observation.result.input_tokens
-    delta_tokens: int | None = None
-    relative_error: float | None = None
-    if actual_input_tokens is not None and estimated_input_tokens is not None:
-        delta_tokens = actual_input_tokens - estimated_input_tokens
-        if actual_input_tokens > 0:
-            relative_error = delta_tokens / actual_input_tokens
-    return Event(
-        type=EventType.CONTEXT_COUNT_RECONCILED,
-        session_id=session.id,
-        agent_name=registered_agent.spec.name,
-        environment_name=environment_name,
-        payload={
-            "model": session.model,
-            "provider": registered_provider.name,
-            "step": step,
-            "attempt": attempt,
-            "max_attempts": max_attempts,
-            "observation_id": observation.observation_id,
-            "pre_call_count": observation.result.model_dump(mode="json"),
-            "actual_input_tokens": actual_input_tokens,
-            "delta_tokens": delta_tokens,
-            "relative_error": relative_error,
-            "reconciled": actual_input_tokens is not None and estimated_input_tokens is not None,
-        },
-    )
-
-
-def _context_pressure_reconciled_event(
-    model_completed_event: Event,
-    *,
-    observation: _ContextPressureObservation,
-    session: Session,
-    registered_agent: runtime_records.RegisteredAgentState,
-    registered_provider: runtime_records.RegisteredProvider,
-    environment_name: str | None,
-    step: int,
-    attempt: int,
-    max_attempts: int,
-) -> Event:
-    if model_completed_event.type != EventType.MODEL_COMPLETED:
-        raise ValueError("Context pressure reconciliation requires a model.completed event.")
-    actual_input_tokens = _actual_input_tokens_from_completed_event(model_completed_event)
-    estimated_input_tokens = observation.estimate.estimated_context_input_tokens
-    delta_tokens: int | None = None
-    relative_error: float | None = None
-    if actual_input_tokens is not None:
-        delta_tokens = actual_input_tokens - estimated_input_tokens
-        if actual_input_tokens > 0:
-            relative_error = delta_tokens / actual_input_tokens
-    return Event(
-        type=EventType.CONTEXT_PRESSURE_RECONCILED,
-        session_id=session.id,
-        agent_name=registered_agent.spec.name,
-        environment_name=environment_name,
-        payload={
-            "model": session.model,
-            "provider": registered_provider.name,
-            "step": step,
-            "attempt": attempt,
-            "max_attempts": max_attempts,
-            "observation_id": observation.observation_id,
-            "pre_call_estimate": observation.estimate.model_dump(mode="json"),
-            "actual_input_tokens": actual_input_tokens,
-            "delta_tokens": delta_tokens,
-            "relative_error": relative_error,
-            "reconciled": actual_input_tokens is not None,
-        },
-    )
-
-
-def _actual_input_tokens_from_completed_event(event: Event) -> int | None:
-    usage_metrics = event.payload.get("usage_metrics")
-    if type(usage_metrics) is not dict:
-        return None
-    input_tokens = usage_metrics.get("input_tokens")
-    if type(input_tokens) is not int or input_tokens < 0:
-        return None
-    return input_tokens
-
-
-def _model_stream_event_to_runtime_event(
-    stream_event: ModelStreamEvent,
-    *,
-    session: Session,
-    registered_agent: runtime_records.RegisteredAgentState,
-    environment_name: str | None,
-    provider_name: str | None,
-    step: int,
-    attempt: int,
-    max_attempts: int,
-    classification: dict[str, str] | None = None,
-    context_pressure_estimate: ContextPressureEstimate | None = None,
-    transcript_cursor_after_completion: int | None = None,
-    usage_dialect: str | None = None,
-) -> Event:
-    if type(stream_event) is not ModelStreamEvent:
-        raise TypeError("Model stream events must be ModelStreamEvent instances.")
-    if stream_event.type == ModelStreamEventType.TEXT_DELTA:
-        return Event(
-            type=EventType.MODEL_TEXT_DELTA,
-            session_id=session.id,
-            agent_name=registered_agent.spec.name,
-            environment_name=environment_name,
-            payload=_retry_attempt_payload(
-                {"delta": stream_event.delta},
-                step=step,
-                attempt=attempt,
-                max_attempts=max_attempts,
-            ),
-        )
-    if stream_event.type == ModelStreamEventType.THINKING:
-        # The live event surfaces only the readable reasoning text; the opaque
-        # round-trip signature stays in the transcript ThinkingPart, not the stream.
-        return Event(
-            type=EventType.MODEL_THINKING_DELTA,
-            session_id=session.id,
-            agent_name=registered_agent.spec.name,
-            environment_name=environment_name,
-            payload=_retry_attempt_payload(
-                {"delta": stream_event.delta},
-                step=step,
-                attempt=attempt,
-                max_attempts=max_attempts,
-            ),
-        )
-    if stream_event.type == ModelStreamEventType.COMPLETED:
-        payload = transcript_helpers.model_completed_event_payload(stream_event.payload)
-        resolved_model = _payload_model(payload, fallback=session.model)
-        payload["requested_model"] = session.model
-        completion = _stream_event_completion(stream_event)
-        payload["completion"] = {
-            "finish_reason": completion.finish_reason.value,
-            "raw_finish_reason": completion.raw_finish_reason,
-            "status": completion.status,
-        }
-        if classification is not None:
-            payload["step_classification"] = classification
-        usage_metrics = usage_metrics_payload(
-            normalize_usage_metrics(
-                provider_name=provider_name,
-                model=resolved_model,
-                requested_model=session.model,
-                raw_usage=payload.get("usage"),
-                usage_dialect=usage_dialect,
-            )
-        )
-        if usage_metrics is not None:
-            payload["usage_metrics"] = usage_metrics
-        if context_pressure_estimate is not None:
-            payload["context_pressure"] = _context_pressure_completed_payload(
-                context_pressure_estimate
-            )
-        if transcript_cursor_after_completion is not None:
-            payload["transcript_cursor"] = transcript_cursor_after_completion
-        payload = _retry_attempt_payload(
-            payload,
-            step=step,
-            attempt=attempt,
-            max_attempts=max_attempts,
-        )
-        return Event(
-            type=EventType.MODEL_COMPLETED,
-            session_id=session.id,
-            agent_name=registered_agent.spec.name,
-            environment_name=environment_name,
-            payload=payload,
-        )
-    if stream_event.type == ModelStreamEventType.ERROR:
-        return Event(
-            type=EventType.MODEL_ERROR,
-            session_id=session.id,
-            agent_name=registered_agent.spec.name,
-            environment_name=environment_name,
-            payload=_retry_attempt_payload(
-                copy_json_value(stream_event.payload, "payload"),
-                step=step,
-                attempt=attempt,
-                max_attempts=max_attempts,
-            ),
-        )
-    raise ValueError(f"Unsupported model stream event type: {stream_event.type}")
-
-
-def _context_pressure_completed_payload(
-    estimate: ContextPressureEstimate,
-) -> dict[str, int]:
-    return {
-        "estimated_tool_schema_input_tokens": estimate.estimated_tool_schema_input_tokens,
-        "estimated_structured_output_input_tokens": (
-            estimate.estimated_structured_output_input_tokens
-        ),
-        "estimated_request_options_input_tokens": (estimate.estimated_request_options_input_tokens),
-        "estimated_request_overhead_input_tokens": (
-            estimate.estimated_request_overhead_input_tokens
-        ),
-    }
-
-
-def _with_structured_output_tool_instruction(
-    messages: list[Message],
-    spec: StructuredOutputSpec,
-) -> list[Message]:
-    copied_messages = copy_context_messages(messages)
-    instruction = Message.text(
-        MessageRole.SYSTEM,
-        structured_output_tool_instruction(spec),
-    )
-    insert_at = 0
-    while (
-        insert_at < len(copied_messages) and copied_messages[insert_at].role == MessageRole.SYSTEM
-    ):
-        insert_at += 1
-    copied_messages.insert(insert_at, instruction)
-    return copied_messages
 
 
 def _has_structured_output_tool_call(
@@ -13406,90 +10958,6 @@ def _structured_output_validating_event(
             "max_retries": spec.max_retries,
         },
     )
-
-
-def _stream_event_completion(stream_event: ModelStreamEvent) -> ModelCompletion:
-    if type(stream_event) is not ModelStreamEvent:
-        raise TypeError("Model stream events must be ModelStreamEvent instances.")
-    if stream_event.type != ModelStreamEventType.COMPLETED:
-        raise ValueError("Only completed model stream events have completion metadata.")
-    if stream_event.completion is not None:
-        return stream_event.completion
-    return normalize_model_completion(stream_event.payload)
-
-
-def _assistant_step_result(
-    *,
-    session_id: str,
-    step: int,
-    assistant_message: Message | None,
-    tool_calls: list[runtime_records.ToolCallRequest],
-    completion: ModelCompletion,
-) -> AssistantStepResult:
-    text_content = assistant_text_content(assistant_message)
-    return AssistantStepResult(
-        session_id=session_id,
-        step=step,
-        assistant_message=assistant_message,
-        tool_calls=list(tool_calls),
-        completion=completion,
-        text_content=text_content,
-        has_user_visible_content=bool(text_content.strip()),
-        provider_state_count=provider_state_count(assistant_message),
-        thinking_count=thinking_count(assistant_message),
-    )
-
-
-def _context_overflow_event_payload(
-    error: ModelContextOverflowError,
-    *,
-    step: int,
-    phase: str,
-    original_message_count: int,
-    recovery_message_count: int | None = None,
-) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "step": step,
-        "phase": require_clean_nonblank(phase, "phase"),
-        "error": str(error),
-        "error_type": type(error).__name__,
-        "provider": error.provider,
-        "original_message_count": original_message_count,
-    }
-    if error.status_code is not None:
-        payload["status_code"] = error.status_code
-    if error.error_type is not None:
-        payload["provider_error_type"] = error.error_type
-    if error.error_code is not None:
-        payload["provider_error_code"] = error.error_code
-    if error.request_id is not None:
-        payload["request_id"] = error.request_id
-    if recovery_message_count is not None:
-        payload["recovery_message_count"] = recovery_message_count
-    return payload
-
-
-def _retry_attempt_payload(
-    payload: dict[str, Any],
-    *,
-    step: int,
-    attempt: int,
-    max_attempts: int,
-) -> dict[str, Any]:
-    if max_attempts <= 1:
-        return payload
-    enriched = dict(payload)
-    enriched["step"] = step
-    enriched["attempt"] = attempt
-    enriched["max_attempts"] = max_attempts
-    return enriched
-
-
-def _payload_model(payload: dict[str, Any], *, fallback: str) -> str:
-    model = payload.get("model")
-    if type(model) is str and model.strip():
-        return model
-    return fallback
 
 
 def _validate_dispatch_handle_for_request(

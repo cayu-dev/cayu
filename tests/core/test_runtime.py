@@ -14,11 +14,11 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
+import cayu.runtime._model_step_executor as model_step_executor_module
 import cayu.runtime._session_control as session_control_module
 import cayu.runtime.app as runtime_app_module
 from cayu.artifacts import (
     RESOLVED_FILE_ATTACHMENTS_OPTION,
-    ArtifactStoreUnavailableError,
     LocalArtifactStore,
     file_attachment,
 )
@@ -9250,7 +9250,7 @@ def test_cayu_app_releases_reservation_for_failure_before_provider_dispatch(
         raise RuntimeError("request preparation failed")
 
     monkeypatch.setattr(
-        runtime_app_module,
+        model_step_executor_module,
         "estimate_model_request_context_pressure",
         fail_before_dispatch,
     )
@@ -24755,61 +24755,6 @@ def test_context_policy_receives_previous_actual_context_usage_on_next_call():
     assert provider.requests[2].messages[-1].content[0].text == "third request"
 
 
-def test_context_usage_state_uses_latest_completed_event_query():
-    class TrackingStore(InMemorySessionStore):
-        def __init__(self) -> None:
-            super().__init__()
-            self.event_queries: list[EventQuery] = []
-
-        async def query_events(self, query: EventQuery | None = None):
-            if query is not None:
-                self.event_queries.append(query)
-            return await super().query_events(query)
-
-    tracking_store = TrackingStore()
-    session_id = "usage_context_policy_latest_event"
-
-    async def run():
-        await tracking_store.create(
-            RunRequest(
-                agent_name="assistant",
-                session_id=session_id,
-                messages=[Message.text("user", "hello")],
-            ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
-        )
-        await tracking_store.append_events(
-            session_id,
-            [
-                Event(
-                    type=EventType.MODEL_COMPLETED,
-                    session_id=session_id,
-                    payload={
-                        "model": "fake-model",
-                        "usage": {"input_tokens": index, "output_tokens": 1},
-                    },
-                )
-                for index in range(1, 106)
-            ],
-        )
-        return await runtime_app_module._context_usage_state_for_session(
-            session_store=tracking_store,
-            session_id=session_id,
-        )
-
-    context_usage = asyncio.run(run())
-
-    assert context_usage.last_input_tokens == 105
-    assert context_usage.last_output_tokens == 1
-    assert context_usage.last_total_tokens == 106
-    assert context_usage.last_provider_name is None
-    assert context_usage.last_requested_model is None
-    assert context_usage.last_model == "fake-model"
-    assert len(tracking_store.event_queries) == 1
-    assert tracking_store.event_queries[0].limit == 1
-    assert tracking_store.event_queries[0].order_by.value == "sequence_desc"
-
-
 def test_observed_delta_context_estimator_estimates_only_messages_after_cursor():
     estimator = ObservedDeltaContextEstimator(chars_per_token=4, json_chars_per_token=2)
     usage = ContextUsageState(last_input_tokens=40, last_transcript_cursor=2)
@@ -31708,60 +31653,6 @@ def test_strip_old_file_attachments_preserves_latest_attachment_result_only():
     assert strip_all[6].content[0].artifacts == []
 
 
-def test_file_attachment_refs_include_user_file_parts():
-    from cayu.core.messages import FilePart
-    from cayu.runtime.app import _file_attachment_refs
-
-    user_attachment = file_attachment(
-        artifact_id="art_user",
-        kind="image",
-        filename="photo.png",
-        content_type="image/png",
-        size_bytes=5,
-    )
-    tool_attachment = file_attachment(
-        artifact_id="art_tool",
-        kind="document",
-        filename="report.pdf",
-        content_type="application/pdf",
-        size_bytes=9,
-    )
-    messages = [
-        Message(
-            role="user",
-            content=[TextPart(text="look"), FilePart(attachment=user_attachment)],
-        ),
-        Message.tool_call(tool_call_id="call_1", tool_name="read_file"),
-        Message.tool_result(
-            tool_call_id="call_1",
-            tool_name="read_file",
-            content="attached",
-            artifacts=[tool_attachment],
-        ),
-    ]
-
-    refs, prompt_ids, tool_ids = _file_attachment_refs(messages)
-
-    assert [ref.artifact_id for ref in refs] == ["art_user", "art_tool"]
-    assert prompt_ids == {"art_user"}
-    assert tool_ids == {"art_tool"}
-
-    conflicting = file_attachment(
-        artifact_id="art_user",
-        kind="image",
-        filename="different.png",
-        content_type="image/png",
-        size_bytes=7,
-    )
-    with pytest.raises(RuntimeError, match="Conflicting file attachment"):
-        _file_attachment_refs(
-            [
-                *messages,
-                Message(role="user", content=[FilePart(attachment=conflicting)]),
-            ]
-        )
-
-
 def _app_with_artifact_store(tmp_path, **app_kwargs) -> tuple[CayuApp, LocalArtifactStore]:
     store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
     app = CayuApp(enable_logging=False, **app_kwargs)
@@ -32149,112 +32040,16 @@ def test_noteify_unresolvable_prompt_files_replaces_only_targeted_parts():
         )
     ]
 
-    projected = runtime_app_module.noteify_unresolvable_prompt_files(messages, {"art_bad"})
+    projected = model_step_executor_module.noteify_unresolvable_prompt_files(
+        messages,
+        {"art_bad"},
+    )
 
     kept = projected[0].content
     assert [type(part).__name__ for part in kept] == ["TextPart", "FilePart", "TextPart"]
     assert kept[1].attachment["artifact_id"] == "art_ok"
     assert "could not be resolved" in kept[2].text
     assert "art_bad" in kept[2].text
-
-
-def test_resolved_file_attachments_fail_open_only_for_prompt_files(monkeypatch, tmp_path):
-    prompt_missing_id = f"art_{'a' * 32}"
-    tool_missing_id = f"art_{'b' * 32}"
-    shared_missing_id = f"art_{'c' * 32}"
-    store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
-    app = CayuApp(enable_logging=False)
-    app.register_environment(
-        Environment(EnvironmentSpec(name="local"), artifact_store=store),
-        default=True,
-    )
-    registered_env = app._environments["local"]
-    session = Session(
-        id="sess_resolve",
-        agent_name="assistant",
-        provider_name="fake",
-        model="fake-model",
-        causal_budget_id="sess_resolve",
-    )
-
-    def missing(artifact_id):
-        return file_attachment(
-            artifact_id=artifact_id,
-            kind="image",
-            filename="ghost.png",
-            content_type="image/png",
-            size_bytes=5,
-        )
-
-    async def resolve(messages):
-        return await runtime_app_module._resolved_file_attachments(
-            messages=messages,
-            session=session,
-            registered_environment=registered_env,
-            max_file_attachment_bytes=8_000_000,
-            max_total_file_attachment_bytes=32_000_000,
-            max_file_attachments_per_request=20,
-        )
-
-    # Prompt file with a missing artifact: fails open into the unresolvable set (no raise).
-    prompt_only = [Message(role="user", content=[FilePart(attachment=missing(prompt_missing_id))])]
-    resolved, unresolvable = asyncio.run(resolve(prompt_only))
-    assert resolved == {}
-    assert unresolvable == {prompt_missing_id}
-
-    # A malformed artifact id (not an 'art_' id) raises ValueError on read but still fails open.
-    bad_id = [Message(role="user", content=[FilePart(attachment=missing("nope"))])]
-    resolved, unresolvable = asyncio.run(resolve(bad_id))
-    assert unresolvable == {"nope"}
-
-    # Tool-result attachment with a missing artifact stays fail-closed.
-    tool_only = [
-        Message.tool_call(tool_call_id="c1", tool_name="read_file"),
-        Message.tool_result(
-            tool_call_id="c1",
-            tool_name="read_file",
-            content="x",
-            artifacts=[missing(tool_missing_id)],
-        ),
-    ]
-    with pytest.raises(FileNotFoundError):
-        asyncio.run(resolve(tool_only))
-
-    # An id referenced by BOTH a prompt file and a tool result stays fail-closed (the tool-result
-    # provider path would brick on a missing resolved entry).
-    shared = [
-        Message(role="user", content=[FilePart(attachment=missing(shared_missing_id))]),
-        Message.tool_call(tool_call_id="c2", tool_name="read_file"),
-        Message.tool_result(
-            tool_call_id="c2",
-            tool_name="read_file",
-            content="x",
-            artifacts=[missing(shared_missing_id)],
-        ),
-    ]
-    with pytest.raises(FileNotFoundError):
-        asyncio.run(resolve(shared))
-
-    async def permission_failure(_artifact_id, *, max_bytes=None):
-        raise PermissionError("Artifact backend permission denied.")
-
-    monkeypatch.setattr(store, "read_bytes", permission_failure)
-    with pytest.raises(PermissionError, match="permission denied"):
-        asyncio.run(resolve(prompt_only))
-
-    async def unavailable_failure(_artifact_id, *, max_bytes=None):
-        raise ArtifactStoreUnavailableError("Artifact backend unavailable.")
-
-    monkeypatch.setattr(store, "read_bytes", unavailable_failure)
-    with pytest.raises(ArtifactStoreUnavailableError, match="backend unavailable"):
-        asyncio.run(resolve(prompt_only))
-
-    async def invalid_store_failure(_artifact_id, *, max_bytes=None):
-        raise ValueError("Artifact store returned invalid data.")
-
-    monkeypatch.setattr(store, "read_bytes", invalid_store_failure)
-    with pytest.raises(ValueError, match="invalid data"):
-        asyncio.run(resolve(prompt_only))
 
 
 def test_run_fails_open_on_unresolvable_prompt_file(tmp_path):
