@@ -15,6 +15,12 @@ export default defineConfig({
     },
   },
   build: {
+    // Emit the licenses for modules that actually survive bundling. The
+    // post-build finalizer adds CSS and registry-generated source that Vite's
+    // JavaScript module graph cannot discover.
+    license: {
+      fileName: "THIRD_PARTY_LICENSES.md",
+    },
     rolldownOptions: {
       output: {
         chunkFileNames: (chunk) => {

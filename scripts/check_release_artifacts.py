@@ -18,6 +18,7 @@ _SDIST_REQUIRED = {
     "src/cayu/data/__init__.py",
     "src/cayu/data/default_model_catalog.json",
     "src/cayu/data/default_price_book.json",
+    "src/cayu/server/dashboard/THIRD_PARTY_LICENSES.md",
 }
 _SDIST_ALLOWED_ROOTS = {
     ".gitignore",
@@ -40,7 +41,17 @@ _WHEEL_REQUIRED = {
     "cayu/guides/authoring.md",
     "cayu/guides/diagnostics.md",
     "cayu/guides/tool-effects.md",
+    "cayu/server/dashboard/THIRD_PARTY_LICENSES.md",
     "cayu/server/dashboard/index.html",
+}
+_THIRD_PARTY_LICENSE_MARKERS = {
+    "## @base-ui/react -",
+    "## class-variance-authority -",
+    "## lucide-react -",
+    "## react -",
+    "## shadcn/ui registry source (MIT)",
+    "## tailwindcss -",
+    "## tw-animate-css -",
 }
 _FORBIDDEN_PARTS = {".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".venv", "dist"}
 
@@ -58,6 +69,17 @@ def _validate_safe_path(name: str, *, archive: Path) -> PurePosixPath:
     if "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"}:
         _fail(f"{archive}: generated Python cache included: {name}")
     return path
+
+
+def _validate_third_party_licenses(contents: bytes, *, archive: Path) -> None:
+    try:
+        notice = contents.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{archive}: third-party license inventory is not UTF-8") from exc
+
+    missing = sorted(marker for marker in _THIRD_PARTY_LICENSE_MARKERS if marker not in notice)
+    if missing:
+        _fail(f"{archive}: third-party license inventory is incomplete: {', '.join(missing)}")
 
 
 def validate_sdist(archive: Path) -> None:
@@ -87,6 +109,14 @@ def validate_sdist(archive: Path) -> None:
     if missing:
         _fail(f"{archive}: missing required source files: {', '.join(missing)}")
 
+    notice_name = f"{root}/src/cayu/server/dashboard/THIRD_PARTY_LICENSES.md"
+    with tarfile.open(archive, "r:gz") as source:
+        extracted = source.extractfile(notice_name)
+        if extracted is None:
+            raise ValueError(f"{archive}: could not read third-party license inventory")
+        notice_contents = extracted.read()
+    _validate_third_party_licenses(notice_contents, archive=archive)
+
 
 def validate_wheel(archive: Path) -> None:
     with zipfile.ZipFile(archive) as wheel:
@@ -99,6 +129,9 @@ def validate_wheel(archive: Path) -> None:
     missing = sorted(_WHEEL_REQUIRED - name_set)
     if missing:
         _fail(f"{archive}: missing required wheel files: {', '.join(missing)}")
+    with zipfile.ZipFile(archive) as wheel:
+        notice_contents = wheel.read("cayu/server/dashboard/THIRD_PARTY_LICENSES.md")
+    _validate_third_party_licenses(notice_contents, archive=archive)
     if not any(
         name.startswith("cayu/server/dashboard/assets/") and name.endswith(".js")
         for name in name_set

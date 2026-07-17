@@ -8,8 +8,8 @@
   },
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
-    "build:package": "tsc && vite build --outDir ../src/cayu/server/dashboard --emptyOutDir",
+    "build": "tsc && vite build && node scripts/finalize-third-party-licenses.mjs dist",
+    "build:package": "tsc && vite build --outDir ../src/cayu/server/dashboard --emptyOutDir && node scripts/finalize-third-party-licenses.mjs ../src/cayu/server/dashboard",
     "preview": "vite preview",
     "generate:api": "cd .. && ${CAYU_PYTHON:-.venv/bin/python} scripts/generate_dashboard_api_types.py",
     "check:api": "cd .. && ${CAYU_PYTHON:-.venv/bin/python} scripts/generate_dashboard_api_types.py --check",

@@ -2,3 +2,7 @@ Cayu
 Copyright 2026 Cayu Technologies, Inc.
 
 Licensed under the Apache License, Version 2.0.
+
+The packaged dashboard includes third-party software. Its copyright and
+license notices are provided in THIRD_PARTY_LICENSES.md alongside the
+dashboard assets (source path: src/cayu/server/dashboard/THIRD_PARTY_LICENSES.md).

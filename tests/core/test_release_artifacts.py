@@ -30,6 +30,7 @@ def _valid_wheel_names() -> set[str]:
         "cayu/guides/authoring.md",
         "cayu/guides/diagnostics.md",
         "cayu/guides/tool-effects.md",
+        "cayu/server/dashboard/THIRD_PARTY_LICENSES.md",
         "cayu/server/dashboard/index.html",
         "cayu/server/dashboard/assets/app.js",
         "cayu/server/dashboard/assets/app.css",
@@ -42,10 +43,22 @@ def _valid_wheel_names() -> set[str]:
     }
 
 
-def _write_wheel(path: Path, names: set[str]) -> None:
+def _write_wheel(
+    path: Path,
+    names: set[str],
+    *,
+    third_party_notice: str | None = None,
+) -> None:
     with zipfile.ZipFile(path, "w") as archive:
         for name in names:
-            archive.writestr(name, "")
+            contents = ""
+            if name == "cayu/server/dashboard/THIRD_PARTY_LICENSES.md":
+                contents = (
+                    third_party_notice
+                    if third_party_notice is not None
+                    else "\n".join(artifact_validator["_THIRD_PARTY_LICENSE_MARKERS"])
+                )
+            archive.writestr(name, contents)
 
 
 def test_validate_wheel_requires_application_anatomy_guide(tmp_path) -> None:
@@ -68,6 +81,24 @@ def test_validate_wheel_requires_tool_effect_guide(tmp_path) -> None:
     _write_wheel(wheel, names)
 
     with pytest.raises(ValueError, match="missing required wheel files"):
+        validate_wheel(wheel)
+
+
+def test_validate_wheel_requires_third_party_license_inventory(tmp_path) -> None:
+    wheel = tmp_path / "missing-third-party-licenses.whl"
+    names = _valid_wheel_names()
+    names.remove("cayu/server/dashboard/THIRD_PARTY_LICENSES.md")
+    _write_wheel(wheel, names)
+
+    with pytest.raises(ValueError, match="missing required wheel files"):
+        validate_wheel(wheel)
+
+
+def test_validate_wheel_rejects_incomplete_third_party_license_inventory(tmp_path) -> None:
+    wheel = tmp_path / "incomplete-third-party-licenses.whl"
+    _write_wheel(wheel, _valid_wheel_names(), third_party_notice="MIT")
+
+    with pytest.raises(ValueError, match="third-party license inventory is incomplete"):
         validate_wheel(wheel)
 
 
