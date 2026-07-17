@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 
 from cayu import CayuApp
 from cayu.core.events import EVENT_ID_MAX_CHARS, Event, EventType
-from cayu.server import create_server
+from cayu.server import AuthContext, create_server
 from cayu.server.contracts import SSE_LAST_EVENT_ID_FORMAT
 from cayu.server.sse import (
     SSE_ERROR_SESSION_ID_MAX_BYTES,
@@ -150,6 +150,37 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
         "supported_targets": ["typescript", "python"],
         "source_of_truth": "openapi",
     }
+
+
+def test_openapi_declares_auth_tenant_as_provenance_only() -> None:
+    schema = _client().get("/openapi.json").json()
+    operation = schema["paths"]["/api/contract"]["get"]
+    auth_context_schema = operation["x-cayu-auth-context"]
+
+    assert auth_context_schema["title"] == "AuthContext"
+    assert auth_context_schema["additionalProperties"] is False
+    assert auth_context_schema["required"] == ["subject"]
+    auth_context_description = " ".join(auth_context_schema["description"].split())
+    assert "operator-action provenance" in auth_context_description
+    assert "does not scope sessions" in auth_context_description
+
+    tenant_description = auth_context_schema["properties"]["tenant"]["description"]
+    assert (
+        tenant_description == AuthContext.model_json_schema()["properties"]["tenant"]["description"]
+    )
+    for warning in (
+        "provenance only",
+        "not a storage partition",
+        "authorization rule",
+        "row-level filter",
+        "tenant-isolation primitive",
+        "does not scope Cayu data",
+    ):
+        assert warning in tenant_description
+
+    operation_description = operation["description"]
+    assert "AuthContext.tenant is actor provenance only" in operation_description
+    assert "does not filter or isolate Cayu data" in operation_description
 
 
 def test_custom_api_path_updates_contract_and_openapi_paths() -> None:

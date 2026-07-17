@@ -1823,7 +1823,9 @@ def create_router(
             control-plane route that can start, change, inspect, or reveal runtime
             state; only the health route stays open for load balancers. It must
             return ``AuthContext`` or a compatible mapping and raise
-            ``HTTPException`` (401/403) to deny a request.
+            ``HTTPException`` (401/403) to deny a request. Authentication does not
+            add tenant-level authorization or storage isolation:
+            ``AuthContext.tenant`` is operator provenance only.
         api_path: URL path prefix for the CAYU control plane. Defaults to
             ``/api``.
         openapi_url: Public OpenAPI schema URL advertised by ``/contract`` for
@@ -1842,6 +1844,7 @@ def create_router(
 
     api_prefix = _normalize_api_path(api_path)
     router = APIRouter(prefix=api_prefix)
+    auth_context_openapi_schema = AuthContext.model_json_schema()
 
     # Shared dependency list for control-plane routes. FastAPI treats an empty
     # sequence like no dependencies, so `auth=None` keeps current dev behavior.
@@ -1907,7 +1910,17 @@ def create_router(
 
         return record_acceptance
 
-    @router.get("/contract", response_model=ServerContractResponse, dependencies=protected)
+    @router.get(
+        "/contract",
+        response_model=ServerContractResponse,
+        dependencies=protected,
+        description=(
+            "Return the versioned Cayu server contract. Authentication controls access "
+            "to protected routes, but AuthContext.tenant is actor provenance only and "
+            "does not filter or isolate Cayu data."
+        ),
+        openapi_extra={"x-cayu-auth-context": auth_context_openapi_schema},
+    )
     async def get_contract():
         return ServerContractResponse(
             api_prefix=api_prefix,

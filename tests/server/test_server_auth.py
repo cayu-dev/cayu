@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 # ruff: noqa: E402
+import inspect
 from collections.abc import AsyncIterator
 
 import pytest
@@ -14,7 +15,15 @@ from fastapi.testclient import TestClient
 from cayu import AgentSpec, CayuApp, InMemoryTaskStore
 from cayu.core.events import Event, EventType
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.server import AuthContext, BasicAuth, create_server, mount_cayu
+from cayu.server import (
+    AuthContext,
+    BasicAuth,
+    DashboardStaticFiles,
+    create_router,
+    create_server,
+    mount_cayu,
+    mount_dashboard,
+)
 
 _TOKEN = "secret-token"
 _AUTH_HEADERS = {"Authorization": f"Bearer {_TOKEN}"}
@@ -43,7 +52,11 @@ class OneShotProvider(ModelProvider):
 def _require_bearer_token(request: Request) -> AuthContext:
     if request.headers.get("Authorization") != f"Bearer {_TOKEN}":
         raise HTTPException(status_code=401, detail="Missing or invalid credentials.")
-    return AuthContext(subject="test-user", claims={"scheme": "bearer"})
+    return AuthContext(
+        subject="test-user",
+        tenant="tenant-a",
+        claims={"scheme": "bearer"},
+    )
 
 
 def _make_client(*, expose_docs: bool | None = None) -> TestClient:
@@ -51,6 +64,26 @@ def _make_client(*, expose_docs: bool | None = None) -> TestClient:
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
     return TestClient(create_server(app, auth=_require_bearer_token, expose_docs=expose_docs))
+
+
+@pytest.mark.parametrize(
+    "public_api",
+    [
+        BasicAuth,
+        DashboardStaticFiles,
+        create_router,
+        create_server,
+        mount_cayu,
+        mount_dashboard,
+    ],
+)
+def test_public_auth_helpers_document_tenant_as_provenance_only(public_api) -> None:
+    documentation = inspect.getdoc(public_api)
+
+    assert documentation is not None
+    assert "AuthContext" in documentation
+    assert "provenance only" in documentation
+    assert "does not" in documentation
 
 
 @pytest.mark.parametrize(
@@ -487,6 +520,7 @@ def test_authenticated_resolution_derives_resolved_by_from_auth_context() -> Non
     actor = captured[0].resolved_by
     assert actor is not None
     assert actor.subject == "test-user"
+    assert actor.tenant == "tenant-a"
     assert actor.source is ResolutionActorSource.HTTP_AUTH
     assert actor.claims == {"scheme": "bearer"}
 
@@ -589,6 +623,7 @@ def test_authenticated_interruption_derives_requested_by_from_auth_context() -> 
     actor = captured[0].requested_by
     assert actor is not None
     assert actor.subject == "test-user"
+    assert actor.tenant == "tenant-a"
     assert actor.source is ResolutionActorSource.HTTP_AUTH
     assert actor.claims == {"scheme": "bearer"}
 

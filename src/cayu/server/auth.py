@@ -15,13 +15,29 @@ from cayu._validation import copy_json_value, require_clean_nonblank
 
 
 class AuthContext(BaseModel):
-    """Authenticated caller identity returned by server auth dependencies."""
+    """Authenticated caller identity and operator-action provenance.
+
+    Authentication protects access to Cayu's server surfaces. ``tenant`` does
+    not scope sessions, events, transcripts, tasks, knowledge, artifacts,
+    usage, or dashboard/control-plane reads; applications must enforce any
+    tenant authorization and storage isolation separately.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    subject: str
-    tenant: str | None = None
-    claims: dict[str, Any] = Field(default_factory=dict)
+    subject: str = Field(description="Verified identity of the authenticated caller.")
+    tenant: str | None = Field(
+        default=None,
+        description=(
+            "Optional verified tenant identity for actor provenance only. It is not a "
+            "storage partition, authorization rule, row-level filter, or tenant-isolation "
+            "primitive, and it does not scope Cayu data."
+        ),
+    )
+    claims: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Verified authentication claims available to trusted server code.",
+    )
 
     @field_validator("subject")
     @classmethod
@@ -78,7 +94,11 @@ def copy_auth_context(value: AuthContext | Mapping[str, Any]) -> AuthContext:
 
 
 class BasicAuth:
-    """HTTP Basic authentication dependency for small self-hosted deployments."""
+    """HTTP Basic authentication dependency for small self-hosted deployments.
+
+    ``tenant``, when configured, is copied into ``AuthContext`` as authenticated
+    actor provenance only. It does not scope or authorize access to Cayu data.
+    """
 
     def __init__(
         self,

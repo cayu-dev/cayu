@@ -53,7 +53,12 @@ class _DocumentOpenParser(HTMLParser):
 
 
 class DashboardStaticFiles(StaticFiles):
-    """Serve dashboard assets with React-router fallback for page routes."""
+    """Serve dashboard assets with optional auth and React-router fallback.
+
+    ``auth`` may accept or reject access to the shell and assets. A returned
+    ``AuthContext.tenant`` is provenance only and does not filter dashboard
+    assets or the data requested from ``api_base_url``.
+    """
 
     def __init__(
         self,

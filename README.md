@@ -280,6 +280,9 @@ Cayu makes safety boundaries explicit, but configuration still matters:
   or another conforming shared store for sustained multi-process concurrency.
 - The FastAPI control plane requires authentication outside explicit
   `dev=True`; protect it as an operator surface, not an end-user endpoint.
+  `AuthContext.tenant` records authenticated operator provenance but does not
+  filter or isolate Cayu data. See [Server authentication and tenant
+  isolation](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/server-auth-tenancy.md).
   Generated API documentation is a separate exposure decision.
 - Usage is derived from recorded events and survives restarts when those events
   use a durable store; cost remains an estimate against the price book your
@@ -306,6 +309,7 @@ Start with the document that matches the job:
 | Design assertions and trajectory evals | [Evals](https://github.com/cayu-dev/cayu/blob/main/docs/evals.md) |
 | Estimate and govern cost | [Cost optimization](https://github.com/cayu-dev/cayu/blob/main/docs/cost-optimization.md) |
 | Use the application console | [Console](https://github.com/cayu-dev/cayu/blob/main/docs/console.md) |
+| Embed Cayu behind tenant-aware product APIs | [Server authentication and tenant isolation](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/server-auth-tenancy.md) |
 | Inspect supported model metadata | [Model catalog](https://github.com/cayu-dev/cayu/blob/main/docs/model-catalog.md) |
 | Look up exact runtime behavior | [Runtime contracts](https://github.com/cayu-dev/cayu/blob/main/docs/runtime-contracts.md) |
 | Track prerelease behavior and migrations | [Release notes](https://github.com/cayu-dev/cayu/blob/main/docs/release-notes.md) |

@@ -114,3 +114,65 @@ def test_application_anatomy_guide_is_linked_from_release_facing_docs() -> None:
         assert "application-anatomy.md" in text, (
             f"canonical anatomy guide not linked from {relative_path}"
         )
+
+
+def test_server_auth_tenant_isolation_boundary_is_documented() -> None:
+    readme = " ".join((_REPO_ROOT / "README.md").read_text(encoding="utf-8").split())
+    runtime_contract = " ".join(
+        (_REPO_ROOT / "docs" / "runtime-contracts.md").read_text(encoding="utf-8").split()
+    )
+    recipe = " ".join(
+        (_REPO_ROOT / "docs" / "recipes" / "server-auth-tenancy.md")
+        .read_text(encoding="utf-8")
+        .split()
+    )
+
+    assert "`AuthContext.tenant` records authenticated operator provenance" in readme
+    assert "server-auth-tenancy.md" in readme
+
+    for required in (
+        "Authentication and tenant isolation are separate contracts",
+        "session, event, transcript, task, knowledge, artifact, usage",
+        "not filtered by it",
+        "same raw Cayu record",
+        "Labels, metadata, namespaced identifiers, and query filters",
+        "operator boundary",
+        "session compaction, and message enqueue",
+    ):
+        assert required in runtime_contract
+
+    for required in (
+        "WHERE public_id = :public_id AND tenant_id = :authenticated_tenant",
+        "require_owned_run",
+        "before constructing a Cayu query",
+        "allocates non-null `public_id`, `cayu_session_id`, and `task_id`",
+        "`(tenant_id, idempotency_key)` constraint",
+        "request_fingerprint",
+        "IdempotencyConflict",
+        "status_code=409",
+        "owned.cayu_session_id is None or owned.task_id is None",
+        "raise HTTPException(status_code=404",
+        "passing `None` to an optional Cayu query filter",
+        "status_code=202",
+        "create_task",
+        "load_task",
+        "task_matches_product_run",
+        "except ValueError",
+        "lost HTTP response and concurrent task-creation race",
+        "existing task is accepted only after its immutable creation fields",
+        "durable `TaskStore`",
+        "run_task_worker",
+        "outside the HTTP request",
+        "rejects ordinary product members",
+        "does not rewrite their store queries",
+        "none is sufficient authorization by itself",
+        "never raw Cayu events or payloads",
+        "application-owned allowlist",
+        "row-level security",
+        "Native tenant-aware storage is not currently part",
+    ):
+        assert required in recipe
+
+    assert "run_to_completion" not in recipe
+    assert "return await cayu_app.session_store.query_events" not in recipe
+    assert "product_runs.require_owned" not in recipe

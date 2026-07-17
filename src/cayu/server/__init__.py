@@ -116,7 +116,9 @@ def create_server(
             ``fastapi.HTTPException`` (401/403) inside it to reject a request.
             It protects every control-plane route that can start, change,
             inspect, or reveal runtime state; only the health route stays open
-            for load balancers.
+            for load balancers. This authenticates access but does not provide
+            tenant authorization or storage isolation. ``AuthContext.tenant``
+            is operator-action provenance only and does not filter Cayu data.
         dev: Explicit opt-in for unauthenticated local/dev servers. Without
             ``auth`` or ``dev=True``, ``create_server`` raises instead of
             accidentally exposing the control plane.
@@ -299,6 +301,12 @@ def mount_cayu(
     inactive for at least ``interruption_recovery_inactive_after_seconds``, and
     drains accepted background interruption cascades for up to
     ``interruption_shutdown_grace_seconds`` before the host shuts down.
+
+    ``auth`` authenticates access to the complete mounted surface. It does not
+    make that surface tenant-scoped: ``AuthContext.tenant`` is operator-action
+    provenance only, and Cayu's built-in reads are not filtered by it. Treat the
+    mount as an operator surface unless the host application enforces
+    end-to-end tenant authorization and storage isolation.
     """
     if auth is None and not dev:
         raise ValueError(
@@ -371,6 +379,12 @@ def mount_dashboard(
     after registering their API routes. It serves one subpath-safe dashboard
     build under ``dashboard_path`` and injects runtime config so the dashboard
     uses the selected mount path.
+
+    ``auth`` protects only the dashboard shell and static assets; the API at
+    ``api_base_url`` must have its own equivalent protection. A returned
+    ``AuthContext.tenant`` is provenance only and does not filter dashboard or
+    API data. Treat this helper as an operator surface unless the host proves
+    end-to-end tenant authorization and storage isolation.
 
     Returns ``True`` when a dashboard was mounted and ``False`` when mounting
     was disabled or the dashboard directory is absent.

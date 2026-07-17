@@ -689,6 +689,30 @@ gateway authentication. The packaged dashboard and state-bearing control-plane
 routes share that authentication boundary; the health route remains open for
 load balancers. `dev=True` is not a production configuration.
 
+Authentication and tenant isolation are separate contracts. `AuthContext.tenant`
+is verified actor provenance: the server may stamp it into approval,
+interruption, recovery, user-input resolution, session compaction, and message
+enqueue operator evidence. It is not passed to stores as a query scope and is
+not a storage partition, authorization rule, row-level filter, or
+tenant-isolation primitive. Built-in session, event, transcript, task,
+knowledge, artifact, usage, and dashboard/control-plane reads are therefore not
+filtered by it. Two authenticated callers with different tenant values can
+address the same raw Cayu record when either knows its identifier unless the
+embedding application establishes a stronger boundary. Labels, metadata,
+namespaced identifiers, and query filters can carry application context or add
+defense in depth, but they do not authorize access by themselves.
+
+For tenant-facing products, keep the raw Cayu routes and inspector on an operator
+boundary unless end-to-end tenant scoping has been proved. Product routes should
+authenticate the caller, authorize a product-owned tenant/resource mapping, and
+only then call Cayu with the mapped runtime identifier; tenant-aware store or
+route wrappers must enforce the same rule for every read and write. Background
+work must preserve trusted server-side scope rather than accept a tenant id from
+the request body. See the [server authentication and tenant isolation
+recipe](recipes/server-auth-tenancy.md). Native tenant-aware storage is not part
+of this contract; any future core implementation requires separate design and
+tracking rather than an inference from `AuthContext.tenant`.
+
 `create_server(...)` disables `/openapi.json`, `/docs`, and `/redoc` by
 default in an authenticated deployment. `expose_docs=True` deliberately makes
 those generated documentation routes public; the Cayu authentication dependency
