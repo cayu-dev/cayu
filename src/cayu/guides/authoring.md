@@ -58,6 +58,7 @@ A Cayu project declares a synchronous factory in `pyproject.toml`:
 ```toml
 [tool.cayu]
 factory = "app:build_app"
+eval_target = "evals.assistant:build_eval"
 ```
 
 Calling the factory constructs a fresh, process-scoped `CayuApp`. The app is
@@ -69,6 +70,8 @@ start workers/recovery/schedulers, or invoke a model or tool.
 The factory may expose optional dependency-injection arguments for tests as
 long as a normal zero-argument call remains valid. Tests should inject
 `ScriptedModelProvider` and in-memory stores through those public seams.
+The separate `eval_target` returns an eval plan and lets `cayu eval run` use the
+project's default suite without treating the application factory as an eval.
 
 ## 4. Inspect before changing
 
@@ -229,7 +232,7 @@ The default credential-free proof is:
 cayu inspect --json
 cayu check --json
 pytest
-cayu eval run evals.assistant:build_eval
+cayu eval run
 ```
 
 Tests should exercise `CayuApp.run` or `run_to_completion` with a

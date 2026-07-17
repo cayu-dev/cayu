@@ -7,8 +7,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from cayu.cli._targets import load_target
-from cayu.cli.project import project_context
+from cayu.cli._targets import TargetResolutionError, load_target
+from cayu.cli.project import project_context, resolve_eval_project
 from cayu.evals import (
     EvalPlan,
     EvalStatus,
@@ -33,13 +33,14 @@ def add_eval_parser(subparsers: Any) -> None:
 
     run = inner.add_parser(
         "run",
-        help="Run an eval plan from a Python target such as package.module:build.",
+        help="Run a configured or explicit eval plan.",
     )
     run.add_argument(
         "target",
+        nargs="?",
         help=(
             "Python target that returns EvalPlan, (CayuApp, EvalSuite), or an object "
-            "with app and suite attributes."
+            "with app and suite attributes. Defaults to [tool.cayu].eval_target."
         ),
     )
     run.add_argument("--output", "-o", metavar="FILE", help="Write JSON results to FILE.")
@@ -96,13 +97,14 @@ def run_eval_command(args: argparse.Namespace) -> int:
 
 
 async def _run(args: argparse.Namespace) -> int:
-    with project_context(Path.cwd().resolve()):
-        loaded = load_target(args.target, label="Eval target")
-        if callable(loaded):
-            loaded = loaded()
-        if inspect.isawaitable(loaded):
-            loaded = await loaded
-        plan = _coerce_plan(loaded)
+    project = resolve_eval_project(args.target)
+    label = (
+        "Command-line eval target"
+        if args.target is not None
+        else f"Configured eval target from {project.root / 'pyproject.toml'}"
+    )
+    with project_context(project.root):
+        plan = await _load_eval_plan(project.target, label=label)
         run = await run_eval_suite(
             plan.app,
             plan.suite,
@@ -113,6 +115,28 @@ async def _run(args: argparse.Namespace) -> int:
         if args.html_output is not None:
             Path(args.html_output).write_text(render_html_report(run), encoding="utf-8")
         return 0 if run.status == EvalStatus.PASSED else 1
+
+
+async def _load_eval_plan(target: str, *, label: str) -> EvalPlan:
+    try:
+        loaded = load_target(target, label=label)
+    except TargetResolutionError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"{label} could not be loaded ({type(exc).__name__}): {exc}") from exc
+
+    try:
+        if callable(loaded):
+            loaded = loaded()
+        if inspect.isawaitable(loaded):
+            loaded = await loaded
+    except Exception as exc:
+        raise RuntimeError(f"{label} failed ({type(exc).__name__}): {exc}") from exc
+
+    try:
+        return _coerce_plan(loaded)
+    except Exception as exc:
+        raise TypeError(f"{label} returned an invalid eval plan: {exc}") from exc
 
 
 def _report(args: argparse.Namespace) -> int:

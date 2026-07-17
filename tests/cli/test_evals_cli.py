@@ -6,6 +6,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 from cayu import (
     AgentSpec,
     CayuApp,
@@ -21,6 +23,23 @@ from cayu import (
 from cayu.cli import main
 from cayu.cli.evals import add_eval_parser
 from cayu.providers import ModelProvider, ModelStreamEvent
+
+
+def _write_cayu_project_config(
+    root: Path,
+    *,
+    factory_target: str | None = "app:build_app",
+    eval_declaration: str | None = None,
+) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    lines = ["[tool.cayu]"]
+    if factory_target is not None:
+        lines.append(f'factory = "{factory_target}"')
+    if eval_declaration is not None:
+        lines.append(eval_declaration)
+    path = root / "pyproject.toml"
+    path.write_text("\n".join((*lines, "")), encoding="utf-8")
+    return path
 
 
 class _SlowProvider(ModelProvider):
@@ -53,6 +72,11 @@ def build_slow_eval_plan() -> EvalPlan:
     return EvalPlan(app=app, suite=suite)
 
 
+async def build_async_eval_plan() -> EvalPlan:
+    await asyncio.sleep(0)
+    return build_slow_eval_plan()
+
+
 def test_eval_run_parses_optional_case_timeout_as_float() -> None:
     parser = argparse.ArgumentParser(prog="cayu")
     subparsers = parser.add_subparsers(dest="command")
@@ -61,10 +85,235 @@ def test_eval_run_parses_optional_case_timeout_as_float() -> None:
     configured = parser.parse_args(
         ["eval", "run", "example:build", "--case-timeout-seconds", "0.05"]
     )
-    omitted = parser.parse_args(["eval", "run", "example:build"])
+    timeout_omitted = parser.parse_args(["eval", "run", "example:build"])
+    target_omitted = parser.parse_args(["eval", "run"])
 
     assert configured.case_timeout_seconds == 0.05
-    assert omitted.case_timeout_seconds is None
+    assert timeout_omitted.case_timeout_seconds is None
+    assert target_omitted.target is None
+
+
+def test_eval_help_describes_configured_and_explicit_run_targets(capsys) -> None:
+    with pytest.raises(SystemExit) as raised:
+        main(["eval", "--help"])
+
+    assert raised.value.code == 0
+    assert "Run a configured or explicit eval plan." in capsys.readouterr().out
+
+
+def test_eval_run_discovers_async_default_target_from_nested_project_directory(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "project"
+    nested = project / "agents" / "reviewer"
+    nested.mkdir(parents=True)
+    _write_cayu_project_config(
+        project,
+        eval_declaration=f'eval_target = "{__name__}:build_async_eval_plan"',
+    )
+    monkeypatch.chdir(nested)
+
+    assert main(["eval", "run", "--output", "eval-run.json"]) == 0
+
+    report_path = project / "eval-run.json"
+    assert report_path.is_file()
+    assert load_eval_run(report_path).suite_id == "slow-suite"
+    assert not (nested / "eval-run.json").exists()
+    assert Path.cwd() == nested
+
+
+def test_eval_run_explicit_target_overrides_configured_default(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _write_cayu_project_config(
+        tmp_path,
+        eval_declaration='eval_target = "missing_default_eval:build"',
+    )
+    output = tmp_path / "explicit-eval.json"
+    monkeypatch.chdir(tmp_path)
+
+    assert (
+        main(
+            [
+                "eval",
+                "run",
+                f"{__name__}:build_async_eval_plan",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+
+    assert load_eval_run(output).suite_id == "slow-suite"
+
+
+def test_eval_report_and_compare_do_not_require_project_discovery(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    run_path = tmp_path / "eval-run.json"
+    report_path = tmp_path / "eval-report.json"
+    comparison_path = tmp_path / "comparison.json"
+    monkeypatch.chdir(tmp_path)
+    assert (
+        main(
+            [
+                "eval",
+                "run",
+                f"{__name__}:build_async_eval_plan",
+                "--output",
+                str(run_path),
+            ]
+        )
+        == 0
+    )
+    (tmp_path / "pyproject.toml").write_text("[tool.cayu\n", encoding="utf-8")
+
+    assert (
+        main(
+            [
+                "eval",
+                "report",
+                str(run_path),
+                "--format",
+                "json",
+                "--output",
+                str(report_path),
+            ]
+        )
+        == 0
+    )
+    assert (
+        main(
+            [
+                "eval",
+                "compare",
+                str(run_path),
+                str(run_path),
+                "--output",
+                str(comparison_path),
+            ]
+        )
+        == 0
+    )
+    assert report_path.is_file()
+    assert comparison_path.is_file()
+
+
+def test_eval_run_does_not_climb_past_nearest_project_missing_default(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    parent = tmp_path / "parent"
+    project = parent / "project"
+    nested = project / "nested"
+    nested.mkdir(parents=True)
+    parent_marker = parent / "parent-eval-loaded.txt"
+    _write_cayu_project_config(
+        parent,
+        factory_target="parent_app:build_app",
+        eval_declaration='eval_target = "parent_eval:build"',
+    )
+    (parent / "parent_eval.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(parent_marker)!r}).write_text('loaded', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    project_pyproject = _write_cayu_project_config(
+        project,
+        factory_target="project_app:build_app",
+    )
+    monkeypatch.chdir(nested)
+
+    assert main(["eval", "run"]) == 1
+
+    error = capsys.readouterr().err
+    assert str(project_pyproject) in error
+    assert "[tool.cayu].eval_target is not configured" in error
+    assert not parent_marker.exists()
+
+
+def test_eval_run_does_not_climb_past_eval_target_only_project(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    parent = tmp_path / "parent"
+    project = parent / "project"
+    nested = project / "nested"
+    nested.mkdir(parents=True)
+    parent_marker = parent / "parent-eval-loaded.txt"
+    _write_cayu_project_config(
+        parent,
+        factory_target="parent_app:build_app",
+        eval_declaration='eval_target = "parent_eval:build"',
+    )
+    (parent / "parent_eval.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(parent_marker)!r}).write_text('loaded', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    project_pyproject = _write_cayu_project_config(
+        project,
+        factory_target=None,
+        eval_declaration='eval_target = "project_eval:build"',
+    )
+    monkeypatch.chdir(nested)
+
+    assert main(["eval", "run"]) == 1
+
+    error = capsys.readouterr().err
+    assert str(project_pyproject) in error
+    assert "[tool.cayu].factory is not configured" in error
+    assert 'factory = "module:build_app"' in error
+    assert not parent_marker.exists()
+
+
+def test_eval_run_reports_non_utf8_pyproject_path(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_bytes(b"[tool.cayu]\nfactory = \xff\n")
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["eval", "run"]) == 1
+
+    error = capsys.readouterr().err
+    assert f"Could not read {pyproject}" in error
+    assert "utf-8" in error
+
+
+def test_eval_run_reports_missing_or_malformed_configured_target(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    pyproject = tmp_path / "pyproject.toml"
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["eval", "run"]) == 1
+    missing_project_error = capsys.readouterr().err
+    assert "No Cayu project found" in missing_project_error
+    assert '[tool.cayu] factory = "module:build_app"' in missing_project_error
+    assert 'eval_target = "module:build_eval"' in missing_project_error
+    assert "cayu eval run module:build_eval" in missing_project_error
+
+    for declaration in ('eval_target = ""', "eval_target = 42"):
+        _write_cayu_project_config(
+            tmp_path,
+            eval_declaration=declaration,
+        )
+
+        assert main(["eval", "run"]) == 1
+        error = capsys.readouterr().err
+        assert str(pyproject) in error
+        assert "[tool.cayu].eval_target must be a non-empty string" in error
 
 
 def test_eval_run_timeout_returns_nonzero_and_saves_actionable_error(tmp_path: Path) -> None:
@@ -128,7 +377,9 @@ def build():
     sys.modules.pop(module_name, None)
     monkeypatch.chdir(second_project)
     assert main(["eval", "run", f"{module_name}:build"]) == 1
-    assert f"No module named '{module_name}'" in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert "Command-line eval target could not be loaded" in error
+    assert f"No module named '{module_name}'" in error
     assert sys.path == original_path
 
 
@@ -195,8 +446,61 @@ def test_eval_run_reports_clear_target_resolution_errors(
     monkeypatch.chdir(tmp_path)
     sys.modules.pop(module_name, None)
 
+    assert main(["eval", "run", "not-a-target"]) == 1
+    syntax_error = capsys.readouterr().err
+    assert "Command-line eval target must use module:attribute syntax" in syntax_error
+
     assert main(["eval", "run", "missing_repo_local_eval:build"]) == 1
-    assert "No module named 'missing_repo_local_eval'" in capsys.readouterr().err
+    missing_error = capsys.readouterr().err
+    assert "Command-line eval target could not be loaded" in missing_error
+    assert "No module named 'missing_repo_local_eval'" in missing_error
 
     assert main(["eval", "run", f"{module_name}:missing"]) == 1
-    assert "has no attribute 'missing'" in capsys.readouterr().err
+    attribute_error = capsys.readouterr().err
+    assert "Command-line eval target could not be loaded" in attribute_error
+    assert "has no attribute 'missing'" in attribute_error
+
+
+def test_eval_run_configured_target_errors_identify_pyproject_source(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    pyproject = _write_cayu_project_config(
+        tmp_path,
+        eval_declaration='eval_target = "not-a-target"',
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["eval", "run"]) == 1
+
+    syntax_error = capsys.readouterr().err
+    assert f"Configured eval target from {pyproject}" in syntax_error
+    assert "must use module:attribute syntax" in syntax_error
+
+    _write_cayu_project_config(
+        tmp_path,
+        eval_declaration='eval_target = "missing_configured_eval:build"',
+    )
+    assert main(["eval", "run"]) == 1
+
+    error = capsys.readouterr().err
+    assert f"Configured eval target from {pyproject}" in error
+    assert "No module named 'missing_configured_eval'" in error
+
+    (tmp_path / "invalid_configured_eval.py").write_text(
+        "def build():\n    return object()\n",
+        encoding="utf-8",
+    )
+    _write_cayu_project_config(
+        tmp_path,
+        eval_declaration='eval_target = "invalid_configured_eval:build"',
+    )
+    sys.modules.pop("invalid_configured_eval", None)
+
+    assert main(["eval", "run"]) == 1
+
+    invalid_error = capsys.readouterr().err
+    assert f"Configured eval target from {pyproject}" in invalid_error
+    assert "returned an invalid eval plan" in invalid_error
+    assert "Eval target must return EvalPlan" in invalid_error

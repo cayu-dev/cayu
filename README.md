@@ -61,7 +61,7 @@ cd myagent
 cayu inspect --json
 cayu check --json
 pytest
-cayu eval run evals.assistant:build_eval
+cayu eval run
 ```
 
 The scaffold is credential-free and includes:

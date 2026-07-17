@@ -67,26 +67,47 @@ async def main():
 
 ## CLI
 
-`cayu eval run` loads a Python target. The target should return one of:
+`cayu eval run [module:attribute]` loads a Python target. The target should
+return one of:
 
 - `EvalPlan(app=app, suite=suite)`
 - `(app, suite)`
 - an object or dict with `app` and `suite`
 
-For the duration of the run, the caller's current directory takes precedence
-on Python's import path, so repo-local modules shadow same-named installed
-packages. The original import path is restored when the command finishes.
+Projects can declare one default alongside their application factory:
+
+```toml
+[tool.cayu]
+factory = "app:build_app"
+eval_target = "evals.assistant:build_eval"
+```
+
+Running `cayu eval run` without a target searches upward for the nearest Cayu
+project, changes to that project root, and resolves `eval_target` with the root
+first on Python's import path. Relative stores, fixtures, and output paths
+therefore resolve consistently when the command starts in a nested directory.
+The original working directory, import path, and project modules are restored
+when the command finishes.
+
+An explicit target overrides project configuration and retains the caller's
+current directory as its root. Use this form for additional suites or for evals
+outside a configured Cayu project. Targets may be synchronous or awaitable; the
+application `factory` is not used as an eval target because it does not identify
+an `EvalSuite`.
 
 Example:
 
 ```bash
-cayu eval run my_project.evals:build --output results.json
+cayu eval run --output results.json
+cayu eval run evals.reviewer:build_eval --output reviewer-results.json
 cayu eval report results.json --format html --output eval-report.html
 cayu eval compare baseline.json results.json --output comparison.json
 ```
 
 The command exits with `0` when all cases pass and `1` when the run fails,
-errors, or a comparison detects regressions.
+errors, or a comparison detects regressions. `eval report` and `eval compare`
+operate only on the paths supplied to them and do not perform project
+discovery.
 
 ## First-party runtime acceptance suite
 

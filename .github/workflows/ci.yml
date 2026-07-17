@@ -176,7 +176,7 @@ jobs:
             exit 1
           fi
           "$GITHUB_WORKSPACE/.release-venv/bin/python" -m pytest -q
-          "$GITHUB_WORKSPACE/.release-venv/bin/cayu" eval run evals.assistant:build_eval >/dev/null
+          "$GITHUB_WORKSPACE/.release-venv/bin/cayu" eval run >/dev/null
           "$GITHUB_WORKSPACE/.release-venv/bin/cayu" eval run evals.reviewer:build_eval >/dev/null
           "$GITHUB_WORKSPACE/.release-venv/bin/python" - <<'PY'
           from pathlib import Path

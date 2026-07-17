@@ -240,6 +240,7 @@ dev = ["pytest"]
 
 [tool.cayu]
 factory = "app:build_app"
+eval_target = "evals.assistant:build_eval"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -268,7 +269,7 @@ cayu guide anatomy
 cayu inspect --json
 cayu check --json
 pytest
-cayu eval run evals.assistant:build_eval
+cayu eval run
 ```
 
 These commands require no model API key. They prove project construction,
@@ -326,7 +327,7 @@ needs. `app.py` is the application factory and explicit registration surface.
 - Tool replay classification: `cayu guide tool-effects`.
 - Inspect/check: `cayu inspect --json` and `cayu check --json`.
 - Safe generation: `cayu generate slice NAME --tool TOOL --effect EFFECT`.
-- Hermetic proof: `pytest` and `cayu eval run MODULE:build_eval`.
+- Hermetic proof: `pytest` and `cayu eval run`.
 - Interactive inspection: `cayu console` (constructs the app; starts no services).
 - Live execution: `python run.py` only when `OPENAI_API_KEY` is explicitly available.
 
@@ -340,8 +341,9 @@ needs. `app.py` is the application factory and explicit registration surface.
 3. Plan generated edits with
    `cayu generate slice NAME --tool TOOL --effect EFFECT --dry-run --json`.
 4. Apply with `cayu generate slice NAME --tool TOOL --effect EFFECT`; review every changed file.
-5. Run `cayu check --json`, `pytest`, and the relevant
-   `cayu eval run evals.assistant:build_eval` target. Before submitting, clear
+5. Run `cayu check --json`, `pytest`, and the default `cayu eval run` target.
+   Use an explicit `cayu eval run MODULE:build_eval` target for additional
+   suites. Before submitting, clear
    every generated slice's tracer-bullet marker only after replacing its domain
    prompt, tool schema/body, runtime test, and trajectory eval, then require
    `cayu check --fail-on warning --json` to pass.
@@ -435,5 +437,5 @@ def run_new(args: argparse.Namespace) -> int:
     print("  cayu inspect --json")
     print("  cayu check --json")
     print("  pytest")
-    print("  cayu eval run evals.assistant:build_eval")
+    print("  cayu eval run")
     return 0

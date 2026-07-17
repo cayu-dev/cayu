@@ -12,6 +12,7 @@ from importlib.abc import MetaPathFinder
 from importlib.machinery import ModuleSpec, PathFinder
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 from cayu.cli._targets import TargetResolutionError, load_target
 from cayu.runtime.app import CayuApp
@@ -23,8 +24,16 @@ class CayuProject:
     target: str
 
 
+@dataclass(frozen=True)
+class _ConfiguredCayuProject:
+    root: Path
+    pyproject: Path
+    factory_target: str
+    config: dict[str, Any]
+
+
 class ProjectError(Exception):
-    """An actionable project discovery or application-factory contract error."""
+    """An actionable project discovery or configured-target contract error."""
 
 
 def _project_import_roots(root: Path) -> set[str]:
@@ -113,35 +122,101 @@ def _install_before_path_finder(finder: MetaPathFinder) -> None:
     sys.meta_path.append(finder)
 
 
-def resolve_project(
-    explicit_target: str | None = None,
-    *,
-    command: str = "cayu",
-) -> CayuProject:
-    cwd = Path.cwd().resolve()
-    if explicit_target is not None:
-        return CayuProject(root=cwd, target=explicit_target)
+def _configured_target(value: object, *, pyproject: Path, key: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ProjectError(f"{pyproject}: [tool.cayu].{key} must be a non-empty string.")
+    return value.strip()
 
+
+def _discover_configured_project(
+    *,
+    command: str,
+    configuration_example: str,
+    explicit_target_example: str,
+    discovery_keys: tuple[str, ...] = ("factory",),
+) -> _ConfiguredCayuProject:
+    cwd = Path.cwd().resolve()
     for directory in (cwd, *cwd.parents):
         pyproject = directory / "pyproject.toml"
         if not pyproject.is_file():
             continue
         try:
             config = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-        except (OSError, tomllib.TOMLDecodeError) as exc:
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
             raise ProjectError(f"Could not read {pyproject}: {exc}") from exc
         tool_config = config.get("tool", {})
         cayu_config = tool_config.get("cayu", {}) if isinstance(tool_config, dict) else {}
-        target = cayu_config.get("factory") if isinstance(cayu_config, dict) else None
-        if target is None:
+        if not isinstance(cayu_config, dict) or not any(
+            key in cayu_config for key in discovery_keys
+        ):
             continue
-        if not isinstance(target, str) or not target.strip():
-            raise ProjectError(f"{pyproject}: [tool.cayu].factory must be a non-empty string.")
-        return CayuProject(root=directory, target=target)
+        if "factory" not in cayu_config:
+            raise ProjectError(
+                f"{pyproject}: [tool.cayu].factory is not configured. "
+                'Add factory = "module:build_app" under [tool.cayu].'
+            )
+        target = cayu_config["factory"]
+        factory_target = _configured_target(target, pyproject=pyproject, key="factory")
+        return _ConfiguredCayuProject(
+            root=directory,
+            pyproject=pyproject,
+            factory_target=factory_target,
+            config=cayu_config,
+        )
 
     raise ProjectError(
-        'No Cayu project found. Add [tool.cayu] factory = "module:build_app" '
-        f"to pyproject.toml, or pass {command} module:build_app."
+        f"No Cayu project found. Add {configuration_example} to pyproject.toml, "
+        f"or pass {command} {explicit_target_example}."
+    )
+
+
+def resolve_project(
+    explicit_target: str | None = None,
+    *,
+    command: str = "cayu",
+) -> CayuProject:
+    if explicit_target is not None:
+        return CayuProject(root=Path.cwd().resolve(), target=explicit_target)
+
+    configured = _discover_configured_project(
+        command=command,
+        configuration_example='[tool.cayu] factory = "module:build_app"',
+        explicit_target_example="module:build_app",
+    )
+    return CayuProject(root=configured.root, target=configured.factory_target)
+
+
+def resolve_eval_project(
+    explicit_target: str | None = None,
+    *,
+    command: str = "cayu eval run",
+) -> CayuProject:
+    """Resolve an eval target without applying the application-factory contract."""
+    if explicit_target is not None:
+        return CayuProject(root=Path.cwd().resolve(), target=explicit_target)
+
+    configured = _discover_configured_project(
+        command=command,
+        configuration_example=(
+            '[tool.cayu] factory = "module:build_app" and eval_target = "module:build_eval"'
+        ),
+        explicit_target_example="module:build_eval",
+        discovery_keys=("factory", "eval_target"),
+    )
+    target = configured.config.get("eval_target")
+    if target is None:
+        raise ProjectError(
+            f"{configured.pyproject}: [tool.cayu].eval_target is not configured. "
+            'Add eval_target = "module:build_eval" under [tool.cayu], '
+            f"or pass {command} module:build_eval."
+        )
+    return CayuProject(
+        root=configured.root,
+        target=_configured_target(
+            target,
+            pyproject=configured.pyproject,
+            key="eval_target",
+        ),
     )
 
 

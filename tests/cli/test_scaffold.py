@@ -7,7 +7,14 @@ import importlib.util
 import sys
 from pathlib import Path
 
-from cayu import CayuApp, InMemorySessionStore, InMemoryTaskStore, ScriptedModelProvider
+from cayu import (
+    CayuApp,
+    EvalStatus,
+    InMemorySessionStore,
+    InMemoryTaskStore,
+    ScriptedModelProvider,
+    load_eval_run,
+)
 from cayu.cli import main
 from cayu.cli.project import project_context
 
@@ -48,12 +55,15 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert '[project.optional-dependencies]\nconsole = ["cayu[console]"]' in pyproject
     assert 'dev = ["pytest"]' in pyproject
     assert '[tool.cayu]\nfactory = "app:build_app"' in pyproject
+    assert 'eval_target = "evals.assistant:build_eval"' in pyproject
     readme = (proj / "README.md").read_text(encoding="utf-8")
     assert "cayu inspect --json" in readme
     assert "cayu guide anatomy" in readme
     assert readme.index("## Application structure") < readme.index("## Setup and prove the project")
     assert "pip install -e '.[console,dev]'" in readme
     assert "uv sync --extra console --extra dev" in readme
+    assert "cayu eval run" in readme
+    assert "cayu eval run evals.assistant:build_eval" not in readme
     assert "cayu generate slice NAME --tool TOOL --effect EFFECT" in readme
     assert "cayu check --json" in capsys.readouterr().out
 
@@ -189,9 +199,29 @@ def test_cayu_new_emits_safe_agent_instructions_and_credential_free_proof(
     assert "cayu check --fail-on warning --json" in instructions
     assert "cayu generate slice" in instructions
     assert "pytest" in instructions
-    assert "cayu eval run evals.assistant:build_eval" in instructions
+    assert "cayu eval run" in instructions
+    assert "cayu eval run evals.assistant:build_eval" not in instructions
     assert "registered tool manifest" in instructions
     assert "Do not claim live verification" in instructions
+
+
+def test_scaffolded_default_eval_runs_from_nested_directory_without_api_keys(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    assert main(["new", "myproj", "--dir", str(tmp_path)]) == 0
+    project = tmp_path / "myproj"
+    nested = project / "agents" / "reviewer"
+    nested.mkdir(parents=True)
+    monkeypatch.chdir(nested)
+
+    assert main(["eval", "run", "--output", "eval-run.json"]) == 0
+
+    report_path = project / "eval-run.json"
+    report = load_eval_run(report_path)
+    assert report.status == EvalStatus.PASSED
+    assert report.suite_id == "assistant-trajectory"
+    assert not (nested / "eval-run.json").exists()
 
 
 def test_cayu_new_refuses_a_nonempty_directory(tmp_path: Path) -> None:
