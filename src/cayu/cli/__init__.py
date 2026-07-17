@@ -8,7 +8,7 @@ def _version() -> str:
     try:
         return version("cayu")
     except PackageNotFoundError:
-        return "0.1.0a2"
+        return "0.1.0a3"
 
 
 def main(argv: list[str] | None = None) -> int:
