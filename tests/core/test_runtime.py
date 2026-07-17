@@ -14,6 +14,7 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
+import cayu.runtime._environment_lifecycle as environment_lifecycle_module
 import cayu.runtime._model_step_executor as model_step_executor_module
 import cayu.runtime._session_control as session_control_module
 import cayu.runtime.app as runtime_app_module
@@ -3989,7 +3990,8 @@ def test_cayu_app_closes_factory_environment_when_post_create_checkpoint_fails()
                 state = checkpoint_transform(session, checkpoint)
                 if (
                     state is not None
-                    and runtime_app_module._ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY in state
+                    and environment_lifecycle_module.ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY
+                    in state
                 ):
                     raise RuntimeError("reconnect checkpoint unavailable")
                 return state
@@ -4069,7 +4071,8 @@ def test_cayu_app_closes_factory_environment_when_post_create_checkpoint_is_canc
                 state = checkpoint_transform(session, checkpoint)
                 if (
                     state is not None
-                    and runtime_app_module._ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY in state
+                    and environment_lifecycle_module.ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY
+                    in state
                 ):
                     raise asyncio.CancelledError()
                 return state
@@ -4673,13 +4676,16 @@ def test_cancelled_factory_checkpoint_reports_fallback_cleanup_failure(
         app = CayuApp(session_store=store, enable_logging=False)
         checkpoint_started = asyncio.Event()
 
-        async def block_checkpoint(**_kwargs: Any) -> None:
+        async def block_checkpoint(
+            _lifecycle: environment_lifecycle_module.EnvironmentLifecycle,
+            **_kwargs: Any,
+        ) -> None:
             checkpoint_started.set()
             await asyncio.Event().wait()
 
         monkeypatch.setattr(
-            app,
-            "_checkpoint_environment_factory_reconnect_metadata",
+            environment_lifecycle_module.EnvironmentLifecycle,
+            "_checkpoint_factory_reconnect_metadata",
             block_checkpoint,
         )
         app.register_provider(FakeProvider([]), default=True)
