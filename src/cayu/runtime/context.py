@@ -27,6 +27,11 @@ from cayu.artifacts import (
     file_attachment_from_payload,
 )
 from cayu.core.agents import AgentSpec
+from cayu.core.billing import (
+    BillingIdentity,
+    completed_billing_identity,
+    copy_billing_identity,
+)
 from cayu.core.events import EventType
 from cayu.core.messages import (
     FilePart,
@@ -53,7 +58,11 @@ from cayu.runtime._model_errors import model_provider_error_from_payload
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy, retry_decision
 from cayu.runtime.sessions import Session
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
-from cayu.runtime.usage import normalize_usage_metrics, usage_metrics_payload
+from cayu.runtime.usage import (
+    normalize_usage_metrics,
+    strip_provider_billing_identity,
+    usage_metrics_payload,
+)
 from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_NAMESPACE,
     KnowledgeHit,
@@ -1636,6 +1645,11 @@ class ContextCompactor(ABC):
         del request
         return False
 
+    def _uses_runtime_provider_dispatch_runner_for_forced_compaction(self) -> bool:
+        """Whether forced bounded compaction exposes every provider dispatch."""
+
+        return False
+
     @abstractmethod
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         """Return a compact summary for older transcript messages."""
@@ -1657,8 +1671,9 @@ _AUTOMATIC_COMPACTION_RUNNER: ContextVar[_AutomaticCompactionRunner | None] = Co
 
 _AutomaticCompactionDispatchRunner = Callable[
     [
+        ModelProvider,
         str,
-        str,
+        BillingIdentity | None,
         Callable[[], Awaitable[tuple[str, dict[str, Any]]]],
     ],
     Awaitable[tuple[str, dict[str, Any]]],
@@ -1827,7 +1842,7 @@ class ModelCompactor(ContextCompactor):
         self.retry_policy = copy_retry_policy(retry_policy)
 
     def provider_budget_identity(self, session: Session) -> tuple[str, str]:
-        return self.provider.name, self.model
+        return self.provider.billing_provider_name or self.provider.name, self.model
 
     def _uses_runtime_provider_dispatch_runner_for_request(
         self,
@@ -1838,6 +1853,9 @@ class ModelCompactor(ContextCompactor):
         # instrumented provider-dispatch boundary. An overridden ``compact``
         # method is opaque to the runtime and is rejected when reservation-
         # bearing limits apply.
+        return type(self).compact is ModelCompactor.compact
+
+    def _uses_runtime_provider_dispatch_runner_for_forced_compaction(self) -> bool:
         return type(self).compact is ModelCompactor.compact
 
     async def compact(self, request: CompactionRequest) -> CompactionResult:
@@ -2117,7 +2135,10 @@ class PromptCacheCompactor(ContextCompactor):
             raise ValueError(
                 "model is required when the compactor provider differs from the session provider."
             )
-        return self.provider.name, self.model if self.model is not None else session.model
+        return (
+            self.provider.billing_provider_name or self.provider.name,
+            self.model if self.model is not None else session.model,
+        )
 
     def _provider_budget_identity_for_request(
         self,
@@ -2126,26 +2147,29 @@ class PromptCacheCompactor(ContextCompactor):
         provider_differs = self.provider.name != request.session.provider_name
         bounded_model = self.model if self.model is not None else request.session.model
         if request.existing_summary is not None or request.force_bounded_compaction:
-            return self.provider.name, bounded_model
+            return self.provider.billing_provider_name or self.provider.name, bounded_model
         if provider_differs:
             if self.model is None:
                 raise ValueError(
                     "model is required when the compactor provider differs from "
                     "the session provider."
                 )
-            return self.provider.name, bounded_model
+            return self.provider.billing_provider_name or self.provider.name, bounded_model
 
         cached_request = request.cache_prefix_request
         if cached_request is None:
             if self.model is not None and self.model != request.session.model:
-                return self.provider.name, self.model
+                return self.provider.billing_provider_name or self.provider.name, self.model
             return self._fallback._provider_budget_identity_for_request(request)
         cached_model = cached_request.model
         if cached_model != request.session.model:
-            return self.provider.name, bounded_model
+            return self.provider.billing_provider_name or self.provider.name, bounded_model
         if self.model is not None and self.model != cached_model:
-            return self.provider.name, self.model
-        return self.provider.name, self.model if self.model is not None else cached_model
+            return self.provider.billing_provider_name or self.provider.name, self.model
+        return (
+            self.provider.billing_provider_name or self.provider.name,
+            self.model if self.model is not None else cached_model,
+        )
 
     def _uses_runtime_provider_dispatch_runner_for_request(
         self,
@@ -2173,6 +2197,12 @@ class PromptCacheCompactor(ContextCompactor):
         return (
             type(self)._compact_bounded_after_exact_failure
             is PromptCacheCompactor._compact_bounded_after_exact_failure
+            and type(self)._compact_bounded is PromptCacheCompactor._compact_bounded
+        )
+
+    def _uses_runtime_provider_dispatch_runner_for_forced_compaction(self) -> bool:
+        return (
+            type(self).compact is PromptCacheCompactor.compact
             and type(self)._compact_bounded is PromptCacheCompactor._compact_bounded
         )
 
@@ -2382,11 +2412,57 @@ async def _run_compaction_model(
     retry_policy: RetryPolicy,
     observe_completion: Callable[[dict[str, Any]], dict[str, Any]],
 ) -> tuple[str, dict[str, Any]]:
+    try:
+        billing_identity = copy_billing_identity(
+            await provider.billing_identity_for_request(model_request)
+        )
+    except asyncio.CancelledError:
+        raise
+    except ModelProviderError:
+        raise
+    except Exception as exc:
+        raise ModelProviderError(
+            str(exc),
+            provider=provider.name,
+            error_type=type(exc).__name__,
+            error_code="billing_identity_resolution_failed",
+            retryable=False,
+        ) from exc
+
+    def observe_completion_with_billing_identity(
+        completed_metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        observed_metadata = copy_json_value(completed_metadata, "completed_metadata")
+        try:
+            completed_identity = completed_billing_identity(
+                billing_identity,
+                provider.billing_identity_for_completion(
+                    billing_identity,
+                    observed_metadata,
+                ),
+            )
+        except ModelProviderError:
+            raise
+        except Exception as exc:
+            raise ModelProviderError(
+                str(exc),
+                provider=provider.name,
+                error_type=type(exc).__name__,
+                error_code="billing_identity_resolution_failed",
+                retryable=False,
+            ) from exc
+        # Billing identity is runtime-owned. Providers may report facts used by the
+        # hook above, but cannot inject an identity through their raw payload.
+        observed_metadata.pop("billing_identity", None)
+        if completed_identity is not None:
+            observed_metadata["billing_identity"] = completed_identity.model_dump(mode="json")
+        return observe_completion(observed_metadata)
+
     async def dispatch() -> tuple[str, dict[str, Any]]:
         return await _stream_compaction_model(
             provider=provider,
             model_request=model_request,
-            observe_completion=observe_completion,
+            observe_completion=observe_completion_with_billing_identity,
         )
 
     attempt = 1
@@ -2395,7 +2471,12 @@ async def _run_compaction_model(
             run_dispatch = _AUTOMATIC_COMPACTION_DISPATCH_RUNNER.get()
             if run_dispatch is None:
                 return await dispatch()
-            return await run_dispatch(provider.name, model_request.model, dispatch)
+            return await run_dispatch(
+                provider,
+                model_request.model,
+                billing_identity,
+                dispatch,
+            )
         except ModelProviderError as exc:
             decision = retry_decision(
                 policy=retry_policy,
@@ -2476,8 +2557,8 @@ def _provider_compaction_result(
     metadata: dict[str, Any],
 ) -> CompactionResult:
     provider_name = require_clean_nonblank(provider.name, "provider.name")
-    # A completed provider call is real spend even when its text is unusable. Build the
-    # attributable payload before validating the summary so the failure path can account for it.
+    # Build attributable evidence before validating the summary so completed spend
+    # survives an unusable-text failure.
     model_completed_payload = _compaction_model_completed_payload(
         completed_payload=completed_metadata,
         provider_name=provider_name,
@@ -3607,6 +3688,7 @@ def _provider_completed_metadata(payload: dict[str, Any]) -> dict[str, Any]:
     if type(copied) is not dict:
         raise ValueError("Provider completed payload must be an object.")
     copied.pop("provider_state", None)
+    strip_provider_billing_identity(copied)
     return copied
 
 
@@ -3635,6 +3717,12 @@ def _compaction_model_completed_payload(
     payload["requested_model"] = fallback_model
     payload["purpose"] = "context_compaction"
     payload["compactor"] = compactor
+    raw_billing_identity = payload.get("billing_identity")
+    billing_identity = (
+        BillingIdentity.model_validate(raw_billing_identity)
+        if type(raw_billing_identity) is dict
+        else None
+    )
     usage_metrics = usage_metrics_payload(
         normalize_usage_metrics(
             provider_name=provider_name,
@@ -3642,9 +3730,13 @@ def _compaction_model_completed_payload(
             requested_model=fallback_model,
             raw_usage=payload.get("usage"),
             usage_dialect=usage_dialect,
+            billing_identity=billing_identity,
         )
     )
     if usage_metrics is not None:
+        # The event-level identity is the only durable authority. Readers attach
+        # it to parsed usage after validating the completion payload.
+        usage_metrics.pop("billing_identity", None)
         payload["usage_metrics"] = usage_metrics
     return payload
 

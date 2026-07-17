@@ -9,7 +9,11 @@ import pytest
 from tests.core._budget_ledger_contract import assert_idempotent_terminal_settlements
 
 from cayu.core import Event, EventType, Message
-from cayu.providers import UsageDialect
+from cayu.providers import (
+    UsageDialect,
+    bedrock_billing_identity,
+    completed_bedrock_billing_identity,
+)
 from cayu.runtime import (
     BudgetLimit,
     BudgetPolicy,
@@ -52,6 +56,7 @@ from cayu.runtime.usage import (
     usage_metrics_from_event_payload,
 )
 from cayu.storage import SQLiteBudgetLedger, SQLiteSessionStore
+from cayu.storage import migrations as schema_migrations
 
 
 class MutableClock:
@@ -86,6 +91,40 @@ def test_normalize_openai_usage_metrics() -> None:
     assert metrics.cache.write_tokens == 0
     assert metrics.cache.cached_input_tokens == 60
     assert metrics.cache.uncached_input_tokens == 40
+
+
+def test_usage_event_promotes_and_validates_the_durable_billing_identity() -> None:
+    identity = bedrock_billing_identity(
+        invoked_model="global.anthropic.claude-sonnet-4-6",
+        source_region="us-east-1",
+        resource_type="inference_profile",
+        profile_scope="global",
+    )
+    payload = {
+        "billing_identity": identity.model_dump(mode="json"),
+        "usage_metrics": {
+            "provider_name": "bedrock",
+            "model": identity.resource_id,
+            "input_tokens": 1,
+            "total_tokens": 1,
+        },
+    }
+
+    metrics = usage_metrics_from_event_payload(payload)
+
+    assert metrics is not None
+    assert metrics.billing_identity == identity
+
+    payload["usage_metrics"]["billing_identity"] = identity.model_copy(
+        update={
+            "request_evidence": {
+                **identity.request_evidence,
+                "source_region": "us-west-2",
+            }
+        }
+    ).model_dump(mode="json")
+    with pytest.raises(ValueError, match="billing identities do not match"):
+        usage_metrics_from_event_payload(payload)
 
 
 def test_normalize_openai_chat_usage_shape() -> None:
@@ -1221,6 +1260,118 @@ def test_sqlite_budget_ledger_database_can_be_shared_with_session_store(tmp_path
     assert session.id == "sess_shared_budget_db"
 
 
+def test_sqlite_budget_ledger_preserves_bedrock_identity_across_reopen(tmp_path) -> None:
+    path = tmp_path / "bedrock-budget.sqlite"
+    requested_identity = bedrock_billing_identity(
+        invoked_model="global.anthropic.claude-sonnet-4-6",
+        source_region="us-east-1",
+        resource_type="inference_profile",
+        profile_scope="global",
+    )
+    completed_identity = completed_bedrock_billing_identity(
+        requested_identity,
+        effective_service_tier="default",
+    )
+    pricing = PriceBook(
+        prices=(
+            ModelPrice.fixed(
+                provider_name="bedrock",
+                model=requested_identity.resource_id,
+                match="exact",
+                input_per_million=Decimal("3"),
+                output_per_million=Decimal("15"),
+                pricing_context={
+                    "source_region": ("us-east-1",),
+                    "service_tier": ("default",),
+                },
+            ),
+        )
+    )
+    limit = BudgetLimit(
+        scope="app",
+        max_estimated_cost=Decimal("20"),
+        pricing=pricing,
+        reservation=BudgetReservation(
+            max_input_tokens=1_000_000,
+            max_output_tokens=1_000_000,
+        ),
+    )
+
+    async def run():
+        first = SQLiteBudgetLedger(path)
+        try:
+            reserved = await first.reserve(
+                limit=limit,
+                session_id="sess_bedrock",
+                agent_name="assistant",
+                provider_name="bedrock",
+                model=requested_identity.resource_id,
+                billing_identity=requested_identity,
+            )
+        finally:
+            await first.close()
+        assert reserved.record is not None
+
+        second = SQLiteBudgetLedger(path)
+        try:
+            reconciled = await second.reconcile(
+                reservation_id=reserved.record.reservation_id,
+                actual_amount=Decimal("9"),
+                reason="model completed",
+                billing_identity=completed_identity,
+            )
+        finally:
+            await second.close()
+        return reserved, reconciled
+
+    reserved, reconciled = asyncio.run(run())
+
+    assert reserved.accepted is True
+    assert reserved.record is not None
+    assert reserved.record.billing_identity == requested_identity
+    assert reconciled.billing_identity == completed_identity
+    assert reconciled.actual_amount == Decimal("9")
+
+
+def test_sqlite_budget_ledger_revision_21_adds_billing_identity_column(tmp_path) -> None:
+    path = tmp_path / "bedrock-budget-migration.sqlite"
+
+    async def create_current_schema() -> None:
+        ledger = SQLiteBudgetLedger(path)
+        await ledger.close()
+
+    asyncio.run(create_current_schema())
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 21")
+        connection.execute("ALTER TABLE cayu_budget_reservations DROP COLUMN billing_identity_json")
+        connection.execute("PRAGMA user_version = 20")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 21"):
+        SQLiteBudgetLedger(path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
+
+    async def migrate() -> None:
+        ledger = SQLiteBudgetLedger(path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
+        await ledger.close()
+
+    asyncio.run(migrate())
+    connection = sqlite3.connect(path)
+    try:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(cayu_budget_reservations)")
+        }
+        revision = connection.execute(
+            "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 21"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert "billing_identity_json" in columns
+    assert revision == ("breaking", 21)
+
+
 def test_sqlite_budget_ledger_migrates_legacy_unprefixed_table(tmp_path) -> None:
     # Before ADR 0001 revision 8 the ledger created an ad-hoc unprefixed
     # `budget_reservations` table. Opening such a database must carry active
@@ -1849,6 +2000,9 @@ def test_normalize_anthropic_usage_metrics() -> None:
     assert metrics.total_tokens == 195
     assert metrics.cache.read_tokens == 70
     assert metrics.cache.write_tokens == 5
+    assert metrics.cache.write_5m_tokens == 2
+    assert metrics.cache.write_1h_tokens == 3
+    assert metrics.cache.write_unknown_ttl_tokens == 0
     assert metrics.cache.cached_input_tokens == 70
     assert metrics.cache.uncached_input_tokens == 100
 
@@ -1875,8 +2029,34 @@ def test_normalize_vertex_usage_metrics_matches_anthropic() -> None:
     assert metrics.total_tokens == 195
     assert metrics.cache.read_tokens == 70
     assert metrics.cache.write_tokens == 5
+    assert metrics.cache.write_5m_tokens == 2
+    assert metrics.cache.write_1h_tokens == 3
+    assert metrics.cache.write_unknown_ttl_tokens == 0
     assert metrics.cache.cached_input_tokens == 70
     assert metrics.cache.uncached_input_tokens == 100
+
+
+def test_normalize_cache_details_take_precedence_over_anthropic_cache_creation() -> None:
+    metrics = normalize_usage_metrics(
+        provider_name="bedrock",
+        model="global.anthropic.claude-sonnet-4-6",
+        raw_usage={
+            "input_tokens": 1,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 7,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 2,
+                "ephemeral_1h_input_tokens": 5,
+            },
+            "cache_details": [{"ttl": "5m", "input_tokens": 7}],
+        },
+    )
+
+    assert metrics is not None
+    assert metrics.cache.write_tokens == 7
+    assert metrics.cache.write_5m_tokens == 7
+    assert metrics.cache.write_1h_tokens == 0
+    assert metrics.cache.write_unknown_ttl_tokens == 0
 
 
 def test_normalize_bedrock_anthropic_shape_by_payload() -> None:

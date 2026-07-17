@@ -15,7 +15,9 @@ import {
   TableRow,
 } from "../components/ui/table"
 import { fetchSessionsSummary, type SessionsSummary, type SessionsSummaryQuery } from "../lib/api"
+import { bedrockBillingRows } from "../lib/bedrock-billing"
 import { dashboardConfig } from "../lib/config"
+import { addDecimalStrings } from "../lib/decimal"
 import { formatCount, formatDateTime, formatDecimal, numericValue } from "../lib/format"
 import { cn } from "../lib/utils"
 
@@ -23,6 +25,7 @@ type SessionStatusFilter = "all" | Exclude<SessionsSummaryQuery["status"], null 
 type UsageBreakdown = NonNullable<SessionsSummary["provider_breakdown"]>[number]
 type UsageSession = SessionsSummary["usage"]["session_summaries"][number]
 type UsageSessionCost = NonNullable<SessionsSummary["cost"]>["session_costs"][number]
+type UsageCostLineItem = NonNullable<SessionsSummary["cost"]>["line_items"][number]
 
 type UsageRollup = {
   sessions: SessionsSummary["sessions"]
@@ -85,6 +88,13 @@ function addUsage(left: UsageBreakdown["usage"], right: UsageBreakdown["usage"])
       read_tokens: numericValue(left.cache?.read_tokens) + numericValue(right.cache?.read_tokens),
       write_tokens:
         numericValue(left.cache?.write_tokens) + numericValue(right.cache?.write_tokens),
+      write_5m_tokens:
+        numericValue(left.cache?.write_5m_tokens) + numericValue(right.cache?.write_5m_tokens),
+      write_1h_tokens:
+        numericValue(left.cache?.write_1h_tokens) + numericValue(right.cache?.write_1h_tokens),
+      write_unknown_ttl_tokens:
+        numericValue(left.cache?.write_unknown_ttl_tokens) +
+        numericValue(right.cache?.write_unknown_ttl_tokens),
       cached_input_tokens:
         numericValue(left.cache?.cached_input_tokens) +
         numericValue(right.cache?.cached_input_tokens),
@@ -93,42 +103,6 @@ function addUsage(left: UsageBreakdown["usage"], right: UsageBreakdown["usage"])
         numericValue(right.cache?.uncached_input_tokens),
     },
   }
-}
-
-function addDecimalStrings(left: string, right: string) {
-  const split = (value: string) => {
-    const trimmed = value.trim()
-    const sign = trimmed.startsWith("-") ? -1n : 1n
-    const unsigned = trimmed.replace(/^[+-]/, "")
-    const [mantissa = "0", exponentText] = unsigned.toLowerCase().split("e")
-    const exponent = exponentText ? Number.parseInt(exponentText, 10) : 0
-    const [wholeRaw = "0", fractionalRaw = ""] = mantissa.split(".")
-    const digits = `${wholeRaw}${fractionalRaw}`.replace(/^0+(?=\d)/, "") || "0"
-    const decimalPlaces = fractionalRaw.length - exponent
-    if (decimalPlaces <= 0) {
-      return { sign, whole: `${digits}${"0".repeat(Math.abs(decimalPlaces))}`, fractional: "" }
-    }
-    if (digits.length > decimalPlaces) {
-      const splitAt = digits.length - decimalPlaces
-      return { sign, whole: digits.slice(0, splitAt), fractional: digits.slice(splitAt) }
-    }
-    return { sign, whole: "0", fractional: `${"0".repeat(decimalPlaces - digits.length)}${digits}` }
-  }
-  const leftParts = split(left)
-  const rightParts = split(right)
-  const precision = Math.max(leftParts.fractional.length, rightParts.fractional.length)
-  const scale = 10n ** BigInt(precision)
-  const parse = (parts: ReturnType<typeof split>) =>
-    parts.sign *
-    (BigInt(parts.whole) * scale + BigInt(parts.fractional.padEnd(precision, "0") || "0"))
-
-  const total = parse(leftParts) + parse(rightParts)
-  const sign = total < 0n ? "-" : ""
-  const absolute = total < 0n ? -total : total
-  if (precision === 0) return `${sign}${absolute.toString()}`
-  const whole = absolute / scale
-  const fractional = (absolute % scale).toString().padStart(precision, "0").replace(/0+$/g, "")
-  return fractional ? `${sign}${whole.toString()}.${fractional}` : `${sign}${whole.toString()}`
 }
 
 function mergeCost(left: SessionsSummary["cost"], right: SessionsSummary["cost"]) {
@@ -336,6 +310,69 @@ function BreakdownTable({
   )
 }
 
+function BedrockBillingBreakdown({
+  lineItems,
+  currency,
+}: {
+  lineItems: UsageCostLineItem[]
+  currency: string
+}) {
+  const rows = useMemo(() => bedrockBillingRows(lineItems), [lineItems])
+
+  if (!rows.length) return null
+  return (
+    <DataCard
+      title="Bedrock Billing Breakdown"
+      description="Exact invocation identity used for pricing; regions, profiles, and tiers are never combined."
+    >
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead>Invoked resource</TableHead>
+            <TableHead>Source region</TableHead>
+            <TableHead>Scope</TableHead>
+            <TableHead>Requested / effective tier</TableHead>
+            <TableHead>Pricing target</TableHead>
+            <TableHead className="text-right">Priced / unpriced</TableHead>
+            <TableHead className="text-right">Cost</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {rows.map((row) => (
+            <TableRow
+              key={JSON.stringify([
+                row.identity.invoked_model,
+                row.identity.source_region,
+                row.identity.resource_type,
+                row.identity.profile_scope,
+                row.identity.requested_service_tier,
+                row.identity.effective_service_tier,
+              ])}
+            >
+              <TableCell className="max-w-80 truncate font-mono text-xs">
+                {row.identity.invoked_model}
+              </TableCell>
+              <TableCell>{row.identity.source_region ?? "unresolved"}</TableCell>
+              <TableCell>{row.identity.profile_scope ?? row.identity.resource_type}</TableCell>
+              <TableCell>
+                {row.identity.requested_service_tier ?? "default"} /{" "}
+                {row.identity.effective_service_tier ?? "not reported"}
+              </TableCell>
+              <TableCell className="max-w-64 truncate font-mono text-xs">
+                {row.pricingModel ?? row.missingReason ?? "unpriced"}
+              </TableCell>
+              <TableCell className="text-right">
+                {formatCount(row.priced)} / {formatCount(row.unpriced)}
+              </TableCell>
+              <TableCell className="text-right">{formatCost(row.totalCost, currency)}</TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </DataCard>
+  )
+}
+
 export function UsagePage() {
   const [search, setSearch] = useState("")
   const [status, setStatus] = useState<SessionStatusFilter>("all")
@@ -495,6 +532,13 @@ export function UsagePage() {
               includeModel
             />
           </div>
+
+          {data.cost && (
+            <BedrockBillingBreakdown
+              lineItems={data.cost.line_items}
+              currency={data.cost.currency}
+            />
+          )}
 
           <DataCard
             title={data.cost ? "Highest Cost Sessions" : "Highest Token Sessions"}

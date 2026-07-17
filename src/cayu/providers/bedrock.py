@@ -9,7 +9,7 @@ import threading
 from collections.abc import AsyncIterator, Mapping, Sequence
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal, get_args
 
 from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.artifacts import (
@@ -17,6 +17,7 @@ from cayu.artifacts import (
     file_attachment_from_payload,
     resolved_file_attachments_from_options,
 )
+from cayu.core.billing import BillingIdentity, PricingContext
 from cayu.core.messages import (
     FilePart,
     MessageRole,
@@ -42,6 +43,127 @@ from cayu.providers.base import (
 DEFAULT_BEDROCK_MAX_TOKENS = 4096
 DEFAULT_BEDROCK_STREAM_IDLE_TIMEOUT_SECONDS = 120.0
 DEFAULT_BEDROCK_STREAM_CLOSE_TIMEOUT_SECONDS = 5.0
+BedrockResourceType = Literal[
+    "foundation_model",
+    "inference_profile",
+    "application_inference_profile",
+    "provisioned_model",
+    "custom_model",
+    "marketplace_endpoint",
+    "prompt",
+    "unknown",
+]
+BedrockProfileScope = Literal["global", "geographic"]
+_BEDROCK_RESOURCE_TYPES = frozenset(get_args(BedrockResourceType))
+_BEDROCK_PROFILE_SCOPES = frozenset(get_args(BedrockProfileScope))
+
+
+def bedrock_billing_identity(
+    *,
+    invoked_model: str,
+    source_region: str | None,
+    resource_type: BedrockResourceType,
+    profile_scope: BedrockProfileScope | None = None,
+    requested_service_tier: str = "default",
+    effective_service_tier: str | None = None,
+) -> BillingIdentity:
+    """Build Bedrock evidence inside the provider-specific adapter boundary."""
+
+    invoked_model = require_clean_nonblank(invoked_model, "invoked_model")
+    if source_region is not None:
+        source_region = require_clean_nonblank(source_region, "source_region")
+    requested_service_tier = require_clean_nonblank(
+        requested_service_tier,
+        "requested_service_tier",
+    )
+    if effective_service_tier is not None:
+        effective_service_tier = require_clean_nonblank(
+            effective_service_tier,
+            "effective_service_tier",
+        )
+    if resource_type not in _BEDROCK_RESOURCE_TYPES:
+        raise ValueError(f"Unsupported Bedrock resource_type: {resource_type!r}.")
+    if profile_scope is not None and profile_scope not in _BEDROCK_PROFILE_SCOPES:
+        raise ValueError(f"Unsupported Bedrock profile_scope: {profile_scope!r}.")
+    if profile_scope is not None and resource_type != "inference_profile":
+        raise ValueError("profile_scope is only valid for system inference profiles.")
+    request_evidence: dict[str, Any] = {
+        "resource_type": resource_type,
+        "requested_service_tier": requested_service_tier,
+    }
+    if source_region is not None:
+        request_evidence["source_region"] = source_region
+    if profile_scope is not None:
+        request_evidence["profile_scope"] = profile_scope
+    completion_evidence = (
+        {} if effective_service_tier is None else {"effective_service_tier": effective_service_tier}
+    )
+    service_tiers = (
+        (effective_service_tier,)
+        if effective_service_tier is not None
+        else ("reserved", "default")
+        if requested_service_tier == "reserved"
+        else (requested_service_tier,)
+    )
+    pricing_contexts = (
+        ()
+        if source_region is None
+        else tuple(
+            PricingContext(
+                dimensions={
+                    "source_region": source_region,
+                    "service_tier": service_tier,
+                }
+            )
+            for service_tier in service_tiers
+        )
+    )
+    return BillingIdentity(
+        provider_name="bedrock",
+        resource_id=invoked_model,
+        request_evidence=request_evidence,
+        completion_evidence=completion_evidence,
+        pricing_contexts=pricing_contexts,
+    )
+
+
+def completed_bedrock_billing_identity(
+    requested: BillingIdentity,
+    *,
+    effective_service_tier: str,
+) -> BillingIdentity:
+    """Attach Bedrock completion evidence inside the provider adapter boundary."""
+
+    if requested.provider_name != "bedrock":
+        raise ValueError("Bedrock completion requires a Bedrock billing identity.")
+    effective_service_tier = require_clean_nonblank(
+        effective_service_tier,
+        "effective_service_tier",
+    )
+    source_region = requested.request_evidence.get("source_region")
+    if source_region is not None and type(source_region) is not str:
+        raise ValueError("Bedrock request billing evidence is invalid.")
+    pricing_contexts = (
+        ()
+        if source_region is None
+        else (
+            PricingContext(
+                dimensions={
+                    "source_region": source_region,
+                    "service_tier": effective_service_tier,
+                }
+            ),
+        )
+    )
+    return BillingIdentity(
+        provider_name=requested.provider_name,
+        resource_id=requested.resource_id,
+        request_evidence=requested.request_evidence,
+        completion_evidence={"effective_service_tier": effective_service_tier},
+        pricing_contexts=pricing_contexts,
+    )
+
+
 BEDROCK_STREAM_QUEUE_SIZE = 32
 
 _RESERVED_BEDROCK_OPTIONS = frozenset({"modelId", "messages", "system", "toolConfig"})
@@ -134,6 +256,7 @@ class BedrockProvider(ModelProvider):
     """Amazon Bedrock Converse adapter for Cayu's provider-neutral runtime."""
 
     name = "bedrock"
+    billing_provider_name = "bedrock"
     usage_dialect = UsageDialect.ANTHROPIC
 
     def __init__(
@@ -173,6 +296,60 @@ class BedrockProvider(ModelProvider):
         if not self._owns_client:
             return
         await asyncio.to_thread(self._close_owned_client)
+
+    async def billing_identity_for_request(
+        self,
+        request: ModelRequest,
+    ) -> BillingIdentity:
+        options = request.options.get("bedrock", {})
+        if options is None:
+            options = {}
+        if type(options) is not dict:
+            raise ValueError("ModelRequest.options['bedrock'] must be an object.")
+        requested_tier = _requested_service_tier(options)
+        source_region = None
+        client = self._client
+        if client is not None:
+            meta = getattr(client, "meta", None)
+            source_region = _optional_clean_string(
+                getattr(meta, "region_name", None),
+                "client.meta.region_name",
+            )
+        if source_region is None:
+            source_region = self.region_name
+        if source_region is None:
+            client = await self._get_client()
+            meta = getattr(client, "meta", None)
+            source_region = _optional_clean_string(
+                getattr(meta, "region_name", None),
+                "client.meta.region_name",
+            )
+        resource_type, profile_scope = _bedrock_resource_identity(request.model)
+        return bedrock_billing_identity(
+            invoked_model=request.model,
+            source_region=source_region,
+            resource_type=resource_type,
+            profile_scope=profile_scope,
+            requested_service_tier=requested_tier,
+        )
+
+    def billing_identity_for_completion(
+        self,
+        identity: BillingIdentity | None,
+        payload: dict[str, Any],
+    ) -> BillingIdentity | None:
+        if identity is None:
+            return None
+        effective_tier = payload.get("bedrock_service_tier")
+        if effective_tier is None:
+            return identity
+        if type(effective_tier) is not str:
+            raise BedrockProtocolError("Bedrock effective service tier must be a string.")
+        effective_tier = require_clean_nonblank(effective_tier, "bedrock_service_tier")
+        return completed_bedrock_billing_identity(
+            identity,
+            effective_service_tier=effective_tier,
+        )
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         try:
@@ -468,6 +645,10 @@ async def bedrock_converse_stream_events(
     metrics = metadata.get("metrics")
     if metrics is not None:
         payload["metrics"] = copy_json_value(metrics, "bedrock metrics")
+    service_tier = metadata.get("serviceTier")
+    if service_tier is not None:
+        service_tier_payload = _mapping(service_tier, "metadata.serviceTier")
+        payload["bedrock_service_tier"] = _required_string(service_tier_payload, "type")
     yield ModelStreamEvent.completed(payload)
 
 
@@ -698,7 +879,7 @@ def _bedrock_tool(tool: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _canonical_bedrock_usage(usage: Mapping[str, Any]) -> dict[str, int]:
+def _canonical_bedrock_usage(usage: Mapping[str, Any]) -> dict[str, Any]:
     keys = {
         "inputTokens": "input_tokens",
         "outputTokens": "output_tokens",
@@ -706,7 +887,7 @@ def _canonical_bedrock_usage(usage: Mapping[str, Any]) -> dict[str, int]:
         "cacheReadInputTokens": "cache_read_input_tokens",
         "cacheWriteInputTokens": "cache_creation_input_tokens",
     }
-    result: dict[str, int] = {}
+    result: dict[str, Any] = {}
     for source, target in keys.items():
         if source not in usage:
             continue
@@ -714,7 +895,68 @@ def _canonical_bedrock_usage(usage: Mapping[str, Any]) -> dict[str, int]:
         if type(value) is not int or value < 0:
             raise BedrockProtocolError(f"Bedrock usage {source} must be a non-negative integer.")
         result[target] = value
+    cache_details = usage.get("cacheDetails")
+    if cache_details is not None:
+        if not isinstance(cache_details, Sequence) or isinstance(cache_details, (str, bytes)):
+            raise BedrockProtocolError("Bedrock usage cacheDetails must be an array.")
+        canonical_details: list[dict[str, Any]] = []
+        for index, raw_detail in enumerate(cache_details):
+            detail = _mapping(raw_detail, f"metadata.usage.cacheDetails[{index}]")
+            ttl = _required_string(detail, "ttl")
+            input_tokens = _nonnegative_int(detail.get("inputTokens"), "inputTokens")
+            canonical_details.append({"ttl": ttl, "input_tokens": input_tokens})
+        result["cache_details"] = canonical_details
     return result
+
+
+def _requested_service_tier(options: Mapping[str, Any]) -> str:
+    service_tier = options.get("serviceTier")
+    if service_tier is None:
+        return "default"
+    if not isinstance(service_tier, Mapping):
+        raise ValueError("Bedrock serviceTier must be an object.")
+    return _required_string(service_tier, "type")
+
+
+def _bedrock_resource_identity(
+    model_id: str,
+) -> tuple[BedrockResourceType, BedrockProfileScope | None]:
+    """Classify only syntax Bedrock documents; opaque ARNs stay opaque."""
+
+    if model_id.startswith("arn:"):
+        arn_fields = model_id.split(":", 5)
+        if len(arn_fields) != 6 or arn_fields[2] != "bedrock":
+            return "unknown", None
+        resource = arn_fields[5]
+        if resource.startswith("application-inference-profile/"):
+            return "application_inference_profile", None
+        if resource.startswith("inference-profile/"):
+            profile_id = resource.removeprefix("inference-profile/")
+            return "inference_profile", _bedrock_profile_scope(profile_id)
+        if resource.startswith("provisioned-model/"):
+            return "provisioned_model", None
+        if resource.startswith(("custom-model/", "imported-model/")):
+            return "custom_model", None
+        if resource.startswith(("endpoint/", "marketplace-model-endpoint/")):
+            return "marketplace_endpoint", None
+        if resource.startswith("prompt/"):
+            return "prompt", None
+        if resource.startswith("foundation-model/"):
+            return "foundation_model", None
+        return "unknown", None
+    profile_scope = _bedrock_profile_scope(model_id)
+    if profile_scope is not None:
+        return "inference_profile", profile_scope
+    return "foundation_model", None
+
+
+def _bedrock_profile_scope(model_id: str) -> BedrockProfileScope | None:
+    prefix, separator, _ = model_id.partition(".")
+    if separator and prefix == "global":
+        return "global"
+    if separator and prefix in {"us", "us-gov", "eu", "apac", "au", "jp"}:
+        return "geographic"
+    return None
 
 
 def _raise_stream_error(raw: Mapping[str, Any]) -> None:

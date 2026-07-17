@@ -96,6 +96,7 @@ RECOMMENDATION_PAGES = {
     "google": "https://ai.google.dev/gemini-api/docs/models",
     "vertex": "https://cloud.google.com/vertex-ai/generative-ai/docs/partner-models/use-claude",
     "azure": "https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure",
+    "bedrock": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
 }
 
 RECOMMENDATION_SCHEMA = {

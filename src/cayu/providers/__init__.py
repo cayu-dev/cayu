@@ -38,8 +38,10 @@ from cayu.providers.bedrock import (
     BedrockError,
     BedrockProtocolError,
     BedrockProvider,
+    bedrock_billing_identity,
     bedrock_converse_stream_events,
     build_bedrock_converse_payload,
+    completed_bedrock_billing_identity,
 )
 from cayu.providers.cache import CacheBreakpoint, CachePolicy
 from cayu.providers.chat_completions import (
@@ -129,6 +131,7 @@ __all__ = [
     "VertexTransport",
     "anthropic_response_events",
     "anthropic_stream_events",
+    "bedrock_billing_identity",
     "bedrock_converse_stream_events",
     "build_anthropic_payload",
     "build_bedrock_converse_payload",
@@ -136,6 +139,7 @@ __all__ = [
     "build_openai_embedding_payload",
     "build_openai_payload",
     "chat_completions_stream_events",
+    "completed_bedrock_billing_identity",
     "copy_input_token_count_result",
     "copy_model_context_pressure_profile",
     "copy_model_stream_event",

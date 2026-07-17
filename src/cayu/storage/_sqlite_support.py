@@ -590,6 +590,7 @@ _MIGRATION_STEPS: dict[int, str] = {
         END;
 
     """,
+    21: "",
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -781,12 +782,28 @@ def _backfill_pending_action_event_batch(
     return int(sequence_rows[-1]["sequence"])
 
 
+def _add_budget_billing_identity_if_present(connection: sqlite3.Connection) -> None:
+    """Add revision-21 evidence when this database owns a budget ledger table."""
+
+    exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cayu_budget_reservations'"
+    ).fetchone()
+    if exists is not None:
+        _add_column_if_missing(
+            connection,
+            "cayu_budget_reservations",
+            "billing_identity_json",
+            "TEXT",
+        )
+
+
 # Per-revision Python follow-ups that cannot be expressed as unconditional DDL
 # (e.g. conditionally carrying data out of a legacy ad-hoc table). Each hook runs
 # after its revision's DDL and before the revision is recorded.
 _MIGRATION_HOOKS: dict[int, Callable[[sqlite3.Connection], None]] = {
     8: _migrate_legacy_budget_reservations,
     14: _backfill_session_activity,
+    21: _add_budget_billing_identity_if_present,
 }
 
 _REVISION_17_INDEX_NAMES = frozenset(

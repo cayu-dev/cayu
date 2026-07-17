@@ -44,11 +44,13 @@ these provider keys:
 - `google` — Gemini API / AI Studio
 - `vertex` — Google Cloud Vertex AI
 - `azure` — Azure OpenAI
+- `bedrock` — Amazon Bedrock Runtime
 
-Amazon Bedrock is not yet bundled. Regional inference profiles and Bedrock-specific
-billing dimensions need their own explicit identities; issue #310 tracks that work on
-top of the price-book boundary. Applications can provide a complete custom `PriceBook`
-for Bedrock or another gateway today.
+The Bedrock subset is deliberately narrow: Global Claude Sonnet 4.6 at the Standard
+(`default` on the wire) service tier, from the source regions documented by its AWS model
+card. Geographic profiles, direct regional invocation, Reserved/Priority/Flex tiers,
+provisioned throughput, negotiated rates, and other models require a complete
+application-owned `PriceBook`.
 
 Provider names are part of both model and price identity. Model aliases never alias a
 provider name. Account discounts, regional premiums, negotiated rates, taxes, invoice
@@ -84,6 +86,47 @@ prices = PriceBook(
 
 `fixed()` creates one application-owned schedule without a start or end date. It is
 appropriate only when the application deliberately owns an indefinite rate.
+
+## Amazon Bedrock billing identity
+
+Bedrock pricing resolves from the exact `modelId` sent to `ConverseStream`, the source
+region of the Boto client, and the requested/effective service tier. Omitting
+`serviceTier` means Standard and is represented as `default`. When Bedrock reports an
+effective tier, reconciliation uses it; a Reserved request without a reported effective
+tier is unpriced because AWS may overflow it to Standard.
+
+Contextual Bedrock prices must use `match="exact"` and a `pricing_context` whose
+`dimensions` contain exactly `source_region` and `service_tier`; aliases and prefixes
+are rejected. Global and geographic inference profiles therefore cannot cross-match,
+nor can two source regions or tiers. An unresolved region or unsupported tier stays
+visibly unpriced and strict budgets fail closed before dispatch.
+
+Existing application price books must migrate every legacy
+`provider_name="bedrock"` row before upgrading: add a `pricing_context` with the exact
+source-region and service-tier sets, splitting a row when regions or tiers have
+different rates.
+Cayu rejects provider/model-only Bedrock rows during `PriceBook` validation instead of
+silently leaving them unmatched. Use `service_tier=["default"]` for Standard on-demand
+pricing; add a separate `reserved` selector only when the application has an explicit
+Reserved rate.
+
+Application inference-profile ARNs are opaque. Cayu never calls `GetInferenceProfile`
+or guesses the underlying model. An application must either price the exact ARN or add a
+`PricingResourceMapping(provider_name="bedrock", resource_id=...,
+pricing_model=...)` to its price book. Provisioned-throughput and negotiated prices
+likewise remain explicit application data; Cayu does not invent per-token amortization
+for fixed commitments.
+
+Contextual providers that distinguish cache-write TTLs can declare
+`requires_cache_write_ttls=True` in their `ContextualPricingRequirement`. A price may
+also opt into that behavior directly by listing `cache_write_ttls`. Otherwise a
+provider-neutral billing identity continues to use the ordinary
+`cache_write_input_per_million` rate.
+
+Bedrock cache-write usage retains the reported 5-minute and 1-hour token breakdown.
+Unknown-TTL writes are priced only when the contextual price's `cache_write_ttls`
+declares exactly one supported TTL (or all applicable TTL rates are equal); otherwise
+the whole step is unpriced rather than applying a guessed rate.
 
 ## Effective dates and reconstruction
 

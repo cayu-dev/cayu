@@ -28,6 +28,7 @@ from cayu import (
     TaskCreate,
     TaskQuery,
 )
+from cayu.providers import bedrock_billing_identity, completed_bedrock_billing_identity
 from cayu.runtime import BudgetLimit, BudgetReservation, BudgetWindow, ModelPrice, PriceBook
 from cayu.storage import migrations as schema
 from cayu.storage.migrations import SchemaMode
@@ -496,6 +497,78 @@ def test_postgres_budget_ledger_heartbeat_and_reconcile_serialize_same_reservati
     assert reconciled.actual_amount == Decimal("0.01")
     assert replacement.accepted is True
     assert replacement.actual == Decimal("0.23")
+
+
+def test_postgres_budget_ledger_preserves_bedrock_identity_across_reopen(
+    postgres_dsn: str,
+) -> None:
+    requested_identity = bedrock_billing_identity(
+        invoked_model="global.anthropic.claude-sonnet-4-6",
+        source_region="us-east-1",
+        resource_type="inference_profile",
+        profile_scope="global",
+    )
+    completed_identity = completed_bedrock_billing_identity(
+        requested_identity,
+        effective_service_tier="default",
+    )
+    limit = BudgetLimit(
+        scope="app",
+        max_estimated_cost=Decimal("20"),
+        pricing=PriceBook(
+            prices=(
+                ModelPrice.fixed(
+                    provider_name="bedrock",
+                    model=requested_identity.resource_id,
+                    match="exact",
+                    input_per_million=Decimal("3"),
+                    output_per_million=Decimal("15"),
+                    pricing_context={
+                        "source_region": ("us-east-1",),
+                        "service_tier": ("default",),
+                    },
+                ),
+            )
+        ),
+        reservation=BudgetReservation(
+            max_input_tokens=1_000_000,
+            max_output_tokens=1_000_000,
+        ),
+    )
+
+    async def run():
+        await drop_cayu_tables(postgres_dsn)
+        first = PostgresBudgetLedger(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            reserved = await first.reserve(
+                limit=limit,
+                session_id="sess_bedrock",
+                agent_name="assistant",
+                provider_name="bedrock",
+                model=requested_identity.resource_id,
+                billing_identity=requested_identity,
+            )
+        finally:
+            await first.close()
+        assert reserved.record is not None
+
+        second = PostgresBudgetLedger(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
+        try:
+            reconciled = await second.reconcile(
+                reservation_id=reserved.record.reservation_id,
+                actual_amount=Decimal("9"),
+                reason="model completed",
+                billing_identity=completed_identity,
+            )
+        finally:
+            await second.close()
+        return reserved, reconciled
+
+    reserved, reconciled = asyncio.run(run())
+
+    assert reserved.record is not None
+    assert reserved.record.billing_identity == requested_identity
+    assert reconciled.billing_identity == completed_identity
 
 
 def test_postgres_budget_ledger_reaps_only_the_advisory_locked_budget(

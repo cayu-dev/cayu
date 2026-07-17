@@ -18,6 +18,7 @@ from cayu.core.messages import (
     copy_message_part,
 )
 from cayu.runtime._runtime_records import ToolCallOutcome, ToolCallRequest
+from cayu.runtime.usage import strip_provider_billing_identity
 
 
 @dataclass
@@ -162,6 +163,7 @@ def model_completed_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if type(copied) is not dict:
         raise ValueError("Model completed payload must be an object.")
     copied.pop("provider_state", None)
+    strip_provider_billing_identity(copied)
     return copied
 
 

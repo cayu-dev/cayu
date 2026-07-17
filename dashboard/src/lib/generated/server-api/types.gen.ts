@@ -1074,6 +1074,42 @@ export type ArtifactsResponse = {
 };
 
 /**
+ * BillingIdentity
+ *
+ * Provider-neutral commercial identity and possible pricing contexts.
+ *
+ * Providers own the meaning of their evidence. Core preserves it durably and
+ * enforces that completion cannot rewrite request evidence or widen the set of
+ * pricing outcomes established before dispatch.
+ */
+export type BillingIdentity = {
+    /**
+     * Completion Evidence
+     */
+    completion_evidence?: {
+        [key: string]: unknown;
+    };
+    /**
+     * Pricing Contexts
+     */
+    pricing_contexts?: Array<PricingContext>;
+    /**
+     * Provider Name
+     */
+    provider_name: string;
+    /**
+     * Request Evidence
+     */
+    request_evidence?: {
+        [key: string]: unknown;
+    };
+    /**
+     * Resource Id
+     */
+    resource_id: string;
+};
+
+/**
  * BudgetLimit
  *
  * Estimated-cost budget that applies across one durable runtime scope.
@@ -1175,9 +1211,21 @@ export type CacheUsageMetrics = {
      */
     uncached_input_tokens?: number;
     /**
+     * Write 1H Tokens
+     */
+    write_1h_tokens?: number;
+    /**
+     * Write 5M Tokens
+     */
+    write_5m_tokens?: number;
+    /**
      * Write Tokens
      */
     write_tokens?: number;
+    /**
+     * Write Unknown Ttl Tokens
+     */
+    write_unknown_ttl_tokens?: number;
 };
 
 /**
@@ -1336,11 +1384,32 @@ export type CompactSessionBody = {
 };
 
 /**
+ * ContextualPricingRequirement
+ *
+ * Commercial constraints every contextual price for one provider must declare.
+ */
+export type ContextualPricingRequirement = {
+    /**
+     * Dimensions
+     */
+    dimensions: Array<string>;
+    /**
+     * Provider Name
+     */
+    provider_name: string;
+    /**
+     * Requires Cache Write Ttls
+     */
+    requires_cache_write_ttls?: boolean;
+};
+
+/**
  * CostLineItem
  *
  * Estimated cost for one model.completed event.
  */
 export type CostLineItem = {
+    billing_identity?: BillingIdentity | null;
     /**
      * Cache Read Input Cost
      */
@@ -1350,6 +1419,14 @@ export type CostLineItem = {
      */
     cache_read_input_tokens: number;
     /**
+     * Cache Write 1H Input Tokens
+     */
+    cache_write_1h_input_tokens?: number;
+    /**
+     * Cache Write 5M Input Tokens
+     */
+    cache_write_5m_input_tokens?: number;
+    /**
      * Cache Write Input Cost
      */
     cache_write_input_cost: string;
@@ -1357,6 +1434,10 @@ export type CostLineItem = {
      * Cache Write Input Tokens
      */
     cache_write_input_tokens: number;
+    /**
+     * Cache Write Unknown Ttl Input Tokens
+     */
+    cache_write_unknown_ttl_input_tokens?: number;
     /**
      * Currency
      */
@@ -1404,7 +1485,7 @@ export type CostLineItem = {
     /**
      * Pricing Match
      */
-    pricing_match?: 'exact' | 'prefix' | null;
+    pricing_match?: 'exact' | 'prefix' | 'resource_mapping' | null;
     /**
      * Pricing Model
      */
@@ -1583,6 +1664,10 @@ export type ModelPrice = {
      */
     aliases?: Array<string>;
     /**
+     * Cache Write Ttls
+     */
+    cache_write_ttls?: Array<'5m' | '1h'>;
+    /**
      * Match
      */
     match?: 'exact' | 'prefix';
@@ -1594,6 +1679,7 @@ export type ModelPrice = {
      * Model
      */
     model: string;
+    pricing_context?: PricingContextSelector | null;
     /**
      * Provider Name
      */
@@ -1782,6 +1868,10 @@ export type PendingKnowledgeListResponse = {
  */
 export type PriceBook = {
     /**
+     * Contextual Pricing Requirements
+     */
+    contextual_pricing_requirements?: Array<ContextualPricingRequirement>;
+    /**
      * Generated At
      */
     generated_at?: string;
@@ -1793,6 +1883,10 @@ export type PriceBook = {
      * Prices
      */
     prices: Array<ModelPrice>;
+    /**
+     * Resource Mappings
+     */
+    resource_mappings?: Array<PricingResourceMapping>;
 };
 
 /**
@@ -1842,6 +1936,54 @@ export type PriceTier = {
      * Output Per Million
      */
     output_per_million: number | string;
+};
+
+/**
+ * PricingContext
+ *
+ * One exact set of commercial dimensions that may price a dispatch.
+ */
+export type PricingContext = {
+    /**
+     * Dimensions
+     */
+    dimensions: {
+        [key: string]: string;
+    };
+};
+
+/**
+ * PricingContextSelector
+ *
+ * Exact pricing dimensions accepted by one contextual price row.
+ */
+export type PricingContextSelector = {
+    /**
+     * Dimensions
+     */
+    dimensions: {
+        [key: string]: Array<string>;
+    };
+};
+
+/**
+ * PricingResourceMapping
+ *
+ * Map one opaque provider resource to an explicit pricing model.
+ */
+export type PricingResourceMapping = {
+    /**
+     * Pricing Model
+     */
+    pricing_model: string;
+    /**
+     * Provider Name
+     */
+    provider_name: string;
+    /**
+     * Resource Id
+     */
+    resource_id: string;
 };
 
 /**
@@ -2557,8 +2699,9 @@ export type ThinkingConfig = {
  * Only the context-band ``standard`` tiers feed the cost engine today. A tier-local
  * cache-write rate takes precedence over the model-wide
  * ``cache_write_5m_per_million`` fallback.
- * ``batch`` and ``cache_write_1h_per_million`` are carried for completeness and future
- * use — they are NOT auto-applied by ``estimate_session_cost``.
+ * ``batch`` is carried for completeness and future use. Contextual pricing
+ * applies ``cache_write_1h_per_million`` only to usage explicitly attributed
+ * to a one-hour cache write.
  */
 export type TieredPricing = {
     batch?: PriceTier | null;
@@ -2825,6 +2968,7 @@ export type UsageBreakdownItem = {
  * Provider-neutral token counters for one model step.
  */
 export type UsageMetrics = {
+    billing_identity?: BillingIdentity | null;
     cache?: CacheUsageMetrics;
     /**
      * Input Tokens

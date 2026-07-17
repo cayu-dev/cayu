@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from collections.abc import Callable
 from datetime import datetime, timedelta
@@ -8,6 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from cayu._validation import require_clean_nonblank, require_nonblank
+from cayu.core.billing import BillingIdentity
 from cayu.runtime.budgets import (
     DEFAULT_RESERVATION_TTL_SECONDS,
     BudgetLedger,
@@ -31,7 +33,7 @@ from cayu.runtime.budgets import (
 from . import _sqlite_support as sqlite_support
 from . import migrations as schema
 
-_SQLITE_MIN_REQUIRED_REVISION = 18
+_SQLITE_MIN_REQUIRED_REVISION = 21
 
 
 class SQLiteBudgetLedger(BudgetLedger):
@@ -82,6 +84,7 @@ class SQLiteBudgetLedger(BudgetLedger):
         agent_name: str,
         provider_name: str,
         model: str,
+        billing_identity: BillingIdentity | None = None,
     ) -> BudgetReservationResult:
         if type(limit) is not BudgetLimit:
             raise TypeError("limit must be a BudgetLimit.")
@@ -98,6 +101,7 @@ class SQLiteBudgetLedger(BudgetLedger):
                     provider_name=provider_name,
                     model=model,
                     effective_at=now,
+                    billing_identity=billing_identity,
                 )
                 self._reap_expired_unlocked(now, limit=limit)
                 current = self._used_amount_unlocked(limit, now=now)
@@ -124,6 +128,7 @@ class SQLiteBudgetLedger(BudgetLedger):
                     agent_name=agent_name,
                     provider_name=provider_name,
                     model=model,
+                    billing_identity=billing_identity,
                     reserved_amount=requested,
                     created_at=now,
                     updated_at=now,
@@ -174,6 +179,7 @@ class SQLiteBudgetLedger(BudgetLedger):
         actual_amount: Decimal,
         reason: str | None = None,
         occurred_at: datetime | None = None,
+        billing_identity: BillingIdentity | None = None,
     ) -> BudgetReconciliation:
         reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
         actual_amount = _validate_amount(actual_amount, "actual_amount")
@@ -191,6 +197,7 @@ class SQLiteBudgetLedger(BudgetLedger):
                     actual_amount=actual_amount,
                     reason=reason,
                     updated_at=reconciled_at,
+                    billing_identity=billing_identity,
                 )
                 self._update_record_unlocked(reconciled)
                 self._connection.commit()
@@ -315,6 +322,7 @@ class SQLiteBudgetLedger(BudgetLedger):
                 agent_name,
                 provider_name,
                 model,
+                billing_identity_json,
                 reserved_amount,
                 actual_amount,
                 status,
@@ -322,7 +330,7 @@ class SQLiteBudgetLedger(BudgetLedger):
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.reservation_id,
@@ -334,6 +342,11 @@ class SQLiteBudgetLedger(BudgetLedger):
                 record.agent_name,
                 record.provider_name,
                 record.model,
+                (
+                    None
+                    if record.billing_identity is None
+                    else record.billing_identity.model_dump_json()
+                ),
                 str(record.reserved_amount),
                 None if record.actual_amount is None else str(record.actual_amount),
                 record.status,
@@ -349,6 +362,7 @@ class SQLiteBudgetLedger(BudgetLedger):
             """
             UPDATE cayu_budget_reservations
             SET actual_amount = ?,
+                billing_identity_json = ?,
                 status = ?,
                 reason = ?,
                 updated_at = ?
@@ -356,6 +370,11 @@ class SQLiteBudgetLedger(BudgetLedger):
             """,
             (
                 None if record.actual_amount is None else str(record.actual_amount),
+                (
+                    None
+                    if record.billing_identity is None
+                    else record.billing_identity.model_dump_json()
+                ),
                 record.status,
                 record.reason,
                 updated_at,
@@ -369,7 +388,8 @@ class SQLiteBudgetLedger(BudgetLedger):
         row = self._connection.execute(
             """
             SELECT reservation_id, scope, budget_key, budget_window, currency, session_id,
-                   agent_name, provider_name, model, reserved_amount, actual_amount,
+                   agent_name, provider_name, model, billing_identity_json,
+                   reserved_amount, actual_amount,
                    status, reason, created_at, updated_at
             FROM cayu_budget_reservations
             WHERE reservation_id = ?
@@ -388,6 +408,11 @@ class SQLiteBudgetLedger(BudgetLedger):
             agent_name=row["agent_name"],
             provider_name=row["provider_name"],
             model=row["model"],
+            billing_identity=(
+                None
+                if row["billing_identity_json"] is None
+                else BillingIdentity.model_validate(json.loads(row["billing_identity_json"]))
+            ),
             reserved_amount=Decimal(row["reserved_amount"]),
             actual_amount=(None if row["actual_amount"] is None else Decimal(row["actual_amount"])),
             status=row["status"],

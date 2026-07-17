@@ -113,7 +113,7 @@ from cayu.storage import migrations as schema
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = 20
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = 21
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
     contains_style="sqlite_nocase_like",

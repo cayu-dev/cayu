@@ -143,6 +143,12 @@ REVISIONS: tuple[Revision, ...] = (
     # their existing live fan-out, so the schema remains additive and preserves
     # revision 19's compatibility floor.
     Revision(revision=20, kind=RevisionKind.ADDITIVE, compatible_from=19),
+    # Budget reservations now persist the provider billing identity used for
+    # admission, and model.completed usage payloads add billing/cache dimensions
+    # that pre-21 readers reject. The SQL is additive, but the durable event
+    # contract is not safe for mixed-version readers, so raise the compatibility
+    # floor and block rolling deploys or app-only rollbacks across this revision.
+    Revision(revision=21, kind=RevisionKind.BREAKING, compatible_from=21),
 )
 
 #: The revision an empty database is initialized to.

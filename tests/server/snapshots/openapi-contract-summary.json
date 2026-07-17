@@ -2062,6 +2062,44 @@
       "title": "ArtifactsResponse",
       "type": "object"
     },
+    "BillingIdentity": {
+      "additionalProperties": false,
+      "description": "Provider-neutral commercial identity and possible pricing contexts.\n\nProviders own the meaning of their evidence. Core preserves it durably and\nenforces that completion cannot rewrite request evidence or widen the set of\npricing outcomes established before dispatch.",
+      "properties": {
+        "completion_evidence": {
+          "additionalProperties": true,
+          "title": "Completion Evidence",
+          "type": "object"
+        },
+        "pricing_contexts": {
+          "default": [],
+          "items": {
+            "$ref": "#/components/schemas/PricingContext"
+          },
+          "title": "Pricing Contexts",
+          "type": "array"
+        },
+        "provider_name": {
+          "title": "Provider Name",
+          "type": "string"
+        },
+        "request_evidence": {
+          "additionalProperties": true,
+          "title": "Request Evidence",
+          "type": "object"
+        },
+        "resource_id": {
+          "title": "Resource Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider_name",
+        "resource_id"
+      ],
+      "title": "BillingIdentity",
+      "type": "object"
+    },
     "BudgetLimit": {
       "additionalProperties": false,
       "description": "Estimated-cost budget that applies across one durable runtime scope.",
@@ -2258,10 +2296,28 @@
           "title": "Uncached Input Tokens",
           "type": "integer"
         },
+        "write_1h_tokens": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Write 1H Tokens",
+          "type": "integer"
+        },
+        "write_5m_tokens": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Write 5M Tokens",
+          "type": "integer"
+        },
         "write_tokens": {
           "default": 0,
           "minimum": 0.0,
           "title": "Write Tokens",
+          "type": "integer"
+        },
+        "write_unknown_ttl_tokens": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Write Unknown Ttl Tokens",
           "type": "integer"
         }
       },
@@ -2541,10 +2597,48 @@
       "title": "CompactSessionBody",
       "type": "object"
     },
+    "ContextualPricingRequirement": {
+      "additionalProperties": false,
+      "description": "Commercial constraints every contextual price for one provider must declare.",
+      "properties": {
+        "dimensions": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Dimensions",
+          "type": "array"
+        },
+        "provider_name": {
+          "title": "Provider Name",
+          "type": "string"
+        },
+        "requires_cache_write_ttls": {
+          "default": false,
+          "title": "Requires Cache Write Ttls",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "provider_name",
+        "dimensions"
+      ],
+      "title": "ContextualPricingRequirement",
+      "type": "object"
+    },
     "CostLineItem": {
       "additionalProperties": false,
       "description": "Estimated cost for one model.completed event.",
       "properties": {
+        "billing_identity": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/BillingIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "cache_read_input_cost": {
           "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
           "title": "Cache Read Input Cost",
@@ -2555,6 +2649,18 @@
           "title": "Cache Read Input Tokens",
           "type": "integer"
         },
+        "cache_write_1h_input_tokens": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Cache Write 1H Input Tokens",
+          "type": "integer"
+        },
+        "cache_write_5m_input_tokens": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Cache Write 5M Input Tokens",
+          "type": "integer"
+        },
         "cache_write_input_cost": {
           "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
           "title": "Cache Write Input Cost",
@@ -2563,6 +2669,12 @@
         "cache_write_input_tokens": {
           "minimum": 0.0,
           "title": "Cache Write Input Tokens",
+          "type": "integer"
+        },
+        "cache_write_unknown_ttl_input_tokens": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Cache Write Unknown Ttl Input Tokens",
           "type": "integer"
         },
         "currency": {
@@ -2649,7 +2761,8 @@
             {
               "enum": [
                 "exact",
-                "prefix"
+                "prefix",
+                "resource_mapping"
               ],
               "type": "string"
             },
@@ -3021,6 +3134,18 @@
           "title": "Aliases",
           "type": "array"
         },
+        "cache_write_ttls": {
+          "default": [],
+          "items": {
+            "enum": [
+              "5m",
+              "1h"
+            ],
+            "type": "string"
+          },
+          "title": "Cache Write Ttls",
+          "type": "array"
+        },
         "match": {
           "default": "prefix",
           "enum": [
@@ -3041,6 +3166,16 @@
         "model": {
           "title": "Model",
           "type": "string"
+        },
+        "pricing_context": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/PricingContextSelector"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "provider_name": {
           "title": "Provider Name",
@@ -3391,6 +3526,14 @@
       "additionalProperties": false,
       "description": "A versioned collection of application-owned commercial model prices.",
       "properties": {
+        "contextual_pricing_requirements": {
+          "default": [],
+          "items": {
+            "$ref": "#/components/schemas/ContextualPricingRequirement"
+          },
+          "title": "Contextual Pricing Requirements",
+          "type": "array"
+        },
         "generated_at": {
           "default": "unspecified",
           "title": "Generated At",
@@ -3407,6 +3550,14 @@
           },
           "minItems": 1,
           "title": "Prices",
+          "type": "array"
+        },
+        "resource_mappings": {
+          "default": [],
+          "items": {
+            "$ref": "#/components/schemas/PricingResourceMapping"
+          },
+          "title": "Resource Mappings",
           "type": "array"
         }
       },
@@ -3538,6 +3689,70 @@
         "output_per_million"
       ],
       "title": "PriceTier",
+      "type": "object"
+    },
+    "PricingContext": {
+      "additionalProperties": false,
+      "description": "One exact set of commercial dimensions that may price a dispatch.",
+      "properties": {
+        "dimensions": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Dimensions",
+          "type": "object"
+        }
+      },
+      "required": [
+        "dimensions"
+      ],
+      "title": "PricingContext",
+      "type": "object"
+    },
+    "PricingContextSelector": {
+      "additionalProperties": false,
+      "description": "Exact pricing dimensions accepted by one contextual price row.",
+      "properties": {
+        "dimensions": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "title": "Dimensions",
+          "type": "object"
+        }
+      },
+      "required": [
+        "dimensions"
+      ],
+      "title": "PricingContextSelector",
+      "type": "object"
+    },
+    "PricingResourceMapping": {
+      "additionalProperties": false,
+      "description": "Map one opaque provider resource to an explicit pricing model.",
+      "properties": {
+        "pricing_model": {
+          "title": "Pricing Model",
+          "type": "string"
+        },
+        "provider_name": {
+          "title": "Provider Name",
+          "type": "string"
+        },
+        "resource_id": {
+          "title": "Resource Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider_name",
+        "resource_id",
+        "pricing_model"
+      ],
+      "title": "PricingResourceMapping",
       "type": "object"
     },
     "Provenance": {
@@ -4755,7 +4970,7 @@
     },
     "TieredPricing": {
       "additionalProperties": false,
-      "description": "Full pricing for one model: context-band tiers plus optional batch and\ncache-write-duration rates.\n\nOnly the context-band ``standard`` tiers feed the cost engine today. A tier-local\ncache-write rate takes precedence over the model-wide\n``cache_write_5m_per_million`` fallback.\n``batch`` and ``cache_write_1h_per_million`` are carried for completeness and future\nuse \u2014 they are NOT auto-applied by ``estimate_session_cost``.",
+      "description": "Full pricing for one model: context-band tiers plus optional batch and\ncache-write-duration rates.\n\nOnly the context-band ``standard`` tiers feed the cost engine today. A tier-local\ncache-write rate takes precedence over the model-wide\n``cache_write_5m_per_million`` fallback.\n``batch`` is carried for completeness and future use. Contextual pricing\napplies ``cache_write_1h_per_million`` only to usage explicitly attributed\nto a one-hour cache write.",
       "properties": {
         "batch": {
           "anyOf": [
@@ -5356,6 +5571,16 @@
       "additionalProperties": false,
       "description": "Provider-neutral token counters for one model step.",
       "properties": {
+        "billing_identity": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/BillingIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "cache": {
           "$ref": "#/components/schemas/CacheUsageMetrics"
         },

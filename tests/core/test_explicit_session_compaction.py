@@ -9,8 +9,15 @@ import pytest
 from pydantic import ValidationError
 
 from cayu.core import AgentSpec, Event, EventType, Message
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.providers import (
+    ModelProvider,
+    ModelRequest,
+    ModelStreamEvent,
+    bedrock_billing_identity,
+    completed_bedrock_billing_identity,
+)
 from cayu.runtime import (
+    BillingIdentity,
     BudgetLimit,
     BudgetPolicy,
     BudgetReservation,
@@ -35,6 +42,7 @@ from cayu.runtime import (
     SessionIdentity,
     SessionStatus,
 )
+from cayu.runtime.context import ContextBuildError
 from cayu.storage import SQLiteSessionStore
 
 
@@ -123,6 +131,42 @@ class UsageCompactionProvider(ModelProvider):
         self.calls += 1
         yield ModelStreamEvent.text_delta(self.summary)
         yield ModelStreamEvent.completed({"usage": {"input_tokens": 8, "output_tokens": 2}})
+
+
+class ContextualBedrockCompactionProvider(ModelProvider):
+    name = "bedrock"
+    billing_provider_name = "bedrock"
+
+    def __init__(self, identity: BillingIdentity, *, report_usage: bool = True) -> None:
+        self.identity = identity
+        self.report_usage = report_usage
+        self.calls = 0
+
+    async def billing_identity_for_request(
+        self,
+        request: ModelRequest,
+    ) -> BillingIdentity:
+        assert request.model == self.identity.resource_id
+        return self.identity
+
+    def billing_identity_for_completion(
+        self,
+        identity: BillingIdentity | None,
+        payload: dict,
+    ) -> BillingIdentity | None:
+        assert identity == self.identity
+        return completed_bedrock_billing_identity(
+            self.identity,
+            effective_service_tier="default",
+        )
+
+    async def stream(self, request: ModelRequest):
+        self.calls += 1
+        yield ModelStreamEvent.text_delta("provider summary")
+        completed: dict[str, object] = {"model": request.model}
+        if self.report_usage:
+            completed["usage"] = {"input_tokens": 8, "output_tokens": 2}
+        yield ModelStreamEvent.completed(completed)
 
 
 class FinalRenewalFailureBudgetLedger(InMemoryBudgetLedger):
@@ -252,6 +296,12 @@ class FailOnceCompactor(ContextCompactor):
 
 
 class AdversarialTelemetryCompactor(ContextCompactor):
+    def __init__(self) -> None:
+        self.billing_identity = BillingIdentity(
+            provider_name="fake-compactor",
+            resource_id="summary-model-v1",
+        )
+
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         return CompactionResult(
             summary="private summary text",
@@ -265,7 +315,15 @@ class AdversarialTelemetryCompactor(ContextCompactor):
                     "provider_name": "fake-compactor",
                     "requested_model": "summary-model",
                     "model": "summary-model-v1",
-                    "usage": {"input_tokens": 8, "output_tokens": 2},
+                    "usage_metrics": {
+                        "provider_name": "fake-compactor",
+                        "requested_model": "summary-model",
+                        "model": "summary-model-v1",
+                        "billing_identity": self.billing_identity.model_dump(mode="json"),
+                        "input_tokens": 8,
+                        "output_tokens": 2,
+                        "total_tokens": 10,
+                    },
                     "summary": "model event summary leak",
                     "instructions": "model event instruction leak",
                     "provider_state": {"secret": "opaque continuation leak"},
@@ -501,10 +559,11 @@ def test_compact_session_events_allowlist_adversarial_compactor_telemetry() -> N
     async def run() -> None:
         store = InMemorySessionStore()
         app = CayuApp(session_store=store, enable_logging=False)
+        compactor = AdversarialTelemetryCompactor()
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
             context_policy=CheckpointCompactionContextPolicy(
-                compactor=AdversarialTelemetryCompactor(),
+                compactor=compactor,
                 max_user_turns=1,
             ),
         )
@@ -561,6 +620,10 @@ def test_compact_session_events_allowlist_adversarial_compactor_telemetry() -> N
         assert usage_event.payload["purpose"] == "context_compaction"
         assert usage_event.payload["provider_name"] == "fake-compactor"
         assert usage_event.payload["usage_metrics"]["total_tokens"] == 10
+        assert usage_event.payload["billing_identity"] == compactor.billing_identity.model_dump(
+            mode="json"
+        )
+        assert "billing_identity" not in usage_event.payload["usage_metrics"]
         assert "usage" not in usage_event.payload
         assert "provider_state" not in usage_event.payload
         completed_event = next(
@@ -1610,6 +1673,337 @@ def test_compact_session_usage_counts_against_supplied_cost_budget() -> None:
         checkpoint = await store.load_checkpoint(created.id)
         assert checkpoint is not None
         assert "context_compaction" not in checkpoint
+
+    asyncio.run(run())
+
+
+def test_compact_session_resolves_bedrock_identity_before_reservation_and_replays() -> None:
+    async def run() -> None:
+        identity = bedrock_billing_identity(
+            invoked_model="global.anthropic.claude-sonnet-4-6",
+            source_region="us-east-1",
+            resource_type="inference_profile",
+            profile_scope="global",
+        )
+        provider = ContextualBedrockCompactionProvider(identity)
+        pricing = PriceBook(
+            prices=(
+                ModelPrice.fixed(
+                    provider_name="bedrock",
+                    model=identity.resource_id,
+                    match="exact",
+                    input_per_million=Decimal("3"),
+                    output_per_million=Decimal("15"),
+                    pricing_context={
+                        "source_region": ("us-east-1",),
+                        "service_tier": ("default",),
+                    },
+                ),
+            )
+        )
+        ledger = InMemoryBudgetLedger()
+        store = InMemorySessionStore()
+        app = CayuApp(
+            session_store=store,
+            budget_policy=BudgetPolicy(
+                limits=(
+                    BudgetLimit(
+                        scope="app",
+                        max_estimated_cost=Decimal("10"),
+                        pricing=pricing,
+                        reservation=BudgetReservation(
+                            max_input_tokens=10,
+                            max_output_tokens=10,
+                        ),
+                    ),
+                )
+            ),
+            budget_ledger=ledger,
+            enable_logging=False,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(provider=provider, model=identity.resource_id),
+                max_user_turns=1,
+            ),
+        )
+        created = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_contextual_explicit_compaction",
+                messages=[Message.text("user", "create only")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        transcript = [
+            Message.text("user", "old request"),
+            Message.text("assistant", "old answer"),
+            Message.text("user", "current request"),
+            Message.text("assistant", "current answer"),
+        ]
+        await store.append_transcript_messages(created.id, transcript)
+        completed = await store.update_status(created.id, SessionStatus.COMPLETED)
+        request = CompactSessionRequest(
+            session_id=created.id,
+            idempotency_key="contextual-explicit-compaction",
+            expected_run_epoch=completed.run_epoch,
+            expected_transcript_cursor=len(transcript),
+        )
+
+        first = [event async for event in app.compact_session(request)]
+        replay = [event async for event in app.compact_session(request)]
+
+        assert provider.calls == 1
+        assert [event.id for event in replay] == [event.id for event in first]
+        reserved = next(event for event in first if event.type == EventType.BUDGET_RESERVED)
+        reconciled = next(event for event in first if event.type == EventType.BUDGET_RECONCILED)
+        completion = next(event for event in first if event.type == EventType.MODEL_COMPLETED)
+        completed_identity = BillingIdentity.model_validate(completion.payload["billing_identity"])
+        assert reserved.payload["billing_identity"] == identity.model_dump(mode="json")
+        assert reconciled.payload["billing_identity"] == completion.payload["billing_identity"]
+        assert reconciled.payload["actual_amount"] == "0.000054"
+        assert next(iter(ledger._records.values())).billing_identity == completed_identity
+        assert len([event for event in first if event.type == EventType.BUDGET_CHECKED]) == 1
+
+    asyncio.run(run())
+
+
+def test_compact_session_preserves_bedrock_identity_without_usage_metrics() -> None:
+    async def run() -> None:
+        identity = bedrock_billing_identity(
+            invoked_model="global.anthropic.claude-sonnet-4-6",
+            source_region="us-east-1",
+            resource_type="inference_profile",
+            profile_scope="global",
+        )
+        completed_identity = completed_bedrock_billing_identity(
+            identity,
+            effective_service_tier="default",
+        )
+        provider = ContextualBedrockCompactionProvider(identity, report_usage=False)
+        pricing = PriceBook(
+            prices=(
+                ModelPrice.fixed(
+                    provider_name="bedrock",
+                    model=identity.resource_id,
+                    match="exact",
+                    input_per_million=Decimal("3"),
+                    output_per_million=Decimal("15"),
+                    pricing_context={
+                        "source_region": ("us-east-1",),
+                        "service_tier": ("default",),
+                    },
+                ),
+            )
+        )
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(provider=provider, model=identity.resource_id),
+                max_user_turns=1,
+            ),
+        )
+        created = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_contextual_compaction_without_usage",
+                messages=[Message.text("user", "create only")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        transcript = [
+            Message.text("user", "old request"),
+            Message.text("assistant", "old answer"),
+            Message.text("user", "current request"),
+            Message.text("assistant", "current answer"),
+        ]
+        await store.append_transcript_messages(created.id, transcript)
+        completed = await store.update_status(created.id, SessionStatus.COMPLETED)
+        request = CompactSessionRequest(
+            session_id=created.id,
+            idempotency_key="contextual-compaction-without-usage",
+            expected_run_epoch=completed.run_epoch,
+            expected_transcript_cursor=len(transcript),
+        )
+
+        first = [event async for event in app.compact_session(request)]
+        replay = [event async for event in app.compact_session(request)]
+
+        assert provider.calls == 1
+        assert [event.id for event in replay] == [event.id for event in first]
+        completion = next(event for event in first if event.type == EventType.MODEL_COMPLETED)
+        assert completion.payload["billing_identity"] == completed_identity.model_dump(mode="json")
+        assert "usage_metrics" not in completion.payload
+        stored = await store.load_events(created.id)
+        stored_completion = next(event for event in stored if event.id == completion.id)
+        assert (
+            stored_completion.payload["billing_identity"] == completion.payload["billing_identity"]
+        )
+        cost = await app.get_session_cost(created.id, pricing)
+        assert cost.model_steps == 1
+        assert cost.unpriced_model_steps == 1
+        assert cost.line_items[0].billing_identity == completed_identity
+        assert (
+            cost.line_items[0].missing_pricing_reason
+            == "model.completed event has no token usage metrics"
+        )
+
+    asyncio.run(run())
+
+
+def test_compact_session_rejects_completion_billing_identity_rewrite() -> None:
+    async def run() -> None:
+        identity = bedrock_billing_identity(
+            invoked_model="global.anthropic.claude-sonnet-4-6",
+            source_region="us-east-1",
+            resource_type="inference_profile",
+            profile_scope="global",
+        )
+
+        class RewritingCompactionProvider(ContextualBedrockCompactionProvider):
+            def billing_identity_for_completion(
+                self,
+                requested: BillingIdentity | None,
+                payload: dict,
+            ) -> BillingIdentity | None:
+                assert requested == identity
+                return identity.model_copy(
+                    update={
+                        "request_evidence": {
+                            **identity.request_evidence,
+                            "source_region": "eu-west-1",
+                        }
+                    }
+                )
+
+        provider = RewritingCompactionProvider(identity)
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(provider=provider, model=identity.resource_id),
+                max_user_turns=1,
+            ),
+        )
+        created = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_rewritten_compaction_billing_identity",
+                messages=[Message.text("user", "create only")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        transcript = [
+            Message.text("user", "old request"),
+            Message.text("assistant", "old answer"),
+            Message.text("user", "current request"),
+            Message.text("assistant", "current answer"),
+        ]
+        await store.append_transcript_messages(created.id, transcript)
+        completed = await store.update_status(created.id, SessionStatus.COMPLETED)
+        events = []
+
+        with pytest.raises(ContextBuildError, match="conflicts with request identity"):
+            async for event in app.compact_session(
+                CompactSessionRequest(
+                    session_id=created.id,
+                    idempotency_key="rewritten-compaction-billing-identity",
+                    expected_run_epoch=completed.run_epoch,
+                    expected_transcript_cursor=len(transcript),
+                )
+            ):
+                events.append(event)
+
+        assert provider.calls == 1
+        assert EventType.MODEL_COMPLETED not in [event.type for event in events]
+        assert events[-1].type == EventType.CONTEXT_COMPACTION_FAILED
+        assert await store.load_transcript(created.id) == transcript
+
+    asyncio.run(run())
+
+
+def test_compact_session_rejects_unpriced_bedrock_identity_before_dispatch() -> None:
+    async def run() -> None:
+        identity = bedrock_billing_identity(
+            invoked_model="global.anthropic.claude-sonnet-4-6",
+            source_region="eu-west-1",
+            resource_type="inference_profile",
+            profile_scope="global",
+        )
+        provider = ContextualBedrockCompactionProvider(identity)
+        pricing = PriceBook(
+            prices=(
+                ModelPrice.fixed(
+                    provider_name="bedrock",
+                    model=identity.resource_id,
+                    match="exact",
+                    input_per_million=Decimal("3"),
+                    output_per_million=Decimal("15"),
+                    pricing_context={
+                        "source_region": ("us-east-1",),
+                        "service_tier": ("default",),
+                    },
+                ),
+            )
+        )
+        store = InMemorySessionStore()
+        app = CayuApp(
+            session_store=store,
+            budget_policy=BudgetPolicy(
+                limits=(
+                    BudgetLimit(
+                        scope="app",
+                        max_estimated_cost=Decimal("10"),
+                        pricing=pricing,
+                    ),
+                )
+            ),
+            enable_logging=False,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(provider=provider, model=identity.resource_id),
+                max_user_turns=1,
+            ),
+        )
+        created = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_unpriced_contextual_explicit_compaction",
+                messages=[Message.text("user", "create only")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        transcript = [
+            Message.text("user", "old request"),
+            Message.text("assistant", "old answer"),
+            Message.text("user", "current request"),
+            Message.text("assistant", "current answer"),
+        ]
+        await store.append_transcript_messages(created.id, transcript)
+        completed = await store.update_status(created.id, SessionStatus.COMPLETED)
+        events: list[Event] = []
+
+        with pytest.raises(RuntimeError, match="budget limit reached"):
+            async for event in app.compact_session(
+                CompactSessionRequest(
+                    session_id=created.id,
+                    idempotency_key="unpriced-contextual-explicit-compaction",
+                    expected_run_epoch=completed.run_epoch,
+                    expected_transcript_cursor=len(transcript),
+                )
+            ):
+                events.append(event)
+
+        assert provider.calls == 0
+        assert EventType.BUDGET_RESERVED not in [event.type for event in events]
+        assert EventType.BUDGET_LIMIT_REACHED in [event.type for event in events]
+        assert events[-1].type == EventType.CONTEXT_COMPACTION_FAILED
 
     asyncio.run(run())
 

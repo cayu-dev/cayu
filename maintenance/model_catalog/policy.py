@@ -22,13 +22,14 @@ MAX_BUNDLED_PRICE_PER_MILLION_USD = Decimal("1000")
 MAX_AUTOMATED_PRICE_CHANGE_FACTOR = Decimal("4")
 MAX_CATALOG_CONTEXT_WINDOW_TOKENS = 10_000_000
 MAX_AUTOMATED_CONTEXT_WINDOW_CHANGE_FACTOR = Decimal("4")
-REQUIRED_PROVIDERS = frozenset({"openai", "anthropic", "google", "vertex", "azure"})
+REQUIRED_PROVIDERS = frozenset({"openai", "anthropic", "google", "vertex", "azure", "bedrock"})
 # A bundled billing identity that is deliberately not a routable model must be named here
 # and documented in docs/model-catalog.md. Application-owned books do not use this policy.
 BUNDLED_PRICE_ONLY_IDENTITIES: frozenset[tuple[str, str]] = frozenset()
 OFFICIAL_HOSTS = {
     "anthropic": frozenset({"docs.anthropic.com", "platform.claude.com"}),
     "azure": frozenset({"azure.microsoft.com", "learn.microsoft.com", "prices.azure.com"}),
+    "bedrock": frozenset({"aws.amazon.com", "docs.aws.amazon.com"}),
     "google": frozenset({"ai.google.dev"}),
     "openai": frozenset({"developers.openai.com", "openai.com", "platform.openai.com"}),
     "vertex": frozenset({"cloud.google.com", "docs.cloud.google.com"}),
@@ -133,6 +134,24 @@ def price_policy_errors(
     errors: list[str] = []
     if model.match != "exact":
         errors.append(f"{identity}: bundled canonical price match must be 'exact'")
+    if model.provider_name == "bedrock":
+        dimensions = {} if model.pricing_context is None else model.pricing_context.dimensions
+        if not dimensions.get("source_region"):
+            errors.append(f"{identity}: Bedrock price must declare exact source regions")
+        if not dimensions.get("service_tier"):
+            errors.append(f"{identity}: Bedrock price must declare an exact service tier")
+        if model.aliases or model.match_prefixes:
+            errors.append(f"{identity}: Bedrock contextual prices cannot use aliases or prefixes")
+        has_cache_write_rate = any(
+            schedule.pricing.cache_write_5m_per_million is not None
+            or schedule.pricing.cache_write_1h_per_million is not None
+            or any(
+                tier.cache_write_input_per_million is not None for tier in schedule.pricing.standard
+            )
+            for schedule in model.schedules
+        )
+        if has_cache_write_rate and not model.cache_write_ttls:
+            errors.append(f"{identity}: Bedrock price must declare supported cache-write TTLs")
     for prefix in model.match_prefixes:
         suffix = prefix[len(model.model) :] if prefix.startswith(model.model) else ""
         if len(suffix) < 2 or suffix[0] not in _MATCH_PREFIX_DELIMITERS:

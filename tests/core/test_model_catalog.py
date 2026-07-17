@@ -224,6 +224,7 @@ def test_default_model_catalog_is_freshly_validated_metadata_only_data() -> None
     assert {model.provider_name for model in first.models} == {
         "anthropic",
         "azure",
+        "bedrock",
         "google",
         "openai",
         "vertex",

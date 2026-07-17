@@ -28,6 +28,12 @@ from cayu.artifacts import (
     resolved_file_attachment,
 )
 from cayu.core.agents import AgentSpec
+from cayu.core.billing import (
+    BillingIdentity,
+    completed_billing_identity,
+    copy_billing_identity,
+    resolved_billing_identity,
+)
 from cayu.core.events import Event, EventType
 from cayu.core.messages import (
     FilePart,
@@ -82,7 +88,9 @@ from cayu.runtime.budgets import (
     BudgetLimit,
     BudgetPolicy,
     BudgetReservationResult,
+    budget_limits_for_session,
     copy_request_budget_limits,
+    has_deferred_contextual_price,
 )
 from cayu.runtime.context import (
     CompactionRequest,
@@ -409,6 +417,7 @@ class ModelStepExecutor:
             [], Awaitable[tuple[list[Event], BudgetReservationResult | None, Exception | None]]
         ],
         before_provider_dispatch: Callable[[], Awaitable[None]],
+        billing_identity: BillingIdentity | None = None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         retry_policy = copy_retry_policy(retry_policy)
         attempt = 1
@@ -500,6 +509,7 @@ class ModelStepExecutor:
                 max_attempts=retry_policy.max_attempts,
                 transcript_cursor_before_request=transcript_cursor_before_request,
                 before_provider_dispatch=before_provider_dispatch,
+                billing_identity=billing_identity,
             )
             try:
                 result: AssistantStepResult | None = None
@@ -755,6 +765,7 @@ class ModelStepExecutor:
         max_attempts: int,
         transcript_cursor_before_request: int,
         before_provider_dispatch: Callable[[], Awaitable[None]],
+        billing_identity: BillingIdentity | None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         assistant_parts: list[
             transcript_helpers.AssistantTextPart
@@ -825,6 +836,51 @@ class ModelStepExecutor:
                         # but an empty readable delta should not reach consumers.
                         continue
                 elif stream_event.type == ModelStreamEventType.COMPLETED:
+                    try:
+                        billing_identity = completed_billing_identity(
+                            billing_identity,
+                            provider.billing_identity_for_completion(
+                                billing_identity,
+                                stream_event.payload,
+                            ),
+                        )
+                    except Exception as exc:
+                        provider_error = ModelProviderError(
+                            str(exc),
+                            provider=registered_provider.name,
+                            error_type=type(exc).__name__,
+                            error_code="billing_identity_resolution_failed",
+                            retryable=False,
+                        )
+                        error_payload = {
+                            "error": str(provider_error),
+                            "error_type": type(provider_error).__name__,
+                            "stage": "billing_identity_for_completion",
+                            **provider_error.error_payload_fields(),
+                        }
+                        yield (
+                            await self._event_writer.emit(
+                                Event(
+                                    type=EventType.MODEL_ERROR,
+                                    session_id=session.id,
+                                    agent_name=registered_agent.spec.name,
+                                    environment_name=environment_name,
+                                    payload=_retry_attempt_payload(
+                                        error_payload,
+                                        step=step,
+                                        attempt=attempt,
+                                        max_attempts=max_attempts,
+                                    ),
+                                )
+                            ),
+                            None,
+                        )
+                        raise ModelAttemptFailed(
+                            message=str(provider_error),
+                            payload=error_payload,
+                            emitted_error_event=True,
+                            cause=provider_error,
+                        ) from exc
                     model_completed = True
                     completed_stream_event = stream_event
                     provider_state_parts = transcript_helpers.provider_state_parts(
@@ -858,6 +914,7 @@ class ModelStepExecutor:
                             + (1 if assistant_message is not None else 0)
                         ),
                         usage_dialect=registered_provider.provider.usage_dialect,
+                        billing_identity=billing_identity,
                     )
                     yield await self._event_writer.emit(event), None
                     continue
@@ -985,6 +1042,22 @@ class ModelStepRun:
         self._run_started_at = run_started_at
         self._turn_usage_tracker = turn_usage_tracker
         self._active_run = active_run
+        contextual_limits = (
+            *budget_limits_for_session(
+                policy=self._budget_policy,
+                agent_name=self._registered_agent.spec.name,
+                causal_budget_id=self._session.causal_budget_id,
+            ),
+            *self._request_budget_limits,
+        )
+        self._deferred_contextual_price = any(
+            has_deferred_contextual_price(
+                limit.pricing,
+                provider_name=(self._provider.billing_provider_name or self._session.provider_name),
+                model=self._session.model,
+            )
+            for limit in contextual_limits
+        )
 
     async def execute(
         self,
@@ -1112,6 +1185,69 @@ class ModelStepRun:
         messages: list[Message],
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
         controller = self._executor._run_limit_controller
+        try:
+            billing_identity = copy_billing_identity(
+                await self._provider.billing_identity_for_request(model_request)
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            provider_error = (
+                exc
+                if isinstance(exc, ModelProviderError)
+                else ModelProviderError(
+                    str(exc),
+                    provider=self._registered_provider.name,
+                    error_type=type(exc).__name__,
+                    error_code="billing_identity_resolution_failed",
+                    retryable=False,
+                )
+            )
+            payload = {
+                "error": str(provider_error),
+                "error_type": type(provider_error).__name__,
+                "stage": "billing_identity_for_request",
+                **provider_error.error_payload_fields(),
+            }
+            yield (
+                await self._executor._event_writer.emit(
+                    Event(
+                        type=EventType.MODEL_ERROR,
+                        session_id=self._session.id,
+                        agent_name=self._registered_agent.spec.name,
+                        environment_name=self._environment_name,
+                        payload=_retry_attempt_payload(
+                            payload,
+                            step=step,
+                            attempt=1,
+                            max_attempts=self._retry_policy.max_attempts,
+                        ),
+                    )
+                ),
+                None,
+            )
+            if provider_error is exc:
+                raise
+            raise provider_error from exc
+        if billing_identity is not None or self._has_deferred_contextual_price():
+            should_stop: bool | None = None
+            gate_events = self._billing_identity_budget_gate(
+                messages=messages,
+                billing_identity=billing_identity,
+            )
+            try:
+                async for event, gate_outcome in gate_events:
+                    if event is not None:
+                        yield event, None
+                    if gate_outcome is not None:
+                        should_stop = gate_outcome
+            finally:
+                await _close_async_iterator(gate_events)
+            if should_stop is None:
+                raise RuntimeError("Billing-identity budget gate finished without an outcome.")
+            if should_stop:
+                yield None, ModelStepFlowOutcome(stop_session=True)
+                return
         reservation_setup = await controller.reserve_for_model_step(
             session=self._session,
             agent_name=self._registered_agent.spec.name,
@@ -1119,6 +1255,7 @@ class ModelStepRun:
             environment_name=self._environment_name,
             budget_policy=self._budget_policy,
             request_budget_limits=self._request_budget_limits,
+            billing_identity=billing_identity,
         )
         budget_reservations = list(reservation_setup.reservations)
         try:
@@ -1217,6 +1354,7 @@ class ModelStepRun:
                 environment_name=self._environment_name,
                 budget_policy=self._budget_policy,
                 request_budget_limits=self._request_budget_limits,
+                billing_identity=billing_identity,
             )
             if retry_setup.error is not None:
                 return settlement_events + list(retry_setup.events), None, retry_setup.error
@@ -1244,6 +1382,7 @@ class ModelStepRun:
             settle_provider_dispatch=settle_provider_dispatch,
             prepare_provider_dispatch=prepare_provider_dispatch,
             before_provider_dispatch=before_provider_dispatch,
+            billing_identity=billing_identity,
         )
         guarded_events = controller.model_step_events_with_heartbeat(
             model_step_events,
@@ -1395,6 +1534,7 @@ class ModelStepRun:
             [], Awaitable[tuple[list[Event], BudgetReservationResult | None, Exception | None]]
         ],
         before_provider_dispatch: Callable[[], Awaitable[None]],
+        billing_identity: BillingIdentity | None,
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
         overflow_policy = self._registered_agent.context_overflow_policy
         compaction_budget_events: list[Event] = []
@@ -1415,6 +1555,7 @@ class ModelStepRun:
                 record_model_completion=record_model_completion,
                 prepare_provider_dispatch=prepare_provider_dispatch,
                 before_provider_dispatch=before_provider_dispatch,
+                billing_identity=billing_identity,
             )
 
         attempt_events = run_attempt(model_request)
@@ -1751,6 +1892,61 @@ class ModelStepRun:
             await _close_async_iterator(limit_events)
         yield None, limit_evaluation.decision is not None
 
+    async def _billing_identity_budget_gate(
+        self,
+        *,
+        messages: list[Message],
+        billing_identity: BillingIdentity | None,
+    ) -> AsyncIterator[tuple[Event | None, bool | None]]:
+        budget_evaluation = await self._limit_gate.evaluate_budget(
+            self._budget_policy,
+            billing_identity_state=resolved_billing_identity(billing_identity),
+        )
+        request = ModelStepBudgetEvaluationRequest(
+            evaluation=budget_evaluation,
+            session=self._session,
+            registered_agent=self._registered_agent,
+            registered_environment=self._registered_environment,
+            environment_name=self._environment_name,
+            messages=messages,
+            run_started_at=self._run_started_at,
+            turn_usage_tracker=self._turn_usage_tracker,
+            active_run=self._active_run,
+        )
+        budget_events = self._executor._apply_budget_evaluation(request)
+        try:
+            async for event in budget_events:
+                yield event, None
+        finally:
+            await _close_async_iterator(budget_events)
+        if budget_evaluation.check is not None:
+            yield None, True
+            return
+        limit_evaluation = await self._limit_gate.evaluate_limits(
+            billing_identity_state=resolved_billing_identity(billing_identity),
+        )
+        request = ModelStepLimitEvaluationRequest(
+            evaluation=limit_evaluation,
+            session=self._session,
+            registered_agent=self._registered_agent,
+            registered_environment=self._registered_environment,
+            environment_name=self._environment_name,
+            messages=messages,
+            run_started_at=self._run_started_at,
+            turn_usage_tracker=self._turn_usage_tracker,
+            active_run=self._active_run,
+        )
+        limit_events = self._executor._apply_limit_evaluation(request)
+        try:
+            async for event in limit_events:
+                yield event, None
+        finally:
+            await _close_async_iterator(limit_events)
+        yield None, limit_evaluation.decision is not None
+
+    def _has_deferred_contextual_price(self) -> bool:
+        return self._deferred_contextual_price
+
     async def _stop_for_budget_reservation_failure(
         self,
         *,
@@ -1823,19 +2019,28 @@ class ModelStepRun:
         budget_events: list[Event],
     ) -> CompactionResult:
         controller = self._executor._run_limit_controller
-        limits = controller.provider_reservation_limits(
+        all_limits = controller.provider_budget_limits(
             session=self._session,
             agent_name=self._registered_agent.spec.name,
             budget_policy=self._budget_policy,
             request_budget_limits=self._request_budget_limits,
         )
-        if not limits:
+        reservation_limits = tuple(limit for limit in all_limits if limit.reservation is not None)
+        strict_contextual_candidates = tuple(
+            limit
+            for limit in all_limits
+            if limit.action == "interrupt"
+            and not limit.allow_unpriced
+            and any(price.pricing_context is not None for price in limit.pricing.prices)
+        )
+        if not reservation_limits and not strict_contextual_candidates:
             return await execute()
         try:
             identity = compactor._provider_budget_identity_for_request(compaction_request)
         except NotImplementedError as exc:
             raise RuntimeError(
-                "Automatic compaction with cost reservations requires the "
+                "Automatic compaction with cost reservations or strict contextual "
+                "pricing requires the "
                 "ContextCompactor to declare provider_budget_identity(session), "
                 "returning provider/model or None for deterministic execution."
             ) from exc
@@ -1848,18 +2053,38 @@ class ModelStepRun:
             )
         require_clean_nonblank(identity[0], "compactor_provider_name")
         require_clean_nonblank(identity[1], "compactor_model")
+        pricing_provider_name = identity[0]
+        declared_model = identity[1]
+        contextual_limits = tuple(
+            limit
+            for limit in strict_contextual_candidates
+            if has_deferred_contextual_price(
+                limit.pricing,
+                provider_name=pricing_provider_name,
+                model=declared_model,
+            )
+        )
+        limits = tuple(
+            limit
+            for limit in all_limits
+            if limit.reservation is not None or limit in contextual_limits
+        )
+        if not limits:
+            return await execute()
         if not compactor._uses_runtime_provider_dispatch_runner_for_request(compaction_request):
             raise RuntimeError(
-                "Automatic compaction with cost reservations cannot safely run "
+                "Automatic compaction with cost reservations or strict contextual "
+                "pricing cannot safely run "
                 f"opaque provider-backed compactor {type(compactor).__name__}: "
-                "Cayu cannot reserve each provider dispatch independently. Use an "
+                "Cayu cannot admit each provider dispatch independently. Use an "
                 "unmodified built-in provider compactor or remove reservation-bearing "
-                "cost limits."
+                "or strict contextual cost limits."
             )
 
         async def run_provider_dispatch(
-            actual_provider_name: str,
+            actual_provider: ModelProvider,
             actual_model: str,
+            billing_identity: BillingIdentity | None,
             dispatch: Callable[[], Awaitable[tuple[str, dict[str, Any]]]],
         ) -> tuple[str, dict[str, Any]]:
             before_count = len(completed_payloads())
@@ -1884,10 +2109,11 @@ class ModelStepRun:
                 agent_name=self._registered_agent.spec.name,
                 environment_name=self._environment_name,
                 provider_name=require_clean_nonblank(
-                    actual_provider_name,
-                    "compactor_provider_name",
+                    actual_provider.name, "compactor_provider_name"
                 ),
                 model=require_clean_nonblank(actual_model, "compactor_model"),
+                billing_identity=billing_identity,
+                pricing_provider_name=pricing_provider_name,
                 authoritative_failure_types=(ContextBuildError,),
             )
             budget_events.extend(outcome.events)
@@ -2482,6 +2708,7 @@ def _model_stream_event_to_runtime_event(
     context_pressure_estimate: ContextPressureEstimate | None = None,
     transcript_cursor_after_completion: int | None = None,
     usage_dialect: str | None = None,
+    billing_identity: BillingIdentity | None = None,
 ) -> Event:
     if type(stream_event) is not ModelStreamEvent:
         raise TypeError("Model stream events must be ModelStreamEvent instances.")
@@ -2495,6 +2722,11 @@ def _model_stream_event_to_runtime_event(
         payload = transcript_helpers.model_completed_event_payload(stream_event.payload)
         resolved_model = _payload_model(payload, fallback=session.model)
         payload["requested_model"] = session.model
+        # Billing identity is runtime-owned. Providers may report completion facts
+        # consumed by their hook, but cannot inject an identity in the raw payload.
+        payload.pop("billing_identity", None)
+        if billing_identity is not None:
+            payload["billing_identity"] = billing_identity.model_dump(mode="json")
         completion = _stream_event_completion(stream_event)
         payload["completion"] = {
             "finish_reason": completion.finish_reason.value,
@@ -2510,9 +2742,14 @@ def _model_stream_event_to_runtime_event(
                 requested_model=session.model,
                 raw_usage=payload.get("usage"),
                 usage_dialect=usage_dialect,
+                billing_identity=billing_identity,
             )
         )
         if metrics is not None:
+            # The event-level identity is authoritative. Keeping a second nested
+            # copy would let an untrusted provider payload create conflicting
+            # accounting evidence when normalized usage is unavailable.
+            metrics.pop("billing_identity", None)
             payload["usage_metrics"] = metrics
         if context_pressure_estimate is not None:
             payload["context_pressure"] = {

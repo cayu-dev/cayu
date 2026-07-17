@@ -35,6 +35,7 @@ from cayu._validation import (
     require_clean_nonblank,
     require_nonblank,
 )
+from cayu.core.billing import BillingIdentity
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, MessageRole
 from cayu.embeddings import TextEmbeddingProvider, TextEmbeddingRequest
@@ -195,7 +196,7 @@ from cayu.storage.memory import (
 _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 _SCHEMA_ADVISORY_LOCK_POLL_SECONDS = 0.25
 _POSTGRES_MIN_REQUIRED_REVISION = 18
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 20
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 21
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="%s",
@@ -630,6 +631,10 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "CREATE INDEX IF NOT EXISTS idx_cayu_persisted_event_side_effects_delivery "
         "ON cayu_persisted_event_side_effects"
         "(status, next_attempt_at, lease_expires_at, event_sequence)",
+    ),
+    21: (
+        "ALTER TABLE IF EXISTS cayu_budget_reservations "
+        "ADD COLUMN IF NOT EXISTS billing_identity JSONB",
     ),
 }
 
@@ -1954,6 +1959,8 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
     machinery (ADR 0001 revision 8).
     """
 
+    _min_required_revision = 21
+
     def __init__(
         self,
         conninfo: str | None = None,
@@ -1987,6 +1994,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         agent_name: str,
         provider_name: str,
         model: str,
+        billing_identity: BillingIdentity | None = None,
     ) -> BudgetReservationResult:
         if type(limit) is not BudgetLimit:
             raise TypeError("limit must be a BudgetLimit.")
@@ -2008,6 +2016,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                         provider_name=provider_name,
                         model=model,
                         effective_at=now,
+                        billing_identity=billing_identity,
                     )
                     await self._reap_expired(cur, now, limit=limit)
                     current = await self._used_amount(cur, limit, now=now)
@@ -2033,6 +2042,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                         agent_name=agent_name,
                         provider_name=provider_name,
                         model=model,
+                        billing_identity=billing_identity,
                         reserved_amount=requested,
                         created_at=now,
                         updated_at=now,
@@ -2081,6 +2091,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         actual_amount: Decimal,
         reason: str | None = None,
         occurred_at: datetime | None = None,
+        billing_identity: BillingIdentity | None = None,
     ) -> BudgetReconciliation:
         reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
         actual_amount = _validate_amount(actual_amount, "actual_amount")
@@ -2095,6 +2106,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                         actual_amount=actual_amount,
                         reason=reason,
                         updated_at=reconciled_at,
+                        billing_identity=billing_identity,
                     )
                     await self._update_record(cur, reconciled)
                 await conn.commit()
@@ -2212,6 +2224,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                 agent_name,
                 provider_name,
                 model,
+                billing_identity,
                 reserved_amount,
                 actual_amount,
                 status,
@@ -2219,7 +2232,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                 created_at,
                 updated_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 record.reservation_id,
@@ -2231,6 +2244,11 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                 record.agent_name,
                 record.provider_name,
                 record.model,
+                (
+                    None
+                    if record.billing_identity is None
+                    else _dumps(record.billing_identity.model_dump(mode="json"))
+                ),
                 record.reserved_amount,
                 record.actual_amount,
                 record.status,
@@ -2245,6 +2263,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
             """
             UPDATE cayu_budget_reservations
             SET actual_amount = %s,
+                billing_identity = %s,
                 status = %s,
                 reason = %s,
                 updated_at = %s
@@ -2252,6 +2271,11 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
             """,
             (
                 record.actual_amount,
+                (
+                    None
+                    if record.billing_identity is None
+                    else _dumps(record.billing_identity.model_dump(mode="json"))
+                ),
                 record.status,
                 record.reason,
                 pg_support.to_utc(record.updated_at),
@@ -2269,7 +2293,8 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         await cur.execute(
             """
             SELECT reservation_id, scope, budget_key, budget_window, currency, session_id,
-                   agent_name, provider_name, model, reserved_amount, actual_amount,
+                   agent_name, provider_name, model, billing_identity,
+                   reserved_amount, actual_amount,
                    status, reason, created_at, updated_at
             FROM cayu_budget_reservations
             WHERE reservation_id = %s
@@ -2290,12 +2315,15 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
             agent_name=row[6],
             provider_name=row[7],
             model=row[8],
-            reserved_amount=row[9],
-            actual_amount=row[10],
-            status=row[11],
-            reason=row[12],
-            created_at=pg_support.to_utc(row[13]),
-            updated_at=pg_support.to_utc(row[14]),
+            billing_identity=(
+                None if row[9] is None else BillingIdentity.model_validate(_json_obj(row[9]))
+            ),
+            reserved_amount=row[10],
+            actual_amount=row[11],
+            status=row[12],
+            reason=row[13],
+            created_at=pg_support.to_utc(row[14]),
+            updated_at=pg_support.to_utc(row[15]),
         )
 
     async def _active_record_for_update(

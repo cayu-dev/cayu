@@ -26,6 +26,7 @@ from cayu import (
     REDACTED_SECRET,
     AgentSpec,
     ArtifactScope,
+    BillingIdentity,
     CayuApp,
     Environment,
     EnvironmentFactory,
@@ -52,7 +53,13 @@ from cayu import (
 )
 from cayu.artifacts import ArtifactListResult, ArtifactMetadata, ArtifactReadResult, ArtifactStore
 from cayu.core.events import Event, EventType
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.providers import (
+    ModelProvider,
+    ModelRequest,
+    ModelStreamEvent,
+    bedrock_billing_identity,
+    completed_bedrock_billing_identity,
+)
 from cayu.runtime import (
     CheckpointCompactionContextPolicy,
     EventQuery,
@@ -68,9 +75,11 @@ from cayu.runtime import (
     TranscriptDigestCompactor,
 )
 from cayu.runtime.budgets import InMemoryBudgetStore
+from cayu.runtime.usage import CacheUsageMetrics, UsageMetrics
 from cayu.server import create_server, mount_cayu, mount_dashboard
 from cayu.server.routes import (
     _accepted_event_stream_response,
+    _add_usage_metrics,
     _detached_event_stream_response,
     _next_replay_poll_interval,
 )
@@ -108,6 +117,30 @@ class UsageProvider(ModelProvider):
         )
 
 
+def test_server_usage_aggregation_preserves_cache_ttl_buckets() -> None:
+    combined = _add_usage_metrics(
+        UsageMetrics(
+            cache=CacheUsageMetrics(
+                write_tokens=5,
+                write_5m_tokens=2,
+                write_1h_tokens=3,
+            )
+        ),
+        UsageMetrics(
+            cache=CacheUsageMetrics(
+                write_tokens=7,
+                write_5m_tokens=7,
+                write_unknown_ttl_tokens=1,
+            )
+        ),
+    )
+
+    assert combined.cache.write_tokens == 12
+    assert combined.cache.write_5m_tokens == 9
+    assert combined.cache.write_1h_tokens == 3
+    assert combined.cache.write_unknown_ttl_tokens == 1
+
+
 class FailOnceEventSink(InMemoryEventSink):
     def __init__(self) -> None:
         super().__init__()
@@ -130,6 +163,43 @@ class NeverReturningEventSink(InMemoryEventSink):
             await asyncio.Event().wait()
         finally:
             self.cancelled = True
+
+
+class BedrockUsageProvider(ModelProvider):
+    name = "bedrock"
+    identity = bedrock_billing_identity(
+        invoked_model="global.anthropic.claude-sonnet-4-6",
+        source_region="us-east-1",
+        resource_type="inference_profile",
+        profile_scope="global",
+    )
+
+    async def billing_identity_for_request(
+        self,
+        request: ModelRequest,
+    ) -> BillingIdentity:
+        assert request.model == self.identity.resource_id
+        return self.identity
+
+    def billing_identity_for_completion(
+        self,
+        identity: BillingIdentity | None,
+        payload: dict[str, Any],
+    ) -> BillingIdentity | None:
+        assert identity == self.identity
+        return completed_bedrock_billing_identity(
+            self.identity,
+            effective_service_tier=payload["bedrock_service_tier"],
+        )
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        yield ModelStreamEvent.completed(
+            {
+                "model": request.model,
+                "usage": {"input_tokens": 1_000_000, "output_tokens": 1_000_000},
+                "bedrock_service_tier": "default",
+            }
+        )
 
 
 class CountingArtifactStore(ArtifactStore):
@@ -3079,6 +3149,69 @@ def test_server_exposes_session_cost_estimate() -> None:
             }
         ],
     }
+
+
+def test_server_preserves_priced_and_unpriced_bedrock_identity() -> None:
+    app = CayuApp()
+    provider = BedrockUsageProvider()
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model=provider.identity.resource_id))
+    asyncio.run(
+        _collect_run(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="bedrock_cost_1",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+    pricing = _price_book_payload(
+        provider_name="bedrock",
+        model=provider.identity.resource_id,
+        input_per_million="3",
+        output_per_million="15",
+    )
+    price = pricing["prices"][0]
+    assert isinstance(price, dict)
+    price.update(
+        {
+            "match": "exact",
+            "pricing_context": {
+                "dimensions": {
+                    "source_region": ["us-east-1"],
+                    "service_tier": ["default"],
+                }
+            },
+        }
+    )
+
+    client = TestClient(create_server(app, dev=True))
+    priced = client.post(
+        "/api/sessions/bedrock_cost_1/cost",
+        json={"pricing": pricing},
+    ).json()
+    pricing_context = price["pricing_context"]
+    assert isinstance(pricing_context, dict)
+    dimensions = pricing_context["dimensions"]
+    assert isinstance(dimensions, dict)
+    dimensions["source_region"] = ["us-west-2"]
+    unpriced = client.post(
+        "/api/sessions/bedrock_cost_1/cost",
+        json={"pricing": pricing},
+    ).json()
+
+    completed_identity = completed_bedrock_billing_identity(
+        provider.identity,
+        effective_service_tier="default",
+    ).model_dump(mode="json")
+    assert priced["total_cost"] == "18"
+    assert priced["line_items"][0]["billing_identity"] == completed_identity
+    assert priced["line_items"][0]["pricing_model"] == provider.identity.resource_id
+    assert unpriced["total_cost"] == "0"
+    assert unpriced["unpriced_model_steps"] == 1
+    assert unpriced["line_items"][0]["billing_identity"] == completed_identity
+    assert unpriced["line_items"][0]["missing_pricing_reason"] == "no matching model pricing"
 
 
 def test_server_cost_accepts_tiered_price_book() -> None:

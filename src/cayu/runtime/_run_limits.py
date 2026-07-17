@@ -10,6 +10,13 @@ from decimal import Decimal
 from typing import Generic, TypeVar
 
 from cayu._validation import require_clean_nonblank
+from cayu.core.billing import (
+    UNRESOLVED_BILLING_IDENTITY,
+    BillingIdentity,
+    BillingIdentityState,
+    ResolvedBillingIdentity,
+    resolved_billing_identity,
+)
 from cayu.core.events import Event, EventType
 from cayu.providers import ModelProviderError
 from cayu.runtime._event_writer import RuntimeEventWriter
@@ -32,6 +39,7 @@ from cayu.runtime.budgets import (
     budget_reconciliation_with_pricing,
     budget_reservation_payload,
     events_for_budget_window,
+    has_deferred_contextual_price,
     request_budget_limits_for_session,
 )
 from cayu.runtime.costs import SessionCostSummary, estimate_session_cost
@@ -334,6 +342,7 @@ class RunLimitController:
         operation_events: list[Event],
         provider_name: str | None,
         model: str | None,
+        billing_identity_state: BillingIdentityState = UNRESOLVED_BILLING_IDENTITY,
     ) -> tuple[OperationBudgetCheck, ...]:
         """Evaluate scopes while including an operation's uncommitted events."""
 
@@ -376,6 +385,7 @@ class RunLimitController:
                 events=events,
                 provider_name=effective_provider_name,
                 model=effective_model,
+                billing_identity_state=billing_identity_state,
                 effective_at=self._clock(),
             )
             checks.append(OperationBudgetCheck(limit=limit, check=check))
@@ -395,6 +405,8 @@ class RunLimitController:
         pending_tool_calls: int = 0,
         budget_notify_events: list[Event] | None = None,
         usage_tracker: SessionUsageTracker | None = None,
+        billing_identity_state: BillingIdentityState = UNRESOLVED_BILLING_IDENTITY,
+        pricing_provider_name: str | None = None,
     ) -> LimitEvaluation:
         budget_limits = request_budget_limits_for_session(
             limits=budget_limits,
@@ -497,6 +509,8 @@ class RunLimitController:
                 cost_summary=cost_summary,
                 cost_baseline=budget_baseline,
                 effective_at=budget_window_now,
+                billing_identity_state=billing_identity_state,
+                pricing_provider_name=pricing_provider_name,
             )
             if budget_outcome is None:
                 continue
@@ -535,6 +549,8 @@ class RunLimitController:
         agent_name: str,
         environment_name: str | None,
         budget_policy: BudgetPolicy | None,
+        billing_identity_state: BillingIdentityState = UNRESOLVED_BILLING_IDENTITY,
+        pricing_provider_name: str | None = None,
     ) -> BudgetEvaluation:
         limits = budget_limits_for_session(
             policy=budget_policy,
@@ -544,6 +560,7 @@ class RunLimitController:
         if not limits:
             return BudgetEvaluation(check=None)
         emitted_events: list[Event] = []
+        effective_provider_name = pricing_provider_name or session.provider_name
         for limit in limits:
             events = await self._budget_store.load_events_for_budget(
                 scope=limit.scope,
@@ -553,21 +570,32 @@ class RunLimitController:
             check = budget_check_from_events(
                 limit=limit,
                 events=events,
-                provider_name=session.provider_name,
+                provider_name=effective_provider_name,
                 model=session.model,
+                billing_identity_state=billing_identity_state,
                 effective_at=self._clock(),
             )
-            emitted_events.append(
-                await self._event_writer.emit(
-                    Event(
-                        type=EventType.BUDGET_CHECKED,
-                        session_id=session.id,
-                        agent_name=agent_name,
-                        environment_name=environment_name,
-                        payload=budget_check_payload(check),
-                    )
+            deferred_contextual_check = (
+                not isinstance(billing_identity_state, ResolvedBillingIdentity)
+                and not check.limit_reached
+                and has_deferred_contextual_price(
+                    limit.pricing,
+                    provider_name=effective_provider_name,
+                    model=session.model,
                 )
             )
+            if not deferred_contextual_check:
+                emitted_events.append(
+                    await self._event_writer.emit(
+                        Event(
+                            type=EventType.BUDGET_CHECKED,
+                            session_id=session.id,
+                            agent_name=agent_name,
+                            environment_name=environment_name,
+                            payload=budget_check_payload(check),
+                        )
+                    )
+                )
             if not check.limit_reached:
                 continue
             if limit.action == "notify":
@@ -650,6 +678,7 @@ class RunLimitController:
         environment_name: str | None,
         budget_policy: BudgetPolicy | None,
         request_budget_limits: tuple[BudgetLimit, ...] = (),
+        billing_identity: BillingIdentity | None = None,
     ) -> BudgetReservationSetup:
         limits = self.provider_reservation_limits(
             session=session,
@@ -666,13 +695,23 @@ class RunLimitController:
         release_reason = "reservation setup failed"
         try:
             for limit in limits:
-                result = await self._budget_ledger.reserve(
-                    limit=limit,
-                    session_id=session.id,
-                    agent_name=agent_name,
-                    provider_name=provider_name,
-                    model=session.model,
-                )
+                if billing_identity is None:
+                    result = await self._budget_ledger.reserve(
+                        limit=limit,
+                        session_id=session.id,
+                        agent_name=agent_name,
+                        provider_name=provider_name,
+                        model=session.model,
+                    )
+                else:
+                    result = await self._budget_ledger.reserve(
+                        limit=limit,
+                        session_id=session.id,
+                        agent_name=agent_name,
+                        provider_name=provider_name,
+                        model=session.model,
+                        billing_identity=billing_identity,
+                    )
                 if result.accepted:
                     if result.record is None:
                         raise RuntimeError("Accepted budget reservation did not return a record.")
@@ -741,7 +780,25 @@ class RunLimitController:
     ) -> tuple[BudgetLimit, ...]:
         return tuple(
             limit
-            for limit in (
+            for limit in self.provider_budget_limits(
+                session=session,
+                agent_name=agent_name,
+                budget_policy=budget_policy,
+                request_budget_limits=request_budget_limits,
+            )
+            if limit.reservation is not None
+        )
+
+    def provider_budget_limits(
+        self,
+        *,
+        session: Session,
+        agent_name: str,
+        budget_policy: BudgetPolicy | None,
+        request_budget_limits: tuple[BudgetLimit, ...] = (),
+    ) -> tuple[BudgetLimit, ...]:
+        return tuple(
+            (
                 *budget_limits_for_session(
                     policy=budget_policy,
                     agent_name=agent_name,
@@ -749,7 +806,6 @@ class RunLimitController:
                 ),
                 *request_budget_limits,
             )
-            if limit.reservation is not None
         )
 
     async def reconcile_dispatched_reservations(
@@ -790,11 +846,17 @@ class RunLimitController:
                     if reservation_id in dispatch.settled_reservation_ids:
                         continue
                     priced_actual = None
+                    completed_billing_identity = None
                     if dispatch.completion is None:
                         actual_amount = reservation.record.reserved_amount
                         reason = unknown_reason
                         reconciled_at = self._clock()
                     else:
+                        raw_identity = dispatch.completion.payload.get("billing_identity")
+                        if type(raw_identity) is dict:
+                            completed_billing_identity = BillingIdentity.model_validate(
+                                raw_identity
+                            )
                         reconciled_at = dispatch.completion.timestamp
                         try:
                             priced_actual = budget_actual_cost_for_event(
@@ -808,12 +870,26 @@ class RunLimitController:
                             actual_amount = priced_actual.amount
                             reason = "model completed"
                     try:
-                        reconciliation = await self._budget_ledger.reconcile(
-                            reservation_id=reservation_id,
-                            actual_amount=actual_amount,
-                            reason=reason,
-                            occurred_at=reconciled_at,
+                        reconciliation_identity = (
+                            priced_actual.line_item.billing_identity
+                            if priced_actual is not None
+                            else completed_billing_identity
                         )
+                        if reconciliation_identity is None:
+                            reconciliation = await self._budget_ledger.reconcile(
+                                reservation_id=reservation_id,
+                                actual_amount=actual_amount,
+                                reason=reason,
+                                occurred_at=reconciled_at,
+                            )
+                        else:
+                            reconciliation = await self._budget_ledger.reconcile(
+                                reservation_id=reservation_id,
+                                actual_amount=actual_amount,
+                                reason=reason,
+                                occurred_at=reconciled_at,
+                                billing_identity=reconciliation_identity,
+                            )
                         if priced_actual is not None:
                             reconciliation = budget_reconciliation_with_pricing(
                                 reconciliation,
@@ -1140,6 +1216,8 @@ class RunLimitController:
         provider_name: str,
         model: str,
         authoritative_failure_types: tuple[type[BaseException], ...],
+        billing_identity: BillingIdentity | None = None,
+        pricing_provider_name: str | None = None,
     ) -> (
         BudgetedOperationSucceeded[_OperationResultT]
         | BudgetedOperationRejected
@@ -1148,6 +1226,51 @@ class RunLimitController:
         """Run one observable compactor dispatch under strict budget accounting."""
 
         lifecycle = _BudgetedOperationLifecycle()
+        effective_pricing_provider_name = pricing_provider_name or provider_name
+        contextual_preflight_limits = tuple(
+            limit
+            for limit in budget_limits
+            if limit.action == "interrupt"
+            and not limit.allow_unpriced
+            and has_deferred_contextual_price(
+                limit.pricing,
+                provider_name=effective_pricing_provider_name,
+                model=model,
+            )
+        )
+        if contextual_preflight_limits:
+            resolved_checks = await self.evaluate_operation_budgets(
+                session=session,
+                budget_limits=contextual_preflight_limits,
+                operation_events=[],
+                provider_name=effective_pricing_provider_name,
+                model=model,
+                billing_identity_state=resolved_billing_identity(billing_identity),
+            )
+            for resolved in resolved_checks:
+                if not resolved.check.limit_reached:
+                    continue
+                failure = BudgetReservationResult(
+                    accepted=False,
+                    scope=resolved.limit.scope,
+                    key=resolved.limit.key,
+                    window=resolved.limit.window,
+                    currency=resolved.limit.currency,
+                    maximum=resolved.limit.max_estimated_cost,
+                    requested=Decimal("0"),
+                    actual=resolved.check.actual,
+                    message=resolved.check.message,
+                )
+                event = await self._event_writer.emit(
+                    Event(
+                        type=EventType.BUDGET_RESERVATION_FAILED,
+                        session_id=session.id,
+                        agent_name=agent_name,
+                        environment_name=environment_name,
+                        payload=budget_reservation_payload(failure),
+                    )
+                )
+                return BudgetedOperationRejected(failure=failure, events=(event,))
         result: _OperationResultT | None = None
         reservation_failure: BudgetReservationResult | None = None
         authoritative_failure: BaseException | None = None
@@ -1161,6 +1284,7 @@ class RunLimitController:
                 agent_name=agent_name,
                 provider_name=provider_name,
                 model=model,
+                billing_identity=billing_identity,
                 rejection_release_reason="reservation failed",
                 accepted_record_error=(
                     "Accepted automatic compaction budget reservation has no record."
@@ -1452,14 +1576,27 @@ class RunLimitController:
                         )
                     else:
                         reason = "automatic context compaction model completed"
-                reconciliation = await self._budget_ledger.reconcile(
-                    reservation_id=reservation.record.reservation_id,
-                    actual_amount=actual_amount,
-                    reason=reason,
-                    occurred_at=(
-                        completed_events[-1].timestamp if completed_events else self._clock()
-                    ),
-                )
+                completed_billing_identity = _single_completion_billing_identity(completed_events)
+                if len(completed_events) == 1 and len(priced_actuals) == 1:
+                    completed_billing_identity = (
+                        priced_actuals[0].line_item.billing_identity or completed_billing_identity
+                    )
+                occurred_at = completed_events[-1].timestamp if completed_events else self._clock()
+                if completed_billing_identity is None:
+                    reconciliation = await self._budget_ledger.reconcile(
+                        reservation_id=reservation.record.reservation_id,
+                        actual_amount=actual_amount,
+                        reason=reason,
+                        occurred_at=occurred_at,
+                    )
+                else:
+                    reconciliation = await self._budget_ledger.reconcile(
+                        reservation_id=reservation.record.reservation_id,
+                        actual_amount=actual_amount,
+                        reason=reason,
+                        occurred_at=occurred_at,
+                        billing_identity=completed_billing_identity,
+                    )
                 if len(completed_events) == 1 and len(priced_actuals) == 1:
                     reconciliation = budget_reconciliation_with_pricing(
                         reconciliation,
@@ -1491,6 +1628,7 @@ class RunLimitController:
         model: str | None,
         rejection_release_reason: str,
         accepted_record_error: str,
+        billing_identity: BillingIdentity | None = None,
     ) -> OperationReservationSetup:
         limits = [limit for limit in budget_limits if limit.reservation is not None]
         if not limits or provider_name is None or model is None:
@@ -1501,13 +1639,23 @@ class RunLimitController:
         releases: list[BudgetReconciliation] = []
         for limit in limits:
             try:
-                result = await self._budget_ledger.reserve(
-                    limit=limit,
-                    session_id=session_id,
-                    agent_name=agent_name,
-                    provider_name=provider_name,
-                    model=model,
-                )
+                if billing_identity is None:
+                    result = await self._budget_ledger.reserve(
+                        limit=limit,
+                        session_id=session_id,
+                        agent_name=agent_name,
+                        provider_name=provider_name,
+                        model=model,
+                    )
+                else:
+                    result = await self._budget_ledger.reserve(
+                        limit=limit,
+                        session_id=session_id,
+                        agent_name=agent_name,
+                        provider_name=provider_name,
+                        model=model,
+                        billing_identity=billing_identity,
+                    )
                 results.append(result)
                 if not result.accepted:
                     async for reconciliation in self.release_operation_reservations(
@@ -1583,14 +1731,34 @@ class RunLimitController:
         except ValueError:
             actual_amount = reservation.record.reserved_amount
             reason = missing_usage_reason
-        reconciliation = await self._budget_ledger.reconcile(
-            reservation_id=reservation.record.reservation_id,
-            actual_amount=actual_amount,
-            reason=reason,
-            occurred_at=(
-                model_completed_events[-1].timestamp if model_completed_events else self._clock()
-            ),
+        completed_billing_identity = _single_completion_billing_identity(model_completed_events)
+        if len(model_completed_events) == 1 and len(priced_actuals) == 1:
+            completed_billing_identity = (
+                priced_actuals[0].line_item.billing_identity or completed_billing_identity
+            )
+        if reservation.record.billing_identity is None:
+            # A context-free price may reserve before the provider's optional
+            # billing hook runs. Completion cannot introduce an identity that
+            # was absent from the request-time reservation.
+            completed_billing_identity = None
+        occurred_at = (
+            model_completed_events[-1].timestamp if model_completed_events else self._clock()
         )
+        if completed_billing_identity is None:
+            reconciliation = await self._budget_ledger.reconcile(
+                reservation_id=reservation.record.reservation_id,
+                actual_amount=actual_amount,
+                reason=reason,
+                occurred_at=occurred_at,
+            )
+        else:
+            reconciliation = await self._budget_ledger.reconcile(
+                reservation_id=reservation.record.reservation_id,
+                actual_amount=actual_amount,
+                reason=reason,
+                occurred_at=occurred_at,
+                billing_identity=completed_billing_identity,
+            )
         if len(priced_actuals) == 1:
             reconciliation = budget_reconciliation_with_pricing(
                 reconciliation,
@@ -1671,6 +1839,7 @@ class RunLimitGate:
         run_baseline: SessionUsageSummary | None,
         budget_baseline_events: list[Event],
         budget_notify_events: list[Event],
+        pricing_provider_name: str | None = None,
     ) -> None:
         self._controller = controller
         self._session = session
@@ -1682,9 +1851,15 @@ class RunLimitGate:
         self._run_baseline = run_baseline
         self._budget_baseline_events = budget_baseline_events
         self._budget_notify_events = budget_notify_events
+        self._pricing_provider_name = pricing_provider_name
         self._usage_tracker = controller.usage_tracker(session.id)
 
-    async def evaluate_limits(self, *, pending_tool_calls: int = 0) -> LimitEvaluation:
+    async def evaluate_limits(
+        self,
+        *,
+        pending_tool_calls: int = 0,
+        billing_identity_state: BillingIdentityState = UNRESOLVED_BILLING_IDENTITY,
+    ) -> LimitEvaluation:
         return await self._controller.evaluate_request_limits(
             session=self._session,
             agent_name=self._agent_name,
@@ -1697,14 +1872,23 @@ class RunLimitGate:
             pending_tool_calls=pending_tool_calls,
             budget_notify_events=self._budget_notify_events,
             usage_tracker=self._usage_tracker,
+            billing_identity_state=billing_identity_state,
+            pricing_provider_name=self._pricing_provider_name,
         )
 
-    async def evaluate_budget(self, budget_policy: BudgetPolicy | None) -> BudgetEvaluation:
+    async def evaluate_budget(
+        self,
+        budget_policy: BudgetPolicy | None,
+        *,
+        billing_identity_state: BillingIdentityState = UNRESOLVED_BILLING_IDENTITY,
+    ) -> BudgetEvaluation:
         return await self._controller.evaluate_policy_budgets(
             session=self._session,
             agent_name=self._agent_name,
             environment_name=self._environment_name,
             budget_policy=budget_policy,
+            billing_identity_state=billing_identity_state,
+            pricing_provider_name=self._pricing_provider_name,
         )
 
 
@@ -1719,6 +1903,13 @@ def _latest_model_event_identity(events: list[Event]) -> tuple[str | None, str |
             model if type(model) is str else None,
         )
     return None, None
+
+
+def _single_completion_billing_identity(events: list[Event]) -> BillingIdentity | None:
+    if len(events) != 1:
+        return None
+    raw_identity = events[0].payload.get("billing_identity")
+    return BillingIdentity.model_validate(raw_identity) if type(raw_identity) is dict else None
 
 
 def _remove_reservation(
@@ -1779,6 +1970,8 @@ def _first_budget_limit_outcome(
     cost_summary: SessionCostSummary,
     cost_baseline: SessionCostSummary | None,
     effective_at: datetime,
+    billing_identity_state: BillingIdentityState = UNRESOLVED_BILLING_IDENTITY,
+    pricing_provider_name: str | None = None,
 ) -> _BudgetLimitOutcome | None:
     if type(session) is not Session:
         raise TypeError("session must be a Session instance.")
@@ -1824,6 +2017,8 @@ def _first_budget_limit_outcome(
         session=session,
         limit=limit,
         effective_at=effective_at,
+        billing_identity_state=billing_identity_state,
+        pricing_provider_name=pricing_provider_name,
     )
     if preflight_error is not None:
         decision = StopDecision(
@@ -1895,24 +2090,48 @@ def _budget_limit_preflight_error(
     session: Session,
     limit: BudgetLimit,
     effective_at: datetime,
+    billing_identity_state: BillingIdentityState = UNRESOLVED_BILLING_IDENTITY,
+    pricing_provider_name: str | None = None,
 ) -> str | None:
-    if limit.allow_unpriced:
+    effective_provider_name = pricing_provider_name or session.provider_name
+    if not isinstance(billing_identity_state, ResolvedBillingIdentity):
+        if limit.allow_unpriced:
+            return None
+        price = budget_price(
+            limit,
+            provider_name=effective_provider_name,
+            model=session.model,
+            effective_at=effective_at,
+        )
+        if price is None:
+            # Contextual rates cannot be selected until the provider resolves
+            # request pricing dimensions. Recheck immediately before dispatch.
+            deferred = budget_check_from_events(
+                limit=limit,
+                events=[],
+                provider_name=effective_provider_name,
+                model=session.model,
+                effective_at=effective_at,
+            )
+            if not deferred.limit_reached:
+                return None
+            return (
+                "Estimated cost budget cannot be verified because "
+                f"{effective_provider_name}/{session.model} has no matching pricing."
+            )
+        if price.currency.upper() != limit.currency.upper():
+            return (
+                "Estimated cost budget cannot be verified because "
+                f"{effective_provider_name}/{session.model} pricing currency {price.currency} "
+                f"does not match requested {limit.currency}."
+            )
         return None
-    price = budget_price(
-        limit,
-        provider_name=session.provider_name,
+    check = budget_check_from_events(
+        limit=limit,
+        events=[],
+        provider_name=effective_provider_name,
         model=session.model,
+        billing_identity_state=billing_identity_state,
         effective_at=effective_at,
     )
-    if price is None:
-        return (
-            "Estimated cost budget cannot be verified because "
-            f"{session.provider_name}/{session.model} has no matching pricing."
-        )
-    if price.currency.upper() != limit.currency.upper():
-        return (
-            "Estimated cost budget cannot be verified because "
-            f"{session.provider_name}/{session.model} pricing currency {price.currency} "
-            f"does not match requested {limit.currency}."
-        )
-    return None
+    return check.message if check.limit_reached else None

@@ -8,6 +8,7 @@ from typing import Any, cast
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu.core.billing import BillingIdentity
 from cayu.core.messages import Message, copy_message
 
 
@@ -574,6 +575,8 @@ class ModelProvider(ABC):
     """Normalizes provider-specific model streams."""
 
     name: str
+    billing_provider_name: str | None = None
+    """Canonical commercial provider key, when billing differs from ``name``."""
     usage_dialect: UsageDialect = UsageDialect.AUTO
     """Usage payload dialect for cache-token normalization; see ``UsageDialect``.
 
@@ -591,6 +594,23 @@ class ModelProvider(ABC):
     @property
     def context_pressure_profile(self) -> ModelContextPressureProfile:
         return ModelContextPressureProfile()
+
+    async def billing_identity_for_request(
+        self,
+        request: ModelRequest,
+    ) -> BillingIdentity | None:
+        """Resolve optional request context needed for commercial accounting."""
+
+        return None
+
+    def billing_identity_for_completion(
+        self,
+        identity: BillingIdentity | None,
+        payload: dict[str, Any],
+    ) -> BillingIdentity | None:
+        """Merge provider-reported completion facts into a request identity."""
+
+        return identity
 
     def preflight_native_structured_output_schema(self, json_schema: dict[str, Any]) -> None:
         """Optionally reject a NATIVE structured-output schema this adapter's

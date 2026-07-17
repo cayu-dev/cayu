@@ -5,6 +5,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu.core.billing import BillingIdentity
 from cayu.core.events import Event, EventType
 
 
@@ -15,6 +16,11 @@ class CacheUsageMetrics(BaseModel):
 
     read_tokens: StrictInt = Field(default=0, ge=0)
     write_tokens: StrictInt = Field(default=0, ge=0)
+    write_5m_tokens: StrictInt = Field(default=0, ge=0, exclude_if=lambda value: value == 0)
+    write_1h_tokens: StrictInt = Field(default=0, ge=0, exclude_if=lambda value: value == 0)
+    write_unknown_ttl_tokens: StrictInt = Field(
+        default=0, ge=0, exclude_if=lambda value: value == 0
+    )
     cached_input_tokens: StrictInt = Field(default=0, ge=0)
     uncached_input_tokens: StrictInt = Field(default=0, ge=0)
 
@@ -27,6 +33,9 @@ class UsageMetrics(BaseModel):
     provider_name: str | None = None
     requested_model: str | None = None
     model: str | None = None
+    billing_identity: BillingIdentity | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     input_tokens: StrictInt = Field(default=0, ge=0)
     output_tokens: StrictInt = Field(default=0, ge=0)
     total_tokens: StrictInt = Field(default=0, ge=0)
@@ -128,6 +137,7 @@ def normalize_usage_metrics(
     raw_usage: Any,
     usage_dialect: str | None = None,
     requested_model: str | None = None,
+    billing_identity: BillingIdentity | None = None,
 ) -> UsageMetrics | None:
     """Normalize provider usage payloads without hiding the original raw usage.
 
@@ -172,11 +182,52 @@ def normalize_usage_metrics(
 
     cache_read_tokens = _nonnegative_int(raw_usage.get("cache_read_input_tokens"))
     cache_write_tokens = _nonnegative_int(raw_usage.get("cache_creation_input_tokens"))
+    cache_write_5m_tokens = 0
+    cache_write_1h_tokens = 0
+    cache_write_unknown_ttl_tokens = 0
+    cache_details = raw_usage.get("cache_details")
+    has_cache_details = type(cache_details) is list
+    if has_cache_details:
+        for detail in cache_details:
+            if type(detail) is not dict:
+                continue
+            tokens = _nonnegative_int(detail.get("input_tokens"))
+            ttl = detail.get("ttl")
+            if ttl == "5m":
+                cache_write_5m_tokens += tokens
+            elif ttl == "1h":
+                cache_write_1h_tokens += tokens
+            else:
+                cache_write_unknown_ttl_tokens += tokens
     cache_creation = raw_usage.get("cache_creation")
     if type(cache_creation) is dict:
         cache_creation_tokens = sum(_nonnegative_int(value) for value in cache_creation.values())
         if cache_creation_tokens > 0:
-            cache_write_tokens = cache_creation_tokens
+            cache_write_tokens = max(cache_write_tokens, cache_creation_tokens)
+        if not has_cache_details:
+            cache_write_5m_tokens += _nonnegative_int(
+                cache_creation.get("ephemeral_5m_input_tokens")
+            )
+            cache_write_1h_tokens += _nonnegative_int(
+                cache_creation.get("ephemeral_1h_input_tokens")
+            )
+            cache_write_unknown_ttl_tokens += sum(
+                _nonnegative_int(value)
+                for key, value in cache_creation.items()
+                if key
+                not in {
+                    "ephemeral_5m_input_tokens",
+                    "ephemeral_1h_input_tokens",
+                }
+            )
+
+    detailed_cache_writes = (
+        cache_write_5m_tokens + cache_write_1h_tokens + cache_write_unknown_ttl_tokens
+    )
+    if detailed_cache_writes > cache_write_tokens:
+        cache_write_tokens = detailed_cache_writes
+    elif cache_write_tokens > detailed_cache_writes:
+        cache_write_unknown_ttl_tokens += cache_write_tokens - detailed_cache_writes
 
     provider = provider_name.strip().lower() if type(provider_name) is str else None
     dialect = _resolve_usage_dialect(
@@ -202,6 +253,7 @@ def normalize_usage_metrics(
         provider_name=provider_name,
         requested_model=requested_model,
         model=model,
+        billing_identity=billing_identity,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         total_tokens=total_tokens,
@@ -209,6 +261,9 @@ def normalize_usage_metrics(
         cache=CacheUsageMetrics(
             read_tokens=cache_read_tokens,
             write_tokens=cache_write_tokens,
+            write_5m_tokens=cache_write_5m_tokens,
+            write_1h_tokens=cache_write_1h_tokens,
+            write_unknown_ttl_tokens=cache_write_unknown_ttl_tokens,
             cached_input_tokens=cached_input_tokens,
             uncached_input_tokens=uncached_input_tokens,
         ),
@@ -219,6 +274,15 @@ def usage_metrics_payload(metrics: UsageMetrics | None) -> dict[str, Any] | None
     if metrics is None:
         return None
     return metrics.model_dump()
+
+
+def strip_provider_billing_identity(payload: dict[str, Any]) -> None:
+    """Remove billing identity fields that only the runtime may populate."""
+
+    payload.pop("billing_identity", None)
+    usage_metrics = payload.get("usage_metrics")
+    if type(usage_metrics) is dict:
+        usage_metrics.pop("billing_identity", None)
 
 
 # The event types usage accounting reads and folds: `tool.call.started`
@@ -297,15 +361,25 @@ def causal_budget_usage_summary(
 
 
 def usage_metrics_from_event_payload(payload: dict[str, Any]) -> UsageMetrics | None:
+    raw_identity = payload.get("billing_identity")
+    event_identity = (
+        BillingIdentity.model_validate(raw_identity) if type(raw_identity) is dict else None
+    )
     metrics = payload.get("usage_metrics")
     if type(metrics) is dict:
-        return UsageMetrics(**copy_json_value(metrics, "usage_metrics"))
+        parsed = UsageMetrics(**copy_json_value(metrics, "usage_metrics"))
+        if event_identity is None:
+            return parsed
+        if parsed.billing_identity is not None and parsed.billing_identity != event_identity:
+            raise ValueError("model.completed billing identities do not match.")
+        return parsed.model_copy(update={"billing_identity": event_identity}, deep=True)
 
     return normalize_usage_metrics(
         provider_name=_optional_string(payload.get("provider_name")),
         model=_optional_string(payload.get("model")),
         requested_model=_optional_string(payload.get("requested_model")),
         raw_usage=payload.get("usage"),
+        billing_identity=event_identity,
     )
 
 
@@ -318,6 +392,11 @@ def _add_usage(left: UsageMetrics, right: UsageMetrics) -> UsageMetrics:
         cache=CacheUsageMetrics(
             read_tokens=left.cache.read_tokens + right.cache.read_tokens,
             write_tokens=left.cache.write_tokens + right.cache.write_tokens,
+            write_5m_tokens=left.cache.write_5m_tokens + right.cache.write_5m_tokens,
+            write_1h_tokens=left.cache.write_1h_tokens + right.cache.write_1h_tokens,
+            write_unknown_ttl_tokens=(
+                left.cache.write_unknown_ttl_tokens + right.cache.write_unknown_ttl_tokens
+            ),
             cached_input_tokens=left.cache.cached_input_tokens + right.cache.cached_input_tokens,
             uncached_input_tokens=left.cache.uncached_input_tokens
             + right.cache.uncached_input_tokens,

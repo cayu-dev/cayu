@@ -6,6 +6,7 @@ import threading
 from collections.abc import Iterable
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -32,6 +33,7 @@ from cayu.providers import (
     ModelRequest,
     ModelStreamEvent,
     ModelStreamEventType,
+    bedrock_billing_identity,
 )
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 
@@ -42,6 +44,7 @@ class FakeBedrockClient:
         self.converse_calls: list[dict[str, Any]] = []
         self.count_calls: list[dict[str, Any]] = []
         self.closed = False
+        self.meta = SimpleNamespace(region_name="us-east-1")
 
     def converse_stream(self, **kwargs: Any) -> dict[str, Any]:
         self.converse_calls.append(kwargs)
@@ -149,8 +152,10 @@ def test_bedrock_provider_streams_text_and_usage_through_converse() -> None:
                         "totalTokens": 13,
                         "cacheReadInputTokens": 3,
                         "cacheWriteInputTokens": 1,
+                        "cacheDetails": [{"ttl": "5m", "inputTokens": 1}],
                     },
                     "metrics": {"latencyMs": 42},
+                    "serviceTier": {"type": "default"},
                 }
             },
         ]
@@ -181,6 +186,7 @@ def test_bedrock_provider_streams_text_and_usage_through_converse() -> None:
             "total_tokens": 13,
             "cache_read_input_tokens": 3,
             "cache_creation_input_tokens": 1,
+            "cache_details": [{"ttl": "5m", "input_tokens": 1}],
         },
         "bedrock_usage": {
             "inputTokens": 11,
@@ -188,8 +194,10 @@ def test_bedrock_provider_streams_text_and_usage_through_converse() -> None:
             "totalTokens": 13,
             "cacheReadInputTokens": 3,
             "cacheWriteInputTokens": 1,
+            "cacheDetails": [{"ttl": "5m", "inputTokens": 1}],
         },
         "metrics": {"latencyMs": 42},
+        "bedrock_service_tier": "default",
     }
     assert client.converse_calls == [
         {
@@ -199,6 +207,107 @@ def test_bedrock_provider_streams_text_and_usage_through_converse() -> None:
             "inferenceConfig": {"maxTokens": 4096},
         }
     ]
+
+
+def test_bedrock_billing_identity_uses_actual_client_region_and_service_tier() -> None:
+    client = FakeBedrockClient([])
+    provider = BedrockProvider(client=client, region_name="eu-west-1")
+    request = ModelRequest(
+        model="global.anthropic.claude-sonnet-4-6",
+        messages=[Message.text("user", "hello")],
+        options={"bedrock": {"serviceTier": {"type": "reserved"}}},
+    )
+
+    identity = asyncio.run(provider.billing_identity_for_request(request))
+    completed = provider.billing_identity_for_completion(
+        identity,
+        {"bedrock_service_tier": "default"},
+    )
+
+    assert identity.provider_name == "bedrock"
+    assert identity.resource_id == request.model
+    assert identity.request_evidence["source_region"] == "us-east-1"
+    assert identity.request_evidence["profile_scope"] == "global"
+    assert identity.request_evidence["requested_service_tier"] == "reserved"
+    assert completed is not None
+    assert completed.completion_evidence["effective_service_tier"] == "default"
+
+
+@pytest.mark.parametrize(
+    ("resource_type", "profile_scope", "message"),
+    [
+        ("invalid", None, "resource_type"),
+        ("inference_profile", "invalid", "profile_scope"),
+    ],
+)
+def test_bedrock_billing_identity_rejects_invalid_classification_literals(
+    resource_type: Any,
+    profile_scope: Any,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        bedrock_billing_identity(
+            invoked_model="global.anthropic.claude-sonnet-4-6",
+            source_region="us-east-1",
+            resource_type=resource_type,
+            profile_scope=profile_scope,
+        )
+
+
+@pytest.mark.parametrize(
+    ("model_id", "resource_type", "profile_scope"),
+    [
+        (
+            "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-v1:0",
+            "foundation_model",
+            None,
+        ),
+        (
+            "arn:aws:bedrock:us-east-1:123456789012:"
+            "inference-profile/global.anthropic.claude-sonnet-v1:0",
+            "inference_profile",
+            "global",
+        ),
+        (
+            "arn:aws:bedrock:us-east-1:123456789012:"
+            "inference-profile/us.anthropic.claude-sonnet-v1:0",
+            "inference_profile",
+            "geographic",
+        ),
+        (
+            "arn:aws-us-gov:bedrock:us-gov-west-1:123456789012:"
+            "inference-profile/us-gov.anthropic.claude-sonnet-v1:0",
+            "inference_profile",
+            "geographic",
+        ),
+        (
+            "arn:aws:bedrock:us-east-1:123456789012:prompt/ABCDEFGHIJ:1",
+            "prompt",
+            None,
+        ),
+        (
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/profile-1",
+            "application_inference_profile",
+            None,
+        ),
+        ("arn:aws:bedrock", "unknown", None),
+        ("arn:aws:s3:::bucket", "unknown", None),
+        (
+            "arn:aws:bedrock:us-east-1:123456789012:unsupported-resource/value:1",
+            "unknown",
+            None,
+        ),
+    ],
+)
+def test_bedrock_billing_identity_classifies_complete_arn_resource(
+    model_id: str,
+    resource_type: str,
+    profile_scope: str | None,
+) -> None:
+    assert bedrock_module._bedrock_resource_identity(model_id) == (
+        resource_type,
+        profile_scope,
+    )
 
 
 def test_bedrock_provider_round_trips_tools_through_converse() -> None:
@@ -688,8 +797,13 @@ async def test_bedrock_provider_supports_structured_output_via_tools() -> None:
                 ModelPrice.fixed(
                     provider_name="bedrock",
                     model="anthropic.claude-test",
+                    match="exact",
                     input_per_million=Decimal("1"),
                     output_per_million=Decimal("2"),
+                    pricing_context={
+                        "source_region": ("us-east-1",),
+                        "service_tier": ("default",),
+                    },
                 ),
             )
         ),

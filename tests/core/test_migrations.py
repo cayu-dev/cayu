@@ -107,3 +107,27 @@ def test_revision_twenty_side_effect_handoff_is_rolling_deploy_compatible() -> N
         app_latest=20,
         app_min_supported=20,
     )
+
+
+def test_revision_twenty_one_rejects_pre_billing_identity_readers() -> None:
+    state = m.SchemaState(revision=21, compatible_from=21)
+
+    with pytest.raises(m.SchemaTooNew, match="understands revision >= 21"):
+        m.validate(
+            state,
+            app_latest=20,
+            app_min_supported=19,
+        )
+
+    with pytest.raises(m.SchemaTooOld, match="requires >= 21"):
+        m.validate(
+            m.SchemaState(revision=20, compatible_from=19),
+            app_latest=21,
+            app_min_supported=21,
+        )
+
+    m.validate(
+        state,
+        app_latest=21,
+        app_min_supported=21,
+    )

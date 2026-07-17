@@ -11,7 +11,13 @@ from decimal import Decimal
 import pytest
 
 from cayu.core import AgentSpec, Event, EventType, Message
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.core.billing import BillingIdentity
+from cayu.providers import (
+    ModelProvider,
+    ModelRequest,
+    ModelStreamEvent,
+    bedrock_billing_identity,
+)
 from cayu.runtime import CayuApp
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._run_limits import (
@@ -32,6 +38,7 @@ from cayu.runtime.budgets import (
     BudgetReservationResult,
     InMemoryBudgetLedger,
     SessionBudgetStore,
+    has_deferred_contextual_price,
 )
 from cayu.runtime.costs import ModelPrice, PriceBook
 from cayu.runtime.sessions import (
@@ -86,6 +93,42 @@ def _reserved_limit(maximum: str) -> BudgetLimit:
             max_input_tokens=1_000_000,
             max_output_tokens=0,
         ),
+    )
+
+
+def test_deferred_bedrock_price_does_not_shadow_direct_gateway_price() -> None:
+    pricing = PriceBook(
+        prices=(
+            ModelPrice.fixed(
+                provider_name="gateway",
+                model="shared-model",
+                match="exact",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("2"),
+            ),
+            ModelPrice.fixed(
+                provider_name="bedrock",
+                model="shared-model",
+                match="exact",
+                input_per_million=Decimal("3"),
+                output_per_million=Decimal("15"),
+                pricing_context={
+                    "source_region": ("us-east-1",),
+                    "service_tier": ("default",),
+                },
+            ),
+        )
+    )
+
+    assert not has_deferred_contextual_price(
+        pricing,
+        provider_name="gateway",
+        model="shared-model",
+    )
+    assert has_deferred_contextual_price(
+        pricing,
+        provider_name="bedrock",
+        model="shared-model",
     )
 
 
@@ -680,7 +723,13 @@ def test_controller_preserves_partial_model_release_progress_after_later_failure
 
 def test_controller_reconciles_operation_reservations_with_priced_actuals():
     store = InMemorySessionStore()
-    controller = _controller(store)
+    ledger = InMemoryBudgetLedger()
+    controller = _controller(store, ledger=ledger)
+    completion_identity = BillingIdentity(
+        provider_name="fake",
+        resource_id="fake-model",
+        completion_evidence={"effective_tier": "standard"},
+    )
 
     async def scenario():
         setup = await controller.reserve_operation_budgets(
@@ -705,6 +754,7 @@ def test_controller_reconciles_operation_reservations_with_priced_actuals():
                         payload={
                             "provider_name": "fake",
                             "model": "fake-model",
+                            "billing_identity": completion_identity.model_dump(mode="json"),
                             "usage": {
                                 "input_tokens": 250_000,
                                 "output_tokens": 0,
@@ -730,6 +780,8 @@ def test_controller_reconciles_operation_reservations_with_priced_actuals():
     assert reconciliations[0].reason == "operation model completed"
     assert reconciliations[0].pricing_provider_name == "fake"
     assert reconciliations[0].pricing_model == "fake-model"
+    assert reconciliations[0].billing_identity == completion_identity
+    assert next(iter(ledger._records.values())).billing_identity is None
 
 
 def test_controller_arbitrates_operation_heartbeat_lease_loss():
@@ -856,6 +908,75 @@ def test_controller_returns_typed_rejection_without_dispatching_compactor():
     assert isinstance(outcome, BudgetedOperationRejected)
     assert dispatched is False
     assert outcome.failure.accepted is False
+    assert [event.type for event in outcome.events] == [EventType.BUDGET_RESERVATION_FAILED]
+
+
+def test_controller_returns_typed_rejection_for_unreservable_bedrock_tier():
+    store = InMemorySessionStore()
+    ledger = InMemoryBudgetLedger()
+    controller = _controller(store, ledger=ledger)
+    dispatched = False
+    model = "global.anthropic.claude-sonnet-4-6"
+    identity = bedrock_billing_identity(
+        invoked_model=model,
+        source_region="us-east-1",
+        resource_type="inference_profile",
+        profile_scope="global",
+        requested_service_tier="reserved",
+    )
+    pricing = PriceBook(
+        prices=(
+            ModelPrice.fixed(
+                provider_name="bedrock",
+                model=model,
+                match="exact",
+                input_per_million=Decimal("3"),
+                output_per_million=Decimal("15"),
+                pricing_context={
+                    "source_region": ("us-east-1",),
+                    "service_tier": ("default",),
+                },
+            ),
+        )
+    )
+
+    async def scenario():
+        session = await _running_session(store, "sess_unreservable_compactor_tier")
+
+        async def operation() -> str:
+            nonlocal dispatched
+            dispatched = True
+            return "must not run"
+
+        return await controller.run_automatic_compaction_dispatch(
+            operation,
+            completed_events=list,
+            budget_limits=(
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal("20"),
+                    pricing=pricing,
+                    reservation=BudgetReservation(
+                        max_input_tokens=1_000_000,
+                        max_output_tokens=1_000_000,
+                    ),
+                ),
+            ),
+            session=session,
+            agent_name="assistant",
+            environment_name=None,
+            provider_name="bedrock",
+            model=model,
+            billing_identity=identity,
+            authoritative_failure_types=(),
+        )
+
+    outcome = asyncio.run(scenario())
+
+    assert isinstance(outcome, BudgetedOperationRejected)
+    assert dispatched is False
+    assert ledger._records == {}
+    assert "no matching model pricing" in outcome.failure.message
     assert [event.type for event in outcome.events] == [EventType.BUDGET_RESERVATION_FAILED]
 
 

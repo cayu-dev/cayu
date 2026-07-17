@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from importlib import resources
 from itertools import pairwise
 from pathlib import Path
-from typing import Literal, NamedTuple, TypeVar
+from typing import Any, Literal, NamedTuple, TypeVar
 
 from pydantic import (
     BaseModel,
@@ -15,11 +15,17 @@ from pydantic import (
     Field,
     StrictBool,
     StrictInt,
+    field_serializer,
     field_validator,
     model_validator,
 )
 
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import (
+    FrozenJsonDict,
+    copy_json_value,
+    require_clean_nonblank,
+)
+from cayu.core.billing import BillingIdentity, PricingContext
 from cayu.core.events import Event, EventType
 from cayu.runtime.usage import UsageMetrics, usage_metrics_from_event_payload
 
@@ -87,8 +93,9 @@ class TieredPricing(BaseModel):
     Only the context-band ``standard`` tiers feed the cost engine today. A tier-local
     cache-write rate takes precedence over the model-wide
     ``cache_write_5m_per_million`` fallback.
-    ``batch`` and ``cache_write_1h_per_million`` are carried for completeness and future
-    use — they are NOT auto-applied by ``estimate_session_cost``.
+    ``batch`` is carried for completeness and future use. Contextual pricing
+    applies ``cache_write_1h_per_million`` only to usage explicitly attributed
+    to a one-hour cache write.
     """
 
     model_config = _MODEL_ENTITY_CONFIG
@@ -175,6 +182,121 @@ class _PriceMatchRule(NamedTuple):
     match: Literal["exact", "prefix"]
 
 
+class PricingContextSelector(BaseModel):
+    """Exact pricing dimensions accepted by one contextual price row."""
+
+    model_config = _MODEL_ENTITY_CONFIG
+
+    dimensions: Mapping[str, tuple[str, ...]]
+
+    @field_validator("dimensions", mode="before")
+    @classmethod
+    def validate_dimensions(cls, value: Any) -> dict[str, tuple[str, ...]]:
+        if not isinstance(value, Mapping) or not value:
+            raise ValueError("pricing context dimensions must be a non-empty object.")
+        result: dict[str, tuple[str, ...]] = {}
+        for key, raw_values in value.items():
+            if type(key) is not str:
+                raise ValueError("pricing context dimension names must be strings.")
+            clean_key = require_clean_nonblank(key, "dimension name")
+            if not isinstance(raw_values, (list, tuple)) or not raw_values:
+                raise ValueError(
+                    f"Pricing context dimension {clean_key!r} must have allowed values."
+                )
+            values_list: list[str] = []
+            for item in raw_values:
+                if type(item) is not str:
+                    raise ValueError(
+                        f"Pricing context dimension {clean_key!r} values must be strings."
+                    )
+                values_list.append(require_clean_nonblank(item, f"dimensions.{clean_key}"))
+            values = tuple(values_list)
+            if len(values) != len(set(values)):
+                raise ValueError(
+                    f"Pricing context dimension {clean_key!r} values must be distinct."
+                )
+            result[clean_key] = values
+        return result
+
+    @field_validator("dimensions")
+    @classmethod
+    def freeze_dimensions(
+        cls,
+        value: Mapping[str, tuple[str, ...]],
+    ) -> Mapping[str, tuple[str, ...]]:
+        return FrozenJsonDict((key, tuple(allowed_values)) for key, allowed_values in value.items())
+
+    @field_serializer("dimensions")
+    def serialize_dimensions(
+        self,
+        value: Mapping[str, tuple[str, ...]],
+    ) -> dict[str, list[str]]:
+        return {key: list(values) for key, values in value.items()}
+
+    def storage_key(self) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        return tuple(
+            (key, tuple(sorted(values))) for key, values in sorted(self.dimensions.items())
+        )
+
+    def matches(self, context: PricingContext) -> bool:
+        return set(self.dimensions) == set(context.dimensions) and all(
+            context.dimensions[key] in values for key, values in self.dimensions.items()
+        )
+
+
+class ContextualPricingRequirement(BaseModel):
+    """Commercial constraints every contextual price for one provider must declare."""
+
+    model_config = _MODEL_ENTITY_CONFIG
+
+    provider_name: str
+    dimensions: tuple[str, ...]
+    requires_cache_write_ttls: StrictBool = False
+
+    @field_validator("provider_name")
+    @classmethod
+    def validate_provider_name(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("dimensions")
+    @classmethod
+    def validate_requirement_dimensions(
+        cls,
+        value: tuple[str, ...],
+        info,
+    ) -> tuple[str, ...]:
+        result = tuple(require_clean_nonblank(item, info.field_name) for item in value)
+        if not result or len(result) != len(set(result)):
+            raise ValueError(
+                "contextual pricing requirement dimensions must be non-empty/distinct."
+            )
+        return result
+
+
+class PricingResourceMapping(BaseModel):
+    """Map one opaque provider resource to an explicit pricing model."""
+
+    model_config = _MODEL_ENTITY_CONFIG
+
+    provider_name: str
+    resource_id: str
+    pricing_model: str
+
+    @field_validator("provider_name", "resource_id", "pricing_model")
+    @classmethod
+    def validate_mapping_identity(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+
+_BUILTIN_CONTEXTUAL_PRICING_REQUIREMENTS = (
+    ContextualPricingRequirement(
+        provider_name="bedrock",
+        dimensions=("source_region", "service_tier"),
+        requires_cache_write_ttls=True,
+    ),
+)
+
+
 class ModelPrice(BaseModel):
     """Pricing identity and its non-overlapping effective schedules."""
 
@@ -185,6 +307,8 @@ class ModelPrice(BaseModel):
     aliases: tuple[str, ...] = ()
     match: Literal["exact", "prefix"] = "prefix"
     match_prefixes: tuple[str, ...] = ()
+    pricing_context: PricingContextSelector | None = None
+    cache_write_ttls: tuple[Literal["5m", "1h"], ...] = ()
     schedules: tuple[PriceSchedule, ...] = Field(min_length=1)
 
     @classmethod
@@ -201,6 +325,8 @@ class ModelPrice(BaseModel):
         aliases: tuple[str, ...] = (),
         match: Literal["exact", "prefix"] = "prefix",
         match_prefixes: tuple[str, ...] = (),
+        pricing_context: PricingContextSelector | Mapping[str, tuple[str, ...]] | None = None,
+        cache_write_ttls: tuple[Literal["5m", "1h"], ...] = (),
         provenance: Provenance | None = None,
     ) -> ModelPrice:
         """Build one application-owned price with no validity bound.
@@ -212,12 +338,18 @@ class ModelPrice(BaseModel):
             url="application://price-book",
             as_of="unspecified",
         )
+        if pricing_context is None or type(pricing_context) is PricingContextSelector:
+            resolved_pricing_context = pricing_context
+        else:
+            resolved_pricing_context = PricingContextSelector(dimensions=dict(pricing_context))
         return cls(
             provider_name=provider_name,
             model=model,
             aliases=aliases,
             match=match,
             match_prefixes=match_prefixes,
+            pricing_context=resolved_pricing_context,
+            cache_write_ttls=cache_write_ttls,
             schedules=(
                 PriceSchedule(
                     pricing=TieredPricing(
@@ -248,6 +380,14 @@ class ModelPrice(BaseModel):
 
     @model_validator(mode="after")
     def validate_schedules(self) -> ModelPrice:
+        if self.pricing_context is not None and (
+            self.match != "exact" or self.aliases or self.match_prefixes
+        ):
+            raise ValueError("Contextual pricing must use one exact model identity.")
+        if self.cache_write_ttls and self.pricing_context is None:
+            raise ValueError("cache_write_ttls require contextual pricing.")
+        if len(self.cache_write_ttls) != len(set(self.cache_write_ttls)):
+            raise ValueError("cache_write_ttls must be distinct.")
         ordered = sorted(
             self.schedules,
             key=lambda schedule: (
@@ -261,6 +401,20 @@ class ModelPrice(BaseModel):
                 raise ValueError("price schedules overlap.")
             if current.effective_from <= previous.effective_through:
                 raise ValueError("price schedules overlap.")
+        for schedule in self.schedules:
+            if (
+                "5m" in self.cache_write_ttls
+                and schedule.pricing.cache_write_5m_per_million is None
+                and any(
+                    tier.cache_write_input_per_million is None for tier in schedule.pricing.standard
+                )
+            ):
+                raise ValueError("5-minute cache TTL requires a 5-minute write rate.")
+            if (
+                "1h" in self.cache_write_ttls
+                and schedule.pricing.cache_write_1h_per_million is None
+            ):
+                raise ValueError("1-hour cache TTL requires a 1-hour write rate.")
         return self
 
     def _match_rules(self) -> tuple[_PriceMatchRule, ...]:
@@ -281,10 +435,29 @@ class _PriceBookMatch(NamedTuple):
     price: ModelPrice
     model: str
     match: Literal["exact", "prefix"]
+    resource_mapping: bool = False
 
 
 def _price_book_match_key(candidate: _PriceBookMatch) -> tuple[str, str, str]:
     return (candidate.price.provider_name, candidate.model, candidate.match)
+
+
+def _price_context_matches(
+    price: ModelPrice,
+    context: PricingContext | None,
+) -> bool:
+    if context is None:
+        return price.pricing_context is None
+    return price.pricing_context is not None and price.pricing_context.matches(context)
+
+
+def _pricing_context_selectors_overlap(
+    left: PricingContextSelector,
+    right: PricingContextSelector,
+) -> bool:
+    return set(left.dimensions) == set(right.dimensions) and all(
+        set(values) & set(right.dimensions[key]) for key, values in left.dimensions.items()
+    )
 
 
 class PriceBook(BaseModel):
@@ -295,6 +468,8 @@ class PriceBook(BaseModel):
     price_book_version: str = "application"
     generated_at: str = "unspecified"
     prices: tuple[ModelPrice, ...] = Field(min_length=1)
+    contextual_pricing_requirements: tuple[ContextualPricingRequirement, ...] = ()
+    resource_mappings: tuple[PricingResourceMapping, ...] = ()
 
     @field_validator("price_book_version", "generated_at")
     @classmethod
@@ -303,30 +478,121 @@ class PriceBook(BaseModel):
 
     @model_validator(mode="after")
     def validate_unique_matches(self) -> PriceBook:
-        seen: set[tuple[str, str, str]] = set()
+        requirements = {
+            _normalize_provider(requirement.provider_name): requirement
+            for requirement in (
+                *_BUILTIN_CONTEXTUAL_PRICING_REQUIREMENTS,
+                *self.contextual_pricing_requirements,
+            )
+        }
+        if len(requirements) != (
+            len(_BUILTIN_CONTEXTUAL_PRICING_REQUIREMENTS)
+            + len(self.contextual_pricing_requirements)
+        ):
+            raise ValueError("Contextual pricing requirements must have unique providers.")
+        seen: set[tuple[str, str, str, tuple[tuple[str, tuple[str, ...]], ...] | None]] = set()
+        contextual_selectors: dict[
+            tuple[str, str, str],
+            list[PricingContextSelector],
+        ] = {}
         for price in self.prices:
+            requirement = requirements.get(_normalize_provider(price.provider_name))
+            required_dimensions = None if requirement is None else set(requirement.dimensions)
+            if requirement is not None and (
+                price.pricing_context is None
+                or set(price.pricing_context.dimensions) != required_dimensions
+            ):
+                dimensions = ", ".join(sorted(requirement.dimensions))
+                raise ValueError(
+                    f"{price.provider_name} pricing requires exact contextual dimensions: "
+                    f"{dimensions}."
+                )
             for rule in price._match_rules():
-                key = _match_key(price.provider_name, rule.model, rule.match)
+                match_key = _match_key(price.provider_name, rule.model, rule.match)
+                key = (
+                    *match_key,
+                    (
+                        None
+                        if price.pricing_context is None
+                        else price.pricing_context.storage_key()
+                    ),
+                )
                 if key in seen:
                     raise ValueError("Price book contains duplicate provider/model/match entries.")
                 seen.add(key)
+                if price.pricing_context is not None:
+                    existing = contextual_selectors.setdefault(match_key, [])
+                    if any(
+                        _pricing_context_selectors_overlap(price.pricing_context, other)
+                        for other in existing
+                    ):
+                        raise ValueError("Price book contains overlapping pricing contexts.")
+                    existing.append(price.pricing_context)
+        mapping_keys = [
+            (_normalize_provider(mapping.provider_name), mapping.resource_id)
+            for mapping in self.resource_mappings
+        ]
+        if len(mapping_keys) != len(set(mapping_keys)):
+            raise ValueError("Price book contains duplicate resource mappings.")
         return self
+
+    def _requires_cache_write_ttls(self, provider_name: str) -> bool:
+        requirement = next(
+            (
+                requirement
+                for requirement in (
+                    *_BUILTIN_CONTEXTUAL_PRICING_REQUIREMENTS,
+                    *self.contextual_pricing_requirements,
+                )
+                if _normalize_provider(requirement.provider_name)
+                == _normalize_provider(provider_name)
+            ),
+            None,
+        )
+        return requirement is not None and requirement.requires_cache_write_ttls
 
     def _resolve_match(
         self,
         *,
         provider_name: str | None,
         model: str | None,
+        billing_identity: BillingIdentity | None = None,
+        pricing_context: PricingContext | None = None,
     ) -> _PriceBookMatch | None:
+        pricing_provider_name = (
+            billing_identity.provider_name if billing_identity is not None else provider_name
+        )
+        pricing_model = billing_identity.resource_id if billing_identity is not None else model
+        mapped = False
+        if billing_identity is not None:
+            mapping = next(
+                (
+                    item
+                    for item in self.resource_mappings
+                    if _normalize_provider(item.provider_name)
+                    == _normalize_provider(billing_identity.provider_name)
+                    and item.resource_id == billing_identity.resource_id
+                ),
+                None,
+            )
+            if mapping is not None:
+                pricing_model = mapping.pricing_model
+                mapped = True
         candidates: tuple[_PriceBookMatch, ...] = tuple(
-            _PriceBookMatch(price=price, model=rule.model, match=rule.match)
+            _PriceBookMatch(
+                price=price,
+                model=rule.model,
+                match=rule.match,
+                resource_mapping=mapped,
+            )
             for price in self.prices
             for rule in price._match_rules()
+            if _price_context_matches(price, pricing_context)
         )
         return _best_match_record(
             candidates,
-            provider_name=provider_name,
-            model=model,
+            provider_name=pricing_provider_name,
+            model=pricing_model,
             key=_price_book_match_key,
         )
 
@@ -516,8 +782,24 @@ def dump_price_book(price_book: PriceBook) -> str:
     """Serialize a price book deterministically for review and packaging."""
     if type(price_book) is not PriceBook:
         raise TypeError("price_book must be a PriceBook instance.")
-    ordered = tuple(sorted(price_book.prices, key=lambda price: (price.provider_name, price.model)))
+    ordered = tuple(
+        sorted(
+            price_book.prices,
+            key=lambda price: (
+                price.provider_name,
+                price.model,
+                (() if price.pricing_context is None else price.pricing_context.storage_key()),
+            ),
+        )
+    )
     data = price_book.model_copy(update={"prices": ordered}).model_dump(mode="json")
+    data["resource_mappings"] = [
+        mapping.model_dump(mode="json")
+        for mapping in sorted(
+            price_book.resource_mappings,
+            key=lambda mapping: (mapping.provider_name, mapping.resource_id),
+        )
+    ]
     return json.dumps(data, sort_keys=True, indent=2) + "\n"
 
 
@@ -541,9 +823,13 @@ class CostLineItem(BaseModel):
     provider_name: str | None = None
     requested_model: str | None = None
     model: str | None = None
+    billing_identity: BillingIdentity | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     pricing_provider_name: str | None = None
     pricing_model: str | None = None
-    pricing_match: Literal["exact", "prefix"] | None = None
+    pricing_match: Literal["exact", "prefix", "resource_mapping"] | None = None
     pricing_provenance: Provenance | None = None
     pricing_effective_from: date | None = None
     pricing_effective_through: date | None = None
@@ -555,6 +841,21 @@ class CostLineItem(BaseModel):
     output_tokens: StrictInt = Field(ge=0)
     cache_read_input_tokens: StrictInt = Field(ge=0)
     cache_write_input_tokens: StrictInt = Field(ge=0)
+    cache_write_5m_input_tokens: StrictInt = Field(
+        default=0,
+        ge=0,
+        exclude_if=lambda value: value == 0,
+    )
+    cache_write_1h_input_tokens: StrictInt = Field(
+        default=0,
+        ge=0,
+        exclude_if=lambda value: value == 0,
+    )
+    cache_write_unknown_ttl_input_tokens: StrictInt = Field(
+        default=0,
+        ge=0,
+        exclude_if=lambda value: value == 0,
+    )
     uncached_input_tokens: StrictInt = Field(ge=0)
     input_cost: Decimal = Field(ge=0)
     output_cost: Decimal = Field(ge=0)
@@ -632,6 +933,13 @@ def copy_price_book(price_book: PriceBook) -> PriceBook:
         price_book_version=price_book.price_book_version,
         generated_at=price_book.generated_at,
         prices=tuple(price.model_copy(deep=True) for price in price_book.prices),
+        contextual_pricing_requirements=tuple(
+            requirement.model_copy(deep=True)
+            for requirement in price_book.contextual_pricing_requirements
+        ),
+        resource_mappings=tuple(
+            mapping.model_copy(deep=True) for mapping in price_book.resource_mappings
+        ),
     )
 
 
@@ -675,6 +983,7 @@ def _estimate_session_cost(
         model_step += 1
         metrics = usage_metrics_from_event_payload(event.payload)
         if metrics is None:
+            raw_identity = event.payload.get("billing_identity")
             line_items.append(
                 _unpriced_line_item(
                     model_step=model_step,
@@ -683,6 +992,11 @@ def _estimate_session_cost(
                     model=_optional_nonblank(event.payload.get("model")),
                     currency=currency,
                     reason="model.completed event has no token usage metrics",
+                    billing_identity=(
+                        BillingIdentity.model_validate(raw_identity)
+                        if type(raw_identity) is dict
+                        else None
+                    ),
                 )
             )
             continue
@@ -765,9 +1079,10 @@ def estimate_causal_budget_cost(
 class _ResolvedPrice(NamedTuple):
     price: ModelPrice
     matched_model: str
-    match: Literal["exact", "prefix"]
+    match: Literal["exact", "prefix", "resource_mapping"]
     schedule: PriceSchedule
     tier: PriceTier
+    requires_cache_write_ttls: bool
 
     @property
     def currency(self) -> str:
@@ -791,6 +1106,16 @@ class _ResolvedPrice(NamedTuple):
             return self.tier.cache_write_input_per_million
         return self.schedule.pricing.cache_write_5m_per_million
 
+    @property
+    def cache_write_5m_per_million(self) -> Decimal | None:
+        if self.tier.cache_write_input_per_million is not None:
+            return self.tier.cache_write_input_per_million
+        return self.schedule.pricing.cache_write_5m_per_million
+
+    @property
+    def cache_write_1h_per_million(self) -> Decimal | None:
+        return self.schedule.pricing.cache_write_1h_per_million
+
 
 class _PriceResolution(NamedTuple):
     resolved: _ResolvedPrice | None
@@ -804,6 +1129,8 @@ def resolve_price_book(
     model: str | None,
     input_tokens: int,
     effective_on: date,
+    billing_identity: BillingIdentity | None = None,
+    pricing_context: PricingContext | None = None,
 ) -> _ResolvedPrice | None:
     """Resolve one price-book entry, effective schedule, and context tier."""
     return _resolve_price_book(
@@ -812,6 +1139,8 @@ def resolve_price_book(
         model=model,
         input_tokens=input_tokens,
         effective_on=effective_on,
+        billing_identity=billing_identity,
+        pricing_context=pricing_context,
     ).resolved
 
 
@@ -822,8 +1151,21 @@ def _resolve_price_book(
     model: str | None,
     input_tokens: int,
     effective_on: date,
+    billing_identity: BillingIdentity | None = None,
+    pricing_context: PricingContext | None = None,
 ) -> _PriceResolution:
-    matched = price_book._resolve_match(provider_name=provider_name, model=model)
+    if billing_identity is not None and pricing_context is None:
+        if len(billing_identity.pricing_contexts) != 1:
+            if billing_identity.pricing_contexts:
+                return _PriceResolution(None, "billing identity has ambiguous pricing contexts")
+        else:
+            pricing_context = billing_identity.pricing_contexts[0]
+    matched = price_book._resolve_match(
+        provider_name=provider_name,
+        model=model,
+        billing_identity=billing_identity,
+        pricing_context=pricing_context,
+    )
     if matched is None:
         return _PriceResolution(None, "no matching model pricing")
     schedule = matched.price.schedule_on(effective_on)
@@ -840,9 +1182,13 @@ def _resolve_price_book(
         _ResolvedPrice(
             price=matched.price,
             matched_model=matched.model,
-            match=matched.match,
+            match=("resource_mapping" if matched.resource_mapping else matched.match),
             schedule=schedule,
             tier=schedule.pricing.tier_for(input_tokens),
+            requires_cache_write_ttls=(
+                bool(matched.price.cache_write_ttls)
+                or price_book._requires_cache_write_ttls(matched.price.provider_name)
+            ),
         ),
         None,
     )
@@ -857,13 +1203,20 @@ def _resolve_price(
     # A provider-reported model is authoritative for billing. Falling back from a
     # present-but-unpriced resolved model to the requested model could silently apply
     # the wrong rate after routing; use the request only when no resolved model exists.
-    billing_model = metrics.model if metrics.model is not None else metrics.requested_model
+    billing_model = (
+        metrics.billing_identity.resource_id
+        if metrics.billing_identity is not None
+        else metrics.model
+        if metrics.model is not None
+        else metrics.requested_model
+    )
     return _resolve_price_book(
         pricing,
         provider_name=metrics.provider_name,
         model=billing_model,
         input_tokens=metrics.input_tokens,
         effective_on=effective_on,
+        billing_identity=metrics.billing_identity,
     )
 
 
@@ -885,6 +1238,7 @@ def _cost_line_item(
             currency=currency,
             reason=resolution.missing_reason or "no matching model pricing",
             metrics=metrics,
+            billing_identity=metrics.billing_identity,
         )
     price = resolution.resolved
 
@@ -897,6 +1251,7 @@ def _cost_line_item(
             currency=currency,
             reason=f"pricing currency {price.currency} does not match requested {currency}",
             metrics=metrics,
+            billing_identity=metrics.billing_identity,
         )
 
     uncached_input_tokens = metrics.cache.uncached_input_tokens
@@ -922,7 +1277,22 @@ def _cost_line_item(
     input_cost = _token_cost(uncached_input_tokens, price.input_per_million)
     output_cost = _token_cost(metrics.output_tokens, price.output_per_million)
     cache_read_cost = _token_cost(metrics.cache.read_tokens, cache_read_price)
-    cache_write_cost = _token_cost(metrics.cache.write_tokens, cache_write_price)
+    if not price.requires_cache_write_ttls:
+        cache_write_cost = _token_cost(metrics.cache.write_tokens, cache_write_price)
+    else:
+        ttl_resolution = _contextual_cache_write_cost(metrics=metrics, price=price)
+        if isinstance(ttl_resolution, str):
+            return _unpriced_line_item(
+                model_step=model_step,
+                provider_name=metrics.provider_name,
+                requested_model=metrics.requested_model,
+                model=metrics.model,
+                currency=currency,
+                reason=ttl_resolution,
+                metrics=metrics,
+                billing_identity=metrics.billing_identity,
+            )
+        cache_write_cost = ttl_resolution
     total_cost = input_cost + output_cost + cache_read_cost + cache_write_cost
 
     return CostLineItem(
@@ -930,6 +1300,7 @@ def _cost_line_item(
         provider_name=metrics.provider_name,
         requested_model=metrics.requested_model,
         model=metrics.model,
+        billing_identity=metrics.billing_identity,
         pricing_provider_name=price.price.provider_name,
         pricing_model=price.matched_model,
         pricing_match=price.match,
@@ -943,6 +1314,9 @@ def _cost_line_item(
         output_tokens=metrics.output_tokens,
         cache_read_input_tokens=metrics.cache.read_tokens,
         cache_write_input_tokens=metrics.cache.write_tokens,
+        cache_write_5m_input_tokens=metrics.cache.write_5m_tokens,
+        cache_write_1h_input_tokens=metrics.cache.write_1h_tokens,
+        cache_write_unknown_ttl_input_tokens=metrics.cache.write_unknown_ttl_tokens,
         uncached_input_tokens=uncached_input_tokens,
         input_cost=input_cost,
         output_cost=output_cost,
@@ -961,18 +1335,25 @@ def _unpriced_line_item(
     reason: str,
     metrics: UsageMetrics | None = None,
     requested_model: str | None = None,
+    billing_identity: BillingIdentity | None = None,
 ) -> CostLineItem:
     return CostLineItem(
         model_step=model_step,
         provider_name=provider_name,
         requested_model=requested_model,
         model=model,
+        billing_identity=billing_identity,
         priced=False,
         currency=currency.upper(),
         input_tokens=0 if metrics is None else metrics.input_tokens,
         output_tokens=0 if metrics is None else metrics.output_tokens,
         cache_read_input_tokens=0 if metrics is None else metrics.cache.read_tokens,
         cache_write_input_tokens=0 if metrics is None else metrics.cache.write_tokens,
+        cache_write_5m_input_tokens=0 if metrics is None else metrics.cache.write_5m_tokens,
+        cache_write_1h_input_tokens=0 if metrics is None else metrics.cache.write_1h_tokens,
+        cache_write_unknown_ttl_input_tokens=(
+            0 if metrics is None else metrics.cache.write_unknown_ttl_tokens
+        ),
         uncached_input_tokens=0 if metrics is None else metrics.cache.uncached_input_tokens,
         input_cost=Decimal("0"),
         output_cost=Decimal("0"),
@@ -980,6 +1361,45 @@ def _unpriced_line_item(
         cache_write_input_cost=Decimal("0"),
         total_cost=Decimal("0"),
         missing_pricing_reason=reason,
+    )
+
+
+def _contextual_cache_write_cost(
+    *,
+    metrics: UsageMetrics,
+    price: _ResolvedPrice,
+) -> Decimal | str:
+    five_minute_rate = price.cache_write_5m_per_million
+    one_hour_rate = price.cache_write_1h_per_million
+    supported = price.price.cache_write_ttls
+    if metrics.cache.write_5m_tokens and "5m" not in supported:
+        return "pricing does not declare 5-minute cache writes"
+    if metrics.cache.write_1h_tokens and "1h" not in supported:
+        return "pricing does not declare 1-hour cache writes"
+    if metrics.cache.write_5m_tokens and five_minute_rate is None:
+        return "pricing has no 5-minute cache-write rate"
+    if metrics.cache.write_1h_tokens and one_hour_rate is None:
+        return "pricing has no 1-hour cache-write rate"
+
+    unknown_rate: Decimal | None = None
+    if metrics.cache.write_unknown_ttl_tokens:
+        if supported == ("5m",):
+            unknown_rate = five_minute_rate
+        elif supported == ("1h",):
+            unknown_rate = one_hour_rate
+        elif (
+            set(supported) == {"5m", "1h"}
+            and five_minute_rate is not None
+            and five_minute_rate == one_hour_rate
+        ):
+            unknown_rate = five_minute_rate
+        if unknown_rate is None:
+            return "cache-write TTL is unknown and applicable rates are ambiguous"
+
+    return (
+        _token_cost(metrics.cache.write_5m_tokens, five_minute_rate or Decimal("0"))
+        + _token_cost(metrics.cache.write_1h_tokens, one_hour_rate or Decimal("0"))
+        + _token_cost(metrics.cache.write_unknown_ttl_tokens, unknown_rate or Decimal("0"))
     )
 
 

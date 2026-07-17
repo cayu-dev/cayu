@@ -1,6 +1,6 @@
 {
-  "catalog_version": "2026-07-14",
-  "generated_at": "2026-07-14",
+  "catalog_version": "2026-07-16",
+  "generated_at": "2026-07-16",
   "models": [
     {
       "aliases": [],
@@ -259,6 +259,37 @@
       "provider_name": "azure",
       "reasoning": true,
       "release_date": null,
+      "retirement_date": null,
+      "structured_output": true,
+      "tool_calling": true
+    },
+    {
+      "aliases": [],
+      "context_window": 1000000,
+      "deprecated": false,
+      "family": "claude-sonnet",
+      "knowledge_cutoff": null,
+      "match": "exact",
+      "match_prefixes": [],
+      "max_output_tokens": 64000,
+      "modalities_in": [
+        "text",
+        "image",
+        "pdf"
+      ],
+      "modalities_out": [
+        "text"
+      ],
+      "model": "global.anthropic.claude-sonnet-4-6",
+      "prompt_caching": true,
+      "provenance": {
+        "as_of": "2026-07-16",
+        "source": "official",
+        "url": "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-sonnet-4-6.html"
+      },
+      "provider_name": "bedrock",
+      "reasoning": true,
+      "release_date": "2026-02-17",
       "retirement_date": null,
       "structured_output": true,
       "tool_calling": true

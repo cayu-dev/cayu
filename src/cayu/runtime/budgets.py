@@ -20,12 +20,22 @@ from pydantic import (
 )
 
 from cayu._validation import require_clean_nonblank
+from cayu.core.billing import (
+    UNRESOLVED_BILLING_IDENTITY,
+    BillingIdentity,
+    BillingIdentityState,
+    PricingContext,
+    ResolvedBillingIdentity,
+    billing_identity_value,
+    completed_billing_identity,
+)
 from cayu.core.events import Event, EventType, copy_event
 from cayu.runtime.costs import (
     CostLineItem,
     PriceBook,
     Provenance,
     SessionCostSummary,
+    _normalize_provider,
     _resolve_price_book,
     _ResolvedPrice,
     estimate_session_cost,
@@ -315,6 +325,7 @@ class BudgetReservationRecord(BaseModel):
     agent_name: str
     provider_name: str
     model: str
+    billing_identity: BillingIdentity | None = None
     reserved_amount: Decimal = Field(ge=0)
     actual_amount: Decimal | None = Field(default=None, ge=0)
     status: BudgetReservationStatus = "active"
@@ -419,9 +430,10 @@ class BudgetReconciliation(BaseModel):
     actual_amount: Decimal | None = Field(default=None, ge=0)
     released_amount: Decimal = Field(ge=0)
     reason: str | None = None
+    billing_identity: BillingIdentity | None = None
     pricing_provider_name: str | None = None
     pricing_model: str | None = None
-    pricing_match: Literal["exact", "prefix"] | None = None
+    pricing_match: Literal["exact", "prefix", "resource_mapping"] | None = None
     pricing_provenance: Provenance | None = None
     pricing_effective_from: date | None = None
     pricing_effective_through: date | None = None
@@ -531,6 +543,7 @@ class BudgetLedger(ABC):
         agent_name: str,
         provider_name: str,
         model: str,
+        billing_identity: BillingIdentity | None = None,
     ) -> BudgetReservationResult:
         """Reserve budget for one provider dispatch if capacity remains."""
 
@@ -542,6 +555,7 @@ class BudgetLedger(ABC):
         actual_amount: Decimal,
         reason: str | None = None,
         occurred_at: datetime | None = None,
+        billing_identity: BillingIdentity | None = None,
     ) -> BudgetReconciliation:
         """Replace a reservation with the charged amount.
 
@@ -693,6 +707,7 @@ class InMemoryBudgetLedger(BudgetLedger):
         agent_name: str,
         provider_name: str,
         model: str,
+        billing_identity: BillingIdentity | None = None,
     ) -> BudgetReservationResult:
         async with self._lock:
             now = self._clock()
@@ -701,6 +716,7 @@ class InMemoryBudgetLedger(BudgetLedger):
                 provider_name=provider_name,
                 model=model,
                 effective_at=now,
+                billing_identity=billing_identity,
             )
             self._reap_expired_unlocked(now, limit=limit)
             current = _ledger_used_amount(
@@ -729,6 +745,7 @@ class InMemoryBudgetLedger(BudgetLedger):
                 agent_name=agent_name,
                 provider_name=provider_name,
                 model=model,
+                billing_identity=billing_identity,
                 reserved_amount=request,
                 created_at=now,
                 updated_at=now,
@@ -771,6 +788,7 @@ class InMemoryBudgetLedger(BudgetLedger):
         actual_amount: Decimal,
         reason: str | None = None,
         occurred_at: datetime | None = None,
+        billing_identity: BillingIdentity | None = None,
     ) -> BudgetReconciliation:
         reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
         actual_amount = _validate_amount(actual_amount, "actual_amount")
@@ -782,6 +800,7 @@ class InMemoryBudgetLedger(BudgetLedger):
                 actual_amount=actual_amount,
                 reason=reason,
                 updated_at=reconciled_at,
+                billing_identity=billing_identity,
             )
             self._records[reservation_id] = reconciled
             return _reconciliation_from_record(reconciled)
@@ -998,6 +1017,7 @@ def budget_check_from_events(
     events: list[Event],
     provider_name: str | None = None,
     model: str | None = None,
+    billing_identity_state: BillingIdentityState = UNRESOLVED_BILLING_IDENTITY,
     effective_at: datetime | None = None,
 ) -> BudgetCheck:
     if type(limit) is not BudgetLimit:
@@ -1027,6 +1047,7 @@ def budget_check_from_events(
                 limit,
                 provider_name,
                 model,
+                billing_identity_state=billing_identity_state,
                 effective_at=effective_at,
             )
         )
@@ -1110,29 +1131,82 @@ def _budget_preflight_error(
     provider_name: str | None,
     model: str | None,
     *,
+    billing_identity_state: BillingIdentityState,
     effective_at: datetime | None,
 ) -> str | None:
+    billing_identity = billing_identity_value(billing_identity_state)
     reference = (
         datetime.now(UTC) if effective_at is None else _utc_datetime(effective_at, "effective_at")
     )
-    resolution = _resolve_price_book(
-        limit.pricing,
-        provider_name=provider_name,
-        model=model,
-        input_tokens=0,
-        effective_on=reference.astimezone(UTC).date(),
-    )
-    price = resolution.resolved
-    if price is None:
-        reason = resolution.missing_reason or "no matching model pricing"
-        return f"Budget cannot be verified because {provider_name}/{model}: {reason}."
-    if price.currency.upper() != limit.currency.upper():
-        return (
-            "Budget cannot be verified because "
-            f"{provider_name}/{model} pricing currency {price.currency} "
-            f"does not match requested {limit.currency}."
+    for pricing_context in _budget_pricing_contexts(billing_identity):
+        resolution = _resolve_price_book(
+            limit.pricing,
+            provider_name=provider_name,
+            model=model,
+            input_tokens=0,
+            effective_on=reference.astimezone(UTC).date(),
+            billing_identity=billing_identity,
+            pricing_context=pricing_context,
         )
+        price = resolution.resolved
+        if price is None:
+            # Contextual dimensions are request-specific. The run loop repeats
+            # preflight with the provider-resolved identity immediately before
+            # reserving and dispatching.
+            if not isinstance(
+                billing_identity_state, ResolvedBillingIdentity
+            ) and has_deferred_contextual_price(
+                limit.pricing,
+                provider_name=provider_name,
+                model=model,
+            ):
+                return None
+            reason = resolution.missing_reason or "no matching model pricing"
+            return f"Budget cannot be verified because {provider_name}/{model}: {reason}."
+        if price.currency.upper() != limit.currency.upper():
+            return (
+                "Budget cannot be verified because "
+                f"{provider_name}/{model} pricing currency {price.currency} "
+                f"does not match requested {limit.currency}."
+            )
     return None
+
+
+def has_deferred_contextual_price(
+    pricing: PriceBook,
+    *,
+    provider_name: str | None,
+    model: str | None,
+) -> bool:
+    if provider_name is None or model is None:
+        return False
+    # A directly matching context-free price belongs to the declared provider and
+    # does not need deferred resolution. This also prevents an unrelated contextual
+    # row with the same model identifier from shadowing it.
+    if (
+        pricing._resolve_match(
+            provider_name=provider_name,
+            model=model,
+            billing_identity=None,
+        )
+        is not None
+    ):
+        return False
+    pricing_model = next(
+        (
+            mapping.pricing_model
+            for mapping in pricing.resource_mappings
+            if _normalize_provider(mapping.provider_name) == _normalize_provider(provider_name)
+            and mapping.resource_id == model
+        ),
+        model,
+    )
+    return any(
+        _normalize_provider(price.provider_name) == _normalize_provider(provider_name)
+        and price.model == pricing_model
+        and price.pricing_context is not None
+        for price in pricing.prices
+    )
 
 
 def budget_reservation_payload(result: BudgetReservationResult) -> dict[str, Any]:
@@ -1156,6 +1230,8 @@ def budget_reservation_payload(result: BudgetReservationResult) -> dict[str, Any
         payload["agent_name"] = result.record.agent_name
         payload["provider_name"] = result.record.provider_name
         payload["model"] = result.record.model
+        if result.record.billing_identity is not None:
+            payload["billing_identity"] = result.record.billing_identity.model_dump(mode="json")
     return payload
 
 
@@ -1193,6 +1269,11 @@ def budget_reconciliation_payload(reconciliation: BudgetReconciliation) -> dict[
         "released_amount": str(reconciliation.released_amount),
         "reason": reconciliation.reason,
         "pricing": pricing,
+        "billing_identity": (
+            None
+            if reconciliation.billing_identity is None
+            else reconciliation.billing_identity.model_dump(mode="json")
+        ),
     }
 
 
@@ -1241,6 +1322,7 @@ def budget_reconciliation_with_pricing(
             "pricing_effective_from": line_item.pricing_effective_from,
             "pricing_effective_through": line_item.pricing_effective_through,
             "pricing_tier_max_input_tokens": line_item.pricing_tier_max_input_tokens,
+            "billing_identity": line_item.billing_identity,
         }
     )
 
@@ -1251,6 +1333,7 @@ def _budget_reservation_amount(
     provider_name: str,
     model: str,
     effective_at: datetime,
+    billing_identity: BillingIdentity | None = None,
 ) -> Decimal:
     if limit.reservation is None:
         raise ValueError("Budget limit does not define a reservation policy.")
@@ -1260,35 +1343,65 @@ def _budget_reservation_amount(
         + reservation.max_cache_read_input_tokens
         + reservation.max_cache_write_input_tokens
     )
-    price = budget_price(
-        limit,
-        provider_name=provider_name,
-        model=model,
-        input_tokens=reserved_input_tokens,
-        effective_at=effective_at,
-    )
-    if price is None:
-        raise ValueError(f"Budget reservation cannot be priced for {provider_name}/{model}.")
-    if price.currency.upper() != limit.currency.upper():
-        raise ValueError(
-            f"Budget reservation currency {price.currency} does not match {limit.currency}."
+    amounts: list[Decimal] = []
+    for pricing_context in _budget_pricing_contexts(billing_identity):
+        price = budget_price(
+            limit,
+            provider_name=provider_name,
+            model=model,
+            input_tokens=reserved_input_tokens,
+            effective_at=effective_at,
+            billing_identity=billing_identity,
+            pricing_context=pricing_context,
         )
-    cache_read_price = (
-        price.cache_read_input_per_million
-        if price.cache_read_input_per_million is not None
-        else price.input_per_million
-    )
-    cache_write_price = (
-        price.cache_write_input_per_million
-        if price.cache_write_input_per_million is not None
-        else price.input_per_million
-    )
-    return (
-        _token_cost(reservation.max_input_tokens, price.input_per_million)
-        + _token_cost(reservation.max_output_tokens, price.output_per_million)
-        + _token_cost(reservation.max_cache_read_input_tokens, cache_read_price)
-        + _token_cost(reservation.max_cache_write_input_tokens, cache_write_price)
-    )
+        if price is None:
+            raise ValueError(f"Budget reservation cannot be priced for {provider_name}/{model}.")
+        if price.currency.upper() != limit.currency.upper():
+            raise ValueError(
+                f"Budget reservation currency {price.currency} does not match {limit.currency}."
+            )
+        cache_read_price = (
+            price.input_per_million
+            if price.cache_read_input_per_million is None
+            else price.cache_read_input_per_million
+        )
+        if not price.requires_cache_write_ttls:
+            cache_write_price = (
+                price.cache_write_input_per_million
+                if price.cache_write_input_per_million is not None
+                else price.input_per_million
+            )
+        else:
+            supported_rates = {
+                "5m": price.cache_write_5m_per_million,
+                "1h": price.cache_write_1h_per_million,
+            }
+            cache_write_rates = [supported_rates[ttl] for ttl in price.price.cache_write_ttls]
+            if reservation.max_cache_write_input_tokens and (
+                not cache_write_rates or any(rate is None for rate in cache_write_rates)
+            ):
+                raise ValueError("Budget reservation cannot price the declared cache-write TTLs.")
+            cache_write_price = max(
+                (rate for rate in cache_write_rates if rate is not None),
+                default=Decimal("0"),
+            )
+        amounts.append(
+            _token_cost(reservation.max_input_tokens, price.input_per_million)
+            + _token_cost(reservation.max_output_tokens, price.output_per_million)
+            + _token_cost(reservation.max_cache_read_input_tokens, cache_read_price)
+            + _token_cost(reservation.max_cache_write_input_tokens, cache_write_price)
+        )
+    return max(amounts)
+
+
+def _budget_pricing_contexts(
+    billing_identity: BillingIdentity | None,
+) -> tuple[PricingContext | None, ...]:
+    """Return every pricing outcome established before provider dispatch."""
+
+    if billing_identity is None:
+        return (None,)
+    return billing_identity.pricing_contexts or (None,)
 
 
 def _token_cost(tokens: int, price_per_million: Decimal) -> Decimal:
@@ -1302,6 +1415,8 @@ def budget_price(
     model: str | None,
     input_tokens: int = 0,
     effective_at: datetime | None = None,
+    billing_identity: BillingIdentity | None = None,
+    pricing_context: PricingContext | None = None,
 ) -> _ResolvedPrice | None:
     effective_at = (
         datetime.now(UTC) if effective_at is None else _utc_datetime(effective_at, "effective_at")
@@ -1312,6 +1427,8 @@ def budget_price(
         model=model,
         input_tokens=input_tokens,
         effective_on=effective_at.astimezone(UTC).date(),
+        billing_identity=billing_identity,
+        pricing_context=pricing_context,
     )
 
 
@@ -1407,9 +1524,15 @@ def _reconciled_record(
     actual_amount: Decimal,
     reason: str | None,
     updated_at: datetime | None = None,
+    billing_identity: BillingIdentity | None = None,
 ) -> BudgetReservationRecord:
+    resolved_identity = _reconciled_billing_identity(record.billing_identity, billing_identity)
     if record.status == "reconciled":
-        if record.actual_amount == actual_amount and record.reason == reason:
+        if (
+            record.actual_amount == actual_amount
+            and record.reason == reason
+            and record.billing_identity == resolved_identity
+        ):
             return record
         raise ValueError(
             f"Budget reservation has a conflicting reconciliation: {record.reservation_id}"
@@ -1427,6 +1550,7 @@ def _reconciled_record(
             "status": "reconciled",
             "reason": reason,
             "updated_at": reconciled_at,
+            "billing_identity": resolved_identity,
         },
         deep=True,
     )
@@ -1471,7 +1595,17 @@ def _reconciliation_from_record(record: BudgetReservationRecord) -> BudgetReconc
         actual_amount=actual_amount,
         released_amount=released_amount,
         reason=record.reason,
+        billing_identity=record.billing_identity,
     )
+
+
+def _reconciled_billing_identity(
+    requested: BillingIdentity | None,
+    completed: BillingIdentity | None,
+) -> BillingIdentity | None:
+    if completed is None:
+        return requested
+    return completed_billing_identity(requested, completed)
 
 
 def _validate_amount(value: Decimal, field_name: str) -> Decimal:

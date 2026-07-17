@@ -31,5 +31,12 @@ WORKSPACE_GUIDANCE = (
     "group(s) = larger-context TIERS → context_tiers. It is NEVER batch.\n"
     "  - Only fill batch_* if the page has a price EXPLICITLY labeled 'Batch' for THIS model that is "
     "distinct from standard. If batch is behind an unselected tab, or you are unsure whether a number "
-    "is batch vs a context tier, set batch to null. A wrong batch is worse than a null one."
+    "is batch vs a context tier, set batch to null. A wrong batch is worse than a null one.\n"
+    "\nAMAZON BEDROCK: preserve the committed exact inference-profile scope, source-region allowlist, "
+    "service tier, and cache-write TTLs. Verify rates only for that exact combination. Global and "
+    "geographic profiles are distinct products; the request's source region selects the price. "
+    "Standard is represented by the API value 'default'. Do not infer an application-profile ARN's "
+    "underlying model, invent Reserved/Provisioned rates, or import Batch/Priority/Flex rates into a "
+    "Standard row. If official evidence does not identify the exact scope/tier/rate, leave the "
+    "committed row unchanged and flag it for human review."
 )

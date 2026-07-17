@@ -1,5 +1,12 @@
 """Runtime contracts."""
 
+from cayu.core.billing import (
+    BillingIdentity,
+    BillingIdentityState,
+    PricingContext,
+    ResolvedBillingIdentity,
+    UnresolvedBillingIdentity,
+)
 from cayu.runtime.app import CayuApp, RegisteredAgent, RegisteredEnvironment
 from cayu.runtime.approvals import (
     PendingToolApproval,
@@ -87,6 +94,7 @@ from cayu.runtime.context_counting import (
 )
 from cayu.runtime.costs import (
     CausalBudgetCostSummary,
+    ContextualPricingRequirement,
     CostLineItem,
     ModelCatalog,
     ModelInfo,
@@ -94,6 +102,8 @@ from cayu.runtime.costs import (
     PriceBook,
     PriceSchedule,
     PriceTier,
+    PricingContextSelector,
+    PricingResourceMapping,
     Provenance,
     SessionCostSummary,
     TieredPricing,
@@ -331,6 +341,8 @@ __all__ = [
     "BeforeStopDecision",
     "BeforeToolCallDecision",
     "BeforeToolCallHookContext",
+    "BillingIdentity",
+    "BillingIdentityState",
     "BudgetAction",
     "BudgetCheck",
     "BudgetLedger",
@@ -370,6 +382,7 @@ __all__ = [
     "ContextPressureOverhead",
     "ContextRequest",
     "ContextUsageState",
+    "ContextualPricingRequirement",
     "CostLineItem",
     "DefaultContextPolicy",
     "DenyPatternRule",
@@ -444,6 +457,9 @@ __all__ = [
     "PriceBook",
     "PriceSchedule",
     "PriceTier",
+    "PricingContext",
+    "PricingContextSelector",
+    "PricingResourceMapping",
     "ProjectCheckReport",
     "ProjectDiagnostic",
     "PromptCacheCompactor",
@@ -457,6 +473,7 @@ __all__ = [
     "RequiredFieldRule",
     "ResolutionActor",
     "ResolutionActorSource",
+    "ResolvedBillingIdentity",
     "ResumeRequest",
     "RetryDecision",
     "RetryPolicy",
@@ -524,6 +541,7 @@ __all__ = [
     "TranscriptPage",
     "TranscriptQuery",
     "TranscriptRecord",
+    "UnresolvedBillingIdentity",
     "UsageMetrics",
     "UsageTriggeredContextPolicy",
     "UserInputRecoveryRequest",

@@ -1492,6 +1492,11 @@ def _add_usage_metrics(left: UsageMetrics, right: UsageMetrics) -> UsageMetrics:
         cache=CacheUsageMetrics(
             read_tokens=left.cache.read_tokens + right.cache.read_tokens,
             write_tokens=left.cache.write_tokens + right.cache.write_tokens,
+            write_5m_tokens=left.cache.write_5m_tokens + right.cache.write_5m_tokens,
+            write_1h_tokens=left.cache.write_1h_tokens + right.cache.write_1h_tokens,
+            write_unknown_ttl_tokens=(
+                left.cache.write_unknown_ttl_tokens + right.cache.write_unknown_ttl_tokens
+            ),
             cached_input_tokens=left.cache.cached_input_tokens + right.cache.cached_input_tokens,
             uncached_input_tokens=left.cache.uncached_input_tokens
             + right.cache.uncached_input_tokens,

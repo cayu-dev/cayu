@@ -74,8 +74,12 @@ Provider-backed custom compactors used on this path must declare their charged
 provider and model through `provider_budget_identity(session)`. That identity
 does not declare provider-call cardinality: when reservation-bearing limits
 apply, automatic compaction fails before invoking an opaque custom compactor
-because Cayu cannot reserve each hidden dispatch independently. Such compactors
-remain compatible with event-backed budgets that do not use reservations.
+because Cayu cannot reserve each hidden dispatch independently. A strict
+contextual-pricing limit likewise requires the built-in observable dispatch
+boundary so the provider-resolved billing identity can be admitted immediately
+before spend, even when the limit has no reservation. Opaque custom compactors
+remain compatible with event-backed budgets only when pricing does not require
+that request-specific contextual preflight.
 
 ### Explicit application-requested compaction
 
@@ -925,6 +929,27 @@ continue its pre-revision-20 live fan-out without leaving a handoff it does not
 know how to acknowledge, while every revision-20 write gets the new recovery
 guarantee.
 
+Revision 21 adds durable provider billing identity to budget reservations and
+new billing/cache dimensions to `model.completed` usage. Before deploying this
+revision, stop revision-20 and older processes and run `cayu storage migrate`
+against every PostgreSQL database and every SQLite file used by either a
+session store or a separately configured budget ledger. Revision 21 raises the
+compatibility floor: mixed-version operation and app-only rollback are rejected
+because older readers do not accept the new durable event payload. Roll back
+the database and application together from a pre-upgrade backup if a revision-20
+rollback is required.
+
+The durable billing envelope is provider-neutral: `provider_name` and
+`resource_id` identify the commercial resource, request/completion evidence
+remain opaque provider-owned JSON, and `pricing_contexts` enumerate exact
+commercial dimensions core may select. Before a provider request hook runs the
+runtime carries an explicit unresolved state; after it runs, a resolved state
+contains either an identity or `None`. Completion may add evidence and narrow
+the request's possible contexts to a non-empty subset, but cannot erase them,
+rewrite request evidence, replace the resource, introduce/remove an identity,
+or widen possible pricing. These rules apply equally to normal model steps,
+compaction, durable usage, and budget reservation/reconciliation.
+
 ## Event Watchers
 
 Event watchers are durable app-side processors for events that were already
@@ -1598,7 +1623,7 @@ Providers that require opaque response items for stateless continuation may retu
 
 `AnthropicProvider` adapts the Anthropic Messages API to Cayu's provider-neutral transcript. It keeps Cayu `system` messages as Anthropic's top-level `system` field, maps assistant tool calls to Anthropic `tool_use` blocks, and maps Cayu tool-result messages back to Anthropic user `tool_result` blocks. Callers can override Anthropic request options through `ModelRequest.options["anthropic"]` except for fields owned by the provider contract.
 
-`BedrockProvider` adapts Amazon Bedrock `ConverseStream` to the same transcript without requiring an Anthropic API key. Install `cayu[aws]`, configure the standard AWS credential chain and region (or pass `profile_name=` for a named Boto3 profile), and pass an explicit Bedrock model ID or inference-profile ARN through the agent's `model`; Cayu never guesses a provider from the model name. The caller needs `bedrock:CountTokens` and `bedrock:InvokeModel` for `CountTokens`, plus `bedrock:InvokeModelWithResponseStream` for streaming. System messages, reasoning text and its required signature/redacted round-trip state, tools/tool results, images/PDFs, tool-strategy structured output, stop reasons, `CountTokens`, cache-aware usage, and typed AWS errors are normalized behind the provider interface. `CountTokens` availability remains model-specific: some Claude models offered only through cross-Region inference require the separate Bedrock Mantle endpoint, which this adapter does not call. `ModelRequest.options["bedrock"]` accepts copied Converse options, but the adapter owns `modelId`, `messages`, `system`, and `toolConfig`. AWS credentials are resolved by Boto3 and are never copied into events or request metadata. Native structured output is not claimed; use Cayu's provider-neutral tool strategy. Register pricing rows under provider `bedrock` because Bedrock pricing is distinct from the direct Anthropic API.
+`BedrockProvider` adapts Amazon Bedrock `ConverseStream` to the same transcript without requiring an Anthropic API key. Install `cayu[aws]`, configure the standard AWS credential chain and region (or pass `profile_name=` for a named Boto3 profile), and pass an explicit Bedrock model ID or inference-profile ARN through the agent's `model`; Cayu never guesses a provider from the model name. The caller needs `bedrock:CountTokens` and `bedrock:InvokeModel` for `CountTokens`, plus `bedrock:InvokeModelWithResponseStream` for streaming. System messages, reasoning text and its required signature/redacted round-trip state, tools/tool results, images/PDFs, tool-strategy structured output, stop reasons, `CountTokens`, cache-aware usage (including cache-write TTL details), effective service tier, and typed AWS errors are normalized behind the provider interface. `CountTokens` availability remains model-specific: some Claude models offered only through cross-Region inference require the separate Bedrock Mantle endpoint, which this adapter does not call. `ModelRequest.options["bedrock"]` accepts copied Converse options, including `serviceTier`, but the adapter owns `modelId`, `messages`, `system`, and `toolConfig`. AWS credentials are resolved by Boto3 and are never copied into events or request metadata. Native structured output is not claimed; use Cayu's provider-neutral tool strategy. Bedrock cost and reservation accounting use one durable identity containing the exact invoked resource, actual Boto client source region, requested tier (omission is Standard/`default`), and provider-reported effective tier. Unknown combinations are unpriced; opaque application-profile ARNs require an explicit price or mapping. `ModelCatalog` is never consulted for this billing decision.
 
 `OpenAIProvider` adapts the OpenAI Responses API to the same Cayu transcript. It keeps Cayu `system` messages as OpenAI `instructions`, maps assistant tool calls to Responses `function_call` items, maps Cayu tool-result messages to `function_call_output` items, and sets `store: false` by default so Cayu remains the durable session source of truth. It uses OpenAI Responses server-sent-event streaming by default, normalizes typed text/function-call/completed events into Cayu provider stream events, and enforces a provider-event idle timeout so a stalled stream fails the model step instead of leaving the session running indefinitely. Callers can override OpenAI request options through `ModelRequest.options["openai"]` except for fields owned by the provider contract.
 

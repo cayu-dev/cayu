@@ -1,6 +1,6 @@
 {
-  "price_book_version": "2026-07-14",
-  "generated_at": "2026-07-14",
+  "price_book_version": "2026-07-16",
+  "generated_at": "2026-07-16",
   "prices": [
     {
       "aliases": [],
@@ -329,6 +329,83 @@
             "as_of": "2026-07-13",
             "source": "official",
             "url": "https://azure.microsoft.com/en-us/pricing/details/azure-openai/"
+          }
+        }
+      ]
+    },
+    {
+      "aliases": [],
+      "cache_write_ttls": [
+        "5m"
+      ],
+      "match": "exact",
+      "match_prefixes": [],
+      "model": "global.anthropic.claude-sonnet-4-6",
+      "pricing_context": {
+        "dimensions": {
+          "service_tier": [
+            "default"
+          ],
+          "source_region": [
+            "af-south-1",
+            "ap-east-2",
+            "ap-northeast-1",
+            "ap-northeast-2",
+            "ap-northeast-3",
+            "ap-south-1",
+            "ap-south-2",
+            "ap-southeast-1",
+            "ap-southeast-2",
+            "ap-southeast-3",
+            "ap-southeast-4",
+            "ap-southeast-5",
+            "ap-southeast-6",
+            "ap-southeast-7",
+            "ca-central-1",
+            "ca-west-1",
+            "eu-central-1",
+            "eu-central-2",
+            "eu-north-1",
+            "eu-south-1",
+            "eu-south-2",
+            "eu-west-1",
+            "eu-west-2",
+            "eu-west-3",
+            "il-central-1",
+            "me-central-1",
+            "me-south-1",
+            "mx-central-1",
+            "sa-east-1",
+            "us-east-1",
+            "us-east-2",
+            "us-west-1",
+            "us-west-2"
+          ]
+        }
+      },
+      "provider_name": "bedrock",
+      "schedules": [
+        {
+          "effective_from": "2026-02-17",
+          "effective_through": null,
+          "pricing": {
+            "batch": null,
+            "cache_write_1h_per_million": null,
+            "cache_write_5m_per_million": "3.75",
+            "currency": "USD",
+            "standard": [
+              {
+                "cache_read_input_per_million": "0.30",
+                "input_per_million": "3",
+                "max_input_tokens": null,
+                "output_per_million": "15"
+              }
+            ]
+          },
+          "provenance": {
+            "as_of": "2026-07-16",
+            "source": "official",
+            "url": "https://aws.amazon.com/marketplace/pp/prodview-o6w4hyizv7g64"
           }
         }
       ]

@@ -38,6 +38,13 @@ from cayu.artifacts import (
     validate_file_attachment_content_type,
 )
 from cayu.core.agents import AgentSpec
+from cayu.core.billing import (
+    UNRESOLVED_BILLING_IDENTITY,
+    BillingIdentity,
+    BillingIdentityState,
+    ResolvedBillingIdentity,
+    resolved_billing_identity,
+)
 from cayu.core.events import Event, EventType, copy_event
 from cayu.core.messages import (
     FilePart,
@@ -151,15 +158,19 @@ from cayu.runtime.budgets import (
     budget_reservation_payload,
     copy_budget_policy,
     copy_request_budget_limits,
+    has_deferred_contextual_price,
     request_budget_limits_for_session,
 )
 from cayu.runtime.context import (
     CheckpointCompactionContextPolicy,
     ContextBuildError,
+    ContextBuildResult,
     ContextCompactionTelemetry,
     ContextPolicy,
     ContextRequest,
     DefaultContextPolicy,
+    _automatic_compaction_dispatch_runner_scope,
+    _compaction_model_completed_payload,
 )
 from cayu.runtime.context_counting import (
     ContextCountingConfig,
@@ -302,7 +313,6 @@ from cayu.runtime.tool_rounds import (
 )
 from cayu.runtime.usage import (
     USAGE_BEARING_EVENT_TYPES,
-    CacheUsageMetrics,
     CausalBudgetUsageSummary,
     SessionUsageSummary,
     UsageMetrics,
@@ -1677,6 +1687,24 @@ class CayuApp:
         else:
             app_policy_budget_limits = candidate_app_policy_budget_limits
             budget_limits = (*app_policy_budget_limits, *candidate_request_budget_limits)
+        contextual_dispatch_budget_limits = tuple(
+            limit
+            for limit in budget_limits
+            if has_deferred_contextual_price(
+                limit.pricing,
+                provider_name=compactor_provider_name,
+                model=compactor_model,
+            )
+        )
+        if (
+            contextual_dispatch_budget_limits
+            and not context_policy.compactor._uses_runtime_provider_dispatch_runner_for_forced_compaction()
+        ):
+            raise RuntimeError(
+                "Explicit compaction with contextual pricing requires an "
+                "unmodified built-in provider compactor so Cayu can admit every "
+                "resolved provider dispatch before execution."
+            )
         operation_started_at = time.monotonic()
 
         operation_id = str(uuid4())
@@ -1871,6 +1899,7 @@ class CayuApp:
         await self._event_writer.fan_out_persisted([started_event])
         yield started_event
         attempt_events: list[Event] = []
+        prepublished_dispatch_events: list[Event] = []
         reached_budget_keys: set[tuple[str, str | None, str, str, Decimal]] = set()
         budget_reservations: list[BudgetStepReservation] = []
         budget_reservations_settled = False
@@ -1919,7 +1948,7 @@ class CayuApp:
                 session=loaded_session,
                 registered_agent=registered_agent,
                 environment_name=environment_name,
-                budget_limits=budget_limits,
+                budget_limits=(() if contextual_dispatch_budget_limits else budget_limits),
                 provider_name=compactor_provider_name,
                 model=compactor_model,
                 request=request,
@@ -1964,11 +1993,255 @@ class CayuApp:
             if reservation_error is not None:
                 raise reservation_error
 
-            (
-                result,
-                reservation_lease_failure,
-            ) = await self._run_limit_controller.run_operation_with_reservation_heartbeat(
-                lambda: context_policy.build_with_checkpoint(
+            async def publish_dispatch_budget_events() -> None:
+                if not attempt_events:
+                    return
+                events = list(attempt_events)
+                await self._persist_compaction_attempt_events(
+                    session=loaded_session,
+                    request=request,
+                    operation_id=operation_id,
+                    attempt_id=attempt_id,
+                    events=events,
+                )
+                attempt_events.clear()
+                await self._event_writer.fan_out_persisted(events)
+                prepublished_dispatch_events.extend(events)
+
+            def dispatch_completion_event(
+                *,
+                actual_provider: ModelProvider,
+                actual_model: str,
+                completed_metadata: dict[str, Any],
+            ) -> Event:
+                return Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id=loaded_session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload=_compaction_model_completed_payload(
+                        completed_payload=completed_metadata,
+                        provider_name=actual_provider.name,
+                        fallback_model=actual_model,
+                        compactor=type(context_policy.compactor).__name__,
+                        usage_dialect=actual_provider.usage_dialect,
+                    ),
+                )
+
+            async def settle_contextual_dispatch(
+                dispatch_reservations: list[BudgetStepReservation],
+                *,
+                completed_event: Event | None,
+                uncertain_reason: str,
+            ) -> None:
+                dispatch_reservation_ids = {
+                    reservation.record.reservation_id for reservation in dispatch_reservations
+                }
+                if completed_event is None:
+                    settlement = self._reconcile_uncertain_compaction_budget_reservations(
+                        dispatch_reservations,
+                        session=loaded_session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        request=request,
+                        operation_id=operation_id,
+                        attempt_id=attempt_id,
+                        compactor=type(context_policy.compactor).__name__,
+                    )
+                else:
+                    settlement = self._reconcile_compaction_budget_reservations(
+                        dispatch_reservations,
+                        model_completed_events=[completed_event],
+                        session=loaded_session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        request=request,
+                        operation_id=operation_id,
+                        attempt_id=attempt_id,
+                        compactor=type(context_policy.compactor).__name__,
+                    )
+                try:
+                    async for event in settlement:
+                        attempt_events.append(event)
+                except Exception as exc:
+                    exc.add_note(uncertain_reason)
+                    raise
+                finally:
+                    unsettled_ids = {
+                        reservation.record.reservation_id for reservation in dispatch_reservations
+                    }
+                    settled_ids = dispatch_reservation_ids - unsettled_ids
+                    budget_reservations[:] = [
+                        reservation
+                        for reservation in budget_reservations
+                        if reservation.record.reservation_id not in settled_ids
+                    ]
+
+            async def run_contextual_provider_dispatch(
+                actual_provider: ModelProvider,
+                actual_model: str,
+                billing_identity: BillingIdentity | None,
+                dispatch: Callable[[], Awaitable[tuple[str, dict[str, Any]]]],
+            ) -> tuple[str, dict[str, Any]]:
+                budget_error = await self._enforce_compaction_budget_limits(
+                    session=loaded_session,
+                    budget_limits=budget_limits,
+                    app_policy_budget_limits=app_policy_budget_limits,
+                    attempt_events=attempt_events,
+                    reached_budget_keys=reached_budget_keys,
+                    request=request,
+                    operation_id=operation_id,
+                    attempt_id=attempt_id,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    compactor=type(context_policy.compactor).__name__,
+                    provider_name=actual_provider.name,
+                    model=actual_model,
+                    billing_identity_state=resolved_billing_identity(billing_identity),
+                )
+                if budget_error is not None:
+                    await publish_dispatch_budget_events()
+                    raise budget_error
+
+                reservation_start = len(budget_reservations)
+                reservation_failure = await self._reserve_compaction_budget(
+                    session=loaded_session,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    budget_limits=budget_limits,
+                    provider_name=actual_provider.name,
+                    model=actual_model,
+                    request=request,
+                    operation_id=operation_id,
+                    attempt_id=attempt_id,
+                    compactor=type(context_policy.compactor).__name__,
+                    reservations=budget_reservations,
+                    events=attempt_events,
+                    billing_identity=billing_identity,
+                )
+                dispatch_reservations = budget_reservations[reservation_start:]
+                if reservation_failure is not None:
+                    attempt_events.append(
+                        _application_compaction_ledger_event(
+                            event_type=EventType.BUDGET_LIMIT_REACHED,
+                            payload=budget_reservation_payload(reservation_failure),
+                            request=request,
+                            operation_id=operation_id,
+                            attempt_id=attempt_id,
+                            session=loaded_session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                            compactor=type(context_policy.compactor).__name__,
+                        )
+                    )
+                    await publish_dispatch_budget_events()
+                    raise RuntimeError(
+                        f"Compaction budget reservation failed: {reservation_failure.message}"
+                    )
+                await publish_dispatch_budget_events()
+
+                try:
+                    (
+                        dispatch_result,
+                        lease_failure,
+                    ) = await self._run_limit_controller.run_operation_with_reservation_heartbeat(
+                        dispatch,
+                        reservations=dispatch_reservations,
+                        authoritative_failure_types=(ContextBuildError,),
+                        lease_lost_before_dispatch_message=(
+                            "Compaction budget reservation lease was lost before provider dispatch."
+                        ),
+                        authoritative_failure_note=(
+                            "Budget reservation lease was also lost as compaction failed"
+                        ),
+                        concurrent_failure_note=(
+                            "Compactor also failed while reservation lease loss was handled"
+                        ),
+                    )
+                except asyncio.CancelledError as exc:
+
+                    async def settle_cancelled_dispatch() -> None:
+                        await settle_contextual_dispatch(
+                            dispatch_reservations,
+                            completed_event=None,
+                            uncertain_reason=(
+                                "Contextual compaction dispatch settlement failed "
+                                "during cancellation."
+                            ),
+                        )
+                        await publish_dispatch_budget_events()
+
+                    settlement_task = asyncio.create_task(settle_cancelled_dispatch())
+                    settlement_failure: BaseException | None = None
+                    while not settlement_task.done():
+                        try:
+                            await asyncio.shield(settlement_task)
+                        except asyncio.CancelledError:
+                            continue
+                        except BaseException as candidate:
+                            settlement_failure = candidate
+                            break
+                    if settlement_failure is None:
+                        try:
+                            settlement_task.result()
+                        except BaseException as candidate:
+                            settlement_failure = candidate
+                    if settlement_failure is not None:
+                        exc.add_note(
+                            "Contextual compaction cancellation settlement also failed: "
+                            f"{type(settlement_failure).__name__}: {settlement_failure}"
+                        )
+                    raise
+                except BaseException as exc:
+                    raw_completed = getattr(exc, "completed_metadata", None)
+                    completed_event = (
+                        dispatch_completion_event(
+                            actual_provider=actual_provider,
+                            actual_model=actual_model,
+                            completed_metadata=raw_completed,
+                        )
+                        if type(raw_completed) is dict
+                        else None
+                    )
+                    try:
+                        await settle_contextual_dispatch(
+                            dispatch_reservations,
+                            completed_event=completed_event,
+                            uncertain_reason=(
+                                "Contextual compaction dispatch settlement failed after "
+                                "provider error."
+                            ),
+                        )
+                        await publish_dispatch_budget_events()
+                    except BaseException as settlement_failure:
+                        if not isinstance(settlement_failure, Exception):
+                            raise settlement_failure from exc
+                        add_budget_failure_note(
+                            exc,
+                            operation="contextual compaction dispatch settlement",
+                            accounting_failure=settlement_failure,
+                        )
+                    raise
+
+                completed_event = dispatch_completion_event(
+                    actual_provider=actual_provider,
+                    actual_model=actual_model,
+                    completed_metadata=dispatch_result[1],
+                )
+                await settle_contextual_dispatch(
+                    dispatch_reservations,
+                    completed_event=completed_event,
+                    uncertain_reason=(
+                        "Contextual compaction dispatch settlement failed after completion."
+                    ),
+                )
+                await publish_dispatch_budget_events()
+                if lease_failure is not None:
+                    raise lease_failure
+                return dispatch_result
+
+            async def execute_compaction() -> ContextBuildResult:
+                return await context_policy.build_with_checkpoint(
                     ContextRequest(
                         session=loaded_session,
                         agent=_session_agent_spec(
@@ -1987,19 +2260,33 @@ class CayuApp:
                         compaction_instructions=request.instructions,
                     ),
                     checkpoint=claimed_checkpoint,
-                ),
-                reservations=budget_reservations,
-                authoritative_failure_types=(ContextBuildError,),
-                lease_lost_before_dispatch_message=(
-                    "Compaction budget reservation lease was lost before provider dispatch."
-                ),
-                authoritative_failure_note=(
-                    "Budget reservation lease was also lost as compaction failed"
-                ),
-                concurrent_failure_note=(
-                    "Compactor also failed while reservation lease loss was handled"
-                ),
-            )
+                )
+
+            if contextual_dispatch_budget_limits:
+                with _automatic_compaction_dispatch_runner_scope(run_contextual_provider_dispatch):
+                    result = await execute_compaction()
+                reservation_lease_failure = None
+            else:
+                (
+                    result,
+                    reservation_lease_failure,
+                ) = await self._run_limit_controller.run_operation_with_reservation_heartbeat(
+                    execute_compaction,
+                    reservations=budget_reservations,
+                    authoritative_failure_types=(ContextBuildError,),
+                    lease_lost_before_dispatch_message=(
+                        "Compaction budget reservation lease was lost before provider dispatch."
+                    ),
+                    authoritative_failure_note=(
+                        "Budget reservation lease was also lost as compaction failed"
+                    ),
+                    concurrent_failure_note=(
+                        "Compactor also failed while reservation lease loss was handled"
+                    ),
+                )
+            for event in prepublished_dispatch_events:
+                yield event
+            prepublished_dispatch_events.clear()
             if result.checkpoint is None or result.checkpoint_event_payload is None:
                 raise ValueError("Session has no complete older context to compact.")
 
@@ -2267,6 +2554,9 @@ class CayuApp:
             )
             failed_events = [*attempt_events, failed_event]
             await self._event_writer.fan_out_persisted(failed_events)
+            for event in prepublished_dispatch_events:
+                yield event
+            prepublished_dispatch_events.clear()
             for event in failed_events:
                 yield event
             raise
@@ -2360,6 +2650,7 @@ class CayuApp:
         compactor: str,
         provider_name: str | None,
         model: str | None,
+        billing_identity_state: BillingIdentityState = UNRESOLVED_BILLING_IDENTITY,
     ) -> RuntimeError | None:
         checks = await self._run_limit_controller.evaluate_operation_budgets(
             session=session,
@@ -2367,11 +2658,24 @@ class CayuApp:
             operation_events=attempt_events,
             provider_name=provider_name,
             model=model,
+            billing_identity_state=billing_identity_state,
         )
         interrupt_error: RuntimeError | None = None
         for outcome in checks:
             budget_limit, check = outcome.limit, outcome.check
-            if any(budget_limit is limit for limit in app_policy_budget_limits):
+            deferred_contextual_check = (
+                not isinstance(billing_identity_state, ResolvedBillingIdentity)
+                and not check.limit_reached
+                and has_deferred_contextual_price(
+                    budget_limit.pricing,
+                    provider_name=provider_name,
+                    model=model,
+                )
+            )
+            if (
+                any(budget_limit is limit for limit in app_policy_budget_limits)
+                and not deferred_contextual_check
+            ):
                 attempt_events.append(
                     _application_compaction_ledger_event(
                         event_type=EventType.BUDGET_CHECKED,
@@ -2448,6 +2752,7 @@ class CayuApp:
         compactor: str,
         reservations: list[BudgetStepReservation],
         events: list[Event],
+        billing_identity: BillingIdentity | None = None,
     ) -> BudgetReservationResult | None:
         setup = await self._run_limit_controller.reserve_operation_budgets(
             budget_limits=budget_limits,
@@ -2455,6 +2760,7 @@ class CayuApp:
             agent_name=registered_agent.spec.name,
             provider_name=provider_name,
             model=model,
+            billing_identity=billing_identity,
             rejection_release_reason="compaction budget reservation failed",
             accepted_record_error="Accepted compaction budget reservation has no record.",
         )
@@ -4497,6 +4803,10 @@ class CayuApp:
                     budget_baseline_events=budget_baseline_events,
                     pending_tool_calls=executable_pending_tool_calls,
                     budget_notify_events=request_budget_notify_events,
+                    pricing_provider_name=(
+                        registered_provider.provider.billing_provider_name
+                        or registered_provider.name
+                    ),
                 )
                 for event in limit_evaluation.events:
                     yield event
@@ -5626,6 +5936,9 @@ class CayuApp:
                 run_baseline=run_baseline,
                 budget_baseline_events=baseline_events,
                 budget_notify_events=request_budget_notify_events,
+                pricing_provider_name=(
+                    registered_provider.provider.billing_provider_name or registered_provider.name
+                ),
             )
             tool_round_runner = self._tool_round_executor.create_run(
                 session=session,
@@ -8899,37 +9212,11 @@ def _application_compaction_usage_metrics(payload: dict[str, Any]) -> UsageMetri
     requested_model = _application_compaction_event_text(identity_source.get("requested_model"))
     model = _application_compaction_event_text(identity_source.get("model"))
     if type(supplied_metrics) is dict:
-        cache = supplied_metrics.get("cache")
-        if type(cache) is not dict:
-            cache = {}
-        return UsageMetrics(
-            provider_name=provider_name,
-            requested_model=requested_model,
-            model=model,
-            input_tokens=_application_compaction_event_integer(supplied_metrics.get("input_tokens"))
-            or 0,
-            output_tokens=_application_compaction_event_integer(
-                supplied_metrics.get("output_tokens")
-            )
-            or 0,
-            total_tokens=_application_compaction_event_integer(supplied_metrics.get("total_tokens"))
-            or 0,
-            reasoning_output_tokens=_application_compaction_event_integer(
-                supplied_metrics.get("reasoning_output_tokens")
-            )
-            or 0,
-            cache=CacheUsageMetrics(
-                read_tokens=_application_compaction_event_integer(cache.get("read_tokens")) or 0,
-                write_tokens=_application_compaction_event_integer(cache.get("write_tokens")) or 0,
-                cached_input_tokens=_application_compaction_event_integer(
-                    cache.get("cached_input_tokens")
-                )
-                or 0,
-                uncached_input_tokens=_application_compaction_event_integer(
-                    cache.get("uncached_input_tokens")
-                )
-                or 0,
-            ),
+        return usage_metrics_from_event_payload(
+            {
+                "billing_identity": payload.get("billing_identity"),
+                "usage_metrics": copy_json_value(supplied_metrics, "usage_metrics"),
+            }
         )
     raw_usage = _application_compaction_raw_usage(payload.get("usage"))
     if raw_usage is None:
@@ -8959,9 +9246,21 @@ def _application_compaction_event(
     payload: dict[str, Any] = {}
     if telemetry.event_type == EventType.MODEL_COMPLETED:
         metrics = _application_compaction_usage_metrics(telemetry_payload)
+        raw_billing_identity = telemetry_payload.get("billing_identity")
+        billing_identity = (
+            BillingIdentity.model_validate(raw_billing_identity)
+            if type(raw_billing_identity) is dict
+            else None
+        )
+        if billing_identity is None and metrics is not None:
+            billing_identity = metrics.billing_identity
         payload["purpose"] = "context_compaction"
+        if billing_identity is not None:
+            payload["billing_identity"] = billing_identity.model_dump(mode="json")
         if metrics is not None:
-            payload["usage_metrics"] = metrics.model_dump()
+            serialized_metrics = metrics.model_dump()
+            serialized_metrics.pop("billing_identity", None)
+            payload["usage_metrics"] = serialized_metrics
             for key in ("provider_name", "requested_model", "model"):
                 value = getattr(metrics, key)
                 if value is not None:
