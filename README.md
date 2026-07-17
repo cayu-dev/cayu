@@ -297,7 +297,7 @@ Start with the document that matches the job:
 | Goal | Guide |
 | --- | --- |
 | Build an application, by hand or with an AI coding agent | [Authoring guide](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/authoring.md) |
-| Classify tool mutation and replay behavior | [Tool effects](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/tool-effects.md) |
+| Classify and verify tool mutation and replay behavior | [Tool effects](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/tool-effects.md) |
 | Understand factories, process roles, and lifecycle | [Application anatomy](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/application-anatomy.md) |
 | Choose how work starts | [Triggering runs](https://github.com/cayu-dev/cayu/blob/main/docs/triggering-runs.md) |
 | Create per-session workspaces and runners | [Environment factories](https://github.com/cayu-dev/cayu/blob/main/docs/environment-factories.md) |

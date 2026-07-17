@@ -56,3 +56,6 @@ def test_package_shipped_tool_effect_guide_renders_canonical_decisions(capsys) -
     assert "durable snapshot or artifact" in normalized
     assert "outcome is unknown after a timeout" in normalized
     assert "does not authorize execution" in guidance
+    assert "verify_tool_effect" in guidance
+    assert "bounded temporary Cayu workspace" in guidance
+    assert "`cayu check` remains structural" in guidance

@@ -1654,6 +1654,21 @@ decision table ships with the installed package as `cayu guide tool-effects`.
 Authorization and approval, budgets and quotas, taint, and audit telemetry are
 orthogonal contracts; `ToolEffect` does not authorize execution.
 
+The optional public `cayu.testing.verify_tool_effect(...)` helper executes one
+registered tool directly against a bounded temporary `LocalWorkspace`. It gives
+`NONE` a scoped consistency or mismatch verdict from created, updated, and
+deleted workspace paths. Effectful declarations require an explicit opt-in and
+are observed once without a replay-safety claim. The result names unobserved
+systems and limitations; the helper does not evaluate policy, approvals, hooks,
+events, or the model loop, and its current-process invocation is not a security
+sandbox. The observer compares regular-file paths and content; empty
+directories, symlinks, other non-regular entries, permissions, timestamps, and
+filesystem metadata remain outside mutation evidence but count toward its
+bounded traversal. One cooperative deadline covers seeding, execution, both
+snapshots, and cleanup checks. Expiration raises `TimeoutError` without a
+verdict; only a killable process boundary can enforce a hard wall-clock stop.
+`cayu check` remains structural and never calls the helper.
+
 Tool declarations are captured when an agent is registered with `CayuApp`.
 The registered name, description, and input schema are the public contract shown to the model for that agent.
 Changing `tool.spec` after registration does not update the registered agent or the model-facing tool declaration.

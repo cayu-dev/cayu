@@ -134,6 +134,7 @@ jobs:
           "$GITHUB_WORKSPACE/.release-venv/bin/cayu" guide anatomy >/dev/null
           "$GITHUB_WORKSPACE/.release-venv/bin/cayu" guide authoring >/dev/null
           "$GITHUB_WORKSPACE/.release-venv/bin/cayu" guide tool-effects >/dev/null
+          "$GITHUB_WORKSPACE/.release-venv/bin/python" -c 'from cayu.testing import verify_tool_effect'
           "$GITHUB_WORKSPACE/.release-venv/bin/cayu" inspect --json >/dev/null
           "$GITHUB_WORKSPACE/.release-venv/bin/cayu" check --json >/dev/null
           "$GITHUB_WORKSPACE/.release-venv/bin/cayu" generate slice reviewer --tool assess_submission --effect none

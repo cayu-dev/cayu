@@ -265,6 +265,13 @@ State exactly which commands ran and which were skipped. Successful imports,
 construction, mocks, scripted providers, or a local runner do not prove live
 provider access, sandbox isolation, network egress, or deployment readiness.
 
+Before deploying a tool declared `NONE`, use the bounded workspace check in
+`cayu guide tool-effects` when workspace mutation is part of its risk boundary.
+The check is explicit and behavioral; `cayu check` never executes tools. Treat
+an unchanged workspace as scoped evidence only, and use domain-specific tests
+for databases, external services, idempotency, and effects outside that first
+supported observer.
+
 ## 9. Shape-specific reminders
 
 - **Conversation:** preserve transcript/recovery semantics; omit tasks and

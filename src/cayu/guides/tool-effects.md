@@ -35,6 +35,57 @@ test a stable downstream replay contract.
 The classification describes replay safety; it does not mean Cayu will
 automatically retry the tool.
 
+## Check a `NONE` declaration before deployment
+
+`verify_tool_effect(...)` is an explicit deployment-readiness test seam. It
+invokes one registered tool against a bounded temporary Cayu workspace, then
+reports the declared effect and any created, updated, or deleted paths:
+
+```python
+from cayu.testing import ToolEffectVerificationStatus, verify_tool_effect
+
+evidence = await verify_tool_effect(
+    app,
+    agent_name="reporter",
+    tool_name="calculate_report_total",
+    arguments={"source": "input.json"},
+    workspace_files={"input.json": b'{"total": 42}'},
+    unobserved_systems=("reporting_database",),
+)
+assert evidence.status is ToolEffectVerificationStatus.CONSISTENT
+```
+
+For `NONE`, an unchanged workspace is `consistent`; any observed create,
+update, or delete is a `mismatch`. This is scoped evidence, not proof that the
+tool is universally pure. This first observer compares regular-file paths and
+content only. Empty directories, symlinks, other non-regular entries,
+permissions, timestamps, and filesystem metadata are outside its mutation
+evidence, although every traversed entry counts toward the observation limit.
+The result always names systems outside the boundary, including network
+services, databases outside the workspace, artifact stores, runner execution,
+process state, and host paths outside the temporary workspace. Add
+application-specific systems through `unobserved_systems`.
+
+The verifier supplies no runner, artifact store, vault, proxy, or knowledge
+store and runs the tool directly without policy, approvals, hooks, events, or
+the model loop. Build a fresh application with controlled adapters for this
+test: the current Python process is not a security sandbox, and tool-instance
+state is not observed. One cooperative asyncio deadline covers workspace
+seeding, tool execution, both snapshots, and cleanup checks. If it expires, the
+helper raises `TimeoutError` and returns no verdict because observation did not
+complete. A tool or filesystem operation that blocks the event loop can delay
+that failure; enforcing a hard wall-clock stop requires a killable process
+boundary. Snapshots stop at configured traversed-entry and regular-file caps,
+and bound per-file and total content bytes. Deadline and observation-limit
+failures therefore fail closed.
+
+`IDEMPOTENT` and `EXTERNAL` declarations require the explicit
+`allow_effectful_execution=True` opt-in. They execute once and return `observed`,
+which records workspace changes but does not claim replay safety. Use a
+domain-specific test for the downstream idempotency or reconciliation contract.
+`cayu check` remains structural and never invokes this verifier or application
+tools.
+
 ## Keep other controls separate
 
 `ToolEffect` does not authorize execution. Authorization and approval belong in
