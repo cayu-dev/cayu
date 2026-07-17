@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 
 from cayu.runtime.context import (
@@ -79,6 +80,22 @@ def test_readme_surfaces_reviewed_knowledge_and_links_runtime_contracts() -> Non
     readme = readme_path.read_text(encoding="utf-8")
     assert "[Runtime contracts](" in readme
     assert "/docs/runtime-contracts.md" in readme
+
+
+def test_release_facing_metadata_uses_public_urls() -> None:
+    readme = (_REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "https://github.com/vertexkg/cayu" not in readme
+
+    with (_REPO_ROOT / "pyproject.toml").open("rb") as source:
+        project = tomllib.load(source)["project"]
+
+    assert project["urls"] == {
+        "Homepage": "https://cayu.dev",
+        "Repository": "https://github.com/cayu-dev/cayu",
+        "Documentation": "https://github.com/cayu-dev/cayu#readme",
+        "Issues": "https://github.com/cayu-dev/cayu/issues",
+        "Changelog": "https://github.com/cayu-dev/cayu/blob/main/docs/release-notes.md",
+    }
 
 
 def test_application_anatomy_guide_is_linked_from_release_facing_docs() -> None:

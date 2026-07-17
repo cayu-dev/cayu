@@ -128,9 +128,9 @@ in `RunOutcome.events`; use it for bounded runs. Consume `CayuApp.run(...)`
 incrementally for long-lived or high-volume runs.
 
 For a runnable example with no API key, use
-[`examples/echo_tool_runtime.py`](https://github.com/vertexkg/cayu/blob/main/examples/echo_tool_runtime.py). To add
+[`examples/echo_tool_runtime.py`](https://github.com/cayu-dev/cayu/blob/main/examples/echo_tool_runtime.py). To add
 workspace tools and command execution, see
-[`examples/local_environment_runtime.py`](https://github.com/vertexkg/cayu/blob/main/examples/local_environment_runtime.py).
+[`examples/local_environment_runtime.py`](https://github.com/cayu-dev/cayu/blob/main/examples/local_environment_runtime.py).
 
 ### Build with a coding agent
 
@@ -234,7 +234,7 @@ Start work through the API that matches the trigger:
 - a subagent for model-selected bounded delegation; or
 - an event watcher for durable reactions to already-persisted events.
 
-See [Triggering runs](https://github.com/vertexkg/cayu/blob/main/docs/triggering-runs.md) for the decision guide and
+See [Triggering runs](https://github.com/cayu-dev/cayu/blob/main/docs/triggering-runs.md) for the decision guide and
 lifecycle responsibilities.
 
 ## Providers and environments
@@ -287,7 +287,7 @@ Cayu makes safety boundaries explicit, but configuration still matters:
 - Recovery never invents the outcome of an ambiguous external side effect.
   Reconcile it through the typed recovery APIs.
 
-Read [Runtime contracts](https://github.com/vertexkg/cayu/blob/main/docs/runtime-contracts.md) before changing persistence,
+Read [Runtime contracts](https://github.com/cayu-dev/cayu/blob/main/docs/runtime-contracts.md) before changing persistence,
 replay, approval, interruption, budget, provider, runner, or recovery behavior.
 
 ## Documentation
@@ -296,60 +296,60 @@ Start with the document that matches the job:
 
 | Goal | Guide |
 | --- | --- |
-| Build an application, by hand or with an AI coding agent | [Authoring guide](https://github.com/vertexkg/cayu/blob/main/src/cayu/guides/authoring.md) |
-| Classify tool mutation and replay behavior | [Tool effects](https://github.com/vertexkg/cayu/blob/main/src/cayu/guides/tool-effects.md) |
-| Understand factories, process roles, and lifecycle | [Application anatomy](https://github.com/vertexkg/cayu/blob/main/src/cayu/guides/application-anatomy.md) |
-| Choose how work starts | [Triggering runs](https://github.com/vertexkg/cayu/blob/main/docs/triggering-runs.md) |
-| Create per-session workspaces and runners | [Environment factories](https://github.com/vertexkg/cayu/blob/main/docs/environment-factories.md) |
-| Implement a runner for your platform | [Build a runner](https://github.com/vertexkg/cayu/blob/main/docs/build-a-runner.md) |
-| Configure network and credential boundaries | [Virtual egress](https://github.com/vertexkg/cayu/blob/main/docs/virtual-egress.md) |
-| Design assertions and trajectory evals | [Evals](https://github.com/vertexkg/cayu/blob/main/docs/evals.md) |
-| Estimate and govern cost | [Cost optimization](https://github.com/vertexkg/cayu/blob/main/docs/cost-optimization.md) |
-| Use the application console | [Console](https://github.com/vertexkg/cayu/blob/main/docs/console.md) |
-| Inspect supported model metadata | [Model catalog](https://github.com/vertexkg/cayu/blob/main/docs/model-catalog.md) |
-| Look up exact runtime behavior | [Runtime contracts](https://github.com/vertexkg/cayu/blob/main/docs/runtime-contracts.md) |
-| Track prerelease behavior and migrations | [Release notes](https://github.com/vertexkg/cayu/blob/main/docs/release-notes.md) |
+| Build an application, by hand or with an AI coding agent | [Authoring guide](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/authoring.md) |
+| Classify tool mutation and replay behavior | [Tool effects](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/tool-effects.md) |
+| Understand factories, process roles, and lifecycle | [Application anatomy](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/application-anatomy.md) |
+| Choose how work starts | [Triggering runs](https://github.com/cayu-dev/cayu/blob/main/docs/triggering-runs.md) |
+| Create per-session workspaces and runners | [Environment factories](https://github.com/cayu-dev/cayu/blob/main/docs/environment-factories.md) |
+| Implement a runner for your platform | [Build a runner](https://github.com/cayu-dev/cayu/blob/main/docs/build-a-runner.md) |
+| Configure network and credential boundaries | [Virtual egress](https://github.com/cayu-dev/cayu/blob/main/docs/virtual-egress.md) |
+| Design assertions and trajectory evals | [Evals](https://github.com/cayu-dev/cayu/blob/main/docs/evals.md) |
+| Estimate and govern cost | [Cost optimization](https://github.com/cayu-dev/cayu/blob/main/docs/cost-optimization.md) |
+| Use the application console | [Console](https://github.com/cayu-dev/cayu/blob/main/docs/console.md) |
+| Inspect supported model metadata | [Model catalog](https://github.com/cayu-dev/cayu/blob/main/docs/model-catalog.md) |
+| Look up exact runtime behavior | [Runtime contracts](https://github.com/cayu-dev/cayu/blob/main/docs/runtime-contracts.md) |
+| Track prerelease behavior and migrations | [Release notes](https://github.com/cayu-dev/cayu/blob/main/docs/release-notes.md) |
 
 Maintainer-facing architecture is documented in
-[Architecture](https://github.com/vertexkg/cayu/blob/main/docs/architecture.md),
-[Project layout](https://github.com/vertexkg/cayu/blob/main/docs/project-layout.md),
-and the [Glossary](https://github.com/vertexkg/cayu/blob/main/docs/glossary.md).
+[Architecture](https://github.com/cayu-dev/cayu/blob/main/docs/architecture.md),
+[Project layout](https://github.com/cayu-dev/cayu/blob/main/docs/project-layout.md),
+and the [Glossary](https://github.com/cayu-dev/cayu/blob/main/docs/glossary.md).
 
 ## Examples
 
-- [Echo tool runtime](https://github.com/vertexkg/cayu/blob/main/examples/echo_tool_runtime.py) — credential-free model/tool loop.
-- [Local environment runtime](https://github.com/vertexkg/cayu/blob/main/examples/local_environment_runtime.py) — files and commands.
-- [Server example](https://github.com/vertexkg/cayu/blob/main/examples/server_example.py) — protected API and control plane.
-- [Cloud PR reviewer](https://github.com/vertexkg/cayu/blob/main/docs/recipes/pr-reviewer.md) — durable task, isolated workspace,
+- [Echo tool runtime](https://github.com/cayu-dev/cayu/blob/main/examples/echo_tool_runtime.py) — credential-free model/tool loop.
+- [Local environment runtime](https://github.com/cayu-dev/cayu/blob/main/examples/local_environment_runtime.py) — files and commands.
+- [Server example](https://github.com/cayu-dev/cayu/blob/main/examples/server_example.py) — protected API and control plane.
+- [Cloud PR reviewer](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/pr-reviewer.md) — durable task, isolated workspace,
   QA, and an explicit external effect.
-- [Business approvals](https://github.com/vertexkg/cayu/blob/main/docs/recipes/business-approvals.md) — domain approval routing
+- [Business approvals](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/business-approvals.md) — domain approval routing
   over the binary runtime primitive.
-- [Advanced runtime examples](https://github.com/vertexkg/cayu/blob/main/examples/ADVANCED_RUNTIME_EXAMPLES.md) — forks,
+- [Advanced runtime examples](https://github.com/cayu-dev/cayu/blob/main/examples/ADVANCED_RUNTIME_EXAMPLES.md) — forks,
   compaction, taint isolation, speculative approval, and measured evidence.
 
 Advanced examples are executable runtime specifications, not claims that one
 strategy fits every workload. Their evidence boundaries and measured results
 are described in
-[Advanced runtime strategies](https://github.com/vertexkg/cayu/blob/main/docs/advanced-runtime-examples.md).
+[Advanced runtime strategies](https://github.com/cayu-dev/cayu/blob/main/docs/advanced-runtime-examples.md).
 
 ## Contributing and security
 
 Framework contributors should read
-[CONTRIBUTING.md](https://github.com/vertexkg/cayu/blob/main/CONTRIBUTING.md) for
+[CONTRIBUTING.md](https://github.com/cayu-dev/cayu/blob/main/CONTRIBUTING.md) for
 placement policy, setup, validation commands, and pull-request requirements.
 New third-party integrations normally live in their own packages against
 Cayu's public extension contracts.
 
 Report suspected vulnerabilities privately as described in
-[SECURITY.md](https://github.com/vertexkg/cayu/blob/main/SECURITY.md). Do not open a public issue or pull request for a
+[SECURITY.md](https://github.com/cayu-dev/cayu/blob/main/SECURITY.md). Do not open a public issue or pull request for a
 suspected security vulnerability.
 
 For questions and project discussion, join
 [Discord](https://discord.gg/jWa3kKJ7R8). Use
-[GitHub issues](https://github.com/vertexkg/cayu/issues) for actionable bugs and
+[GitHub issues](https://github.com/cayu-dev/cayu/issues) for actionable bugs and
 concrete feature proposals.
 
 ## License
 
 Cayu is licensed under the
-[Apache License 2.0](https://github.com/vertexkg/cayu/blob/main/LICENSE).
+[Apache License 2.0](https://github.com/cayu-dev/cayu/blob/main/LICENSE).
