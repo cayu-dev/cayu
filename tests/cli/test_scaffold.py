@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
@@ -24,8 +25,9 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     proj = tmp_path / "myproj"
     for filename in ("app.py", "pyproject.toml", "README.md", ".gitignore"):
         assert (proj / filename).exists()
-    for dirname in ("agents", "tools", "evals", "tests"):
+    for dirname in ("agents", "evals", "tests"):
         assert (proj / dirname).is_dir()
+    assert not (proj / "tools").exists()
 
     # The generated app.py must import cleanly: every cayu export in the template
     # exists and the syntax is valid. build_app() is not called at import, so no
@@ -55,7 +57,7 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert '[project.optional-dependencies]\nconsole = ["cayu[console]"]' in pyproject
     assert 'dev = ["pytest"]' in pyproject
     assert '[tool.cayu]\nfactory = "app:build_app"' in pyproject
-    assert 'eval_target = "evals.assistant:build_eval"' in pyproject
+    assert 'eval_target = "evals.agent:build_eval"' in pyproject
     readme = (proj / "README.md").read_text(encoding="utf-8")
     assert "cayu inspect --json" in readme
     assert "cayu guide anatomy" in readme
@@ -63,9 +65,25 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert "pip install -e '.[console,dev]'" in readme
     assert "uv sync --extra console --extra dev" in readme
     assert "cayu eval run" in readme
-    assert "cayu eval run evals.assistant:build_eval" not in readme
-    assert "cayu generate slice NAME --tool TOOL --effect EFFECT" in readme
+    assert "cayu eval run evals.agent:build_eval" not in readme
+    assert "src/cayu/guides/authoring.md#cayu-map" in readme
+    assert 'python run.py --message "YOUR REQUEST"' in readme
+    assert "model-only" in readme
+    assert "cayu generate slice" not in readme
     assert "cayu check --json" in capsys.readouterr().out
+
+
+def test_python_m_cayu_routes_to_the_cli() -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "cayu", "version"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.startswith("cayu ")
+    assert result.stderr == ""
 
 
 def test_project_context_isolates_and_restores_project_packages(
@@ -169,10 +187,10 @@ def test_cayu_new_emits_safe_agent_instructions_and_credential_free_proof(
     project = tmp_path / "myproj"
 
     assert (project / "AGENTS.md").is_file()
-    assert (project / "agents" / "assistant.py").is_file()
-    assert (project / "tools" / "greet.py").is_file()
-    assert (project / "tests" / "test_assistant.py").is_file()
-    assert (project / "evals" / "assistant.py").is_file()
+    assert (project / "agents" / "agent.py").is_file()
+    assert not (project / "tools" / "greet.py").exists()
+    assert (project / "tests" / "test_agent.py").is_file()
+    assert (project / "evals" / "agent.py").is_file()
     assert not (project / "workflows").exists()
     assert not (project / "memory").exists()
 
@@ -180,29 +198,36 @@ def test_cayu_new_emits_safe_agent_instructions_and_credential_free_proof(
     assert "ExecCommandTool" not in app_source
     assert "# <cayu:generated-imports>" in app_source
     assert "# <cayu:generated-registrations>" in app_source
-    tool_source = (project / "tools" / "greet.py").read_text(encoding="utf-8")
-    agent_source = (project / "agents" / "assistant.py").read_text(encoding="utf-8")
-    eval_source = (project / "evals" / "assistant.py").read_text(encoding="utf-8")
-    assert 'GREET_TOOL_NAME = "greet"' in tool_source
-    assert "from tools.greet import GREET_TOOL_NAME" in agent_source
-    assert "workflow_tool_names=(GREET_TOOL_NAME,)" in agent_source
-    assert "name=GREET_TOOL_NAME" in tool_source
-    assert "ToolCalled(GREET_TOOL_NAME)" in eval_source
-    assert "ToolEffect.NONE" in tool_source
-    assert "ToolEffect.EXTERNAL" not in tool_source
+    agent_source = (project / "agents" / "agent.py").read_text(encoding="utf-8")
+    eval_source = (project / "evals" / "agent.py").read_text(encoding="utf-8")
+    assert 'name="myproj"' in agent_source
+    assert "system_prompt" not in agent_source
+    assert "workflow_tool_names" not in agent_source
+    assert "ToolCalled" not in eval_source
 
     instructions = (project / "AGENTS.md").read_text(encoding="utf-8")
     assert "cayu guide anatomy" in instructions
-    assert "cayu guide tool-effects" in instructions
     assert "cayu inspect --json" in instructions
     assert "cayu check --json" in instructions
-    assert "cayu check --fail-on warning --json" in instructions
-    assert "cayu generate slice" in instructions
     assert "pytest" in instructions
     assert "cayu eval run" in instructions
-    assert "cayu eval run evals.assistant:build_eval" not in instructions
-    assert "registered tool manifest" in instructions
-    assert "Do not claim live verification" in instructions
+    assert "cayu eval run evals.agent:build_eval" not in instructions
+    assert "Edit the existing agent, test, and eval" in instructions
+    assert "Tools are optional" in instructions
+    assert "src/cayu/guides/authoring.md#cayu-map" in instructions
+    assert "examples/README.md" in instructions
+    assert "Deployment is a separate task" in instructions
+    assert "Clarify users, jobs, triggers" not in instructions
+    assert "cayu generate slice" not in instructions
+
+
+def test_cayu_new_uses_supported_hyphenated_project_name_for_the_agent(
+    tmp_path: Path,
+) -> None:
+    assert main(["new", "code-review", "--dir", str(tmp_path)]) == 0
+
+    agent_source = (tmp_path / "code-review" / "agents" / "agent.py").read_text(encoding="utf-8")
+    assert 'name="code-review"' in agent_source
 
 
 def test_scaffolded_default_eval_runs_from_nested_directory_without_api_keys(
@@ -220,7 +245,7 @@ def test_scaffolded_default_eval_runs_from_nested_directory_without_api_keys(
     report_path = project / "eval-run.json"
     report = load_eval_run(report_path)
     assert report.status == EvalStatus.PASSED
-    assert report.suite_id == "assistant-trajectory"
+    assert report.suite_id == "agent-output"
     assert not (nested / "eval-run.json").exists()
 
 

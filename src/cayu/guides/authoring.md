@@ -1,64 +1,74 @@
 # Building applications with Cayu
 
-This is the canonical, vendor-neutral authoring path for humans and coding
-agents working from an installed Cayu package. Generated projects repeat only
-the project-specific commands and registration rules in `AGENTS.md`.
+This guide is the canonical concept map and implementation path for Cayu
+applications. Generated projects repeat only their local commands and
+registration rules in `AGENTS.md`.
 
-The supported implementation loop is:
+For local development, the supported loop is:
 
-`understand -> clarify -> inspect -> check -> plan -> change -> test -> eval -> exercise -> report evidence`
+`edit the requested behavior -> inspect -> check -> test -> eval`
 
-## 1. Start from behavior, not framework objects
+## 1. Start with one model-only agent
 
-Before editing, identify:
+In a fresh generated project, edit the existing agent, test, and eval in place.
+Do not retain the starter and add a second agent. Give the agent a focused job,
+domain input, and observable output. A system prompt is optional until the job
+requires one, and a model-only agent needs no tools.
 
-- the users and the job they are trying to complete;
-- triggers, domain inputs, and observable outputs;
-- what the model decides and what deterministic code decides;
-- autonomy, human oversight, and approval points;
-- durable state, replay, interruption, and recovery expectations;
-- external effects and the authority required for each effect;
-- workspaces, execution environments, artifacts, credentials, and egress;
-- representative successful, failing, interrupted, and recovery trajectories.
+Use safe local defaults for reversible development choices. Ask questions when
+the requested behavior itself is ambiguous. Questions about recipients,
+credentials, spending authority, destructive effects, ambiguous retries,
+durable recovery, and infrastructure begin when the user requests those
+capabilities or asks to deploy.
 
-Ask one bounded clarification batch when an answer changes the security
-boundary, durable data model, effect semantics, or acceptance behavior. Safe
-defaults are appropriate for naming, local file layout, and reversible
-presentation choices. Never silently choose recipients, destinations,
-credentials, spending authority, destructive behavior, or ambiguous retry
-semantics.
+## Cayu Map
 
-## 2. Select the smallest Cayu shape
+Use only the concepts your agent needs. Start with the first row and add another
+only when the requested behavior requires it.
 
-Use only the concepts the application needs:
+| When you need it | Cayu concepts | Start here |
+| --- | --- | --- |
+| One model-driven agent | `CayuApp`, `AgentSpec`, `ModelProvider`, `RunRequest` | [`cayu new`](https://github.com/cayu-dev/cayu/blob/main/src/cayu/cli/scaffold.py), [application anatomy](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/application-anatomy.md) |
+| A provider-neutral run result | `run_to_completion`, `RunOutcome`, events | [application anatomy](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/application-anatomy.md) |
+| Model-specific routing or capabilities | provider registration, model catalog, thinking, structured output | [model catalog](https://github.com/cayu-dev/cayu/blob/main/docs/model-catalog.md), [structured output](https://github.com/cayu-dev/cayu/blob/main/examples/structured_output_live.py) |
+| A capability outside the model | `Tool`, `ToolSpec`, `ToolContext` | [echo tool](https://github.com/cayu-dev/cayu/blob/main/examples/echo_tool_runtime.py) |
+| Replay or mutation semantics | `ToolEffect`, idempotency keys | [tool effects](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/tool-effects.md) |
+| Authority or a human decision | `ToolPolicy`, approvals, user-input checkpoints | [business approvals](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/business-approvals.md) |
+| Files or commands during a run | `Environment`, `Workspace`, `Runner` | [local environment](https://github.com/cayu-dev/cayu/blob/main/examples/local_environment_runtime.py), [environment factories](https://github.com/cayu-dev/cayu/blob/main/docs/environment-factories.md) |
+| Durable uploads or generated files | `ArtifactStore`, artifact/workspace bridges | [artifact example](https://github.com/cayu-dev/cayu/blob/main/examples/artifact_workspace_bridge.py) |
+| Secrets or restricted network access | vaults, virtual credentials, egress policies | [virtual egress](https://github.com/cayu-dev/cayu/blob/main/docs/virtual-egress.md) |
+| Tools exposed over MCP | MCP adapters and manifest policy | [stdio MCP](https://github.com/cayu-dev/cayu/blob/main/examples/stdio_mcp_runtime.py) |
+| Conversation history that survives restarts | `SessionStore`, transcripts, checkpoints, resume | [runtime contracts](https://github.com/cayu-dev/cayu/blob/main/docs/runtime-contracts.md) |
+| Context approaching a model limit | token counting, context policies, compaction, overflow recovery | [context counting](https://github.com/cayu-dev/cayu/blob/main/examples/context_counting_live.py) |
+| Reviewed or retrievable knowledge | knowledge stores, review state, recall tools | [local knowledge](https://github.com/cayu-dev/cayu/blob/main/examples/knowledge_remember_local.py) |
+| Durable background work | `TaskStore`, dispatcher, worker, event watcher | [triggering runs](https://github.com/cayu-dev/cayu/blob/main/docs/triggering-runs.md), [task worker](https://github.com/cayu-dev/cayu/blob/main/examples/task_worker_loop.py) |
+| Deterministic orchestration | workflow helpers and runtime hooks | [workflow helpers](https://github.com/cayu-dev/cayu/blob/main/examples/workflow_helpers.py) |
+| Delegated model work | subagent tools and child-session policy | [subagent example](https://github.com/cayu-dev/cayu/blob/main/examples/subagent_live.py) |
+| Behavioral regression proof | `EvalSuite`, runtime assertions, replay | [evals](https://github.com/cayu-dev/cayu/blob/main/docs/evals.md) |
+| Usage limits or cost control | usage events, run limits, budgets, pricing | [cost optimization](https://github.com/cayu-dev/cayu/blob/main/docs/cost-optimization.md), [usage summary](https://github.com/cayu-dev/cayu/blob/main/examples/usage_cost_summary.py) |
+| Developer and operator inspection | `cayu inspect`, `cayu check`, console, dashboard, tracing | [console](https://github.com/cayu-dev/cayu/blob/main/docs/console.md), [OpenTelemetry](https://github.com/cayu-dev/cayu/blob/main/examples/otel_tracing.py) |
+| An HTTP control plane | `cayu[server]`, authenticated FastAPI application | [server example](https://github.com/cayu-dev/cayu/blob/main/examples/server_example.py) |
+| Advanced authority, isolation, caching, or speculation | composed runtime strategies with explicit evidence boundaries | [advanced runtime strategies](https://github.com/cayu-dev/cayu/blob/main/docs/advanced-runtime-examples.md) |
 
-| Desired behavior | Cayu concept |
-| --- | --- |
-| One model-driven interaction | `CayuApp`, `AgentSpec`, `ModelProvider`, `RunRequest` |
-| Deterministic action callable by a model | `Tool`, `ToolSpec`, explicit `ToolEffect` |
-| Authority over effects | `ToolPolicy`; approval policies for human gates |
-| Mutable files or command execution | `Environment` with an explicit `Workspace` and `Runner` |
-| Durable uploaded/generated files | `ArtifactStore` |
-| Long-lived conversation/recovery | durable `SessionStore` and checkpoint APIs |
-| Background durable work | `TaskStore`, dispatcher, and an explicitly started worker |
-| Deterministic orchestration | workflow helpers |
-| Delegated model work | subagent tools and explicit child-session policy |
-| Behavioral regression proof | runtime-native `EvalSuite` and trajectory assertions |
+This map is a menu, not a checklist. A conversational, classification,
+generation, or research agent does not automatically need a tool, workflow,
+task queue, environment, approval step, knowledge store, server, or multi-agent
+topology. Use the [examples index](https://github.com/cayu-dev/cayu/blob/main/examples/README.md)
+to find the smallest runnable reference for an optional capability.
 
-A conversational or research agent does not automatically need a workflow,
-task queue, environment, approval step, memory store, server, or multi-agent
-topology. A coding agent does not automatically need a shell: prefer narrow
-file and domain tools; when command execution is necessary, use an explicit
-runner and an enforcing command/tool policy.
+A tool-backed slice is optional. Add one only when the agent needs a real
+capability outside the model. Prefer a narrow domain tool; when command
+execution is necessary, use an explicit runner and enforcing command/tool
+policy.
 
-## 3. Use the project factory
+## 2. Use the project factory
 
 A Cayu project declares a synchronous factory in `pyproject.toml`:
 
 ```toml
 [tool.cayu]
 factory = "app:build_app"
-eval_target = "evals.assistant:build_eval"
+eval_target = "evals.agent:build_eval"
 ```
 
 Calling the factory constructs a fresh, process-scoped `CayuApp`. The app is
@@ -73,7 +83,7 @@ long as a normal zero-argument call remains valid. Tests should inject
 The separate `eval_target` returns an eval plan and lets `cayu eval run` use the
 project's default suite without treating the application factory as an eval.
 
-## 4. Inspect before changing
+## 3. Inspect before changing
 
 Run from the project root or any nested directory:
 
@@ -98,9 +108,10 @@ and `2` means discovery, import, factory, or invocation failure. Each finding
 gives a stable code, machine path, observed parameters, correction, and
 verification command.
 
-## 5. Add one vertical slice
+## 4. Add a tool-backed slice only when needed
 
-For a generated project, plan before applying:
+Do not use the generator for the first model-only agent. When the application
+actually needs an additional tool-backed slice, plan before applying:
 
 ```bash
 cayu generate slice reviewer --tool assess_submission --effect none --dry-run --json
@@ -133,7 +144,7 @@ hand-authored agents, declare every exact tool name that machine-owned workflow
 instructions expect through `AgentSpec.workflow_tool_names`; do not maintain an
 independent list in prose or tests.
 
-## 6. Treat effects as a security contract
+## 5. Treat effects as a security contract
 
 Every tool declares one effect:
 
@@ -202,7 +213,7 @@ failed check that also writes remains a failed check with a separate effect
 mismatch. These controls do not replace container or microVM isolation when the
 command executes untrusted repository code.
 
-## 7. Put state in the right place
+## 6. Put state in the right place
 
 - Transcript/session state belongs in a `SessionStore`.
 - Durable work ownership and results belong in a `TaskStore`.
@@ -224,7 +235,7 @@ unnamed `RunRequest`s should use that environment. Otherwise leave it
 non-default and set `RunRequest.environment_name` explicitly. Registering the
 first environment never makes it the default implicitly.
 
-## 8. Prove behavior through public seams
+## 7. Prove behavior through public seams
 
 The default credential-free proof is:
 
@@ -272,7 +283,7 @@ an unchanged workspace as scoped evidence only, and use domain-specific tests
 for databases, external services, idempotency, and effects outside that first
 supported observer.
 
-## 9. Shape-specific reminders
+## 8. Shape-specific reminders
 
 - **Conversation:** preserve transcript/recovery semantics; omit tasks and
   environments unless behavior needs them.

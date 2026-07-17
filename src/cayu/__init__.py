@@ -68,6 +68,7 @@ from cayu.embeddings import (
     TextEmbeddingResult,
     TextEmbeddingUsage,
 )
+from cayu.entrypoint import run_project_entrypoint
 from cayu.environments import (
     DEFAULT_ENVIRONMENT_FACTORY_RELEASE_TIMEOUT_SECONDS,
     DEFAULT_WORKSPACE_INSTRUCTION_PATHS,
@@ -1225,6 +1226,7 @@ __all__ = [
     "run_eval_case",
     "run_eval_plan",
     "run_eval_suite",
+    "run_project_entrypoint",
     "run_task_worker",
     "run_to_completion",
     "secret_env_refs",

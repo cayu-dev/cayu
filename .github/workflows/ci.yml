@@ -128,23 +128,52 @@ jobs:
       - name: Check built-wheel authoring contract
         run: |
           uv pip install --python .release-venv/bin/python pytest
+          .release-venv/bin/python -m cayu version
           project_root="$(mktemp -d)"
           .release-venv/bin/cayu new proof --dir "$project_root"
           cd "$project_root/proof"
+          "$GITHUB_WORKSPACE/.release-venv/bin/python" run.py --help >/dev/null
           "$GITHUB_WORKSPACE/.release-venv/bin/cayu" guide anatomy >/dev/null
           "$GITHUB_WORKSPACE/.release-venv/bin/cayu" guide authoring >/dev/null
           "$GITHUB_WORKSPACE/.release-venv/bin/cayu" guide tool-effects >/dev/null
           "$GITHUB_WORKSPACE/.release-venv/bin/python" -c 'from cayu.testing import verify_tool_effect'
           "$GITHUB_WORKSPACE/.release-venv/bin/cayu" inspect --json >/dev/null
           "$GITHUB_WORKSPACE/.release-venv/bin/cayu" check --json >/dev/null
+          "$GITHUB_WORKSPACE/.release-venv/bin/python" - <<'PY'
+          import run
+          from app import build_app
+          from cayu import ModelStreamEvent, ScriptedModelProvider
+
+          provider = ScriptedModelProvider([
+              ModelStreamEvent.text_delta("ready"),
+              ModelStreamEvent.completed({"finish_reason": "stop"}),
+          ])
+          run.build_app = lambda **_kwargs: build_app(provider=provider)
+          assert run.main(["--message", "Run the agent."]) == 0
+          PY
           "$GITHUB_WORKSPACE/.release-venv/bin/cayu" generate slice reviewer --tool assess_submission --effect none
+          "$GITHUB_WORKSPACE/.release-venv/bin/python" - <<'PY'
+          import run
+          from app import build_app
+          from cayu import ModelStreamEvent, ScriptedModelProvider
+
+          provider = ScriptedModelProvider([
+              ModelStreamEvent.text_delta("reviewed"),
+              ModelStreamEvent.completed({"finish_reason": "stop"}),
+          ])
+          run.build_app = lambda **_kwargs: build_app(provider=provider)
+          assert run.main([
+              "--agent", "reviewer", "--message", "Review the change."
+          ]) == 0
+          assert len(provider.requests) == 1
+          PY
           "$GITHUB_WORKSPACE/.release-venv/bin/cayu" generate slice reviewer --tool assess_submission --effect none --json > repeated-plan.json
           "$GITHUB_WORKSPACE/.release-venv/bin/python" - <<'PY'
           import json
           from pathlib import Path
 
           repeated = json.loads(Path("repeated-plan.json").read_text())
-          assert repeated["schema_version"] == "2"
+          assert repeated["schema_version"] == "3"
           assert repeated["status"] == "already_present"
           assert repeated["edits"] == []
 

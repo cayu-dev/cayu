@@ -53,6 +53,9 @@ deployments.
 The generated project is the recommended path for both humans and coding
 agents. Cayu requires Python 3.11 or newer.
 
+You can give a coding agent one request: “Run `pip install cayu` and create a
+code review agent.”
+
 ```bash
 pip install cayu pytest
 cayu new myagent
@@ -62,17 +65,20 @@ cayu inspect --json
 cayu check --json
 pytest
 cayu eval run
+
+# After configuring the provider in app.py:
+python run.py --message "Review this change."
 ```
 
 The scaffold is credential-free and includes:
 
 - a process-scoped `build_app()` factory with bounded local-store initialization;
-- one safe example tool;
-- a hermetic runtime test and trajectory eval; and
+- one model-only agent with no required tools;
+- a hermetic runtime test and output eval; and
 - a project-local `AGENTS.md` with the exact build and verification contract.
 
-Open the generated project, replace the tracer-bullet behavior with your domain
-behavior, and keep the public test/eval seam intact.
+Open the generated project, describe the requested job in the existing agent,
+and keep its public test/eval seam intact.
 
 ### Run an agent
 
@@ -145,16 +151,21 @@ cayu inspect --json
 cayu check --fail-on warning --json
 ```
 
+The [authoring guide and Cayu Map](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/authoring.md#cayu-map)
+route each optional capability to the smallest relevant guide. The
+[examples index](https://github.com/cayu-dev/cayu/blob/main/examples/README.md)
+provides runnable references without making them required project structure.
+
 The supported authoring loop is:
 
 ```text
 understand -> inspect -> plan -> change -> test -> eval -> exercise -> report evidence
 ```
 
-Use `cayu generate slice ... --dry-run --json` to plan a small vertical slice.
-Generated slices are intentionally unfinished tracer bullets; replace their
-placeholder prompt, tool behavior, runtime test, and eval before treating them
-as application functionality.
+Start by editing the existing model-only agent, test, and eval. Add a generated
+tool-backed slice only when the requested job needs a capability outside the
+model; generated slices remain unfinished until their placeholder behavior,
+test, and eval have been replaced.
 
 ## Mental model
 
@@ -299,7 +310,7 @@ Start with the document that matches the job:
 
 | Goal | Guide |
 | --- | --- |
-| Build an application, by hand or with an AI coding agent | [Authoring guide](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/authoring.md) |
+| Choose Cayu concepts and build an application, by hand or with an AI coding agent | [Authoring guide and Cayu Map](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/authoring.md#cayu-map) |
 | Classify and verify tool mutation and replay behavior | [Tool effects](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/tool-effects.md) |
 | Understand factories, process roles, and lifecycle | [Application anatomy](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/application-anatomy.md) |
 | Choose how work starts | [Triggering runs](https://github.com/cayu-dev/cayu/blob/main/docs/triggering-runs.md) |
@@ -321,6 +332,7 @@ and the [Glossary](https://github.com/cayu-dev/cayu/blob/main/docs/glossary.md).
 
 ## Examples
 
+- [Examples index](https://github.com/cayu-dev/cayu/blob/main/examples/README.md) — find the smallest reference for a capability.
 - [Echo tool runtime](https://github.com/cayu-dev/cayu/blob/main/examples/echo_tool_runtime.py) — credential-free model/tool loop.
 - [Local environment runtime](https://github.com/cayu-dev/cayu/blob/main/examples/local_environment_runtime.py) — files and commands.
 - [Server example](https://github.com/cayu-dev/cayu/blob/main/examples/server_example.py) — protected API and control plane.

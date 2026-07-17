@@ -7,7 +7,10 @@ def test_package_shipped_authoring_and_diagnostic_guides_are_discoverable(capsys
     assert main(["guide", "authoring"]) == 0
     authoring = capsys.readouterr().out
     assert "# Building applications with Cayu" in authoring
-    assert "understand -> clarify -> inspect -> check" in authoring
+    assert "Start with one model-only agent" in authoring
+    assert "## Cayu Map" in authoring
+    assert "A tool-backed slice is optional" in authoring
+    assert "Clarify users, jobs, triggers" not in authoring
     assert "Model-controlled command selectors are untrusted argv input" in authoring
     assert "An executable allowlist does not authorize its argument protocol" in authoring
     assert "do not replace container or microVM isolation" in authoring

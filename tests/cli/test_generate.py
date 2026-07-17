@@ -20,6 +20,17 @@ def _files(root: Path) -> dict[str, bytes]:
     }
 
 
+def _stable_files(root: Path) -> dict[str, bytes]:
+    """Snapshot project files whose bytes are not mutable runtime state."""
+
+    cache_parts = {"__pycache__", ".pytest_cache", ".ruff_cache"}
+    return {
+        relative: content
+        for relative, content in _files(root).items()
+        if Path(relative).parts[0] != "data" and cache_parts.isdisjoint(Path(relative).parts)
+    }
+
+
 def test_generate_slice_effect_help_routes_to_canonical_guide(capsys) -> None:
     with pytest.raises(SystemExit) as excinfo:
         main(["generate", "slice", "--help"])
@@ -58,14 +69,16 @@ def test_generate_slice_dry_run_is_deterministic_and_write_free(
     second = json.loads(capsys.readouterr().out)
 
     assert first == second
-    assert first["schema_version"] == "2"
+    assert first["schema_version"] == "3"
     assert first["status"] == "ready"
     assert first["authoring_state"] == "unfinished_generated_tracer_bullet"
+    assert [item["path"] for item in first["preconditions"]] == ["agents/agent.py"]
     assert [edit["path"] for edit in first["edits"]] == [
         "agents/analyst.py",
         "app.py",
         "evals/analyst.py",
         "tests/test_analyst.py",
+        "tools/__init__.py",
         "tools/analyze_document.py",
     ]
     assert first["verification_commands"] == [
@@ -138,6 +151,15 @@ def test_generate_slice_applies_once_and_passes_public_verification(
     )
     assert "tools=[ANALYZE_DOCUMENT_TOOL_NAME]" in app_source
     assert 'tools=["analyze_document"]' not in app_source
+    assert after_apply["tools/__init__.py"] == b""
+    formatted = subprocess.run(
+        [sys.executable, "-m", "ruff", "format", "--check", "--no-cache", "."],
+        cwd=project,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert formatted.returncode == 0, formatted.stdout + formatted.stderr
 
     assert main([*command, "--json"]) == 0
     repeated = json.loads(capsys.readouterr().out)
@@ -155,7 +177,7 @@ def test_generate_slice_applies_once_and_passes_public_verification(
         sys.modules.pop(module_name, None)
     assert main(["inspect", "--json"]) == 0
     manifest = json.loads(capsys.readouterr().out)
-    assert [agent["name"] for agent in manifest["agents"]] == ["analyst", "assistant"]
+    assert [agent["name"] for agent in manifest["agents"]] == ["analyst", "project"]
     analyst = next(agent for agent in manifest["agents"] if agent["name"] == "analyst")
     assert analyst["workflow_tool_names"] == ["analyze_document"]
     assert analyst["authoring_state"] == "unfinished_generated_tracer_bullet"
@@ -200,6 +222,430 @@ def test_generate_slice_applies_once_and_passes_public_verification(
         check=False,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_generate_slice_rejects_an_existing_logical_agent_without_writes(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    assert main(["new", "reviewer", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "reviewer"
+    before = _files(project)
+    monkeypatch.chdir(project)
+
+    plan = plan_slice(name="reviewer", tool_name="assess_submission", effect="none")
+
+    assert plan.status == "conflict"
+    assert plan.conflicts == (
+        {
+            "path": "app.py",
+            "operation": "update_region",
+            "reason": (
+                "agent name 'reviewer' is already registered by agents.agent.AGENT; "
+                "choose a different slice name or extend the existing agent explicitly"
+            ),
+        },
+    )
+    assert (
+        main(
+            [
+                "generate",
+                "slice",
+                "reviewer",
+                "--tool",
+                "assess_submission",
+                "--effect",
+                "none",
+            ]
+        )
+        == 1
+    )
+    assert "agent name 'reviewer' is already registered" in capsys.readouterr().out
+    assert _files(project) == before
+    assert main(["inspect", "--json"]) == 0
+    assert [agent["name"] for agent in json.loads(capsys.readouterr().out)["agents"]] == [
+        "reviewer"
+    ]
+
+
+def test_generate_slice_detects_keyword_registration_and_constant_agent_name(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    assert main(["new", "reviewer", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "reviewer"
+    agent_path = project / "agents" / "agent.py"
+    agent_source = agent_path.read_text(encoding="utf-8")
+    agent_source = agent_source.replace(
+        'AGENT = AgentSpec(\n    name="reviewer",',
+        'AGENT_NAME = "reviewer"\n\n\nAGENT = AgentSpec(\n    name=AGENT_NAME,',
+    )
+    agent_path.write_text(agent_source, encoding="utf-8")
+    app_path = project / "app.py"
+    app_path.write_text(
+        app_path.read_text(encoding="utf-8").replace(
+            "app.register_agent(AGENT)",
+            "app.register_agent(spec=AGENT)",
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(project)
+
+    plan = plan_slice(name="reviewer", tool_name="assess_submission", effect="none")
+
+    assert plan.status == "conflict"
+    assert "agent name 'reviewer' is already registered" in plan.conflicts[0]["reason"]
+
+
+def test_generate_slice_fails_closed_for_a_reassigned_agent_symbol(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    assert main(["new", "reviewer", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "reviewer"
+    agent_path = project / "agents" / "agent.py"
+    agent_path.write_text(
+        agent_path.read_text(encoding="utf-8").replace(
+            "AGENT = AgentSpec(\n",
+            ('AGENT = AgentSpec(name="other", model="gpt-5.6-luna")\n\n\nAGENT = AgentSpec(\n'),
+        ),
+        encoding="utf-8",
+    )
+    before = _files(project)
+    monkeypatch.chdir(project)
+
+    plan = plan_slice(name="reviewer", tool_name="assess_submission", effect="none")
+
+    assert plan.status == "manual_action_required"
+    assert "cannot determine the registered agent name" in plan.conflicts[0]["reason"]
+    assert _files(project) == before
+
+
+def test_generate_slice_does_not_exempt_a_customized_same_symbol_registration(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    monkeypatch.chdir(project)
+    command = [
+        "generate",
+        "slice",
+        "analyst",
+        "--tool",
+        "analyze_document",
+        "--effect",
+        "none",
+    ]
+    assert main(command) == 0
+    capsys.readouterr()
+    app_path = project / "app.py"
+    app_path.write_text(
+        app_path.read_text(encoding="utf-8").replace(
+            "app.register_agent(ANALYST_AGENT, tools=[AnalyzeDocumentTool()])",
+            "app.register_agent(ANALYST_AGENT)",
+        ),
+        encoding="utf-8",
+    )
+    before = _files(project)
+
+    plan = plan_slice(name="analyst", tool_name="analyze_document", effect="none")
+
+    assert plan.status == "conflict"
+    assert "agent name 'analyst' is already registered" in plan.conflicts[0]["reason"]
+    assert main(command) == 1
+    assert "extend the existing agent explicitly" in capsys.readouterr().out
+    assert _files(project) == before
+
+
+def test_generate_slice_detects_a_bound_registration_alias_without_writes(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    assert main(["new", "reviewer", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "reviewer"
+    app_path = project / "app.py"
+    app_path.write_text(
+        app_path.read_text(encoding="utf-8").replace(
+            "    app.register_agent(AGENT)\n",
+            "    register_agent = app.register_agent\n    register_agent(AGENT)\n",
+        ),
+        encoding="utf-8",
+    )
+    assert "    register_agent(AGENT)\n" in app_path.read_text(encoding="utf-8")
+    before = _files(project)
+    monkeypatch.chdir(project)
+
+    plan = plan_slice(name="reviewer", tool_name="assess_submission", effect="none")
+
+    assert plan.status == "conflict"
+    assert "agent name 'reviewer' is already registered" in plan.conflicts[0]["reason"]
+    assert _files(project) == before
+
+
+def test_generate_slice_fails_closed_for_a_function_local_agent_shadow(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    assert main(["new", "reviewer", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "reviewer"
+    agent_path = project / "agents" / "agent.py"
+    agent_path.write_text(
+        agent_path.read_text(encoding="utf-8").replace(
+            'name="reviewer"',
+            'name="other"',
+        ),
+        encoding="utf-8",
+    )
+    app_path = project / "app.py"
+    app_source = app_path.read_text(encoding="utf-8")
+    app_source = app_source.replace(
+        "from cayu import (\n",
+        "from cayu import (\n    AgentSpec,\n",
+    )
+    app_path.write_text(
+        app_source.replace(
+            "    app.register_agent(AGENT)\n",
+            (
+                '    AGENT = AgentSpec(name="reviewer", model="gpt-5.6-luna")\n'
+                "    app.register_agent(AGENT)\n"
+            ),
+        ),
+        encoding="utf-8",
+    )
+    before = _files(project)
+    monkeypatch.chdir(project)
+
+    plan = plan_slice(name="reviewer", tool_name="assess_submission", effect="none")
+
+    assert plan.status == "manual_action_required"
+    assert "cannot determine the registered agent name" in plan.conflicts[0]["reason"]
+    assert _files(project) == before
+
+
+def test_generate_slice_fails_closed_for_a_pattern_bound_agent_shadow(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    assert main(["new", "reviewer", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "reviewer"
+    agent_path = project / "agents" / "agent.py"
+    agent_path.write_text(
+        agent_path.read_text(encoding="utf-8").replace(
+            'name="reviewer"',
+            'name="other"',
+        ),
+        encoding="utf-8",
+    )
+    app_path = project / "app.py"
+    app_source = app_path.read_text(encoding="utf-8").replace(
+        "    CayuApp,\n",
+        "    AgentSpec,\n    CayuApp,\n",
+    )
+    app_path.write_text(
+        app_source.replace(
+            "    app.register_agent(AGENT)\n",
+            (
+                '    match AgentSpec(name="reviewer", model="gpt-5.6-luna"):\n'
+                "        case AGENT:\n"
+                "            app.register_agent(AGENT)\n"
+            ),
+        ),
+        encoding="utf-8",
+    )
+    before = _files(project)
+    monkeypatch.chdir(project)
+
+    plan = plan_slice(name="reviewer", tool_name="assess_submission", effect="none")
+
+    assert plan.status == "manual_action_required"
+    assert "cannot determine the registered agent name" in plan.conflicts[0]["reason"]
+    assert (
+        main(
+            [
+                "generate",
+                "slice",
+                "reviewer",
+                "--tool",
+                "assess_submission",
+                "--effect",
+                "none",
+            ]
+        )
+        == 1
+    )
+    assert "Planned reviewer: manual_action_required" in capsys.readouterr().out
+    assert _files(project) == before
+    assert main(["inspect", "--json"]) == 0
+    assert [agent["name"] for agent in json.loads(capsys.readouterr().out)["agents"]] == [
+        "reviewer"
+    ]
+
+
+def test_generate_slice_preserves_formatted_multiline_registrations(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    monkeypatch.chdir(project)
+    analyst_command = [
+        "generate",
+        "slice",
+        "analyst",
+        "--tool",
+        "analyze_document",
+        "--effect",
+        "external",
+    ]
+    assert main(analyst_command) == 0
+    capsys.readouterr()
+    app_path = project / "app.py"
+    assert "    app.register_agent(\n        ANALYST_AGENT," in app_path.read_text(encoding="utf-8")
+    formatted = app_path.read_bytes()
+
+    repeated = plan_slice(name="analyst", tool_name="analyze_document", effect="external")
+
+    assert repeated.status == "already_present"
+    assert repeated.edits == ()
+    assert app_path.read_bytes() == formatted
+    assert (
+        main(
+            [
+                "generate",
+                "slice",
+                "writer",
+                "--tool",
+                "write_report",
+                "--effect",
+                "none",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert main(["inspect", "--json"]) == 0
+    assert [agent["name"] for agent in json.loads(capsys.readouterr().out)["agents"]] == [
+        "analyst",
+        "project",
+        "writer",
+    ]
+    linted = subprocess.run(
+        [sys.executable, "-m", "ruff", "check", "--no-cache", "."],
+        cwd=project,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert linted.returncode == 0, linted.stdout + linted.stderr
+
+
+def test_generate_slice_fails_closed_for_a_dynamic_registered_agent_name(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    agent_path = project / "agents" / "agent.py"
+    agent_source = agent_path.read_text(encoding="utf-8")
+    agent_source = agent_source.replace(
+        'AGENT = AgentSpec(\n    name="project",',
+        (
+            'def agent_name() -> str:\n    return "analyst"\n\n\n'
+            "AGENT = AgentSpec(\n    name=agent_name(),"
+        ),
+    )
+    agent_path.write_text(agent_source, encoding="utf-8")
+    before = _files(project)
+    monkeypatch.chdir(project)
+
+    plan = plan_slice(name="analyst", tool_name="analyze_document", effect="none")
+
+    assert plan.status == "manual_action_required"
+    assert "cannot determine the registered agent name" in plan.conflicts[0]["reason"]
+    assert (
+        main(
+            [
+                "generate",
+                "slice",
+                "analyst",
+                "--tool",
+                "analyze_document",
+                "--effect",
+                "none",
+            ]
+        )
+        == 1
+    )
+    assert "without executing project code" in capsys.readouterr().out
+    assert _files(project) == before
+
+
+def test_generated_tool_package_wins_over_an_unrelated_installed_tools_package(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    monkeypatch.chdir(project)
+    assert (
+        main(
+            [
+                "generate",
+                "slice",
+                "analyst",
+                "--tool",
+                "analyze_document",
+                "--effect",
+                "none",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    unrelated = tmp_path / "unrelated"
+    unrelated_tools = unrelated / "tools"
+    unrelated_tools.mkdir(parents=True)
+    (unrelated_tools / "__init__.py").write_text("SOURCE = 'unrelated'\n", encoding="utf-8")
+    framework_source = Path(__file__).parents[2] / "src"
+    completed = subprocess.run(
+        [sys.executable, "-m", "cayu", "inspect", "--json"],
+        cwd=project,
+        env={
+            **os.environ,
+            "PYTHONPATH": os.pathsep.join((str(framework_source), str(unrelated))),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert [agent["name"] for agent in json.loads(completed.stdout)["agents"]] == [
+        "analyst",
+        "project",
+    ]
 
 
 def test_generate_slice_completion_is_explicit_and_preserves_customized_files(
@@ -305,12 +751,12 @@ def test_generate_slice_completion_is_explicit_and_preserves_customized_files(
     )
     assert json.loads(eval_output.read_text(encoding="utf-8"))["status"] == "passed"
 
-    completed_files = _files(project)
+    completed_files = _stable_files(project)
     assert main([*command, "--json"]) == 1
     repeated = json.loads(capsys.readouterr().out)
     assert repeated["status"] == "conflict"
     assert repeated["authoring_state"] == "unfinished_generated_tracer_bullet"
-    assert _files(project) == completed_files
+    assert _stable_files(project) == completed_files
 
 
 def test_generate_slice_missing_registration_seam_requires_manual_action_without_writes(
@@ -486,6 +932,91 @@ def test_apply_slice_plan_rejects_stale_preimages_without_writes(
     before = _files(project)
 
     with pytest.raises(GeneratorApplyError, match="changed after the plan was created"):
+        apply_slice_plan(plan)
+
+    assert _files(project) == before
+
+
+def test_apply_slice_plan_rejects_a_stale_registered_agent_source(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    monkeypatch.chdir(project)
+    plan = plan_slice(name="analyst", tool_name="analyze_document", effect="none")
+    agent_path = project / "agents" / "agent.py"
+    agent_path.write_text(
+        agent_path.read_text(encoding="utf-8").replace(
+            'name="project"',
+            'name="analyst"',
+        ),
+        encoding="utf-8",
+    )
+    before = _files(project)
+
+    with pytest.raises(GeneratorApplyError, match="agents/agent.py changed"):
+        apply_slice_plan(plan)
+
+    assert _files(project) == before
+
+
+def test_apply_slice_plan_rejects_a_removed_tools_package_initializer(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    tools = project / "tools"
+    tools.mkdir()
+    init_path = tools / "__init__.py"
+    init_path.write_text("# user package\n", encoding="utf-8")
+    monkeypatch.chdir(project)
+    plan = plan_slice(name="analyst", tool_name="analyze_document", effect="none")
+    init_path.unlink()
+    before = _files(project)
+
+    with pytest.raises(GeneratorApplyError, match="tools/__init__.py changed"):
+        apply_slice_plan(plan)
+
+    assert _files(project) == before
+
+
+def test_apply_slice_plan_rejects_a_stale_preserved_slice_file(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    monkeypatch.chdir(project)
+    command = [
+        "generate",
+        "slice",
+        "analyst",
+        "--tool",
+        "analyze_document",
+        "--effect",
+        "none",
+    ]
+    assert main(command) == 0
+    capsys.readouterr()
+    (project / "evals" / "analyst.py").unlink()
+    plan = plan_slice(name="analyst", tool_name="analyze_document", effect="none")
+    assert plan.status == "ready"
+    tool_path = project / "tools" / "analyze_document.py"
+    tool_path.write_text(
+        tool_path.read_text(encoding="utf-8") + "\n# concurrent edit\n",
+        encoding="utf-8",
+    )
+    before = _files(project)
+
+    with pytest.raises(GeneratorApplyError, match="tools/analyze_document.py changed"):
         apply_slice_plan(plan)
 
     assert _files(project) == before

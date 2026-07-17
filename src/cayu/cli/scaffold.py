@@ -33,13 +33,13 @@ from cayu import (
     TaskStore,
 )
 
-from agents.assistant import ASSISTANT_AGENT
-from tools.greet import GreetTool
+from agents.agent import AGENT
 
-# Generated external-effect slices import AlwaysRequireApprovalToolPolicy and
-# register an enforcing policy. The safe starter tool below has no side effect.
+# Generated tool-backed slices add their imports and registrations here.
 # <cayu:generated-imports>
 # </cayu:generated-imports>
+
+_UNCONFIGURED_PROVIDER_NAME = "openai-unconfigured"
 
 
 def configured_provider() -> ModelProvider:
@@ -53,7 +53,24 @@ def configured_provider() -> ModelProvider:
     api_key = os.environ.get("OPENAI_API_KEY")
     if api_key:
         return OpenAIProvider(api_key=api_key)
-    return ScriptedModelProvider([], name="openai-unconfigured")
+    return ScriptedModelProvider([], name=_UNCONFIGURED_PROVIDER_NAME)
+
+
+def validate_run_configuration(app: CayuApp, agent_name: str) -> None:
+    """Require live-provider setup after the command has selected an agent."""
+
+    manifest_agent = next(
+        agent for agent in app.describe().agents if agent.name == agent_name
+    )
+    if manifest_agent.resolved_provider is None:
+        raise RuntimeError(
+            f"agent {agent_name!r} does not resolve to exactly one model provider"
+        )
+    provider = app.get_provider(manifest_agent.resolved_provider)
+    if provider.name == _UNCONFIGURED_PROVIDER_NAME:
+        raise RuntimeError(
+            "OPENAI_API_KEY is not set; set it or update app.configured_provider()."
+        )
 
 
 def build_app(
@@ -64,16 +81,19 @@ def build_app(
 ) -> CayuApp:
     """Construct a fresh process-scoped application graph.
 
-    Optional arguments are public test seams. Normal processes call build_app()
-    with no arguments and receive the configured durable local stores.
+    Injected stores and providers are public test seams. Inspection can call
+    ``build_app()`` without live-provider credentials.
     """
 
     app = CayuApp(
         session_store=session_store or SQLiteSessionStore("data/sessions.sqlite"),
         task_store=task_store or SQLiteTaskStore("data/tasks.sqlite"),
     )
-    app.register_provider(provider or configured_provider(), default=True)
-    app.register_agent(ASSISTANT_AGENT, tools=[GreetTool()])
+    selected_provider = provider
+    if selected_provider is None:
+        selected_provider = configured_provider()
+    app.register_provider(selected_provider, default=True)
+    app.register_agent(AGENT)
     # <cayu:generated-registrations>
     # </cayu:generated-registrations>
     return app
@@ -81,41 +101,12 @@ def build_app(
 
 _AGENT_PY = """from cayu import AgentSpec
 
-from tools.greet import GREET_TOOL_NAME
 
-
-ASSISTANT_AGENT = AgentSpec(
-    name="assistant",
+AGENT = AgentSpec(
+    name="__PROJECT_NAME__",
     model="gpt-5.6-luna",
-    system_prompt=f"Use {GREET_TOOL_NAME} when it directly helps the user.",
-    workflow_tool_names=(GREET_TOOL_NAME,),
 )
 """
-
-_TOOL_PY = '''from cayu import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
-
-
-GREET_TOOL_NAME = "greet"
-
-
-class GreetTool(Tool):
-    """Return a greeting without changing external state."""
-
-    spec = ToolSpec(
-        name=GREET_TOOL_NAME,
-        effect=ToolEffect.NONE,
-        description="Return a friendly greeting for a name.",
-        input_schema={
-            "type": "object",
-            "properties": {"name": {"type": "string"}},
-            "required": ["name"],
-            "additionalProperties": False,
-        },
-    )
-
-    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
-        return ToolResult(content=f"Hello, {args['name']}!")
-'''
 
 _TEST_PY = """from __future__ import annotations
 
@@ -132,20 +123,13 @@ from cayu import (
 )
 
 from app import build_app
-from tools.greet import GREET_TOOL_NAME
 
 
-def test_assistant_uses_greet_tool_through_the_runtime() -> None:
+def test_agent_runs_through_the_runtime() -> None:
     provider = ScriptedModelProvider(
         [
-            [
-                ModelStreamEvent.tool_call(name=GREET_TOOL_NAME, arguments={"name": "Ada"}),
-                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
-            ],
-            [
-                ModelStreamEvent.text_delta("Greeted Ada."),
-                ModelStreamEvent.completed({"finish_reason": "stop"}),
-            ],
+            ModelStreamEvent.text_delta("Agent result."),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
         ]
     )
     app = build_app(
@@ -158,16 +142,15 @@ def test_assistant_uses_greet_tool_through_the_runtime() -> None:
         run_to_completion(
             app,
             RunRequest(
-                agent_name="assistant",
-                messages=[Message.text("user", "Greet Ada")],
-                max_steps=2,
+                agent_name="__PROJECT_NAME__",
+                messages=[Message.text("user", "Handle this request")],
             ),
         )
     )
 
     assert outcome.ok
-    assert outcome.final_text == "Greeted Ada."
-    assert len(provider.requests) == 2
+    assert outcome.final_text == "Agent result."
+    assert len(provider.requests) == 1
 """
 
 _EVAL_PY = """from cayu import (
@@ -182,24 +165,16 @@ _EVAL_PY = """from cayu import (
     RunRequest,
     ScriptedModelProvider,
     SessionCompleted,
-    ToolCalled,
 )
 
 from app import build_app
-from tools.greet import GREET_TOOL_NAME
 
 
 def build_eval() -> EvalPlan:
     provider = ScriptedModelProvider(
         [
-            [
-                ModelStreamEvent.tool_call(name=GREET_TOOL_NAME, arguments={"name": "Ada"}),
-                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
-            ],
-            [
-                ModelStreamEvent.text_delta("Greeted Ada."),
-                ModelStreamEvent.completed({"finish_reason": "stop"}),
-            ],
+            ModelStreamEvent.text_delta("Agent result."),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
         ]
     )
     app = build_app(
@@ -208,19 +183,17 @@ def build_eval() -> EvalPlan:
         task_store=InMemoryTaskStore(),
     )
     suite = EvalSuite(
-        id="assistant-trajectory",
+        id="agent-output",
         cases=[
             EvalCase(
-                id="greets-by-name",
+                id="returns-output",
                 request=RunRequest(
-                    agent_name="assistant",
-                    messages=[Message.text("user", "Greet Ada")],
-                    max_steps=2,
+                    agent_name="__PROJECT_NAME__",
+                    messages=[Message.text("user", "Handle this request")],
                 ),
                 assertions=[
                     SessionCompleted(),
-                    ToolCalled(GREET_TOOL_NAME),
-                    FinalOutputContains("Ada"),
+                    FinalOutputContains("Agent result"),
                 ],
             )
         ],
@@ -240,7 +213,7 @@ dev = ["pytest"]
 
 [tool.cayu]
 factory = "app:build_app"
-eval_target = "evals.assistant:build_eval"
+eval_target = "evals.agent:build_eval"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -248,18 +221,19 @@ pythonpath = ["."]
 
 _README = """# __PROJECT_NAME__
 
-A safe, inspectable Cayu agent scaffold.
+A model-only Cayu agent scaffold. It starts with one agent, one deterministic
+runtime test, and one output eval. Add capabilities only when the job needs them.
 
 ## Application structure
 
-`build_app()` returns a fresh process-scoped `CayuApp`. Each script, console,
-server, worker, or test calls the factory for itself. Configured durable stores
-coordinate cross-process state; the Python application object is not a global
-registry or singleton. Importing the project does not construct the app or
-start workers, recovery, schedulers, sessions, models, or tools.
+Describe the requested job in `agents/agent.py`; update `tests/test_agent.py`
+and `evals/agent.py` to prove that behavior. The project factory is `build_app()`
+in `app.py`. Run `cayu guide anatomy` for its lifecycle contract.
 
-Run `cayu guide anatomy` for the canonical factory, process-role, durable-state,
-and lifecycle contract.
+Use the [Cayu Map](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/authoring.md#cayu-map)
+to select another concept only when the requested behavior requires it. The
+[examples index](https://github.com/cayu-dev/cayu/blob/main/examples/README.md)
+links the smallest runnable references.
 
 ## Setup and prove the project
 
@@ -273,104 +247,71 @@ cayu eval run
 ```
 
 These commands require no model API key. They prove project construction,
-static wiring, a deterministic runtime tool trajectory, and its eval. They do
-not claim that a live provider or execution environment was verified.
+static wiring, a deterministic model response, and its eval.
 
 ## Run with a live provider
 
 ```bash
 export OPENAI_API_KEY=sk-...
-python run.py
+python run.py --message "YOUR REQUEST"
 ```
 
-The checked-in `AGENTS.md` is the canonical workflow for coding agents. Add a
-reviewable agent/tool/test/eval slice with
-`cayu generate slice NAME --tool TOOL --effect EFFECT`.
+`--agent` is optional while this is the only registered agent. The checked-in
+`AGENTS.md` is the local instruction surface for coding agents.
 """
 
-_RUN_PY = """import asyncio
-import os
+_RUN_PY = """from __future__ import annotations
 
-from cayu import Message, RunRequest, run_to_completion
+from cayu import run_project_entrypoint
 
-from app import build_app
+from app import build_app, validate_run_configuration
 
 
-async def main() -> None:
-    if not os.environ.get("OPENAI_API_KEY"):
-        raise SystemExit("Set OPENAI_API_KEY before live execution.")
-    outcome = await run_to_completion(
-        build_app(),
-        RunRequest(
-            agent_name="assistant",
-            messages=[Message.text("user", "Greet Ada, then say what you did.")],
-        ),
+def main(argv: list[str] | None = None) -> int:
+    return run_project_entrypoint(
+        build_app,
+        argv,
+        validate_run=validate_run_configuration,
     )
-    print(outcome.final_text if outcome.ok else f"run failed: {outcome.error}")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(main())
 """
 
 _AGENTS_MD = """# Coding-agent instructions
 
-Build desired behavior first; introduce only the Cayu subsystems the product
-needs. `app.py` is the application factory and explicit registration surface.
+Edit the existing agent, test, and eval to implement the user's first requested
+job. Do not retain the starter and add a second agent. Tools are optional: add
+one only for a real capability outside the model, such as reading a repository
+or calling an API. Do not create echo, pass-through, or placeholder tools.
+
+Use the Cayu Map to choose only the concepts the job needs:
+https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/authoring.md#cayu-map
+
+If another capability is required, use the smallest matching reference from:
+https://github.com/cayu-dev/cayu/blob/main/examples/README.md
+
+This scaffold is for local development. Deployment is a separate task.
 
 ## Project commands
 
 - Setup: `pip install -e '.[console,dev]'` or
   `uv sync --extra console --extra dev`.
 - Application contract: `cayu guide anatomy`.
-- Authoring concepts: `cayu guide authoring`.
-- Tool replay classification: `cayu guide tool-effects`.
+- Authoring details: `cayu guide authoring`.
 - Inspect/check: `cayu inspect --json` and `cayu check --json`.
-- Safe generation: `cayu generate slice NAME --tool TOOL --effect EFFECT`.
 - Hermetic proof: `pytest` and `cayu eval run`.
-- Interactive inspection: `cayu console` (constructs the app; starts no services).
-- Live execution: `python run.py` only when `OPENAI_API_KEY` is explicitly available.
-
-## Supported loop
-
-1. Clarify users, jobs, triggers, inputs/outputs, autonomy, state, effects,
-   approval boundaries, recovery, environments, artifacts, and eval cases.
-   Use the package guides above for application structure, concept selection,
-   and tool replay classification.
-2. Run `cayu inspect --json` and `cayu check --json` before editing.
-3. Plan generated edits with
-   `cayu generate slice NAME --tool TOOL --effect EFFECT --dry-run --json`.
-4. Apply with `cayu generate slice NAME --tool TOOL --effect EFFECT`; review every changed file.
-5. Run `cayu check --json`, `pytest`, and the default `cayu eval run` target.
-   Use an explicit `cayu eval run MODULE:build_eval` target for additional
-   suites. Before submitting, clear
-   every generated slice's tracer-bullet marker only after replacing its domain
-   prompt, tool schema/body, runtime test, and trajectory eval, then require
-   `cayu check --fail-on warning --json` to pass.
-6. Exercise optional live boundaries only when credentials and infrastructure
-   are explicitly available, then report evidence by verification layer.
+- Live execution: `python run.py --message "USER REQUEST"` after configuring a
+  provider in `app.configured_provider()`.
 
 Use public `cayu` imports and public CLI JSON only. Do not depend on Cayu source,
-private symbols, import-time application construction, or arbitrary Python
-rewriting. Edit user-owned code normally; generated commands may update only
-their delimited registration regions and independent generated files.
+private symbols, or import-time application construction.
 
-Every tool must declare `ToolEffect`; classify durable mutation and replay
-behavior instead of inferring it from transport, price, or a name such as
-"read". Effect metadata does not authorize execution. External-effect tools
-require an enforcing policy such as `AlwaysRequireApprovalToolPolicy`; never
-treat a comment or UI confirmation as authorization. Prefer closed JSON schemas.
-
-Use one constant for each exact tool name across `ToolSpec`, generated workflow
-instructions, `AgentSpec.workflow_tool_names`, tests, and evals. `cayu check`
-compares the explicit workflow names with that agent's registered tool manifest;
-it never infers names from arbitrary prose.
-
-Report static inspection, hermetic runtime tests, process-boundary checks, and
-credential-gated live checks separately. Do not claim live verification from
-successful imports, construction, mocks, or scripted providers. A
+If the job truly needs a tool, read `cayu guide tool-effects`; every tool must
+declare `ToolEffect`, and effect metadata does not authorize execution. A
 `ScriptedModelProvider` proves handling of predetermined calls, not prompt
-comprehension or model tool choice.
+comprehension or live model behavior.
 """
 
 _GITIGNORE = "data/\n__pycache__/\n*.pyc\n.pytest_cache/\n.venv/\n"
@@ -395,12 +336,10 @@ def project_files(name: str) -> dict[str, str]:
         "app.py": render(_APP_PY),
         "run.py": _RUN_PY,
         "agents/__init__.py": "",
-        "agents/assistant.py": _AGENT_PY,
-        "tools/__init__.py": "",
-        "tools/greet.py": _TOOL_PY,
-        "tests/test_assistant.py": _TEST_PY,
+        "agents/agent.py": render(_AGENT_PY),
+        "tests/test_agent.py": render(_TEST_PY),
         "evals/__init__.py": "",
-        "evals/assistant.py": _EVAL_PY,
+        "evals/agent.py": render(_EVAL_PY),
         "pyproject.toml": render(_PYPROJECT),
         "README.md": render(_README),
         "AGENTS.md": _AGENTS_MD,
