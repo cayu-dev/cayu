@@ -7,6 +7,7 @@ from cayu.core.events import Event, EventType
 from cayu.runtime.budgets import BudgetStore
 from cayu.runtime.event_sinks import EventSink
 from cayu.runtime.sessions import (
+    EventQuery,
     PersistedEventSideEffectClaim,
     PersistedEventSideEffectClaimLost,
     PersistedEventSideEffectDelivery,
@@ -45,6 +46,26 @@ class RuntimeEventWriter:
             return event.model_copy(deep=True)
         delivered_event, _ = await self._deliver_persisted_side_effect_claim(claim)
         return delivered_event
+
+    async def persist(self, event: Event) -> Event:
+        """Commit an event to the durable side-effect handoff without delivering it.
+
+        This is reserved for failure evidence that must become durable before
+        caller cancellation is redelivered. The store atomically creates the
+        pending side-effect record, so normal recovery retains ownership of
+        budget and sink delivery.
+        """
+
+        await self._session_store.append_event(event.session_id, event)
+        return event.model_copy(deep=True)
+
+    async def is_persisted(self, event: Event) -> bool:
+        """Return whether this exact event reached the durable event handoff."""
+
+        records = await self._session_store.query_events(
+            EventQuery(session_id=event.session_id, event_id=event.id, limit=1)
+        )
+        return any(record.event.id == event.id for record in records)
 
     async def emit_many(self, session_id: str, events: list[Event]) -> list[Event]:
         """Persist and fan out a defensive copy of one event batch.

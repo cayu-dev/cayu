@@ -421,6 +421,84 @@ def test_prepare_fails_closed_when_docker_errors() -> None:
         asyncio.run(run())
 
 
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_docker_prepare_real_task_cancellation_is_not_duplicated(
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_fails: bool,
+) -> None:
+    prepare_started = asyncio.Event()
+    cleanup_error = RuntimeError("docker rollback failed")
+
+    class _FakeAuthority:
+        def ca_cert_pem(self) -> bytes:
+            return b"session-ca"
+
+    class _FakeProxyServer:
+        authority = _FakeAuthority()
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        async def start(self) -> int:
+            return 9123
+
+        async def close(self) -> None:
+            pass
+
+    class _CancelledPrepareDocker(_FakeDocker):
+        async def __call__(self, argv: Sequence[str]) -> tuple[int, str]:
+            self.calls.append(list(argv))
+            if argv[:2] == ["network", "create"]:
+                prepare_started.set()
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+            if cleanup_fails and argv[:2] == ["rm", "-f"]:
+                raise cleanup_error
+            return 0, ""
+
+    async def run() -> tuple[BaseException, bool, int]:
+        import cayu.egress.docker_adapter as docker_adapter_module
+
+        monkeypatch.setattr(
+            docker_adapter_module,
+            "TransparentEgressProxyServer",
+            _FakeProxyServer,
+        )
+        adapter = DockerEgressAdapter(
+            docker_exec=_CancelledPrepareDocker(),
+            proxy_host="127.0.0.1",
+        )
+        task = asyncio.create_task(
+            adapter.prepare(
+                session_id="sess_cancelled_docker_prepare",
+                grants=[],
+                broker=_credentialless_broker(),
+            )
+        )
+        await prepare_started.wait()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError as exc:
+            return exc, task.cancelled(), task.cancelling()
+        except BaseException as exc:
+            return exc, task.cancelled(), task.cancelling()
+        raise AssertionError("cancelled preparation unexpectedly succeeded")
+
+    failure, task_cancelled, pending_cancellations = asyncio.run(run())
+
+    assert pending_cancellations == 0
+    if cleanup_fails:
+        assert isinstance(failure, BaseExceptionGroup)
+        assert isinstance(failure.exceptions[1], RuntimeError)
+        assert "Docker egress teardown incomplete" in str(failure.exceptions[1])
+        assert sum(isinstance(exc, asyncio.CancelledError) for exc in failure.exceptions) == 1
+        assert task_cancelled is False
+    else:
+        assert isinstance(failure, asyncio.CancelledError)
+        assert task_cancelled is True
+
+
 def test_prepare_rolls_back_when_authenticated_sidecar_never_becomes_ready() -> None:
     class _UnreadyDocker(_FakeDocker):
         async def __call__(self, argv: Sequence[str]) -> tuple[int, str]:

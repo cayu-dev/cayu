@@ -409,6 +409,83 @@ def test_microsandbox_adapter_creates_only_a_proxy_reachable_runner(tmp_path: Pa
     assert _FakeProxyServer.instances[0].closed is True
 
 
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_microsandbox_runner_prepare_real_task_cancellation_is_not_duplicated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_fails: bool,
+) -> None:
+    prepare_started = asyncio.Event()
+    cleanup_error = RuntimeError("microsandbox rollback failed")
+
+    async def block_identity_load(_module: Any, _sandbox_name: str) -> float:
+        prepare_started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def run() -> tuple[BaseException, bool, int]:
+        _reset_fakes()
+        broker, grant = _broker_and_grant()
+        adapter = MicrosandboxEgressAdapter(
+            microsandbox_module=_FakeMicrosandboxModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=tmp_path / "cancelled-claims",
+        )
+        binding = await adapter.prepare(
+            session_id="session-1",
+            grants=[grant],
+            broker=broker,
+        )
+        monkeypatch.setattr(adapter, "_sandbox_created_at", block_identity_load)
+        task = asyncio.create_task(
+            adapter.create_runner(
+                _request(
+                    binding=binding,
+                    grant=grant,
+                    ca_path=tmp_path / "cancelled-ca.pem",
+                )
+            )
+        )
+        await prepare_started.wait()
+        sandbox = _FakeSandboxApi.sandbox
+        assert sandbox is not None
+        if cleanup_fails:
+
+            async def fail_stop() -> None:
+                raise cleanup_error
+
+            sandbox.stop_and_wait = fail_stop  # type: ignore[method-assign]
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError as exc:
+            await binding.close()
+            return exc, task.cancelled(), task.cancelling()
+        except BaseException as exc:
+            await binding.close()
+            return exc, task.cancelled(), task.cancelling()
+        raise AssertionError("cancelled preparation unexpectedly succeeded")
+
+    failure, task_cancelled, pending_cancellations = asyncio.run(run())
+
+    assert pending_cancellations == 0
+    if cleanup_fails:
+        assert isinstance(failure, BaseExceptionGroup)
+
+        def leaves(error: BaseException) -> list[BaseException]:
+            if isinstance(error, BaseExceptionGroup):
+                return [leaf for child in error.exceptions for leaf in leaves(child)]
+            return [error]
+
+        failure_leaves = leaves(failure)
+        assert cleanup_error in failure_leaves
+        assert sum(isinstance(exc, asyncio.CancelledError) for exc in failure_leaves) == 1
+        assert task_cancelled is False
+    else:
+        assert isinstance(failure, asyncio.CancelledError)
+        assert task_cancelled is True
+
+
 def test_microsandbox_process_restart_reuses_sandbox_with_fresh_enforcement(
     tmp_path: Path,
 ) -> None:
@@ -1248,6 +1325,56 @@ def test_microsandbox_partial_attestation_write_is_removed_after_runner_rollback
 
     assert _FakeSandboxApi.removed == ["sandbox-generated-name"]
     assert list((tmp_path / "claims").glob("*.json")) == []
+
+
+def test_microsandbox_releases_unbound_claim_before_rollback_aggregate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured_claim: Any = None
+
+    def cancel_write(claim: Any, identity: Any) -> None:
+        nonlocal captured_claim
+        del identity
+        captured_claim = claim
+        assert _FakeSandboxApi.sandbox is not None
+        _FakeSandboxApi.sandbox.fail_stop = True
+        raise asyncio.CancelledError("attestation write cancelled")
+
+    monkeypatch.setattr(adapter_module._ReconnectClaim, "write_identity", cancel_write)
+
+    async def run() -> BaseExceptionGroup:
+        _reset_fakes()
+        broker, grant = _broker_and_grant()
+        adapter = MicrosandboxEgressAdapter(
+            microsandbox_module=_FakeMicrosandboxModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=tmp_path / "claims",
+        )
+        binding = await adapter.prepare(
+            session_id="session-1",
+            grants=[grant],
+            broker=broker,
+        )
+        try:
+            with pytest.raises(BaseExceptionGroup) as exc_info:
+                await adapter.create_runner(
+                    _request(
+                        binding=binding,
+                        grant=grant,
+                        ca_path=tmp_path / "ca.pem",
+                    )
+                )
+            return exc_info.value
+        finally:
+            await binding.close()
+
+    failure = asyncio.run(run())
+
+    assert isinstance(failure.exceptions[0], asyncio.CancelledError)
+    assert isinstance(failure.exceptions[1], RuntimeError)
+    assert captured_claim is not None
+    assert captured_claim.closed is True
 
 
 def test_microsandbox_adapter_rejects_mismatched_runner_kind(tmp_path: Path) -> None:

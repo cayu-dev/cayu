@@ -82,6 +82,7 @@ from cayu.server.routes import (
     _add_usage_metrics,
     _detached_event_stream_response,
     _next_replay_poll_interval,
+    _start_detached_event_stream_response,
 )
 from cayu.server.sse import (
     SSE_ERROR_TEXT_MAX_BYTES,
@@ -6080,6 +6081,66 @@ def test_runtime_failure_survives_cancelled_stream_cleanup() -> None:
     error = json.loads(messages[-1]["data"])
     assert error["kind"] == "runtime"
     assert error["code"] == "runtime_failed"
+
+
+def test_runtime_cancellation_group_becomes_structured_stream_error() -> None:
+    async def grouped_failure_stream() -> AsyncIterator[Event]:
+        yield Event(
+            id="event_before_grouped_failure",
+            type="custom.before_grouped_failure",
+            session_id="session_grouped_stream_failure",
+        )
+        raise BaseExceptionGroup(
+            "runtime cleanup cancelled and failed",
+            [asyncio.CancelledError(), RuntimeError("cleanup failed")],
+        )
+
+    async def exercise() -> list[dict[str, str]]:
+        response = await _accepted_event_stream_response(
+            grouped_failure_stream(),
+            cayu_app=CayuApp(enable_logging=False),
+            session_id="session_grouped_stream_failure",
+        )
+        return [message async for message in response.body_iterator]
+
+    messages = asyncio.run(exercise())
+
+    assert messages[0]["id"] == "session_grouped_stream_failure:event_before_grouped_failure"
+    assert messages[-1]["event"] == "error"
+    error = json.loads(messages[-1]["data"])
+    assert error["kind"] == "runtime"
+    assert error["code"] == "runtime_failed"
+
+
+def test_runtime_cancellation_only_group_is_not_reported_as_runtime_failure() -> None:
+    cancellation_group = BaseExceptionGroup(
+        "runtime cleanup cancelled",
+        [asyncio.CancelledError()],
+    )
+
+    async def grouped_cancellation_stream() -> AsyncIterator[Event]:
+        yield Event(
+            id="event_before_grouped_cancellation",
+            type="custom.before_grouped_cancellation",
+            session_id="session_grouped_stream_cancellation",
+        )
+        raise cancellation_group
+
+    async def exercise() -> tuple[list[dict[str, str]], BaseExceptionGroup]:
+        response, pump_task, _ = _start_detached_event_stream_response(
+            grouped_cancellation_stream(),
+            cayu_app=CayuApp(enable_logging=False),
+            session_id="session_grouped_stream_cancellation",
+        )
+        messages = [message async for message in response.body_iterator]
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            await pump_task
+        return messages, exc_info.value
+
+    messages, failure = asyncio.run(exercise())
+
+    assert failure is cancellation_group
+    assert [message.get("event") for message in messages] == [None]
 
 
 def test_accepted_stream_driver_finishes_when_response_start_send_fails() -> None:

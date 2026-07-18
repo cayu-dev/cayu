@@ -31,6 +31,8 @@ from cayu.egress.adapter import (
     SandboxEgressAdapter,
     VirtualEgressRunnerRequest,
     _await_bounded_cleanup_task,
+    _consume_accounted_task_cancellation,
+    _raise_primary_with_cleanup_cancellation,
 )
 from cayu.egress.broker import TransparentEgressBroker
 from cayu.egress.errors import (
@@ -417,11 +419,14 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
             return runner
         except BaseException as original:
             rollback_complete = False
+            rollback_cancelled = False
+            rollback_failure: BaseException | None = None
             if runner is not None:
+                _consume_accounted_task_cancellation(original)
                 runner.close_action = "remove" if created_new else "detach"
                 cleanup_task = asyncio.create_task(runner.close())
                 try:
-                    await _await_bounded_cleanup_task(
+                    rollback_cancelled = await _await_bounded_cleanup_task(
                         cleanup_task,
                         timeout_s=DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
                         timeout_message="Microsandbox egress runner rollback timed out.",
@@ -432,12 +437,32 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
                         "Microsandbox egress runner rollback incomplete: "
                         f"{type(cleanup_error).__name__}."
                     )
+                    try:
+                        _raise_primary_with_cleanup_cancellation(
+                            original,
+                            cleanup_error,
+                            message=(
+                                "Microsandbox egress runner rollback failed after cancellation."
+                            ),
+                        )
+                    except BaseException as aggregate:
+                        # The reconnect ownership claim below must be released
+                        # before propagating the authoritative failure aggregate.
+                        rollback_failure = aggregate
             if created_new and rollback_complete and runner is not None:
                 claim = unbound_claim or self._claims_by_name.get(runner.name)
                 if claim is not None:
                     claim.remove_on_close = True
             if unbound_claim is not None:
                 unbound_claim.close()
+            if rollback_failure is not None:
+                raise rollback_failure from rollback_failure.__cause__
+            if rollback_cancelled:
+                cancellation = asyncio.CancelledError()
+                raise BaseExceptionGroup(
+                    "Microsandbox egress runner rollback completed after cancellation.",
+                    [original, cancellation],
+                ) from cancellation
             raise
 
     def reconnect_metadata(self, runner: Runner) -> dict[str, Any]:

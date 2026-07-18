@@ -17,6 +17,8 @@ from cayu.egress.adapter import (
     SandboxEgressAdapter,
     VirtualEgressRunnerRequest,
     _await_bounded_cleanup_task,
+    _consume_accounted_task_cancellation,
+    _raise_primary_with_cleanup_cancellation,
     validate_grant_scope,
 )
 from cayu.egress.broker import TransparentEgressBroker
@@ -278,6 +280,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             await self._run(["network", "connect", network, sidecar])
             await self._run(["exec", sidecar, "sh", "-c", _SIDECAR_READY_SCRIPT])
         except BaseException as original:
+            _consume_accounted_task_cancellation(original)
             cleanup_task = asyncio.create_task(
                 self._teardown(
                     server,
@@ -289,7 +292,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                 )
             )
             try:
-                await _await_bounded_cleanup_task(
+                rollback_cancelled = await _await_bounded_cleanup_task(
                     cleanup_task,
                     timeout_s=DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
                     timeout_message="Docker egress prepare rollback timed out.",
@@ -298,6 +301,17 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                 original.add_note(
                     f"Docker egress prepare rollback incomplete: {type(cleanup_error).__name__}."
                 )
+                _raise_primary_with_cleanup_cancellation(
+                    original,
+                    cleanup_error,
+                    message="Docker egress prepare rollback failed after cancellation.",
+                )
+            else:
+                if rollback_cancelled:
+                    raise BaseExceptionGroup(
+                        "Docker egress prepare rollback completed after cancellation.",
+                        [original, asyncio.CancelledError()],
+                    )
             raise
 
         proxy_url = f"http://{sidecar}:{_SIDECAR_LISTEN_PORT}"

@@ -47,6 +47,7 @@ from cayu.artifacts import (
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, MessageRole
 from cayu.core.thinking import ThinkingConfig
+from cayu.runtime._binding_cleanup import is_containable_cleanup_error
 from cayu.runtime.approvals import (
     ResolutionActor,
     ResolutionActorSource,
@@ -359,8 +360,13 @@ async def _close_event_stream(event_stream: AsyncIterator[Event]) -> None:
         # Cleanup is best-effort and must not replace the primary stream outcome.
         # CancelledError is a BaseException, so suppress it explicitly rather than
         # letting a secondary close failure bypass the observer's terminal signal.
-        with contextlib.suppress(asyncio.CancelledError, Exception):
+        try:
             await close()
+        except BaseExceptionGroup as error:
+            if not is_containable_cleanup_error(error):
+                raise
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 def _preaccept_error_detail(cayu_app: Any, error: BaseException) -> str:
@@ -699,6 +705,15 @@ def _start_detached_event_stream_response(
                 resolve_acceptance(exc, "before_first_event")
             await enqueue("done", None, terminal=True)
             raise
+        except BaseExceptionGroup as exc:
+            if not saw_first_event:
+                resolve_acceptance(exc, "before_first_event")
+            await _close_event_stream(event_stream)
+            if exc.subgroup(Exception) is not None and is_containable_cleanup_error(exc):
+                await enqueue("runtime_error", exc, terminal=True)
+            else:
+                await enqueue("done", None, terminal=True)
+                raise
         except Exception as exc:
             if not saw_first_event:
                 resolve_acceptance(exc, "before_first_event")

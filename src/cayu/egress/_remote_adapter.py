@@ -8,6 +8,8 @@ from cayu.egress.adapter import (
     EgressBinding,
     VirtualEgressRunnerRequest,
     _await_bounded_cleanup_task,
+    _consume_accounted_task_cancellation,
+    _raise_primary_with_cleanup_cancellation,
     validate_grant_scope,
 )
 from cayu.egress.broker import TransparentEgressBroker
@@ -85,9 +87,10 @@ async def prepare_exposed_proxy_binding(
             ) from exc
         proxy_url = endpoint.url
     except BaseException as original:
+        _consume_accounted_task_cancellation(original)
         cleanup_task = asyncio.create_task(cleanup())
         try:
-            await _await_bounded_cleanup_task(
+            rollback_cancelled = await _await_bounded_cleanup_task(
                 cleanup_task,
                 timeout_s=DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
                 timeout_message=f"{runner_kind} egress prepare rollback timed out.",
@@ -96,6 +99,17 @@ async def prepare_exposed_proxy_binding(
             original.add_note(
                 f"{runner_kind} egress prepare rollback incomplete: {type(cleanup_error).__name__}."
             )
+            _raise_primary_with_cleanup_cancellation(
+                original,
+                cleanup_error,
+                message=f"{runner_kind} egress prepare rollback failed after cancellation.",
+            )
+        else:
+            if rollback_cancelled:
+                raise BaseExceptionGroup(
+                    f"{runner_kind} egress prepare rollback completed after cancellation.",
+                    [original, asyncio.CancelledError()],
+                )
         raise
 
     env = {

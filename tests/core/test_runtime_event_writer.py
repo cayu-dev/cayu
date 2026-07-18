@@ -18,6 +18,7 @@ from cayu.runtime import (
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime.budgets import BudgetWindow, InMemoryBudgetStore
 from cayu.runtime.event_sinks import EventSink
+from cayu.runtime.sessions import EventQuery, EventRecord
 
 
 class _RecordingSink(EventSink):
@@ -188,6 +189,80 @@ def test_emit_persists_forwards_cost_event_and_fans_out() -> None:
     assert [event.id for event in persisted] == [emitted.id]
     assert [event.id for event in budget_events] == [emitted.id]
     assert [event.id for event in sink_events] == [emitted.id]
+
+
+def test_persist_leaves_side_effect_delivery_for_recovery() -> None:
+    async def scenario() -> tuple[list[Event], list[Event], list[Event]]:
+        store = await _session_store("writer_persist_only")
+        sink = _RecordingSink()
+        writer = RuntimeEventWriter(
+            session_store=store,
+            budget_store=InMemoryBudgetStore(),
+            event_sinks=[sink],
+        )
+        event = Event(
+            type=EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED,
+            session_id="writer_persist_only",
+        )
+
+        persisted = await writer.persist(event)
+        before_recovery = list(sink.events)
+        recovered = await writer.recover_persisted_side_effects()
+        return [persisted], before_recovery, recovered
+
+    persisted, before_recovery, recovered = asyncio.run(scenario())
+
+    assert before_recovery == []
+    assert [event.id for event in recovered] == [persisted[0].id]
+
+
+def test_is_persisted_uses_bounded_event_id_query() -> None:
+    class _QueryTrackingStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.queries: list[EventQuery | None] = []
+
+        async def load_events(self, session_id: str) -> list[Event]:
+            raise AssertionError("is_persisted must not load the complete session history")
+
+        async def query_events(self, query: EventQuery | None = None) -> list[EventRecord]:
+            self.queries.append(query)
+            return await super().query_events(query)
+
+    async def scenario() -> tuple[bool, bool, list[EventQuery | None], str, str]:
+        store = _QueryTrackingStore()
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="writer_reconciliation",
+                messages=[Message.text("user", "go")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        writer = RuntimeEventWriter(
+            session_store=store,
+            budget_store=InMemoryBudgetStore(),
+            event_sinks=[],
+        )
+        persisted = Event(type=EventType.SESSION_STARTED, session_id="writer_reconciliation")
+        await store.append_event(persisted.session_id, persisted)
+        missing = Event(type=EventType.SESSION_STARTED, session_id="writer_reconciliation")
+        return (
+            await writer.is_persisted(persisted),
+            await writer.is_persisted(missing),
+            store.queries,
+            persisted.id,
+            missing.id,
+        )
+
+    persisted, missing, queries, persisted_id, missing_id = asyncio.run(scenario())
+
+    assert persisted is True
+    assert missing is False
+    assert queries == [
+        EventQuery(session_id="writer_reconciliation", event_id=persisted_id, limit=1),
+        EventQuery(session_id="writer_reconciliation", event_id=missing_id, limit=1),
+    ]
 
 
 def test_recover_persisted_side_effects_delivers_once_without_replaying_origin() -> None:

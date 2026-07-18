@@ -183,7 +183,10 @@ from cayu.runtime import (
 )
 from cayu.runtime import _interruption_coordinator as interruption_coordinator_module
 from cayu.runtime import _tool_execution as tool_execution
-from cayu.runtime._binding_cleanup import record_binding_cleanup_failure
+from cayu.runtime._binding_cleanup import (
+    binding_cleanup_status,
+    record_binding_cleanup_failure,
+)
 from cayu.runtime.app import _require_native_structured_output_support
 from cayu.runtime.context import (
     ContextBuildResult,
@@ -759,12 +762,14 @@ class RecordingWorkspaceBinding(WorkspaceBinding):
         final_snapshot: WorkspaceSnapshot | None = None,
         fail_bind: bool = False,
         fail_finalize: bool = False,
+        finalize_error: RuntimeError | None = None,
     ) -> None:
         self.bound_workspace = bound_workspace
         self.snapshot = snapshot
         self.final_snapshot = final_snapshot
         self.fail_bind = fail_bind
         self.fail_finalize = fail_finalize
+        self.finalize_error = finalize_error
         self.bind_calls: list[dict] = []
         self.finalize_calls: list[dict] = []
 
@@ -814,7 +819,7 @@ class RecordingWorkspaceBinding(WorkspaceBinding):
             }
         )
         if self.fail_finalize:
-            raise RuntimeError("finalize failed")
+            raise self.finalize_error or RuntimeError("finalize failed")
         return self.final_snapshot
 
 
@@ -5855,17 +5860,317 @@ def test_cayu_app_reports_and_retries_incomplete_binding_cleanup(retry_fails: bo
     assert provider.requests == []
 
 
+def test_cayu_app_persists_bind_failure_before_reraising_cancelled_cleanup_retry():
+    bind_error = RuntimeError("bind failed")
+    initial_cleanup_error = RuntimeError("binding rollback failed")
+    initial_cancellation = asyncio.CancelledError("bind cancelled")
+    retry_cleanup_error = RuntimeError("cleanup retry failed")
+    retry_cancellation = asyncio.CancelledError("retry cancelled")
+
+    class CancelledCleanupRetryBinding(WorkspaceBinding):
+        async def bind(self, workspace, runner, **kwargs):  # type: ignore[no-untyped-def]
+            async def retry() -> None:
+                raise BaseExceptionGroup(
+                    "cleanup retry cancelled and failed",
+                    [retry_cancellation, retry_cleanup_error],
+                )
+
+            failure = BaseExceptionGroup(
+                "bind rollback cancelled and failed",
+                [bind_error, initial_cleanup_error, initial_cancellation],
+            )
+            record_binding_cleanup_failure(
+                failure,
+                initial_cleanup_error,
+                retry=retry,
+            )
+            raise failure
+
+        async def finalize(self, bound, *, outcome=None, metadata=None):  # type: ignore[no-untyped-def]
+            raise AssertionError("finalize should not run")
+
+    async def run() -> tuple[BaseExceptionGroup, list[Event], Session]:
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                binding=CancelledCleanupRetryBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            await collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_cancelled_binding_cleanup_retry",
+                    messages=[Message.text("user", "run")],
+                ),
+            )
+        events = await store.load_events("sess_cancelled_binding_cleanup_retry")
+        session = await store.load("sess_cancelled_binding_cleanup_retry")
+        assert session is not None
+        return exc_info.value, events, session
+
+    failure, events, session = asyncio.run(run())
+
+    assert failure.exceptions[0].exceptions == (
+        bind_error,
+        initial_cleanup_error,
+        initial_cancellation,
+    )
+    assert failure.exceptions[1].exceptions == (
+        retry_cancellation,
+        retry_cleanup_error,
+    )
+    cleanup_status = binding_cleanup_status(failure)
+    assert cleanup_status is not None
+    assert cleanup_status.retry_attempted is True
+    assert cleanup_status.retry_error is failure.exceptions[1]
+    binding_failed = next(
+        event for event in events if event.type is EventType.ENVIRONMENT_BINDING_FAILED
+    )
+    assert binding_failed.payload["binding_cleanup"] == {
+        "incomplete": True,
+        "initial_error": "binding rollback failed",
+        "initial_error_type": "RuntimeError",
+        "retry_attempted": True,
+        "retry_completed": False,
+        "retry_error": "cleanup retry cancelled and failed (2 sub-exceptions)",
+        "retry_error_type": "BaseExceptionGroup",
+    }
+    assert session.status is SessionStatus.INTERRUPTED
+    assert any(event.type is EventType.SESSION_INTERRUPTED for event in events)
+
+
+def test_cayu_app_propagates_real_cancellation_during_ordinary_bind_retry():
+    retry_started = asyncio.Event()
+    bind_error = RuntimeError("bind failed")
+    cleanup_error = RuntimeError("binding rollback failed")
+
+    class OrdinaryBindRetryBinding(WorkspaceBinding):
+        async def bind(self, workspace, runner, **kwargs):  # type: ignore[no-untyped-def]
+            async def retry() -> None:
+                retry_started.set()
+                await asyncio.Event().wait()
+
+            record_binding_cleanup_failure(bind_error, cleanup_error, retry=retry)
+            raise bind_error
+
+        async def finalize(self, bound, *, outcome=None, metadata=None):  # type: ignore[no-untyped-def]
+            raise AssertionError("finalize should not run")
+
+    async def run() -> tuple[BaseExceptionGroup, list[Event]]:
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                binding=OrdinaryBindRetryBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_ordinary_bind_retry_cancelled",
+                    messages=[Message.text("user", "run")],
+                ),
+            )
+        )
+        await retry_started.wait()
+        task.cancel()
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            await task
+        return exc_info.value, await store.load_events("sess_ordinary_bind_retry_cancelled")
+
+    failure, events = asyncio.run(run())
+    assert isinstance(failure.exceptions[0], RuntimeError)
+    assert isinstance(failure.exceptions[1], asyncio.CancelledError)
+    assert any(event.type is EventType.ENVIRONMENT_BINDING_FAILED for event in events)
+
+
+def test_cayu_app_persists_factory_failure_before_grouped_cancellation_cleanup():
+    factory_error = RuntimeError("factory setup failed")
+    cleanup_error = RuntimeError("factory rollback failed")
+    cancellation = asyncio.CancelledError("factory rollback cancelled")
+
+    class FailingFactory(EnvironmentFactory):
+        async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
+            raise BaseExceptionGroup(
+                "factory rollback cancelled and failed",
+                [factory_error, cleanup_error, cancellation],
+            )
+
+    async def run() -> tuple[BaseExceptionGroup, list[Event], Session]:
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="factory-env"),
+            FailingFactory(),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            await collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_grouped_factory_cleanup",
+                    messages=[Message.text("user", "run")],
+                ),
+            )
+        events = await store.load_events("sess_grouped_factory_cleanup")
+        session = await store.load("sess_grouped_factory_cleanup")
+        assert session is not None
+        return exc_info.value, events, session
+
+    failure, events, session = asyncio.run(run())
+
+    assert failure.exceptions == (factory_error, cleanup_error, cancellation)
+    factory_failed = next(
+        event for event in events if event.type is EventType.ENVIRONMENT_FACTORY_FAILED
+    )
+    assert factory_failed.payload["error_type"] == "BaseExceptionGroup"
+    assert session.status is SessionStatus.INTERRUPTED
+    assert any(event.type is EventType.SESSION_INTERRUPTED for event in events)
+
+
+def test_cayu_app_preserves_bind_signals_when_failure_publication_fails():
+    bind_error = RuntimeError("bind failed")
+    cleanup_error = RuntimeError("rollback failed")
+    cancellation = asyncio.CancelledError("bind cancelled")
+    publication_error = RuntimeError("binding failure event unavailable")
+
+    class FailingBinding(WorkspaceBinding):
+        async def bind(self, workspace, runner, **kwargs):  # type: ignore[no-untyped-def]
+            failure = BaseExceptionGroup(
+                "bind rollback cancelled and failed",
+                [bind_error, cleanup_error, cancellation],
+            )
+
+            async def retry() -> None:
+                return None
+
+            record_binding_cleanup_failure(failure, cleanup_error, retry=retry)
+            raise failure
+
+        async def finalize(self, bound, *, outcome=None, metadata=None):  # type: ignore[no-untyped-def]
+            raise AssertionError("finalize should not run")
+
+    class FailingStore(InMemorySessionStore):
+        async def append_event(self, session_id: str, event: Event) -> None:
+            if event.type is EventType.ENVIRONMENT_BINDING_FAILED:
+                raise publication_error
+            await super().append_event(session_id, event)
+
+    async def run() -> BaseExceptionGroup:
+        app = CayuApp(session_store=FailingStore(), enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="local"), binding=FailingBinding()),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            await collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_bind_failure_publication_fails",
+                    messages=[Message.text("user", "run")],
+                ),
+            )
+        return exc_info.value
+
+    failure = asyncio.run(run())
+
+    assert failure.exceptions[0].exceptions == (bind_error, cleanup_error, cancellation)
+    assert failure.exceptions[1] is publication_error
+    assert failure.__cause__ is cancellation
+    cleanup_status = binding_cleanup_status(failure)
+    assert cleanup_status is not None
+    assert cleanup_status.retry_attempted is True
+    assert cleanup_status.retry_error is None
+
+
+def test_cayu_app_does_not_publish_fatal_only_bind_group_as_ordinary_failure():
+    fatal_signal = GeneratorExit("binding aborted")
+    failure_event_attempted = False
+
+    class FatalBinding(WorkspaceBinding):
+        async def bind(self, workspace, runner, **kwargs):  # type: ignore[no-untyped-def]
+            raise BaseExceptionGroup("fatal bind failure", [fatal_signal])
+
+        async def finalize(self, bound, *, outcome=None, metadata=None):  # type: ignore[no-untyped-def]
+            raise AssertionError("finalize should not run")
+
+    class RecordingStore(InMemorySessionStore):
+        async def append_event(self, session_id: str, event: Event) -> None:
+            nonlocal failure_event_attempted
+            if event.type is EventType.ENVIRONMENT_BINDING_FAILED:
+                failure_event_attempted = True
+            await super().append_event(session_id, event)
+
+    async def run() -> BaseExceptionGroup:
+        app = CayuApp(session_store=RecordingStore(), enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="local"), binding=FatalBinding()),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            await collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_fatal_only_bind_group",
+                    messages=[Message.text("user", "run")],
+                ),
+            )
+        return exc_info.value
+
+    failure = asyncio.run(run())
+
+    assert failure.exceptions == (fatal_signal,)
+    assert failure_event_attempted is False
+
+
 def test_cayu_app_binding_finalize_failure_is_reported_on_terminal_event():
+    from cayu.runtime._binding_cleanup import BINDING_FINALIZE_ERROR_TEXT_MAX_BYTES
+    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+
+    secret = "binding-finalize-secret"
+    raw_message = f"finalize failed: {secret}: {'界' * 300}"
+    finalize_error = RuntimeError(raw_message)
+
     async def run():
         store = InMemorySessionStore()
-        binding = RecordingWorkspaceBinding(fail_finalize=True)
+        binding = RecordingWorkspaceBinding(
+            fail_finalize=True,
+            finalize_error=finalize_error,
+        )
         provider = FakeProvider(
             [
                 ModelStreamEvent.text_delta("done"),
                 ModelStreamEvent.completed({"finish_reason": "stop"}),
             ]
         )
-        app = CayuApp(session_store=store, enable_logging=False)
+        app = CayuApp(
+            session_store=store,
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
         app.register_provider(provider, default=True)
         app.register_environment(
             Environment(EnvironmentSpec(name="local"), binding=binding),
@@ -5893,16 +6198,29 @@ def test_cayu_app_binding_finalize_failure_is_reported_on_terminal_event():
         EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED,
         EventType.SESSION_COMPLETED,
     ]
-    assert events[-2].payload["error"] == "finalize failed"
+    persisted_error = events[-2].payload["error"]
+    assert REDACTED_SECRET in persisted_error
+    assert secret not in persisted_error
+    assert persisted_error.endswith("... [truncated]")
+    assert len(persisted_error.encode("utf-8")) <= BINDING_FINALIZE_ERROR_TEXT_MAX_BYTES
     assert events[-2].payload["error_type"] == "RuntimeError"
     assert events[-2].payload["outcome"] == "completed"
     assert events[-1].type == EventType.SESSION_COMPLETED
     assert len(binding.finalize_calls) == 1
     assert events[-1].payload["binding_finalize_error"] == {
-        "error": "finalize failed",
+        "error": persisted_error,
         "error_type": "RuntimeError",
         "outcome": "completed",
+        "failures": [
+            {
+                "phase": "workspace_finalize",
+                "error": persisted_error,
+                "error_type": "RuntimeError",
+            }
+        ],
     }
+    assert secret not in str(events[-1].payload["binding_finalize_error"])
+    assert str(finalize_error) == raw_message
 
 
 def test_cayu_app_invalid_binding_finalize_snapshot_is_reported_on_terminal_event():
@@ -5949,6 +6267,13 @@ def test_cayu_app_invalid_binding_finalize_snapshot_is_reported_on_terminal_even
         "error": "Workspace snapshot copies require a WorkspaceSnapshot or None.",
         "error_type": "TypeError",
         "outcome": "completed",
+        "failures": [
+            {
+                "phase": "workspace_finalize",
+                "error": "Workspace snapshot copies require a WorkspaceSnapshot or None.",
+                "error_type": "TypeError",
+            }
+        ],
     }
 
 
@@ -9233,6 +9558,40 @@ def test_cayu_app_reconciles_reserved_amount_when_provider_raises_after_dispatch
     assert reconciliation.payload["reason"] == (
         "provider usage unknown after dispatch; charged reserved amount"
     )
+
+
+def test_cayu_app_treats_provider_exception_group_as_an_ordinary_failure() -> None:
+    class GroupRaisingProvider(ModelProvider):
+        name = "group-raising"
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            raise ExceptionGroup(
+                "provider failures",
+                [RuntimeError("transport failed"), ValueError("invalid response")],
+            )
+            yield  # pragma: no cover
+
+    async def run() -> tuple[list[Event], Session | None]:
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(GroupRaisingProvider(), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_provider_exception_group",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+        return events, await store.load("sess_provider_exception_group")
+
+    events, session = asyncio.run(run())
+
+    assert session is not None
+    assert session.status is SessionStatus.FAILED
+    assert events[-1].type is EventType.SESSION_FAILED
+    assert events[-1].payload["error_type"] == "ExceptionGroup"
 
 
 def test_cayu_app_releases_reservation_for_failure_before_provider_dispatch(

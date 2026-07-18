@@ -22,6 +22,10 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from cayu._task_wait import (
+    await_shielded_task_outcome,
+    consume_pending_task_cancellation,
+)
 from cayu._validation import copy_json_value
 from cayu.artifacts import ArtifactStore
 from cayu.core.events import Event, EventType
@@ -73,8 +77,14 @@ from cayu.runners.base import (
     Runner,
     RunnerWorkspaceCapabilityT,
 )
-from cayu.runtime._binding_cleanup import record_binding_cleanup_failure
-from cayu.vaults import SecretRef, SecretResolver
+from cayu.runtime._binding_cleanup import (
+    BindingFinalizeFailure,
+    binding_finalize_explicit_cancellation,
+    binding_finalize_fatal_signal,
+    record_binding_cleanup_failure,
+    record_binding_finalize_failures,
+)
+from cayu.vaults import SecretRedactor, SecretRef, SecretResolver
 from cayu.workspaces import RunnerBoundWorkspace, Workspace
 
 EventEmitter = Callable[[Event], Awaitable[Event]]
@@ -532,6 +542,8 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             await self._emit_grant_events(request, grants, runner_kind=runner_kind)
         except BaseException as original:
             cleanup_errors: list[tuple[str, BaseException]] = []
+            original_cancellation = binding_finalize_explicit_cancellation(original)
+            rollback_cancellation = original_cancellation
             deadline = asyncio.get_running_loop().time() + (
                 binding.teardown_timeout_s
                 if binding is not None
@@ -542,27 +554,29 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                     await managed_runner.finalize(
                         outcome="interrupted" if reconnect_identity is not None else None
                     )
-                except asyncio.CancelledError:
-                    pass
+                except asyncio.CancelledError as cancellation:
+                    rollback_cancellation = cancellation
                 except BaseException as cleanup_error:
                     cleanup_errors.append(("managed runner", cleanup_error))
             else:
                 revocation_complete = False
                 try:
-                    await authority_revoker.revoke(
+                    if await authority_revoker.revoke(
                         timeout_s=_remaining_before_deadline(
                             deadline,
                             "Virtual-egress rollback timed out before grant revocation.",
                         )
-                    )
+                    ):
+                        rollback_cancellation = asyncio.CancelledError()
                     revocation_complete = True
-                except asyncio.CancelledError:
+                except asyncio.CancelledError as cancellation:
+                    rollback_cancellation = cancellation
                     revocation_complete = True
                 except BaseException as cleanup_error:
                     cleanup_errors.append(("grant revocation", cleanup_error))
                 if runner is not None and revocation_complete:
                     try:
-                        await _await_rollback_phase(
+                        if await _await_rollback_phase(
                             lambda: adapter.finalize_runner(
                                 runner,
                                 outcome=(
@@ -571,20 +585,22 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                             ),
                             deadline=deadline,
                             phase="runner",
-                        )
-                    except asyncio.CancelledError:
-                        pass
+                        ):
+                            rollback_cancellation = asyncio.CancelledError()
+                    except asyncio.CancelledError as cancellation:
+                        rollback_cancellation = cancellation
                     except BaseException as cleanup_error:
                         cleanup_errors.append(("runner", cleanup_error))
                 if binding is not None and revocation_complete:
                     try:
-                        await _await_rollback_phase(
+                        if await _await_rollback_phase(
                             binding.close,
                             deadline=deadline,
                             phase="binding",
-                        )
-                    except asyncio.CancelledError:
-                        pass
+                        ):
+                            rollback_cancellation = asyncio.CancelledError()
+                    except asyncio.CancelledError as cancellation:
+                        rollback_cancellation = cancellation
                     except BaseException as cleanup_error:
                         cleanup_errors.append(("binding", cleanup_error))
             if ca_dir is not None:
@@ -595,6 +611,31 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                     f"{phase}: {type(error).__name__}" for phase, error in cleanup_errors
                 )
                 original.add_note(f"Virtual-egress rollback incomplete: {details}.")
+                cleanup_cancellation = next(
+                    (
+                        cancellation
+                        for _, cleanup_error in cleanup_errors
+                        if (cancellation := binding_finalize_explicit_cancellation(cleanup_error))
+                        is not None
+                    ),
+                    None,
+                )
+                rollback_cancellation = rollback_cancellation or cleanup_cancellation
+            if rollback_cancellation is not None and (
+                cleanup_errors or original_cancellation is None
+            ):
+                failures = [original, *(error for _, error in cleanup_errors)]
+                if (
+                    binding_finalize_explicit_cancellation(
+                        BaseExceptionGroup("Virtual-egress rollback failures.", failures)
+                    )
+                    is None
+                ):
+                    failures.append(rollback_cancellation)
+                raise BaseExceptionGroup(
+                    "Virtual-egress creation rollback failed after cancellation.",
+                    failures,
+                ) from rollback_cancellation
             raise
         environment_metadata: dict[str, Any] = {
             "kind": runner_kind,
@@ -768,16 +809,19 @@ async def _await_cleanup_task(
             timeout_s=timeout_s,
             timeout_message=timeout_message or "Cleanup timed out.",
         )
-    cancelled = False
-    while True:
-        try:
-            await asyncio.shield(task)
-            return cancelled
-        except asyncio.CancelledError:
-            cancelled = True
-            if task.done():
-                await task
-                return cancelled
+    task_outcome = await await_shielded_task_outcome(task)
+    if task_outcome.error is not None:
+        if isinstance(task_outcome.error, asyncio.CancelledError):
+            if task_outcome.cancellation is not None:
+                raise task_outcome.cancellation from task_outcome.error
+            raise task_outcome.error
+        if task_outcome.cancellation is not None:
+            raise BaseExceptionGroup(
+                "Cleanup failed after caller cancellation.",
+                [task_outcome.cancellation, task_outcome.error],
+            ) from task_outcome.error
+        raise task_outcome.error
+    return task_outcome.cancellation is not None
 
 
 async def _await_cleanup(awaitable: Awaitable[None]) -> bool:
@@ -785,6 +829,47 @@ async def _await_cleanup(awaitable: Awaitable[None]) -> bool:
         await awaitable
 
     return await _await_cleanup_task(asyncio.create_task(_run()))
+
+
+def _split_cleanup_cancellation(
+    error: BaseExceptionGroup,
+) -> tuple[asyncio.CancelledError | None, Exception | None]:
+    """Separate one explicit cancellation from ordinary cleanup failures."""
+
+    cancellation = binding_finalize_explicit_cancellation(error)
+    _, ordinary_group = error.split(asyncio.CancelledError)
+    if ordinary_group is None:
+        return cancellation, None
+    ordinary_error: BaseException = ordinary_group
+    while isinstance(ordinary_error, BaseExceptionGroup) and len(ordinary_error.exceptions) == 1:
+        ordinary_error = ordinary_error.exceptions[0]
+    if not isinstance(ordinary_error, Exception):
+        raise error
+    return cancellation, ordinary_error
+
+
+def _contains_timeout(error: BaseException) -> bool:
+    """Return whether a cleanup error contains a timeout at any nesting level."""
+
+    if isinstance(error, TimeoutError):
+        return True
+    if isinstance(error, BaseExceptionGroup):
+        return any(_contains_timeout(child) for child in error.exceptions)
+    return False
+
+
+def _append_prior_cleanup_cancellation(
+    error: BaseException,
+    cancellation: asyncio.CancelledError | None,
+) -> BaseException:
+    """Retain cancellation completed by an earlier cleanup phase."""
+
+    if cancellation is None or binding_finalize_explicit_cancellation(error) is not None:
+        return error
+    return BaseExceptionGroup(
+        "Virtual-egress cleanup timed out after caller cancellation.",
+        [cancellation, error],
+    )
 
 
 def _remaining_before_deadline(deadline: float, timeout_message: str) -> float:
@@ -940,38 +1025,68 @@ class _EgressManagedRunner(Runner):
 
     async def _finalize_serialized(self) -> None:
         deadline = asyncio.get_running_loop().time() + self._teardown_timeout_s
-        cancelled = await self._authority_revoker.revoke(
-            timeout_s=self._remaining_teardown_time(deadline)
+        cancellation = (
+            asyncio.CancelledError()
+            if await self._authority_revoker.revoke(
+                timeout_s=self._remaining_teardown_time(deadline)
+            )
+            else None
         )
         # Do not release enforcement resources unless revocation completed.
         # A revocation error leaves this runner open for a truthful retry.
-        errors: list[tuple[str, Exception]] = []
+        errors: list[tuple[str, BaseException]] = []
+
+        def record_timeout(phase: str, failure: BaseException) -> None:
+            nonlocal cancellation
+            if not isinstance(failure, BaseExceptionGroup):
+                errors.append((phase, failure))
+                return
+            phase_cancellation, timeout_error = _split_cleanup_cancellation(failure)
+            cancellation = cancellation or phase_cancellation
+            if (
+                phase_cancellation is not None
+                and isinstance(timeout_error, TimeoutError)
+                and len(failure.exceptions) == 2
+            ):
+                errors.append((phase, failure))
+                return
+            errors.append((phase, timeout_error or failure))
+
         try:
             runner_outcome = (
                 "interrupted"
                 if self._requested_runner_action == "detach"
                 else self._requested_terminal_outcome
             )
-            cancelled = (
-                await self._await_runner_close(outcome=runner_outcome, deadline=deadline)
-                or cancelled
-            )
+            if await self._await_runner_close(outcome=runner_outcome, deadline=deadline):
+                cancellation = cancellation or asyncio.CancelledError()
             self._completed_runner_action = self._runner_close_action
             # A terminal caller may have registered while detach was pending.
             if (
                 self._completed_runner_action == "detach"
                 and self._requested_runner_action == "remove"
             ):
-                cancelled = (
-                    await self._await_runner_close(
-                        outcome=self._requested_terminal_outcome,
-                        deadline=deadline,
-                    )
-                    or cancelled
-                )
+                if await self._await_runner_close(
+                    outcome=self._requested_terminal_outcome,
+                    deadline=deadline,
+                ):
+                    cancellation = cancellation or asyncio.CancelledError()
                 self._completed_runner_action = self._runner_close_action
-        except TimeoutError:
-            raise
+        except TimeoutError as exc:
+            timeout_failure = _append_prior_cleanup_cancellation(exc, cancellation)
+            record_timeout("runner", timeout_failure)
+        except BaseExceptionGroup as exc:
+            fatal_signal = binding_finalize_fatal_signal(exc)
+            if fatal_signal is not None:
+                raise
+            if exc.subgroup(TimeoutError) is not None:
+                timeout_failure = _append_prior_cleanup_cancellation(exc, cancellation)
+                record_timeout("runner", timeout_failure)
+            else:
+                phase_cancellation, cleanup_error = _split_cleanup_cancellation(exc)
+                cancellation = cancellation or phase_cancellation
+                if cleanup_error is not None:
+                    errors.append(("runner", cleanup_error))
         except Exception as exc:
             errors.append(("runner", exc))
         # The binding owns the provider ownership claim. Never release it while
@@ -980,42 +1095,105 @@ class _EgressManagedRunner(Runner):
         if not errors:
             self._binding_release_started = True
             try:
-                cancelled = (
-                    await self._await_close_phase(
-                        "_binding_close_task",
-                        self._egress_binding.close,
-                        deadline=deadline,
-                        phase="binding",
-                    )
-                    or cancelled
-                )
-            except TimeoutError:
-                raise
+                if await self._await_close_phase(
+                    "_binding_close_task",
+                    self._egress_binding.close,
+                    deadline=deadline,
+                    phase="binding",
+                ):
+                    cancellation = cancellation or asyncio.CancelledError()
+            except TimeoutError as exc:
+                timeout_failure = _append_prior_cleanup_cancellation(exc, cancellation)
+                record_timeout("binding", timeout_failure)
+            except BaseExceptionGroup as exc:
+                fatal_signal = binding_finalize_fatal_signal(exc)
+                if fatal_signal is not None:
+                    raise
+                if exc.subgroup(TimeoutError) is not None:
+                    timeout_failure = _append_prior_cleanup_cancellation(exc, cancellation)
+                    record_timeout("binding", timeout_failure)
+                else:
+                    phase_cancellation, cleanup_error = _split_cleanup_cancellation(exc)
+                    cancellation = cancellation or phase_cancellation
+                    if cleanup_error is not None:
+                        errors.append(("binding", cleanup_error))
             except Exception as exc:
                 errors.append(("binding", exc))
-        if self._audit is not None:
+        if self._audit is not None and not any(_contains_timeout(error) for _, error in errors):
             try:
-                cancelled = (
-                    await self._await_close_phase(
-                        "_audit_drain_task",
-                        self._audit.drain,
-                        deadline=deadline,
-                        phase="audit",
-                    )
-                    or cancelled
-                )
-            except TimeoutError:
-                raise
+                if await self._await_close_phase(
+                    "_audit_drain_task",
+                    self._audit.drain,
+                    deadline=deadline,
+                    phase="audit",
+                ):
+                    cancellation = cancellation or asyncio.CancelledError()
+            except TimeoutError as exc:
+                timeout_failure = _append_prior_cleanup_cancellation(exc, cancellation)
+                record_timeout("audit", timeout_failure)
+            except BaseExceptionGroup as exc:
+                fatal_signal = binding_finalize_fatal_signal(exc)
+                if fatal_signal is not None:
+                    raise
+                if exc.subgroup(TimeoutError) is not None:
+                    timeout_failure = _append_prior_cleanup_cancellation(exc, cancellation)
+                    record_timeout("audit", timeout_failure)
+                else:
+                    phase_cancellation, cleanup_error = _split_cleanup_cancellation(exc)
+                    cancellation = cancellation or phase_cancellation
+                    if cleanup_error is not None:
+                        errors.append(("audit", cleanup_error))
             except Exception as exc:
                 errors.append(("audit", exc))
         if errors:
-            details = "; ".join(f"{phase}: {type(exc).__name__}: {exc}" for phase, exc in errors)
-            raise RuntimeError(f"Virtual-egress resource cleanup incomplete: {details}")
+            if len(errors) == 1 and cancellation is None:
+                only_error = errors[0][1]
+                details = "; ".join(
+                    f"{phase}: {type(error).__name__}: {error}" for phase, error in errors
+                )
+                if isinstance(only_error, TimeoutError):
+                    raise only_error
+                cleanup_error = RuntimeError(
+                    f"Virtual-egress resource cleanup incomplete: {details}"
+                )
+                raise cleanup_error from only_error
+            if (
+                len(errors) == 1
+                and cancellation is not None
+                and isinstance(errors[0][1], BaseExceptionGroup)
+                and binding_finalize_explicit_cancellation(errors[0][1]) is not None
+            ):
+                raise errors[0][1]
+            if (
+                cancellation is not None
+                and len(errors) == 1
+                and isinstance(errors[0][1], TimeoutError)
+            ):
+                raise BaseExceptionGroup(
+                    "Virtual-egress cleanup failed after caller cancellation.",
+                    [cancellation, errors[0][1]],
+                ) from errors[0][1]
+            failures = [error for _, error in errors]
+            failure_tree = BaseExceptionGroup(
+                "Virtual-egress resource cleanup phases failed.",
+                failures,
+            )
+            details = "; ".join(
+                f"{phase}: {type(error).__name__}: {error}" for phase, error in errors
+            )
+            cleanup_error = RuntimeError(f"Virtual-egress resource cleanup incomplete: {details}")
+            cleanup_error.__cause__ = failure_tree
+            if cancellation is not None:
+                raise BaseExceptionGroup(
+                    "Virtual-egress cleanup failed after caller cancellation.",
+                    [cancellation, cleanup_error],
+                ) from cleanup_error
+            raise cleanup_error from failure_tree
         with contextlib.suppress(Exception):
             shutil.rmtree(self._ca_dir, ignore_errors=True)
         self._closed = True
-        if cancelled:
-            raise asyncio.CancelledError()
+        if cancellation is not None:
+            raise cancellation
 
     def _register_runner_action(self, action: str, *, outcome: str | None) -> None:
         if action == "remove":
@@ -1209,6 +1387,9 @@ class _EgressTeardownBinding(WorkspaceBinding):
         self._inner = inner
         self._runner = runner
         self._grants = tuple(grants)
+        self._finalize_redactor = SecretRedactor(
+            tuple(grant.presented_value for grant in self._grants)
+        )
         self._emitter = emitter
         self._audit = audit
         self._session_id = session_id
@@ -1216,7 +1397,7 @@ class _EgressTeardownBinding(WorkspaceBinding):
         self._environment_name = environment_name
         self._reconnected = reconnected
         self._revocation_emit_lock = asyncio.Lock()
-        self._revocation_emitted = False
+        self._revocation_emission_attempted_grant_ids: set[str] = set()
 
     async def bind(
         self,
@@ -1240,30 +1421,54 @@ class _EgressTeardownBinding(WorkspaceBinding):
         except BaseException as bind_error:
             # Runtime does not call finalize() after bind failure, so the
             # virtual-egress resources must be released here.
-            cancelled = False
+            rollback_cancellation = binding_finalize_explicit_cancellation(bind_error)
             cleanup_error: BaseException | None = None
             try:
                 await self._close_resources(outcome="interrupted" if self._reconnected else None)
-            except asyncio.CancelledError:
-                cancelled = True
+            except asyncio.CancelledError as cancellation:
+                rollback_cancellation = rollback_cancellation or cancellation
+            except BaseExceptionGroup as exc:
+                if binding_finalize_fatal_signal(exc) is not None:
+                    raise
+                rollback_cancellation, cleanup_error = _split_cleanup_cancellation(exc)
             except BaseException as exc:
                 cleanup_error = exc
             await self._drain_audit()
             if cleanup_error is None:
                 await self._emit_revoked()
             else:
-                record_binding_cleanup_failure(
-                    bind_error,
-                    cleanup_error,
-                    retry=self._retry_bind_cleanup,
-                )
                 bind_error.add_note(
                     "Virtual-egress bind rollback incomplete: "
                     f"{type(cleanup_error).__name__}: {cleanup_error}. "
                     "The runtime will retry the binding-owned cleanup."
                 )
-            if cancelled:
-                raise asyncio.CancelledError() from None
+            if rollback_cancellation is not None:
+                if cleanup_error is None and isinstance(bind_error, asyncio.CancelledError):
+                    raise bind_error
+                errors = [bind_error]
+                if cleanup_error is not None:
+                    errors.append(cleanup_error)
+                if not any(
+                    binding_finalize_explicit_cancellation(error) is not None for error in errors
+                ):
+                    errors.append(rollback_cancellation)
+                rollback_error = BaseExceptionGroup(
+                    "Virtual-egress bind rollback failed after caller cancellation.",
+                    errors,
+                )
+                if cleanup_error is not None:
+                    record_binding_cleanup_failure(
+                        rollback_error,
+                        cleanup_error,
+                        retry=self._retry_bind_cleanup,
+                    )
+                raise rollback_error from rollback_cancellation
+            if cleanup_error is not None:
+                record_binding_cleanup_failure(
+                    bind_error,
+                    cleanup_error,
+                    retry=self._retry_bind_cleanup,
+                )
             raise
 
     async def _retry_bind_cleanup(self) -> None:
@@ -1295,15 +1500,33 @@ class _EgressTeardownBinding(WorkspaceBinding):
     ) -> WorkspaceSnapshot | None:
         snapshot: WorkspaceSnapshot | None = None
         inner_error: BaseException | None = None
-        cancelled = False
+        revoke_cancelled = False
         # Disable guest-side authority before workspace commands run. If this
         # fails, leave both the workspace and ownership claim untouched so a
         # truthful retry can resume from the same safety boundary.
-        cancelled = await self._runner.revoke_authority()
+        try:
+            revoke_cancelled = await self._runner.revoke_authority()
+        except BaseException as exc:
+            record_binding_finalize_failures(
+                exc,
+                (
+                    BindingFinalizeFailure(
+                        phase="managed_resource_cleanup",
+                        error=exc,
+                    ),
+                ),
+                supplemental_redactor=self._finalize_redactor,
+            )
+            raise
         try:
             snapshot = await self._inner.finalize(bound, outcome=outcome, metadata=metadata)
         except BaseException as exc:
             inner_error = exc
+            if binding_finalize_explicit_cancellation(exc) is not None:
+                # This boundary already owns the workspace-side cancellation.
+                # Normalize its task state before nested managed cleanup so the
+                # shared waiter cannot report the same request a second time.
+                consume_pending_task_cancellation()
         cleanup_error: BaseException | None = None
         try:
             # Workspace sync/unmount must finish before an interrupted MicroVM
@@ -1312,14 +1535,96 @@ class _EgressTeardownBinding(WorkspaceBinding):
         except BaseException as exc:
             if cleanup_error is None:
                 cleanup_error = exc
-        await self._drain_audit()
-        await self._emit_revoked()
+        diagnostic_cancellation: asyncio.CancelledError | None = None
+        diagnostic_fatal: BaseException | None = None
+        try:
+            if await _await_cleanup(self._drain_audit()):
+                diagnostic_cancellation = asyncio.CancelledError()
+        except asyncio.CancelledError as cancellation:
+            diagnostic_cancellation = cancellation
+        except BaseExceptionGroup as diagnostic_error:
+            fatal_signal = binding_finalize_fatal_signal(diagnostic_error)
+            if fatal_signal is not None:
+                diagnostic_fatal = fatal_signal
+            else:
+                diagnostic_cancellation = binding_finalize_explicit_cancellation(diagnostic_error)
+        except (KeyboardInterrupt, SystemExit, GeneratorExit) as fatal_signal:
+            diagnostic_fatal = fatal_signal
+        if diagnostic_fatal is None:
+            try:
+                if await _await_cleanup(self._emit_revoked()) and diagnostic_cancellation is None:
+                    diagnostic_cancellation = asyncio.CancelledError()
+            except asyncio.CancelledError as cancellation:
+                if diagnostic_cancellation is None:
+                    diagnostic_cancellation = cancellation
+            except BaseExceptionGroup as diagnostic_error:
+                fatal_signal = binding_finalize_fatal_signal(diagnostic_error)
+                if fatal_signal is not None:
+                    diagnostic_fatal = fatal_signal
+                elif diagnostic_cancellation is None:
+                    diagnostic_cancellation = binding_finalize_explicit_cancellation(
+                        diagnostic_error
+                    )
+            except (KeyboardInterrupt, SystemExit, GeneratorExit) as fatal_signal:
+                diagnostic_fatal = fatal_signal
+        failures: list[BindingFinalizeFailure] = []
+        if revoke_cancelled:
+            failures.append(
+                BindingFinalizeFailure(
+                    phase="cancellation",
+                    error=asyncio.CancelledError(),
+                )
+            )
         if inner_error is not None:
-            raise inner_error
+            failures.append(
+                BindingFinalizeFailure(
+                    phase="workspace_finalize",
+                    error=inner_error,
+                )
+            )
         if cleanup_error is not None:
-            raise cleanup_error
-        if cancelled:
-            raise asyncio.CancelledError()
+            failures.append(
+                BindingFinalizeFailure(
+                    phase="managed_resource_cleanup",
+                    error=cleanup_error,
+                )
+            )
+        if diagnostic_cancellation is not None:
+            failures.append(
+                BindingFinalizeFailure(
+                    phase="cancellation",
+                    error=diagnostic_cancellation,
+                )
+            )
+        if diagnostic_fatal is not None:
+            if not failures:
+                raise diagnostic_fatal
+            finalization_error = BaseExceptionGroup(
+                "Virtual-egress finalization failed during diagnostics.",
+                [*(failure.error for failure in failures), diagnostic_fatal],
+            )
+            record_binding_finalize_failures(
+                finalization_error,
+                tuple(failures),
+                supplemental_redactor=self._finalize_redactor,
+            )
+            raise finalization_error from diagnostic_fatal
+        if failures:
+            if len(failures) == 1:
+                finalization_error = failures[0].error
+            else:
+                finalization_error = BaseExceptionGroup(
+                    "Virtual-egress finalization reported multiple failures.",
+                    [failure.error for failure in failures],
+                )
+            record_binding_finalize_failures(
+                finalization_error,
+                tuple(failures),
+                supplemental_redactor=self._finalize_redactor,
+            )
+            if len(failures) == 1:
+                raise finalization_error
+            raise finalization_error from failures[-1].error
         return snapshot
 
     async def _close_resources(
@@ -1339,12 +1644,23 @@ class _EgressTeardownBinding(WorkspaceBinding):
 
     async def _emit_revoked(self) -> None:
         async with self._revocation_emit_lock:
-            if self._revocation_emitted:
+            if all(
+                grant.grant_id in self._revocation_emission_attempted_grant_ids
+                for grant in self._grants
+            ):
                 return
             if self._emitter is None:
-                self._revocation_emitted = True
+                self._revocation_emission_attempted_grant_ids.update(
+                    grant.grant_id for grant in self._grants
+                )
                 return
             for grant in self._grants:
+                if grant.grant_id in self._revocation_emission_attempted_grant_ids:
+                    continue
+                # Revocation events are best-effort and at-most-once. Mark the
+                # attempt before awaiting the emitter so a committed delivery
+                # with a lost acknowledgement is not duplicated by a retry.
+                self._revocation_emission_attempted_grant_ids.add(grant.grant_id)
                 with contextlib.suppress(Exception):
                     await self._emitter(
                         Event(
@@ -1355,7 +1671,6 @@ class _EgressTeardownBinding(WorkspaceBinding):
                             payload=_grant_payload(grant),
                         )
                     )
-            self._revocation_emitted = True
 
 
 def _grant_payload(grant: VirtualCredentialGrant) -> dict[str, Any]:

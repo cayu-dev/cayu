@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from math import isfinite
 from typing import Any
 
+from cayu._task_wait import await_shielded_task_outcome, consume_pending_task_cancellation
 from cayu.egress.broker import TransparentEgressBroker
 from cayu.egress.capabilities import EgressCapabilityEvidence
 from cayu.egress.errors import UnsupportedEgressError, UnsupportedEgressReconnectError
@@ -25,23 +26,71 @@ async def _await_bounded_cleanup_task(
 ) -> bool:
     """Finish one cleanup task despite cancellation, or report a bounded timeout."""
 
-    cancelled = False
-    deadline = asyncio.get_running_loop().time() + timeout_s
-    while not task.done():
-        remaining = deadline - asyncio.get_running_loop().time()
-        if remaining <= 0:
-            raise TimeoutError(timeout_message)
-        try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
-        except asyncio.CancelledError:
-            cancelled = True
-        except TimeoutError as exc:
-            if task.done():
-                await task
-                break
-            raise TimeoutError(timeout_message) from exc
-    task.result()
-    return cancelled
+    outcome = await await_shielded_task_outcome(task, timeout_s=timeout_s)
+
+    def timeout_failure(
+        cancellation: asyncio.CancelledError | None,
+    ) -> TimeoutError | BaseExceptionGroup:
+        timeout_error = TimeoutError(timeout_message)
+        if cancellation is None:
+            return timeout_error
+        return BaseExceptionGroup(
+            "Cleanup timed out after caller cancellation.",
+            [cancellation, timeout_error],
+        )
+
+    if outcome.timed_out:
+        raise timeout_failure(outcome.cancellation)
+    if outcome.error is not None:
+        if isinstance(outcome.error, asyncio.CancelledError):
+            if outcome.cancellation is not None:
+                raise outcome.cancellation from outcome.error
+            raise outcome.error
+        if outcome.cancellation is not None:
+            raise BaseExceptionGroup(
+                "Cleanup failed after caller cancellation.",
+                [outcome.cancellation, outcome.error],
+            ) from outcome.error
+        raise outcome.error
+    return outcome.cancellation is not None
+
+
+def _explicit_cleanup_cancellation(
+    error: BaseException,
+) -> asyncio.CancelledError | None:
+    """Find cancellation carried by cleanup without following stale causes."""
+
+    if isinstance(error, asyncio.CancelledError):
+        return error
+    if isinstance(error, BaseExceptionGroup):
+        for child in error.exceptions:
+            cancellation = _explicit_cleanup_cancellation(child)
+            if cancellation is not None:
+                return cancellation
+    return None
+
+
+def _consume_accounted_task_cancellation(error: BaseException) -> None:
+    """Normalize task cancellation already represented by a primary error."""
+
+    if _explicit_cleanup_cancellation(error) is not None:
+        consume_pending_task_cancellation()
+
+
+def _raise_primary_with_cleanup_cancellation(
+    primary_error: BaseException,
+    cleanup_error: BaseException,
+    *,
+    message: str,
+) -> None:
+    """Retain a primary failure when its rollback also carries cancellation."""
+
+    cancellation = _explicit_cleanup_cancellation(primary_error)
+    if cancellation is None:
+        cancellation = _explicit_cleanup_cancellation(cleanup_error)
+    if cancellation is None:
+        return
+    raise BaseExceptionGroup(message, [primary_error, cleanup_error]) from cancellation
 
 
 def validate_grant_scope(

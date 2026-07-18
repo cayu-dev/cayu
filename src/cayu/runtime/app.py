@@ -76,8 +76,11 @@ from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
+from cayu.runtime._binding_cleanup import binding_finalize_explicit_cancellation
 from cayu.runtime._environment_lifecycle import (
     EnvironmentLifecycle,
+    _persist_binding_finalize_failure_event,  # noqa: F401
+    _reconcile_binding_finalize_failure_event,  # noqa: F401
     exception_failure_payload,
     render_initial_system_prompt,
 )
@@ -527,6 +530,7 @@ class CayuApp:
             session_store=self.session_store,
             event_writer=self._event_writer,
             checkpoint_transform=_replace_checkpoint_preserving_runtime_state,
+            secret_redactor=self._secret_redactor,
         )
         self._run_limit_controller = RunLimitController(
             session_store=self.session_store,
@@ -1392,6 +1396,22 @@ class CayuApp:
                     yield event
                 return
             raise
+        except BaseExceptionGroup as exc:
+            persisted_session = await self.session_store.load(session.id)
+            if (
+                binding_finalize_explicit_cancellation(exc) is not None
+                and persisted_session is not None
+                and persisted_session.status in _INTERRUPTIBLE_SESSION_STATUSES
+            ):
+                async for event in self._handle_session_interrupted(
+                    session=persisted_session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=_environment_name(registered_environment),
+                ):
+                    yield event
+                raise exc
+            raise
         except Exception as exc:
             task_failure_event, task_failure_error = await self._fail_task_for_run_setup_error(
                 task_id=request.task_id,
@@ -1485,6 +1505,25 @@ class CayuApp:
                 ):
                     yield event
                 return
+            raise
+        except BaseExceptionGroup as exc:
+            # Lifecycle cleanup can aggregate a cancellation with its cleanup
+            # failure. Preserve the grouped signal while applying the same
+            # durable session interruption transition as a plain cancellation.
+            persisted_session = await self.session_store.load(session.id)
+            if (
+                binding_finalize_explicit_cancellation(exc) is not None
+                and persisted_session is not None
+                and persisted_session.status in _INTERRUPTIBLE_SESSION_STATUSES
+            ):
+                async for event in self._handle_session_interrupted(
+                    session=persisted_session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=_environment_name(registered_environment),
+                ):
+                    yield event
+                raise exc
             raise
         except GeneratorExit:
             # Close the inner run stream deterministically so it finalizes (not
@@ -7012,7 +7051,7 @@ class CayuApp:
                     usage_tracker=turn_usage_tracker,
                     active_run=active_run,
                 )
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(BaseException):
             async for _ in self._emit_terminal_event_with_hooks(
                 event=Event(
                     type=EventType.SESSION_INTERRUPTED,
@@ -7071,7 +7110,7 @@ class CayuApp:
         registered_environment = self._get_registered_environment_for_session(
             session.environment_name
         )
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(BaseException):
             await self._finalize_abandoned_session_run(
                 session=session,
                 registered_agent=registered_agent,

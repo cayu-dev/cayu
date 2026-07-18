@@ -213,6 +213,13 @@ def test_sync_binding_partial_finalize_failure_is_durable_and_retry_converges(
         "error": "forced sync write failure: b-fail.txt",
         "error_type": "OSError",
         "outcome": "completed",
+        "failures": [
+            {
+                "phase": "workspace_finalize",
+                "error": "forced sync write failure: b-fail.txt",
+                "error_type": "OSError",
+            }
+        ],
     }
 
     assert type(retry_snapshot) is WorkspaceSnapshot
