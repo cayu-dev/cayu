@@ -111,6 +111,7 @@ from cayu.runtime.sessions import (
     _activate_session_run_fence,
     _active_unexpired_session_operation_id,
     _assert_session_run_epoch,
+    _assert_session_run_epoch_value,
     _copy_session_event_batch,
     _current_session_run_epoch,
     _deactivate_session_run_fence,
@@ -125,12 +126,14 @@ from cayu.runtime.sessions import (
     copy_run_request,
     copy_session_identity,
     copy_session_query,
+    copy_session_user_metadata,
     copy_transcript_messages,
     copy_transcript_query,
     decode_session_cursor,
     encode_session_cursor,
     enforce_pending_action_result_size,
     filter_transcript_records,
+    replace_session_user_metadata,
     session_next_cursor,
     session_outcome,
 )
@@ -4344,15 +4347,13 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             async with conn.cursor() as cur:
                 if expected_run_epoch is None:
                     await cur.execute(
-                        "UPDATE cayu_sessions SET updated_at = %s, last_activity_at = %s "
-                        "WHERE id = %s",
-                        (updated_at, updated_at, session_id),
+                        "UPDATE cayu_sessions SET updated_at = %s WHERE id = %s",
+                        (updated_at, session_id),
                     )
                 else:
                     await cur.execute(
-                        "UPDATE cayu_sessions SET updated_at = %s, last_activity_at = %s "
-                        "WHERE id = %s AND run_epoch = %s",
-                        (updated_at, updated_at, session_id, expected_run_epoch),
+                        "UPDATE cayu_sessions SET updated_at = %s WHERE id = %s AND run_epoch = %s",
+                        (updated_at, session_id, expected_run_epoch),
                     )
                 if cur.rowcount != 1:
                     if expected_run_epoch is not None:
@@ -4378,38 +4379,30 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
 
     async def update_metadata(self, session_id: str, metadata: dict[str, Any]) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
-        new_metadata = copy_json_value(metadata, "metadata")
-        if type(new_metadata) is not dict:
-            raise TypeError("Session metadata must be an object.")
+        user_metadata = copy_session_user_metadata(metadata)
         await self._ensure_ready()
         updated_at = datetime.now(UTC)
-        expected_run_epoch = _current_session_run_epoch(session_id)
         async with self._pool.connection() as conn:
-            async with conn.cursor() as cur:
-                if expected_run_epoch is None:
+            try:
+                async with conn.cursor() as cur:
                     await cur.execute(
-                        "UPDATE cayu_sessions SET metadata = %s, updated_at = %s, "
-                        "last_activity_at = %s WHERE id = %s",
-                        (_dumps(new_metadata), updated_at, updated_at, session_id),
+                        "SELECT run_epoch, metadata FROM cayu_sessions WHERE id = %s FOR UPDATE",
+                        (session_id,),
                     )
-                else:
+                    row = await cur.fetchone()
+                    if row is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    _assert_session_run_epoch_value(session_id, row[0])
+                    new_metadata = replace_session_user_metadata(_json_obj(row[1]), user_metadata)
                     await cur.execute(
-                        "UPDATE cayu_sessions SET metadata = %s, updated_at = %s, "
-                        "last_activity_at = %s WHERE id = %s AND run_epoch = %s",
-                        (
-                            _dumps(new_metadata),
-                            updated_at,
-                            updated_at,
-                            session_id,
-                            expected_run_epoch,
-                        ),
+                        "UPDATE cayu_sessions SET metadata = %s, updated_at = %s WHERE id = %s",
+                        (_dumps(new_metadata), updated_at, session_id),
                     )
-                if cur.rowcount != 1:
-                    if expected_run_epoch is not None:
-                        await _raise_session_write_conflict(cur, session_id, expected_run_epoch)
-                    raise KeyError(f"Session not found: {session_id}")
-                loaded = await self._load(cur, session_id)
-            await conn.commit()
+                    loaded = await self._load(cur, session_id)
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
             if loaded is None:
                 raise KeyError(f"Session not found: {session_id}")
             return loaded

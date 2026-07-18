@@ -308,7 +308,7 @@ export function AgentsPage() {
   const selectedAgent =
     filteredAgents.find((agent) => agent.name === selectedAgentName) ?? filteredAgents[0] ?? null
   const relatedSessions = useQuery({
-    queryKey: ["agent-related-sessions", selectedAgent?.name],
+    queryKey: ["sessions-summary", "agent-related", selectedAgent?.name],
     queryFn: () =>
       fetchSessionsSummary({
         agent_name: selectedAgent?.name,

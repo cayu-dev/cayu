@@ -2933,6 +2933,8 @@ export type UpdateSessionLabelsBody = {
 export type UpdateSessionMetadataBody = {
     /**
      * Metadata
+     *
+     * Complete replacement for user-authored session metadata. Cayu-owned entries are preserved by the store and must not be supplied.
      */
     metadata: {
         [key: string]: unknown;

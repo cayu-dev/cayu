@@ -908,7 +908,12 @@ class UpdateSessionLabelsBody(BaseModel):
 class UpdateSessionMetadataBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    metadata: dict[str, Any]
+    metadata: dict[str, Any] = Field(
+        description=(
+            "Complete replacement for user-authored session metadata. Cayu-owned "
+            "entries are preserved by the store and must not be supplied."
+        )
+    )
 
 
 class SessionCostBody(BaseModel):
@@ -3744,6 +3749,7 @@ def create_router(
         body: UpdateSessionLabelsBody,
     ):
         try:
+            require_durable_json_text(body.labels, "labels")
             session = await session_store.update_labels(session_id, body.labels)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -3761,6 +3767,7 @@ def create_router(
         body: UpdateSessionMetadataBody,
     ):
         try:
+            require_durable_json_text(body.metadata, "metadata")
             session = await session_store.update_metadata(session_id, body.metadata)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc

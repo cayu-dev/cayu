@@ -2,6 +2,22 @@
 
 ## v0.1.0 (unreleased)
 
+### Session metadata updates preserve runtime-owned state
+
+`SessionStore.update_metadata(...)` and
+`PATCH /api/sessions/{session_id}/metadata` now replace only user-authored
+metadata. Top-level `cayu:` entries and `subagent` are runtime-owned: built-in
+stores preserve them atomically and reject callers that include them in a
+replacement. An empty object clears the user-authored portion without erasing
+tool-policy or subagent-coordination state.
+
+This is an intentional prerelease contract correction. Clients that previously
+round-tripped the complete `ApiSession.metadata` object must omit runtime-owned
+entries from the PATCH body. Custom `SessionStore` implementations must preserve
+the same boundary; `copy_session_user_metadata` and
+`replace_session_user_metadata` provide the shared validation and transactional
+merge primitives.
+
 ### Custom SessionStore implementations must support event side-effect handoffs
 
 The `SessionStore` interface now requires durable persisted-event side-effect

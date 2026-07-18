@@ -2334,10 +2334,14 @@ def test_session_stores_update_labels_replaces_and_filters(store_factory, tmp_pa
             identity=_identity(),
         )
         await store.update_status("sess_labeled", SessionStatus.COMPLETED)
+        before_edit = await store.load("sess_labeled")
+        assert before_edit is not None
         updated = await store.update_labels("sess_labeled", {"stage": "review"})
         # Full replacement, not a merge: the old "team" label is gone.
         assert updated.labels == {"stage": "review"}
-        assert updated.updated_at >= created.updated_at
+        assert updated.created_at == created.created_at
+        assert updated.updated_at >= before_edit.updated_at
+        assert updated.last_activity_at == before_edit.last_activity_at
         # Updating labels must not change the session's status.
         assert updated.status == SessionStatus.COMPLETED
         reloaded = await store.load("sess_labeled")
@@ -2352,6 +2356,7 @@ def test_session_stores_update_labels_replaces_and_filters(store_factory, tmp_pa
         # An empty dict clears every label.
         cleared = await store.update_labels("sess_labeled", {})
         assert cleared.labels == {}
+        assert cleared.last_activity_at == before_edit.last_activity_at
         assert (await store.list_sessions(SessionQuery(labels={"stage": "review"}))).sessions == []
         # Reserved cayu: labels are rejected on update, same as on create.
         with pytest.raises(ValueError, match="reserved"):
@@ -2369,17 +2374,40 @@ def test_session_stores_update_metadata_replaces(store_factory, tmp_path):
 
     async def run() -> None:
         await store.create(
-            _lifecycle_request("sess_meta", metadata={"a": 1, "keep": False}),
+            _lifecycle_request(
+                "sess_meta",
+                metadata={
+                    "a": 1,
+                    "keep": False,
+                    "subagent": {"mode": "background"},
+                    "cayu:taint_labels": ["untrusted"],
+                },
+            ),
             identity=_identity(),
         )
         await store.update_status("sess_meta", SessionStatus.COMPLETED)
+        before_edit = await store.load("sess_meta")
+        assert before_edit is not None
         updated = await store.update_metadata("sess_meta", {"b": [1, 2]})
-        assert updated.metadata == {"b": [1, 2]}
+        assert updated.metadata == {
+            "b": [1, 2],
+            "subagent": {"mode": "background"},
+            "cayu:taint_labels": ["untrusted"],
+        }
+        assert updated.updated_at >= before_edit.updated_at
+        assert updated.last_activity_at == before_edit.last_activity_at
         # Updating metadata must not change the session's status.
         assert updated.status == SessionStatus.COMPLETED
         reloaded = await store.load("sess_meta")
         assert reloaded is not None
-        assert reloaded.metadata == {"b": [1, 2]}
+        assert reloaded.metadata == updated.metadata
+        with pytest.raises(ValueError, match="runtime-owned"):
+            await store.update_metadata("sess_meta", {"subagent": {}})
+        with pytest.raises(ValueError, match="runtime-owned"):
+            await store.update_metadata("sess_meta", {"cayu:taint_labels": []})
+        with pytest.raises(ValueError, match="NUL"):
+            await store.update_metadata("sess_meta", {"value": "not\x00durable"})
+        assert (await store.load("sess_meta")).metadata == updated.metadata
         with pytest.raises(KeyError, match="Session not found"):
             await store.update_metadata("sess_missing", {"k": "v"})
         await _close_store(store)

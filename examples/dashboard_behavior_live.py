@@ -348,6 +348,11 @@ async def _seed_app() -> tuple[CayuApp, DashboardContractProvider, InMemorySessi
         RunRequest(
             agent_name=AGENT_NAME,
             session_id=SESSION_ID,
+            labels={"stage": "initial"},
+            metadata={
+                "customer": {"id": "dashboard-customer"},
+                "cayu:dashboard_fixture": {"marker": "runtime-dashboard-marker"},
+            },
             messages=[Message.text("user", "Show the dashboard contract session.")],
         ),
         identity=SessionIdentity(provider_name=PROVIDER_NAME, model=MODEL_NAME),
@@ -565,6 +570,8 @@ async def _run_browser_contract(
     }
     expected_observer_aborts: list[ObserverAbort] = []
     expected_query_aborts: list[str] = []
+    expected_edit_rejections: list[str] = []
+    expected_edit_console_errors: list[str] = []
     expected_observer_abort_paths = {
         "/api/run",
         "/api/resume",
@@ -591,6 +598,8 @@ async def _run_browser_contract(
             expected_observer_aborts,
             expected_observer_abort_paths,
             expected_query_aborts,
+            expected_edit_rejections,
+            expected_edit_console_errors,
         )
         try:
             await _exercise_dashboard(page, base_url, provider, faults)
@@ -610,6 +619,16 @@ async def _run_browser_contract(
                 len(expected_query_aborts),
                 1,
                 "the superseded session query must abort exactly one browser request",
+            )
+            require_equal(
+                len(expected_edit_rejections),
+                1,
+                "the injected session edit rejection must remain an expected API response",
+            )
+            require_equal(
+                len(expected_edit_console_errors),
+                len(expected_edit_rejections),
+                "each expected edit rejection must produce one classified Chromium resource error",
             )
         except BaseException:
             await _capture_diagnostics(context, page, diagnostics_dir, browser_failures)
@@ -634,6 +653,7 @@ async def _run_browser_contract(
             "manual_mutation_reobservation",
             "sessions_list",
             "session_detail",
+            "session_annotation_editing",
             "event_detail",
             "event_filters",
             "exact_event_lookup",
@@ -648,6 +668,7 @@ async def _run_browser_contract(
         "page_errors": 0,
         "mutation_observer_aborts": len(expected_observer_aborts),
         "session_query_aborts": len(expected_query_aborts),
+        "session_edit_rejections": len(expected_edit_rejections),
         "request_failures": 0,
         "api_errors": 0,
     }
@@ -675,6 +696,7 @@ async def _exercise_dashboard(
     await expect(page.get_by_role("heading", name=SESSION_ID)).to_be_visible()
     token_stat = page.get_by_text("Tokens", exact=True).locator("..")
     await expect(token_stat.get_by_text("15", exact=True)).to_be_visible()
+    await _exercise_session_annotations(page)
 
     completed_event = page.get_by_role("button", name=re.compile(r"model\.completed"))
     await expect(completed_event).to_be_visible()
@@ -728,6 +750,106 @@ async def _exercise_dashboard(
     await expect(include_thinking).to_be_checked()
     await expect(thinking_payload).to_be_visible()
     await _exercise_existing_session_mutations(page, base_url, provider)
+
+
+async def _exercise_session_annotations(page: Page) -> None:
+    labels_path = f"**/api/sessions/{SESSION_ID}/labels"
+    metadata_path = f"**/api/sessions/{SESSION_ID}/metadata"
+    label_saves = 0
+    metadata_saves = 0
+
+    async def reject_first_label_save(route, request) -> None:
+        nonlocal label_saves
+        if request.method == "PATCH":
+            label_saves += 1
+            if label_saves == 1:
+                await route.fulfill(
+                    status=422,
+                    headers={"content-type": "application/json"},
+                    body=json.dumps({"detail": "Injected session label validation failure."}),
+                )
+                return
+        await route.continue_()
+
+    async def count_metadata_saves(route, request) -> None:
+        nonlocal metadata_saves
+        if request.method == "PATCH":
+            metadata_saves += 1
+        await route.continue_()
+
+    await page.route(labels_path, reject_first_label_save)
+    await page.route(metadata_path, count_metadata_saves)
+    try:
+        await expect(page.get_by_text("stage=initial", exact=True)).to_be_visible()
+        await expect(page.locator("pre").filter(has_text="dashboard-customer")).to_be_visible()
+        await expect(
+            page.locator("pre").filter(has_text="runtime-dashboard-marker")
+        ).to_be_visible()
+
+        await page.get_by_role("button", name="Edit labels", exact=True).click()
+        labels_editor = page.get_by_label("Session labels JSON")
+        pending_labels = '{"stage":"draft-preserved-across-metadata-save"}'
+        await labels_editor.fill(pending_labels)
+
+        # A confirmed metadata response replaces the detail cache. The independently
+        # active labels editor must retain its draft across that parent re-render.
+        await page.get_by_role("button", name="Edit metadata", exact=True).click()
+        metadata_editor = page.get_by_label("Session metadata JSON")
+        await metadata_editor.fill(
+            '{"customer":{"id":"dashboard-customer"},"marker":"metadata-browser-marker"}'
+        )
+        await page.get_by_role("button", name="Save metadata", exact=True).click()
+        await expect(page.locator("pre").filter(has_text="metadata-browser-marker")).to_be_visible()
+        await expect(labels_editor).to_have_value(pending_labels)
+        require_equal(metadata_saves, 1, "saving metadata must send exactly one PATCH")
+
+        await page.get_by_role("button", name="Cancel label editing", exact=True).click()
+        await expect(page.get_by_role("button", name="Edit labels", exact=True)).to_be_focused()
+        await page.get_by_role("button", name="Edit labels", exact=True).click()
+        labels_editor = page.get_by_label("Session labels JSON")
+        await expect(labels_editor).to_have_value(re.compile(r'"stage": "initial"'))
+
+        await labels_editor.fill('{"stage":1}')
+        await page.get_by_role("button", name="Save labels", exact=True).click()
+        await expect(page.get_by_text('Label "stage" must have a string value.')).to_be_visible()
+        require_equal(label_saves, 0, "client-invalid labels must not reach the server")
+
+        valid_labels = '{"stage":"review","tenant":"acme"}'
+        await labels_editor.fill(valid_labels)
+        await page.get_by_role("button", name="Save labels", exact=True).click()
+        await expect(
+            page.get_by_text("Injected session label validation failure.", exact=True)
+        ).to_be_visible()
+        await expect(labels_editor).to_have_value(valid_labels)
+        await page.get_by_role("button", name="Save labels", exact=True).evaluate(
+            "button => { button.click(); button.click(); }"
+        )
+        await expect(page.get_by_text("stage=review", exact=True)).to_be_visible()
+        await expect(page.get_by_text("tenant=acme", exact=True)).to_be_visible()
+        require_equal(label_saves, 2, "duplicate save activation must send one retry PATCH")
+
+        await page.get_by_role("button", name="Edit metadata", exact=True).click()
+        metadata_editor = page.get_by_label("Session metadata JSON")
+        await metadata_editor.fill('{"cancelled":true}')
+        cancel_metadata = page.get_by_role("button", name="Cancel metadata editing", exact=True)
+        await cancel_metadata.click()
+        await expect(page.get_by_role("button", name="Edit metadata", exact=True)).to_be_focused()
+        require_equal(metadata_saves, 1, "cancelling metadata editing must not send a PATCH")
+
+        await page.get_by_role("button", name="Edit labels", exact=True).click()
+        await page.get_by_label("Session labels JSON").fill("{}")
+        await page.get_by_role("button", name="Save labels", exact=True).click()
+        await expect(page.get_by_text("No labels.", exact=True)).to_be_visible()
+
+        await page.reload(wait_until="networkidle")
+        await expect(page.get_by_text("No labels.", exact=True)).to_be_visible()
+        await expect(page.locator("pre").filter(has_text="metadata-browser-marker")).to_be_visible()
+        await expect(
+            page.locator("pre").filter(has_text="runtime-dashboard-marker")
+        ).to_be_visible()
+    finally:
+        await page.unroute(labels_path, reject_first_label_save)
+        await page.unroute(metadata_path, count_metadata_saves)
 
 
 async def _exercise_session_discovery(
@@ -1169,6 +1291,8 @@ def _record_browser_failures(
     expected_observer_aborts: list[ObserverAbort],
     expected_observer_abort_paths: set[str],
     expected_query_aborts: list[str],
+    expected_edit_rejections: list[str],
+    expected_edit_console_errors: list[str],
 ) -> None:
     def record_request_failure(request: Request) -> None:
         path = urlsplit(request.url).path
@@ -1200,22 +1324,35 @@ def _record_browser_failures(
             return
         failures["request_failures"].append(detail)
 
-    page.on(
-        "console",
-        lambda message: (
-            failures["console_errors"].append(message.text) if message.type == "error" else None
-        ),
-    )
+    def record_response(response) -> None:
+        request = response.request
+        path = urlsplit(response.url).path
+        detail = f"{response.status} {request.method} {response.url}"
+        if (
+            response.status == 422
+            and request.method == "PATCH"
+            and path == f"/api/sessions/{SESSION_ID}/labels"
+        ):
+            expected_edit_rejections.append(detail)
+            return
+        if "/api/" in response.url and response.status >= 400:
+            failures["api_errors"].append(detail)
+
+    def record_console(message) -> None:
+        if message.type != "error":
+            return
+        if (
+            message.text
+            == "Failed to load resource: the server responded with a status of 422 (Unprocessable Entity)"
+        ):
+            expected_edit_console_errors.append(message.text)
+            return
+        failures["console_errors"].append(message.text)
+
+    page.on("console", record_console)
     page.on("pageerror", lambda error: failures["page_errors"].append(str(error)))
     page.on("requestfailed", record_request_failure)
-    page.on(
-        "response",
-        lambda response: (
-            failures["api_errors"].append(f"{response.status} {response.url}")
-            if "/api/" in response.url and response.status >= 400
-            else None
-        ),
-    )
+    page.on("response", record_response)
 
 
 def _require_no_browser_failures(failures: dict[str, list[str]]) -> None:

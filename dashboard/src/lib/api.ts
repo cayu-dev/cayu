@@ -50,6 +50,10 @@ import type {
   ToolApprovalRecoveryBody,
   ToolApprovalRecoveryOutcome,
   ToolRoundRecoveryBody,
+  UpdateSessionLabelsApiSessionsSessionIdLabelsPatchResponse,
+  UpdateSessionLabelsBody,
+  UpdateSessionMetadataApiSessionsSessionIdMetadataPatchResponse,
+  UpdateSessionMetadataBody,
   UserInputRecoveryBody,
 } from "./generated/server-api"
 
@@ -99,6 +103,8 @@ export type SessionTranscriptPage = GetSessionTranscriptApiSessionsSessionIdTran
 export type SessionTranscriptQuery = NonNullable<
   GetSessionTranscriptApiSessionsSessionIdTranscriptGetData["query"]
 >
+export type SessionLabelsUpdate = UpdateSessionLabelsBody
+export type SessionMetadataUpdate = UpdateSessionMetadataBody
 export type SessionsSummary = GetSessionsSummaryApiSessionsSummaryPostResponse
 export type SessionListQuery = NonNullable<ListSessionsApiSessionsGetData["query"]>
 export type SessionsSummaryQuery = NonNullable<
@@ -181,6 +187,13 @@ function postJson<T>(path: string, body?: unknown): Promise<T> {
   return requestJson<T>(path, {
     method: "POST",
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  })
+}
+
+function patchJson<T>(path: string, body: unknown): Promise<T> {
+  return requestJson<T>(path, {
+    method: "PATCH",
+    body: JSON.stringify(body),
   })
 }
 
@@ -277,6 +290,26 @@ export async function fetchSessionsSummary(
 
 export async function fetchSession(id: string): Promise<SessionDetail> {
   return requestJson<SessionDetail>(`/sessions/${encodeURIComponent(id)}`)
+}
+
+export async function updateSessionLabels(
+  id: string,
+  body: SessionLabelsUpdate,
+): Promise<SessionDetail> {
+  return patchJson<UpdateSessionLabelsApiSessionsSessionIdLabelsPatchResponse>(
+    `/sessions/${encodeURIComponent(id)}/labels`,
+    body,
+  )
+}
+
+export async function updateSessionMetadata(
+  id: string,
+  body: SessionMetadataUpdate,
+): Promise<SessionDetail> {
+  return patchJson<UpdateSessionMetadataApiSessionsSessionIdMetadataPatchResponse>(
+    `/sessions/${encodeURIComponent(id)}/metadata`,
+    body,
+  )
 }
 
 export async function fetchSessionState(id: string, signal?: AbortSignal): Promise<SessionState> {

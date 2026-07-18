@@ -66,6 +66,7 @@ from cayu.runtime.sessions import (
     _activate_session_run_fence,
     _active_unexpired_session_operation_id,
     _assert_session_run_epoch,
+    _assert_session_run_epoch_value,
     _copy_session_event_batch,
     _current_session_run_epoch,
     _deactivate_session_run_fence,
@@ -80,12 +81,14 @@ from cayu.runtime.sessions import (
     copy_run_request,
     copy_session_identity,
     copy_session_query,
+    copy_session_user_metadata,
     copy_transcript_messages,
     copy_transcript_query,
     decode_session_cursor,
     encode_session_cursor,
     enforce_pending_action_result_size,
     filter_transcript_records,
+    replace_session_user_metadata,
     session_next_cursor,
     session_outcome,
 )
@@ -949,14 +952,12 @@ class SQLiteSessionStore(SessionStore):
                 epoch_clause = "" if expected_run_epoch is None else " AND run_epoch = ?"
                 params: list[object] = [
                     sqlite_support.format_datetime(updated_at),
-                    sqlite_support.format_datetime(updated_at),
                     session_id,
                 ]
                 if expected_run_epoch is not None:
                     params.append(expected_run_epoch)
                 cursor = self._connection.execute(
-                    "UPDATE cayu_sessions SET updated_at = ?, last_activity_at = ? "
-                    f"WHERE id = ?{epoch_clause}",
+                    f"UPDATE cayu_sessions SET updated_at = ? WHERE id = ?{epoch_clause}",
                     params,
                 )
                 if cursor.rowcount != 1:
@@ -984,33 +985,34 @@ class SQLiteSessionStore(SessionStore):
 
     async def update_metadata(self, session_id: str, metadata: dict[str, Any]) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
-        new_metadata = copy_json_value(metadata, "metadata")
-        if type(new_metadata) is not dict:
-            raise TypeError("Session metadata must be an object.")
+        user_metadata = copy_session_user_metadata(metadata)
         updated_at = datetime.now(UTC)
-        expected_run_epoch = _current_session_run_epoch(session_id)
         async with self._lock:
-            with self._connection:
-                epoch_clause = "" if expected_run_epoch is None else " AND run_epoch = ?"
-                params: list[object] = [
-                    sqlite_support.json_dumps(new_metadata),
-                    sqlite_support.format_datetime(updated_at),
-                    sqlite_support.format_datetime(updated_at),
-                    session_id,
-                ]
-                if expected_run_epoch is not None:
-                    params.append(expected_run_epoch)
-                cursor = self._connection.execute(
-                    "UPDATE cayu_sessions SET metadata_json = ?, updated_at = ?, "
-                    f"last_activity_at = ? WHERE id = ?{epoch_clause}",
-                    params,
-                )
-                if cursor.rowcount != 1:
-                    if expected_run_epoch is not None:
-                        _raise_session_write_conflict(
-                            self._connection, session_id, expected_run_epoch
-                        )
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                row = self._connection.execute(
+                    "SELECT run_epoch, metadata_json FROM cayu_sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if row is None:
                     raise KeyError(f"Session not found: {session_id}")
+                _assert_session_run_epoch_value(session_id, row["run_epoch"])
+                new_metadata = replace_session_user_metadata(
+                    json.loads(row["metadata_json"]),
+                    user_metadata,
+                )
+                self._connection.execute(
+                    "UPDATE cayu_sessions SET metadata_json = ?, updated_at = ? WHERE id = ?",
+                    (
+                        sqlite_support.json_dumps(new_metadata),
+                        sqlite_support.format_datetime(updated_at),
+                        session_id,
+                    ),
+                )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
             loaded = self._load_unlocked(session_id)
             if loaded is None:
                 raise KeyError(f"Session not found: {session_id}")

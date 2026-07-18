@@ -317,7 +317,7 @@ export function EnvironmentsPage() {
     filteredEnvironments[0] ??
     null
   const relatedSessions = useQuery({
-    queryKey: ["environment-related-sessions", selectedEnvironment?.name],
+    queryKey: ["sessions-summary", "environment-related", selectedEnvironment?.name],
     queryFn: () =>
       fetchSessionsSummary({
         environment_name: selectedEnvironment?.name,

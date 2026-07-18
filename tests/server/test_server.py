@@ -5261,6 +5261,10 @@ def test_server_updates_session_labels() -> None:
     # An invalid label (blank value) is a client error (422), not an unhandled 500.
     invalid = client.patch("/api/sessions/sess_lab/labels", json={"labels": {"k": "   "}})
     assert invalid.status_code == 422
+    non_durable = client.patch(
+        "/api/sessions/sess_lab/labels", json={"labels": {"stage": "review\x00hidden"}}
+    )
+    assert non_durable.status_code == 422
     # A typo'd key must 422 (extra="forbid"), NOT silently replace all labels with {}.
     typo = client.patch("/api/sessions/sess_lab/labels", json={"lables": {"a": "b"}})
     assert typo.status_code == 422
@@ -5273,19 +5277,60 @@ def test_server_updates_session_labels() -> None:
 
 def test_server_updates_session_metadata() -> None:
     async def seed(store):
-        await _create_session(store, "sess_meta", metadata={"a": 1})
+        await _create_session(
+            store,
+            "sess_meta",
+            metadata={
+                "a": 1,
+                "subagent": {"mode": "background"},
+                "cayu:taint_labels": ["untrusted"],
+            },
+        )
 
     _, client = _lifecycle_store_and_client(seed)
 
     response = client.patch("/api/sessions/sess_meta/metadata", json={"metadata": {"b": [1, 2]}})
     assert response.status_code == 200
-    assert response.json()["metadata"] == {"b": [1, 2]}
+    expected = {
+        "b": [1, 2],
+        "subagent": {"mode": "background"},
+        "cayu:taint_labels": ["untrusted"],
+    }
+    assert response.json()["metadata"] == expected
     missing = client.patch("/api/sessions/sess_missing/metadata", json={"metadata": {}})
     assert missing.status_code == 404
     # Typo'd key / missing field must 422, never silently wipe metadata.
     assert client.patch("/api/sessions/sess_meta/metadata", json={"metadat": {}}).status_code == 422
     assert client.patch("/api/sessions/sess_meta/metadata", json={}).status_code == 422
-    assert client.get("/api/sessions/sess_meta").json()["metadata"] == {"b": [1, 2]}
+    assert (
+        client.patch(
+            "/api/sessions/sess_meta/metadata",
+            json={"metadata": {"subagent": {}}},
+        ).status_code
+        == 422
+    )
+    assert (
+        client.patch(
+            "/api/sessions/sess_meta/metadata",
+            json={"metadata": {"cayu:taint_labels": []}},
+        ).status_code
+        == 422
+    )
+    assert (
+        client.patch(
+            "/api/sessions/sess_meta/metadata", json={"metadata": {"nested": ["value\x00"]}}
+        ).status_code
+        == 422
+    )
+    assert (
+        client.patch(
+            "/api/sessions/sess_meta/metadata",
+            content=b'{"metadata":{"nested":"\\ud800"}}',
+            headers={"content-type": "application/json"},
+        ).status_code
+        == 422
+    )
+    assert client.get("/api/sessions/sess_meta").json()["metadata"] == expected
 
 
 def test_server_lists_sessions_with_cursor_pagination() -> None:

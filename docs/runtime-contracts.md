@@ -371,7 +371,7 @@ Events emitted for an environment-backed run carry `environment_name` as a top-l
 
 Run ownership is a required part of the `SessionStore` contract. A successful `transition_status(..., to_status=RUNNING)` or `transition_status_and_checkpoint(..., to_status=RUNNING)` increments `Session.run_epoch` and binds that epoch to the current execution context. `fence_stalled_run(...)` atomically verifies status and inactivity, increments the epoch, refreshes activity, and binds the replacement claim. While a claim is active, runtime progress writes to status, model, labels, metadata, events, transcript, or checkpoint must compare the durable epoch and raise `SessionRunFenced` after ownership changes. `release_run_fence(...)` runs once after trailing writes; if the task still owns the durable epoch, it increments that epoch before clearing task-local ownership so child contexts that inherited the old claim cannot write late. Custom stores must implement both fencing methods and equivalent task-local ownership tracking.
 
-`Session.last_activity_at` is the durable recovery signal. Runtime progress writes refresh it, and inactive-session queries must apply `last_activity_before` in storage before `limit` so recent rows cannot hide older stalled work. Recovery must claim a stalled run through `fence_stalled_run(...)` before repairing it; a plain status update is not an ownership transfer.
+`Session.last_activity_at` is the durable recovery signal. Runtime progress writes refresh it, and inactive-session queries must apply `last_activity_before` in storage before `limit` so recent rows cannot hide older stalled work. Operator annotation writes through `update_labels(...)` or `update_metadata(...)` advance `updated_at` but leave `last_activity_at` unchanged, so editing a stalled session cannot postpone recovery. Recovery must claim a stalled run through `fence_stalled_run(...)` before repairing it; a plain status update is not an ownership transfer.
 
 An app can register either a concrete `Environment` or an `EnvironmentFactory` under an `EnvironmentSpec` name. A factory receives durable session context (`session_id`, `agent_name`, `environment_name`, explicit `operation`, parent session id, causal budget id, labels, metadata, and previous reconnect metadata for that session/environment) and returns a concrete `Environment` for that session. `operation=CREATE` is used for new sessions and a fork's first child allocation; `operation=RECONNECT` is used for later resume/recovery and requires the factory to fail closed rather than allocate a replacement when durable identity is missing. The returned environment must keep the registered environment name so resume/fork/dispatch do not silently switch identity. Factory-backed environments are resolved before workspace binding, MCP setup, tool execution, and, for new sessions, workspace-instruction loading. The runtime emits `environment.factory.started`, `environment.factory.completed`, and `environment.factory.failed` with JSON-safe diagnostics and never serializes live workspace, runner, or vault objects. `EnvironmentFactoryResult.reconnect_metadata` is non-secret durable state such as a sandbox id, region, image, or attach handle; Cayu atomically checkpoints it with runtime-owned allocation provenance under the registered environment name before emitting `environment.factory.completed`, and passes it back on later resume, approval continuation, or recovery. This provenance closes the checkpoint-to-event crash window: recovery reconnects an already-checkpointed child allocation even if its completion event was never written. A result that owns live reconnectable resources provides an explicit `release` callback: an uncheckpointed new allocation is released with `DISCARD`, while a reconnect or an already-checkpointed new allocation is released with `PRESERVE` so host handles are detached without deleting the durable resource. Cancellation after a checkpoint write begins also selects `PRESERVE`, because cancellation of a threaded or remote store await cannot prove that its durable commit stopped. Release runs to its result-level `release_timeout_s` bound despite caller cancellation (15 seconds by default), after which pending caller cancellation is re-raised. If a durable result omits that callback, Cayu leaves the allocation untouched rather than terminally closing an identity it has already committed, and records that limitation on the failure. Forks that copy checkpoint state also copy reconnect metadata as context, but the first child factory request is an explicit create operation; later child resumes reconnect the child's own allocation. Factory failure fails a new session before `session.started`; for pending approval continuation or manual approval recovery, factory failure is emitted before `session.resumed` and the session returns to `interrupted` with the approval still recoverable. Static environments still validate workspace instructions before creating a session, preserving the existing early-failure behavior for ordinary local runs.
 
@@ -672,11 +672,21 @@ method by loading and copying the full session or checkpoint. The richer
 is intentionally an on-demand/low-frequency read rather than a heartbeat.
 
 `GET /api/sessions/{session_id}` is the stable session metadata read. Its
-`ApiSession` response contains identity, labels, and full user-authored metadata
+`ApiSession` response contains identity, labels, and complete session metadata
 directly; it does not load or embed events, transcript messages, summary data,
-or interruption-cascade state. This replaces the earlier compound response:
-clients must read session fields at the response root and use `/state`,
-`/events`, `/transcript`, and `/summary` for the separated bounded read models.
+or interruption-cascade state. Top-level `cayu:` entries and `subagent` are
+runtime-owned because policy enforcement and workflow recovery consume them.
+`PATCH /api/sessions/{session_id}/metadata` atomically replaces only the
+user-authored portion, preserves those runtime entries in the store transaction,
+and rejects attempts to supply them. An empty object therefore clears user
+metadata without erasing runtime state. The labels mutation remains a complete
+label-map replacement and rejects Cayu-reserved labels. Clients must read session
+fields at the response root and use `/state`, `/events`, `/transcript`, and
+`/summary` for the separated bounded read models. Custom `SessionStore`
+implementations can use `copy_session_user_metadata` before acquiring their write
+lock and `replace_session_user_metadata` inside the locked transaction to enforce
+the same ownership boundary without validating a large request while holding the
+lock.
 
 The optional server also exposes `GET /api/sessions/{session_id}/transcript`
 for paginated transcript inspection. It accepts `offset`, `limit`, and `role`

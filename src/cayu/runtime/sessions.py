@@ -99,11 +99,15 @@ def _deactivate_session_run_fence(session_id: str) -> None:
 
 
 def _assert_session_run_epoch(session_id: str, session: Session) -> None:
+    _assert_session_run_epoch_value(session_id, session.run_epoch)
+
+
+def _assert_session_run_epoch_value(session_id: str, current_run_epoch: int) -> None:
     expected = _current_session_run_epoch(session_id)
-    if expected is not None and session.run_epoch != expected:
+    if expected is not None and current_run_epoch != expected:
         raise SessionRunFenced(
             f"Session run epoch no longer owns {session_id}: expected {expected}, "
-            f"current {session.run_epoch}."
+            f"current {current_run_epoch}."
         )
 
 
@@ -118,6 +122,54 @@ class SessionStatus(StrEnum):
 
 SESSION_MESSAGE_CONTENT_MAX_BYTES = 65_536
 SESSION_MESSAGE_DELIVERY_BATCH_LIMIT = 100
+SESSION_RUNTIME_METADATA_KEYS = frozenset({"subagent"})
+SESSION_RUNTIME_METADATA_PREFIX = "cayu:"
+
+
+def is_runtime_owned_session_metadata_key(key: str) -> bool:
+    """Return whether a session metadata entry is owned by Cayu's runtime."""
+
+    return key in SESSION_RUNTIME_METADATA_KEYS or key.startswith(SESSION_RUNTIME_METADATA_PREFIX)
+
+
+def copy_session_user_metadata(replacement: dict[str, Any]) -> dict[str, Any]:
+    """Validate and detach a complete user-authored metadata replacement."""
+
+    copied_replacement = copy_json_value(replacement, "metadata")
+    if type(copied_replacement) is not dict:
+        raise TypeError("Session metadata must be an object.")
+    require_durable_json_text(copied_replacement, "metadata")
+    for key in copied_replacement:
+        if is_runtime_owned_session_metadata_key(key):
+            raise ValueError(
+                f"Session metadata key {key!r} is runtime-owned and cannot be replaced."
+            )
+    return copied_replacement
+
+
+def replace_session_user_metadata(
+    current: dict[str, Any],
+    replacement: dict[str, Any],
+) -> dict[str, Any]:
+    """Combine validated user metadata with the current runtime-owned entries.
+
+    Callers perform this merge while holding the store's session lock. Runtime
+    metadata participates in recovery and policy enforcement, so it must be read
+    and retained in the same transaction that writes the replacement.
+    """
+
+    if type(current) is not dict:
+        raise TypeError("Current session metadata must be an object.")
+    if type(replacement) is not dict:
+        raise TypeError("Session metadata replacement must be an object.")
+    if any(is_runtime_owned_session_metadata_key(key) for key in replacement):
+        raise ValueError("Session user metadata replacement contains a runtime-owned key.")
+    runtime_metadata = {
+        key: copy_json_value(value, f"current_metadata.{key}")
+        for key, value in current.items()
+        if is_runtime_owned_session_metadata_key(key)
+    }
+    return {**replacement, **runtime_metadata}
 
 
 class SessionMessageDeliveryMode(StrEnum):
@@ -2042,13 +2094,21 @@ class SessionStore(ABC):
     async def update_labels(self, session_id: str, labels: dict[str, str]) -> Session:
         """Replace a session's labels (full replacement, not a merge) and return it.
 
+        Annotation writes update ``updated_at`` but do not refresh the runtime
+        recovery signal in ``last_activity_at``.
+
         Raises ``KeyError`` if the session does not exist. Default raises
         ``NotImplementedError`` so out-of-tree stores keep working.
         """
         raise NotImplementedError("This SessionStore does not support update_labels.")
 
     async def update_metadata(self, session_id: str, metadata: dict[str, Any]) -> Session:
-        """Replace a session's metadata (full replacement, not a merge) and return it.
+        """Replace a session's user metadata and return the updated session.
+
+        This is a full replacement of user-authored metadata, not a merge.
+        Runtime-owned entries are retained atomically and cannot be supplied by
+        callers. Annotation writes update ``updated_at`` but do not refresh the
+        runtime recovery signal in ``last_activity_at``.
 
         Raises ``KeyError`` if the session does not exist. Default raises
         ``NotImplementedError`` so out-of-tree stores keep working.
@@ -2451,26 +2511,21 @@ class InMemorySessionStore(SessionStore):
                 raise KeyError(f"Session not found: {session_id}")
             _assert_session_run_epoch(session_id, session)
             now = datetime.now(UTC)
-            updated = session.model_copy(
-                update={"labels": new_labels, "updated_at": now, "last_activity_at": now}
-            )
+            updated = session.model_copy(update={"labels": new_labels, "updated_at": now})
             self._sessions[session_id] = updated
             return updated.model_copy(deep=True)
 
     async def update_metadata(self, session_id: str, metadata: dict[str, Any]) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
-        new_metadata = copy_json_value(metadata, "metadata")
-        if type(new_metadata) is not dict:
-            raise TypeError("Session metadata must be an object.")
+        user_metadata = copy_session_user_metadata(metadata)
         async with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
             _assert_session_run_epoch(session_id, session)
+            new_metadata = replace_session_user_metadata(session.metadata, user_metadata)
             now = datetime.now(UTC)
-            updated = session.model_copy(
-                update={"metadata": new_metadata, "updated_at": now, "last_activity_at": now}
-            )
+            updated = session.model_copy(update={"metadata": new_metadata, "updated_at": now})
             self._sessions[session_id] = updated
             return updated.model_copy(deep=True)
 

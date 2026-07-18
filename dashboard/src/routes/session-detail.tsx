@@ -29,6 +29,7 @@ import {
   MutationTransportStatus,
   mutationTransportErrorMessage,
 } from "../components/dashboard/mutation-transport-status"
+import { SessionAnnotations } from "../components/dashboard/session-annotations"
 import { Badge } from "../components/ui/badge"
 import { Button, buttonVariants } from "../components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card"
@@ -2796,6 +2797,8 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
       </Card>
 
       <SessionArtifacts artifacts={sessionArtifacts.data?.artifacts ?? []} sessionId={session.id} />
+
+      <SessionAnnotations key={session.id} session={session} />
 
       {pendingAction && (
         <PendingActionBanner

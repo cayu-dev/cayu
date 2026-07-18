@@ -5508,6 +5508,7 @@
       "properties": {
         "metadata": {
           "additionalProperties": true,
+          "description": "Complete replacement for user-authored session metadata. Cayu-owned entries are preserved by the store and must not be supplied.",
           "title": "Metadata",
           "type": "object"
         }
