@@ -20,7 +20,7 @@ from cayu.runtime.approvals import (
     ToolApprovalRequest,
     resolution_actor_payload,
 )
-from cayu.runtime.sessions import Session
+from cayu.runtime.sessions import Session, SessionStore
 from cayu.runtime.tool_policy import ToolPolicyResult
 from cayu.vaults import SecretRedactor
 
@@ -40,6 +40,17 @@ _USER_INPUT_ROUND_TERMINAL_EVENT_TYPES = frozenset(
         EventType.TOOL_CALL_BLOCKED,
     }
 )
+
+
+async def checkpoint_without_pending_approval(
+    session_store: SessionStore,
+    session_id: str,
+) -> dict[str, Any]:
+    """Copy a session checkpoint without its pending approval marker."""
+    checkpoint = await session_store.load_checkpoint(session_id)
+    copied = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+    copied.pop(PENDING_TOOL_APPROVAL_CHECKPOINT_KEY, None)
+    return copied
 
 
 def pending_approval_expired(approval: PendingToolApproval, now: datetime) -> bool:

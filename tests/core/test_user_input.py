@@ -23,7 +23,10 @@ from cayu.runtime import (
     InMemorySessionStore,
     NativeStructuredOutputUnsupported,
     ResumeRequest,
+    RetryPolicy,
+    RunLimits,
     RunRequest,
+    Session,
     SessionStatus,
     StructuredOutputSpec,
     StructuredOutputStrategy,
@@ -60,6 +63,56 @@ class _ScriptedProvider(ModelProvider):
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
+class _RunConfigProvider(ModelProvider):
+    """Pause for input, request a follow-up tool, then finish."""
+
+    name = "fake"
+
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            yield ModelStreamEvent.tool_call(
+                id="call_input",
+                name="ask_user",
+                arguments={"question": "Continue?"},
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        if len(self.requests) == 2:
+            yield ModelStreamEvent.tool_call(
+                id="call_echo",
+                name="echo",
+                arguments={"text": "after input"},
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        yield ModelStreamEvent.text_delta("done")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _BlockingContinuationProvider(_ScriptedProvider):
+    def __init__(self, first_round: list[tuple[str, str, dict]]) -> None:
+        super().__init__(first_round)
+        self.continuation_started: asyncio.Event | None = None
+        self.never_complete: asyncio.Event | None = None
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            for call_id, name, arguments in self._first_round:
+                yield ModelStreamEvent.tool_call(id=call_id, name=name, arguments=arguments)
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        if self.continuation_started is None or self.never_complete is None:
+            raise AssertionError("Blocking continuation events were not initialized.")
+        self.continuation_started.set()
+        await self.never_complete.wait()
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
 class _EchoTool(Tool):
     spec = ToolSpec(
         name="echo",
@@ -80,6 +133,26 @@ class _EchoTool(Tool):
         return ToolResult(content=args["text"])
 
 
+class _BlockingTool(Tool):
+    spec = ToolSpec(
+        name="block",
+        description="Block until the consuming runtime task is cancelled.",
+        input_schema={"type": "object", "properties": {}},
+    )
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started: asyncio.Event | None = None
+        self.never_complete: asyncio.Event | None = None
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        if self.started is None or self.never_complete is None:
+            raise AssertionError("Blocking tool events were not initialized.")
+        self.started.set()
+        await self.never_complete.wait()
+        return ToolResult(content="unexpected")
+
+
 class _RecordingReleaseStore(InMemorySessionStore):
     def __init__(self) -> None:
         super().__init__()
@@ -88,6 +161,86 @@ class _RecordingReleaseStore(InMemorySessionStore):
     async def release_run_fence(self, session_id: str) -> None:
         self.release_calls[session_id] = self.release_calls.get(session_id, 0) + 1
         await super().release_run_fence(session_id)
+
+
+class _FailingReleaseAfterCleanupStore(_RecordingReleaseStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_next_release = False
+
+    async def release_run_fence(self, session_id: str) -> None:
+        await super().release_run_fence(session_id)
+        if self.fail_next_release:
+            self.fail_next_release = False
+            raise RuntimeError("run fence release unavailable")
+
+
+class _FailingReleaseBeforeCleanupStore(_RecordingReleaseStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_next_release = False
+
+    async def release_run_fence(self, session_id: str) -> None:
+        self.release_calls[session_id] = self.release_calls.get(session_id, 0) + 1
+        if self.fail_next_release:
+            self.fail_next_release = False
+            raise RuntimeError("run fence release unavailable before cleanup")
+        await InMemorySessionStore.release_run_fence(self, session_id)
+
+
+class _BlockingCommittedRunningTransitionStore(_RecordingReleaseStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.block_next_running_transition = False
+        self.transition_committed: asyncio.Event | None = None
+        self.finish_transition: asyncio.Event | None = None
+
+    async def transition_status(
+        self,
+        session_id: str,
+        *,
+        from_statuses: set[SessionStatus],
+        to_status: SessionStatus,
+    ) -> Session:
+        session = await super().transition_status(
+            session_id,
+            from_statuses=from_statuses,
+            to_status=to_status,
+        )
+        if self.block_next_running_transition and to_status == SessionStatus.RUNNING:
+            self.block_next_running_transition = False
+            if self.transition_committed is None or self.finish_transition is None:
+                raise AssertionError("Transition boundary events were not initialized.")
+            self.transition_committed.set()
+            await self.finish_transition.wait()
+        return session
+
+
+class _BlockingAbandonedFinalizationStore(_RecordingReleaseStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.block_next_interrupted_transition = False
+        self.finalization_started: asyncio.Event | None = None
+        self.finish_finalization: asyncio.Event | None = None
+
+    async def transition_status(
+        self,
+        session_id: str,
+        *,
+        from_statuses: set[SessionStatus],
+        to_status: SessionStatus,
+    ) -> Session:
+        if self.block_next_interrupted_transition and to_status == SessionStatus.INTERRUPTED:
+            self.block_next_interrupted_transition = False
+            if self.finalization_started is None or self.finish_finalization is None:
+                raise AssertionError("Finalization boundary events were not initialized.")
+            self.finalization_started.set()
+            await self.finish_finalization.wait()
+        return await super().transition_status(
+            session_id,
+            from_statuses=from_statuses,
+            to_status=to_status,
+        )
 
 
 async def _collect(app: CayuApp, request: RunRequest) -> list[Event]:
@@ -203,7 +356,7 @@ def test_resolve_user_input_injects_answer_and_continues() -> None:
 
 
 def test_resolve_user_input_releases_run_fence_once_after_handoff() -> None:
-    async def resolve(*, close_after_handoff: bool) -> tuple[int, SessionStatus]:
+    async def resolve(*, close_after_handoff: bool) -> tuple[int, SessionStatus, bool]:
         session_id = "s_release_close" if close_after_handoff else "s_release_success"
         store = _RecordingReleaseStore()
         app, _ = _build(
@@ -234,13 +387,245 @@ def test_resolve_user_input_releases_run_fence_once_after_handoff() -> None:
             await _drain(stream)
         session = await store.load(session_id)
         assert session is not None
-        return store.release_calls[session_id] - releases_before_resolution, session.status
+        return (
+            store.release_calls[session_id] - releases_before_resolution,
+            session.status,
+            app._session_control.has_active_tasks(session_id),
+        )
 
-    success_releases, success_status = asyncio.run(resolve(close_after_handoff=False))
-    close_releases, close_status = asyncio.run(resolve(close_after_handoff=True))
+    success_releases, success_status, success_has_active_tasks = asyncio.run(
+        resolve(close_after_handoff=False)
+    )
+    close_releases, close_status, close_has_active_tasks = asyncio.run(
+        resolve(close_after_handoff=True)
+    )
 
     assert (success_releases, success_status) == (1, SessionStatus.COMPLETED)
     assert (close_releases, close_status) == (1, SessionStatus.INTERRUPTED)
+    assert success_has_active_tasks is False
+    assert close_has_active_tasks is False
+
+
+def test_resolve_user_input_task_cancellation_finalizes_and_preserves_pending_state() -> None:
+    async def run() -> None:
+        session_id = "s_resolution_task_cancelled"
+        store = _FailingReleaseAfterCleanupStore()
+        blocking_tool = _BlockingTool()
+        app, _ = _build(
+            [
+                ("call_input", "ask_user", {"question": "Continue?"}),
+                ("call_block", "block", {}),
+            ],
+            tools=[UserInputTool(), blocking_tool],
+            store=store,
+        )
+        blocking_tool.started = asyncio.Event()
+        blocking_tool.never_complete = asyncio.Event()
+        pause_events = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        input_id = next(
+            event for event in pause_events if event.type == EventType.SESSION_AWAITING_USER_INPUT
+        ).payload["input_id"]
+
+        releases_before = store.release_calls[session_id]
+        store.fail_next_release = True
+        resolution_task = asyncio.create_task(
+            _drain(
+                app.resolve_user_input(
+                    UserInputResponse(session_id=session_id, input_id=input_id, answer="yes")
+                )
+            )
+        )
+        await asyncio.wait_for(blocking_tool.started.wait(), timeout=5)
+        assert resolution_task.cancelling() == 0
+        resolution_task.cancel("cancel user-input resolution")
+        assert resolution_task.cancelling() == 1
+        try:
+            await resolution_task
+        except asyncio.CancelledError as cancellation:
+            assert cancellation.args == ("cancel user-input resolution",)
+            assert any(
+                "run fence release" in note for note in getattr(cancellation, "__notes__", ())
+            )
+        else:
+            pytest.fail("User-input resolution did not preserve task cancellation.")
+
+        assert resolution_task.cancelled() is True
+        assert resolution_task.cancelling() == 1
+        session = await store.load(session_id)
+        assert session is not None
+        assert session.status == SessionStatus.INTERRUPTED
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        assert checkpoint["pending_user_input"]["input_id"] == input_id
+        events = await store.load_events(session_id)
+        assert events[-1].type == EventType.SESSION_INTERRUPTED
+        assert events[-1].payload["abandoned"] is True
+        assert store.release_calls[session_id] - releases_before == 1
+        assert app._session_control.has_active_tasks(session_id) is False
+
+    asyncio.run(run())
+
+
+def test_resolve_user_input_cancellation_after_running_transition_finalizes_claim() -> None:
+    async def run() -> None:
+        session_id = "s_resolution_cancelled_after_running_commit"
+        store = _BlockingCommittedRunningTransitionStore()
+        app, _ = _build(
+            [("call_input", "ask_user", {"question": "Continue?"})],
+            store=store,
+        )
+        pause_events = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        input_id = next(
+            event for event in pause_events if event.type == EventType.SESSION_AWAITING_USER_INPUT
+        ).payload["input_id"]
+
+        releases_before = store.release_calls[session_id]
+        store.transition_committed = asyncio.Event()
+        store.finish_transition = asyncio.Event()
+        store.block_next_running_transition = True
+        resolution_task = asyncio.create_task(
+            _drain(
+                app.resolve_user_input(
+                    UserInputResponse(session_id=session_id, input_id=input_id, answer="yes")
+                )
+            )
+        )
+        await asyncio.wait_for(store.transition_committed.wait(), timeout=5)
+        committed = await store.load(session_id)
+        assert committed is not None
+        assert committed.status == SessionStatus.RUNNING
+
+        resolution_task.cancel("cancel after running transition committed")
+        store.finish_transition.set()
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await resolution_task
+
+        assert raised.value.args == ("cancel after running transition committed",)
+        assert resolution_task.cancelled() is True
+        session = await store.load(session_id)
+        assert session is not None
+        assert session.status == SessionStatus.INTERRUPTED
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        assert checkpoint["pending_user_input"]["input_id"] == input_id
+        assert store.release_calls[session_id] - releases_before == 1
+        assert app._session_control.has_active_tasks(session_id) is False
+
+    asyncio.run(run())
+
+
+def test_resolve_user_input_repeated_cancellation_cannot_interrupt_finalization() -> None:
+    async def run() -> None:
+        session_id = "s_resolution_repeated_cancel_during_finalization"
+        store = _BlockingAbandonedFinalizationStore()
+        blocking_tool = _BlockingTool()
+        app, _ = _build(
+            [
+                ("call_input", "ask_user", {"question": "Continue?"}),
+                ("call_block", "block", {}),
+            ],
+            tools=[UserInputTool(), blocking_tool],
+            store=store,
+        )
+        blocking_tool.started = asyncio.Event()
+        blocking_tool.never_complete = asyncio.Event()
+        pause_events = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        input_id = next(
+            event for event in pause_events if event.type == EventType.SESSION_AWAITING_USER_INPUT
+        ).payload["input_id"]
+
+        releases_before = store.release_calls[session_id]
+        store.finalization_started = asyncio.Event()
+        store.finish_finalization = asyncio.Event()
+        store.block_next_interrupted_transition = True
+        resolution_task = asyncio.create_task(
+            _drain(
+                app.resolve_user_input(
+                    UserInputResponse(session_id=session_id, input_id=input_id, answer="yes")
+                )
+            )
+        )
+        await asyncio.wait_for(blocking_tool.started.wait(), timeout=5)
+        resolution_task.cancel("first cancellation")
+        await asyncio.wait_for(store.finalization_started.wait(), timeout=5)
+        resolution_task.cancel("second cancellation")
+        store.finish_finalization.set()
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await resolution_task
+
+        assert raised.value.args == ("first cancellation",)
+        assert resolution_task.cancelled() is True
+        assert resolution_task.cancelling() == 2
+        session = await store.load(session_id)
+        assert session is not None
+        assert session.status == SessionStatus.INTERRUPTED
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        assert checkpoint["pending_user_input"]["input_id"] == input_id
+        assert store.release_calls[session_id] - releases_before == 1
+        assert app._session_control.has_active_tasks(session_id) is False
+
+    asyncio.run(run())
+
+
+def test_resolve_user_input_aclose_surfaces_precleanup_fence_release_failure() -> None:
+    async def run() -> None:
+        session_id = "s_resolution_aclose_release_failure"
+        store = _FailingReleaseBeforeCleanupStore()
+        app, _ = _build(
+            [("call_input", "ask_user", {"question": "Continue?"})],
+            store=store,
+        )
+        pause_events = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        input_id = next(
+            event for event in pause_events if event.type == EventType.SESSION_AWAITING_USER_INPUT
+        ).payload["input_id"]
+
+        releases_before = store.release_calls[session_id]
+        stream = app.resolve_user_input(
+            UserInputResponse(session_id=session_id, input_id=input_id, answer="yes")
+        )
+        while (await anext(stream)).type != EventType.MODEL_STARTED:
+            pass
+        store.fail_next_release = True
+        with pytest.raises(RuntimeError, match="run fence release unavailable before cleanup"):
+            await stream.aclose()
+
+        session = await store.load(session_id)
+        assert session is not None
+        assert session.status == SessionStatus.INTERRUPTED
+        assert store.release_calls[session_id] - releases_before == 1
+        assert app._session_control.has_active_tasks(session_id) is False
+
+    asyncio.run(run())
 
 
 def test_resolve_user_input_events_carry_resolved_by_actor() -> None:
@@ -304,6 +689,104 @@ def test_resolve_user_input_events_carry_resolved_by_actor() -> None:
     )
     assert answered.payload["resolved_by"] == expected_actor
     assert asyncio.run(store.load("s_actor")).status == SessionStatus.COMPLETED
+
+
+def _run_config_app() -> tuple[CayuApp, InMemorySessionStore, _EchoTool]:
+    store = InMemorySessionStore()
+    echo = _EchoTool()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(_RunConfigProvider(), default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[UserInputTool(), echo],
+    )
+    return app, store, echo
+
+
+def test_resolve_user_input_restores_original_run_configuration() -> None:
+    app, store, echo = _run_config_app()
+    session_id = "s_input_restores_run_config"
+
+    pause_events = asyncio.run(
+        _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+                max_steps=7,
+                limits=RunLimits(max_tool_calls=1, scope="session"),
+                retry_policy=RetryPolicy(max_attempts=3),
+            ),
+        )
+    )
+    input_id = next(
+        event for event in pause_events if event.type == EventType.SESSION_AWAITING_USER_INPUT
+    ).payload["input_id"]
+    checkpoint = asyncio.run(store.load_checkpoint(session_id))
+    assert checkpoint is not None
+    pending = checkpoint["pending_user_input"]
+    assert pending["max_steps"] == 7
+    assert pending["limits"]["max_tool_calls"] == 1
+    assert pending["limits"]["scope"] == "session"
+    assert pending["retry_policy"]["max_attempts"] == 3
+    assert pending["budget_limits"] == []
+
+    events = asyncio.run(
+        _drain(
+            app.resolve_user_input(
+                UserInputResponse(
+                    session_id=session_id,
+                    input_id=input_id,
+                    answer="yes",
+                )
+            )
+        )
+    )
+
+    assert echo.metadata_by_text == {}
+    limit_events = [event for event in events if event.type == EventType.SESSION_LIMIT_REACHED]
+    assert len(limit_events) == 1
+    assert limit_events[0].payload["limit"] == "tool_calls"
+    session = asyncio.run(store.load(session_id))
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTED
+
+
+def test_resolve_user_input_explicit_limits_override_persisted_configuration() -> None:
+    app, _store, echo = _run_config_app()
+    session_id = "s_input_overrides_run_config"
+
+    pause_events = asyncio.run(
+        _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+                limits=RunLimits(max_tool_calls=1, scope="session"),
+            ),
+        )
+    )
+    input_id = next(
+        event for event in pause_events if event.type == EventType.SESSION_AWAITING_USER_INPUT
+    ).payload["input_id"]
+
+    events = asyncio.run(
+        _drain(
+            app.resolve_user_input(
+                UserInputResponse(
+                    session_id=session_id,
+                    input_id=input_id,
+                    answer="yes",
+                    limits=RunLimits(),
+                )
+            )
+        )
+    )
+
+    assert "after input" in echo.metadata_by_text
+    assert events[-1].type == EventType.SESSION_COMPLETED
 
 
 def test_mixed_round_executes_other_tools_and_keeps_model_order() -> None:
@@ -1023,6 +1506,167 @@ def test_recover_user_input_supplies_outcome_and_completes() -> None:
     results = {part.tool_call_id: part.content for part in parts}
     assert results["call_1"] == "recovered externally"  # operator-supplied outcome
     assert results["call_2"] == "a"  # ask_user answer injected on continuation
+
+
+def test_recover_user_input_closes_continuation_before_aclose_returns() -> None:
+    async def run() -> tuple[Event, SessionStatus, int, bool]:
+        session_id = "s_recovery_stream_closed"
+        store = _RecordingReleaseStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(
+            _ScriptedProvider(
+                [("call_1", "count", {}), ("call_2", "ask_user", {"question": "q"})],
+                final_text="all done",
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[UserInputTool(), _CountingTool()],
+        )
+        pause = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        input_id = next(
+            event for event in pause if event.type == EventType.SESSION_AWAITING_USER_INPUT
+        ).payload["input_id"]
+        await store.append_event(
+            session_id,
+            Event(
+                type=EventType.TOOL_CALL_STARTED,
+                session_id=session_id,
+                agent_name="assistant",
+                tool_name="count",
+                payload={"tool_call_id": "call_1"},
+            ),
+        )
+        stuck = await _drain(
+            app.resolve_user_input(
+                UserInputResponse(session_id=session_id, input_id=input_id, answer="a")
+            )
+        )
+        assert stuck[-1].payload.get("manual_recovery_required") is True
+
+        releases_before = store.release_calls.get(session_id, 0)
+        stream = app.recover_user_input(
+            UserInputRecoveryRequest(
+                session_id=session_id,
+                input_id=input_id,
+                answer="a",
+                tool_call_id="call_1",
+                outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                message="recovered externally",
+            )
+        )
+        while True:
+            boundary_event = await anext(stream)
+            if boundary_event.type == EventType.MODEL_STARTED:
+                break
+        assert app._session_control.has_active_tasks(session_id) is True
+        await stream.aclose()
+        release_delta = store.release_calls.get(session_id, 0) - releases_before
+        has_active_tasks = app._session_control.has_active_tasks(session_id)
+        session = await store.load(session_id)
+        assert session is not None
+        return boundary_event, session.status, release_delta, has_active_tasks
+
+    boundary_event, status, release_delta, has_active_tasks = asyncio.run(run())
+
+    assert boundary_event.type == EventType.MODEL_STARTED
+    assert status == SessionStatus.INTERRUPTED
+    assert release_delta == 1
+    assert has_active_tasks is False
+
+
+def test_recover_user_input_task_cancellation_finalizes_continuation() -> None:
+    async def run() -> None:
+        session_id = "s_recovery_task_cancelled"
+        store = _RecordingReleaseStore()
+        provider = _BlockingContinuationProvider(
+            [("call_count", "count", {}), ("call_input", "ask_user", {"question": "q"})]
+        )
+        provider.continuation_started = asyncio.Event()
+        provider.never_complete = asyncio.Event()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[UserInputTool(), _CountingTool()],
+        )
+        pause = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        input_id = next(
+            event for event in pause if event.type == EventType.SESSION_AWAITING_USER_INPUT
+        ).payload["input_id"]
+        await store.append_event(
+            session_id,
+            Event(
+                type=EventType.TOOL_CALL_STARTED,
+                session_id=session_id,
+                agent_name="assistant",
+                tool_name="count",
+                payload={"tool_call_id": "call_count"},
+            ),
+        )
+        stuck = await _drain(
+            app.resolve_user_input(
+                UserInputResponse(session_id=session_id, input_id=input_id, answer="yes")
+            )
+        )
+        assert stuck[-1].payload["manual_recovery_required"] is True
+
+        releases_before = store.release_calls[session_id]
+        recovery_task = asyncio.create_task(
+            _drain(
+                app.recover_user_input(
+                    UserInputRecoveryRequest(
+                        session_id=session_id,
+                        input_id=input_id,
+                        answer="yes",
+                        tool_call_id="call_count",
+                        outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                        message="count completed externally",
+                    )
+                )
+            )
+        )
+        await asyncio.wait_for(provider.continuation_started.wait(), timeout=5)
+        assert recovery_task.cancelling() == 0
+        recovery_task.cancel("cancel user-input recovery")
+        assert recovery_task.cancelling() == 1
+        try:
+            await recovery_task
+        except asyncio.CancelledError as cancellation:
+            assert cancellation.args == ("cancel user-input recovery",)
+        else:
+            pytest.fail("User-input recovery did not preserve task cancellation.")
+
+        assert recovery_task.cancelled() is True
+        assert recovery_task.cancelling() == 1
+        session = await store.load(session_id)
+        assert session is not None
+        assert session.status == SessionStatus.INTERRUPTED
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        assert "pending_user_input" not in checkpoint
+        events = await store.load_events(session_id)
+        assert events[-1].type == EventType.SESSION_INTERRUPTED
+        assert events[-1].payload["abandoned"] is True
+        assert store.release_calls[session_id] - releases_before == 1
+        assert app._session_control.has_active_tasks(session_id) is False
+
+    asyncio.run(run())
 
 
 def test_recover_user_input_rejects_tool_without_started_event() -> None:

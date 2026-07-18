@@ -662,24 +662,3 @@ def test_thinking_threads_through_request_copies() -> None:
         session_id="s", messages=[Message.text("user", "hi")], dispatch_id="d", thinking=cfg
     )
     assert copy_dispatch_request(dispatch).thinking == cfg
-
-
-def test_effective_approval_thinking_restores_pending_run_config() -> None:
-    from cayu.runtime.app import _effective_approval_thinking
-    from cayu.runtime.approvals import PendingToolApproval, PendingToolCallApproval
-
-    pending = PendingToolApproval(
-        approval_id="a",
-        tool_call_id="t",
-        tool_name="x",
-        agent_name="ag",
-        tool_calls=[PendingToolCallApproval(tool_call_id="t", tool_name="x")],
-        thinking=ThinkingConfig(effort="high"),
-    )
-    # No override on the approval request -> restore the original run's config.
-    restored = _effective_approval_thinking(thinking=None, pending_approval=pending)
-    assert restored is not None
-    assert restored.effort == "high"
-    # An override on the approval request wins.
-    override = ThinkingConfig(effort="low")
-    assert _effective_approval_thinking(thinking=override, pending_approval=pending) is override

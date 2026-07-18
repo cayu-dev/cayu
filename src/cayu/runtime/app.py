@@ -55,7 +55,6 @@ from cayu.core.messages import (
 )
 from cayu.core.thinking import ThinkingConfig
 from cayu.core.tools import (
-    _TOOL_POLICY_DENIAL_SOURCE,
     Tool,
     ToolResult,
     ToolSpec,
@@ -101,6 +100,17 @@ from cayu.runtime._model_step_executor import (
     ModelStepLimitEvaluationRequest,
     _session_agent_spec,
 )
+from cayu.runtime._recovery_coordinator import (
+    _DEFAULT_APPROVAL_MAX_STEPS,
+    RecoveryCoordinator,
+    RecoveryLimitStopRequest,
+    RecoverySessionRunRequest,
+    RecoveryTaskEventRequest,
+    RecoveryTerminalEventRequest,
+    _effective_approval_structured_output,
+    _effective_user_input_structured_output,
+    _run_recovery_cleanup_steps,
+)
 from cayu.runtime._run_limits import (
     BudgetEvaluation,
     BudgetReservationLeaseLost,
@@ -129,18 +139,15 @@ from cayu.runtime._tool_round_executor import (
     ToolRoundLimitRequest,
     UserInputRequired,
     ordered_tool_result_messages,
-    policy_denial_payload_fields,
 )
 from cayu.runtime.approvals import (
     PendingToolApproval,
     PendingToolCallApproval,
-    ToolApprovalDecision,
     ToolApprovalRecoveryOutcome,
     ToolApprovalRecoveryRequest,
     ToolApprovalRequest,
     copy_tool_approval_recovery_request,
     copy_tool_approval_request,
-    expiry_resolution_actor,
     resolution_actor_payload,
 )
 from cayu.runtime.budgets import (
@@ -261,7 +268,9 @@ from cayu.runtime.sessions import (
     SessionStatus,
     SessionStatusConflict,
     SessionStore,
+    _activate_session_run_fence,
     _current_session_run_epoch,
+    _deactivate_session_run_fence,
     copy_compact_session_request,
     copy_enqueue_session_message_request,
     copy_fork_session_request,
@@ -303,7 +312,6 @@ from cayu.runtime.tasks import (
 from cayu.runtime.tool_policy import (
     AllowAllToolPolicy,
     ToolPolicy,
-    ToolPolicyDecision,
     metadata_with_taint_labels,
     taint_labels_from_metadata,
 )
@@ -321,8 +329,6 @@ from cayu.runtime.usage import (
     usage_metrics_from_event_payload,
 )
 from cayu.runtime.user_input import (
-    PENDING_USER_INPUT_CHECKPOINT_KEY,
-    PendingUserInput,
     UserInputRecoveryRequest,
     UserInputResponse,
     copy_user_input_recovery_request,
@@ -382,9 +388,6 @@ _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED = "tool_approval_required"
 _INTERRUPTION_TYPE_USER_INPUT_REQUIRED = "user_input_required"
 _INTERRUPTION_TYPE_LIMIT_REACHED = "limit_reached"
 _ABANDONED_RUN_REASON = "event_stream_closed"
-# Fallback for approvals checkpointed before the original run config was
-# persisted on PendingToolApproval (the historical ToolApprovalRequest default).
-_DEFAULT_APPROVAL_MAX_STEPS = 16
 DEFAULT_MAX_PARALLEL_TOOL_CALLS = 4
 
 
@@ -570,6 +573,24 @@ class CayuApp:
             checkpoint_transform=_replace_checkpoint_preserving_runtime_state,
             apply_limit_evaluation=self._apply_tool_round_limit,
             close_interrupted_round=self._close_tool_round_after_interrupt,
+        )
+        self._recovery_coordinator = RecoveryCoordinator(
+            session_store=self.session_store,
+            task_store=self.task_store,
+            event_writer=self._event_writer,
+            session_control=self._session_control,
+            environment_lifecycle=self._environment_lifecycle,
+            run_limit_controller=self._run_limit_controller,
+            tool_round_executor=self._tool_round_executor,
+            secret_redactor=self._secret_redactor,
+            clock=self._clock,
+            checkpoint_transform=_replace_checkpoint_preserving_runtime_state,
+            effective_retry_policy=self._effective_retry_policy,
+            run_session=self._run_recovery_session,
+            emit_terminal_event_with_hooks=self._emit_recovery_terminal_event_with_hooks,
+            finalize_abandoned_session_by_id=self._finalize_abandoned_session_by_id,
+            stop_session_for_limit_reached=self._stop_recovery_session_for_limit_reached,
+            task_event=_recovery_task_event,
         )
         self._background_interruption_coordinator = BackgroundInterruptionCoordinator(
             session_store=self.session_store,
@@ -3910,6 +3931,173 @@ class CayuApp:
             )
         )
 
+    def _run_recovery_session(
+        self,
+        request: RecoverySessionRunRequest,
+    ) -> AsyncGenerator[Event, None]:
+        return self._run_session(
+            session=request.session,
+            registered_agent=request.registered_agent,
+            registered_provider=request.registered_provider,
+            registered_environment=request.registered_environment,
+            messages=request.messages,
+            messages_to_append=request.messages_to_append,
+            max_steps=request.max_steps,
+            limits=request.limits,
+            budget_limits=request.budget_limits,
+            retry_policy=request.retry_policy,
+            structured_output=request.structured_output,
+            thinking=request.thinking,
+            request_loop_policies=request.request_loop_policies,
+            request_metadata=request.request_metadata,
+            task_id=request.task_id,
+            task_worker_id=request.task_worker_id,
+            start_event_type=request.start_event_type,
+            start_event_payload=request.start_event_payload,
+            start_task_on_enter=request.start_task_on_enter,
+            release_run_fence_on_exit=request.release_run_fence_on_exit,
+        )
+
+    def _emit_recovery_terminal_event_with_hooks(
+        self,
+        request: RecoveryTerminalEventRequest,
+    ) -> AsyncIterator[Event]:
+        return self._emit_terminal_event_with_hooks(
+            event=request.event,
+            phase=request.phase,
+            session=request.session,
+            registered_agent=request.registered_agent,
+            registered_environment=request.registered_environment,
+        )
+
+    def _stop_recovery_session_for_limit_reached(
+        self,
+        request: RecoveryLimitStopRequest,
+    ) -> AsyncIterator[Event]:
+        return self._stop_session_for_limit_reached(
+            session=request.session,
+            registered_agent=request.registered_agent,
+            registered_environment=request.registered_environment,
+            environment_name=request.environment_name,
+            decision=request.decision,
+            usage_summary=request.usage_summary,
+            cost_summary=request.cost_summary,
+            messages=request.messages,
+            tool_calls=request.tool_calls,
+            completed_tool_outcomes=request.completed_tool_outcomes,
+            pending_approval_to_clear=request.pending_approval_to_clear,
+        )
+
+    async def _cleanup_recovery_handoff(
+        self,
+        *,
+        stream: AsyncGenerator[Event, None],
+        session_id: str,
+        authoritative_failure: BaseException | None,
+        finalize_abandoned: bool,
+        release_run_fence: bool,
+    ) -> None:
+        cleanup_steps: list[tuple[str, Callable[[], Awaitable[None]]]] = [
+            ("nested stream close", stream.aclose)
+        ]
+        if finalize_abandoned:
+            cleanup_steps.append(
+                (
+                    "abandoned session finalization",
+                    lambda: self._finalize_abandoned_session_by_id(session_id),
+                )
+            )
+        if release_run_fence:
+            cleanup_steps.append(
+                ("run fence release", lambda: self.session_store.release_run_fence(session_id))
+            )
+        try:
+            await _run_recovery_cleanup_steps(
+                authoritative_failure=authoritative_failure,
+                steps=tuple(cleanup_steps),
+            )
+        finally:
+            # Cancellation-resistant cleanup may run in a child task with a copied
+            # context. Clear the caller's task-local epoch as the handoff ends too.
+            _deactivate_session_run_fence(session_id)
+
+    async def _transition_recovery_session_to_running(self, session_id: str) -> Session:
+        """Claim a paused session without leaving cancellation outcome-uncertain.
+
+        Session stores activate run fences in task-local context after the durable
+        transition commits. Keeping the transition in a shielded child task lets it
+        reach a definite result even if the caller is cancelled at that boundary.
+        A successful claim is then activated in the caller's context. If cancellation
+        arrived, the claim is finalized and released before that cancellation is
+        propagated.
+        """
+        transition_task = asyncio.create_task(
+            self.session_store.transition_status(
+                session_id,
+                from_statuses={SessionStatus.INTERRUPTED},
+                to_status=SessionStatus.RUNNING,
+            )
+        )
+        cancellation: asyncio.CancelledError | None = None
+        transition_failure: BaseException | None = None
+        while not transition_task.done():
+            try:
+                await asyncio.shield(transition_task)
+            except asyncio.CancelledError as exc:
+                if transition_task.cancelled():
+                    transition_failure = exc
+                    break
+                if cancellation is None:
+                    cancellation = exc
+            except BaseException as exc:
+                transition_failure = exc
+                break
+
+        session: Session | None = None
+        if transition_failure is None:
+            try:
+                session = transition_task.result()
+            except BaseException as exc:
+                transition_failure = exc
+
+        if session is None:
+            if cancellation is not None:
+                if transition_failure is not None:
+                    cancellation.add_note(
+                        "Continuation recovery transition also failed after cancellation: "
+                        f"{type(transition_failure).__name__}."
+                    )
+                raise cancellation from transition_failure
+            if transition_failure is None:
+                raise RuntimeError("Continuation recovery transition completed without a session.")
+            raise transition_failure
+
+        # transition_status() activated this epoch only in the child task's copied
+        # context. The caller owns all subsequent writes and cleanup.
+        _activate_session_run_fence(session)
+        if cancellation is None:
+            return session
+
+        try:
+            await _run_recovery_cleanup_steps(
+                authoritative_failure=cancellation,
+                steps=(
+                    (
+                        "abandoned session finalization",
+                        lambda: self._finalize_abandoned_session_by_id(session.id),
+                    ),
+                    (
+                        "run fence release",
+                        lambda: self.session_store.release_run_fence(session.id),
+                    ),
+                ),
+            )
+        finally:
+            # Shielded cleanup runs in a copied context. Never leave the caller's
+            # task-local epoch active if it catches and handles the cancellation.
+            _deactivate_session_run_fence(session.id)
+        raise cancellation
+
     async def resolve_user_input(
         self,
         response: UserInputResponse,
@@ -3949,373 +4137,33 @@ class CayuApp:
         registered_environment = self._get_registered_environment_for_session(
             loaded_session.environment_name
         )
-        session = await self.session_store.transition_status(
-            loaded_session.id,
-            from_statuses={SessionStatus.INTERRUPTED},
-            to_status=SessionStatus.RUNNING,
-        )
+        session = await self._transition_recovery_session_to_running(loaded_session.id)
 
+        continuation_stream = self._recovery_coordinator.continue_user_input_resolution(
+            response=response,
+            session=session,
+            pending=pending,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            registered_environment=registered_environment,
+        )
+        authoritative_failure: BaseException | None = None
+        abandoned = False
         try:
-            async for event in self._continue_user_input_resolution(
-                response=response,
-                session=session,
-                pending=pending,
-                registered_agent=registered_agent,
-                registered_provider=registered_provider,
-                registered_environment=registered_environment,
-            ):
+            async for event in continuation_stream:
                 yield event
-        except GeneratorExit:
-            await self._finalize_abandoned_session_by_id(session.id)
+        except BaseException as exc:
+            authoritative_failure = exc
+            abandoned = isinstance(exc, GeneratorExit | asyncio.CancelledError)
             raise
         finally:
-            await self.session_store.release_run_fence(session.id)
-
-    async def _continue_user_input_resolution(
-        self,
-        *,
-        response: UserInputResponse,
-        session: Session,
-        pending: PendingUserInput,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_provider: runtime_records.RegisteredProvider,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        emit_resume_event: bool = True,
-    ) -> AsyncIterator[Event]:
-        environment_name = _environment_name(registered_environment)
-        pending_cleared = False
-        tool_outcomes: list[runtime_records.ToolCallOutcome] = []
-        # Restore the original run's config persisted on the pending input; explicit overrides
-        # on the resolution request win. Pending states written before this existed fall back to
-        # the historical defaults.
-        effective_max_steps = _effective_user_input_max_steps(
-            max_steps=response.max_steps,
-            pending=pending,
-        )
-        effective_limits = _effective_user_input_run_limits(
-            limits=response.limits,
-            pending=pending,
-        )
-        effective_budget_limits = _effective_user_input_budget_limits(
-            budget_limits=response.budget_limits,
-            pending=pending,
-        )
-        effective_retry_policy = self._effective_retry_policy(
-            _effective_user_input_retry_policy(
-                retry_policy=response.retry_policy,
-                pending=pending,
+            await self._cleanup_recovery_handoff(
+                stream=continuation_stream,
+                session_id=session.id,
+                authoritative_failure=authoritative_failure,
+                finalize_abandoned=abandoned,
+                release_run_fence=True,
             )
-        )
-        try:
-            transcript = await self.session_store.load_transcript(session.id)
-            resume_events = await self.session_store.load_events(session.id)
-            factory_started_event = await self._environment_lifecycle.emit_factory_started(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-            )
-            if factory_started_event is not None:
-                yield factory_started_event
-            factory_resolution = await self._environment_lifecycle.resolve_factory(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                started_event=factory_started_event,
-                operation=EnvironmentFactoryOperation.RECONNECT,
-            )
-            registered_environment = factory_resolution.registered_environment
-            environment_name = _environment_name(registered_environment)
-            for event in factory_resolution.events:
-                yield event
-            if factory_resolution.error is not None:
-                raise factory_resolution.error
-            if emit_resume_event:
-                yield await self._event_writer.emit(
-                    Event(
-                        type=EventType.SESSION_RESUMED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        payload={
-                            "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
-                            "input_id": pending.input_id,
-                            "tool_call_id": pending.tool_call_id,
-                            "resolved_by": resolution_actor_payload(response.resolved_by),
-                        },
-                    )
-                )
-            binding_started_event = await self._environment_lifecycle.emit_binding_started(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-            )
-            if binding_started_event is not None:
-                yield binding_started_event
-            binding_result = await self._environment_lifecycle.bind(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                started_event=binding_started_event,
-            )
-            registered_environment = binding_result.registered_environment
-            for event in binding_result.events:
-                yield event
-            if binding_result.error is not None:
-                raise binding_result.error
-
-            round_tool_calls = [
-                runtime_records.ToolCallRequest(
-                    id=pending_call.tool_call_id,
-                    name=pending_call.tool_name,
-                    arguments=copy_json_value(pending_call.arguments, "arguments"),
-                )
-                for pending_call in pending.tool_calls
-            ]
-            # Reuse any outcomes already recorded for this round — e.g. a prior resume attempt
-            # that ran some tools before a mid-resume failure — so a retry never re-executes a
-            # side-effecting tool. The round was already projected against limits at pause time;
-            # its remaining tools run on resume without a fresh budget projection (so the user's
-            # answer is never discarded by a limit check here).
-            recorded_outcomes = approval_support.recorded_round_tool_outcomes(
-                events=resume_events,
-                pending_calls=pending.tool_calls,
-                input_id=pending.input_id,
-            )
-            pending_by_id = {call.tool_call_id: call for call in pending.tool_calls}
-
-            # Build the round's outcomes in model order: a call already recorded (retry) is
-            # reused; the answered ask_user call gets the injected answer; every other allowed
-            # call executes now (none ran before the pause); a denied call is blocked.
-            for tool_call in round_tool_calls:
-                recorded_outcome = recorded_outcomes.get(tool_call.id)
-                if recorded_outcome is not None:
-                    tool_outcomes.append(recorded_outcome)
-                    continue
-
-                if tool_call.id == pending.tool_call_id:
-                    registered_tool = registered_agent.tools.get(tool_call.name)
-                    idempotency_key = tool_execution.tool_idempotency_key(
-                        session_id=session.id,
-                        tool_call_id=tool_call.id,
-                        pause_id=pending.input_id,
-                    )
-                    result = ToolResult(
-                        content=response.answer,
-                        structured=response.structured,
-                        artifacts=response.artifacts,
-                        is_error=False,
-                    )
-                    started_payload: dict[str, Any] = {
-                        "tool_call_id": tool_call.id,
-                        "idempotency_key": idempotency_key,
-                        "arguments": deepcopy(tool_call.arguments),
-                        "input_id": pending.input_id,
-                    }
-                    if registered_tool is not None:
-                        started_payload["effect"] = registered_tool.effect.value
-                    yield await self._event_writer.emit(
-                        Event(
-                            type=EventType.TOOL_CALL_STARTED,
-                            session_id=session.id,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            tool_name=tool_call.name,
-                            payload=started_payload,
-                        )
-                    )
-                    async for (
-                        event,
-                        outcome,
-                    ) in self._tool_round_executor.emit_tool_call_result_with_hooks(
-                        event=Event(
-                            type=EventType.TOOL_CALL_COMPLETED,
-                            session_id=session.id,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            tool_name=tool_call.name,
-                            payload={
-                                "tool_call_id": tool_call.id,
-                                "idempotency_key": idempotency_key,
-                                "input_id": pending.input_id,
-                                "resolved_by": resolution_actor_payload(response.resolved_by),
-                                "result": result.model_dump(),
-                            },
-                        ),
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        tool_call=tool_call,
-                        result=result,
-                        task_id=pending.task_id,
-                    ):
-                        yield event
-                        if outcome is not None:
-                            tool_outcomes.append(outcome)
-                    continue
-
-                pending_call = pending_by_id[tool_call.id]
-                policy_result = approval_support.policy_result_from_pending_tool_call(pending_call)
-                call_taint_labels = approval_support.taint_labels_from_pending_tool_call(
-                    pending_call
-                )
-                # `ToolRoundExecutor.execute_tool_call(check_policy=False)` does not re-enforce
-                # the decision, so a DENY must be blocked here explicitly (mirroring the approval
-                # resume) — otherwise a policy-denied sibling would execute. REQUIRE_APPROVAL
-                # cannot occur: it would have preempted the ask_user pause with an approval pause.
-                if policy_result is not None and policy_result.decision == ToolPolicyDecision.DENY:
-                    reason = tool_execution.policy_denial_reason(policy_result)
-                    blocked_result = tool_execution.blocked_tool_result(
-                        policy_result, reason=reason
-                    )
-                    idempotency_key = tool_execution.tool_idempotency_key(
-                        session_id=session.id,
-                        tool_call_id=tool_call.id,
-                        pause_id=pending.input_id,
-                    )
-                    async for (
-                        event,
-                        outcome,
-                    ) in self._tool_round_executor.emit_tool_call_result_with_hooks(
-                        event=Event(
-                            type=EventType.TOOL_CALL_BLOCKED,
-                            session_id=session.id,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            tool_name=tool_call.name,
-                            payload={
-                                "tool_call_id": tool_call.id,
-                                "idempotency_key": idempotency_key,
-                                **policy_denial_payload_fields(
-                                    tool_name=tool_call.name,
-                                    denied_by=_TOOL_POLICY_DENIAL_SOURCE,
-                                    decision=policy_result.decision.value,
-                                    reason=reason,
-                                    metadata=policy_result.metadata,
-                                ),
-                                "result": blocked_result.model_dump(),
-                            },
-                        ),
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        tool_call=tool_call,
-                        result=blocked_result,
-                        task_id=pending.task_id,
-                    ):
-                        yield event
-                        if outcome is not None:
-                            tool_outcomes.append(outcome)
-                    continue
-
-                async for event, outcome in self._tool_round_executor.execute_tool_call(
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    tool_call=tool_call,
-                    request_metadata=response.metadata,
-                    task_id=pending.task_id,
-                    check_policy=False,
-                    policy_result=policy_result,
-                    input_id=pending.input_id,
-                    taint_labels=call_taint_labels,
-                ):
-                    yield event
-                    if outcome is not None:
-                        tool_outcomes.append(outcome)
-
-            # The resume executes the round's tools sequentially in model order, so the outcome
-            # list already lines up with the assistant tool-call parts.
-            tool_result_messages = transcript_helpers.tool_result_messages(tool_outcomes)
-            transcript.extend(tool_result_messages)
-            cleared_checkpoint = await self._checkpoint_without_pending_user_input(session.id)
-            await self.session_store.append_transcript_messages_and_transform_checkpoint(
-                session.id,
-                tool_result_messages,
-                _replace_checkpoint_preserving_runtime_state(cleared_checkpoint),
-            )
-            pending_cleared = True
-
-            session_stream = self._run_session(
-                session=session,
-                registered_agent=registered_agent,
-                registered_provider=registered_provider,
-                registered_environment=registered_environment,
-                messages=transcript,
-                messages_to_append=[],
-                max_steps=effective_max_steps,
-                limits=effective_limits,
-                budget_limits=effective_budget_limits,
-                retry_policy=effective_retry_policy,
-                structured_output=_effective_user_input_structured_output(
-                    structured_output=response.structured_output,
-                    pending=pending,
-                ),
-                thinking=response.thinking or pending.thinking,
-                request_loop_policies=response.loop_policies,
-                request_metadata=response.metadata,
-                task_id=pending.task_id,
-                task_worker_id=None,
-                start_event_type=None,
-                start_event_payload={},
-                start_task_on_enter=False,
-                release_run_fence_on_exit=False,
-            )
-            try:
-                async for event in self._session_control.stream_with_out_of_band_events(
-                    session.id,
-                    session_stream,
-                ):
-                    yield event
-            except GeneratorExit:
-                await session_stream.aclose()
-                raise
-        except Exception as exc:
-            if not pending_cleared:
-                # The pending_user_input checkpoint is still present, so restore the resumable
-                # INTERRUPTED state and emit a terminal event for closure (a SESSION_RESUMED was
-                # already emitted). The caller can retry resolve_user_input; recorded outcomes
-                # prevent re-running a tool that already completed. A tool that started with no
-                # terminal (a crash mid-tool) cannot be re-run safely — flag it as needing manual
-                # recovery so the retry is not a silent double-execution.
-                # Carry the failure so a caller can distinguish "your answer failed, retry" from a
-                # fresh pause (whose interrupted event has no error fields).
-                payload: dict[str, Any] = {
-                    **exception_failure_payload(exc),
-                    "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
-                    "user_input": pending.model_dump(mode="json"),
-                }
-                if isinstance(exc, approval_support.RoundToolManualRecoveryRequired):
-                    payload["manual_recovery_required"] = True
-                    payload["tool_call_id"] = exc.tool_call_id
-                    payload["tool_name"] = exc.tool_name
-                session = await self.session_store.update_status(
-                    session.id, SessionStatus.INTERRUPTED
-                )
-                async for event in self._emit_terminal_event_with_hooks(
-                    event=Event(
-                        type=EventType.SESSION_INTERRUPTED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        payload=payload,
-                    ),
-                    phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                ):
-                    yield event
-                return
-            raise
-
-    async def _checkpoint_without_pending_user_input(
-        self,
-        session_id: str,
-    ) -> dict[str, Any]:
-        checkpoint = await self.session_store.load_checkpoint(session_id)
-        checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
-        checkpoint.pop(PENDING_USER_INPUT_CHECKPOINT_KEY, None)
-        return checkpoint
 
     async def recover_user_input(
         self,
@@ -4359,184 +4207,32 @@ class CayuApp:
         registered_environment = self._get_registered_environment_for_session(
             loaded_session.environment_name
         )
-        session = await self.session_store.transition_status(
-            loaded_session.id,
-            from_statuses={SessionStatus.INTERRUPTED},
-            to_status=SessionStatus.RUNNING,
+        session = await self._transition_recovery_session_to_running(loaded_session.id)
+        recovery_stream = self._recovery_coordinator.recover_user_input(
+            request=request,
+            loaded_session=loaded_session,
+            session=session,
+            pending=pending,
+            pending_tool_call=pending_tool_call,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            registered_environment=registered_environment,
         )
-        recovery_prepared = False
+        authoritative_failure: BaseException | None = None
         try:
-            recovered_result = ToolResult(
-                content=request.message,
-                structured=request.structured,
-                artifacts=request.artifacts,
-                is_error=request.outcome == ToolApprovalRecoveryOutcome.FAILED,
-            )
-            event_type = (
-                EventType.TOOL_CALL_FAILED
-                if recovered_result.is_error
-                else EventType.TOOL_CALL_COMPLETED
-            )
-            events = await self.session_store.load_events(session.id)
-            approval_support.validate_round_recovery_target(
-                events=events,
-                pending_calls=pending.tool_calls,
-                tool_call_id=request.tool_call_id,
-                input_id=pending.input_id,
-            )
-            factory_started_event = await self._environment_lifecycle.emit_factory_started(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-            )
-            if factory_started_event is not None:
-                yield factory_started_event
-            factory_resolution = await self._environment_lifecycle.resolve_factory(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                started_event=factory_started_event,
-                operation=EnvironmentFactoryOperation.RECONNECT,
-            )
-            registered_environment = factory_resolution.registered_environment
-            environment_name = _environment_name(registered_environment)
-            for event in factory_resolution.events:
+            async for event in recovery_stream:
                 yield event
-            if factory_resolution.error is not None:
-                session = await self.session_store.update_status(
-                    session.id,
-                    SessionStatus.INTERRUPTED,
-                )
-                async for event in self._emit_terminal_event_with_hooks(
-                    event=Event(
-                        type=EventType.SESSION_INTERRUPTED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        payload={
-                            "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
-                            "user_input": pending.model_dump(mode="json"),
-                            "error": str(factory_resolution.error),
-                            "error_type": type(factory_resolution.error).__name__,
-                        },
-                    ),
-                    phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                ):
-                    yield event
-                return
-            recovery_tool_event, recovered_result = tool_results.redact_tool_result_event(
-                event=Event(
-                    type=event_type,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    tool_name=pending_tool_call.tool_name,
-                    payload={
-                        "tool_call_id": pending_tool_call.tool_call_id,
-                        "idempotency_key": tool_execution.tool_idempotency_key(
-                            session_id=session.id,
-                            tool_call_id=pending_tool_call.tool_call_id,
-                            pause_id=pending.input_id,
-                        ),
-                        "input_id": pending.input_id,
-                        "manual_recovery": True,
-                        "reason": request.reason,
-                        "metadata": request.metadata,
-                        "resolved_by": resolution_actor_payload(request.resolved_by),
-                        "result": recovered_result.model_dump(),
-                    },
-                ),
-                result=recovered_result,
-                redactor=self._secret_redactor,
-            )
-            recovery_events = [
-                Event(
-                    type=EventType.SESSION_RESUMED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload={
-                        "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
-                        "input_id": pending.input_id,
-                        "tool_call_id": pending.tool_call_id,
-                        "resolved_by": resolution_actor_payload(request.resolved_by),
-                    },
-                ),
-                recovery_tool_event,
-            ]
-            emitted_recovery_events = await self._event_writer.emit_many(
-                session.id, recovery_events
-            )
-            for event in emitted_recovery_events:
-                yield event
-            tool_call = runtime_records.ToolCallRequest(
-                id=pending_tool_call.tool_call_id,
-                name=pending_tool_call.tool_name,
-                arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
-            )
-            tool_event = emitted_recovery_events[-1]
-            # Manual recovery persists the operator-supplied result before hooks run, so
-            # after_tool_call is observe-only here (v1): the threaded modification is ignored.
-            async for event, _modified in self._tool_round_executor.run_tool_call_hooks(
-                session=session,
-                tool_event=tool_event,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                tool_call=tool_call,
-                result=recovered_result,
-                task_id=pending.task_id,
-                redactor=self._secret_redactor,
-                allow_modification=False,
-            ):
-                yield event
-            recovery_prepared = True
-        except GeneratorExit:
-            await self._finalize_abandoned_session_by_id(session.id)
-            raise
-        except Exception:
-            await self.session_store.update_status(session.id, loaded_session.status)
+        except BaseException as exc:
+            authoritative_failure = exc
             raise
         finally:
-            if not recovery_prepared:
-                await self.session_store.release_run_fence(session.id)
-
-        try:
-            response = UserInputResponse(
-                session_id=request.session_id,
-                input_id=request.input_id,
-                answer=request.answer,
-                structured=request.structured,
-                artifacts=request.artifacts,
-                metadata=request.metadata,
-                resolved_by=request.resolved_by,
-                max_steps=request.max_steps,
-                limits=request.limits,
-                budget_limits=request.budget_limits,
-                retry_policy=request.retry_policy,
-                structured_output=request.structured_output,
-                thinking=request.thinking,
-                loop_policies=request.loop_policies,
+            await self._cleanup_recovery_handoff(
+                stream=recovery_stream,
+                session_id=session.id,
+                authoritative_failure=authoritative_failure,
+                finalize_abandoned=False,
+                release_run_fence=False,
             )
-            async for event in self._continue_user_input_resolution(
-                response=response,
-                session=session,
-                pending=pending,
-                registered_agent=registered_agent,
-                registered_provider=registered_provider,
-                registered_environment=registered_environment,
-                emit_resume_event=False,
-            ):
-                yield event
-        except GeneratorExit:
-            # Abandonment while continuing the round: finalize to INTERRUPTED instead of
-            # leaking a RUNNING session (mirrors resolve_user_input's continuation guard).
-            await self._finalize_abandoned_session_by_id(session.id)
-            raise
-        finally:
-            await self.session_store.release_run_fence(session.id)
 
     async def resolve_tool_approval(
         self,
@@ -4570,574 +4266,33 @@ class CayuApp:
         registered_environment = self._get_registered_environment_for_session(
             loaded_session.environment_name
         )
-        session = await self.session_store.transition_status(
-            loaded_session.id,
-            from_statuses={SessionStatus.INTERRUPTED},
-            to_status=SessionStatus.RUNNING,
-        )
+        session = await self._transition_recovery_session_to_running(loaded_session.id)
 
+        continuation_stream = self._recovery_coordinator.continue_tool_approval_resolution(
+            request=request,
+            session=session,
+            pending_approval=pending_approval,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            registered_environment=registered_environment,
+        )
+        authoritative_failure: BaseException | None = None
+        abandoned = False
         try:
-            async for event in self._continue_tool_approval_resolution(
-                request=request,
-                session=session,
-                pending_approval=pending_approval,
-                registered_agent=registered_agent,
-                registered_provider=registered_provider,
-                registered_environment=registered_environment,
-            ):
+            async for event in continuation_stream:
                 yield event
-        except GeneratorExit:
-            await self._finalize_abandoned_session_by_id(session.id)
+        except BaseException as exc:
+            authoritative_failure = exc
+            abandoned = isinstance(exc, GeneratorExit | asyncio.CancelledError)
             raise
         finally:
-            await self.session_store.release_run_fence(session.id)
-
-    async def _continue_tool_approval_resolution(
-        self,
-        *,
-        request: ToolApprovalRequest,
-        session: Session,
-        pending_approval: PendingToolApproval,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_provider: runtime_records.RegisteredProvider,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        emit_resume_event: bool = True,
-        enforce_expiry: bool = True,
-    ) -> AsyncIterator[Event]:
-        environment_name = _environment_name(registered_environment)
-        pending_approval_cleared = False
-        tool_outcomes: list[runtime_records.ToolCallOutcome] = []
-        expired = False
-        # Restore the original run's config persisted on the pending approval;
-        # explicit overrides on the approval request win. Approvals persisted
-        # before this state existed fall back to the historical defaults.
-        effective_max_steps = _effective_approval_max_steps(
-            max_steps=request.max_steps,
-            pending_approval=pending_approval,
-        )
-        effective_limits = _effective_approval_run_limits(
-            limits=request.limits,
-            pending_approval=pending_approval,
-        )
-        effective_budget_limits = _effective_approval_budget_limits(
-            budget_limits=request.budget_limits,
-            pending_approval=pending_approval,
-        )
-        effective_retry_policy = self._effective_retry_policy(
-            _effective_approval_retry_policy(
-                retry_policy=request.retry_policy,
-                pending_approval=pending_approval,
+            await self._cleanup_recovery_handoff(
+                stream=continuation_stream,
+                session_id=session.id,
+                authoritative_failure=authoritative_failure,
+                finalize_abandoned=abandoned,
+                release_run_fence=True,
             )
-        )
-        try:
-            transcript = await self.session_store.load_transcript(session.id)
-            approval_events = await self.session_store.load_events(session.id)
-            history = approval_support.approval_resolution_history(
-                events=approval_events,
-                approval=pending_approval,
-            )
-            # Expiry gates the FIRST grant only: a retry of an approval that
-            # already has granted or executed activity was authorized
-            # in-window before a crash, so coercing it to a denial would
-            # contradict the recorded grant (and trip validate_retry_decision).
-            if (
-                enforce_expiry
-                and approval_support.pending_approval_expired(pending_approval, self._clock())
-                and not history.has_granted_activity
-            ):
-                expired = True
-                # Captured before the coercion below replaces them on the request.
-                requested_decision = request.decision
-                triggered_by = request.resolved_by
-                assert pending_approval.expires_at is not None
-                expired_at_iso = pending_approval.expires_at.isoformat()
-                request = ToolApprovalRequest(
-                    session_id=request.session_id,
-                    approval_id=request.approval_id,
-                    decision=ToolApprovalDecision.DENY,
-                    reason=f"Tool approval expired at {expired_at_iso}.",
-                    metadata=copy_json_value(request.metadata, "metadata"),
-                    resolved_by=expiry_resolution_actor(),
-                    max_steps=request.max_steps,
-                    limits=request.limits,
-                    budget_limits=request.budget_limits,
-                    retry_policy=request.retry_policy,
-                    structured_output=request.structured_output,
-                    thinking=request.thinking,
-                    loop_policies=request.loop_policies,
-                )
-            approval_support.validate_retry_decision(
-                history=history,
-                approval=pending_approval,
-                decision=request.decision,
-            )
-            resolved_by_payload = resolution_actor_payload(request.resolved_by)
-            recorded_outcomes = approval_support.recorded_tool_outcomes(
-                events=approval_events,
-                approval=pending_approval,
-            )
-            factory_started_event = await self._environment_lifecycle.emit_factory_started(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-            )
-            if factory_started_event is not None:
-                yield factory_started_event
-            factory_resolution = await self._environment_lifecycle.resolve_factory(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                started_event=factory_started_event,
-                operation=EnvironmentFactoryOperation.RECONNECT,
-            )
-            registered_environment = factory_resolution.registered_environment
-            environment_name = _environment_name(registered_environment)
-            for event in factory_resolution.events:
-                yield event
-            if factory_resolution.error is not None:
-                raise factory_resolution.error
-            if emit_resume_event:
-                yield await self._event_writer.emit(
-                    approval_support.resumed_event(
-                        session=session,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        approval=pending_approval,
-                        decision=request.decision,
-                        resolved_by=request.resolved_by,
-                        expired=expired,
-                    )
-                )
-            if expired:
-                yield await self._event_writer.emit(
-                    Event(
-                        type=EventType.TOOL_CALL_APPROVAL_EXPIRED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        tool_name=pending_approval.tool_name,
-                        payload={
-                            "approval_id": pending_approval.approval_id,
-                            "tool_call_id": pending_approval.tool_call_id,
-                            "expires_at": expired_at_iso,
-                            "requested_decision": requested_decision.value,
-                            "resolved_by": resolved_by_payload,
-                            "triggered_by": resolution_actor_payload(triggered_by),
-                        },
-                    )
-                )
-
-            if request.decision not in {
-                ToolApprovalDecision.APPROVE,
-                ToolApprovalDecision.DENY,
-            }:
-                raise ValueError(f"Unsupported tool approval decision: {request.decision}")
-
-            binding_started_event = await self._environment_lifecycle.emit_binding_started(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-            )
-            if binding_started_event is not None:
-                yield binding_started_event
-            binding_result = await self._environment_lifecycle.bind(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                started_event=binding_started_event,
-            )
-            registered_environment = binding_result.registered_environment
-            for event in binding_result.events:
-                yield event
-            if binding_result.error is not None:
-                raise binding_result.error
-
-            if request.decision == ToolApprovalDecision.APPROVE:
-                run_started_at = time.monotonic()
-                limits = copy_run_limits(effective_limits)
-                budget_limits = request_budget_limits_for_session(
-                    limits=effective_budget_limits,
-                    agent_name=registered_agent.spec.name,
-                    causal_budget_id=session.causal_budget_id,
-                )
-                run_baseline = (
-                    session_usage_summary(session.id, approval_events)
-                    if limits.scope == "run" and has_run_limits(limits)
-                    else None
-                )
-                budget_baseline_events = (
-                    approval_events if _has_run_budget_limit(budget_limits) else []
-                )
-                request_budget_notify_events: list[Event] = []
-                recorded_tool_outcomes = list(recorded_outcomes.values())
-                pending_tool_calls: list[runtime_records.ToolCallRequest] = []
-                executable_pending_tool_calls = 0
-                for pending_tool_call in approval_support.pending_round_tool_calls(
-                    pending_approval
-                ):
-                    if pending_tool_call.tool_call_id in recorded_outcomes:
-                        continue
-                    tool_call = runtime_records.ToolCallRequest(
-                        id=pending_tool_call.tool_call_id,
-                        name=pending_tool_call.tool_name,
-                        arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
-                    )
-                    pending_tool_calls.append(tool_call)
-                    policy_result = approval_support.policy_result_from_pending_tool_call(
-                        pending_tool_call
-                    )
-                    if (
-                        policy_result is not None
-                        and policy_result.decision == ToolPolicyDecision.DENY
-                    ):
-                        continue
-                    executable_pending_tool_calls += 1
-                limit_evaluation = await self._run_limit_controller.evaluate_request_limits(
-                    session=session,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    limits=limits,
-                    budget_limits=budget_limits,
-                    run_started_at=run_started_at,
-                    run_baseline=run_baseline,
-                    budget_baseline_events=budget_baseline_events,
-                    pending_tool_calls=executable_pending_tool_calls,
-                    budget_notify_events=request_budget_notify_events,
-                    pricing_provider_name=(
-                        registered_provider.provider.billing_provider_name
-                        or registered_provider.name
-                    ),
-                )
-                for event in limit_evaluation.events:
-                    yield event
-                if limit_evaluation.decision is not None:
-                    async for event in self._stop_session_for_limit_reached(
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        environment_name=environment_name,
-                        decision=limit_evaluation.decision,
-                        usage_summary=limit_evaluation.usage_summary,
-                        cost_summary=limit_evaluation.cost_summary,
-                        messages=transcript,
-                        tool_calls=pending_tool_calls,
-                        completed_tool_outcomes=recorded_tool_outcomes,
-                        pending_approval_to_clear=pending_approval,
-                    ):
-                        yield event
-                    pending_approval_cleared = True
-                    return
-
-            for pending_tool_call in approval_support.pending_round_tool_calls(pending_approval):
-                tool_call = runtime_records.ToolCallRequest(
-                    id=pending_tool_call.tool_call_id,
-                    name=pending_tool_call.tool_name,
-                    arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
-                )
-                policy_result = approval_support.policy_result_from_pending_tool_call(
-                    pending_tool_call
-                )
-                call_taint_labels = approval_support.taint_labels_from_pending_tool_call(
-                    pending_tool_call
-                )
-                recorded_outcome = recorded_outcomes.get(tool_call.id)
-                if recorded_outcome is not None:
-                    tool_outcomes.append(recorded_outcome)
-                    continue
-
-                if policy_result is not None and policy_result.decision == ToolPolicyDecision.DENY:
-                    reason = tool_execution.policy_denial_reason(policy_result)
-                    result = tool_execution.blocked_tool_result(policy_result, reason=reason)
-                    idempotency_key = tool_execution.tool_idempotency_key(
-                        session_id=session.id,
-                        tool_call_id=tool_call.id,
-                        approval_id=pending_approval.approval_id,
-                    )
-                    async for (
-                        event,
-                        outcome,
-                    ) in self._tool_round_executor.emit_tool_call_result_with_hooks(
-                        event=Event(
-                            type=EventType.TOOL_CALL_BLOCKED,
-                            session_id=session.id,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            tool_name=tool_call.name,
-                            payload={
-                                "approval_id": pending_approval.approval_id,
-                                "tool_call_id": tool_call.id,
-                                "idempotency_key": idempotency_key,
-                                **policy_denial_payload_fields(
-                                    tool_name=tool_call.name,
-                                    denied_by=_TOOL_POLICY_DENIAL_SOURCE,
-                                    decision=policy_result.decision.value,
-                                    reason=reason,
-                                    metadata=policy_result.metadata,
-                                ),
-                                "result": result.model_dump(),
-                            },
-                        ),
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        tool_call=tool_call,
-                        result=result,
-                        task_id=pending_approval.task_id,
-                    ):
-                        yield event
-                        if outcome is not None:
-                            tool_outcomes.append(outcome)
-                    continue
-
-                if (
-                    policy_result is not None
-                    and policy_result.decision == ToolPolicyDecision.REQUIRE_APPROVAL
-                    and request.decision == ToolApprovalDecision.APPROVE
-                ):
-                    yield await self._event_writer.emit(
-                        Event(
-                            type=EventType.TOOL_CALL_APPROVED,
-                            session_id=session.id,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            tool_name=tool_call.name,
-                            payload={
-                                "approval_id": pending_approval.approval_id,
-                                "tool_call_id": tool_call.id,
-                                "reason": request.reason,
-                                "metadata": request.metadata,
-                                "resolved_by": resolved_by_payload,
-                            },
-                        )
-                    )
-
-                if request.decision == ToolApprovalDecision.DENY:
-                    approval_required = (
-                        policy_result is not None
-                        and policy_result.decision == ToolPolicyDecision.REQUIRE_APPROVAL
-                    )
-                    result = approval_support.approval_denied_tool_result(
-                        request,
-                        approval=pending_approval,
-                        tool_call=tool_call,
-                        approval_required=approval_required,
-                    )
-                    idempotency_key = tool_execution.tool_idempotency_key(
-                        session_id=session.id,
-                        tool_call_id=tool_call.id,
-                        approval_id=pending_approval.approval_id,
-                    )
-                    async for (
-                        event,
-                        outcome,
-                    ) in self._tool_round_executor.emit_tool_call_result_with_hooks(
-                        event=Event(
-                            type=EventType.TOOL_CALL_APPROVAL_DENIED,
-                            session_id=session.id,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            tool_name=tool_call.name,
-                            payload={
-                                "approval_id": pending_approval.approval_id,
-                                "tool_call_id": tool_call.id,
-                                "idempotency_key": idempotency_key,
-                                "approval_required": approval_required,
-                                "reason": request.reason,
-                                "metadata": request.metadata,
-                                "resolved_by": resolved_by_payload,
-                                "expired": expired,
-                                "result": result.model_dump(),
-                            },
-                        ),
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        tool_call=tool_call,
-                        result=result,
-                        task_id=pending_approval.task_id,
-                    ):
-                        yield event
-                        if outcome is not None:
-                            tool_outcomes.append(outcome)
-                    continue
-
-                async for event, outcome in self._tool_round_executor.execute_tool_call(
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    tool_call=tool_call,
-                    request_metadata=request.metadata,
-                    task_id=pending_approval.task_id,
-                    check_policy=False,
-                    emit_started=True,
-                    approval_id=pending_approval.approval_id,
-                    taint_labels=call_taint_labels,
-                ):
-                    yield event
-                    if outcome is not None:
-                        tool_outcomes.append(outcome)
-
-            tool_result_messages = transcript_helpers.tool_result_messages(tool_outcomes)
-            transcript.extend(tool_result_messages)
-            cleared_checkpoint = await self._checkpoint_without_pending_tool_approval(session.id)
-            await self.session_store.append_transcript_messages_and_transform_checkpoint(
-                session.id,
-                tool_result_messages,
-                _replace_checkpoint_preserving_runtime_state(cleared_checkpoint),
-            )
-            pending_approval_cleared = True
-            yield await self._event_writer.emit(
-                approval_support.cleared_event(
-                    session=session,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    approval_id=pending_approval.approval_id,
-                )
-            )
-
-            session_stream = self._run_session(
-                session=session,
-                registered_agent=registered_agent,
-                registered_provider=registered_provider,
-                registered_environment=registered_environment,
-                messages=transcript,
-                messages_to_append=[],
-                max_steps=effective_max_steps,
-                limits=effective_limits,
-                budget_limits=effective_budget_limits,
-                retry_policy=effective_retry_policy,
-                structured_output=_effective_approval_structured_output(
-                    structured_output=request.structured_output,
-                    pending_approval=pending_approval,
-                ),
-                # Restore the original run's thinking config across the approval pause
-                # (an override on the approval request itself wins).
-                thinking=_effective_approval_thinking(
-                    thinking=request.thinking,
-                    pending_approval=pending_approval,
-                ),
-                request_loop_policies=request.loop_policies,
-                request_metadata=request.metadata,
-                task_id=pending_approval.task_id,
-                task_worker_id=None,
-                start_event_type=None,
-                start_event_payload={},
-                start_task_on_enter=False,
-                release_run_fence_on_exit=False,
-            )
-            try:
-                async for event in self._session_control.stream_with_out_of_band_events(
-                    session.id,
-                    session_stream,
-                ):
-                    yield event
-            except GeneratorExit:
-                await session_stream.aclose()
-                raise
-        except GeneratorExit:
-            await self._finalize_abandoned_session_by_id(session.id)
-            raise
-        except Exception as exc:
-            if isinstance(exc, approval_support.ToolApprovalManualRecoveryRequired):
-                session = await self.session_store.update_status(
-                    session.id,
-                    SessionStatus.INTERRUPTED,
-                )
-                async for event in self._emit_terminal_event_with_hooks(
-                    event=Event(
-                        type=EventType.SESSION_INTERRUPTED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        payload={
-                            **exception_failure_payload(exc),
-                            "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
-                            "approval": pending_approval.model_dump(mode="json"),
-                            "approval_id": pending_approval.approval_id,
-                            "tool_call_id": exc.tool_call_id,
-                            "tool_name": exc.tool_name,
-                            "manual_recovery_required": True,
-                        },
-                    ),
-                    phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                ):
-                    yield event
-                return
-
-            if not pending_approval_cleared:
-                session = await self.session_store.update_status(
-                    session.id,
-                    SessionStatus.INTERRUPTED,
-                )
-                async for event in self._emit_terminal_event_with_hooks(
-                    event=Event(
-                        type=EventType.SESSION_INTERRUPTED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        payload={
-                            **exception_failure_payload(exc),
-                            "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
-                            "approval": pending_approval.model_dump(mode="json"),
-                        },
-                    ),
-                    phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                ):
-                    yield event
-                return
-
-            task_failure_error: Exception | None = None
-            if pending_approval.task_id is not None and self.task_store is not None:
-                try:
-                    task = await self.task_store.fail_task(
-                        pending_approval.task_id,
-                        {
-                            "message": str(exc),
-                            "type": type(exc).__name__,
-                            "session_id": session.id,
-                            "approval_id": pending_approval.approval_id,
-                        },
-                    )
-                    yield await self._event_writer.emit(
-                        _task_event(
-                            event_type=EventType.TASK_FAILED,
-                            task=task,
-                            session=session,
-                            registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                        )
-                    )
-                except Exception as task_exc:
-                    task_failure_error = task_exc
-            session = await self.session_store.update_status(session.id, SessionStatus.FAILED)
-            payload: dict[str, Any] = {
-                **exception_failure_payload(exc),
-                "approval_id": pending_approval.approval_id,
-                "tool_call_id": pending_approval.tool_call_id,
-            }
-            if task_failure_error is not None:
-                payload["task_update_error"] = str(task_failure_error)
-                payload["task_update_error_type"] = type(task_failure_error).__name__
-            async for event in self._emit_terminal_event_with_hooks(
-                event=Event(
-                    type=EventType.SESSION_FAILED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload=payload,
-                ),
-                phase=RuntimeHookPhase.AFTER_SESSION_FAILED,
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-            ):
-                yield event
 
     async def recover_tool_approval(
         self,
@@ -5175,182 +4330,32 @@ class CayuApp:
         registered_environment = self._get_registered_environment_for_session(
             loaded_session.environment_name
         )
-        session = await self.session_store.transition_status(
-            loaded_session.id,
-            from_statuses={SessionStatus.INTERRUPTED},
-            to_status=SessionStatus.RUNNING,
+        session = await self._transition_recovery_session_to_running(loaded_session.id)
+        recovery_stream = self._recovery_coordinator.recover_tool_approval(
+            request=request,
+            loaded_session=loaded_session,
+            session=session,
+            pending_approval=pending_approval,
+            pending_tool_call=pending_tool_call,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            registered_environment=registered_environment,
         )
-        recovery_prepared = False
+        authoritative_failure: BaseException | None = None
         try:
-            recovered_result = approval_support.recovered_tool_result(
-                request=request,
-            )
-            event_type = (
-                EventType.TOOL_CALL_FAILED
-                if recovered_result.is_error
-                else EventType.TOOL_CALL_COMPLETED
-            )
-            # Recovery reconciles an externally executed side effect that was
-            # authorized before the crash, so an expired window does not block it
-            # (an expired-never-approved approval has no started tool to recover).
-            # The out-of-window reconciliation is still stamped for the audit trail.
-            recovered_after_expiry = approval_support.pending_approval_expired(
-                pending_approval, self._clock()
-            )
-            events = await self.session_store.load_events(session.id)
-            approval_support.validate_recovery_target(
-                events=events,
-                approval=pending_approval,
-                tool_call_id=request.tool_call_id,
-            )
-            factory_started_event = await self._environment_lifecycle.emit_factory_started(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-            )
-            if factory_started_event is not None:
-                yield factory_started_event
-            factory_resolution = await self._environment_lifecycle.resolve_factory(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                started_event=factory_started_event,
-                operation=EnvironmentFactoryOperation.RECONNECT,
-            )
-            registered_environment = factory_resolution.registered_environment
-            environment_name = _environment_name(registered_environment)
-            for event in factory_resolution.events:
+            async for event in recovery_stream:
                 yield event
-            if factory_resolution.error is not None:
-                session = await self.session_store.update_status(
-                    session.id,
-                    SessionStatus.INTERRUPTED,
-                )
-                async for event in self._emit_terminal_event_with_hooks(
-                    event=Event(
-                        type=EventType.SESSION_INTERRUPTED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        payload={
-                            "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
-                            "approval": pending_approval.model_dump(mode="json"),
-                            "error": str(factory_resolution.error),
-                            "error_type": type(factory_resolution.error).__name__,
-                            "approval_id": pending_approval.approval_id,
-                        },
-                    ),
-                    phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                ):
-                    yield event
-                return
-            recovery_tool_event, recovered_result = tool_results.redact_tool_result_event(
-                event=Event(
-                    type=event_type,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    tool_name=pending_tool_call.tool_name,
-                    payload={
-                        "approval_id": pending_approval.approval_id,
-                        "tool_call_id": pending_tool_call.tool_call_id,
-                        "idempotency_key": tool_execution.tool_idempotency_key(
-                            session_id=session.id,
-                            tool_call_id=pending_tool_call.tool_call_id,
-                            approval_id=pending_approval.approval_id,
-                        ),
-                        "manual_recovery": True,
-                        "reason": request.reason,
-                        "metadata": request.metadata,
-                        "resolved_by": resolution_actor_payload(request.resolved_by),
-                        "expired": recovered_after_expiry,
-                        "result": recovered_result.model_dump(),
-                    },
-                ),
-                result=recovered_result,
-                redactor=self._secret_redactor,
-            )
-            recovery_events = [
-                approval_support.resumed_event(
-                    session=session,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    approval=pending_approval,
-                    decision=ToolApprovalDecision.APPROVE,
-                    resolved_by=request.resolved_by,
-                    expired=recovered_after_expiry,
-                ),
-                recovery_tool_event,
-            ]
-            emitted_recovery_events = await self._event_writer.emit_many(
-                session.id, recovery_events
-            )
-            for event in emitted_recovery_events:
-                yield event
-            tool_call = runtime_records.ToolCallRequest(
-                id=pending_tool_call.tool_call_id,
-                name=pending_tool_call.tool_name,
-                arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
-            )
-            tool_event = emitted_recovery_events[-1]
-            # Manual recovery persists the operator-supplied result before hooks run, so
-            # after_tool_call is observe-only here (v1): the threaded modification is ignored.
-            async for event, _modified in self._tool_round_executor.run_tool_call_hooks(
-                session=session,
-                tool_event=tool_event,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                tool_call=tool_call,
-                result=recovered_result,
-                task_id=pending_approval.task_id,
-                redactor=self._secret_redactor,
-                allow_modification=False,
-            ):
-                yield event
-            recovery_prepared = True
-        except GeneratorExit:
-            # Abandonment: finalize to INTERRUPTED (do NOT roll back to a live status).
-            await self._finalize_abandoned_session_by_id(session.id)
-            raise
-        except Exception:
-            await self.session_store.update_status(session.id, loaded_session.status)
+        except BaseException as exc:
+            authoritative_failure = exc
             raise
         finally:
-            if not recovery_prepared:
-                await self.session_store.release_run_fence(session.id)
-
-        try:
-            approval_request = ToolApprovalRequest(
-                session_id=request.session_id,
-                approval_id=request.approval_id,
-                decision=ToolApprovalDecision.APPROVE,
-                reason=request.reason,
-                metadata=request.metadata,
-                resolved_by=request.resolved_by,
-                max_steps=request.max_steps,
-                limits=request.limits,
-                budget_limits=request.budget_limits,
-                retry_policy=request.retry_policy,
-                structured_output=request.structured_output,
-                thinking=request.thinking,
-                loop_policies=request.loop_policies,
+            await self._cleanup_recovery_handoff(
+                stream=recovery_stream,
+                session_id=session.id,
+                authoritative_failure=authoritative_failure,
+                finalize_abandoned=False,
+                release_run_fence=False,
             )
-            async for event in self._continue_tool_approval_resolution(
-                request=approval_request,
-                session=session,
-                pending_approval=pending_approval,
-                registered_agent=registered_agent,
-                registered_provider=registered_provider,
-                registered_environment=registered_environment,
-                emit_resume_event=False,
-                enforce_expiry=False,
-            ):
-                yield event
-        finally:
-            await self.session_store.release_run_fence(session.id)
 
     async def recover_tool_round(
         self,
@@ -7292,8 +6297,9 @@ class CayuApp:
         expected_tool_calls = [*tool_calls, *(outcome.call for outcome in completed_tool_outcomes)]
         if await self._tool_round_has_result_messages(session.id, expected_tool_calls):
             if pending_approval_to_clear is not None:
-                cleared_checkpoint = await self._checkpoint_without_pending_tool_approval(
-                    session.id
+                cleared_checkpoint = await approval_support.checkpoint_without_pending_approval(
+                    self.session_store,
+                    session.id,
                 )
                 await self.session_store.transform_checkpoint(
                     session.id,
@@ -7343,7 +6349,10 @@ class CayuApp:
         )
         messages.extend(tool_result_messages)
         if pending_approval_to_clear is not None:
-            cleared_checkpoint = await self._checkpoint_without_pending_tool_approval(session.id)
+            cleared_checkpoint = await approval_support.checkpoint_without_pending_approval(
+                self.session_store,
+                session.id,
+            )
             await self.session_store.append_transcript_messages_and_transform_checkpoint(
                 session.id,
                 tool_result_messages,
@@ -7384,15 +6393,6 @@ class CayuApp:
             session_id,
             _replace_checkpoint_preserving_runtime_state(copied_checkpoint),
         )
-
-    async def _checkpoint_without_pending_tool_approval(
-        self,
-        session_id: str,
-    ) -> dict[str, Any]:
-        checkpoint = await self.session_store.load_checkpoint(session_id)
-        checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
-        checkpoint.pop(approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY, None)
-        return checkpoint
 
     async def _load_pending_session_interrupt_payload(
         self,
@@ -9585,83 +8585,6 @@ def _validate_tool_approval_recovery_request(
     return copy_tool_approval_recovery_request(request)
 
 
-def _effective_user_input_max_steps(
-    *,
-    max_steps: int | None,
-    pending: PendingUserInput,
-) -> int:
-    # Restore the original run's max_steps on a user-input continuation; an explicit override
-    # on the resolution request wins. Pending states written before run config was checkpointed
-    # fall back to the historical request default.
-    if type(pending) is not PendingUserInput:
-        raise TypeError("Pending user input must be a PendingUserInput.")
-    if max_steps is not None:
-        return max_steps
-    if pending.max_steps is not None:
-        return pending.max_steps
-    return _DEFAULT_APPROVAL_MAX_STEPS
-
-
-def _effective_user_input_run_limits(
-    *,
-    limits: RunLimits | None,
-    pending: PendingUserInput,
-) -> RunLimits:
-    if type(pending) is not PendingUserInput:
-        raise TypeError("Pending user input must be a PendingUserInput.")
-    if limits is not None:
-        return copy_run_limits(limits)
-    if pending.limits is not None:
-        return copy_run_limits(pending.limits)
-    return RunLimits()
-
-
-def _effective_user_input_budget_limits(
-    *,
-    budget_limits: tuple[BudgetLimit, ...] | None,
-    pending: PendingUserInput,
-) -> tuple[BudgetLimit, ...]:
-    if type(pending) is not PendingUserInput:
-        raise TypeError("Pending user input must be a PendingUserInput.")
-    if budget_limits is not None:
-        return copy_request_budget_limits(budget_limits)
-    if pending.budget_limits is not None:
-        return copy_request_budget_limits(pending.budget_limits)
-    return ()
-
-
-def _effective_user_input_retry_policy(
-    *,
-    retry_policy: RetryPolicy | None,
-    pending: PendingUserInput,
-) -> RetryPolicy | None:
-    # RetryPolicy is frozen, so the persisted reference is safe to reuse.
-    if type(pending) is not PendingUserInput:
-        raise TypeError("Pending user input must be a PendingUserInput.")
-    if retry_policy is not None:
-        return retry_policy
-    return pending.retry_policy
-
-
-def _effective_user_input_structured_output(
-    *,
-    structured_output: StructuredOutputSpec | None,
-    pending: PendingUserInput,
-) -> StructuredOutputSpec | None:
-    # Mirror _effective_approval_structured_output: inherit the paused run's spec when the resolver
-    # supplies none; adopt the resolver's spec when the run had none; a differing spec is a swap of
-    # the contract fixed by the provider history and is rejected.
-    if type(pending) is not PendingUserInput:
-        raise TypeError("Pending user input must be a PendingUserInput.")
-    if structured_output is None:
-        return copy_structured_output_spec(pending.structured_output)
-    if pending.structured_output is None:
-        return copy_structured_output_spec(structured_output)
-    if not _structured_output_specs_equal(structured_output, pending.structured_output):
-        raise ValueError("structured_output does not match the paused run contract.")
-    return copy_structured_output_spec(pending.structured_output)
-
-
 def _effective_tool_round_structured_output(
     *,
     structured_output: StructuredOutputSpec | None,
@@ -9680,79 +8603,6 @@ def _effective_tool_round_structured_output(
     if not _structured_output_specs_equal(structured_output, pending_round.structured_output):
         raise ValueError("structured_output does not match the crashed run contract.")
     return copy_structured_output_spec(pending_round.structured_output)
-
-
-def _effective_approval_thinking(
-    *,
-    thinking: ThinkingConfig | None,
-    pending_approval: PendingToolApproval,
-) -> ThinkingConfig | None:
-    # Restore the original run's thinking config on an approval continuation; a thinking
-    # override on the approval request itself takes precedence. (ThinkingConfig is frozen,
-    # so the reference is safe to reuse.)
-    if type(pending_approval) is not PendingToolApproval:
-        raise TypeError("Pending approval must be a PendingToolApproval.")
-    if thinking is not None:
-        return thinking
-    return pending_approval.thinking
-
-
-def _effective_approval_max_steps(
-    *,
-    max_steps: int | None,
-    pending_approval: PendingToolApproval,
-) -> int:
-    # Restore the original run's max_steps on an approval continuation; an explicit
-    # override on the approval request wins. Approvals persisted before run config
-    # was checkpointed fall back to the historical request default.
-    if type(pending_approval) is not PendingToolApproval:
-        raise TypeError("Pending approval must be a PendingToolApproval.")
-    if max_steps is not None:
-        return max_steps
-    if pending_approval.max_steps is not None:
-        return pending_approval.max_steps
-    return _DEFAULT_APPROVAL_MAX_STEPS
-
-
-def _effective_approval_run_limits(
-    *,
-    limits: RunLimits | None,
-    pending_approval: PendingToolApproval,
-) -> RunLimits:
-    if type(pending_approval) is not PendingToolApproval:
-        raise TypeError("Pending approval must be a PendingToolApproval.")
-    if limits is not None:
-        return copy_run_limits(limits)
-    if pending_approval.limits is not None:
-        return copy_run_limits(pending_approval.limits)
-    return RunLimits()
-
-
-def _effective_approval_budget_limits(
-    *,
-    budget_limits: tuple[BudgetLimit, ...] | None,
-    pending_approval: PendingToolApproval,
-) -> tuple[BudgetLimit, ...]:
-    if type(pending_approval) is not PendingToolApproval:
-        raise TypeError("Pending approval must be a PendingToolApproval.")
-    if budget_limits is not None:
-        return copy_request_budget_limits(budget_limits)
-    if pending_approval.budget_limits is not None:
-        return copy_request_budget_limits(pending_approval.budget_limits)
-    return ()
-
-
-def _effective_approval_retry_policy(
-    *,
-    retry_policy: RetryPolicy | None,
-    pending_approval: PendingToolApproval,
-) -> RetryPolicy | None:
-    # RetryPolicy is frozen, so the persisted reference is safe to reuse.
-    if type(pending_approval) is not PendingToolApproval:
-        raise TypeError("Pending approval must be a PendingToolApproval.")
-    if retry_policy is not None:
-        return retry_policy
-    return pending_approval.retry_policy
 
 
 def _require_native_structured_output_support(
@@ -9781,25 +8631,6 @@ def _require_native_structured_output_support(
     registered_provider.provider.preflight_native_structured_output_schema(
         copy_json_value(structured_output.json_schema, "json_schema")
     )
-
-
-def _effective_approval_structured_output(
-    *,
-    structured_output: StructuredOutputSpec | None,
-    pending_approval: PendingToolApproval,
-) -> StructuredOutputSpec | None:
-    if type(pending_approval) is not PendingToolApproval:
-        raise TypeError("Pending approval must be a PendingToolApproval.")
-    if structured_output is None:
-        return copy_structured_output_spec(pending_approval.structured_output)
-    if pending_approval.structured_output is None:
-        return copy_structured_output_spec(structured_output)
-    if not _structured_output_specs_equal(
-        structured_output,
-        pending_approval.structured_output,
-    ):
-        raise ValueError("Tool approval structured_output does not match the pending run contract.")
-    return copy_structured_output_spec(pending_approval.structured_output)
 
 
 def _structured_output_specs_equal(
@@ -10206,6 +9037,16 @@ def _runtime_hook_event(
         agent_name=registered_agent.spec.name,
         environment_name=_environment_name(registered_environment),
         payload=payload,
+    )
+
+
+def _recovery_task_event(request: RecoveryTaskEventRequest) -> Event:
+    return _task_event(
+        event_type=request.event_type,
+        task=request.task,
+        session=request.session,
+        registered_agent=request.registered_agent,
+        registered_environment=request.registered_environment,
     )
 
 

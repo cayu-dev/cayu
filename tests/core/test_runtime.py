@@ -22216,6 +22216,55 @@ def _reviewer_actor() -> ResolutionActor:
     )
 
 
+class _BlockingApprovalTool(Tool):
+    spec = ToolSpec(
+        name="side_effect",
+        description="Block an approved side effect until its consumer is cancelled.",
+        input_schema={
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+        },
+    )
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started: asyncio.Event | None = None
+        self.never_complete: asyncio.Event | None = None
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        if self.started is None or self.never_complete is None:
+            raise AssertionError("Blocking approval tool events were not initialized.")
+        self.started.set()
+        await self.never_complete.wait()
+        return ToolResult(content="unexpected")
+
+
+class _BlockingApprovalContinuationProvider(ModelProvider):
+    name = "fake"
+
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+        self.continuation_started: asyncio.Event | None = None
+        self.never_complete: asyncio.Event | None = None
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            yield ModelStreamEvent.tool_call(
+                id="call_1",
+                name="side_effect",
+                arguments={"value": "secret"},
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        if self.continuation_started is None or self.never_complete is None:
+            raise AssertionError("Blocking approval continuation events were not initialized.")
+        self.continuation_started.set()
+        await self.never_complete.wait()
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
 def _approval_pause_app(
     *,
     store: InMemorySessionStore,
@@ -22293,6 +22342,136 @@ def test_tool_approval_resolution_events_carry_resolved_by_actor():
     approved = next(event for event in events if event.type == EventType.TOOL_CALL_APPROVED)
     assert approved.payload["resolved_by"] == expected_actor
     assert tool.calls == [{"value": "secret"}]
+
+
+def test_tool_approval_resolution_closes_continuation_before_aclose_returns():
+    class RecordingReleaseStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.release_calls = 0
+
+        async def release_run_fence(self, session_id: str) -> None:
+            self.release_calls += 1
+            await super().release_run_fence(session_id)
+
+    async def run() -> tuple[Event, SessionStatus, int, bool]:
+        session_id = "sess_approval_resolution_stream_closed"
+        store = RecordingReleaseStore()
+        app, _provider = _approval_pause_app(
+            store=store,
+            tool=SideEffectTool(),
+            policy=RequireApprovalPolicy(),
+        )
+        interrupted = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+        approval_id = next(
+            event for event in interrupted if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+        ).payload["approval"]["approval_id"]
+
+        releases_before = store.release_calls
+        stream = app.resolve_tool_approval(
+            ToolApprovalRequest(
+                session_id=session_id,
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+            )
+        )
+        while True:
+            boundary_event = await anext(stream)
+            if boundary_event.type == EventType.MODEL_STARTED:
+                break
+        assert app._session_control.has_active_tasks(session_id) is True
+        await stream.aclose()
+        release_delta = store.release_calls - releases_before
+        has_active_tasks = app._session_control.has_active_tasks(session_id)
+        session = await store.load(session_id)
+        assert session is not None
+        return boundary_event, session.status, release_delta, has_active_tasks
+
+    boundary_event, status, release_delta, has_active_tasks = asyncio.run(run())
+
+    assert boundary_event.type == EventType.MODEL_STARTED
+    assert status == SessionStatus.INTERRUPTED
+    assert release_delta == 1
+    assert has_active_tasks is False
+
+
+def test_tool_approval_resolution_task_cancellation_finalizes_and_preserves_pending_state():
+    class RecordingReleaseStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.release_calls = 0
+
+        async def release_run_fence(self, session_id: str) -> None:
+            self.release_calls += 1
+            await super().release_run_fence(session_id)
+
+    async def run() -> None:
+        session_id = "sess_approval_resolution_task_cancelled"
+        store = RecordingReleaseStore()
+        tool = _BlockingApprovalTool()
+        tool.started = asyncio.Event()
+        tool.never_complete = asyncio.Event()
+        app, _provider = _approval_pause_app(
+            store=store,
+            tool=tool,
+            policy=RequireApprovalPolicy(),
+        )
+        interrupted = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+        approval_id = next(
+            event for event in interrupted if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+        ).payload["approval"]["approval_id"]
+
+        releases_before = store.release_calls
+        resolution_task = asyncio.create_task(
+            collect_tool_approval_events(
+                app,
+                ToolApprovalRequest(
+                    session_id=session_id,
+                    approval_id=approval_id,
+                    decision=ToolApprovalDecision.APPROVE,
+                ),
+            )
+        )
+        await asyncio.wait_for(tool.started.wait(), timeout=5)
+        assert resolution_task.cancelling() == 0
+        resolution_task.cancel("cancel tool approval resolution")
+        assert resolution_task.cancelling() == 1
+        try:
+            await resolution_task
+        except asyncio.CancelledError as cancellation:
+            assert cancellation.args == ("cancel tool approval resolution",)
+        else:
+            pytest.fail("Tool approval resolution did not preserve task cancellation.")
+
+        assert resolution_task.cancelled() is True
+        assert resolution_task.cancelling() == 1
+        session = await store.load(session_id)
+        assert session is not None
+        assert session.status == SessionStatus.INTERRUPTED
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        assert checkpoint["pending_tool_approval"]["approval_id"] == approval_id
+        events = await store.load_events(session_id)
+        assert events[-1].type == EventType.SESSION_INTERRUPTED
+        assert events[-1].payload["abandoned"] is True
+        assert store.release_calls - releases_before == 1
+        assert app._session_control.has_active_tasks(session_id) is False
+
+    asyncio.run(run())
 
 
 def test_tool_approval_denial_events_carry_resolved_by_actor():
@@ -22663,6 +22842,142 @@ def test_tool_approval_recovery_events_carry_resolved_by_and_expiry_stamp():
     assert not any(event.type == EventType.TOOL_CALL_APPROVAL_EXPIRED for event in recovery_events)
     assert recovery_events[-1].type == EventType.SESSION_COMPLETED
     assert release_calls == 1
+
+
+def test_tool_approval_recovery_closes_continuation_before_aclose_returns():
+    async def run() -> tuple[Event, SessionStatus, int, bool]:
+        session_id = "sess_approval_recovery_stream_closed"
+        store = FailingTerminalToolEventStore()
+        app, _provider = _approval_pause_app(
+            store=store,
+            tool=SideEffectTool(),
+            policy=RequireApprovalPolicy(),
+        )
+        interrupted = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+        approval_id = next(
+            event for event in interrupted if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+        ).payload["approval"]["approval_id"]
+        crashed = await collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id=session_id,
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+            ),
+        )
+        assert crashed[-1].type == EventType.SESSION_INTERRUPTED
+
+        releases_before = store.release_calls
+        stream = app.recover_tool_approval(
+            ToolApprovalRecoveryRequest(
+                session_id=session_id,
+                approval_id=approval_id,
+                tool_call_id="call_1",
+                outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                message="side effect completed externally",
+            )
+        )
+        while True:
+            boundary_event = await anext(stream)
+            if boundary_event.type == EventType.MODEL_STARTED:
+                break
+        assert app._session_control.has_active_tasks(session_id) is True
+        await stream.aclose()
+        release_delta = store.release_calls - releases_before
+        has_active_tasks = app._session_control.has_active_tasks(session_id)
+        session = await store.load(session_id)
+        assert session is not None
+        return boundary_event, session.status, release_delta, has_active_tasks
+
+    boundary_event, status, release_delta, has_active_tasks = asyncio.run(run())
+
+    assert boundary_event.type == EventType.MODEL_STARTED
+    assert status == SessionStatus.INTERRUPTED
+    assert release_delta == 1
+    assert has_active_tasks is False
+
+
+def test_tool_approval_recovery_task_cancellation_finalizes_continuation():
+    async def run() -> None:
+        session_id = "sess_approval_recovery_task_cancelled"
+        store = FailingTerminalToolEventStore()
+        provider = _BlockingApprovalContinuationProvider()
+        provider.continuation_started = asyncio.Event()
+        provider.never_complete = asyncio.Event()
+        app = CayuApp(session_store=store)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[SideEffectTool()],
+            tool_policy=RequireApprovalPolicy(),
+        )
+        interrupted = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+        approval_id = next(
+            event for event in interrupted if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+        ).payload["approval"]["approval_id"]
+        crashed = await collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id=session_id,
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+            ),
+        )
+        assert crashed[-1].type == EventType.SESSION_INTERRUPTED
+
+        releases_before = store.release_calls
+        recovery_task = asyncio.create_task(
+            collect_tool_approval_recovery_events(
+                app,
+                ToolApprovalRecoveryRequest(
+                    session_id=session_id,
+                    approval_id=approval_id,
+                    tool_call_id="call_1",
+                    outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                    message="side effect completed externally",
+                ),
+            )
+        )
+        await asyncio.wait_for(provider.continuation_started.wait(), timeout=5)
+        assert recovery_task.cancelling() == 0
+        recovery_task.cancel("cancel tool approval recovery")
+        assert recovery_task.cancelling() == 1
+        try:
+            await recovery_task
+        except asyncio.CancelledError as cancellation:
+            assert cancellation.args == ("cancel tool approval recovery",)
+        else:
+            pytest.fail("Tool approval recovery did not preserve task cancellation.")
+
+        assert recovery_task.cancelled() is True
+        assert recovery_task.cancelling() == 1
+        session = await store.load(session_id)
+        assert session is not None
+        assert session.status == SessionStatus.INTERRUPTED
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        assert "pending_tool_approval" not in checkpoint
+        events = await store.load_events(session_id)
+        assert events[-1].type == EventType.SESSION_INTERRUPTED
+        assert events[-1].payload["abandoned"] is True
+        assert store.release_calls - releases_before == 1
+        assert app._session_control.has_active_tasks(session_id) is False
+
+    asyncio.run(run())
 
 
 def test_tool_approval_recovery_releases_run_fence_once_when_setup_fails():
@@ -40405,81 +40720,6 @@ def test_pending_tool_approval_loads_legacy_checkpoint_without_run_config():
     assert restored.budget_limits is None
     assert restored.retry_policy is None
     assert restored.expires_at is None
-
-
-def test_effective_approval_run_config_prefers_override_then_pending_then_default():
-    from cayu.runtime.app import (
-        _DEFAULT_APPROVAL_MAX_STEPS,
-        _effective_approval_budget_limits,
-        _effective_approval_max_steps,
-        _effective_approval_retry_policy,
-        _effective_approval_run_limits,
-    )
-    from cayu.runtime.approvals import PendingToolApproval, PendingToolCallApproval
-
-    def pending(**kwargs) -> PendingToolApproval:
-        return PendingToolApproval(
-            approval_id="appr_1",
-            tool_call_id="call_1",
-            tool_name="side_effect",
-            agent_name="assistant",
-            tool_calls=[PendingToolCallApproval(tool_call_id="call_1", tool_name="side_effect")],
-            **kwargs,
-        )
-
-    persisted = pending(
-        max_steps=9,
-        limits=RunLimits(max_tool_calls=2, scope="session"),
-        budget_limits=(fake_budget_limit("1.00"),),
-        retry_policy=RetryPolicy(max_attempts=4),
-    )
-    legacy = pending()
-
-    # Explicit overrides on the approval request win.
-    assert _effective_approval_max_steps(max_steps=3, pending_approval=persisted) == 3
-    assert _effective_approval_run_limits(
-        limits=RunLimits(max_tool_calls=5),
-        pending_approval=persisted,
-    ) == RunLimits(max_tool_calls=5)
-    assert (
-        _effective_approval_budget_limits(
-            budget_limits=(),
-            pending_approval=persisted,
-        )
-        == ()
-    )
-    override_policy = RetryPolicy(max_attempts=2)
-    assert (
-        _effective_approval_retry_policy(
-            retry_policy=override_policy,
-            pending_approval=persisted,
-        )
-        is override_policy
-    )
-
-    # No override -> the original run's persisted config is restored.
-    assert _effective_approval_max_steps(max_steps=None, pending_approval=persisted) == 9
-    assert _effective_approval_run_limits(
-        limits=None,
-        pending_approval=persisted,
-    ) == RunLimits(max_tool_calls=2, scope="session")
-    assert _effective_approval_budget_limits(
-        budget_limits=None,
-        pending_approval=persisted,
-    ) == (fake_budget_limit("1.00"),)
-    assert _effective_approval_retry_policy(
-        retry_policy=None,
-        pending_approval=persisted,
-    ) == RetryPolicy(max_attempts=4)
-
-    # Legacy approvals without persisted config fall back to the old defaults.
-    assert (
-        _effective_approval_max_steps(max_steps=None, pending_approval=legacy)
-        == _DEFAULT_APPROVAL_MAX_STEPS
-    )
-    assert _effective_approval_run_limits(limits=None, pending_approval=legacy) == RunLimits()
-    assert _effective_approval_budget_limits(budget_limits=None, pending_approval=legacy) == ()
-    assert _effective_approval_retry_policy(retry_policy=None, pending_approval=legacy) is None
 
 
 def _run_config_approval_app() -> tuple[InMemorySessionStore, SideEffectTool, CayuApp]:
