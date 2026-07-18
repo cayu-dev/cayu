@@ -4816,6 +4816,9 @@ def test_cancelled_sqlite_factory_checkpoint_preserves_committed_allocation(
         transform_started = threading.Event()
         allow_transform_return = threading.Event()
         original_transform_checkpoint = store.transform_checkpoint
+        run_fence_release_started = asyncio.Event()
+        run_fence_release_completed = asyncio.Event()
+        original_release_run_fence = store.release_run_fence
 
         async def delayed_transform_checkpoint(session_id, checkpoint_transform) -> None:
             def delayed_transform(session, checkpoint):
@@ -4827,7 +4830,13 @@ def test_cancelled_sqlite_factory_checkpoint_preserves_committed_allocation(
 
             await original_transform_checkpoint(session_id, delayed_transform)
 
+        async def observed_release_run_fence(session_id: str) -> None:
+            run_fence_release_started.set()
+            await original_release_run_fence(session_id)
+            run_fence_release_completed.set()
+
         monkeypatch.setattr(store, "transform_checkpoint", delayed_transform_checkpoint)
+        monkeypatch.setattr(store, "release_run_fence", observed_release_run_fence)
         release_actions: list[EnvironmentFactoryReleaseAction] = []
 
         async def release(action: EnvironmentFactoryReleaseAction) -> None:
@@ -4864,10 +4873,22 @@ def test_cancelled_sqlite_factory_checkpoint_preserves_committed_allocation(
         )
         await asyncio.wait_for(asyncio.to_thread(transform_started.wait), timeout=2)
         run_task.cancel()
+        await asyncio.sleep(0)
+
+        # Cancellation cannot escape the SQLite ownership boundary while the
+        # checkpoint worker still owns the writer connection. In particular,
+        # factory release and run-fence cleanup must not race that transaction.
+        assert store._lock.locked()
+        assert not run_task.done()
+        assert release_actions == []
+        assert not run_fence_release_started.is_set()
+
         allow_transform_return.set()
         with pytest.raises(asyncio.CancelledError):
             await run_task
 
+        assert run_fence_release_started.is_set()
+        assert run_fence_release_completed.is_set()
         checkpoint = await store.load_checkpoint("sess_cancelled_sqlite_factory_checkpoint")
         await store.close()
         assert checkpoint is not None

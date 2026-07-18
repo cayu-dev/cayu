@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import sqlite3
 import threading
@@ -2101,6 +2102,297 @@ def test_sqlite_session_store_in_memory_shares_single_connection():
         session = await store.load("sess_memory_shared")
         assert session is not None
         await _close(store)
+
+    asyncio.run(run())
+
+
+def test_sqlite_off_thread_writer_retains_connection_ownership_during_cancellation(
+    tmp_path,
+) -> None:
+    store = SQLiteSessionStore(tmp_path / "writer-cancellation.sqlite")
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    follower_started = threading.Event()
+
+    def blocked_write(connection: sqlite3.Connection) -> str:
+        worker_started.set()
+        if not release_worker.wait(timeout=5):
+            raise TimeoutError("test did not release the SQLite writer")
+        connection.execute("SELECT 1")
+        return "first"
+
+    def follower_write(connection: sqlite3.Connection) -> str:
+        follower_started.set()
+        connection.execute("SELECT 1")
+        return "second"
+
+    async def run() -> None:
+        owner = asyncio.create_task(store._run_write(blocked_write))
+        await asyncio.wait_for(asyncio.to_thread(worker_started.wait), timeout=2)
+
+        owner.cancel("first cancellation")
+        await asyncio.sleep(0)
+        assert not owner.done()
+        owner.cancel("second cancellation")
+        await asyncio.sleep(0)
+        follower = asyncio.create_task(store._run_write(follower_write))
+        close_task = asyncio.create_task(store.close())
+        await asyncio.sleep(0)
+
+        assert owner.cancelling() == 2
+        assert store._lock.locked()
+        assert not owner.done()
+        assert not follower_started.is_set()
+        assert not follower.done()
+        assert not close_task.done()
+
+        release_worker.set()
+        with pytest.raises(asyncio.CancelledError) as cancellation:
+            await owner
+        assert cancellation.value.args == ("first cancellation",)
+        assert owner.cancelled()
+        assert await follower == "second"
+        await close_task
+
+    asyncio.run(run())
+
+
+def test_sqlite_pending_cancellation_retains_off_thread_connection_ownership(
+    tmp_path,
+) -> None:
+    store = SQLiteSessionStore(tmp_path / "pending-cancellation.sqlite")
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    follower_started = threading.Event()
+
+    def blocked_write(connection: sqlite3.Connection) -> None:
+        worker_started.set()
+        if not release_worker.wait(timeout=5):
+            raise TimeoutError("test did not release the pending-cancellation worker")
+        connection.execute("SELECT 1")
+
+    def follower_write(connection: sqlite3.Connection) -> None:
+        follower_started.set()
+        connection.execute("SELECT 2")
+
+    async def run() -> None:
+        async def start_with_pending_cancellation() -> None:
+            current_task = asyncio.current_task()
+            assert current_task is not None
+            current_task.cancel("pending before SQLite ownership")
+            await store._run_write(blocked_write)
+
+        owner = asyncio.create_task(start_with_pending_cancellation())
+        await asyncio.wait_for(asyncio.to_thread(worker_started.wait), timeout=2)
+        follower = asyncio.create_task(store._run_write(follower_write))
+        close_task = asyncio.create_task(store.close())
+        await asyncio.sleep(0)
+
+        assert store._lock.locked()
+        assert not owner.done()
+        assert not follower_started.is_set()
+        assert not follower.done()
+        assert not close_task.done()
+
+        release_worker.set()
+        with pytest.raises(asyncio.CancelledError) as cancellation:
+            await owner
+        assert cancellation.value.args == ("pending before SQLite ownership",)
+        await follower
+        await close_task
+
+    asyncio.run(run())
+
+
+def test_sqlite_task_sweep_cannot_end_off_thread_connection_ownership(
+    tmp_path,
+) -> None:
+    store = SQLiteSessionStore(tmp_path / "task-sweep-cancellation.sqlite")
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    follower_started = threading.Event()
+
+    def blocked_write(connection: sqlite3.Connection) -> None:
+        worker_started.set()
+        if not release_worker.wait(timeout=5):
+            raise TimeoutError("test did not release the task-sweep worker")
+        connection.execute("SELECT 1")
+
+    def follower_write(connection: sqlite3.Connection) -> None:
+        follower_started.set()
+        connection.execute("SELECT 2")
+
+    async def run() -> None:
+        owner = asyncio.create_task(store._run_write(blocked_write))
+        await asyncio.wait_for(asyncio.to_thread(worker_started.wait), timeout=2)
+
+        current_task = asyncio.current_task()
+        assert current_task is not None
+        child_tasks = asyncio.all_tasks() - {current_task, owner}
+        owner.cancel("shutdown sweep")
+        for child_task in child_tasks:
+            child_task.cancel("shutdown sweep")
+
+        follower = asyncio.create_task(store._run_write(follower_write))
+        close_task = asyncio.create_task(store.close())
+        await asyncio.sleep(0)
+
+        assert store._lock.locked()
+        assert not owner.done()
+        assert not follower_started.is_set()
+        assert not follower.done()
+        assert not close_task.done()
+
+        release_worker.set()
+        with pytest.raises(asyncio.CancelledError, match="shutdown sweep"):
+            await owner
+        await follower
+        await close_task
+
+    asyncio.run(run())
+
+
+def test_sqlite_off_thread_reader_retains_connection_ownership_during_cancellation(
+    tmp_path,
+) -> None:
+    store = SQLiteSessionStore(tmp_path / "reader-cancellation.sqlite")
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    follower_started = threading.Event()
+
+    def blocked_read(connection: sqlite3.Connection) -> int:
+        worker_started.set()
+        if not release_worker.wait(timeout=5):
+            raise TimeoutError("test did not release the SQLite reader")
+        return connection.execute("SELECT 1").fetchone()[0]
+
+    def follower_read(connection: sqlite3.Connection) -> int:
+        follower_started.set()
+        return connection.execute("SELECT 2").fetchone()[0]
+
+    async def run() -> None:
+        owner = asyncio.create_task(store._run_read(blocked_read))
+        await asyncio.wait_for(asyncio.to_thread(worker_started.wait), timeout=2)
+
+        # The file-backed writer uses a different physical connection and must
+        # remain independent of the occupied read connection.
+        writer_value = await store._run_write(
+            lambda connection: connection.execute("SELECT 3").fetchone()[0]
+        )
+        assert writer_value == 3
+
+        owner.cancel()
+        follower = asyncio.create_task(store._run_read(follower_read))
+        await asyncio.sleep(0)
+        close_task = asyncio.create_task(store.close())
+        await asyncio.sleep(0)
+
+        assert store._read_lock.locked()
+        assert not owner.done()
+        assert not follower_started.is_set()
+        assert not follower.done()
+        assert not close_task.done()
+
+        release_worker.set()
+        with pytest.raises(asyncio.CancelledError):
+            await owner
+        assert await follower == 2
+        await close_task
+
+    asyncio.run(run())
+
+
+def test_sqlite_off_thread_worker_failure_and_cancellation_remain_observable(
+    tmp_path,
+) -> None:
+    store = SQLiteSessionStore(tmp_path / "worker-failure.sqlite")
+
+    class WorkerFailure(RuntimeError):
+        pass
+
+    ordinary_failure = WorkerFailure("ordinary worker failure")
+
+    def fail_ordinary(_connection: sqlite3.Connection) -> None:
+        raise ordinary_failure
+
+    def cancel_worker(_connection: sqlite3.Connection) -> None:
+        raise asyncio.CancelledError("worker cancellation")
+
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    cancelled_failure = WorkerFailure("worker failed after cancellation")
+    context_marker = contextvars.ContextVar("sqlite_worker_context")
+
+    def fail_after_cancellation(_connection: sqlite3.Connection) -> None:
+        worker_started.set()
+        if not release_worker.wait(timeout=5):
+            raise TimeoutError("test did not release the failing SQLite worker")
+        raise cancelled_failure
+
+    async def run() -> None:
+        context_marker.set("caller context")
+        observed_context = await store._run_write(lambda _connection: context_marker.get("missing"))
+        assert observed_context == "caller context"
+
+        with pytest.raises(WorkerFailure) as raised:
+            await store._run_write(fail_ordinary)
+        assert raised.value is ordinary_failure
+
+        with pytest.raises(asyncio.CancelledError, match="worker cancellation"):
+            await store._run_write(cancel_worker)
+        current_task = asyncio.current_task()
+        assert current_task is not None
+        assert current_task.cancelling() == 0
+
+        owner = asyncio.create_task(store._run_write(fail_after_cancellation))
+        await asyncio.wait_for(asyncio.to_thread(worker_started.wait), timeout=2)
+        owner.cancel()
+        release_worker.set()
+        with pytest.raises(asyncio.CancelledError) as cancellation:
+            await owner
+        assert cancellation.value.__cause__ is cancelled_failure
+        assert any(
+            "SQLite worker failed while caller cancellation was pending" in note
+            for note in cancellation.value.__notes__
+        )
+        assert owner.cancelled()
+        await store.close()
+
+    asyncio.run(run())
+
+
+def test_sqlite_in_memory_read_cancellation_serializes_shared_writer_connection() -> None:
+    store = SQLiteSessionStore(":memory:")
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    writer_started = threading.Event()
+
+    def blocked_read(connection: sqlite3.Connection) -> int:
+        worker_started.set()
+        if not release_worker.wait(timeout=5):
+            raise TimeoutError("test did not release the in-memory SQLite reader")
+        return connection.execute("SELECT 1").fetchone()[0]
+
+    def write(connection: sqlite3.Connection) -> None:
+        writer_started.set()
+        connection.execute("CREATE TABLE cancellation_serialization (value INTEGER)")
+
+    async def run() -> None:
+        owner = asyncio.create_task(store._run_read(blocked_read))
+        await asyncio.wait_for(asyncio.to_thread(worker_started.wait), timeout=2)
+        owner.cancel()
+        writer = asyncio.create_task(store._run_write(write))
+        await asyncio.sleep(0)
+
+        assert store._read_lock is store._lock
+        assert not writer_started.is_set()
+        assert not writer.done()
+
+        release_worker.set()
+        with pytest.raises(asyncio.CancelledError):
+            await owner
+        await writer
+        await store.close()
 
     asyncio.run(run())
 

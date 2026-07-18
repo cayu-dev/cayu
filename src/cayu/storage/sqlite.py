@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import math
 import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 from uuid import uuid4
 
 from cayu._validation import (
@@ -119,8 +120,64 @@ _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     contains_style="sqlite_nocase_like",
     datetime_param=sqlite_support.format_datetime,
 )
-
 _T = TypeVar("_T")
+
+
+async def _run_off_thread_with_connection_ownership(
+    lock: asyncio.Lock,
+    connection: sqlite3.Connection,
+    operation: Callable[[sqlite3.Connection], _T],
+) -> _T:
+    """Keep a SQLite connection owned until its off-thread operation terminates.
+
+    Cancelling an ``asyncio.to_thread`` await does not stop the worker thread.
+    Defer caller cancellation while holding the connection lock so no subsequent
+    operation or shutdown can reuse the connection before the worker has left it
+    in a terminal transaction state.
+    """
+
+    async with lock:
+
+        def capture_outcome() -> tuple[bool, object]:
+            try:
+                return True, operation(connection)
+            except BaseException as worker_failure:
+                # The executor future must complete normally even when the
+                # operation raises CancelledError. That makes every cancellation
+                # from shield() unambiguously caller-owned and keeps ownership
+                # tied to the executor's physical completion.
+                return False, worker_failure
+
+        loop = asyncio.get_running_loop()
+        context = contextvars.copy_context()
+        worker = loop.run_in_executor(None, context.run, capture_outcome)
+        cancellation: asyncio.CancelledError | None = None
+
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError as exc:
+                if cancellation is None:
+                    cancellation = exc
+            except BaseException:
+                if worker.done():
+                    break
+                raise
+
+        succeeded, outcome = worker.result()
+        if not succeeded:
+            if not isinstance(outcome, BaseException):
+                raise RuntimeError("SQLite worker returned an invalid failure outcome.")
+            if cancellation is None:
+                raise outcome
+            cancellation.add_note(
+                "SQLite worker failed while caller cancellation was pending: "
+                f"{type(outcome).__name__}: {outcome}"
+            )
+            raise cancellation from outcome
+        if cancellation is not None:
+            raise cancellation
+        return cast("_T", outcome)
 
 
 def _like_contains_pattern(value: str) -> str:
@@ -542,13 +599,19 @@ class SQLiteSessionStore(SessionStore):
 
     async def _run_read(self, query: Callable[[sqlite3.Connection], _T]) -> _T:
         """Run a read-only query off the event loop on the read connection."""
-        async with self._read_lock:
-            return await asyncio.to_thread(query, self._read_connection)
+        return await _run_off_thread_with_connection_ownership(
+            self._read_lock,
+            self._read_connection,
+            query,
+        )
 
     async def _run_write(self, statement: Callable[[sqlite3.Connection], _T]) -> _T:
         """Run a write statement off the event loop on the writer connection."""
-        async with self._lock:
-            return await asyncio.to_thread(statement, self._connection)
+        return await _run_off_thread_with_connection_ownership(
+            self._lock,
+            self._connection,
+            statement,
+        )
 
     async def create(
         self,

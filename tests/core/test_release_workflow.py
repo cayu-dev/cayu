@@ -99,7 +99,7 @@ def test_release_workflow_gates_publish_and_reuses_validated_artifact() -> None:
     assert 'tags: ["v*"]' in workflow
     assert "startsWith(github.ref, 'refs/tags/v')" in publish
     assert "vars.PYPI_PUBLISH_ENABLED == 'true'" in publish
-    assert "needs: [static, test, package, dashboard]" in publish
+    assert "needs: [static, test, sqlite-cancellation, package, dashboard]" in publish
     assert "if: startsWith(github.ref, 'refs/tags/v')" in github_release
     assert "needs: [publish, package]" in github_release
 

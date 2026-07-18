@@ -54,6 +54,32 @@ jobs:
             --cov-report=term-missing:skip-covered \
             --cov-report=markdown-append:${GITHUB_STEP_SUMMARY}
 
+  sqlite-cancellation:
+    name: SQLite cancellation (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - run: uv python install ${{ matrix.python-version }}
+      - run: uv sync --frozen --extra dev --extra server --python ${{ matrix.python-version }}
+      - name: Exercise cancellation ownership repeatedly
+        run: |
+          for attempt in 1 2 3; do
+            uv run pytest -q \
+              tests/core/test_sqlite_session_store.py::test_sqlite_off_thread_writer_retains_connection_ownership_during_cancellation \
+              tests/core/test_sqlite_session_store.py::test_sqlite_pending_cancellation_retains_off_thread_connection_ownership \
+              tests/core/test_sqlite_session_store.py::test_sqlite_task_sweep_cannot_end_off_thread_connection_ownership \
+              tests/core/test_sqlite_session_store.py::test_sqlite_off_thread_reader_retains_connection_ownership_during_cancellation \
+              tests/core/test_sqlite_session_store.py::test_sqlite_off_thread_worker_failure_and_cancellation_remain_observable \
+              tests/core/test_sqlite_session_store.py::test_sqlite_in_memory_read_cancellation_serializes_shared_writer_connection \
+              tests/core/test_runtime.py::test_cancelled_sqlite_factory_checkpoint_preserves_committed_allocation
+          done
+
   package:
     name: Release artifacts
     runs-on: ubuntu-latest
@@ -306,7 +332,7 @@ jobs:
     if: >-
       startsWith(github.ref, 'refs/tags/v') &&
       vars.PYPI_PUBLISH_ENABLED == 'true'
-    needs: [static, test, package, dashboard]
+    needs: [static, test, sqlite-cancellation, package, dashboard]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment:
