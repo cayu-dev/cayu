@@ -4807,6 +4807,141 @@ def test_cancelled_factory_checkpoint_read_discards_uncommitted_allocation(tmp_p
     assert "environment_factory_reconnect" not in (checkpoint or {})
 
 
+@pytest.mark.parametrize(
+    ("failure_mode", "expected_action", "expected_checkpointed"),
+    [
+        pytest.param(
+            "before_commit",
+            EnvironmentFactoryReleaseAction.DISCARD,
+            False,
+            id="proven-uncommitted",
+        ),
+        pytest.param(
+            "after_commit",
+            EnvironmentFactoryReleaseAction.PRESERVE,
+            True,
+            id="lost-commit-acknowledgement",
+        ),
+        pytest.param(
+            "after_commit_unreadable",
+            EnvironmentFactoryReleaseAction.PRESERVE,
+            True,
+            id="unreconciled-commit",
+        ),
+    ],
+)
+def test_factory_checkpoint_write_failure_reconciles_allocation_ownership(
+    tmp_path,
+    failure_mode: Literal[
+        "before_commit",
+        "after_commit",
+        "after_commit_unreadable",
+    ],
+    expected_action: EnvironmentFactoryReleaseAction,
+    expected_checkpointed: bool,
+):
+    class FailingFactoryCheckpointStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.checkpoint_failure_armed = False
+            self.reconciliation_read_failure_armed = False
+
+        async def transform_checkpoint(self, session_id, checkpoint_transform) -> None:
+            if not self.checkpoint_failure_armed:
+                await super().transform_checkpoint(session_id, checkpoint_transform)
+                return
+            self.checkpoint_failure_armed = False
+            if failure_mode == "before_commit":
+                raise ConnectionError("checkpoint write rejected before commit")
+            await super().transform_checkpoint(session_id, checkpoint_transform)
+            if failure_mode == "after_commit_unreadable":
+                self.reconciliation_read_failure_armed = True
+            raise ConnectionError("checkpoint commit acknowledgement lost")
+
+        async def load_checkpoint(self, session_id: str) -> dict[str, Any] | None:
+            if self.reconciliation_read_failure_armed:
+                self.reconciliation_read_failure_armed = False
+                raise ConnectionError("checkpoint reconciliation unavailable")
+            return await super().load_checkpoint(session_id)
+
+    async def run() -> tuple[
+        list[Event],
+        Session | None,
+        list[EnvironmentFactoryReleaseAction],
+        dict[str, Any] | None,
+    ]:
+        store = FailingFactoryCheckpointStore()
+        release_actions: list[EnvironmentFactoryReleaseAction] = []
+
+        async def release(action: EnvironmentFactoryReleaseAction) -> None:
+            release_actions.append(action)
+
+        class ArmingFactory(RecordingEnvironmentFactory):
+            async def create(
+                self,
+                request: EnvironmentFactoryRequest,
+            ) -> EnvironmentFactoryResult:
+                result = await super().create(request)
+                store.checkpoint_failure_armed = True
+                return result
+
+        session_id = f"sess_factory_checkpoint_{failure_mode}"
+        workspace_root = tmp_path / failure_mode
+        workspace_root.mkdir()
+        factory = ArmingFactory(
+            Environment(
+                EnvironmentSpec(name="dynamic"),
+                workspace=LocalWorkspace(workspace_root),
+            ),
+            reconnect_metadata={"sandbox_id": f"sandbox_{failure_mode}"},
+            release=release,
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        session = await store.load(session_id)
+        checkpoint = await store.load_checkpoint(session_id)
+        return events, session, release_actions, checkpoint
+
+    events, session, release_actions, checkpoint = asyncio.run(run())
+
+    assert session is not None
+    assert session.status == SessionStatus.FAILED
+    assert [event.type for event in events] == [
+        EventType.ENVIRONMENT_FACTORY_STARTED,
+        EventType.ENVIRONMENT_FACTORY_FAILED,
+        EventType.SESSION_FAILED,
+    ]
+    assert release_actions == [expected_action]
+    factory_failure = events[1]
+    assert factory_failure.payload["environment_factory_release"]["action"] == str(expected_action)
+    if expected_checkpointed:
+        assert checkpoint is not None
+        assert checkpoint["environment_factory_reconnect"] == {
+            "dynamic": {"sandbox_id": f"sandbox_{failure_mode}"}
+        }
+        assert checkpoint["environment_factory_allocation_owner"] == {
+            "dynamic": f"sess_factory_checkpoint_{failure_mode}"
+        }
+    else:
+        assert "environment_factory_reconnect" not in (checkpoint or {})
+        assert "environment_factory_allocation_owner" not in (checkpoint or {})
+
+
 def test_cancelled_sqlite_factory_checkpoint_preserves_committed_allocation(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

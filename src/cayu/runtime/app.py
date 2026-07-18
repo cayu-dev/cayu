@@ -7,6 +7,7 @@ import inspect
 import json
 import logging
 import mimetypes
+import sys
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable
 from copy import deepcopy
@@ -64,6 +65,7 @@ from cayu.environments import (
     EnvironmentFactory,
     EnvironmentFactoryOperation,
     EnvironmentSpec,
+    ExecutionRequirements,
     copy_bound_workspace,
     copy_environment,
 )
@@ -829,6 +831,7 @@ class CayuApp:
         tool_policy: ToolPolicy | None = None,
         runtime_hooks: Iterable[RuntimeHook] | None = None,
         loop_policies: Iterable[LoopPolicy] | None = None,
+        execution_requirements: ExecutionRequirements | None = None,
     ) -> AgentSpec:
         if type(spec) is not AgentSpec:
             raise TypeError("Agent registration requires an AgentSpec.")
@@ -861,6 +864,14 @@ class CayuApp:
             loop_policies,
             field_name="loop_policies",
         )
+        if execution_requirements is None:
+            stored_execution_requirements = ExecutionRequirements.trusted()
+        elif isinstance(execution_requirements, ExecutionRequirements):
+            stored_execution_requirements = ExecutionRequirements.model_validate(
+                execution_requirements.model_dump(mode="python")
+            )
+        else:
+            raise TypeError("execution_requirements must be ExecutionRequirements or None.")
 
         if tools is None:
             agent_tools = []
@@ -890,6 +901,7 @@ class CayuApp:
             tool_policy=stored_tool_policy,
             runtime_hooks=stored_runtime_hooks,
             loop_policies=stored_loop_policies,
+            execution_requirements=stored_execution_requirements,
             registration_source=registration_source,
             registration_symbol=registration_symbol,
         )
@@ -1452,10 +1464,17 @@ class CayuApp:
         finally:
             try:
                 if release_before_run:
-                    await self.session_store.release_run_fence(session.id)
+                    await self._environment_lifecycle.abort_environment_setup(
+                        session_id=session.id,
+                        original_error=sys.exception(),
+                    )
             finally:
-                if current_task is not None and active_factory_run is not None:
-                    self._session_control.unregister_active_task(session.id, current_task)
+                try:
+                    if release_before_run:
+                        await self.session_store.release_run_fence(session.id)
+                finally:
+                    if current_task is not None and active_factory_run is not None:
+                        self._session_control.unregister_active_task(session.id, current_task)
 
         try:
             messages = transcript_helpers.initial_messages(
@@ -1486,8 +1505,14 @@ class CayuApp:
                 start_event_payload={"agent_name": registered_agent.spec.name},
                 start_task_on_enter=not pre_run_task_started,
             )
-        except BaseException:
-            await self.session_store.release_run_fence(session.id)
+        except BaseException as exc:
+            try:
+                await self._environment_lifecycle.abort_environment_setup(
+                    session_id=session.id,
+                    original_error=exc,
+                )
+            finally:
+                await self.session_store.release_run_fence(session.id)
             raise
         try:
             async for event in self._session_control.stream_with_out_of_band_events(
@@ -4494,10 +4519,16 @@ class CayuApp:
                 yield event
         finally:
             try:
-                await self.session_store.release_run_fence(session.id)
+                await self._environment_lifecycle.abort_environment_setup(
+                    session_id=session.id,
+                    original_error=sys.exception(),
+                )
             finally:
-                if current_task is not None:
-                    self._session_control.unregister_active_task(session.id, current_task)
+                try:
+                    await self.session_store.release_run_fence(session.id)
+                finally:
+                    if current_task is not None:
+                        self._session_control.unregister_active_task(session.id, current_task)
 
     async def _recover_tool_round_claimed(
         self,
@@ -5717,13 +5748,19 @@ class CayuApp:
             ):
                 yield event
         finally:
-            self._session_control.discard_interrupt_signal(session.id)
             try:
-                if release_run_fence_on_exit:
-                    await self.session_store.release_run_fence(session.id)
+                await self._environment_lifecycle.abort_environment_setup(
+                    session_id=session.id,
+                    original_error=sys.exception(),
+                )
             finally:
-                if current_task is not None:
-                    self._session_control.unregister_active_task(session.id, current_task)
+                self._session_control.discard_interrupt_signal(session.id)
+                try:
+                    if release_run_fence_on_exit:
+                        await self.session_store.release_run_fence(session.id)
+                finally:
+                    if current_task is not None:
+                        self._session_control.unregister_active_task(session.id, current_task)
 
     async def _emit_turn_completed(
         self,

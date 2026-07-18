@@ -28,6 +28,7 @@ from cayu.egress import (
 )
 from cayu.egress.microsandbox_adapter import MicrosandboxEgressAdapter
 from cayu.egress.proxy_exposure import MICROSANDBOX_HOST, ExposedProxy
+from cayu.environments import ExecutionRequirements, evaluate_execution_admission
 from cayu.runners import MicrosandboxRunner
 from cayu.vaults import SecretRef, StaticVault
 
@@ -35,6 +36,22 @@ from cayu.vaults import SecretRef, StaticVault
 class _FakeAuthority:
     def ca_cert_pem(self) -> bytes:
         return b"session-ca"
+
+
+def test_microsandbox_declares_an_admissible_untrusted_execution_profile() -> None:
+    adapter = MicrosandboxEgressAdapter(microsandbox_module=_FakeMicrosandboxModule)
+
+    decision = evaluate_execution_admission(
+        candidate="microsandbox",
+        requirements=ExecutionRequirements.untrusted(),
+        evidence=adapter.execution_capability_evidence(),
+        stage="pre_create",
+    )
+
+    assert decision.status == "admitted"
+    assert adapter.execution_capability_evidence().state_for("unprivileged_guest") == (
+        "unsupported"
+    )
 
 
 class _FakeProxyServer:
@@ -143,6 +160,7 @@ class _FakeSandbox:
         self.created_at = created_at
         self.exec_calls: list[dict[str, Any]] = []
         self.shell_calls: list[dict[str, Any]] = []
+        self.command_order: list[str] = []
         self.stopped = False
         self.detached = False
         self.fail_stop = False
@@ -152,10 +170,12 @@ class _FakeSandbox:
         return _FakeExecOutput()
 
     async def exec_stream(self, cmd: str, args: list[str], **kwargs: Any) -> _FakeExecHandle:
+        self.command_order.append("exec")
         self.exec_calls.append({"cmd": cmd, "args": args, **kwargs})
         return _FakeExecHandle()
 
     async def shell_stream(self, script: str, **kwargs: Any) -> _FakeExecHandle:
+        self.command_order.append("shell")
         self.shell_calls.append({"script": script, **kwargs})
         return _FakeExecHandle()
 
@@ -312,6 +332,7 @@ def _request(
     grant: Any,
     ca_path: Path,
     reconnect_metadata: dict[str, Any] | None = None,
+    setup_commands: tuple[str, ...] = (),
 ) -> VirtualEgressRunnerRequest:
     ca_path.write_bytes(binding.ca_cert_pem or b"")
     return VirtualEgressRunnerRequest(
@@ -325,7 +346,7 @@ def _request(
         },
         ca_cert_host_path=str(ca_path),
         guest_ca_path="/etc/cayu/ca.pem",
-        setup_commands=(),
+        setup_commands=setup_commands,
         egress_destinations=("api.stripe.com",),
         session_id="session-1",
         environment_name="egress-env",
@@ -386,22 +407,31 @@ def test_microsandbox_adapter_creates_only_a_proxy_reachable_runner(tmp_path: Pa
         ("copy_file", ca_path, "/etc/cayu/ca.pem", 0o644, True),
     ]
     assert _FakeSandboxApi.sandbox is not None
-    preflight = _FakeSandboxApi.sandbox.exec_calls[0]
-    assert preflight["env"]["HTTPS_PROXY"] == binding.proxy_url
-    assert preflight["env"]["STRIPE_SECRET_KEY"].startswith("sk_test_cayu_vc_")
-    assert "api.stripe.com" in preflight["args"][1]
-    assert "1.1.1.1" in preflight["args"][1]
-    assert "8.8.8.8" in preflight["args"][1]
-    assert "169.254.169.254" in preflight["args"][1]
-    assert '("1.1.1.1", 443, "one.one.one.one")' in preflight["args"][1]
-    assert '("8.8.8.8", 443, "dns.google")' in preflight["args"][1]
-    assert "for host, port, server_hostname in direct_tls_probes:" in preflight["args"][1]
-    assert "ssl.PROTOCOL_TLS_CLIENT" in preflight["args"][1]
-    assert "ssl.CERT_NONE" in preflight["args"][1]
-    assert "X-aws-ec2-metadata-token-ttl-seconds" in preflight["args"][1]
+    assert _FakeSandboxApi.sandbox.command_order == ["exec", "shell", "exec"]
+    for preflight in _FakeSandboxApi.sandbox.exec_calls:
+        assert preflight["env"]["HTTPS_PROXY"] == binding.proxy_url
+        assert preflight["env"]["STRIPE_SECRET_KEY"].startswith("sk_test_cayu_vc_")
+        assert "api.stripe.com" in preflight["args"][1]
+        assert "1.1.1.1" in preflight["args"][1]
+        assert "8.8.8.8" in preflight["args"][1]
+        assert "169.254.169.254" in preflight["args"][1]
+        assert '("1.1.1.1", 443, "one.one.one.one")' in preflight["args"][1]
+        assert '("8.8.8.8", 443, "dns.google")' in preflight["args"][1]
+        assert "for host, port, server_hostname in direct_tls_probes:" in preflight["args"][1]
+        assert "ssl.PROTOCOL_TLS_CLIENT" in preflight["args"][1]
+        assert "ssl.CERT_NONE" in preflight["args"][1]
+        assert "X-aws-ec2-metadata-token-ttl-seconds" in preflight["args"][1]
     setup = _FakeSandboxApi.sandbox.shell_calls[0]
     assert setup["script"] == "python3 -V"
     assert setup["env"]["HTTPS_PROXY"] == binding.proxy_url
+
+    first_evidence = adapter.execution_capability_evidence(runner)
+    second_evidence = adapter.execution_capability_evidence(runner)
+    assert first_evidence == second_evidence
+    network_claim = first_evidence.claim_for("deny_by_default_network")
+    assert network_claim is not None
+    assert network_claim.state == "live_verified"
+    assert network_claim.observed_at is not None
 
     asyncio.run(adapter.finalize_runner(runner, outcome="completed"))
     asyncio.run(binding.close())
@@ -1276,6 +1306,7 @@ def test_microsandbox_fresh_runner_rollback_removes_attestation(
                     binding=binding,
                     grant=grant,
                     ca_path=tmp_path / "ca.pem",
+                    setup_commands=("must-not-run",),
                 )
             )
         assert list((tmp_path / "claims").glob("*.json")) != []
@@ -1284,6 +1315,8 @@ def test_microsandbox_fresh_runner_rollback_removes_attestation(
     asyncio.run(run())
 
     assert _FakeSandboxApi.removed == ["sandbox-generated-name"]
+    assert _FakeSandboxApi.sandbox is not None
+    assert _FakeSandboxApi.sandbox.shell_calls == []
     assert list((tmp_path / "claims").glob("*.json")) == []
 
 

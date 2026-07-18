@@ -15,6 +15,7 @@ from cayu import (
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
     EnvironmentSpec,
+    ExecutionRequirements,
     ScriptedModelProvider,
     SecretRedactor,
     Tool,
@@ -148,7 +149,7 @@ def test_describe_returns_a_deterministic_public_application_manifest() -> None:
     manifest = _described_app().describe()
     reversed_manifest = _described_app(reverse=True).describe()
 
-    assert manifest.schema_version == "2"
+    assert manifest.schema_version == "3"
     assert manifest.defaults.provider == "primary"
     assert manifest.defaults.environment == "local"
     assert [agent.name for agent in manifest.agents] == ["reviewer", "writer"]
@@ -187,6 +188,24 @@ def test_agent_authoring_state_is_typed_copied_and_fingerprinted() -> None:
 
     with pytest.raises(ValidationError, match="authoring_state"):
         AgentSpec(name="bad", model="model", authoring_state="complete")
+
+
+def test_agent_execution_requirements_are_typed_and_fingerprinted() -> None:
+    trusted = CayuApp(enable_logging=False)
+    trusted.register_agent(AgentSpec(name="worker", model="model"))
+
+    isolated = CayuApp(enable_logging=False)
+    isolated.register_agent(
+        AgentSpec(name="worker", model="model"),
+        execution_requirements=ExecutionRequirements.untrusted(),
+    )
+
+    trusted_manifest = trusted.describe()
+    isolated_manifest = isolated.describe()
+
+    assert trusted_manifest.agents[0].execution_requirements == ExecutionRequirements.trusted()
+    assert isolated_manifest.agents[0].execution_requirements == (ExecutionRequirements.untrusted())
+    assert trusted_manifest.fingerprint != isolated_manifest.fingerprint
 
 
 def test_describe_reports_no_default_for_a_non_default_static_environment() -> None:
@@ -270,7 +289,7 @@ def test_manifest_is_public_versioned_redacted_and_deeply_read_only(tmp_path: Pa
     payload = manifest.model_dump_json()
     schema = AppManifest.model_json_schema(mode="serialization")
 
-    assert schema["properties"]["schema_version"]["const"] == "2"
+    assert schema["properties"]["schema_version"]["const"] == "3"
     assert "manifest-secret" not in payload
     assert str(tmp_path) not in payload
     assert factory.called is False
@@ -379,7 +398,7 @@ def test_manifest_rejects_non_json_schema_payloads() -> None:
     with pytest.raises(ValidationError, match="JSON-compatible"):
         AppManifest.model_validate(
             {
-                "schema_version": "2",
+                "schema_version": "3",
                 "fingerprint": "0" * 64,
                 "agents": [
                     {
@@ -388,6 +407,9 @@ def test_manifest_rejects_non_json_schema_payloads() -> None:
                         "configured_provider": None,
                         "resolved_provider": None,
                         "provider_resolution": "missing",
+                        "execution_requirements": ExecutionRequirements.trusted().model_dump(
+                            mode="json"
+                        ),
                         "tools": [
                             {
                                 "name": "bad",

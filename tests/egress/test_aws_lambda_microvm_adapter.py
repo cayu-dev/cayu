@@ -22,6 +22,7 @@ from cayu.egress import (
 from cayu.egress._remote_adapter import run_enforcement_preflight
 from cayu.egress.aws_lambda_microvm_adapter import LambdaMicroVMEgressAdapter
 from cayu.egress.proxy_exposure import ExposedProxy, VpcTaskProxyExposure
+from cayu.environments import ExecutionRequirements, evaluate_execution_admission
 from cayu.runners import Runner
 from cayu.vaults import SecretRef, StaticVault
 
@@ -29,6 +30,59 @@ from cayu.vaults import SecretRef, StaticVault
 class _FakeAuthority:
     def ca_cert_pem(self) -> bytes:
         return b"session-ca"
+
+
+def test_lambda_microvm_admission_reflects_metadata_isolation_mode() -> None:
+    common = {
+        "region_name": "us-east-1",
+        "egress_network_connector_arn": ("arn:aws:lambda:us-east-1:123:network-connector:nc-1"),
+        "exposure": VpcTaskProxyExposure("10.0.0.5"),
+        "client": object(),
+    }
+    required = LambdaMicroVMEgressAdapter(**common)
+    unverified = LambdaMicroVMEgressAdapter(
+        **common,
+        metadata_isolation="unverified",
+    )
+    cancellation_disabled = LambdaMicroVMEgressAdapter(
+        **common,
+        runner_options={"cancellation_cleanup": "none"},
+    )
+
+    admitted = evaluate_execution_admission(
+        candidate="lambda-microvm",
+        requirements=ExecutionRequirements.untrusted(),
+        evidence=required.execution_capability_evidence(),
+        stage="pre_create",
+    )
+    refused = evaluate_execution_admission(
+        candidate="lambda-microvm",
+        requirements=ExecutionRequirements.untrusted(),
+        evidence=unverified.execution_capability_evidence(),
+        stage="pre_create",
+    )
+    cancellation_refused = evaluate_execution_admission(
+        candidate="lambda-microvm",
+        requirements=ExecutionRequirements.untrusted(),
+        evidence=cancellation_disabled.execution_capability_evidence(),
+        stage="pre_create",
+    )
+
+    assert admitted.status == "admitted"
+    assert (
+        unverified.execution_capability_evidence().state_for("real_credential_non_possession")
+        == "unverified"
+    )
+    network = next(
+        item for item in refused.refusals if item.capability == "deny_by_default_network"
+    )
+    assert network.code == "unverified_capability"
+    cancellation = next(
+        item
+        for item in cancellation_refused.refusals
+        if item.capability == "confirmed_cancellation"
+    )
+    assert cancellation.code == "unsupported_capability"
 
 
 class _FakeProxyServer:
@@ -433,6 +487,13 @@ def test_lambda_microvm_adapter_creates_private_vpc_enforced_runner(
             }
         )
     )
+    first_evidence = adapter.execution_capability_evidence(runner)
+    second_evidence = adapter.execution_capability_evidence(runner)
+    assert first_evidence == second_evidence
+    network_claim = first_evidence.claim_for("deny_by_default_network")
+    assert network_claim is not None
+    assert network_claim.state == "live_verified"
+    assert network_claim.observed_at is not None
 
     asyncio.run(binding.close())
     assert exposure.closed is True
@@ -657,6 +718,22 @@ def test_lambda_microvm_adapter_marks_explicit_metadata_opt_out_unverified(
             }
         )
     )
+    credential_claim = adapter.execution_capability_evidence(runner).claim_for(
+        "real_credential_non_possession"
+    )
+    assert credential_claim is not None
+    assert credential_claim.state == "unverified"
+    assert credential_claim.reason_code == "credential_boundary_unverified"
+    decision = evaluate_execution_admission(
+        candidate="lambda-microvm",
+        requirements=ExecutionRequirements.trusted(real_secret_visibility="non_possession"),
+        evidence=adapter.execution_capability_evidence(runner),
+        stage="pre_exposure",
+    )
+    credential_refusal = next(
+        item for item in decision.refusals if item.capability == "real_credential_non_possession"
+    )
+    assert credential_refusal.code == "unverified_capability"
 
 
 @pytest.mark.parametrize("value", [False, None, "verified", "best-effort"])

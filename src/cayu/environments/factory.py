@@ -8,6 +8,10 @@ from math import isfinite
 from typing import Any
 
 from cayu._validation import copy_json_value, copy_label_map, require_clean_nonblank
+from cayu.environments.admission import (
+    ExecutionAdmissionCandidate,
+    ExecutionRequirements,
+)
 from cayu.environments.base import Environment, copy_environment
 
 DEFAULT_ENVIRONMENT_FACTORY_RELEASE_TIMEOUT_SECONDS = 15.0
@@ -43,10 +47,15 @@ class EnvironmentFactoryRequest:
     metadata: dict[str, Any] = field(default_factory=dict)
     reconnect_metadata: dict[str, Any] = field(default_factory=dict)
     operation: EnvironmentFactoryOperation = EnvironmentFactoryOperation.CREATE
+    execution_requirements: ExecutionRequirements = field(
+        default_factory=ExecutionRequirements.trusted
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.operation, EnvironmentFactoryOperation):
             raise TypeError("operation must be an EnvironmentFactoryOperation.")
+        if not isinstance(self.execution_requirements, ExecutionRequirements):
+            raise TypeError("execution_requirements must be ExecutionRequirements.")
         object.__setattr__(
             self, "session_id", require_clean_nonblank(self.session_id, "session_id")
         )
@@ -77,11 +86,22 @@ class EnvironmentFactoryRequest:
             "reconnect_metadata",
             copy_json_value(self.reconnect_metadata, "reconnect_metadata"),
         )
+        object.__setattr__(
+            self,
+            "execution_requirements",
+            ExecutionRequirements.model_validate(
+                self.execution_requirements.model_dump(mode="python")
+            ),
+        )
 
 
 @dataclass(frozen=True)
 class EnvironmentFactoryResult:
-    """Concrete environment produced for a session."""
+    """Concrete environment and pre-adoption release contract for a session.
+
+    ``release`` owns factory-created resources until workspace binding succeeds.
+    After successful binding, the binding owns the adopted environment lifecycle.
+    """
 
     environment: Environment
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -113,6 +133,20 @@ class EnvironmentFactoryResult:
 class EnvironmentFactory(ABC):
     """Creates or attaches a concrete environment for a session."""
 
+    def execution_admission_candidate(
+        self,
+        request: EnvironmentFactoryRequest,
+    ) -> ExecutionAdmissionCandidate | None:
+        """Return explicit pre-create evidence without allocating resources.
+
+        The default deliberately makes no capability claim. Implementations
+        must keep this hook side-effect free because Cayu calls it before
+        ``create``.
+        """
+
+        del request
+        return None
+
     @abstractmethod
     async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
         """Return a concrete environment for the requested session."""
@@ -133,6 +167,7 @@ def copy_environment_factory_request(
         labels=request.labels,
         metadata=request.metadata,
         reconnect_metadata=request.reconnect_metadata,
+        execution_requirements=request.execution_requirements,
     )
 
 

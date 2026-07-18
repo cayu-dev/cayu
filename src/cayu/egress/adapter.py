@@ -4,8 +4,9 @@ import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from math import isfinite
-from typing import Any
+from typing import Any, Literal
 
 from cayu._task_wait import await_shielded_task_outcome, consume_pending_task_cancellation
 from cayu.egress.broker import TransparentEgressBroker
@@ -13,9 +14,197 @@ from cayu.egress.capabilities import EgressCapabilityEvidence
 from cayu.egress.errors import UnsupportedEgressError, UnsupportedEgressReconnectError
 from cayu.egress.grants import VirtualCredentialGrant
 from cayu.egress.proxy_exposure import HttpProxyEndpoint
+from cayu.environments.admission import (
+    EXECUTION_LIVE_EVIDENCE_MAX_TTL_SECONDS,
+    ExecutionCapabilityClaim,
+    ExecutionCapabilityEvidence,
+)
 from cayu.runners.base import Runner
 
 DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS = 15.0
+_ExecutionCapabilityPosture = Literal[
+    "available",
+    "live_verified",
+    "unverified",
+    "unsupported",
+]
+
+
+def _virtual_egress_execution_capability_evidence(
+    *,
+    runner_kind: str,
+    runner_ready: bool,
+    preflight_observed_at: datetime | None,
+    untrusted_isolation: bool,
+    credential_non_possession_posture: _ExecutionCapabilityPosture,
+    guest_privilege: _ExecutionCapabilityPosture,
+    unprivileged_guest: _ExecutionCapabilityPosture,
+    host_filesystem_isolation: bool,
+    reconnect: bool,
+    network_unverified: bool = False,
+    cancellation_confirmed: bool = True,
+) -> ExecutionCapabilityEvidence:
+    """Build the shared admission claims for one enforced virtual-egress path."""
+
+    if preflight_observed_at is not None:
+        if not runner_ready:
+            raise ValueError("Preflight evidence requires a ready runner.")
+        if preflight_observed_at.tzinfo is None or preflight_observed_at.utcoffset() is None:
+            raise ValueError("Preflight evidence timestamps must include a timezone.")
+        observed_at = preflight_observed_at.astimezone(UTC)
+        valid_until = observed_at + timedelta(seconds=EXECUTION_LIVE_EVIDENCE_MAX_TTL_SECONDS)
+    else:
+        observed_at = None
+        valid_until = None
+    claims: list[ExecutionCapabilityClaim] = [
+        (
+            _declared_or_available("untrusted_code_isolation", runner_ready=runner_ready)
+            if untrusted_isolation
+            else ExecutionCapabilityClaim.unsupported(
+                "untrusted_code_isolation",
+                reason_code="isolation_boundary_unsupported",
+                remediation_code="select_isolated_execution",
+            )
+        ),
+        _execution_posture_claim(
+            "real_credential_non_possession",
+            posture=credential_non_possession_posture,
+            runner_ready=runner_ready,
+            observed_at=observed_at,
+            valid_until=valid_until,
+            unverified_reason_code="credential_boundary_unverified",
+            unverified_remediation_code="verify_guest_credential_boundary",
+        ),
+        (
+            ExecutionCapabilityClaim.unverified(
+                "deny_by_default_network",
+                reason_code="network_boundary_unverified",
+                remediation_code="enable_network_preflight",
+            )
+            if network_unverified
+            else (
+                _preflight_claim(
+                    "deny_by_default_network",
+                    observation="denied",
+                    runner_ready=runner_ready,
+                    observed_at=observed_at,
+                    valid_until=valid_until,
+                )
+            )
+        ),
+        _preflight_claim(
+            "brokered_egress",
+            observation="reachable",
+            runner_ready=runner_ready,
+            observed_at=observed_at,
+            valid_until=valid_until,
+        ),
+        _execution_posture_claim(
+            "guest_privilege_containment",
+            posture=guest_privilege,
+            runner_ready=runner_ready,
+            observed_at=observed_at,
+            valid_until=valid_until,
+        ),
+        _execution_posture_claim(
+            "unprivileged_guest",
+            posture=unprivileged_guest,
+            runner_ready=runner_ready,
+            observed_at=observed_at,
+            valid_until=valid_until,
+        ),
+        (
+            _declared_or_available("host_filesystem_isolation", runner_ready=runner_ready)
+            if host_filesystem_isolation
+            else ExecutionCapabilityClaim.unsupported(
+                "host_filesystem_isolation",
+                reason_code="host_filesystem_boundary_unsupported",
+                remediation_code="select_isolated_execution",
+            )
+        ),
+        (
+            _declared_or_available("confirmed_cancellation", runner_ready=runner_ready)
+            if cancellation_confirmed
+            else ExecutionCapabilityClaim.unsupported(
+                "confirmed_cancellation",
+                reason_code="cancellation_cleanup_disabled",
+                remediation_code="enable_cancellation_cleanup",
+            )
+        ),
+        _declared_or_available("confirmed_cleanup", runner_ready=runner_ready),
+        (
+            _declared_or_available("reconnect", runner_ready=runner_ready)
+            if reconnect
+            else ExecutionCapabilityClaim.unsupported(
+                "reconnect",
+                reason_code="reconnect_unsupported",
+                remediation_code="select_reconnectable_execution",
+            )
+        ),
+    ]
+    return ExecutionCapabilityEvidence(subject=runner_kind, claims=tuple(claims))
+
+
+def _execution_posture_claim(
+    capability: str,
+    *,
+    posture: _ExecutionCapabilityPosture,
+    runner_ready: bool,
+    observed_at: datetime | None,
+    valid_until: datetime | None,
+    unverified_reason_code: str = "guest_boundary_unverified",
+    unverified_remediation_code: str = "enable_guest_boundary_preflight",
+) -> ExecutionCapabilityClaim:
+    if posture == "live_verified":
+        if not runner_ready or observed_at is None or valid_until is None:
+            return ExecutionCapabilityClaim.declared(capability)
+        return ExecutionCapabilityClaim.live_verified(
+            capability,
+            observation="supported",
+            observed_at=observed_at,
+            valid_until=valid_until,
+        )
+    if posture == "available":
+        return _declared_or_available(capability, runner_ready=runner_ready)
+    if posture == "unverified":
+        return ExecutionCapabilityClaim.unverified(
+            capability,
+            reason_code=unverified_reason_code,
+            remediation_code=unverified_remediation_code,
+        )
+    return ExecutionCapabilityClaim.unsupported(
+        capability,
+        reason_code="guest_boundary_unsupported",
+        remediation_code="select_hardened_execution",
+    )
+
+
+def _preflight_claim(
+    capability: str,
+    *,
+    observation: Literal["denied", "reachable", "supported"],
+    runner_ready: bool,
+    observed_at: datetime | None,
+    valid_until: datetime | None,
+) -> ExecutionCapabilityClaim:
+    if not runner_ready or observed_at is None or valid_until is None:
+        return ExecutionCapabilityClaim.declared(capability)
+    return ExecutionCapabilityClaim.live_verified(
+        capability,
+        observation=observation,
+        observed_at=observed_at,
+        valid_until=valid_until,
+    )
+
+
+def _declared_or_available(
+    capability: str,
+    *,
+    runner_ready: bool,
+) -> ExecutionCapabilityClaim:
+    if runner_ready:
+        return ExecutionCapabilityClaim.available(capability)
+    return ExecutionCapabilityClaim.declared(capability)
 
 
 async def _await_bounded_cleanup_task(
@@ -256,6 +445,20 @@ class SandboxEgressAdapter(ABC):
     def capability_evidence(self, runner: Runner) -> EgressCapabilityEvidence:
         """Return typed runtime evidence for capabilities proven by ``runner``."""
         return EgressCapabilityEvidence.unclaimed(self.runner_kind)
+
+    def execution_capability_evidence(
+        self,
+        runner: Runner | None = None,
+    ) -> ExecutionCapabilityEvidence:
+        """Return admission evidence before creation or before runner exposure.
+
+        Implementations must remain side-effect free when ``runner`` is ``None`` so
+        the first admission gate cannot create provider resources while gathering
+        evidence.
+        """
+
+        del runner
+        return ExecutionCapabilityEvidence.unclaimed(self.runner_kind)
 
     def configuration_metadata(self) -> dict[str, Any]:
         """Return JSON-safe configured intent without claiming runtime proof."""

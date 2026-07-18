@@ -264,6 +264,16 @@ class RecoveryCoordinator:
                     lambda: self._finalize_abandoned_session_by_id(session_id),
                 )
             )
+        if authoritative_failure is not None:
+            cleanup_steps.append(
+                (
+                    "environment setup abort",
+                    lambda: self._environment_lifecycle.abort_environment_setup(
+                        session_id=session_id,
+                        original_error=authoritative_failure,
+                    ),
+                )
+            )
         if release_run_fence:
             cleanup_steps.append(
                 ("run fence release", lambda: self._session_store.release_run_fence(session_id))

@@ -4,6 +4,7 @@ import os
 from collections.abc import Mapping, Sequence
 from os import PathLike
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from cayu._validation import require_nonblank
 from cayu.credentials import CredentialMode, CredentialModeInput, normalize_credential_mode
@@ -24,6 +25,12 @@ from cayu.runners.base import (
     Runner,
 )
 from cayu.vaults import SecretEnv, SecretRef, SecretResolver, resolve_secret_env
+
+if TYPE_CHECKING:
+    from cayu.environments.admission import (
+        ExecutionAdmissionCandidate,
+        ExecutionCapabilityEvidence,
+    )
 
 # Non-secret operational host variables forwarded when inherit_env is False so
 # commands still resolve binaries and locale without seeing arbitrary host
@@ -61,6 +68,55 @@ class LocalRunner(Runner):
     """
 
     isolation = "local"
+
+    def execution_capability_evidence(self) -> ExecutionCapabilityEvidence:
+        """Declare the local-process boundary without representing it as isolation."""
+
+        from cayu.environments.admission import (
+            ExecutionCapabilityClaim,
+            ExecutionCapabilityEvidence,
+        )
+
+        unsupported = {
+            "untrusted_code_isolation": "local_process_isolation_unsupported",
+            "real_credential_non_possession": "local_credential_boundary_unsupported",
+            "deny_by_default_network": "local_network_boundary_unsupported",
+            "brokered_egress": "local_network_boundary_unsupported",
+            "guest_privilege_containment": "local_privilege_boundary_unsupported",
+            "unprivileged_guest": "local_privilege_boundary_unsupported",
+            "host_filesystem_isolation": "local_host_filesystem_boundary_unsupported",
+            "read_only_host_inputs": "local_host_filesystem_boundary_unsupported",
+            "reconnect": "reconnect_unsupported",
+        }
+        return ExecutionCapabilityEvidence(
+            subject="local",
+            claims=(
+                ExecutionCapabilityClaim.available("confirmed_cancellation"),
+                ExecutionCapabilityClaim.available("confirmed_cleanup"),
+                *(
+                    ExecutionCapabilityClaim.unsupported(
+                        capability,
+                        reason_code=reason_code,
+                        remediation_code=(
+                            "select_reconnectable_execution"
+                            if capability == "reconnect"
+                            else "select_isolated_execution"
+                        ),
+                    )
+                    for capability, reason_code in unsupported.items()
+                ),
+            ),
+        )
+
+    def execution_admission_candidate(self) -> ExecutionAdmissionCandidate:
+        """Expose the local runner's explicit non-isolation evidence to Cayu."""
+
+        from cayu.environments.admission import ExecutionAdmissionCandidate
+
+        return ExecutionAdmissionCandidate(
+            candidate="local",
+            evidence=self.execution_capability_evidence(),
+        )
 
     def __init__(
         self,

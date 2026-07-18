@@ -55,6 +55,10 @@ from cayu.egress.adapter import (
 )
 from cayu.egress.credential_kinds import validate_credential_kind
 from cayu.egress.destinations import validate_approved_destinations
+from cayu.environments.admission import (
+    ExecutionAdmissionCandidate,
+    evaluate_execution_admission,
+)
 from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.environments.bindings import (
     BoundWorkspace,
@@ -81,7 +85,6 @@ from cayu.runtime._binding_cleanup import (
     BindingFinalizeFailure,
     binding_finalize_explicit_cancellation,
     binding_finalize_fatal_signal,
-    record_binding_cleanup_failure,
     record_binding_finalize_failures,
 )
 from cayu.vaults import SecretRedactor, SecretRef, SecretResolver
@@ -392,10 +395,30 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         self._upstream = upstream
         self._require_test_mode = require_test_mode_credentials
 
+    def execution_admission_candidate(
+        self,
+        request: EnvironmentFactoryRequest,
+    ) -> ExecutionAdmissionCandidate:
+        """Publish adapter-owned declarations without creating provider resources."""
+
+        del request
+        adapter = self._adapter or self._resolve_adapter(asyncio.get_running_loop())
+        return ExecutionAdmissionCandidate(
+            candidate=adapter.runner_kind,
+            evidence=adapter.execution_capability_evidence(),
+        )
+
     async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
         loop = asyncio.get_running_loop()
         adapter = self._adapter or self._resolve_adapter(loop)
         runner_kind = adapter.runner_kind
+        admission_evidence = adapter.execution_capability_evidence()
+        evaluate_execution_admission(
+            candidate=runner_kind,
+            requirements=request.execution_requirements,
+            evidence=admission_evidence,
+            stage="pre_create",
+        ).require_admitted()
         raw_configuration = adapter.configuration_metadata()
         if type(raw_configuration) is not dict:
             raise TypeError("Egress adapter configuration_metadata must return a dict.")
@@ -496,6 +519,16 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 reconnect_metadata=reconnect_identity or {},
             )
             runner = await adapter.create_runner(runner_request)
+            runtime_admission_evidence = adapter.execution_capability_evidence(runner)
+            runtime_admission = evaluate_execution_admission(
+                candidate=runner_kind,
+                requirements=request.execution_requirements,
+                evidence=runtime_admission_evidence,
+                stage="pre_exposure",
+            ).require_admitted()
+            if runtime_admission.evidence is None:
+                raise RuntimeError("Admitted execution evidence is missing.")
+            execution_capability_metadata = runtime_admission.evidence.to_metadata()
             if adapter.supports_reconnect:
                 adapter_reconnect_metadata = adapter.validate_reconnect_metadata(
                     adapter.reconnect_metadata(runner)
@@ -536,10 +569,21 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 session_id=request.session_id,
                 agent_name=request.agent_name,
                 environment_name=request.environment_name,
-                reconnected=reconnect_identity is not None,
             )
 
             await self._emit_grant_events(request, grants, runner_kind=runner_kind)
+            final_admission_candidate = managed_runner.execution_admission_candidate()
+            if final_admission_candidate is None:
+                raise RuntimeError("Managed egress runner omitted execution admission evidence.")
+            final_admission = evaluate_execution_admission(
+                candidate=runner_kind,
+                requirements=request.execution_requirements,
+                evidence=final_admission_candidate.evidence,
+                stage="pre_exposure",
+            ).require_admitted()
+            if final_admission.evidence is None:
+                raise RuntimeError("Admitted execution evidence is missing.")
+            execution_capability_metadata = final_admission.evidence.to_metadata()
         except BaseException as original:
             cleanup_errors: list[tuple[str, BaseException]] = []
             original_cancellation = binding_finalize_explicit_cancellation(original)
@@ -644,6 +688,11 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         result_metadata: dict[str, Any] = {}
         environment_metadata["egress_capabilities"] = capability_metadata
         result_metadata["egress_capabilities"] = capability_metadata
+        execution_requirements_metadata = request.execution_requirements.model_dump(mode="json")
+        environment_metadata["execution_requirements"] = execution_requirements_metadata
+        result_metadata["execution_requirements"] = execution_requirements_metadata
+        environment_metadata["execution_capabilities"] = execution_capability_metadata
+        result_metadata["execution_capabilities"] = execution_capability_metadata
         if configuration_metadata:
             environment_metadata["egress_configuration"] = configuration_metadata
             result_metadata["egress_configuration"] = configuration_metadata
@@ -940,6 +989,14 @@ class _EgressManagedRunner(Runner):
     @property
     def resource_key(self) -> tuple[object, ...] | None:
         return self._runner.resource_key
+
+    def execution_admission_candidate(self) -> ExecutionAdmissionCandidate:
+        """Return the adapter's evidence for the exact managed runner."""
+
+        return ExecutionAdmissionCandidate(
+            candidate=self._adapter.runner_kind,
+            evidence=self._adapter.execution_capability_evidence(self._runner),
+        )
 
     @property
     def closed(self) -> bool:
@@ -1382,7 +1439,6 @@ class _EgressTeardownBinding(WorkspaceBinding):
         session_id: str,
         agent_name: str,
         environment_name: str,
-        reconnected: bool,
     ) -> None:
         self._inner = inner
         self._runner = runner
@@ -1395,7 +1451,6 @@ class _EgressTeardownBinding(WorkspaceBinding):
         self._session_id = session_id
         self._agent_name = agent_name
         self._environment_name = environment_name
-        self._reconnected = reconnected
         self._revocation_emit_lock = asyncio.Lock()
         self._revocation_emission_attempted_grant_ids: set[str] = set()
 
@@ -1409,73 +1464,17 @@ class _EgressTeardownBinding(WorkspaceBinding):
         environment_name: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> BoundWorkspace:
-        try:
-            return await self._inner.bind(
-                workspace,
-                runner,
-                session_id=session_id,
-                agent_name=agent_name,
-                environment_name=environment_name,
-                metadata=metadata,
-            )
-        except BaseException as bind_error:
-            # Runtime does not call finalize() after bind failure, so the
-            # virtual-egress resources must be released here.
-            rollback_cancellation = binding_finalize_explicit_cancellation(bind_error)
-            cleanup_error: BaseException | None = None
-            try:
-                await self._close_resources(outcome="interrupted" if self._reconnected else None)
-            except asyncio.CancelledError as cancellation:
-                rollback_cancellation = rollback_cancellation or cancellation
-            except BaseExceptionGroup as exc:
-                if binding_finalize_fatal_signal(exc) is not None:
-                    raise
-                rollback_cancellation, cleanup_error = _split_cleanup_cancellation(exc)
-            except BaseException as exc:
-                cleanup_error = exc
-            await self._drain_audit()
-            if cleanup_error is None:
-                await self._emit_revoked()
-            else:
-                bind_error.add_note(
-                    "Virtual-egress bind rollback incomplete: "
-                    f"{type(cleanup_error).__name__}: {cleanup_error}. "
-                    "The runtime will retry the binding-owned cleanup."
-                )
-            if rollback_cancellation is not None:
-                if cleanup_error is None and isinstance(bind_error, asyncio.CancelledError):
-                    raise bind_error
-                errors = [bind_error]
-                if cleanup_error is not None:
-                    errors.append(cleanup_error)
-                if not any(
-                    binding_finalize_explicit_cancellation(error) is not None for error in errors
-                ):
-                    errors.append(rollback_cancellation)
-                rollback_error = BaseExceptionGroup(
-                    "Virtual-egress bind rollback failed after caller cancellation.",
-                    errors,
-                )
-                if cleanup_error is not None:
-                    record_binding_cleanup_failure(
-                        rollback_error,
-                        cleanup_error,
-                        retry=self._retry_bind_cleanup,
-                    )
-                raise rollback_error from rollback_cancellation
-            if cleanup_error is not None:
-                record_binding_cleanup_failure(
-                    bind_error,
-                    cleanup_error,
-                    retry=self._retry_bind_cleanup,
-                )
-            raise
-
-    async def _retry_bind_cleanup(self) -> None:
-        """Retry the binding-owned rollback and emit revocation only on success."""
-
-        await self.release_unbound(
-            outcome="interrupted" if self._reconnected else None,
+        # Until bind returns successfully, the EnvironmentFactoryResult remains
+        # unadopted and its release callback owns factory-created resources. The
+        # inner binding remains responsible only for rolling back state that it
+        # created while attempting this bind.
+        return await self._inner.bind(
+            workspace,
+            runner,
+            session_id=session_id,
+            agent_name=agent_name,
+            environment_name=environment_name,
+            metadata=metadata,
         )
 
     async def release_unbound(self, *, outcome: str | None) -> None:
@@ -1484,6 +1483,18 @@ class _EgressTeardownBinding(WorkspaceBinding):
         cleanup_error: BaseException | None = None
         try:
             await self._close_resources(outcome=outcome)
+        except Exception as initial_error:
+            # Provider cleanup is designed to converge idempotently. Retry one
+            # incomplete attempt inside the factory result's outer timeout so a
+            # transient detach/remove failure does not leak an unadopted result.
+            try:
+                await self._close_resources(outcome=outcome)
+            except BaseException as retry_error:
+                retry_error.add_note(
+                    "Virtual-egress factory release retry followed "
+                    f"{type(initial_error).__name__}: {initial_error}."
+                )
+                cleanup_error = retry_error
         except BaseException as exc:
             cleanup_error = exc
         await self._drain_audit()

@@ -72,6 +72,37 @@ Most apps use the root-level setup API: `CredentialMode`, `HttpEgressPolicy`,
 `ApprovedEgressDestination`, `VirtualCredentialSpec`, and
 `VirtualEgressEnvironmentFactory`.
 
+Execution suitability is a separate public contract. Configure
+`ExecutionRequirements.trusted()` for an explicitly trusted container or
+`ExecutionRequirements.untrusted()` for model-authored code when registering
+the agent workload. The selected environment factory and final runner must
+provide matching `ExecutionCapabilityEvidence`; Cayu evaluates it before
+resource creation, before committing a directly returned runner's reconnect
+identity, and again after workspace binding immediately before exposing the
+live environment.
+Docker's adapter explicitly reports secure isolation as unsupported, so
+`ExecutionRequirements.untrusted()` cannot be used to relabel Docker virtual
+egress as a sandbox. Microsandbox, E2B, Lambda microVM, and third-party
+integrations must each publish their own capability evidence rather than being
+trusted because of their provider name.
+
+Evidence strictness can vary by required capability. For example, keep the
+untrusted preset's `available` default while requiring the deny-by-default
+network preflight to remain live and fresh:
+
+```python
+from cayu import ExecutionEvidenceOverride, ExecutionRequirements
+
+execution_requirements = ExecutionRequirements.untrusted(
+    evidence_overrides=(
+        ExecutionEvidenceOverride(
+            capability="deny_by_default_network",
+            minimum_evidence="live_verified",
+        ),
+    )
+)
+```
+
 Lower-level extension points live under `cayu.egress` and `cayu.runtime.egress`:
 custom `EgressPolicy` implementations, `SandboxEgressAdapter` registrations,
 proxy exposure adapters, and the broker/proxy contracts used by adapters. Each
@@ -104,8 +135,8 @@ broker minted several ambiguous grants.
 
 ```python
 from cayu import (
-    CayuApp, EnvironmentSpec, HttpEgressPolicy, SecretRef, StaticVault,
-    VirtualCredentialSpec, VirtualEgressEnvironmentFactory,
+    AgentSpec, CayuApp, EnvironmentSpec, ExecutionRequirements, HttpEgressPolicy,
+    SecretRef, StaticVault, VirtualCredentialSpec, VirtualEgressEnvironmentFactory,
 )
 from cayu.runtime import VIRTUAL_EGRESS_EVENT_TYPES
 
@@ -131,6 +162,10 @@ factory = VirtualEgressEnvironmentFactory(
     ),                                          # stream only virtual-egress audit events
 )
 app.register_environment_factory(EnvironmentSpec(name="billing"), factory, default=True)
+app.register_agent(
+    AgentSpec(name="billing-agent", model="claude-sonnet-4-6"),
+    execution_requirements=ExecutionRequirements.trusted(),
+)
 ```
 
 Sessions on that environment run in the explicitly selected Docker container

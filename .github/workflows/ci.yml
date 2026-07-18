@@ -198,8 +198,10 @@ jobs:
           import json
           from pathlib import Path
 
+          from cayu.runtime import APP_MANIFEST_SCHEMA_VERSION
+
           repeated = json.loads(Path("repeated-plan.json").read_text())
-          assert repeated["schema_version"] == "3"
+          assert repeated["schema_version"] == APP_MANIFEST_SCHEMA_VERSION
           assert repeated["status"] == "already_present"
           assert repeated["edits"] == []
 
@@ -217,8 +219,10 @@ jobs:
           import json
           from pathlib import Path
 
+          from cayu.runtime import APP_MANIFEST_SCHEMA_VERSION
+
           inspect = json.loads(Path("unfinished-inspect.json").read_text())
-          assert inspect["schema_version"] == "2"
+          assert inspect["schema_version"] == APP_MANIFEST_SCHEMA_VERSION
           assert inspect["agents"][0]["authoring_state"] == (
               "unfinished_generated_tracer_bullet"
           )

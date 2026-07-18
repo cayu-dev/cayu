@@ -373,7 +373,15 @@ Run ownership is a required part of the `SessionStore` contract. A successful `t
 
 `Session.last_activity_at` is the durable recovery signal. Runtime progress writes refresh it, and inactive-session queries must apply `last_activity_before` in storage before `limit` so recent rows cannot hide older stalled work. Operator annotation writes through `update_labels(...)` or `update_metadata(...)` advance `updated_at` but leave `last_activity_at` unchanged, so editing a stalled session cannot postpone recovery. Recovery must claim a stalled run through `fence_stalled_run(...)` before repairing it; a plain status update is not an ownership transfer.
 
-An app can register either a concrete `Environment` or an `EnvironmentFactory` under an `EnvironmentSpec` name. A factory receives durable session context (`session_id`, `agent_name`, `environment_name`, explicit `operation`, parent session id, causal budget id, labels, metadata, and previous reconnect metadata for that session/environment) and returns a concrete `Environment` for that session. `operation=CREATE` is used for new sessions and a fork's first child allocation; `operation=RECONNECT` is used for later resume/recovery and requires the factory to fail closed rather than allocate a replacement when durable identity is missing. The returned environment must keep the registered environment name so resume/fork/dispatch do not silently switch identity. Factory-backed environments are resolved before workspace binding, MCP setup, tool execution, and, for new sessions, workspace-instruction loading. The runtime emits `environment.factory.started`, `environment.factory.completed`, and `environment.factory.failed` with JSON-safe diagnostics and never serializes live workspace, runner, or vault objects. `EnvironmentFactoryResult.reconnect_metadata` is non-secret durable state such as a sandbox id, region, image, or attach handle; Cayu atomically checkpoints it with runtime-owned allocation provenance under the registered environment name before emitting `environment.factory.completed`, and passes it back on later resume, approval continuation, or recovery. This provenance closes the checkpoint-to-event crash window: recovery reconnects an already-checkpointed child allocation even if its completion event was never written. A result that owns live reconnectable resources provides an explicit `release` callback: an uncheckpointed new allocation is released with `DISCARD`, while a reconnect or an already-checkpointed new allocation is released with `PRESERVE` so host handles are detached without deleting the durable resource. Cancellation after a checkpoint write begins also selects `PRESERVE`, because cancellation of a threaded or remote store await cannot prove that its durable commit stopped. Release runs to its result-level `release_timeout_s` bound despite caller cancellation (15 seconds by default), after which pending caller cancellation is re-raised. If a durable result omits that callback, Cayu leaves the allocation untouched rather than terminally closing an identity it has already committed, and records that limitation on the failure. Forks that copy checkpoint state also copy reconnect metadata as context, but the first child factory request is an explicit create operation; later child resumes reconnect the child's own allocation. Factory failure fails a new session before `session.started`; for pending approval continuation or manual approval recovery, factory failure is emitted before `session.resumed` and the session returns to `interrupted` with the approval still recoverable. Static environments still validate workspace instructions before creating a session, preserving the existing early-failure behavior for ordinary local runs.
+An app can register either a concrete `Environment` or an `EnvironmentFactory` under an `EnvironmentSpec` name. A factory receives durable session context (`session_id`, `agent_name`, `environment_name`, explicit `operation`, parent session id, causal budget id, labels, metadata, and previous reconnect metadata for that session/environment) and returns a concrete `Environment` for that session. `operation=CREATE` is used for new sessions, a retry whose earlier setup never committed an allocation, and a fork's first child allocation; `operation=RECONNECT` is used once that session owns a durable allocation and requires the factory to fail closed rather than allocate a replacement when durable identity is missing. The returned environment must keep the registered environment name so resume/fork/dispatch do not silently switch identity. Factory-backed environments are resolved before workspace binding, MCP setup, tool execution, and, for new sessions, workspace-instruction loading. The runtime emits `environment.factory.started`, `environment.factory.completed`, and `environment.factory.failed` with JSON-safe diagnostics and never serializes live workspace, runner, or vault objects. `EnvironmentFactoryResult.reconnect_metadata` is non-secret durable state such as a sandbox id, region, image, or attach handle. Cayu admits a runner returned directly by the factory before atomically checkpointing reconnect metadata with runtime-owned allocation provenance under the registered environment name and emitting `environment.factory.completed`; a runner created or replaced by binding is admitted immediately after binding instead. Cayu passes the durable metadata back on later resume, approval continuation, or recovery. This provenance closes the checkpoint-to-event crash window: recovery reconnects an already-checkpointed child allocation even if its completion event was never written. A result that owns live reconnectable resources provides an explicit `release` callback: an uncheckpointed new allocation is released with `DISCARD`, while a reconnect or an already-checkpointed new allocation is released with `PRESERVE` so host handles are detached without deleting the durable resource. Cancellation after a checkpoint write begins also selects `PRESERVE`, because cancellation of a threaded or remote store await cannot prove that its durable commit stopped. Release runs to its result-level `release_timeout_s` bound despite caller cancellation (15 seconds by default), after which pending caller cancellation is re-raised. If a durable result omits that callback, Cayu leaves the allocation untouched rather than terminally closing an identity it has already committed, and records that limitation on the failure. Until workspace binding returns successfully, the factory result remains unadopted: the binding rolls back only state created by its own bind attempt, while the result's release callback exclusively owns factory-created runner and allocation cleanup. Bind failure or cancellation invokes that callback once with `PRESERVE` because reconnect identity is already checkpointed. After binding succeeds, ownership transfers to the binding and the factory release callback is no longer invoked. Forks that copy checkpoint state also copy reconnect metadata as context, but the first child factory request is an explicit create operation; later child resumes reconnect the child's own allocation. Factory failure fails a new session before `session.started`; for pending approval continuation or manual approval recovery, factory failure is emitted before `session.resumed` and the session returns to `interrupted` with the approval still recoverable. Static environments still validate workspace instructions before creating a session, preserving the existing early-failure behavior for ordinary local runs.
+
+A factory that delegates runner creation to its binding necessarily commits the
+allocation before final runner admission. When that admission fails, the
+factory result has already been adopted: Cayu records the session as failed and
+passes the preserving `interrupted` outcome only to binding finalization. A
+binding that replaces a factory runner must therefore own both the source and
+replacement lifecycle after successful binding; Cayu does not also call the
+factory release callback and create a second cleanup owner.
 
 `VirtualEgressEnvironmentFactory` narrows that generic reconnect contract to a
 versioned envelope containing runner kind, owning session, environment name,
@@ -1854,6 +1862,121 @@ Runner commands use `ExecCommand`:
 The framework should not pass a single ambiguous command string to runners. Use process mode unless shell parsing, expansion, and quoting are intentional.
 Runner output capture is bounded by `output_limit_bytes` and returns `stdout_truncated` / `stderr_truncated` flags when output is capped. Direct runner calls default to 1 MiB per stream; the model-facing `exec_command` tool passes its smaller 50,000-byte default into the runner. This limit belongs in the runner, not only in tool post-processing, so commands cannot exhaust runtime memory before the model-facing result is built. Runners continue draining both streams after the capture bound is reached so a child cannot block on a full pipe. `ExecResult.stdout_bytes` and `stderr_bytes` report the total bytes observed before truncation when the adapter can know that value; `None` means the total is unavailable, not zero. The captured strings may therefore be smaller than their total byte counts.
 
+### Execution admission
+
+`ExecutionRequirements` is the provider-neutral workload policy used to decide
+whether one explicitly selected execution candidate is suitable. It represents
+code trust, real-secret visibility, network access, guest privilege, host
+filesystem exposure, cancellation, cleanup, durability, and the minimum
+acceptable default evidence level. Typed `ExecutionEvidenceOverride` entries
+can raise or lower that minimum for individual required capabilities without
+changing the workload's provider-neutral security requirements.
+`ExecutionRequirements.untrusted()` requires
+untrusted-code isolation, real-credential non-possession, deny-by-default
+networking, contained guest privilege, host-filesystem isolation, confirmed
+cancellation, confirmed cleanup, and at least
+`available` evidence. Applications can require time-bounded live network proof
+while accepting integration-validated isolation and lifecycle guarantees:
+
+```python
+from cayu import ExecutionEvidenceOverride, ExecutionRequirements
+
+ExecutionRequirements.untrusted(
+    evidence_overrides=(
+        ExecutionEvidenceOverride(
+            capability="deny_by_default_network",
+            minimum_evidence="live_verified",
+        ),
+    )
+)
+```
+
+Overrides must be unique and must name capabilities the workload actually
+requires. `ExecutionRequirements.trusted()` is the permissive starting point
+for explicitly trusted local, Docker, CI, and packaging work.
+
+Applications attach this trusted configuration to an agent registration with
+`CayuApp.register_agent(..., execution_requirements=...)`. Cayu copies it into
+every `EnvironmentFactoryRequest`; it is not accepted from an untrusted run
+request and cannot be weakened per session.
+`EnvironmentFactory.execution_admission_candidate()` exposes explicit,
+side-effect-free pre-create identity and evidence;
+`Runner.execution_admission_candidate()` exposes the corresponding final
+runtime identity and evidence. Missing evidence fails closed whenever the
+workload requires a capability.
+
+`evaluate_execution_admission(...)` evaluates only the named candidate and
+returns an `ExecutionAdmissionDecision`; it never selects a provider or falls
+back to another candidate. A refusal contains every unmet capability with a
+stable code, required state, observed state, and bounded reason/remediation
+references when the evidence supplied them. `require_admitted()` raises
+`ExecutionAdmissionError` while preserving that complete decision. Admission
+decisions enforce their own status invariant: admitted decisions cannot contain
+refusals, and refused decisions must contain at least one. Admission
+does not inspect a provider name, runner class, `runner_kind`, or
+`Runner.isolation` to invent a security property. Those strings remain
+diagnostic identity only.
+
+Execution evidence uses the versioned `cayu.execution_capabilities.v1`
+envelope. Its states have deliberately different meanings:
+
+- `declared`: the integration says its enforced creation path supports the
+  capability; this is not process availability or a live observation.
+- `available`: integration validation or a process preflight found the
+  capability path available; no particular guest resource has thereby been
+  observed.
+- `live_verified`: a runtime preflight or external live verification observed
+  the capability. These claims require timezone-aware `observed_at` and
+  `valid_until` values and become `stale_evidence` after expiry.
+- `unverified`: the integration or operator explicitly skipped the required
+  proof. It never satisfies a requirement.
+- `unsupported`: the integration explicitly cannot provide the capability. It
+  never satisfies a requirement.
+
+Unknown schemas, malformed state/proof combinations, duplicate claims,
+unclaimed capabilities, expired live evidence, and candidate/evidence identity
+mismatches fail closed. Live observations more than 30 seconds in the future or
+whose declared validity window exceeds
+`EXECUTION_LIVE_EVIDENCE_MAX_TTL_SECONDS` (300 seconds in this schema) also fail
+closed, as do observations that contradict the named capability (for example,
+`reachable` cannot prove deny-by-default networking). Capability identities,
+reason/remediation references, and boolean/integer details reuse the same
+bounded, secret-shaped-value-rejecting primitives as
+`EgressCapabilityEvidence`; execution admission does not maintain a second
+unconstrained evidence vocabulary.
+
+Cayu applies admission at its common environment boundary. The `pre_create`
+gate runs before any registered factory's `create()` method. Before creation,
+integrations report positive support only as `declared`; resource/process
+availability cannot be claimed until a runner exists. When a factory returns a
+runner directly, Cayu applies the `pre_exposure` gate before committing reconnect
+identity. A factory may instead delegate runner creation to its binding; that
+runner is admitted immediately after binding. Cayu always checks the final bound
+runner because a binding may replace it or live evidence may expire during setup.
+The common boundary therefore covers static environments, generic factories,
+virtual egress, and third-party integrations. The runtime preserves the
+pre-create candidate identity and refuses a final runner from a different
+candidate rather than falling back silently. Runtime failure events include the
+complete structured admission decision.
+
+`VirtualEgressEnvironmentFactory` retains the same gates internally for direct
+factory callers. Its final check runs after workspace creation and audit-event
+emission so short-lived evidence cannot expire during factory setup and still
+be returned. A refusal rolls back grants, the runner, and egress resources.
+Successful results publish `execution_requirements` and
+`execution_capabilities` in both factory-result metadata and the concrete
+environment spec. Arbitrary caller assertions cannot replace integration
+evidence.
+
+An isolation boundary separates guest execution from the host or control
+plane. Network denial restricts reachable destinations but does not itself
+create that boundary. Real-secret non-possession means the workload never
+receives the credential; redaction after receipt is not non-possession. A
+capability declaration states intended support, process availability says the
+path can currently be attempted, and live verification records an observed,
+time-bounded proof. None of these weaker facts may be reported as a stronger
+one.
+
 `system_execution_mode` declares whether `exec_system()` intentionally shares
 the ordinary `exec()` lane (`shared`) or selects a separate control-plane lane
 (`separate`). Shared mode does not claim elevated privileges; it means that the
@@ -1892,7 +2015,11 @@ Remote runners may talk to a runner service inside EC2/ECS/Daytona/etc.
 in trusted development, CI, conformance, and packaging workflows. A container
 is not a secure sandbox boundary, and Cayu never implicitly selects
 `DockerRunner` for untrusted code or as a fallback when a microVM runner is
-unavailable.
+unavailable. Docker virtual egress declares credential non-possession and
+deny-by-default broker routing, but explicitly reports untrusted-code,
+guest-privilege, and host-filesystem isolation as unsupported. Its candidate is
+therefore rejected during `pre_create` admission for untrusted workloads even
+though its network policy can be enforced.
 
 `E2BRunner.create_hardened(...)` is the public one-way provisioning contract for
 an offline E2B guest. It always creates with `secure=True` and

@@ -20,6 +20,7 @@ from cayu.egress import (
 )
 from cayu.egress.e2b_adapter import E2BEgressAdapter
 from cayu.egress.proxy_exposure import ExposedProxy
+from cayu.environments import ExecutionRequirements, evaluate_execution_admission
 from cayu.runners import E2BRunner
 from cayu.vaults import SecretRef, StaticVault
 
@@ -27,6 +28,40 @@ from cayu.vaults import SecretRef, StaticVault
 class _FakeAuthority:
     def ca_cert_pem(self) -> bytes:
         return b"session-ca"
+
+
+def test_e2b_declares_an_admissible_untrusted_execution_profile() -> None:
+    adapter = E2BEgressAdapter(exposure=_FakeExposure(), e2b_module=_FakeE2BModule)
+
+    decision = evaluate_execution_admission(
+        candidate="e2b",
+        requirements=ExecutionRequirements.untrusted(),
+        evidence=adapter.execution_capability_evidence(),
+        stage="pre_create",
+    )
+
+    assert decision.status == "admitted"
+    assert adapter.execution_capability_evidence().state_for("unprivileged_guest") == ("declared")
+
+
+def test_e2b_refuses_confirmed_cancellation_when_cleanup_is_disabled() -> None:
+    adapter = E2BEgressAdapter(
+        exposure=_FakeExposure(),
+        e2b_module=_FakeE2BModule,
+        e2b_options={"cancellation_cleanup": "none"},
+    )
+
+    decision = evaluate_execution_admission(
+        candidate="e2b",
+        requirements=ExecutionRequirements.untrusted(),
+        evidence=adapter.execution_capability_evidence(),
+        stage="pre_create",
+    )
+
+    cancellation = next(
+        item for item in decision.refusals if item.capability == "confirmed_cancellation"
+    )
+    assert cancellation.code == "unsupported_capability"
 
 
 class _FakeProxyServer:
@@ -319,7 +354,12 @@ def test_e2b_credentialless_prepare_accepts_declared_session_isolation() -> None
 
 
 def test_e2b_adapter_allows_only_the_exposed_cayu_proxy(tmp_path: Path) -> None:
-    async def run() -> tuple[Any, E2BRunner, _FakeExposure]:
+    async def run() -> tuple[
+        Any,
+        E2BRunner,
+        _FakeExposure,
+        E2BEgressAdapter,
+    ]:
         _FakeProxyServer.instances = []
         _FakeAsyncSandbox.created = []
         _FakeCommands.background_result = _FakeCommandResult()
@@ -354,9 +394,9 @@ def test_e2b_adapter_allows_only_the_exposed_cayu_proxy(tmp_path: Path) -> None:
                 egress_destinations=("api.stripe.com",),
             )
         )
-        return binding, runner, exposure
+        return binding, runner, exposure, adapter
 
-    binding, runner, exposure = asyncio.run(run())
+    binding, runner, exposure, adapter = asyncio.run(run())
 
     assert exposure.calls == [("127.0.0.1", 9123)]
     assert binding.proxy_url == "http://203.0.113.10:8443"
@@ -387,32 +427,48 @@ def test_e2b_adapter_allows_only_the_exposed_cayu_proxy(tmp_path: Path) -> None:
     setup_index = next(
         index for index, call in enumerate(command_calls) if "python3 -V" in call["command"]
     )
-    preflight_index = next(
+    preflight_indices = [
         index
         for index, call in enumerate(command_calls)
         if call.get("background") and "api.stripe.com" in call["command"]
-    )
+    ]
     verification_indices = [
         index for index, call in enumerate(command_calls) if "sudo -n true" in call["command"]
     ]
     assert hardening["user"] == "root"
     assert protected_install["envs"]["CAYU_PROTECTED_MODE"] == "444"
-    assert command_calls[preflight_index]["envs"]["HTTPS_PROXY"] == binding.proxy_url
-    assert command_calls[preflight_index]["user"] == "user"
-    assert '("1.1.1.1", 443, "one.one.one.one")' in command_calls[preflight_index]["command"]
-    assert '("8.8.8.8", 443, "dns.google")' in command_calls[preflight_index]["command"]
-    assert (
-        "for host, port, server_hostname in direct_tls_probes:"
-        in (command_calls[preflight_index]["command"])
-    )
-    assert command_calls[preflight_index]["envs"]["STRIPE_SECRET_KEY"].startswith(
-        "sk_test_cayu_vc_"
-    )
+    assert len(preflight_indices) == 2
+    for preflight_index in preflight_indices:
+        assert command_calls[preflight_index]["envs"]["HTTPS_PROXY"] == binding.proxy_url
+        assert command_calls[preflight_index]["user"] == "user"
+        assert '("1.1.1.1", 443, "one.one.one.one")' in command_calls[preflight_index]["command"]
+        assert '("8.8.8.8", 443, "dns.google")' in command_calls[preflight_index]["command"]
+        assert (
+            "for host, port, server_hostname in direct_tls_probes:"
+            in command_calls[preflight_index]["command"]
+        )
+        assert command_calls[preflight_index]["envs"]["STRIPE_SECRET_KEY"].startswith(
+            "sk_test_cayu_vc_"
+        )
     assert command_calls[setup_index]["timeout"] == 300
     assert len(verification_indices) == 2
-    assert verification_indices[0] < preflight_index < setup_index < verification_indices[1]
+    assert (
+        verification_indices[0]
+        < preflight_indices[0]
+        < setup_index
+        < preflight_indices[1]
+        < verification_indices[1]
+    )
     with pytest.raises(RuntimeError, match="Raw E2B filesystem"):
         runner.filesystem()
+
+    first_evidence = adapter.execution_capability_evidence(runner)
+    second_evidence = adapter.execution_capability_evidence(runner)
+    assert first_evidence == second_evidence
+    network_claim = first_evidence.claim_for("deny_by_default_network")
+    assert network_claim is not None
+    assert network_claim.state == "live_verified"
+    assert network_claim.observed_at is not None
 
     asyncio.run(runner.close())
     asyncio.run(binding.close())
@@ -642,7 +698,7 @@ def test_e2b_adapter_closes_sandbox_when_preflight_fails(tmp_path: Path) -> None
                     env_overlay=binding.env,
                     ca_cert_host_path=str(ca_path),
                     guest_ca_path="/etc/cayu/ca.pem",
-                    setup_commands=(),
+                    setup_commands=("must-not-run",),
                     egress_destinations=("api.stripe.com",),
                 )
             )
@@ -653,6 +709,7 @@ def test_e2b_adapter_closes_sandbox_when_preflight_fails(tmp_path: Path) -> None
     sandbox = asyncio.run(run())
 
     assert sandbox.killed is True
+    assert all("must-not-run" not in call["command"] for call in sandbox.commands.calls)
 
 
 def test_e2b_adapter_preserves_public_error_when_hardening_and_rollback_fail(
@@ -891,7 +948,7 @@ def test_e2b_adapter_handoff_budget_covers_every_setup_command(
     runner = asyncio.run(adapter.create_runner(request))
 
     assert runner is returned_runner
-    assert captured["handoff_timeout_s"] == 900
+    assert captured["handoff_timeout_s"] == 1080
 
 
 def test_e2b_adapter_closes_sandbox_when_guest_hardening_fails(

@@ -1,22 +1,32 @@
 from __future__ import annotations
 
-from typing import Annotated, Literal, Self
+from typing import Literal, Self
 
 from pydantic import (
-    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
-    StrictBool,
-    StrictInt,
-    StringConstraints,
     model_validator,
 )
 
+from cayu.capabilities import (
+    MAX_CAPABILITY_CLAIMS,
+    CapabilityClaimBase,
+    CapabilityDetail,
+    CapabilityDetailValue,
+    CapabilityIdentity,
+    CapabilitySafeJsonInteger,
+    CapabilityToken,
+)
+from cayu.capabilities import (
+    MAX_SAFE_JSON_INTEGER as MAX_SAFE_JSON_INTEGER,
+)
+from cayu.capabilities import (
+    MIN_SAFE_JSON_INTEGER as MIN_SAFE_JSON_INTEGER,
+)
+
 EGRESS_CAPABILITY_EVIDENCE_SCHEMA = "cayu.egress_capabilities.v1"
-MAX_EGRESS_CAPABILITY_CLAIMS = 64
-MAX_SAFE_JSON_INTEGER = 2**53 - 1
-MIN_SAFE_JSON_INTEGER = -MAX_SAFE_JSON_INTEGER
+MAX_EGRESS_CAPABILITY_CLAIMS = MAX_CAPABILITY_CLAIMS
 
 EgressCapabilityState = Literal[
     "verified",
@@ -63,64 +73,24 @@ _ALLOWED_CLAIM_PROOFS: dict[
     "unverified": frozenset({("operator_opt_out", "not_probed")}),
     "unsupported": frozenset({("adapter_declaration", "unavailable")}),
 }
-EvidenceToken = Annotated[
-    str,
-    StringConstraints(
-        strip_whitespace=True,
-        min_length=1,
-        max_length=96,
-        pattern=r"^[a-z][a-z0-9_-]*$",
-    ),
-]
+EvidenceToken = CapabilityToken
+EvidenceIdentity = CapabilityIdentity
+SafeJsonInteger = CapabilitySafeJsonInteger
+EgressCapabilityDetailValue = CapabilityDetailValue
+EgressCapabilityDetail = CapabilityDetail
 
 
-def _reject_secret_shaped_identity(value: str) -> str:
-    parts = set(value.replace("-", "_").split("_"))
-    if value.startswith(("ghp_", "github_pat_", "pk_", "sk_", "xox")) or parts.intersection(
-        {"password", "secret"}
-    ):
-        raise ValueError("Evidence identities cannot contain secret-shaped values.")
-    return value
-
-
-EvidenceIdentity = Annotated[EvidenceToken, AfterValidator(_reject_secret_shaped_identity)]
-SafeJsonInteger = Annotated[
-    StrictInt,
-    Field(ge=MIN_SAFE_JSON_INTEGER, le=MAX_SAFE_JSON_INTEGER),
-]
-EgressCapabilityDetailValue = StrictBool | SafeJsonInteger
-
-
-class EgressCapabilityDetail(BaseModel):
-    """One bounded adapter-specific fact attached to a capability claim."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    name: EvidenceIdentity
-    value: EgressCapabilityDetailValue
-
-
-class EgressCapabilityClaim(BaseModel):
+class EgressCapabilityClaim(CapabilityClaimBase):
     """One bounded, secret-safe runtime capability observation."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    capability: EvidenceIdentity
     state: EgressCapabilityClaimState
     proof_source: EgressCapabilityProofSource
     observation: EgressCapabilityObservation | None = None
     reason_code: EgressCapabilityReasonCode | None = None
     remediation_code: EgressCapabilityRemediationCode | None = None
-    adapter_details: tuple[EgressCapabilityDetail, ...] = Field(
-        default_factory=tuple,
-        max_length=16,
-    )
 
     @model_validator(mode="after")
     def validate_state_fields(self) -> Self:
-        detail_names = [detail.name for detail in self.adapter_details]
-        if len(detail_names) != len(set(detail_names)):
-            raise ValueError("Capability adapter details must have unique names.")
         proof = (self.proof_source, self.observation)
         if proof not in _ALLOWED_CLAIM_PROOFS[self.state]:
             raise ValueError(

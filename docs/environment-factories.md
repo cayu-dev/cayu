@@ -31,16 +31,22 @@ Two runnable, API-key-free examples accompany this guide:
 
 ## The lifecycle
 
-For each session the runtime walks a fixed order (see `src/cayu/runtime/app.py`):
+For each session the runtime walks a fixed order (owned by
+`src/cayu/runtime/_environment_lifecycle.py`):
 
 ```
-factory.create(request)   ->  produces a concrete Environment (workspace + runner + binding)
-binding.bind(...)         ->  makes the workspace available to the runner (copy-in / restore / checkout)
+factory admission        ->  verifies side-effect-free pre-create evidence
+factory.create(request)  ->  produces a concrete Environment (workspace + runner + binding)
+runner admission         ->  verifies a runner returned directly by the factory
+binding.bind(...)        ->  makes the workspace available to the runner (copy-in / restore / checkout)
+final runner admission   ->  verifies the exact runner exposed by the binding
    ... the agent runs, tools read/write/exec against the bound workspace ...
 binding.finalize(...)     ->  persist / sync-back / snapshot, using the session outcome
    ... cleanup runs regardless of outcome (completed / failed / interrupted) ...
 ```
 
+The direct-runner admission happens before reconnect identity is checkpointed. The final
+admission always runs after binding because a binding may supply or replace the runner.
 `bind` runs before the first tool call; `finalize` runs when the session ends (completed,
 failed, or interrupted) and receives the `outcome` so it can decide what to persist.
 
@@ -98,7 +104,9 @@ Notes:
   is `CREATE` for new sessions and a fork's first child allocation, and
   `RECONNECT` for resume/recovery. A reconnect operation must fail closed when
   its durable metadata is missing; it must never silently allocate a replacement.
-  Key per-session resources off `session_id`.
+  The request also carries the agent's copied `execution_requirements`; those
+  requirements come from application-controlled agent registration, not from a
+  per-run request. Factories should key per-session resources off `session_id`.
 - `EnvironmentFactoryResult.reconnect_metadata` is checkpointed automatically.
   It must be versioned, JSON-safe, non-secret identity only. A fresh factory must
   either attach the exact resource named by that metadata or return a typed
@@ -107,12 +115,15 @@ Notes:
   provide `EnvironmentFactoryResult.release`. The runtime calls it with
   `DISCARD` when a new allocation fails before the durable checkpoint and
   `PRESERVE` for a reconnect or when a new allocation was checkpointed but its
-  completion event could not be persisted. `PRESERVE` must detach/release
+  completion event or later setup failed before successful workspace binding.
+  `PRESERVE` must detach/release
   host-side handles without deleting
   the reconnectable resource; the callback should be idempotent. Cayu's virtual
   egress factory supplies this callback automatically. Release callbacks are
   cancellation-safe and bounded to 15 seconds by default; set
   `release_timeout_s` on the result when the provider needs a different bound.
+  Code that calls a factory directly, outside `CayuApp`, assumes the same
+  obligation and must release a result whose binding never succeeds.
 - `EnvironmentFactoryResult.environment` must be **exactly** an `Environment` (not a
   subclass) — build one and set `workspace`, `runner`, and `binding` on it.
 - The `binding` is attached to the `Environment`. If you omit it, the binding step is
@@ -125,6 +136,70 @@ Notes:
   the workspace with `NativeBinding`. For example,
   `workspace_factory=MicrosandboxWorkspace` produces a first-party workspace
   in the enforced microVM without exposing the raw `MicrosandboxRunner`.
+
+## Execution admission for custom integrations
+
+Applications attach provider-neutral workload requirements to the agent, not
+to a factory or `RunRequest`:
+
+```python
+from cayu import AgentSpec, ExecutionRequirements
+
+app.register_agent(
+    AgentSpec(name="coding-agent", model="provider/model"),
+    execution_requirements=ExecutionRequirements.untrusted(),
+)
+```
+
+Omitting `execution_requirements` preserves the permissive
+`ExecutionRequirements.trusted()` default. Existing integrations that make no
+admission claim therefore continue to work for trusted agents, but fail closed
+when an agent requires capabilities for which they provide no evidence.
+
+A custom integration supplies evidence at two boundaries. The factory hook
+describes the candidate before allocation; the runner hook describes the exact
+live candidate that will execute commands:
+
+```python
+from cayu import EnvironmentFactory, ExecutionAdmissionCandidate, Runner
+
+
+class HostedFactory(EnvironmentFactory):
+    def execution_admission_candidate(self, request):
+        return ExecutionAdmissionCandidate(
+            candidate="acme-sandbox",
+            evidence=self._declared_evidence,
+        )
+
+    async def create(self, request):
+        ...
+
+
+class HostedRunner(Runner):
+    def execution_admission_candidate(self):
+        return ExecutionAdmissionCandidate(
+            candidate="acme-sandbox",
+            evidence=self._runtime_evidence,
+        )
+```
+
+Both evidence objects are `ExecutionCapabilityEvidence` whose `subject` is the
+same candidate string. The pre-create hook must be side-effect free: it may
+publish integration declarations, but it must not allocate a sandbox or claim
+that a live resource was observed. The final runner hook should return quickly
+and may publish integration-validated availability or bounded live observations.
+Cayu can call it again after asynchronous setup or binding, so evidence with a
+validity window must still be fresh at that point.
+
+If a binding replaces the factory's runner, the replacement must report the
+same admitted candidate. Missing evidence, a changed candidate, insufficient
+claims, and expired live observations fail closed before the runner is exposed
+to the agent. Cayu evaluates only the selected candidate; admission never
+chooses a provider or silently falls back to another environment.
+
+See [Execution admission](runtime-contracts.md#execution-admission) for the
+complete capability vocabulary, evidence states, live-proof bounds, structured
+refusals, and trusted versus untrusted presets.
 
 ## Workspace bindings
 
@@ -142,6 +217,14 @@ On the returned `BoundWorkspace`, `workspace` is what the tools actually bind to
 `source_workspace` is the original workspace the factory built. They **differ** when a binding
 swaps in a copy or a remote view (e.g. `SyncBinding` binds tools to a target while the source
 stays durable) and **coincide** for native/local bindings that pass the same workspace through.
+
+Factory-result ownership transfers only when `bind` returns successfully. On a
+failed or cancelled bind, the binding must roll back only state it created
+during that attempt; Cayu calls the still-unadopted factory result's `release`
+callback for its runner and allocation. After success, `finalize` is the sole
+lifecycle owner. A binding that replaces the factory runner must retain enough
+state to finalize both the source and replacement resources and must not rely on
+the factory release callback as a second cleanup path.
 
 The built-in bindings live in `src/cayu/environments/bindings.py`:
 

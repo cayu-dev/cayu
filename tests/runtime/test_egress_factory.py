@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import AsyncIterator, Mapping, Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,12 @@ from cayu.environments import (
     EnvironmentFactoryOperation,
     EnvironmentFactoryReleaseAction,
     EnvironmentFactoryRequest,
+    EnvironmentSpec,
+    ExecutionAdmissionError,
+    ExecutionCapabilityClaim,
+    ExecutionCapabilityEvidence,
+    ExecutionEvidenceOverride,
+    ExecutionRequirements,
 )
 from cayu.environments.bindings import BoundWorkspace, WorkspaceBinding
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
@@ -60,7 +67,6 @@ from cayu.runtime._binding_cleanup import (
     BINDING_FINALIZE_ERROR_TEXT_MAX_BYTES,
     BindingFinalizeFailure,
     append_binding_finalize_cancellation,
-    binding_cleanup_payload,
     binding_finalize_failure_payload,
     binding_finalize_fatal_signal,
     record_binding_finalize_failures,
@@ -605,6 +611,83 @@ class _CapabilityRecordingAdapter(_RecordingAdapter):
         return {"metadata_isolation_mode": "unverified"}
 
 
+def _available_untrusted_execution_evidence(
+    subject: str,
+    *,
+    network_state: str = "available",
+    live_ttl: timedelta = timedelta(minutes=5),
+) -> ExecutionCapabilityEvidence:
+    claims: list[ExecutionCapabilityClaim] = []
+    for capability in ExecutionRequirements.untrusted().required_capabilities():
+        if capability == "deny_by_default_network" and network_state == "live_verified":
+            observed_at = datetime.now(UTC)
+            claims.append(
+                ExecutionCapabilityClaim.live_verified(
+                    capability,
+                    observation="denied",
+                    observed_at=observed_at,
+                    valid_until=observed_at + live_ttl,
+                )
+            )
+        elif capability == "deny_by_default_network" and network_state == "stale":
+            observed_at = datetime.now(UTC) - timedelta(minutes=6)
+            claims.append(
+                ExecutionCapabilityClaim.live_verified(
+                    capability,
+                    observation="denied",
+                    observed_at=observed_at,
+                    valid_until=observed_at + timedelta(minutes=5),
+                )
+            )
+        elif capability == "deny_by_default_network" and network_state == "unverified":
+            claims.append(
+                ExecutionCapabilityClaim(
+                    capability=capability,
+                    state="unverified",
+                    proof_source="operator_opt_out",
+                    observation="not_probed",
+                    reason_code="network_boundary_unverified",
+                    remediation_code="enable_network_preflight",
+                )
+            )
+        else:
+            claims.append(
+                ExecutionCapabilityClaim(
+                    capability=capability,
+                    state="available",
+                    proof_source="integration_validation",
+                    observation="available",
+                )
+            )
+    return ExecutionCapabilityEvidence(subject=subject, claims=tuple(claims))
+
+
+class _MixedAssuranceAdapter(_RecordingAdapter):
+    def __init__(self, runtime_network_state: str) -> None:
+        super().__init__("hosted-runner")
+        self.runtime_network_state = runtime_network_state
+
+    def execution_capability_evidence(
+        self,
+        runner: Runner | None = None,
+    ) -> ExecutionCapabilityEvidence:
+        return _available_untrusted_execution_evidence(
+            self.runner_kind,
+            network_state=self.runtime_network_state if runner is not None else "available",
+        )
+
+
+def _live_network_execution_requirements() -> ExecutionRequirements:
+    return ExecutionRequirements.untrusted(
+        evidence_overrides=(
+            ExecutionEvidenceOverride(
+                capability="deny_by_default_network",
+                minimum_evidence="live_verified",
+            ),
+        )
+    )
+
+
 class _RetryingLifecycleAdapter(_RecordingAdapter):
     def __init__(self, *, first_error: RuntimeError | None = None) -> None:
         super().__init__("lambda-microvm")
@@ -767,6 +850,239 @@ def test_factory_does_not_fallback_to_docker_for_an_unavailable_microvm() -> Non
         )
 
     assert docker_adapter.prepare_calls == []
+
+
+def test_factory_refuses_untrusted_execution_before_adapter_resources() -> None:
+    adapter = _RecordingAdapter("custom-runner")
+
+    async def run() -> None:
+        factory = _virtual_factory(adapter=adapter)
+        with pytest.raises(ExecutionAdmissionError) as raised:
+            await factory.create(
+                EnvironmentFactoryRequest(
+                    session_id="sess_admission",
+                    agent_name="agent",
+                    environment_name="egress-env",
+                    execution_requirements=ExecutionRequirements.untrusted(),
+                )
+            )
+        assert {refusal.capability for refusal in raised.value.decision.refusals} == set(
+            ExecutionRequirements.untrusted().required_capabilities()
+        )
+
+    asyncio.run(run())
+
+    assert adapter.prepare_calls == []
+
+
+def test_builtin_docker_is_explicitly_unsupported_for_untrusted_execution() -> None:
+    async def run() -> None:
+        factory = _virtual_factory(runner_kind="docker")
+        with pytest.raises(ExecutionAdmissionError) as raised:
+            await factory.create(
+                EnvironmentFactoryRequest(
+                    session_id="sess_untrusted_docker",
+                    agent_name="agent",
+                    environment_name="egress-env",
+                    execution_requirements=ExecutionRequirements.untrusted(),
+                )
+            )
+        refusal = next(
+            item
+            for item in raised.value.decision.refusals
+            if item.capability == "untrusted_code_isolation"
+        )
+        assert refusal.code == "unsupported_capability"
+        assert refusal.reason_code == "container_isolation_unsupported"
+
+    asyncio.run(run())
+
+
+def test_factory_does_not_accept_caller_assertions_in_place_of_adapter_evidence() -> None:
+    evidence = _available_untrusted_execution_evidence("docker")
+
+    with pytest.raises(TypeError, match="execution_evidence"):
+        _virtual_factory(
+            runner_kind="docker",
+            execution_evidence=evidence,
+        )
+
+
+def test_factory_refuses_weakened_runtime_evidence_and_cleans_up_before_exposure() -> None:
+    class _RuntimeEvidenceAdapter(_RecordingAdapter):
+        def execution_capability_evidence(
+            self,
+            runner: Runner | None = None,
+        ) -> ExecutionCapabilityEvidence:
+            return _available_untrusted_execution_evidence(
+                self.runner_kind,
+                network_state="unverified" if runner is not None else "available",
+            )
+
+    adapter = _RuntimeEvidenceAdapter("hosted-runner")
+
+    async def run() -> None:
+        factory = _virtual_factory(adapter=adapter)
+        with pytest.raises(ExecutionAdmissionError) as raised:
+            await factory.create(
+                EnvironmentFactoryRequest(
+                    session_id="sess_runtime_admission",
+                    agent_name="agent",
+                    environment_name="egress-env",
+                    execution_requirements=ExecutionRequirements.untrusted(),
+                )
+            )
+        assert raised.value.decision.stage == "pre_exposure"
+        assert raised.value.decision.refusals[0].capability == "deny_by_default_network"
+
+    asyncio.run(run())
+
+    assert len(adapter.prepare_calls) == 1
+    assert adapter.torn_down == 1
+    runner = adapter.captured["inner_runner"]
+    assert runner.closed is True
+
+
+def test_factory_admits_live_network_with_available_isolation_and_lifecycle_evidence() -> None:
+    adapter = _MixedAssuranceAdapter("live_verified")
+
+    async def run() -> Any:
+        result = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_mixed_assurance",
+                agent_name="agent",
+                environment_name="egress-env",
+                execution_requirements=_live_network_execution_requirements(),
+            )
+        )
+        runner = result.environment.runner
+        assert runner is not None
+        await runner.close()
+        return result
+
+    result = asyncio.run(run())
+
+    claims = {
+        claim["capability"]: claim["state"]
+        for claim in result.metadata["execution_capabilities"]["claims"]
+    }
+    assert claims["deny_by_default_network"] == "live_verified"
+    assert claims["untrusted_code_isolation"] == "available"
+
+
+def test_factory_rechecks_live_evidence_after_async_setup_before_return() -> None:
+    class _ExpiringEvidenceAdapter(_RecordingAdapter):
+        def __init__(self) -> None:
+            super().__init__("hosted-runner")
+            self.runtime_evidence: ExecutionCapabilityEvidence | None = None
+
+        def execution_capability_evidence(
+            self,
+            runner: Runner | None = None,
+        ) -> ExecutionCapabilityEvidence:
+            if runner is None:
+                return _available_untrusted_execution_evidence(self.runner_kind)
+            if self.runtime_evidence is None:
+                self.runtime_evidence = _available_untrusted_execution_evidence(
+                    self.runner_kind,
+                    network_state="live_verified",
+                    live_ttl=timedelta(milliseconds=50),
+                )
+            return self.runtime_evidence
+
+    adapter = _ExpiringEvidenceAdapter()
+
+    async def emitter(event: Event) -> Event:
+        await asyncio.sleep(0.06)
+        return event
+
+    async def run() -> None:
+        with pytest.raises(ExecutionAdmissionError) as raised:
+            await _virtual_factory(adapter=adapter, event_emitter=emitter).create(
+                EnvironmentFactoryRequest(
+                    session_id="sess_expired_before_return",
+                    agent_name="agent",
+                    environment_name="egress-env",
+                    execution_requirements=_live_network_execution_requirements(),
+                )
+            )
+        assert [(item.capability, item.code) for item in raised.value.decision.refusals] == [
+            ("deny_by_default_network", "stale_evidence")
+        ]
+
+    asyncio.run(run())
+
+    assert adapter.torn_down == 1
+    assert adapter.captured["inner_runner"].closed is True
+
+
+@pytest.mark.parametrize(
+    ("network_state", "expected_code"),
+    [
+        ("available", "insufficient_evidence"),
+        ("stale", "stale_evidence"),
+    ],
+)
+def test_factory_refuses_weakened_or_stale_capability_override(
+    network_state: str,
+    expected_code: str,
+) -> None:
+    adapter = _MixedAssuranceAdapter(network_state)
+
+    async def run() -> None:
+        with pytest.raises(ExecutionAdmissionError) as raised:
+            await _virtual_factory(adapter=adapter).create(
+                EnvironmentFactoryRequest(
+                    session_id=f"sess_mixed_{network_state}",
+                    agent_name="agent",
+                    environment_name="egress-env",
+                    execution_requirements=_live_network_execution_requirements(),
+                )
+            )
+        assert [(item.capability, item.code) for item in raised.value.decision.refusals] == [
+            ("deny_by_default_network", expected_code)
+        ]
+
+    asyncio.run(run())
+
+    assert adapter.torn_down == 1
+    runner = adapter.captured["inner_runner"]
+    assert runner.closed is True
+
+
+def test_factory_publishes_admitted_requirements_and_execution_evidence() -> None:
+    class _AdmissibleAdapter(_RecordingAdapter):
+        def execution_capability_evidence(
+            self,
+            runner: Runner | None = None,
+        ) -> ExecutionCapabilityEvidence:
+            return _available_untrusted_execution_evidence(self.runner_kind)
+
+    adapter = _AdmissibleAdapter("hosted-runner")
+
+    async def run() -> Any:
+        result = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_admitted_evidence",
+                agent_name="agent",
+                environment_name="egress-env",
+                execution_requirements=ExecutionRequirements.untrusted(),
+            )
+        )
+        runner = result.environment.runner
+        assert runner is not None
+        await runner.close()
+        return result
+
+    result = asyncio.run(run())
+
+    assert result.metadata["execution_requirements"]["code_trust"] == "untrusted"
+    assert result.metadata["execution_capabilities"]["schema"] == ("cayu.execution_capabilities.v1")
+    assert result.metadata["execution_capabilities"]["subject"] == "hosted-runner"
+    assert (
+        result.environment.spec.metadata["execution_capabilities"]
+        == (result.metadata["execution_capabilities"])
+    )
 
 
 def test_factory_rejects_an_unsupported_explicit_runner_without_a_registry() -> None:
@@ -1389,6 +1705,8 @@ def test_bind_failure_cleans_up_egress_resources() -> None:
         assert runner is not None
         with pytest.raises(RuntimeError, match="bind failed"):
             await binding.bind(None, runner, session_id="sess_bind_fail")
+        assert result.release is not None
+        await result.release(EnvironmentFactoryReleaseAction.DISCARD)
         return runner
 
     runner = asyncio.run(run())
@@ -1432,13 +1750,15 @@ def test_bind_failure_detaches_a_reconnected_environment() -> None:
         assert binding is not None and runner is not None
         with pytest.raises(RuntimeError, match="bind failed"):
             await binding.bind(None, runner, session_id="sess_bind_reconnect")
+        assert result.release is not None
+        await result.release(EnvironmentFactoryReleaseAction.PRESERVE)
 
     asyncio.run(run())
     assert adapter.finalize_calls == ["interrupted"]
     assert adapter.torn_down == 1
 
 
-def test_bind_failure_reports_incomplete_cleanup_without_false_revoked_event() -> None:
+def test_factory_release_retries_incomplete_unadopted_cleanup() -> None:
     adapter = _RetryingLifecycleAdapter()
     events: list[Event] = []
 
@@ -1468,27 +1788,24 @@ def test_bind_failure_reports_incomplete_cleanup_without_false_revoked_event() -
         binding = result.environment.binding
         runner = result.environment.runner
         assert binding is not None and runner is not None
-        with pytest.raises(RuntimeError, match="bind failed") as exc_info:
+        with pytest.raises(RuntimeError, match="bind failed"):
             await binding.bind(None, runner, session_id="sess_bind_cleanup_failure")
-        assert any("bind rollback incomplete" in note for note in exc_info.value.__notes__)
-        assert binding_cleanup_payload(exc_info.value) == {
-            "incomplete": True,
-            "initial_error": (
-                "Virtual-egress resource cleanup incomplete: runner: RuntimeError: suspend failed"
-            ),
-            "initial_error_type": "RuntimeError",
-            "retry_attempted": False,
-        }
-        assert adapter.torn_down == 0
-        assert EventType.EGRESS_GRANT_REVOKED not in {event.type for event in events}
+        assert result.release is not None
+        await result.release(EnvironmentFactoryReleaseAction.DISCARD)
+        assert adapter.finalize_calls == 2
+        assert runner.closed is True
+        assert adapter.torn_down == 1
+        assert sum(event.type is EventType.EGRESS_GRANT_REVOKED for event in events) == 1
 
+        # A later close converges without repeating provider or egress cleanup.
         await runner.close()
+        assert adapter.finalize_calls == 2
         assert adapter.torn_down == 1
 
     asyncio.run(run())
 
 
-def test_app_retries_reconnected_binding_cleanup_without_removing_sandbox() -> None:
+def test_app_retries_factory_release_after_bind_failure() -> None:
     adapter = _RetryingReconnectAdapter()
     egress_events: list[Event] = []
 
@@ -1517,28 +1834,16 @@ def test_app_retries_reconnected_binding_cleanup_without_removing_sandbox() -> N
         store = InMemorySessionStore()
         provider = _UnreachedProvider()
         app = CayuApp(session_store=store, enable_logging=False)
-        result = await _virtual_factory(
-            adapter=adapter,
-            inner_binding=_FailingBindBinding(),
-            event_emitter=emit,
-        ).create(
-            EnvironmentFactoryRequest(
-                session_id="sess_bind_cleanup_app_retry",
-                agent_name="assistant",
-                environment_name="egress-env",
-                operation=EnvironmentFactoryOperation.RECONNECT,
-                reconnect_metadata={
-                    "version": 1,
-                    "runner_kind": "lambda-microvm",
-                    "session_id": "sess_bind_cleanup_app_retry",
-                    "environment_name": "egress-env",
-                    "capability": "supported",
-                    "identity": {"microvm_id": "mvm-old"},
-                },
-            )
-        )
         app.register_provider(provider, default=True)
-        app.register_environment(result.environment, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="egress-env"),
+            _virtual_factory(
+                adapter=adapter,
+                inner_binding=_FailingBindBinding(),
+                event_emitter=emit,
+            ),
+            default=True,
+        )
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
         _ = [
@@ -1559,24 +1864,20 @@ def test_app_retries_reconnected_binding_cleanup_without_removing_sandbox() -> N
         event for event in events if event.type is EventType.ENVIRONMENT_BINDING_FAILED
     )
     session_failed = next(event for event in events if event.type is EventType.SESSION_FAILED)
-    expected_cleanup = {
-        "incomplete": False,
-        "initial_error": (
-            "Virtual-egress resource cleanup incomplete: runner: RuntimeError: suspend failed"
-        ),
-        "initial_error_type": "RuntimeError",
-        "retry_attempted": True,
-        "retry_completed": True,
+    expected_release = {
+        "action": "preserve",
+        "callback_provided": True,
+        "completed": True,
     }
-    assert binding_failed.payload["binding_cleanup"] == expected_cleanup
-    assert session_failed.payload["binding_cleanup"] == expected_cleanup
+    assert binding_failed.payload["environment_factory_release"] == expected_release
+    assert session_failed.payload["environment_factory_release"] == expected_release
     assert sum(event.type is EventType.EGRESS_GRANT_REVOKED for event in egress_events) == 1
     assert adapter.finalize_calls == ["interrupted", "interrupted"]
     assert adapter.torn_down == 1
     assert provider.requests == []
 
 
-def test_app_retries_reconnected_binding_cleanup_during_cancellation() -> None:
+def test_app_retries_factory_release_during_bind_cancellation() -> None:
     adapter = _RetryingReconnectAdapter()
     bind_started = asyncio.Event()
 
@@ -1599,31 +1900,19 @@ def test_app_retries_reconnected_binding_cleanup_during_cancellation() -> None:
             self.requests.append(request)
             yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
-    async def run() -> tuple[_UnreachedProvider, BaseExceptionGroup]:
+    async def run() -> _UnreachedProvider:
         store = InMemorySessionStore()
         provider = _UnreachedProvider()
         app = CayuApp(session_store=store, enable_logging=False)
-        result = await _virtual_factory(
-            adapter=adapter,
-            inner_binding=_CancelledBindBinding(),
-        ).create(
-            EnvironmentFactoryRequest(
-                session_id="sess_cancelled_bind_cleanup_retry",
-                agent_name="assistant",
-                environment_name="egress-env",
-                operation=EnvironmentFactoryOperation.RECONNECT,
-                reconnect_metadata={
-                    "version": 1,
-                    "runner_kind": "lambda-microvm",
-                    "session_id": "sess_cancelled_bind_cleanup_retry",
-                    "environment_name": "egress-env",
-                    "capability": "supported",
-                    "identity": {"microvm_id": "mvm-old"},
-                },
-            )
-        )
         app.register_provider(provider, default=True)
-        app.register_environment(result.environment, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="egress-env"),
+            _virtual_factory(
+                adapter=adapter,
+                inner_binding=_CancelledBindBinding(),
+            ),
+            default=True,
+        )
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
         async def run_app() -> list[Event]:
@@ -1641,15 +1930,12 @@ def test_app_retries_reconnected_binding_cleanup_during_cancellation() -> None:
         run_task = asyncio.create_task(run_app())
         await asyncio.wait_for(bind_started.wait(), timeout=1)
         run_task.cancel()
-        with pytest.raises(BaseExceptionGroup) as exc_info:
+        with pytest.raises(asyncio.CancelledError):
             await run_task
-        return provider, exc_info.value
+        return provider
 
-    provider, failure = asyncio.run(run())
+    provider = asyncio.run(run())
 
-    assert isinstance(failure.exceptions[0], asyncio.CancelledError)
-    assert isinstance(failure.exceptions[1], RuntimeError)
-    assert "suspend failed" in str(failure.exceptions[1])
     assert adapter.finalize_calls == ["interrupted", "interrupted"]
     assert adapter.torn_down == 1
     assert provider.requests == []
@@ -1724,178 +2010,6 @@ def test_factory_rollback_preserves_cancellation_after_ordinary_creation_failure
     failure = asyncio.run(run())
 
     assert failure.exceptions[0] is creation_error
-    assert isinstance(failure.exceptions[1], asyncio.CancelledError)
-
-
-def test_bind_rollback_preserves_bind_cleanup_and_cancellation_failures() -> None:
-    bind_error = RuntimeError("bind failed")
-    cleanup_error = RuntimeError("rollback failed")
-    cancellation = asyncio.CancelledError("caller cancelled")
-
-    class _FailingBindBinding(WorkspaceBinding):
-        async def bind(self, workspace, runner, **kwargs):  # type: ignore[no-untyped-def]
-            raise bind_error
-
-        async def finalize(self, bound, *, outcome=None, metadata=None):  # type: ignore[no-untyped-def]
-            raise AssertionError("finalize should not run")
-
-    async def run() -> BaseExceptionGroup:
-        result = await _virtual_factory(
-            adapter=_RecordingAdapter(),
-            inner_binding=_FailingBindBinding(),
-        ).create(
-            EnvironmentFactoryRequest(
-                session_id="sess_bind_rollback_group",
-                agent_name="assistant",
-                environment_name="egress-env",
-            )
-        )
-        binding = result.environment.binding
-        runner = result.environment.runner
-        assert binding is not None and runner is not None
-
-        async def fail_rollback(*, outcome: str | None) -> None:
-            raise BaseExceptionGroup(
-                "rollback cancelled and failed",
-                [cancellation, cleanup_error],
-            )
-
-        binding._close_resources = fail_rollback  # type: ignore[attr-defined,method-assign]
-        with pytest.raises(BaseExceptionGroup) as exc_info:
-            await binding.bind(None, runner, session_id="sess_bind_rollback_group")
-        return exc_info.value
-
-    failure = asyncio.run(run())
-
-    assert failure.exceptions == (bind_error, cleanup_error, cancellation)
-    assert binding_cleanup_payload(failure) == {
-        "incomplete": True,
-        "initial_error": "rollback failed",
-        "initial_error_type": "RuntimeError",
-        "retry_attempted": False,
-    }
-
-
-def test_bind_rollback_preserves_cleanup_failure_after_bind_cancellation() -> None:
-    cancellation = asyncio.CancelledError("bind cancelled")
-    cleanup_error = RuntimeError("rollback failed")
-
-    class _CancelledBindBinding(WorkspaceBinding):
-        async def bind(self, workspace, runner, **kwargs):  # type: ignore[no-untyped-def]
-            raise cancellation
-
-        async def finalize(self, bound, *, outcome=None, metadata=None):  # type: ignore[no-untyped-def]
-            raise AssertionError("finalize should not run")
-
-    async def run() -> BaseExceptionGroup:
-        result = await _virtual_factory(
-            adapter=_RecordingAdapter(),
-            inner_binding=_CancelledBindBinding(),
-        ).create(
-            EnvironmentFactoryRequest(
-                session_id="sess_cancelled_bind_rollback_failure",
-                agent_name="assistant",
-                environment_name="egress-env",
-            )
-        )
-        binding = result.environment.binding
-        runner = result.environment.runner
-        assert binding is not None and runner is not None
-
-        async def fail_rollback(*, outcome: str | None) -> None:
-            raise cleanup_error
-
-        binding._close_resources = fail_rollback  # type: ignore[attr-defined,method-assign]
-        with pytest.raises(BaseExceptionGroup) as exc_info:
-            await binding.bind(None, runner, session_id="sess_cancelled_bind_rollback_failure")
-        return exc_info.value
-
-    failure = asyncio.run(run())
-
-    assert failure.exceptions == (cancellation, cleanup_error)
-    assert binding_cleanup_payload(failure) == {
-        "incomplete": True,
-        "initial_error": "rollback failed",
-        "initial_error_type": "RuntimeError",
-        "retry_attempted": False,
-    }
-
-
-def test_bind_rollback_reraises_lone_bind_cancellation_directly() -> None:
-    cancellation = asyncio.CancelledError("bind cancelled")
-
-    class _CancelledBindBinding(WorkspaceBinding):
-        async def bind(self, workspace, runner, **kwargs):  # type: ignore[no-untyped-def]
-            raise cancellation
-
-        async def finalize(self, bound, *, outcome=None, metadata=None):  # type: ignore[no-untyped-def]
-            raise AssertionError("finalize should not run")
-
-    async def run() -> None:
-        result = await _virtual_factory(
-            adapter=_RecordingAdapter(),
-            inner_binding=_CancelledBindBinding(),
-        ).create(
-            EnvironmentFactoryRequest(
-                session_id="sess_lone_bind_cancellation",
-                agent_name="assistant",
-                environment_name="egress-env",
-            )
-        )
-        binding = result.environment.binding
-        runner = result.environment.runner
-        assert binding is not None and runner is not None
-        with pytest.raises(asyncio.CancelledError) as exc_info:
-            await binding.bind(None, runner, session_id="sess_lone_bind_cancellation")
-        assert exc_info.value is cancellation
-
-    asyncio.run(run())
-
-
-def test_bind_rollback_preserves_real_cancellation_after_ordinary_bind_failure() -> None:
-    bind_error = RuntimeError("bind failed")
-    rollback_started = asyncio.Event()
-    allow_rollback = asyncio.Event()
-
-    class _FailingBindBinding(WorkspaceBinding):
-        async def bind(self, workspace, runner, **kwargs):  # type: ignore[no-untyped-def]
-            raise bind_error
-
-        async def finalize(self, bound, *, outcome=None, metadata=None):  # type: ignore[no-untyped-def]
-            raise AssertionError("finalize should not run")
-
-    async def run() -> BaseExceptionGroup:
-        result = await _virtual_factory(
-            adapter=_RecordingAdapter(), inner_binding=_FailingBindBinding()
-        ).create(
-            EnvironmentFactoryRequest(
-                session_id="sess_real_bind_rollback_cancellation",
-                agent_name="assistant",
-                environment_name="egress-env",
-            )
-        )
-        binding = result.environment.binding
-        runner = result.environment.runner
-        assert binding is not None and runner is not None
-
-        async def rollback(*, outcome: str | None) -> None:
-            rollback_started.set()
-            await allow_rollback.wait()
-
-        binding._close_resources = rollback  # type: ignore[attr-defined,method-assign]
-        task = asyncio.create_task(
-            binding.bind(None, runner, session_id="sess_real_bind_rollback_cancellation")
-        )
-        await rollback_started.wait()
-        task.cancel()
-        allow_rollback.set()
-        with pytest.raises(BaseExceptionGroup) as exc_info:
-            await task
-        return exc_info.value
-
-    failure = asyncio.run(run())
-
-    assert failure.exceptions[0] is bind_error
     assert isinstance(failure.exceptions[1], asyncio.CancelledError)
 
 

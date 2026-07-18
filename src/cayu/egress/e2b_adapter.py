@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import weakref
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from ipaddress import ip_address
 from pathlib import Path
 from types import ModuleType
@@ -21,11 +23,13 @@ from cayu.egress.adapter import (
     EgressBinding,
     SandboxEgressAdapter,
     VirtualEgressRunnerRequest,
+    _virtual_egress_execution_capability_evidence,
 )
 from cayu.egress.broker import TransparentEgressBroker
 from cayu.egress.errors import UnsupportedEgressCapabilityError, UnsupportedEgressError
 from cayu.egress.grants import VirtualCredentialGrant
 from cayu.egress.proxy_exposure import ProxyExposure
+from cayu.environments.admission import ExecutionCapabilityEvidence
 from cayu.runners.base import Runner
 from cayu.runners.e2b import (
     DEFAULT_E2B_HANDOFF_TIMEOUT_SECONDS,
@@ -66,6 +70,32 @@ class E2BEgressAdapter(SandboxEgressAdapter):
 
     runner_kind = "e2b"
 
+    def execution_capability_evidence(
+        self,
+        runner: Runner | None = None,
+    ) -> ExecutionCapabilityEvidence:
+        if runner is not None and not isinstance(runner, E2BRunner):
+            raise TypeError("E2B adapter received a different runner type.")
+        return _virtual_egress_execution_capability_evidence(
+            runner_kind=self.runner_kind,
+            runner_ready=runner is not None,
+            preflight_observed_at=(
+                self._runner_preflight_observations.get(runner) if runner is not None else None
+            ),
+            untrusted_isolation=True,
+            credential_non_possession_posture="available",
+            guest_privilege="live_verified",
+            unprivileged_guest="live_verified",
+            host_filesystem_isolation=True,
+            reconnect=self.supports_reconnect,
+            cancellation_confirmed=(
+                getattr(runner, "cancellation_cleanup", None)
+                if runner is not None
+                else self._options.get("cancellation_cleanup", "command")
+            )
+            != "none",
+        )
+
     def __init__(
         self,
         *,
@@ -96,6 +126,10 @@ class E2BEgressAdapter(SandboxEgressAdapter):
         self._sandbox_timeout_s = sandbox_timeout_s
         self._proxy_server_factory = proxy_server_factory
         self._preflight_timeout_s = preflight_timeout_s
+        self._runner_preflight_observations: weakref.WeakKeyDictionary[
+            Runner,
+            datetime,
+        ] = weakref.WeakKeyDictionary()
 
     async def prepare(
         self,
@@ -146,16 +180,23 @@ class E2BEgressAdapter(SandboxEgressAdapter):
             )
 
         async def guest_setup(runner: E2BRunner) -> None:
-            await run_enforcement_preflight(
+            preflight_observed_at = await run_enforcement_preflight(
                 runner,
                 request,
                 timeout_s=self._preflight_timeout_s,
             )
             await run_setup_commands(runner, request)
+            if request.setup_commands:
+                preflight_observed_at = await run_enforcement_preflight(
+                    runner,
+                    request,
+                    timeout_s=self._preflight_timeout_s,
+                )
+            self._runner_preflight_observations[runner] = preflight_observed_at
 
         handoff_timeout_s = (
             DEFAULT_E2B_HANDOFF_TIMEOUT_SECONDS
-            + self._preflight_timeout_s
+            + ((1 + bool(request.setup_commands)) * self._preflight_timeout_s)
             + (len(request.setup_commands) * DEFAULT_REMOTE_SETUP_COMMAND_TIMEOUT_SECONDS)
         )
         try:

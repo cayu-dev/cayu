@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Sequence
+from datetime import UTC, datetime
 
 from cayu.egress.adapter import (
     DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
@@ -150,7 +151,7 @@ async def run_enforcement_preflight(
     probe_metadata: bool = True,
     metadata_isolation_reason: str | None = None,
     metadata_isolation_remediation: str | None = None,
-) -> None:
+) -> datetime:
     if not request.egress_destinations:
         raise UnsupportedEgressError(
             f"Runner {request.runner_kind!r} has no provider destination to preflight."
@@ -201,6 +202,7 @@ async def run_enforcement_preflight(
             f"Runner {request.runner_kind!r} failed virtual-egress preflight "
             f"(exit_code={result.exit_code}, timed_out={result.timed_out})."
         )
+    return datetime.now(UTC)
 
 
 async def run_setup_commands(runner: Runner, request: VirtualEgressRunnerRequest) -> None:

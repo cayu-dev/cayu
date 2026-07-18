@@ -6,7 +6,14 @@ from typing import TYPE_CHECKING, Any
 
 from cayu.core.agents import AgentSpec
 from cayu.core.tools import Tool, ToolEffect, ToolResult
-from cayu.environments import BoundWorkspace, Environment, EnvironmentFactory, EnvironmentSpec
+from cayu.environments import (
+    BoundWorkspace,
+    Environment,
+    EnvironmentFactory,
+    EnvironmentFactoryResult,
+    EnvironmentSpec,
+    ExecutionRequirements,
+)
 from cayu.providers import ModelProvider
 from cayu.runtime.context import ContextPolicy
 from cayu.runtime.hooks import RuntimeHook
@@ -31,6 +38,7 @@ class RegisteredAgentState:
     tool_policy: ToolPolicy
     runtime_hooks: tuple[RuntimeHook, ...]
     loop_policies: tuple[LoopPolicy, ...]
+    execution_requirements: ExecutionRequirements
     registration_source: str | None = None
     registration_symbol: str | None = None
 
@@ -61,6 +69,9 @@ class RegisteredEnvironment:
     factory: EnvironmentFactory | None = None
     bound_workspace: BoundWorkspace | None = None
     binding_payload: dict[str, Any] | None = None
+    execution_candidate: str | None = None
+    unclaimed_factory_result: EnvironmentFactoryResult | None = None
+    preserve_factory_allocation: bool = False
     registration_source: str | None = None
     registration_symbol: str | None = None
 

@@ -25,6 +25,10 @@ from cayu.egress.broker import TransparentEgressBroker
 from cayu.egress.errors import UnsupportedEgressError
 from cayu.egress.grants import VirtualCredentialGrant
 from cayu.egress.proxy_server import TransparentEgressProxyServer
+from cayu.environments.admission import (
+    ExecutionCapabilityClaim,
+    ExecutionCapabilityEvidence,
+)
 from cayu.runners.base import Runner
 from cayu.runners.docker import DockerRunner
 
@@ -191,6 +195,63 @@ class DockerEgressAdapter(SandboxEgressAdapter):
     """
 
     runner_kind = "docker"
+
+    def execution_capability_evidence(
+        self,
+        runner: Runner | None = None,
+    ) -> ExecutionCapabilityEvidence:
+        """Declare Docker egress without representing containers as sandboxes."""
+
+        if runner is not None and not isinstance(runner, DockerRunner):
+            raise TypeError("Docker adapter received a different runner type.")
+        available = (
+            "real_credential_non_possession",
+            "deny_by_default_network",
+            "brokered_egress",
+            "confirmed_cancellation",
+            "confirmed_cleanup",
+        )
+        unsupported = {
+            "untrusted_code_isolation": "container_isolation_unsupported",
+            "guest_privilege_containment": "container_privilege_boundary_unsupported",
+            "unprivileged_guest": "container_guest_user_unverified",
+            "host_filesystem_isolation": "container_host_boundary_unsupported",
+            "read_only_host_inputs": "container_host_boundary_unsupported",
+            "reconnect": "reconnect_unsupported",
+        }
+        return ExecutionCapabilityEvidence(
+            subject=self.runner_kind,
+            claims=(
+                *(
+                    ExecutionCapabilityClaim(
+                        capability=capability,
+                        state="available" if runner is not None else "declared",
+                        proof_source=(
+                            "integration_validation"
+                            if runner is not None
+                            else "integration_declaration"
+                        ),
+                        observation="available" if runner is not None else "supported",
+                    )
+                    for capability in available
+                ),
+                *(
+                    ExecutionCapabilityClaim(
+                        capability=capability,
+                        state="unsupported",
+                        proof_source="integration_declaration",
+                        observation="unavailable",
+                        reason_code=reason_code,
+                        remediation_code=(
+                            "select_isolated_execution"
+                            if capability != "reconnect"
+                            else "select_reconnectable_execution"
+                        ),
+                    )
+                    for capability, reason_code in unsupported.items()
+                ),
+            ),
+        )
 
     def __init__(
         self,

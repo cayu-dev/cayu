@@ -14,6 +14,7 @@ import tempfile
 import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from math import isfinite
 from pathlib import Path
 from types import ModuleType
@@ -33,6 +34,7 @@ from cayu.egress.adapter import (
     _await_bounded_cleanup_task,
     _consume_accounted_task_cancellation,
     _raise_primary_with_cleanup_cancellation,
+    _virtual_egress_execution_capability_evidence,
 )
 from cayu.egress.broker import TransparentEgressBroker
 from cayu.egress.errors import (
@@ -50,6 +52,7 @@ from cayu.egress.proxy_exposure import (
     ProxyExposure,
 )
 from cayu.egress.proxy_server import DualStackLoopbackEgressProxyServer
+from cayu.environments.admission import ExecutionCapabilityEvidence
 from cayu.runners.base import ExecCommand, Runner
 from cayu.runners.microsandbox import (
     DEFAULT_MICROSANDBOX_RECONNECT_TIMEOUT_SECONDS,
@@ -161,6 +164,26 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
     runner_kind = "microsandbox"
     supports_reconnect = True
 
+    def execution_capability_evidence(
+        self,
+        runner: Runner | None = None,
+    ) -> ExecutionCapabilityEvidence:
+        if runner is not None and not isinstance(runner, MicrosandboxRunner):
+            raise TypeError("Microsandbox adapter received a different runner type.")
+        return _virtual_egress_execution_capability_evidence(
+            runner_kind=self.runner_kind,
+            runner_ready=runner is not None,
+            preflight_observed_at=(
+                self._runner_preflight_observations.get(runner) if runner is not None else None
+            ),
+            untrusted_isolation=True,
+            credential_non_possession_posture="available",
+            guest_privilege="available",
+            unprivileged_guest="unsupported",
+            host_filesystem_isolation=True,
+            reconnect=self.supports_reconnect,
+        )
+
     def __init__(
         self,
         *,
@@ -200,6 +223,10 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
         self._runner_identities: weakref.WeakKeyDictionary[Runner, _ReconnectIdentity] = (
             weakref.WeakKeyDictionary()
         )
+        self._runner_preflight_observations: weakref.WeakKeyDictionary[
+            Runner,
+            datetime,
+        ] = weakref.WeakKeyDictionary()
 
     async def prepare(
         self,
@@ -410,12 +437,19 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
                 )
             self._runner_claims[runner] = claim
             self._runner_identities[runner] = identity
-            await run_enforcement_preflight(
+            preflight_observed_at = await run_enforcement_preflight(
                 runner,
                 request,
                 timeout_s=self._preflight_timeout_s,
             )
-            await run_setup_commands(runner, request)
+            if request.setup_commands:
+                await run_setup_commands(runner, request)
+                preflight_observed_at = await run_enforcement_preflight(
+                    runner,
+                    request,
+                    timeout_s=self._preflight_timeout_s,
+                )
+            self._runner_preflight_observations[runner] = preflight_observed_at
             return runner
         except BaseException as original:
             rollback_complete = False

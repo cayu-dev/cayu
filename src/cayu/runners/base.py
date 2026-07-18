@@ -4,7 +4,7 @@ import asyncio
 import posixpath
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from typing import Any, Literal, Self, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, Self, TypeVar
 
 from pydantic import (
     BaseModel,
@@ -18,6 +18,9 @@ from pydantic import (
 
 from cayu._validation import copy_json_value, require_nonblank
 from cayu.runners._cleanup import RunnerCleanupResult
+
+if TYPE_CHECKING:
+    from cayu.environments.admission import ExecutionAdmissionCandidate
 
 DEFAULT_EXEC_OUTPUT_LIMIT_BYTES = 1024 * 1024
 RunnerSystemExecutionMode = Literal["shared", "separate"]
@@ -238,6 +241,16 @@ class Runner(ABC):
         """Release the runner. The default implementation only marks it closed."""
 
         self._closed = True
+
+    def execution_admission_candidate(self) -> ExecutionAdmissionCandidate | None:
+        """Return explicit provider-neutral admission evidence, when implemented.
+
+        The default deliberately makes no capability claim. Runtimes must fail
+        closed when a workload requires evidence that its selected runner does
+        not provide.
+        """
+
+        return None
 
     @property
     def resource_key(self) -> tuple[object, ...] | None:

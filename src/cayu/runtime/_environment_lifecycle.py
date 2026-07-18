@@ -11,7 +11,7 @@ import asyncio
 import contextlib
 import inspect
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from cayu._task_wait import await_shielded_task_outcome
@@ -24,12 +24,17 @@ from cayu.environments import (
     EnvironmentFactoryReleaseAction,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
+    ExecutionAdmissionCandidate,
+    ExecutionAdmissionError,
+    ExecutionRequirements,
     WorkspaceInstructions,
     WorkspaceSnapshot,
     copy_environment,
     copy_workspace_snapshot,
+    evaluate_execution_admission,
     load_workspace_instructions,
 )
+from cayu.runners import Runner
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._binding_cleanup import (
     BINDING_FINALIZE_SAFE_PAYLOAD_ATTRIBUTE,
@@ -49,8 +54,8 @@ from cayu.vaults import SecretRedactor
 
 ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY = "environment_factory_reconnect"
 ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY = "environment_factory_allocation_owner"
-_ENVIRONMENT_FACTORY_CHECKPOINT_COMMIT_UNCERTAIN_ATTRIBUTE = (
-    "_cayu_environment_factory_checkpoint_commit_uncertain"
+_ENVIRONMENT_FACTORY_CHECKPOINT_MAY_BE_COMMITTED_ATTRIBUTE = (
+    "_cayu_environment_factory_checkpoint_may_be_committed"
 )
 _ENVIRONMENT_FACTORY_RELEASE_ERROR_ATTRIBUTE = "_cayu_environment_factory_release"
 
@@ -77,6 +82,13 @@ class EnvironmentBindingFinalizeResult:
     events: list[Event]
 
 
+@dataclass
+class _ActiveEnvironmentSetup:
+    registered_environment: runtime_records.RegisteredEnvironment
+    cleanup_started: bool = False
+    cleanup_error: BaseException | None = None
+
+
 class EnvironmentLifecycle:
     """Own environment factory, workspace binding, and reconnect state."""
 
@@ -92,6 +104,12 @@ class EnvironmentLifecycle:
         self._event_writer = event_writer
         self._checkpoint_transform = checkpoint_transform
         self._secret_redactor = secret_redactor or SecretRedactor()
+        # Factory results and bound workspaces contain process-local handles
+        # that cannot be reconstructed from durable session state. Retain the
+        # authoritative owner across async-generator yield boundaries until the
+        # setup is adopted or finalized. The run fence permits one owner per
+        # session.
+        self._active_environment_setups: dict[str, _ActiveEnvironmentSetup] = {}
 
     async def load_workspace_instructions(
         self,
@@ -154,7 +172,7 @@ class EnvironmentLifecycle:
         result: EnvironmentFactoryResult | None = None
         environment: Environment | None = None
         allocation_checkpointed = False
-        allocation_checkpoint_commit_uncertain = False
+        allocation_checkpoint_may_be_committed = False
         effective_operation = operation
         try:
             reconnect_metadata, allocation_owner = await self._load_factory_reconnect_state(
@@ -163,24 +181,13 @@ class EnvironmentLifecycle:
             )
             if (
                 operation is EnvironmentFactoryOperation.RECONNECT
-                and session.parent_session_id is not None
                 and allocation_owner != session.id
             ):
-                completed_for_child = False
-                if allocation_owner is None:
-                    # Compatibility for checkpoints written before allocation
-                    # provenance was persisted atomically with reconnect state.
-                    prior_events = await self._session_store.load_events(session.id)
-                    completed_for_child = any(
-                        event.type is EventType.ENVIRONMENT_FACTORY_COMPLETED
-                        and event.environment_name == environment_name
-                        for event in prior_events
-                    )
-                if not completed_for_child:
-                    # A fork inherits its parent's checkpoint as context, but
-                    # its first factory allocation belongs to the child. Only
-                    # later child resumes reconnect that child allocation.
-                    effective_operation = EnvironmentFactoryOperation.CREATE
+                # A failed setup has no session-owned allocation to reconnect,
+                # and a fork inherits its parent's checkpoint only as context.
+                # Allocation provenance is authoritative; Cayu does not scan
+                # historical events to infer ownership.
+                effective_operation = EnvironmentFactoryOperation.CREATE
             request = EnvironmentFactoryRequest(
                 session_id=session.id,
                 agent_name=registered_agent.spec.name,
@@ -191,7 +198,27 @@ class EnvironmentLifecycle:
                 labels=session.labels,
                 metadata=session.metadata,
                 reconnect_metadata=reconnect_metadata,
+                execution_requirements=registered_agent.execution_requirements,
             )
+            admission_candidate = factory.execution_admission_candidate(request)
+            if admission_candidate is not None and not isinstance(
+                admission_candidate,
+                ExecutionAdmissionCandidate,
+            ):
+                raise TypeError(
+                    "EnvironmentFactory.execution_admission_candidate must return "
+                    "ExecutionAdmissionCandidate or None."
+                )
+            evaluate_execution_admission(
+                candidate=(
+                    environment_name
+                    if admission_candidate is None
+                    else admission_candidate.candidate
+                ),
+                requirements=request.execution_requirements,
+                evidence=None if admission_candidate is None else admission_candidate.evidence,
+                stage="pre_create",
+            ).require_admitted()
             result = await factory.create(request)
             if type(result) is not EnvironmentFactoryResult:
                 raise TypeError("EnvironmentFactory.create must return EnvironmentFactoryResult.")
@@ -200,6 +227,15 @@ class EnvironmentLifecycle:
                 raise ValueError(
                     "Environment factory returned a different environment name: "
                     f"{environment.spec.name!r} != {environment_name!r}"
+                )
+            if environment.runner is not None or environment.binding is None:
+                self._require_runner_admitted(
+                    execution_candidate=(
+                        None if admission_candidate is None else admission_candidate.candidate
+                    ),
+                    fallback_candidate=environment_name,
+                    requirements=request.execution_requirements,
+                    runner=environment.runner,
                 )
             reconnect_metadata = copy_json_value(
                 result.reconnect_metadata,
@@ -211,14 +247,15 @@ class EnvironmentLifecycle:
                     environment_name=environment_name,
                     reconnect_metadata=reconnect_metadata,
                 )
-            except asyncio.CancelledError as exc:
-                # The checkpoint helper marks only cancellation during the
-                # transactional write as uncertain; a preliminary read cancellation
-                # still proves that no reconnect identity was committed.
-                allocation_checkpoint_commit_uncertain = bool(
+            except BaseException as exc:
+                # The checkpoint helper reconciles any failure after the
+                # transactional write begins. Only a durable read proving the
+                # expected owner and metadata absent permits the allocation to
+                # be discarded.
+                allocation_checkpoint_may_be_committed = bool(
                     getattr(
                         exc,
-                        _ENVIRONMENT_FACTORY_CHECKPOINT_COMMIT_UNCERTAIN_ATTRIBUTE,
+                        _ENVIRONMENT_FACTORY_CHECKPOINT_MAY_BE_COMMITTED_ATTRIBUTE,
                         False,
                     )
                 )
@@ -243,6 +280,25 @@ class EnvironmentLifecycle:
                     )
                 )
             )
+            if session.id in self._active_environment_setups:
+                raise RuntimeError(
+                    f"Session {session.id!r} already owns an active environment setup."
+                )
+            if result is None:
+                raise RuntimeError("Environment factory did not return an owned result.")
+            if environment is None:
+                raise RuntimeError("Environment factory did not produce an environment.")
+            resolved_environment = runtime_records.RegisteredEnvironment(
+                spec=registered_environment.spec,
+                environment=environment,
+                execution_candidate=(
+                    None if admission_candidate is None else admission_candidate.candidate
+                ),
+                unclaimed_factory_result=result,
+            )
+            self._active_environment_setups[session.id] = _ActiveEnvironmentSetup(
+                registered_environment=resolved_environment
+            )
         except BaseException as exc:
             if result is not None:
                 release_payload = await _release_unclaimed_factory_result(
@@ -250,7 +306,7 @@ class EnvironmentLifecycle:
                     action=(
                         EnvironmentFactoryReleaseAction.PRESERVE
                         if allocation_checkpointed
-                        or allocation_checkpoint_commit_uncertain
+                        or allocation_checkpoint_may_be_committed
                         or effective_operation is EnvironmentFactoryOperation.RECONNECT
                         else EnvironmentFactoryReleaseAction.DISCARD
                     ),
@@ -292,13 +348,8 @@ class EnvironmentLifecycle:
                 error=exc,
             )
 
-        if environment is None:
-            raise RuntimeError("Environment factory did not produce an environment.")
         return EnvironmentFactoryResolutionResult(
-            registered_environment=runtime_records.RegisteredEnvironment(
-                spec=registered_environment.spec,
-                environment=environment,
-            ),
+            registered_environment=resolved_environment,
             events=events,
         )
 
@@ -353,6 +404,89 @@ class EnvironmentLifecycle:
             )
         )
 
+    def _require_runner_admitted(
+        self,
+        *,
+        execution_candidate: str | None,
+        fallback_candidate: str,
+        requirements: ExecutionRequirements,
+        runner: Runner | None,
+    ) -> None:
+        if execution_candidate is None and not requirements.required_capabilities():
+            return
+        admission_candidate = None if runner is None else runner.execution_admission_candidate()
+        if admission_candidate is not None and not isinstance(
+            admission_candidate,
+            ExecutionAdmissionCandidate,
+        ):
+            raise TypeError(
+                "Runner.execution_admission_candidate must return "
+                "ExecutionAdmissionCandidate or None."
+            )
+        if execution_candidate is not None and admission_candidate is None:
+            missing_evidence = evaluate_execution_admission(
+                candidate=execution_candidate,
+                requirements=requirements,
+                evidence=None,
+                stage="pre_exposure",
+            )
+            if missing_evidence.status == "refused":
+                missing_evidence.require_admitted()
+            raise RuntimeError(
+                f"Execution candidate {execution_candidate!r} supplied pre-create evidence, "
+                "but the final runner supplied no execution admission evidence."
+            )
+        candidate = execution_candidate
+        if candidate is None:
+            candidate = (
+                fallback_candidate if admission_candidate is None else admission_candidate.candidate
+            )
+        evaluate_execution_admission(
+            candidate=candidate,
+            requirements=requirements,
+            evidence=None if admission_candidate is None else admission_candidate.evidence,
+            stage="pre_exposure",
+        ).require_admitted()
+
+    def _require_registered_environment_admitted(
+        self,
+        *,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment,
+    ) -> None:
+        self._require_runner_admitted(
+            execution_candidate=registered_environment.execution_candidate,
+            fallback_candidate=registered_environment.spec.name,
+            requirements=registered_agent.execution_requirements,
+            runner=registered_environment.environment.runner,
+        )
+
+    async def _release_unexposed_factory_environment(
+        self,
+        registered_environment: runtime_records.RegisteredEnvironment,
+        *,
+        error: BaseException,
+    ) -> tuple[runtime_records.RegisteredEnvironment, dict[str, Any] | None]:
+        result = registered_environment.unclaimed_factory_result
+        if result is None:
+            return registered_environment, None
+        # Resolution checkpoints every factory result before returning it to
+        # binding. Once committed, release may detach live handles but must not
+        # destroy the durable allocation that a later resume will reconnect.
+        release_payload = await _release_unclaimed_factory_result(
+            result,
+            action=EnvironmentFactoryReleaseAction.PRESERVE,
+            original_error=error,
+        )
+        setattr(error, _ENVIRONMENT_FACTORY_RELEASE_ERROR_ATTRIBUTE, release_payload)
+        return (
+            replace(
+                registered_environment,
+                unclaimed_factory_result=None,
+            ),
+            release_payload,
+        )
+
     async def bind(
         self,
         *,
@@ -368,16 +502,58 @@ class EnvironmentLifecycle:
         if registered_environment.bound_workspace is not None:
             if started_event is not None:
                 raise AssertionError("Binding start event exists for an already-bound workspace.")
+            try:
+                self._require_registered_environment_admitted(
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                )
+            except Exception as exc:
+                return EnvironmentBindingResult(
+                    registered_environment=registered_environment,
+                    events=[],
+                    error=exc,
+                )
+            adopted_environment = replace(
+                registered_environment,
+                unclaimed_factory_result=None,
+            )
+            setup_owner = self._active_environment_setups.get(session.id)
+            if setup_owner is not None:
+                setup_owner.registered_environment = adopted_environment
             return EnvironmentBindingResult(
-                registered_environment=registered_environment,
+                registered_environment=adopted_environment,
                 events=[],
             )
         binding = registered_environment.environment.binding
         if binding is None:
             if started_event is not None:
                 raise AssertionError("Binding start event exists without a workspace binding.")
+            try:
+                self._require_registered_environment_admitted(
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                )
+            except Exception as exc:
+                (
+                    registered_environment,
+                    _release_payload,
+                ) = await self._release_unexposed_factory_environment(
+                    registered_environment,
+                    error=exc,
+                )
+                self._active_environment_setups.pop(session.id, None)
+                return EnvironmentBindingResult(
+                    registered_environment=registered_environment,
+                    events=[],
+                    error=exc,
+                )
+            adopted_environment = replace(
+                registered_environment,
+                unclaimed_factory_result=None,
+            )
+            self._active_environment_setups.pop(session.id, None)
             return EnvironmentBindingResult(
-                registered_environment=registered_environment,
+                registered_environment=adopted_environment,
                 events=[],
             )
         if started_event is None:
@@ -421,6 +597,14 @@ class EnvironmentLifecycle:
                 )
                 if cleanup_status is not None:
                     attach_binding_cleanup_status(propagated_error, cleanup_status)
+            (
+                registered_environment,
+                _release_payload,
+            ) = await self._release_unexposed_factory_environment(
+                registered_environment,
+                error=exc,
+            )
+            self._active_environment_setups.pop(session.id, None)
             if ordinary_failure:
                 failure_payload = {**base_payload, **exception_failure_payload(exc)}
                 try:
@@ -463,6 +647,27 @@ class EnvironmentLifecycle:
         bound_environment = copy_environment(registered_environment.environment)
         bound_environment.workspace = bound.workspace
         bound_environment.runner = bound.runner
+        bound_registered_environment = runtime_records.RegisteredEnvironment(
+            spec=registered_environment.spec,
+            environment=bound_environment,
+            bound_workspace=bound,
+            binding_payload=copy_json_value(base_payload, "binding_payload"),
+            execution_candidate=registered_environment.execution_candidate,
+            preserve_factory_allocation=(
+                registered_environment.unclaimed_factory_result is not None
+            ),
+        )
+        # Binding owns the live handles from this point. Record that transfer
+        # before publishing it so cancellation or an event-store failure cannot
+        # leave cleanup using the stale pre-bound value.
+        setup_owner = self._active_environment_setups.get(session.id)
+        if setup_owner is None:
+            setup_owner = _ActiveEnvironmentSetup(
+                registered_environment=bound_registered_environment
+            )
+            self._active_environment_setups[session.id] = setup_owner
+        else:
+            setup_owner.registered_environment = bound_registered_environment
         events.append(
             await self._event_writer.emit(
                 Event(
@@ -477,13 +682,24 @@ class EnvironmentLifecycle:
                 )
             )
         )
+        try:
+            self._require_registered_environment_admitted(
+                registered_agent=registered_agent,
+                registered_environment=bound_registered_environment,
+            )
+        except Exception as exc:
+            return EnvironmentBindingResult(
+                registered_environment=bound_registered_environment,
+                events=events,
+                error=exc,
+            )
+        adopted_environment = replace(
+            bound_registered_environment,
+            preserve_factory_allocation=False,
+        )
+        setup_owner.registered_environment = adopted_environment
         return EnvironmentBindingResult(
-            registered_environment=runtime_records.RegisteredEnvironment(
-                spec=registered_environment.spec,
-                environment=bound_environment,
-                bound_workspace=bound,
-                binding_payload=copy_json_value(base_payload, "binding_payload"),
-            ),
+            registered_environment=adopted_environment,
             events=events,
         )
 
@@ -494,30 +710,86 @@ class EnvironmentLifecycle:
         session: Session,
         registered_environment: runtime_records.RegisteredEnvironment | None,
     ) -> EnvironmentBindingFinalizeResult:
+        try:
+            return await self._finalize_terminal_event_once(
+                event=event,
+                session=session,
+                registered_environment=registered_environment,
+            )
+        except BaseException as exc:
+            setup_owner = self._active_environment_setups.get(session.id)
+            if setup_owner is not None and setup_owner.cleanup_started:
+                setup_owner.cleanup_error = exc
+            raise
+
+    async def _finalize_terminal_event_once(
+        self,
+        *,
+        event: Event,
+        session: Session,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+    ) -> EnvironmentBindingFinalizeResult:
+        setup_owner = self._active_environment_setups.get(session.id)
+        if setup_owner is not None:
+            if setup_owner.cleanup_started:
+                if setup_owner.cleanup_error is not None:
+                    raise setup_owner.cleanup_error
+                return EnvironmentBindingFinalizeResult(event=event, events=[])
+            setup_owner.cleanup_started = True
+            registered_environment = setup_owner.registered_environment
+        if (
+            registered_environment is not None
+            and registered_environment.unclaimed_factory_result is not None
+        ):
+            setup_error = RuntimeError(
+                "Environment setup ended before the factory result was adopted."
+            )
+            (
+                registered_environment,
+                release_payload,
+            ) = await self._release_unexposed_factory_environment(
+                registered_environment,
+                error=setup_error,
+            )
+            if release_payload is not None:
+                terminal_payload = copy_json_value(event.payload, "payload")
+                terminal_payload["environment_factory_release"] = release_payload
+                event = _copy_event_with_payload(event, terminal_payload)
         if registered_environment is None or registered_environment.bound_workspace is None:
             return EnvironmentBindingFinalizeResult(event=event, events=[])
         binding = registered_environment.environment.binding
         if binding is None:
             return EnvironmentBindingFinalizeResult(event=event, events=[])
 
-        outcome = _binding_outcome_for_terminal_event(event.type)
+        terminal_outcome = _binding_outcome_for_terminal_event(event.type)
+        preserve_factory_allocation = registered_environment.preserve_factory_allocation
+        outcome = "interrupted" if preserve_factory_allocation else terminal_outcome
         environment_name = _environment_name(registered_environment)
         base_payload = {
             **_binding_base_payload(registered_environment),
             **_bound_workspace_payload(registered_environment.bound_workspace),
             "outcome": outcome,
         }
-        events: list[Event] = [
-            await self._event_writer.emit(
-                Event(
-                    type=EventType.ENVIRONMENT_BINDING_FINALIZE_STARTED,
-                    session_id=session.id,
-                    agent_name=event.agent_name,
-                    environment_name=environment_name,
-                    payload=base_payload,
+        if preserve_factory_allocation:
+            base_payload["terminal_outcome"] = terminal_outcome
+            base_payload["factory_allocation_action"] = "preserve"
+        events: list[Event] = []
+        start_publication_error: BaseException | None = None
+        try:
+            events.append(
+                await self._event_writer.emit(
+                    Event(
+                        type=EventType.ENVIRONMENT_BINDING_FINALIZE_STARTED,
+                        session_id=session.id,
+                        agent_name=event.agent_name,
+                        environment_name=environment_name,
+                        payload=base_payload,
+                    )
                 )
             )
-        ]
+        except BaseException as exc:
+            start_publication_error = exc
+
         try:
             final_snapshot = await binding.finalize(
                 registered_environment.bound_workspace,
@@ -529,6 +801,11 @@ class EnvironmentLifecycle:
             )
             final_snapshot = copy_workspace_snapshot(final_snapshot)
         except (BaseExceptionGroup, Exception, asyncio.CancelledError) as exc:
+            if start_publication_error is not None:
+                exc = BaseExceptionGroup(
+                    "Binding finalization and start-event publication failed.",
+                    [start_publication_error, exc],
+                )
             finalize_error_payload = _binding_finalize_error_payload(
                 exc,
                 outcome=outcome,
@@ -619,21 +896,96 @@ class EnvironmentLifecycle:
                 events=events,
             )
 
-        events.append(
-            await self._event_writer.emit(
-                Event(
-                    type=EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED,
-                    session_id=session.id,
-                    agent_name=event.agent_name,
-                    environment_name=environment_name,
-                    payload={
-                        **base_payload,
-                        "final_snapshot": _workspace_snapshot_payload(final_snapshot),
-                    },
+        completion_publication_error: BaseException | None = None
+        try:
+            events.append(
+                await self._event_writer.emit(
+                    Event(
+                        type=EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED,
+                        session_id=session.id,
+                        agent_name=event.agent_name,
+                        environment_name=environment_name,
+                        payload={
+                            **base_payload,
+                            "final_snapshot": _workspace_snapshot_payload(final_snapshot),
+                        },
+                    )
                 )
             )
+        except BaseException as exc:
+            completion_publication_error = exc
+        publication_failures = tuple(
+            (phase, error)
+            for phase, error in (
+                ("finalize_started_event", start_publication_error),
+                ("finalize_completed_event", completion_publication_error),
+            )
+            if error is not None
         )
+        if publication_failures:
+            terminal_payload = copy_json_value(event.payload, "payload")
+            terminal_payload["binding_finalize_publication_error"] = (
+                _binding_finalize_publication_failure_payload(
+                    publication_failures,
+                    outcome=outcome,
+                    redactor=self._secret_redactor,
+                )
+            )
+            event = _copy_event_with_payload(event, terminal_payload)
         return EnvironmentBindingFinalizeResult(event=event, events=events)
+
+    async def abort_environment_setup(
+        self,
+        *,
+        session_id: str,
+        original_error: BaseException | None,
+    ) -> None:
+        """Release a live setup when no terminal event can own its cleanup."""
+
+        setup_owner = self._active_environment_setups.pop(session_id, None)
+        if setup_owner is None or setup_owner.cleanup_started:
+            return
+        setup_owner.cleanup_started = True
+        registered_environment = setup_owner.registered_environment
+        if original_error is None:
+            original_error = RuntimeError("Environment setup ended without terminal cleanup.")
+        if registered_environment.unclaimed_factory_result is not None:
+            try:
+                await self._release_unexposed_factory_environment(
+                    registered_environment,
+                    error=original_error,
+                )
+            except BaseException as cleanup_error:
+                if cleanup_error is original_error:
+                    raise
+                raise BaseExceptionGroup(
+                    "Environment factory cleanup failed while aborting setup.",
+                    [original_error, cleanup_error],
+                ) from cleanup_error
+            return
+        binding = registered_environment.environment.binding
+        if binding is None or registered_environment.bound_workspace is None:
+            return
+        try:
+            await binding.finalize(
+                registered_environment.bound_workspace,
+                outcome="interrupted",
+                metadata={
+                    "event_type": "environment_setup_aborted",
+                    "session_id": session_id,
+                },
+            )
+        except BaseException as cleanup_error:
+            original_error.add_note(
+                "Environment binding cleanup failed while aborting setup: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}."
+            )
+            if cleanup_error is original_error:
+                raise
+            raise BaseExceptionGroup(
+                "Environment binding cleanup failed while aborting setup.",
+                [original_error, cleanup_error],
+            ) from cleanup_error
 
     async def _load_factory_reconnect_state(
         self,
@@ -701,15 +1053,73 @@ class EnvironmentLifecycle:
                 session_id,
                 self._checkpoint_transform(copied_checkpoint),
             )
-        except asyncio.CancelledError as exc:
+        except BaseException as exc:
             current_task = asyncio.current_task()
-            if current_task is not None and current_task.cancelling() > 0:
+            caller_cancellation = (
+                exc
+                if isinstance(exc, asyncio.CancelledError)
+                and current_task is not None
+                and current_task.cancelling() > 0
+                else None
+            )
+            outcome = await await_shielded_task_outcome(
+                asyncio.create_task(
+                    self._factory_checkpoint_matches(
+                        session_id=session_id,
+                        environment_name=environment_name,
+                        reconnect_metadata=reconnect_metadata,
+                    )
+                ),
+                cancellation=caller_cancellation,
+            )
+            checkpoint_may_be_committed = outcome.error is not None or bool(outcome.result)
+            if outcome.error is not None:
+                fatal_signal = binding_finalize_fatal_signal(outcome.error)
+                if fatal_signal is not None:
+                    setattr(
+                        fatal_signal,
+                        _ENVIRONMENT_FACTORY_CHECKPOINT_MAY_BE_COMMITTED_ATTRIBUTE,
+                        True,
+                    )
+                    fatal_signal.add_note(
+                        "The environment factory checkpoint write also failed; "
+                        "its commit outcome could not be reconciled."
+                    )
+                    raise fatal_signal from exc
+                exc.add_note(
+                    "Could not reconcile whether the environment factory checkpoint "
+                    "committed; the allocation will be preserved."
+                )
+            propagated_error: BaseException = exc
+            if outcome.cancellation is not None and outcome.cancellation is not exc:
+                propagated_error = BaseExceptionGroup(
+                    "Environment factory checkpoint write failed during caller cancellation.",
+                    [exc, outcome.cancellation],
+                )
+            if checkpoint_may_be_committed:
                 setattr(
-                    exc,
-                    _ENVIRONMENT_FACTORY_CHECKPOINT_COMMIT_UNCERTAIN_ATTRIBUTE,
+                    propagated_error,
+                    _ENVIRONMENT_FACTORY_CHECKPOINT_MAY_BE_COMMITTED_ATTRIBUTE,
                     True,
                 )
-            raise
+            if outcome.error is not None:
+                raise propagated_error from outcome.error
+            if propagated_error is exc:
+                raise
+            raise propagated_error from exc
+
+    async def _factory_checkpoint_matches(
+        self,
+        *,
+        session_id: str,
+        environment_name: str,
+        reconnect_metadata: dict[str, Any],
+    ) -> bool:
+        persisted_metadata, allocation_owner = await self._load_factory_reconnect_state(
+            session_id=session_id,
+            environment_name=environment_name,
+        )
+        return allocation_owner == session_id and persisted_metadata == reconnect_metadata
 
 
 def render_initial_system_prompt(
@@ -750,6 +1160,8 @@ def exception_failure_payload(error: BaseException) -> dict[str, Any]:
         "error": str(error),
         "error_type": type(error).__name__,
     }
+    if isinstance(error, ExecutionAdmissionError):
+        payload["execution_admission"] = error.decision.model_dump(mode="json")
     cleanup_payload = binding_cleanup_payload(error)
     if cleanup_payload is not None:
         payload["binding_cleanup"] = cleanup_payload
@@ -760,6 +1172,20 @@ def exception_failure_payload(error: BaseException) -> dict[str, Any]:
             "environment_factory_release",
         )
     return payload
+
+
+def _copy_event_with_payload(event: Event, payload: dict[str, Any]) -> Event:
+    return Event(
+        type=event.type,
+        session_id=event.session_id,
+        id=event.id,
+        timestamp=event.timestamp,
+        agent_name=event.agent_name,
+        environment_name=event.environment_name,
+        workflow_name=event.workflow_name,
+        tool_name=event.tool_name,
+        payload=payload,
+    )
 
 
 async def _reconcile_binding_finalize_failure_event(
@@ -829,6 +1255,39 @@ def _binding_finalize_error_payload(
     if failures is None:
         failures = [{"phase": "workspace_finalize", **details}]
     return {**details, "outcome": outcome, "failures": failures}
+
+
+def _binding_finalize_publication_failure_payload(
+    failures: tuple[tuple[str, BaseException], ...],
+    *,
+    outcome: str,
+    redactor: Any,
+) -> dict[str, Any]:
+    errors = [error for _phase, error in failures]
+    combined_error: BaseException = errors[0]
+    if len(errors) > 1:
+        combined_error = BaseExceptionGroup(
+            "Binding finalization lifecycle publication failed.",
+            errors,
+        )
+    fatal_signal = binding_finalize_fatal_signal(combined_error)
+    if fatal_signal is not None:
+        raise fatal_signal
+    cancellation = binding_finalize_explicit_cancellation(combined_error)
+    if cancellation is not None:
+        if combined_error is cancellation:
+            raise cancellation
+        raise combined_error from cancellation
+    return {
+        "outcome": outcome,
+        "failures": [
+            {
+                "phase": phase,
+                **binding_finalize_error_details(error, redactor=redactor),
+            }
+            for phase, error in failures
+        ],
+    }
 
 
 def _environment_factory_base_payload(
@@ -947,6 +1406,13 @@ async def _release_unclaimed_factory_result(
                 "Environment factory result release failed after "
                 f"{action.value}: {type(cleanup_error).__name__}: {cleanup_error}."
             )
+            fatal_signal = binding_finalize_fatal_signal(cleanup_error)
+            if fatal_signal is not None:
+                if fatal_signal is cleanup_error:
+                    raise
+                raise fatal_signal from cleanup_error
+            if binding_finalize_explicit_cancellation(cleanup_error) is not None:
+                raise cleanup_error
             current_task = asyncio.current_task()
             if current_task is not None and current_task.cancelling():
                 cancellation = asyncio.CancelledError()
@@ -954,7 +1420,10 @@ async def _release_unclaimed_factory_result(
                     "Environment factory result release failed while cancellation was pending: "
                     f"{type(cleanup_error).__name__}: {cleanup_error}."
                 )
-                raise cancellation from cleanup_error
+                raise BaseExceptionGroup(
+                    "Environment factory result release failed after caller cancellation.",
+                    [cancellation, cleanup_error],
+                ) from cleanup_error
         else:
             payload["completed"] = True
             if cancelled:

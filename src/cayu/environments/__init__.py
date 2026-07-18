@@ -1,5 +1,18 @@
 """Environment contracts."""
 
+from cayu.environments.admission import (
+    EXECUTION_CAPABILITY_EVIDENCE_SCHEMA,
+    EXECUTION_LIVE_EVIDENCE_MAX_TTL_SECONDS,
+    ExecutionAdmissionCandidate,
+    ExecutionAdmissionDecision,
+    ExecutionAdmissionError,
+    ExecutionAdmissionRefusal,
+    ExecutionCapabilityClaim,
+    ExecutionCapabilityEvidence,
+    ExecutionEvidenceOverride,
+    ExecutionRequirements,
+    evaluate_execution_admission,
+)
 from cayu.environments.aws_filesystems import (
     EFSAccessPointBinding,
     S3FilesAccessPointBinding,
@@ -43,6 +56,8 @@ __all__ = [
     "DEFAULT_ENVIRONMENT_FACTORY_RELEASE_TIMEOUT_SECONDS",
     "DEFAULT_WORKSPACE_INSTRUCTIONS_MAX_BYTES",
     "DEFAULT_WORKSPACE_INSTRUCTION_PATHS",
+    "EXECUTION_CAPABILITY_EVIDENCE_SCHEMA",
+    "EXECUTION_LIVE_EVIDENCE_MAX_TTL_SECONDS",
     "BoundWorkspace",
     "EFSAccessPointBinding",
     "Environment",
@@ -53,6 +68,14 @@ __all__ = [
     "EnvironmentFactoryRequest",
     "EnvironmentFactoryResult",
     "EnvironmentSpec",
+    "ExecutionAdmissionCandidate",
+    "ExecutionAdmissionDecision",
+    "ExecutionAdmissionError",
+    "ExecutionAdmissionRefusal",
+    "ExecutionCapabilityClaim",
+    "ExecutionCapabilityEvidence",
+    "ExecutionEvidenceOverride",
+    "ExecutionRequirements",
     "GitRepositoryBinding",
     "NativeBinding",
     "NoWorkspaceBinding",
@@ -69,5 +92,6 @@ __all__ = [
     "copy_environment_factory_request",
     "copy_environment_factory_result",
     "copy_workspace_snapshot",
+    "evaluate_execution_admission",
     "load_workspace_instructions",
 ]

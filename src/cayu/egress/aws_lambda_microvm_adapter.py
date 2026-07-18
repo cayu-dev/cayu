@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import weakref
 from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime
 from typing import Any, Literal, TypedDict
 
 from cayu.egress._remote_adapter import (
@@ -17,12 +18,14 @@ from cayu.egress.adapter import (
     EgressBinding,
     SandboxEgressAdapter,
     VirtualEgressRunnerRequest,
+    _virtual_egress_execution_capability_evidence,
 )
 from cayu.egress.broker import TransparentEgressBroker
 from cayu.egress.capabilities import EgressCapabilityClaim, EgressCapabilityEvidence
 from cayu.egress.errors import UnsupportedEgressError
 from cayu.egress.grants import VirtualCredentialGrant
 from cayu.egress.proxy_exposure import ProxyExposure, VpcTaskProxyExposure
+from cayu.environments.admission import ExecutionCapabilityEvidence
 from cayu.runners import (
     ExecCommand,
     LambdaMicroVMProtocolError,
@@ -60,6 +63,35 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
     """
 
     runner_kind = "lambda-microvm"
+
+    def execution_capability_evidence(
+        self,
+        runner: Runner | None = None,
+    ) -> ExecutionCapabilityEvidence:
+        if runner is not None and not isinstance(runner, LambdaMicroVMRunner):
+            raise TypeError("Lambda MicroVM adapter received a different runner type.")
+        return _virtual_egress_execution_capability_evidence(
+            runner_kind=self.runner_kind,
+            runner_ready=runner is not None,
+            preflight_observed_at=(
+                self._runner_preflight_observations.get(runner) if runner is not None else None
+            ),
+            untrusted_isolation=True,
+            credential_non_possession_posture=(
+                "unverified" if self.metadata_isolation == "unverified" else "available"
+            ),
+            guest_privilege="available",
+            unprivileged_guest="available",
+            host_filesystem_isolation=True,
+            reconnect=self.supports_reconnect,
+            network_unverified=self.metadata_isolation == "unverified",
+            cancellation_confirmed=(
+                getattr(runner, "cancellation_cleanup", None)
+                if runner is not None
+                else self.runner_options.get("cancellation_cleanup", "command")
+            )
+            != "none",
+        )
 
     def __init__(
         self,
@@ -115,6 +147,10 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
         self._runner_capabilities: weakref.WeakKeyDictionary[
             Runner,
             EgressCapabilityEvidence,
+        ] = weakref.WeakKeyDictionary()
+        self._runner_preflight_observations: weakref.WeakKeyDictionary[
+            Runner,
+            datetime,
         ] = weakref.WeakKeyDictionary()
         reserved = {
             "region_name",
@@ -214,7 +250,7 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
         try:
             await _install_ca(runner, request)
             await run_setup_commands(runner, request)
-            await run_enforcement_preflight(
+            preflight_observed_at = await run_enforcement_preflight(
                 runner,
                 request,
                 timeout_s=self.preflight_timeout_s,
@@ -231,6 +267,7 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
                     "verified"
                 ),
             )
+            self._runner_preflight_observations[runner] = preflight_observed_at
         except BaseException:
             if created_new:
                 with contextlib.suppress(Exception, asyncio.CancelledError):
