@@ -515,15 +515,25 @@ a shared tunnel does not create isolation; the application-owned exposure must
 enforce the claim with a per-session private route or equivalent boundary.
 
 E2B exposes Firecracker MMDS at `169.254.169.254` inside the guest even when
-external internet access is denied. Before handoff, the adapter installs a root
-firewall reject for that address, removes the default user from the sudo group,
-and makes `sudo`/`su` root-only. A fresh guest process must prove it cannot
-remove the rule, and preflight must prove MMDS GET and token acquisition both
-fail. All later commands are pinned to that same verified guest user, regardless
-of the template's configured default. Missing hardening tools or retained guest
-privilege fail closed. This security mode intentionally removes guest privilege
-escalation; bake privileged setup into the E2B template rather than relying on
-`setup_commands` plus sudo.
+external internet access is denied. The adapter uses the same public
+`E2BRunner.create_hardened(...)` contract as offline E2B consumers: before
+handoff it installs a root firewall reject for that address, removes the default
+user from administrator groups, makes `sudo`/`su` root-only, and installs the
+session CA as a protected root-owned file. Before virtual-egress callbacks run,
+a fresh guest process must prove the common non-root, metadata, and
+protected-file boundary. Virtual-egress preflight then proves the proxy/TLS
+route, direct public TLS denial, MMDS GET, and token acquisition before any
+configured setup command runs. The preflight retains its configured timeout,
+and each setup command retains its 300-second execution limit; the adapter adds
+all of those allowances to the bounded handoff deadline.
+Cayu repeats the common guest and protected-file verification before publishing
+the runner. All later commands and native workspace operations are pinned to
+that same verified guest user, regardless of the template's configured default.
+Missing hardening tools, retained guest privilege, a writable CA, or any
+preflight failure closes the sandbox. This security mode intentionally removes
+guest privilege escalation; bake other privileged setup into the E2B template
+or use the typed protected-file/directory bootstrap contract rather than
+relying on `setup_commands` plus sudo.
 
 Both adapters run a per-session preflight before returning the environment. It
 must reach the proxy, complete TLS using the session CA, fail a raw public-IP

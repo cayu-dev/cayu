@@ -1882,6 +1882,83 @@ is not a secure sandbox boundary, and Cayu never implicitly selects
 `DockerRunner` for untrusted code or as a fallback when a microVM runner is
 unavailable.
 
+`E2BRunner.create_hardened(...)` is the public one-way provisioning contract for
+an offline E2B guest. It always creates with `secure=True` and
+`allow_internet_access=False`, pins command and workspace operations to the
+declared non-root `guest_user`, and applies these ordered phases before
+returning:
+
+1. Cayu blocks E2B MMDS at the IPv4 address `169.254.169.254`, removes the
+   guest from the `sudo` and `wheel` groups, and makes `sudo` and `su`
+   root-only.
+2. An optional trusted `bootstrap(E2BGuestProvisioner)` callback may install
+   only root-owned files and directories with caller-declared, non-writable
+   modes. It is not an arbitrary root-command API. Protected paths must be
+   absolute and normalized, outside the guest home/workspace, temporary
+   directories, and kernel pseudo-filesystems.
+3. Cayu seals the provisioner and verifies the non-root identity, sudo/su
+   denial, MMDS rule, and metadata socket denial before exposing the runner to
+   optional guest-side `guest_setup(runner)` and `guest_probe(runner)`
+   callbacks. For every declared protected asset it runs guest mutation probes,
+   then verifies root ownership and the declared mode through the sealed
+   privileged path.
+4. Cayu repeats the same verification after the guest callbacks and before
+   publishing the runner, so a callback cannot silently weaken the established
+   boundary.
+
+After handoff, a retained provisioner rejects every operation, raw native E2B
+filesystem access through `runner.filesystem()` is disabled, and
+`E2BWorkspace` native calls are pinned to the hardened guest even if a caller
+requests another SDK filesystem user. The command path is independently pinned
+to the handed-off guest; mutating the legacy `exec_user` attribute does not
+restore root execution. Applications should use `E2BWorkspace` for mutable
+agent files and keep trusted verification inputs under a protected root-owned
+path such as `/opt/cayu-verification`.
+
+The handoff is irreversible in the capability and lifecycle sense: Cayu seals
+its privileged provisioner before publishing the runner and never exposes an
+ambient root-execution API. It is not an audit of every privilege path in an
+arbitrary custom Linux image. A trusted custom template must not grant the
+guest other root-equivalent groups or sockets, unsafe setuid binaries or file
+capabilities, or alternate metadata services. Cayu directly verifies the E2B
+MMDS IPv4 endpoint above; provider network policy supplies the broader offline
+boundary.
+
+Creation, bootstrap, guest callbacks, and verification share
+`handoff_timeout_s`. Any exception, timeout, or cancellation kills an allocated
+sandbox with bounded `cleanup_timeout_s` before the original failure
+propagates. Deadline enforcement is independent of callback cancellation:
+at expiry Cayu revokes the provisioner and runner, cancels the handoff work
+without waiting for it to cooperate, and proceeds to bounded sandbox cleanup.
+A callback that suppresses cancellation cannot publish a late runner. If
+cancellation makes the create acknowledgement ambiguous, Cayu uses a unique
+Cayu-owned metadata marker to find and kill the allocation. A create result
+that arrives after supervision has ended observes the same revocation latch and
+is closed before Cayu runs any sandbox command, with an exact bounded kill
+attempted in addition to the already-reported ambiguous cleanup. For ordinary
+failures, cleanup failure is preserved with the original failure in a
+`BaseExceptionGroup`. Cancellation remains the authoritative
+`asyncio.CancelledError` with its native task bookkeeping intact; incomplete
+rollback is retained as its cause and a secret-safe note. Cleanup uncertainty
+is never reported as a successful handoff. Built-in handoff errors expose only
+phase, reason category, and exit code, not command output or protected file
+contents.
+
+The default E2B template must provide `python3`, `/usr/sbin/iptables`, ordinary
+GNU file utilities, and the `user` account. A custom `network` option can still
+allow explicit destinations (the virtual-egress adapter uses this for its
+single proxy endpoint), so omit it for the fully offline contract. The handoff
+constructor rejects provider-global `envs`, because those variables also affect
+privileged SDK commands; use `env_overlay` for the eventual guest command
+environment. Cayu-owned bootstrap and verification commands use a sanitized
+interpreter environment and do not merge `env_overlay`. The E2B template and
+the bootstrap callback remain trusted inputs. The handoff protects the
+guest/root boundary inside the sandbox; it does not replace E2B's VM isolation
+or make caller-supplied bootstrap callbacks untrusted. See
+[`examples/e2b_hardened_coding_agent_live.py`](../examples/e2b_hardened_coding_agent_live.py)
+for an end-to-end coding-agent flow with protected independent verification and
+no virtual credentials.
+
 `MicrosandboxRunner` is Cayu's primary local runner for untrusted code and is
 available as an optional microVM-backed runner:
 

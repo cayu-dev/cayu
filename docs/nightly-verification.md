@@ -162,7 +162,7 @@ high level:
 | Postgres stores, migrations, pgvector, real dispatch claim path | verified when Postgres is available | `postgres-required` |
 | real explicitly selected Docker container exec, timeout cleanup, sync binding, and virtual-egress enforcement (not sandbox isolation) | verified when Docker is available | `docker-runner`, `docker-live-exec`, `docker-live-sync`, `docker-live-virtual-egress` |
 | real microsandbox runner, portable workspace round-trip/path safety, runtime, sync binding, deny-by-default networking with explicit-open compatibility, and opt-in guest-agent liveness | verified when microsandbox is available | `microsandbox-live-*` |
-| real E2B runner, portable workspace round-trip/path safety, and sync binding | verified when E2B is available | `e2b-live-*` |
+| real E2B runner, irreversible hardened guest handoff, portable workspace round-trip/path safety, and sync binding | verified when E2B is available and security-sensitive checks are explicitly enabled | `e2b-live-*` |
 | real Microsandbox virtual-egress enforcement and secret non-possession | verified when the runtime and explicit opt-in are available | `microsandbox-live-virtual-egress` |
 | real E2B virtual-egress enforcement and secret non-possession | verified when the key, tunnel configuration, and explicit opt-in are available | `e2b-live-virtual-egress` |
 | real AWS Lambda MicroVM runner/workspace/cleanup/suspend-resume | verified when AWS and a built sidecar image are available | `lambda-microvm-live` |
@@ -195,13 +195,13 @@ trial per scenario. Real GitHub promotion for the repository tournament remains
 an explicit manual check because it creates a branch and pull request in the
 configured disposable repository.
 
-There are 33 live example files across `examples/` and its provider subdirectories:
+There are 34 live example files across `examples/` and its provider subdirectories:
 
 | prerequisite | examples |
 | --- | --- |
 | Docker | `docker_interrupt_live.py`, `docker_sync_binding_live.py` |
 | microsandbox | `microsandbox_runner_live.py`, `microsandbox_runtime_live.py`, `microsandbox_workspace_live.py`, `microsandbox_sync_binding_live.py`, `microsandbox_guest_agent_liveness_live.py`, `microsandbox_network_default_live.py` |
-| E2B key | `e2b_runner_live.py`, `e2b_workspace_live.py`, `e2b_sync_binding_live.py` |
+| E2B key | `e2b_runner_live.py`, `e2b_hardened_coding_agent_live.py`, `e2b_workspace_live.py`, `e2b_sync_binding_live.py` |
 | AWS credentials, region, and Lambda MicroVM image | `aws/lambda_microvm_runner_live.py` |
 | AWS credentials, region, and Bedrock model | `aws/bedrock_provider_live.py` |
 | Gemini key | `chat_completions_contract_live.py` |
@@ -363,6 +363,12 @@ E2B_API_KEY=... uv run python scripts/nightly_verification.py \
   --check e2b-live-runner \
   --check e2b-live-workspace \
   --check e2b-live-sync \
+  --strict
+
+CAYU_RUN_E2B_HANDOFF_E2E=1 \
+E2B_API_KEY=... \
+uv run python scripts/nightly_verification.py \
+  --check e2b-live-hardened-handoff \
   --strict
 
 CAYU_RUN_E2B_EGRESS_E2E=1 \

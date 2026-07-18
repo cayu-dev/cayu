@@ -277,12 +277,15 @@ def test_live_prerequisites_keep_paid_lanes_explicit() -> None:
     assert ("CAYU_RUN_MICROSANDBOX_EGRESS_E2E", "1") in (
         registrations["microsandbox"].live_prerequisites.required_env_values
     )
-    for registration in registrations.values():
+    for name, registration in registrations.items():
         assert Path(registration.live_proof_source).is_file()
         assert registration.teardown_timeout_s <= 30
+        expected_direct_probes = (
+            ("1.1.1.1:443",) if name == "docker" else ("1.1.1.1:443", "8.8.8.8:443")
+        )
         assert registration.bounded_destinations == (
             "api.stripe.com:443",
-            "1.1.1.1:443",
+            *expected_direct_probes,
             "169.254.169.254:80",
         )
 

@@ -421,6 +421,7 @@ def test_lambda_microvm_adapter_creates_private_vpc_enforced_runner(
     preflight = runner.calls[2]["command"].argv[-1]
     assert "receiver.internal" in preflight
     assert "1.1.1.1" in preflight
+    assert "8.8.8.8" in preflight
     assert "169.254.169.254" in preflight
     assert adapter.capability_evidence(runner).to_metadata() == (
         _expected_lambda_capability_evidence(

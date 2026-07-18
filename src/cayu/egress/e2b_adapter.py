@@ -10,6 +10,7 @@ from typing import Any
 
 from cayu.egress._remote_adapter import (
     DEFAULT_PROXY_SERVER_FACTORY,
+    DEFAULT_REMOTE_SETUP_COMMAND_TIMEOUT_SECONDS,
     ProxyServerFactory,
     prepare_exposed_proxy_binding,
     run_enforcement_preflight,
@@ -20,53 +21,38 @@ from cayu.egress.adapter import (
     EgressBinding,
     SandboxEgressAdapter,
     VirtualEgressRunnerRequest,
-    _await_bounded_cleanup_task,
 )
 from cayu.egress.broker import TransparentEgressBroker
-from cayu.egress.errors import UnsupportedEgressError
+from cayu.egress.errors import UnsupportedEgressCapabilityError, UnsupportedEgressError
 from cayu.egress.grants import VirtualCredentialGrant
 from cayu.egress.proxy_exposure import ProxyExposure
 from cayu.runners.base import Runner
-from cayu.runners.e2b import E2BRunner
+from cayu.runners.e2b import (
+    DEFAULT_E2B_HANDOFF_TIMEOUT_SECONDS,
+    E2BGuestHandoffError,
+    E2BGuestProvisioner,
+    E2BRunner,
+)
 
 _RESERVED_E2B_OPTIONS = {
     "allow_internet_access",
+    "bootstrap",
     "close_action",
+    "cleanup_timeout_s",
     "e2b_module",
     "env_overlay",
     "envs",
+    "ensure_default_cwd",
     "exec_user",
+    "guest_probe",
+    "guest_setup",
+    "guest_user",
+    "handoff_timeout_s",
     "network",
     "sandbox_timeout_s",
     "secure",
     "template",
 }
-
-_HARDEN_METADATA_SCRIPT = r"""
-set -eu
-test "$(id -u)" -eq 0
-test -x /usr/sbin/iptables
-/usr/sbin/iptables -I OUTPUT 1 -d 169.254.169.254/32 -j REJECT
-if id -nG user | tr ' ' '\n' | grep -qx sudo; then
-  gpasswd -d user sudo
-fi
-for path in /usr/bin/sudo /bin/su /usr/bin/su; do
-  if [ -e "$path" ]; then
-    chmod 0700 "$path"
-  fi
-done
-""".strip()
-
-_VERIFY_GUEST_HARDENING_SCRIPT = r"""
-if [ -x /usr/bin/sudo ]; then
-  echo "sudo remains executable" >&2
-  exit 41
-fi
-if /usr/sbin/iptables -D OUTPUT -d 169.254.169.254/32 -j REJECT 2>/dev/null; then
-  echo "guest can remove metadata firewall rule" >&2
-  exit 42
-fi
-""".strip()
 
 
 class E2BEgressAdapter(SandboxEgressAdapter):
@@ -150,61 +136,53 @@ class E2BEgressAdapter(SandboxEgressAdapter):
                 "IPv6 deny-by-default enforcement is not yet verified."
             )
         proxy_ip = str(proxy_address)
+        ca_cert_pem = Path(request.ca_cert_host_path).read_bytes()
 
-        runner: E2BRunner | None = None
-        try:
-            runner = await E2BRunner.create(
-                template=request.image,
-                sandbox_timeout_s=self._sandbox_timeout_s,
-                close_action="kill",
-                secure=True,
-                allow_internet_access=False,
-                network={
-                    "allow_out": [proxy_ip],
-                    "deny_out": ["0.0.0.0/0"],
-                },
-                env_overlay=request.env_overlay,
-                exec_user="user",
-                e2b_module=self._e2b_module(),
-                **self._options,
+        async def bootstrap(provisioner: E2BGuestProvisioner) -> None:
+            await provisioner.install_file(
+                request.guest_ca_path,
+                ca_cert_pem,
+                mode=0o444,
             )
-            await self._harden_guest(runner)
-            ca_cert_pem = Path(request.ca_cert_host_path).read_bytes()
-            await runner.filesystem().write(request.guest_ca_path, ca_cert_pem)
+
+        async def guest_setup(runner: E2BRunner) -> None:
             await run_enforcement_preflight(
                 runner,
                 request,
                 timeout_s=self._preflight_timeout_s,
             )
             await run_setup_commands(runner, request)
-            return runner
-        except BaseException as original:
-            if runner is not None:
-                cleanup_task = asyncio.create_task(runner.close())
-                try:
-                    await _await_bounded_cleanup_task(
-                        cleanup_task,
-                        timeout_s=DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
-                        timeout_message="E2B egress runner rollback timed out.",
-                    )
-                except BaseException as cleanup_error:
-                    original.add_note(
-                        f"E2B egress runner rollback incomplete: {type(cleanup_error).__name__}."
-                    )
-            raise
 
-    async def _harden_guest(self, runner: E2BRunner) -> None:
-        result = await runner._exec_admin(_HARDEN_METADATA_SCRIPT)
-        if result.exit_code != 0:
-            raise UnsupportedEgressError(
-                "E2B metadata hardening failed during root bootstrap "
-                f"(exit_code={result.exit_code})."
+        handoff_timeout_s = (
+            DEFAULT_E2B_HANDOFF_TIMEOUT_SECONDS
+            + self._preflight_timeout_s
+            + (len(request.setup_commands) * DEFAULT_REMOTE_SETUP_COMMAND_TIMEOUT_SECONDS)
+        )
+        try:
+            return await E2BRunner.create_hardened(
+                template=request.image,
+                sandbox_timeout_s=self._sandbox_timeout_s,
+                close_action="kill",
+                network={
+                    "allow_out": [proxy_ip],
+                    "deny_out": ["0.0.0.0/0"],
+                },
+                env_overlay=request.env_overlay,
+                guest_user="user",
+                handoff_timeout_s=handoff_timeout_s,
+                cleanup_timeout_s=DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
+                bootstrap=bootstrap,
+                guest_setup=guest_setup,
+                e2b_module=self._e2b_module(),
+                **self._options,
             )
-        verification = await runner._exec_guest_check(_VERIFY_GUEST_HARDENING_SCRIPT)
-        if verification.exit_code != 0:
-            raise UnsupportedEgressError(
-                f"E2B guest could bypass metadata hardening (exit_code={verification.exit_code})."
-            )
+        except E2BGuestHandoffError as exc:
+            raise UnsupportedEgressError(str(exc)) from exc
+        except ExceptionGroup as exc:
+            authoritative = _find_authoritative_egress_failure(exc)
+            if authoritative is None:
+                raise
+            raise _copy_public_egress_failure(authoritative) from exc
 
     def _e2b_module(self) -> ModuleType | Any:
         if self._module is not None:
@@ -217,3 +195,33 @@ class E2BEgressAdapter(SandboxEgressAdapter):
             raise UnsupportedEgressError(
                 "E2B virtual egress requires the optional e2b package."
             ) from exc
+
+
+def _find_authoritative_egress_failure(
+    error: BaseExceptionGroup,
+) -> UnsupportedEgressError | E2BGuestHandoffError | None:
+    """Find the public fail-closed error without hiding rollback diagnostics."""
+
+    for item in error.exceptions:
+        if isinstance(item, UnsupportedEgressError | E2BGuestHandoffError):
+            return item
+        if isinstance(item, ExceptionGroup):
+            nested = _find_authoritative_egress_failure(item)
+            if nested is not None:
+                return nested
+    return None
+
+
+def _copy_public_egress_failure(
+    error: UnsupportedEgressError | E2BGuestHandoffError,
+) -> UnsupportedEgressError:
+    """Preserve structured public failures without creating an exception cycle."""
+
+    if isinstance(error, UnsupportedEgressCapabilityError):
+        return UnsupportedEgressCapabilityError(
+            runner_kind=error.runner_kind,
+            capability=error.capability,
+            reason=error.reason,
+            remediation=error.remediation,
+        )
+    return UnsupportedEgressError(str(error))

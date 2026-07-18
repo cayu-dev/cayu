@@ -6,11 +6,13 @@ from typing import Any
 
 import pytest
 
+import cayu.egress.e2b_adapter as e2b_adapter_module
 from cayu.egress import (
     ApprovedEgressDestination,
     EgressBinding,
     HttpEgressPolicy,
     TransparentEgressBroker,
+    UnsupportedEgressCapabilityError,
     UnsupportedEgressError,
     VirtualCredentialError,
     VirtualCredentialRegistry,
@@ -142,10 +144,10 @@ class _FakeCommands:
 
 class _FakeFiles:
     def __init__(self) -> None:
-        self.writes: list[tuple[str, bytes]] = []
+        self.writes: list[dict[str, Any]] = []
 
-    async def write(self, path: str, data: bytes) -> None:
-        self.writes.append((path, data))
+    async def write(self, path: str, data: bytes, **kwargs: Any) -> None:
+        self.writes.append({"path": path, "data": data, **kwargs})
 
 
 class _FakeSandbox:
@@ -173,6 +175,58 @@ class _FakeAsyncSandbox:
 
 class _FakeE2BModule:
     AsyncSandbox = _FakeAsyncSandbox
+
+
+class _FailingKillSandbox(_FakeSandbox):
+    async def kill(self) -> bool:
+        raise RuntimeError("sandbox kill failed with provider diagnostics")
+
+
+class _FailingKillAsyncSandbox(_FakeAsyncSandbox):
+    @classmethod
+    async def create(cls, **kwargs: Any) -> _FakeSandbox:
+        cls.created.append(dict(kwargs))
+        cls.sandbox = _FailingKillSandbox()
+        return cls.sandbox
+
+
+class _FailingKillE2BModule:
+    AsyncSandbox = _FailingKillAsyncSandbox
+
+
+class _SelfCancellingKillSandbox(_FakeSandbox):
+    async def kill(self) -> bool:
+        raise asyncio.CancelledError
+
+
+class _SelfCancellingKillAsyncSandbox(_FakeAsyncSandbox):
+    @classmethod
+    async def create(cls, **kwargs: Any) -> _FakeSandbox:
+        cls.created.append(dict(kwargs))
+        cls.sandbox = _SelfCancellingKillSandbox()
+        return cls.sandbox
+
+
+class _SelfCancellingKillE2BModule:
+    AsyncSandbox = _SelfCancellingKillAsyncSandbox
+
+
+class _HangingKillSandbox(_FakeSandbox):
+    async def kill(self) -> bool:
+        await asyncio.Event().wait()
+        return True
+
+
+class _HangingKillAsyncSandbox(_FakeAsyncSandbox):
+    @classmethod
+    async def create(cls, **kwargs: Any) -> _FakeSandbox:
+        cls.created.append(dict(kwargs))
+        cls.sandbox = _HangingKillSandbox()
+        return cls.sandbox
+
+
+class _HangingKillE2BModule:
+    AsyncSandbox = _HangingKillAsyncSandbox
 
 
 def _broker_and_grant() -> tuple[TransparentEgressBroker, Any]:
@@ -306,28 +360,59 @@ def test_e2b_adapter_allows_only_the_exposed_cayu_proxy(tmp_path: Path) -> None:
 
     assert exposure.calls == [("127.0.0.1", 9123)]
     assert binding.proxy_url == "http://203.0.113.10:8443"
-    assert _FakeAsyncSandbox.created == [
-        {
-            "secure": True,
-            "allow_internet_access": False,
-            "template": "base-template",
-            "network": {
-                "allow_out": ["203.0.113.10"],
-                "deny_out": ["0.0.0.0/0"],
-            },
-        }
-    ]
+    assert len(_FakeAsyncSandbox.created) == 1
+    create_options = _FakeAsyncSandbox.created[0]
+    assert create_options["secure"] is True
+    assert create_options["allow_internet_access"] is False
+    assert create_options["template"] == "base-template"
+    assert create_options["network"] == {
+        "allow_out": ["203.0.113.10"],
+        "deny_out": ["0.0.0.0/0"],
+    }
+    assert len(create_options["metadata"]["cayu_guest_handoff_id"]) == 32
     assert _FakeAsyncSandbox.sandbox is not None
-    assert _FakeAsyncSandbox.sandbox.files.writes == [("/etc/cayu/ca.pem", b"session-ca")]
+    assert len(_FakeAsyncSandbox.sandbox.files.writes) == 1
+    staged_ca = _FakeAsyncSandbox.sandbox.files.writes[0]
+    assert staged_ca["path"].startswith("/root/.cayu-handoff-")
+    assert staged_ca["data"] == b"session-ca"
+    assert staged_ca["user"] == "root"
     command_calls = _FakeAsyncSandbox.sandbox.commands.calls
-    assert command_calls[1]["user"] == "root"
-    assert "iptables -I OUTPUT" in command_calls[1]["command"]
-    assert command_calls[2]["user"] == "user"
-    assert "guest can remove metadata firewall rule" in command_calls[2]["command"]
-    assert command_calls[3]["envs"]["HTTPS_PROXY"] == binding.proxy_url
-    assert command_calls[3]["user"] == "user"
-    assert command_calls[3]["envs"]["STRIPE_SECRET_KEY"].startswith("sk_test_cayu_vc_")
-    assert "python3 -V" in command_calls[4]["command"]
+    hardening = next(call for call in command_calls if "iptables -I OUTPUT" in call["command"])
+    protected_install = next(
+        call
+        for call in command_calls
+        if call.get("envs", {}).get("CAYU_PROTECTED_PATH") == "/etc/cayu/ca.pem"
+        and call.get("user") == "root"
+    )
+    setup_index = next(
+        index for index, call in enumerate(command_calls) if "python3 -V" in call["command"]
+    )
+    preflight_index = next(
+        index
+        for index, call in enumerate(command_calls)
+        if call.get("background") and "api.stripe.com" in call["command"]
+    )
+    verification_indices = [
+        index for index, call in enumerate(command_calls) if "sudo -n true" in call["command"]
+    ]
+    assert hardening["user"] == "root"
+    assert protected_install["envs"]["CAYU_PROTECTED_MODE"] == "444"
+    assert command_calls[preflight_index]["envs"]["HTTPS_PROXY"] == binding.proxy_url
+    assert command_calls[preflight_index]["user"] == "user"
+    assert '("1.1.1.1", 443, "one.one.one.one")' in command_calls[preflight_index]["command"]
+    assert '("8.8.8.8", 443, "dns.google")' in command_calls[preflight_index]["command"]
+    assert (
+        "for host, port, server_hostname in direct_tls_probes:"
+        in (command_calls[preflight_index]["command"])
+    )
+    assert command_calls[preflight_index]["envs"]["STRIPE_SECRET_KEY"].startswith(
+        "sk_test_cayu_vc_"
+    )
+    assert command_calls[setup_index]["timeout"] == 300
+    assert len(verification_indices) == 2
+    assert verification_indices[0] < preflight_index < setup_index < verification_indices[1]
+    with pytest.raises(RuntimeError, match="Raw E2B filesystem"):
+        runner.filesystem()
 
     asyncio.run(runner.close())
     asyncio.run(binding.close())
@@ -372,8 +457,15 @@ def test_e2b_adapter_rejects_security_options_that_could_bypass_enforcement() ->
     for options in (
         {"allow_internet_access": False},
         {"network": {"allow_out": ["0.0.0.0/0"]}},
+        {"cleanup_timeout_s": 0.001},
         {"envs": {"REAL_SECRET": "must-not-enter-sandbox"}},
+        {"ensure_default_cwd": False},
         {"exec_user": "root"},
+        {"guest_user": "root"},
+        {"handoff_timeout_s": 600},
+        {"bootstrap": object()},
+        {"guest_setup": object()},
+        {"guest_probe": object()},
     ):
         with pytest.raises(ValueError, match="adapter-owned"):
             E2BEgressAdapter(
@@ -563,34 +655,254 @@ def test_e2b_adapter_closes_sandbox_when_preflight_fails(tmp_path: Path) -> None
     assert sandbox.killed is True
 
 
-@pytest.mark.parametrize(
-    ("foreground_results", "error"),
-    [
-        (
-            [
-                _FakeCommandResult(),
-                _FakeCommandResult(exit_code=20, stderr="iptables unavailable"),
-            ],
-            "metadata hardening failed",
+def test_e2b_adapter_preserves_public_error_when_hardening_and_rollback_fail(
+    tmp_path: Path,
+) -> None:
+    async def run() -> UnsupportedEgressError:
+        _FakeCommands.background_result = _FakeCommandResult()
+        _FakeCommands.foreground_results = [
+            _FakeCommandResult(),
+            _FakeCommandResult(exit_code=20, stderr="must not be surfaced"),
+        ]
+        adapter = E2BEgressAdapter(
+            exposure=_FakeExposure(),
+            e2b_module=_FailingKillE2BModule,
+            proxy_server_factory=_FakeProxyServer,
+        )
+        ca_path = tmp_path / "ca.pem"
+        ca_path.write_bytes(b"session-ca")
+        with pytest.raises(UnsupportedEgressError) as exc_info:
+            await adapter.create_runner(
+                VirtualEgressRunnerRequest(
+                    name="sandbox-1",
+                    runner_kind="e2b",
+                    image="base-template",
+                    binding=EgressBinding(
+                        proxy_url="http://203.0.113.10:8443",
+                        guest_ca_path="/etc/cayu/ca.pem",
+                    ),
+                    env_overlay={},
+                    ca_cert_host_path=str(ca_path),
+                    guest_ca_path="/etc/cayu/ca.pem",
+                    setup_commands=(),
+                    egress_destinations=("api.stripe.com",),
+                )
+            )
+        return exc_info.value
+
+    error = asyncio.run(run())
+
+    assert "guest handoff hardening" in str(error)
+    assert "must not be surfaced" not in str(error)
+    assert "provider diagnostics" not in str(error)
+    assert isinstance(error.__cause__, ExceptionGroup)
+    assert isinstance(error.__cause__.exceptions[0], Exception)
+    assert isinstance(error.__cause__.exceptions[1], RuntimeError)
+
+
+def test_e2b_adapter_preserves_public_error_when_rollback_self_cancels(
+    tmp_path: Path,
+) -> None:
+    async def run() -> UnsupportedEgressError:
+        _FakeCommands.background_result = _FakeCommandResult()
+        _FakeCommands.foreground_results = [
+            _FakeCommandResult(),
+            _FakeCommandResult(exit_code=20, stderr="must not be surfaced"),
+        ]
+        adapter = E2BEgressAdapter(
+            exposure=_FakeExposure(),
+            e2b_module=_SelfCancellingKillE2BModule,
+            proxy_server_factory=_FakeProxyServer,
+        )
+        ca_path = tmp_path / "ca.pem"
+        ca_path.write_bytes(b"session-ca")
+        with pytest.raises(UnsupportedEgressError) as exc_info:
+            await adapter.create_runner(
+                VirtualEgressRunnerRequest(
+                    name="sandbox-1",
+                    runner_kind="e2b",
+                    image="base-template",
+                    binding=EgressBinding(
+                        proxy_url="http://203.0.113.10:8443",
+                        guest_ca_path="/etc/cayu/ca.pem",
+                    ),
+                    env_overlay={},
+                    ca_cert_host_path=str(ca_path),
+                    guest_ca_path="/etc/cayu/ca.pem",
+                    setup_commands=(),
+                    egress_destinations=("api.stripe.com",),
+                )
+            )
+        return exc_info.value
+
+    error = asyncio.run(run())
+
+    assert "guest handoff hardening" in str(error)
+    assert "must not be surfaced" not in str(error)
+    assert isinstance(error.__cause__, ExceptionGroup)
+    assert isinstance(error.__cause__.exceptions[0], Exception)
+    assert isinstance(error.__cause__.exceptions[1], RuntimeError)
+    assert str(error.__cause__.exceptions[1]) == (
+        "E2B guest handoff rollback cancelled without caller cancellation."
+    )
+
+
+def test_e2b_adapter_preserves_pending_handoff_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = UnsupportedEgressError("preflight denied")
+
+    async def cancel_then_fail(*_args: Any, **_kwargs: Any) -> None:
+        current_task = asyncio.current_task()
+        assert current_task is not None
+        current_task.cancel()
+        raise primary
+
+    async def run() -> tuple[BaseExceptionGroup, _FakeSandbox]:
+        _FakeCommands.background_result = _FakeCommandResult()
+        _FakeCommands.foreground_results = []
+        monkeypatch.setattr(
+            e2b_adapter_module,
+            "run_enforcement_preflight",
+            cancel_then_fail,
+        )
+        adapter = E2BEgressAdapter(
+            exposure=_FakeExposure(),
+            e2b_module=_FakeE2BModule,
+            proxy_server_factory=_FakeProxyServer,
+        )
+        ca_path = tmp_path / "ca.pem"
+        ca_path.write_bytes(b"session-ca")
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            await adapter.create_runner(
+                VirtualEgressRunnerRequest(
+                    name="sandbox-1",
+                    runner_kind="e2b",
+                    image="base-template",
+                    binding=EgressBinding(
+                        proxy_url="http://203.0.113.10:8443",
+                        guest_ca_path="/etc/cayu/ca.pem",
+                    ),
+                    env_overlay={},
+                    ca_cert_host_path=str(ca_path),
+                    guest_ca_path="/etc/cayu/ca.pem",
+                    setup_commands=(),
+                    egress_destinations=("api.stripe.com",),
+                )
+            )
+        assert _FakeAsyncSandbox.sandbox is not None
+        return exc_info.value, _FakeAsyncSandbox.sandbox
+
+    error, sandbox = asyncio.run(run())
+
+    assert error.exceptions[0] is primary
+    assert isinstance(error.exceptions[1], asyncio.CancelledError)
+    assert sandbox.killed is True
+
+
+def test_e2b_adapter_preserves_capability_error_when_rollback_times_out(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> UnsupportedEgressCapabilityError:
+        _FakeCommands.background_result = _FakeCommandResult(exit_code=42)
+        _FakeCommands.foreground_results = []
+        monkeypatch.setattr(
+            e2b_adapter_module,
+            "DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS",
+            0.01,
+        )
+        adapter = E2BEgressAdapter(
+            exposure=_FakeExposure(),
+            e2b_module=_HangingKillE2BModule,
+            proxy_server_factory=_FakeProxyServer,
+        )
+        ca_path = tmp_path / "ca.pem"
+        ca_path.write_bytes(b"session-ca")
+        with pytest.raises(UnsupportedEgressCapabilityError) as exc_info:
+            await adapter.create_runner(
+                VirtualEgressRunnerRequest(
+                    name="sandbox-1",
+                    runner_kind="e2b",
+                    image="base-template",
+                    binding=EgressBinding(
+                        proxy_url="http://203.0.113.10:8443",
+                        guest_ca_path="/etc/cayu/ca.pem",
+                    ),
+                    env_overlay={},
+                    ca_cert_host_path=str(ca_path),
+                    guest_ca_path="/etc/cayu/ca.pem",
+                    setup_commands=(),
+                    egress_destinations=("api.stripe.com",),
+                )
+            )
+        return exc_info.value
+
+    error = asyncio.run(run())
+
+    assert error.runner_kind == "e2b"
+    assert error.capability == "metadata_isolation"
+    assert "link-local metadata endpoint" in error.reason
+    assert "restore 'e2b' network enforcement" in error.remediation
+    assert isinstance(error.__cause__, ExceptionGroup)
+    assert isinstance(
+        error.__cause__.exceptions[0],
+        UnsupportedEgressCapabilityError,
+    )
+    assert isinstance(error.__cause__.exceptions[1], TimeoutError)
+
+
+def test_e2b_adapter_handoff_budget_covers_every_setup_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    returned_runner = E2BRunner(_FakeSandbox(), e2b_module=_FakeE2BModule)
+
+    async def create_hardened(**options: Any) -> E2BRunner:
+        captured.update(options)
+        return returned_runner
+
+    monkeypatch.setattr(E2BRunner, "create_hardened", create_hardened)
+    adapter = E2BEgressAdapter(
+        exposure=_FakeExposure(),
+        e2b_module=_FakeE2BModule,
+        proxy_server_factory=_FakeProxyServer,
+        preflight_timeout_s=180,
+    )
+    ca_path = tmp_path / "ca.pem"
+    ca_path.write_bytes(b"session-ca")
+    request = VirtualEgressRunnerRequest(
+        name="sandbox-1",
+        runner_kind="e2b",
+        image="base-template",
+        binding=EgressBinding(
+            proxy_url="http://203.0.113.10:8443",
+            guest_ca_path="/etc/cayu/ca.pem",
         ),
-        (
-            [
-                _FakeCommandResult(),
-                _FakeCommandResult(),
-                _FakeCommandResult(exit_code=21, stderr="sudo remains executable"),
-            ],
-            "could bypass metadata hardening",
-        ),
-    ],
-)
+        env_overlay={},
+        ca_cert_host_path=str(ca_path),
+        guest_ca_path="/etc/cayu/ca.pem",
+        setup_commands=("first", "second"),
+        egress_destinations=("api.stripe.com",),
+    )
+
+    runner = asyncio.run(adapter.create_runner(request))
+
+    assert runner is returned_runner
+    assert captured["handoff_timeout_s"] == 900
+
+
 def test_e2b_adapter_closes_sandbox_when_guest_hardening_fails(
     tmp_path: Path,
-    foreground_results: list[_FakeCommandResult],
-    error: str,
 ) -> None:
     async def run() -> _FakeSandbox:
         _FakeCommands.background_result = _FakeCommandResult()
-        _FakeCommands.foreground_results = list(foreground_results)
+        _FakeCommands.foreground_results = [
+            _FakeCommandResult(),
+            _FakeCommandResult(exit_code=20, stderr="must not be surfaced"),
+        ]
         broker, grant = _broker_and_grant()
         adapter = E2BEgressAdapter(
             exposure=_FakeExposure(),
@@ -604,7 +916,7 @@ def test_e2b_adapter_closes_sandbox_when_guest_hardening_fails(
         )
         ca_path = tmp_path / "ca.pem"
         ca_path.write_bytes(binding.ca_cert_pem or b"")
-        with pytest.raises(UnsupportedEgressError, match=error):
+        with pytest.raises(UnsupportedEgressError, match="guest handoff hardening"):
             await adapter.create_runner(
                 VirtualEgressRunnerRequest(
                     name="sandbox-1",

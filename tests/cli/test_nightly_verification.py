@@ -588,6 +588,30 @@ def test_microsandbox_network_default_is_registered_and_explicitly_gated() -> No
     assert check.required_env_values == {"CAYU_RUN_MICROSANDBOX_NETWORK_LIVE": "1"}
 
 
+def test_e2b_hardened_handoff_is_registered_and_explicitly_gated() -> None:
+    check = next(check for check in nightly.CHECKS if check.id == "e2b-live-hardened-handoff")
+
+    assert check.lane == "e2b"
+    assert check.command == (
+        "uv",
+        "run",
+        "--extra",
+        "e2b",
+        "--extra",
+        "dev",
+        "python",
+        "-m",
+        "pytest",
+        "tests/runners/test_e2b_handoff_e2e.py",
+        "-q",
+        "-s",
+    )
+    assert check.status_on_success == nightly.STATUS_VERIFIED
+    assert check.required_modules == ("e2b",)
+    assert check.required_env == ("E2B_API_KEY",)
+    assert check.required_env_values == {"CAYU_RUN_E2B_HANDOFF_E2E": "1"}
+
+
 def test_virtual_egress_opt_in_flag_must_equal_one(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

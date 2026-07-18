@@ -18,6 +18,7 @@ from cayu.egress.proxy_server import TransparentEgressProxyServer
 from cayu.runners.base import ExecCommand, Runner
 
 GUEST_CA_PATH = "/etc/cayu/ca.pem"
+DEFAULT_REMOTE_SETUP_COMMAND_TIMEOUT_SECONDS = 300
 _METADATA_ISOLATION_UNSUPPORTED_EXIT_CODE = 42
 
 ProxyServerFactory = Callable[..., TransparentEgressProxyServer]
@@ -146,7 +147,9 @@ async def run_enforcement_preflight(
             f"Runner {request.runner_kind!r} egress binding did not provide proxy_url."
         )
     # Proxy reachability and CA trust are session-wide, so one grant destination
-    # samples the positive TLS path; raw-IP probes prove runtime-wide denial.
+    # samples the positive TLS path; a direct public-IP TLS probe proves
+    # runtime-wide denial without mistaking an enforcement edge's TCP accept
+    # for usable egress.
     destination = request.egress_destinations[0]
     script = _preflight_script(
         proxy_host=endpoint.host,
@@ -188,7 +191,10 @@ async def run_enforcement_preflight(
 
 async def run_setup_commands(runner: Runner, request: VirtualEgressRunnerRequest) -> None:
     for command in request.setup_commands:
-        result = await runner.exec_system(ExecCommand.bash(command), timeout_s=300)
+        result = await runner.exec_system(
+            ExecCommand.bash(command),
+            timeout_s=DEFAULT_REMOTE_SETUP_COMMAND_TIMEOUT_SECONDS,
+        )
         if result.exit_code != 0 or result.timed_out:
             raise RuntimeError(
                 f"{request.runner_kind} setup command failed "
@@ -244,12 +250,19 @@ tls = context.wrap_socket(sock, server_hostname=destination)
 tls.close()
 print("preflight: proxy TLS completed", flush=True)
 
-def tcp_reachable(host, port):
+def tls_reachable(host, port, server_hostname):
+    direct = None
     try:
         direct = socket.create_connection((host, port), timeout=2)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        tls = context.wrap_socket(direct, server_hostname=server_hostname)
     except OSError:
+        if direct is not None:
+            direct.close()
         return False
-    direct.close()
+    tls.close()
     return True
 
 def http_request_reaches(host, port, request):
@@ -284,9 +297,16 @@ def metadata_reachable(host, port):
         host, port, token_request
     )
 
-print("preflight: probing direct 1.1.1.1:443", flush=True)
-if tcp_reachable("1.1.1.1", 443):
-    raise RuntimeError("direct egress unexpectedly reached 1.1.1.1:443")
+direct_tls_probes = (
+    ("1.1.1.1", 443, "one.one.one.one"),
+    ("8.8.8.8", 443, "dns.google"),
+)
+for host, port, server_hostname in direct_tls_probes:
+    print(f"preflight: probing direct TLS to {{host}}:{{port}}", flush=True)
+    if tls_reachable(host, port, server_hostname):
+        raise RuntimeError(
+            f"direct egress unexpectedly completed TLS to {{host}}:{{port}}"
+        )
 if {probe_metadata!r}:
     print("preflight: probing metadata 169.254.169.254:80", flush=True)
     if metadata_reachable("169.254.169.254", 80):
