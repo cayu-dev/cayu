@@ -11,7 +11,9 @@ import { StrictMode } from "react"
 import { createRoot } from "react-dom/client"
 import { Layout } from "./Layout"
 import { dashboardConfig } from "./lib/config"
+import { parseDashboardSearch, stringifyDashboardSearch } from "./lib/search-params"
 import { validateSessionHistorySearch } from "./lib/session-history-search"
+import { validateSessionIndexSearch } from "./lib/session-index-search"
 
 const AgentsPage = lazyRouteComponent(() => import("./routes/agents"), "AgentsPage")
 const ArtifactsPage = lazyRouteComponent(() => import("./routes/artifacts"), "ArtifactsPage")
@@ -57,6 +59,7 @@ const dashboardRoute = createRoute({
 const sessionsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/sessions",
+  validateSearch: validateSessionIndexSearch,
   component: SessionsPage,
 })
 
@@ -133,6 +136,8 @@ const routeTree = rootRoute.addChildren([
 const router = createRouter({
   routeTree,
   basepath: dashboardConfig.basePath === "/" ? undefined : dashboardConfig.basePath,
+  parseSearch: parseDashboardSearch,
+  stringifySearch: stringifyDashboardSearch,
   defaultPendingComponent: RoutePending,
   defaultPreload: "intent",
 })

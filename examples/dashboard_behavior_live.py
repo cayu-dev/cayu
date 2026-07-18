@@ -53,11 +53,19 @@ INTERRUPT_SESSION_ID = "dashboard-contract-interrupt"
 INTERRUPT_FAILURE_SESSION_ID = "dashboard-contract-interrupt-failure"
 RESUME_INTERRUPT_SESSION_ID = "dashboard-contract-resume-interrupt"
 REOBSERVE_SESSION_ID = "dashboard-contract-reobserve"
+FILTERED_SESSION_ID = "dashboard-contract-filtered-session"
+PAGINATED_SESSION_PREFIX = "dashboard-contract-page"
+PAGINATED_SESSION_COUNT = 101
+DISCOVERY_ENVIRONMENT = "dashboard-contract-production"
+DISCOVERY_BUDGET_ID = "dashboard-contract-budget"
+SLOW_SESSION_QUERY = "dashboard-contract-slow-query"
 AGENT_NAME = "dashboard-contract-agent"
 PROVIDER_NAME = "contract-provider"
 MODEL_NAME = "contract-model"
 PAYLOAD_MARKER = "dashboard-contract-usage"
 EVIDENCE_PREFIX = "CAYU_NIGHTLY_EVIDENCE="
+
+ObserverAbort = tuple[str, str | None, str]
 
 
 class DashboardContractProvider(ModelProvider):
@@ -140,9 +148,19 @@ class MutationDisconnectFaults:
         self.initial_mutation_ids: list[str] = []
         self.initial_mutation_requests: dict[str, int] = {}
         self.replay_requests: list[tuple[str, str]] = []
+        self.slow_summary_started = asyncio.Event()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         headers = dict(scope.get("headers", []))
+        is_summary_post = (
+            scope["type"] == "http"
+            and scope.get("method") == "POST"
+            and scope.get("path") == "/api/sessions/summary"
+        )
+        query = parse_qs(bytes(scope.get("query_string", b"")).decode("utf-8", errors="replace"))
+        if is_summary_post and query.get("q") == [SLOW_SESSION_QUERY]:
+            self.slow_summary_started.set()
+            await asyncio.sleep(1)
         is_run_post = (
             scope["type"] == "http"
             and scope.get("method") == "POST"
@@ -236,7 +254,7 @@ async def main() -> None:
     server_task = asyncio.create_task(server.serve(sockets=[listener]))
     try:
         await _wait_for_server(server, server_task)
-        evidence = await _run_browser_contract(base_url, provider)
+        evidence = await _run_browser_contract(base_url, provider, server_app)
         require_equal(
             server_app.initial_run_requests,
             2,
@@ -396,11 +414,23 @@ async def _seed_app() -> tuple[CayuApp, DashboardContractProvider, InMemorySessi
     )
     await store.update_status(SESSION_ID, SessionStatus.COMPLETED)
 
-    async def seed_completed_session(session_id: str, prompt: str) -> None:
+    async def seed_completed_session(
+        session_id: str,
+        prompt: str,
+        *,
+        parent_session_id: str | None = None,
+        causal_budget_id: str | None = None,
+        environment_name: str | None = None,
+        labels: dict[str, str] | None = None,
+    ) -> None:
         await store.create(
             RunRequest(
                 agent_name=AGENT_NAME,
                 session_id=session_id,
+                parent_session_id=parent_session_id,
+                causal_budget_id=causal_budget_id,
+                environment_name=environment_name,
+                labels=labels or {},
                 messages=[Message.text("user", prompt)],
             ),
             identity=SessionIdentity(provider_name=PROVIDER_NAME, model=MODEL_NAME),
@@ -501,11 +531,31 @@ async def _seed_app() -> tuple[CayuApp, DashboardContractProvider, InMemorySessi
         },
     )
     await store.update_status(APPROVAL_SESSION_ID, SessionStatus.INTERRUPTED)
+
+    for index in range(PAGINATED_SESSION_COUNT):
+        await seed_completed_session(
+            f"{PAGINATED_SESSION_PREFIX}-{index:03d}",
+            f"Exercise bounded session page {index}.",
+            parent_session_id=SESSION_ID,
+            causal_budget_id=DISCOVERY_BUDGET_ID,
+            environment_name=DISCOVERY_ENVIRONMENT,
+            labels={"tenant": "acme", "region": "us", "tier": "critical"},
+        )
+    await seed_completed_session(
+        FILTERED_SESSION_ID,
+        "Exercise every server-authoritative session discovery filter.",
+        parent_session_id=SESSION_ID,
+        causal_budget_id=DISCOVERY_BUDGET_ID,
+        environment_name=DISCOVERY_ENVIRONMENT,
+        labels={"tenant": "acme", "region": "us", "tier": "critical"},
+    )
     return app, provider, store
 
 
 async def _run_browser_contract(
-    base_url: str, provider: DashboardContractProvider
+    base_url: str,
+    provider: DashboardContractProvider,
+    faults: MutationDisconnectFaults,
 ) -> dict[str, object]:
     browser_failures: dict[str, list[str]] = {
         "console_errors": [],
@@ -513,7 +563,8 @@ async def _run_browser_contract(
         "request_failures": [],
         "api_errors": [],
     }
-    expected_observer_aborts: list[str] = []
+    expected_observer_aborts: list[ObserverAbort] = []
+    expected_query_aborts: list[str] = []
     expected_observer_abort_paths = {
         "/api/run",
         "/api/resume",
@@ -539,19 +590,26 @@ async def _run_browser_contract(
             browser_failures,
             expected_observer_aborts,
             expected_observer_abort_paths,
+            expected_query_aborts,
         )
         try:
-            await _exercise_dashboard(page, base_url, provider)
+            await _exercise_dashboard(page, base_url, provider, faults)
             _require_no_browser_failures(browser_failures)
             run_observer_aborts = [
-                failure
-                for failure in expected_observer_aborts
-                if re.search(r"POST .*/api/run:", failure)
+                detail
+                for path, last_event_id, detail in expected_observer_aborts
+                if path == "/api/run" and last_event_id is not None
             ]
             require_equal(
                 len(run_observer_aborts),
                 2,
-                "each recovered browser run must close exactly one completed SSE observer",
+                "each recovered browser run must close exactly one replay SSE observer; "
+                f"observed={run_observer_aborts!r}",
+            )
+            require_equal(
+                len(expected_query_aborts),
+                1,
+                "the superseded session query must abort exactly one browser request",
             )
         except BaseException:
             await _capture_diagnostics(context, page, diagnostics_dir, browser_failures)
@@ -582,23 +640,31 @@ async def _run_browser_contract(
             "filtered_failure_diagnostics",
             "transcript_filters",
             "history_navigation",
+            "session_cursor_pagination",
+            "session_filter_url_state",
+            "session_query_cancellation",
         ],
         "console_errors": 0,
         "page_errors": 0,
         "mutation_observer_aborts": len(expected_observer_aborts),
+        "session_query_aborts": len(expected_query_aborts),
         "request_failures": 0,
         "api_errors": 0,
     }
 
 
 async def _exercise_dashboard(
-    page: Page, base_url: str, provider: DashboardContractProvider
+    page: Page,
+    base_url: str,
+    provider: DashboardContractProvider,
+    faults: MutationDisconnectFaults,
 ) -> None:
     await _exercise_mutation_recovery(page, base_url)
     await page.goto(f"{base_url}/cayu/sessions", wait_until="networkidle")
     require((await page.locator("body").inner_text()).strip() != "", "dashboard rendered blank")
 
     await expect(page.get_by_role("heading", name="Sessions").first).to_be_visible()
+    await _exercise_session_discovery(page, faults)
     session_link = page.get_by_role("link", name=SESSION_ID)
     await expect(session_link).to_be_visible()
     session_row = page.get_by_role("row").filter(has_text=SESSION_ID)
@@ -662,6 +728,117 @@ async def _exercise_dashboard(
     await expect(include_thinking).to_be_checked()
     await expect(thinking_payload).to_be_visible()
     await _exercise_existing_session_mutations(page, base_url, provider)
+
+
+async def _exercise_session_discovery(
+    page: Page,
+    faults: MutationDisconnectFaults,
+) -> None:
+    await page.get_by_text("Advanced filters", exact=True).click()
+    await page.get_by_label("Agent", exact=True).fill(AGENT_NAME)
+    await page.get_by_label("Environment", exact=True).fill(DISCOVERY_ENVIRONMENT)
+    await page.get_by_label("Provider", exact=True).fill(PROVIDER_NAME)
+    await page.get_by_label("Model", exact=True).fill(MODEL_NAME)
+    await page.get_by_label("Parent session", exact=True).fill(SESSION_ID)
+    await page.get_by_label("Causal budget", exact=True).fill(DISCOVERY_BUDGET_ID)
+    await page.locator("#session-label-filter").fill("tenant=acme\ntier=critical")
+    await page.locator("#session-selector-filter").fill("region in (us,eu)\n!archived")
+    await page.get_by_role("button", name="Apply filters").click()
+
+    advanced_query = parse_qs(urlsplit(page.url).query)
+    for field in (
+        "agent_name",
+        "environment_name",
+        "provider_name",
+        "model",
+        "parent_session_id",
+        "causal_budget_id",
+        "label",
+        "label_selector",
+    ):
+        require(field in advanced_query, f"session discovery URL must preserve {field}")
+    require_equal(
+        advanced_query["label"],
+        ["tenant=acme", "tier=critical"],
+        "session discovery URL must preserve repeated exact labels",
+    )
+    require_equal(
+        advanced_query["label_selector"],
+        ["region in (us,eu)", "!archived"],
+        "session discovery URL must preserve repeated label selectors",
+    )
+    require("cursor" not in advanced_query, "changing session filters must reset the cursor")
+    await expect(page.get_by_role("link", name=FILTERED_SESSION_ID)).to_be_visible()
+    require_equal(
+        await page.locator("tbody tr").count(),
+        100,
+        "combined server session filters must retain one bounded first page",
+    )
+    await expect(page.get_by_role("link", name=f"{PAGINATED_SESSION_PREFIX}-000")).to_have_count(0)
+
+    next_page = page.get_by_role("button", name="Next page")
+    await expect(next_page).to_be_visible()
+    await next_page.click()
+    await expect(page).to_have_url(re.compile(r"[?&]cursor="))
+    await expect(page.get_by_role("link", name=f"{PAGINATED_SESSION_PREFIX}-000")).to_be_visible()
+
+    filtered_later_page_url = page.url
+    await page.reload(wait_until="networkidle")
+    await expect(page).to_have_url(filtered_later_page_url)
+    await expect(page.get_by_role("link", name=f"{PAGINATED_SESSION_PREFIX}-000")).to_be_visible()
+
+    await page.get_by_role("button", name="First page").click()
+    await expect(page).not_to_have_url(re.compile(r"[?&]cursor="))
+    await expect(page.get_by_role("link", name=FILTERED_SESSION_ID)).to_be_visible()
+    filtered_first_page_url = page.url
+    await page.go_back()
+    await expect(page).to_have_url(filtered_later_page_url)
+    await expect(page.get_by_role("link", name=f"{PAGINATED_SESSION_PREFIX}-000")).to_be_visible()
+    await page.go_forward()
+    await expect(page).to_have_url(filtered_first_page_url)
+    await expect(page.get_by_role("link", name=FILTERED_SESSION_ID)).to_be_visible()
+
+    await page.get_by_role("button", name="Clear filters").click()
+    await expect(page).to_have_url(re.compile(r"/cayu/sessions$"))
+
+    search = page.get_by_label("Search sessions")
+    await search.fill(SLOW_SESSION_QUERY)
+    await asyncio.wait_for(faults.slow_summary_started.wait(), timeout=5)
+    await search.fill(FILTERED_SESSION_ID)
+    await expect(page.get_by_role("link", name=FILTERED_SESSION_ID)).to_be_visible()
+    await asyncio.sleep(1.1)
+    await expect(page.get_by_role("link", name=FILTERED_SESSION_ID)).to_be_visible()
+    require_equal(
+        await page.locator("tbody tr").count(),
+        1,
+        "a superseded session response must not replace the active query",
+    )
+    await search.fill("dashboard-contract-pending-clear")
+    await page.get_by_role("button", name="Clear filters").click()
+    await asyncio.sleep(0.4)
+    await expect(page).to_have_url(re.compile(r"/cayu/sessions$"))
+
+    await page.get_by_label("Filter by status").select_option("completed")
+    await page.get_by_label("Filter by debug state").select_option("tool_issue")
+    await page.get_by_label("Sort sessions").select_option("created_at_asc")
+    final_query = parse_qs(urlsplit(page.url).query)
+    require_equal(final_query.get("status"), ["completed"], "status filter URL state")
+    require_equal(final_query.get("debug_state"), ["tool_issue"], "debug filter URL state")
+    require_equal(final_query.get("order_by"), ["created_at_asc"], "session order URL state")
+    await expect(page.get_by_role("link", name=SESSION_ID)).to_be_visible()
+
+    await page.get_by_role("button", name="Clear filters").click()
+    cleared_query = parse_qs(urlsplit(page.url).query)
+    require("status" not in cleared_query, "clearing filters must remove status")
+    require("debug_state" not in cleared_query, "clearing filters must remove debug state")
+    require("cursor" not in cleared_query, "clearing filters must remove the cursor")
+    require_equal(
+        cleared_query.get("order_by"),
+        ["created_at_asc"],
+        "clearing filters must preserve ordering",
+    )
+    await expect(page.get_by_label("Sort sessions")).to_have_value("created_at_asc")
+    await expect(page.get_by_role("link", name=SESSION_ID)).to_be_visible()
 
 
 async def _exercise_mutation_recovery(page: Page, base_url: str) -> None:
@@ -989,20 +1166,37 @@ async def _exercise_manual_mutation_reobservation(page: Page, base_url: str) -> 
 def _record_browser_failures(
     page: Page,
     failures: dict[str, list[str]],
-    expected_observer_aborts: list[str],
+    expected_observer_aborts: list[ObserverAbort],
     expected_observer_abort_paths: set[str],
+    expected_query_aborts: list[str],
 ) -> None:
     def record_request_failure(request: Request) -> None:
-        detail = f"{request.method} {request.url}: {request.failure or 'unknown failure'}"
-        # The client deliberately aborts only these mutation observers after a
-        # durable terminal boundary or when an explicit interrupt supersedes an
-        # active observation. Every other failed API request remains a failure.
+        path = urlsplit(request.url).path
+        headers = request.headers
+        last_event_id = headers.get("last-event-id")
+        detail = (
+            f"{request.method} {request.url}: {request.failure or 'unknown failure'} "
+            f"[mutation={headers.get('cayu-mutation-id', '-')}, "
+            f"last_event_id={last_event_id or '-'}]"
+        )
+        # The client deliberately aborts mutation observers after a durable
+        # terminal boundary or when an explicit interrupt supersedes active
+        # observation. Chromium can also classify an injected initial disconnect
+        # as ERR_ABORTED; Last-Event-ID distinguishes replay observers below.
         if (
             request.method == "POST"
-            and urlsplit(request.url).path in expected_observer_abort_paths
+            and path in expected_observer_abort_paths
             and request.failure == "net::ERR_ABORTED"
         ):
-            expected_observer_aborts.append(detail)
+            expected_observer_aborts.append((path, last_event_id, detail))
+            return
+        if (
+            request.method == "POST"
+            and urlsplit(request.url).path == "/api/sessions/summary"
+            and parse_qs(urlsplit(request.url).query).get("q") == [SLOW_SESSION_QUERY]
+            and request.failure == "net::ERR_ABORTED"
+        ):
+            expected_query_aborts.append(detail)
             return
         failures["request_failures"].append(detail)
 

@@ -266,10 +266,12 @@ export async function fetchSessionsPage(query: SessionListQuery = {}): Promise<S
 export async function fetchSessionsSummary(
   query: SessionsSummaryQuery = {},
   body: SessionsSummaryBody = {},
+  signal?: AbortSignal,
 ): Promise<SessionsSummary> {
   return requestJson<SessionsSummary>(`/sessions/summary${queryString(query)}`, {
     method: "POST",
     body: JSON.stringify(body),
+    signal,
   })
 }
 
