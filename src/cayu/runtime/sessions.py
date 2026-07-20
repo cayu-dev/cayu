@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import heapq
 import json
 import math
 from abc import ABC, abstractmethod
 from bisect import bisect_left, bisect_right
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextvars import ContextVar
 from copy import deepcopy
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any, Literal
@@ -40,7 +43,20 @@ from cayu._validation import (
 from cayu.core.events import Event, EventType, copy_event
 from cayu.core.messages import Message, MessageRole, ThinkingPart, copy_message, detach_message
 from cayu.core.thinking import ThinkingConfig
-from cayu.runtime.aggregates import AggregateAccuracy, UsageRollupStoreResult
+from cayu.runtime.aggregates import (
+    EXACT_AGGREGATE,
+    AggregateAccuracy,
+    AggregateAccuracyKind,
+    BoundedUsagePricingInputAccumulator,
+    UsageAggregateBreakdown,
+    UsageAggregateGroup,
+    UsageAggregateRemainder,
+    UsageAggregateTotals,
+    UsageRollupStoreResult,
+    add_aggregate_usage,
+    aggregate_usage_metrics_from_event_payload,
+    normalize_aggregate_event_timestamp,
+)
 from cayu.runtime.approvals import (
     ResolutionActor,
     copy_resolution_actor,
@@ -51,6 +67,7 @@ from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.runtime.structured_output import StructuredOutputSpec, copy_structured_output_spec
+from cayu.runtime.usage import UsageMetrics
 
 
 class SessionStatusConflict(ValueError):
@@ -3610,6 +3627,57 @@ class InMemorySessionStore(SessionStore):
     async def list_sessions(self, query: SessionQuery | None = None) -> SessionListResult:
         return await self._list_sessions(query, pending_interruption_cascade_only=False)
 
+    async def aggregate_operational_snapshot(
+        self,
+        filters: SessionAggregateFilter | None = None,
+    ) -> SessionOperationalSnapshot:
+        filters = copy_session_aggregate_filter(filters)
+        session_query = session_query_from_aggregate_filter(filters)
+        async with self._lock:
+            as_of = datetime.now(UTC)
+            counts = {status: 0 for status in SessionStatus}
+            total_count = 0
+            for session in self._sessions.values():
+                if _session_matches(session, session_query):
+                    counts[session.status] += 1
+                    total_count += 1
+            return SessionOperationalSnapshot(
+                as_of=as_of,
+                total_count=total_count,
+                counts_by_status=SessionStatusCounts.model_validate(counts),
+                accuracy=EXACT_AGGREGATE.model_copy(),
+            )
+
+    async def aggregate_usage(self, query: UsageRollupQuery) -> UsageRollupStoreResult:
+        query = copy_usage_rollup_query(query)
+        session_query = session_query_from_aggregate_filter(query.sessions)
+        async with self._lock:
+            as_of = datetime.now(UTC)
+            matching_session_count = 0
+            active_session_count = 0
+            for session in self._sessions.values():
+                if not _session_matches(session, session_query):
+                    continue
+                matching_session_count += 1
+                active_session_count += session.status in {
+                    SessionStatus.PENDING,
+                    SessionStatus.RUNNING,
+                    SessionStatus.INTERRUPTING,
+                }
+
+            def matching_session_records() -> Iterable[tuple[str, Iterable[EventRecord]]]:
+                for session_id, session in self._sessions.items():
+                    if _session_matches(session, session_query):
+                        yield session_id, self._session_event_records.get(session_id, ())
+
+            return _usage_rollup_from_session_records(
+                session_records=matching_session_records,
+                query=query,
+                as_of=as_of,
+                matching_session_count=matching_session_count,
+                active_session_count=active_session_count,
+            )
+
     async def list_sessions_with_pending_interruption_cascade(
         self,
         query: SessionQuery | None = None,
@@ -4643,6 +4711,337 @@ def _session_matches(session: Session, query: SessionQuery) -> bool:
             return False
     return not (
         query.environment_name is not None and session.environment_name != query.environment_name
+    )
+
+
+@dataclass
+class _UsageAccumulator:
+    session_count: int = 0
+    model_steps: int = 0
+    model_steps_with_usage: int = 0
+    usage: UsageMetrics = dataclass_field(default_factory=UsageMetrics)
+
+    def add(self, metrics: UsageMetrics | None) -> None:
+        self.model_steps += 1
+        if metrics is None:
+            return
+        self.model_steps_with_usage += 1
+        self.usage = add_aggregate_usage(self.usage, metrics)
+
+    def totals(self, *, tool_calls: int = 0) -> UsageAggregateTotals:
+        return UsageAggregateTotals(
+            session_count=self.session_count,
+            model_steps=self.model_steps,
+            model_steps_with_usage=self.model_steps_with_usage,
+            tool_calls=tool_calls,
+            usage=self.usage,
+        )
+
+
+_IN_MEMORY_USAGE_GROUP_CANDIDATE_LIMIT = 512
+_UsageGroupKey = tuple[str | None, str | None]
+_UsageGroupSortKey = tuple[bool, str, bool, str]
+_SessionRecordsFactory = Callable[[], Iterable[tuple[str, Iterable[EventRecord]]]]
+
+
+@dataclass
+class _InMemoryUsageGroupCandidates:
+    """Bounded heavy-hitter candidates for one in-memory breakdown dimension."""
+
+    limit: int = _IN_MEMORY_USAGE_GROUP_CANDIDATE_LIMIT
+    _estimates: dict[_UsageGroupKey, tuple[int, int, int]] = dataclass_field(default_factory=dict)
+    _heap: list[tuple[int, int, bool, str, bool, str, int, _UsageGroupKey]] = dataclass_field(
+        default_factory=list
+    )
+    _generation: int = 0
+    sampled: bool = False
+
+    def observe(self, key: _UsageGroupKey, metrics: UsageMetrics | None) -> None:
+        token_weight = 0 if metrics is None else metrics.total_tokens
+        current = self._estimates.get(key)
+        if current is not None:
+            self._record(key, current[0] + token_weight, current[1] + 1)
+            return
+        if len(self._estimates) < self.limit:
+            self._record(key, token_weight, 1)
+            return
+
+        self.sampled = True
+        minimum_tokens, minimum_steps, minimum_key = self._pop_minimum()
+        del self._estimates[minimum_key]
+        self._record(
+            key,
+            minimum_tokens + token_weight,
+            minimum_steps + 1,
+        )
+
+    @property
+    def keys(self) -> tuple[_UsageGroupKey, ...]:
+        return tuple(self._estimates)
+
+    def _record(self, key: _UsageGroupKey, tokens: int, steps: int) -> None:
+        self._generation += 1
+        generation = self._generation
+        self._estimates[key] = tokens, steps, generation
+        heapq.heappush(
+            self._heap,
+            (
+                tokens,
+                steps,
+                *_usage_group_identity_sort_key(key),
+                generation,
+                key,
+            ),
+        )
+        if len(self._heap) > self.limit * 2:
+            self._heap = [
+                (
+                    item_tokens,
+                    item_steps,
+                    *_usage_group_identity_sort_key(item_key),
+                    item_generation,
+                    item_key,
+                )
+                for item_key, (item_tokens, item_steps, item_generation) in (
+                    self._estimates.items()
+                )
+            ]
+            heapq.heapify(self._heap)
+
+    def _pop_minimum(self) -> tuple[int, int, _UsageGroupKey]:
+        while self._heap:
+            tokens, steps, _, _, _, _, generation, key = heapq.heappop(self._heap)
+            if self._estimates.get(key) == (tokens, steps, generation):
+                return tokens, steps, key
+        raise RuntimeError("In-memory usage candidate heap lost its retained groups.")
+
+
+def _usage_rollup_from_session_records(
+    *,
+    session_records: _SessionRecordsFactory,
+    query: UsageRollupQuery,
+    as_of: datetime,
+    matching_session_count: int,
+    active_session_count: int,
+) -> UsageRollupStoreResult:
+    totals = _UsageAccumulator()
+    pricing = BoundedUsagePricingInputAccumulator(query.pricing_input_limit)
+    provider_candidates = _InMemoryUsageGroupCandidates()
+    model_candidates = _InMemoryUsageGroupCandidates()
+    activity_session_count = 0
+    tool_calls = 0
+
+    for _, records in session_records():
+        session_has_activity = False
+        for record in records:
+            event = record.event
+            event_timestamp = normalize_aggregate_event_timestamp(event.timestamp)
+            if event_timestamp < query.start_at or event_timestamp >= query.end_at:
+                continue
+            if event.type == EventType.TOOL_CALL_STARTED:
+                session_has_activity = True
+                tool_calls += 1
+                continue
+            if event.type != EventType.MODEL_COMPLETED:
+                continue
+
+            session_has_activity = True
+            metrics = aggregate_usage_metrics_from_event_payload(event.payload)
+            totals.add(metrics)
+            provider_candidates.observe(
+                _usage_group_key(metrics, dimension="provider"),
+                metrics,
+            )
+            model_candidates.observe(
+                _usage_group_key(metrics, dimension="model"),
+                metrics,
+            )
+
+            if not query.include_pricing_inputs or pricing.truncated:
+                continue
+            pricing.add_payload(
+                effective_on=event_timestamp.date(),
+                occurrences=1,
+                payload=event.payload,
+            )
+        if session_has_activity:
+            activity_session_count += 1
+
+    pricing_items, pricing_group_count, pricing_accuracy = pricing.result()
+
+    totals.session_count = activity_session_count
+    return UsageRollupStoreResult(
+        as_of=as_of,
+        start_at=query.start_at,
+        end_at=query.end_at,
+        totals=totals.totals(tool_calls=tool_calls),
+        provider_breakdown=_bounded_in_memory_usage_breakdown(
+            session_records,
+            query=query,
+            limit=query.group_limit,
+            dimension="provider",
+            candidates=provider_candidates,
+        ),
+        model_breakdown=_bounded_in_memory_usage_breakdown(
+            session_records,
+            query=query,
+            limit=query.group_limit,
+            dimension="model",
+            candidates=model_candidates,
+        ),
+        pricing_inputs=pricing_items,
+        pricing_inputs_included=query.include_pricing_inputs,
+        pricing_input_group_count=pricing_group_count,
+        pricing_inputs_accuracy=pricing_accuracy,
+        active_session_count=active_session_count,
+        matching_session_count=matching_session_count,
+    )
+
+
+def _bounded_in_memory_usage_breakdown(
+    session_records: _SessionRecordsFactory,
+    *,
+    query: UsageRollupQuery,
+    limit: int,
+    dimension: Literal["provider", "model"],
+    candidates: _InMemoryUsageGroupCandidates,
+) -> UsageAggregateBreakdown:
+    accumulators = _accumulate_usage_group_batch(
+        session_records,
+        query=query,
+        dimension=dimension,
+        keys=candidates.keys,
+    )
+    visible_items = sorted(accumulators.items(), key=_usage_group_rank_key)[:limit]
+
+    visible = tuple(
+        UsageAggregateGroup(
+            provider_name=key[0],
+            model=key[1],
+            totals=accumulator.totals(),
+        )
+        for key, accumulator in visible_items
+    )
+    if candidates.sampled:
+        return UsageAggregateBreakdown(
+            groups=visible,
+            remainder=None,
+            accuracy=AggregateAccuracy(
+                kind=AggregateAccuracyKind.SAMPLED,
+                reason=(
+                    f"Distinct {dimension} groups exceed the bounded in-memory "
+                    "heavy-hitter candidate limit."
+                ),
+                limit=candidates.limit,
+            ),
+        )
+
+    group_count = len(candidates.keys)
+    if group_count <= limit:
+        return UsageAggregateBreakdown(
+            groups=visible,
+            remainder=None,
+            accuracy=EXACT_AGGREGATE.model_copy(),
+        )
+
+    remainder = _accumulate_usage_remainder(
+        session_records,
+        query=query,
+        dimension=dimension,
+        visible_keys={(group.provider_name, group.model) for group in visible},
+    )
+    return UsageAggregateBreakdown(
+        groups=visible,
+        remainder=UsageAggregateRemainder(
+            group_count=group_count - len(visible),
+            totals=remainder.totals(),
+        ),
+        accuracy=AggregateAccuracy(
+            kind=AggregateAccuracyKind.TRUNCATED,
+            reason=f"Distinct {dimension} groups exceed group_limit.",
+            limit=limit,
+        ),
+    )
+
+
+def _accumulate_usage_group_batch(
+    session_records: _SessionRecordsFactory,
+    *,
+    query: UsageRollupQuery,
+    dimension: Literal["provider", "model"],
+    keys: tuple[_UsageGroupKey, ...],
+) -> dict[_UsageGroupKey, _UsageAccumulator]:
+    accumulators = {key: _UsageAccumulator() for key in keys}
+    for _, records in session_records():
+        seen: set[_UsageGroupKey] = set()
+        for record in records:
+            event = record.event
+            if not _aggregate_model_event_is_in_window(event, query):
+                continue
+            metrics = aggregate_usage_metrics_from_event_payload(event.payload)
+            key = _usage_group_key(metrics, dimension=dimension)
+            accumulator = accumulators.get(key)
+            if accumulator is None:
+                continue
+            accumulator.add(metrics)
+            seen.add(key)
+        for key in seen:
+            accumulators[key].session_count += 1
+    return accumulators
+
+
+def _accumulate_usage_remainder(
+    session_records: _SessionRecordsFactory,
+    *,
+    query: UsageRollupQuery,
+    dimension: Literal["provider", "model"],
+    visible_keys: set[_UsageGroupKey],
+) -> _UsageAccumulator:
+    remainder = _UsageAccumulator()
+    for _, records in session_records():
+        session_has_remainder = False
+        for record in records:
+            event = record.event
+            if not _aggregate_model_event_is_in_window(event, query):
+                continue
+            metrics = aggregate_usage_metrics_from_event_payload(event.payload)
+            if _usage_group_key(metrics, dimension=dimension) in visible_keys:
+                continue
+            remainder.add(metrics)
+            session_has_remainder = True
+        remainder.session_count += session_has_remainder
+    return remainder
+
+
+def _aggregate_model_event_is_in_window(event: Event, query: UsageRollupQuery) -> bool:
+    if event.type != EventType.MODEL_COMPLETED:
+        return False
+    timestamp = normalize_aggregate_event_timestamp(event.timestamp)
+    return query.start_at <= timestamp < query.end_at
+
+
+def _usage_group_key(
+    metrics: UsageMetrics | None,
+    *,
+    dimension: Literal["provider", "model"],
+) -> _UsageGroupKey:
+    provider_name = None if metrics is None else metrics.provider_name
+    model = None if metrics is None or dimension == "provider" else metrics.model
+    return provider_name, model
+
+
+def _usage_group_identity_sort_key(key: _UsageGroupKey) -> _UsageGroupSortKey:
+    return key[0] is None, key[0] or "", key[1] is None, key[1] or ""
+
+
+def _usage_group_rank_key(
+    item: tuple[_UsageGroupKey, _UsageAccumulator],
+) -> tuple[int, int, bool, str, bool, str]:
+    key, accumulator = item
+    return (
+        -accumulator.usage.total_tokens,
+        -accumulator.model_steps,
+        *_usage_group_identity_sort_key(key),
     )
 
 

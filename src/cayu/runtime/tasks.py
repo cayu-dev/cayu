@@ -11,7 +11,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from cayu._validation import copy_json_object, require_clean_nonblank, require_nonblank
-from cayu.runtime.aggregates import AggregateAccuracy
+from cayu.runtime.aggregates import EXACT_AGGREGATE, AggregateAccuracy
 
 
 class TaskStatus(StrEnum):
@@ -435,6 +435,27 @@ class InMemoryTaskStore(TaskStore):
             tasks = _sort_tasks(tasks, query.order_by)
             page = tasks[query.offset : query.offset + query.limit]
             return [task.model_copy(deep=True) for task in page]
+
+    async def aggregate_operational_snapshot(
+        self,
+        filters: TaskAggregateFilter | None = None,
+    ) -> TaskOperationalSnapshot:
+        filters = copy_task_aggregate_filter(filters)
+        task_query = task_query_from_aggregate_filter(filters)
+        async with self._lock:
+            as_of = datetime.now(UTC)
+            counts = {status: 0 for status in TaskStatus}
+            total_count = 0
+            for task in self._tasks.values():
+                if _task_matches(task, task_query):
+                    counts[task.status] += 1
+                    total_count += 1
+            return TaskOperationalSnapshot(
+                as_of=as_of,
+                total_count=total_count,
+                counts_by_status=TaskStatusCounts.model_validate(counts),
+                accuracy=EXACT_AGGREGATE.model_copy(),
+            )
 
     async def start_task(
         self,
