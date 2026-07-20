@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+import subprocess
 import tomllib
 from pathlib import Path
 
@@ -12,6 +14,14 @@ from cayu.runtime.context import (
 )
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+_INTERNAL_MARKDOWN_REFERENCE_PATTERNS = (
+    re.compile(r"https://github\.com/cayu-dev/cayu/(?:issues|pull)/[0-9]+", re.I),
+    re.compile(r"(?:\.\./)+(?:issues|pull)/[0-9]+", re.I),
+    re.compile(r"\b(?:cayu|cayu-dev/cayu)#[0-9]+\b", re.I),
+    re.compile(r"(?<![A-Za-z0-9_/-])#[0-9]+\b"),
+    re.compile(r"\bpre-#[0-9]+", re.I),
+    re.compile(r"\bmetadata-isolation-[0-9a-f]{8,}\b", re.I),
+)
 
 
 def _section(path: Path, *, start: str, end: str) -> str:
@@ -84,7 +94,8 @@ def test_readme_surfaces_reviewed_knowledge_and_links_runtime_contracts() -> Non
 
 def test_release_facing_metadata_uses_public_urls() -> None:
     readme = (_REPO_ROOT / "README.md").read_text(encoding="utf-8")
-    assert "https://github.com/vertexkg/cayu" not in readme
+    private_repository_url = "https://github.com/" + "vertex" + "kg/cayu"
+    assert private_repository_url not in readme
 
     with (_REPO_ROOT / "pyproject.toml").open("rb") as source:
         project = tomllib.load(source)["project"]
@@ -96,6 +107,79 @@ def test_release_facing_metadata_uses_public_urls() -> None:
         "Issues": "https://github.com/cayu-dev/cayu/issues",
         "Changelog": "https://github.com/cayu-dev/cayu/blob/main/docs/release-notes.md",
     }
+
+
+def test_tracked_tree_excludes_private_and_internal_identifiers() -> None:
+    forbidden_terms = ("vertex" + "kg", "lane" + "-" + "agent")
+    tracked_paths = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=_REPO_ROOT,
+        check=True,
+        capture_output=True,
+    ).stdout.lower()
+    assert all(term.encode("utf-8") not in tracked_paths for term in forbidden_terms)
+
+    completed = subprocess.run(
+        [
+            "git",
+            "grep",
+            "--ignore-case",
+            "--line-number",
+            *(argument for term in forbidden_terms for argument in ("-e", term)),
+        ],
+        cwd=_REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 1, completed.stdout or completed.stderr
+
+
+def test_public_markdown_excludes_internal_tracker_and_run_identifiers() -> None:
+    tracked_paths = subprocess.run(
+        ["git", "ls-files", "-z", "--", "*.md"],
+        cwd=_REPO_ROOT,
+        check=True,
+        capture_output=True,
+    ).stdout.split(b"\0")
+
+    for encoded_path in tracked_paths:
+        if not encoded_path:
+            continue
+        relative_path = encoded_path.decode("utf-8")
+        contents = (_REPO_ROOT / relative_path).read_text(encoding="utf-8")
+        matches = [
+            match.group(0)
+            for pattern in _INTERNAL_MARKDOWN_REFERENCE_PATTERNS
+            if (match := pattern.search(contents)) is not None
+        ]
+        assert not matches, (
+            f"{relative_path}: internal tracker or run identifiers remain: {matches}"
+        )
+
+
+def test_internal_markdown_reference_patterns_preserve_generic_pull_syntax() -> None:
+    rejected = (
+        "tracked in #" + "174",
+        "cayu#" + "16",
+        "Issue #" + "243",
+        "(#" + "212)",
+        "pre-#" + "336",
+        "https://github.com/cayu-dev/cayu/issues/" + "243",
+        "../../../pull/" + "352",
+        "metadata-isolation-" + "2e0cb47627d6",
+    )
+    for reference in rejected:
+        assert any(
+            pattern.search(reference) for pattern in _INTERNAL_MARKDOWN_REFERENCE_PATTERNS
+        ), reference
+
+    generic_repository_pull = "owner/repo#" + "123"
+    assert all(
+        pattern.search(generic_repository_pull) is None
+        for pattern in _INTERNAL_MARKDOWN_REFERENCE_PATTERNS
+    )
 
 
 def test_application_anatomy_guide_is_linked_from_release_facing_docs() -> None:

@@ -1,7 +1,5 @@
 # AWS Bedrock and Lambda MicroVM design record
 
-Issues: [#212](https://github.com/vertexkg/cayu/issues/212), [#78](https://github.com/vertexkg/cayu/issues/78)  
-
 ## Outcome
 
 The design consists of two independent, first-party AWS adapters:
@@ -227,7 +225,7 @@ sync Boto3 calls and run off the event loop. The Bedrock stream bridge likewise 
 Boto3 event stream on a worker thread and forwards events through a bounded async queue;
 cancellation closes the SDK event stream and joins the worker within a bounded timeout.
 
-## Bedrock implementation (#212)
+## Bedrock implementation
 
 ### Implementation
 
@@ -293,7 +291,7 @@ Register it in
 `scripts/nightly_verification.py` as an opt-in provider-contract check that reports `skipped`
 when prerequisites are absent. It is not CI-enforced.
 
-## Lambda MicroVM implementation (#78)
+## Lambda MicroVM implementation
 
 ### Implementation
 

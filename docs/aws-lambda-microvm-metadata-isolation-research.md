@@ -13,9 +13,9 @@ The following is established:
 
 - AWS documents no first-class Lambda MicroVM setting for disabling or filtering metadata access. `RunMicrovm` exposes ingress connectors, egress connectors, and an optional execution role, but no metadata option ([RunMicrovm API](https://docs.aws.amazon.com/lambda/latest/microvm-api/API_RunMicrovm.html)).
 - Customer-managed network connectors configure VPC egress through subnets, security groups, and an IPv4/DualStack selection; they expose no link-local route or metadata policy ([MicroVM networking](https://docs.aws.amazon.com/lambda/latest/dg/microvms-networking.html), [CreateNetworkConnector API](https://docs.aws.amazon.com/lambda/latest/lambda-core/API_CreateNetworkConnector.html), [connector configuration type](https://docs.aws.amazon.com/lambda/latest/lambda-core/API_NetworkConnectorConfiguration.html)).
-- Cayu's earlier real-AWS runs established that a broad guest block of `169.254.169.254` disrupted the managed ingress path, while the working configuration allowed a guest TCP connection to `169.254.169.254:80` ([issue #336](https://github.com/vertexkg/cayu/issues/336), [PR #352 real-AWS evidence](https://github.com/vertexkg/cayu/pull/352)).
+- Cayu's earlier real-AWS verification established that a broad guest block of `169.254.169.254` disrupted the managed ingress path, while the working configuration allowed a guest TCP connection to `169.254.169.254:80`.
 - AWS explicitly documents that Lambda MicroVM images granted `additionalOsCapabilities=["ALL"]` can create network namespaces and run eBPF programs ([MicroVM images: operating system capabilities](https://docs.aws.amazon.com/lambda/latest/dg/microvms-images.html)). Cayu now uses that documented network-namespace capability.
-- In the final real-AWS run, the trusted root sidecar retained managed ingress while ordinary commands ran as UID/GID 1000 with no capabilities in a network namespace with no default route. The namespace could reach only a fixed-port relay to the private Cayu proxy. Metadata and direct public egress were denied, while the scoped request, revocation, workspace release, and cleanup all passed ([PR #352](https://github.com/vertexkg/cayu/pull/352)).
+- In the final real-AWS verification, the trusted root sidecar retained managed ingress while ordinary commands ran as UID/GID 1000 with no capabilities in a network namespace with no default route. The namespace could reach only a fixed-port relay to the private Cayu proxy. Metadata and direct public egress were denied, while the scoped request, revocation, workspace release, and cleanup all passed.
 
 The accurate product statement is:
 
@@ -60,9 +60,9 @@ Lambda Managed Instances are a separate product with capacity-provider and VPC n
 
 ## What the Cayu experiment established
 
-The pre-#336 AWS run reported that a broad guest block of `169.254.169.254` prevented the managed sidecar from serving commands; disabling that probe restored operation ([issue #336](https://github.com/vertexkg/cayu/issues/336), [PR #329](https://github.com/vertexkg/cayu/pull/329)). This is strong evidence of a dependency or conflict in that image and base-image version, but AWS does not document the internal mechanism. Calling it a definitely shared AWS endpoint is an inference.
+An earlier AWS run reported that a broad guest block of `169.254.169.254` prevented the managed sidecar from serving commands; disabling that probe restored operation. This is strong evidence of a dependency or conflict in that image and base-image version, but AWS does not document the internal mechanism. Calling it a definitely shared AWS endpoint is an inference.
 
-The #336 run `metadata-isolation-2e0cb47627d6` established the following at the real boundary ([PR #352](https://github.com/vertexkg/cayu/pull/352)):
+A later metadata-isolation run established the following at the real boundary:
 
 - managed sidecar and private scoped proxy request worked;
 - direct public-IP egress was denied;
@@ -90,7 +90,7 @@ The replacement design uses a dedicated `cayu-agent` network namespace:
 - the Cayu broker still enforces the virtual token and exact host, method, and
   path at the application layer.
 
-The final run `metadata-isolation-72c8f35f51a6` established on real AWS that
+The final verification established on real AWS that
 managed sidecar ingress and proxy reachability remained verified, metadata and
 direct public egress were denied, AWS credential material and the vault canary
 were absent, and required metadata isolation, scoped request, revocation,

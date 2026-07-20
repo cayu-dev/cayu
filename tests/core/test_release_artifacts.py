@@ -47,11 +47,13 @@ def _write_wheel(
     path: Path,
     names: set[str],
     *,
+    contents_by_name: dict[str, str] | None = None,
     third_party_notice: str | None = None,
 ) -> None:
+    contents_by_name = contents_by_name or {}
     with zipfile.ZipFile(path, "w") as archive:
         for name in names:
-            contents = ""
+            contents = contents_by_name.get(name, "")
             if name == "cayu/server/dashboard/THIRD_PARTY_LICENSES.md":
                 contents = (
                     third_party_notice
@@ -59,6 +61,27 @@ def _write_wheel(
                     else "\n".join(artifact_validator["_THIRD_PARTY_LICENSE_MARKERS"])
                 )
             archive.writestr(name, contents)
+
+
+def _write_sdist(
+    path: Path,
+    *,
+    additional_names: set[str] | None = None,
+    contents_by_name: dict[str, str] | None = None,
+) -> None:
+    additional_names = additional_names or set()
+    contents_by_name = contents_by_name or {}
+    names = artifact_validator["_SDIST_REQUIRED"] | additional_names
+    third_party_notice = "\n".join(artifact_validator["_THIRD_PARTY_LICENSE_MARKERS"])
+    with tarfile.open(path, "w:gz") as archive:
+        for relative_name in names:
+            contents = contents_by_name.get(relative_name, "")
+            if relative_name == "src/cayu/server/dashboard/THIRD_PARTY_LICENSES.md":
+                contents = third_party_notice
+            data = contents.encode()
+            member = tarfile.TarInfo(f"cayu-0.1.0/{relative_name}")
+            member.size = len(data)
+            archive.addfile(member, io.BytesIO(data))
 
 
 def test_validate_wheel_requires_application_anatomy_guide(tmp_path) -> None:
@@ -100,6 +123,69 @@ def test_validate_wheel_rejects_incomplete_third_party_license_inventory(tmp_pat
 
     with pytest.raises(ValueError, match="third-party license inventory is incomplete"):
         validate_wheel(wheel)
+
+
+def test_validate_wheel_rejects_non_public_identifiers(tmp_path) -> None:
+    wheel = tmp_path / "non-public-identifier.whl"
+    private_organization = "vertex" + "kg"
+    _write_wheel(
+        wheel,
+        _valid_wheel_names(),
+        contents_by_name={"cayu/__init__.py": f'REPOSITORY_OWNER = "{private_organization}"\n'},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="non-public identifier included in cayu/__init__.py",
+    ):
+        validate_wheel(wheel)
+
+
+def test_validate_sdist_rejects_non_public_identifiers_case_insensitively(
+    tmp_path,
+) -> None:
+    sdist = tmp_path / "non-public-identifier.tar.gz"
+    internal_application = ("lane" + "-" + "agent").upper()
+    _write_sdist(
+        sdist,
+        contents_by_name={"README.md": f"Internal consumer: {internal_application}\n"},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"non-public identifier included in cayu-0\.1\.0/README\.md",
+    ):
+        validate_sdist(sdist)
+
+
+def test_validate_wheel_rejects_non_public_identifiers_in_member_paths(tmp_path) -> None:
+    wheel = tmp_path / "non-public-path.whl"
+    private_organization = ("vertex" + "kg").upper()
+    _write_wheel(
+        wheel,
+        _valid_wheel_names() | {f"cayu/{private_organization}.py"},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="non-public identifier included in archive path",
+    ):
+        validate_wheel(wheel)
+
+
+def test_validate_sdist_rejects_non_public_identifiers_in_member_paths(tmp_path) -> None:
+    sdist = tmp_path / "non-public-path.tar.gz"
+    internal_application = "lane" + "-" + "agent"
+    _write_sdist(
+        sdist,
+        additional_names={f"src/cayu/{internal_application}.py"},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="non-public identifier included in archive path",
+    ):
+        validate_sdist(sdist)
 
 
 def test_validate_sdist_rejects_tests_tree(tmp_path) -> None:

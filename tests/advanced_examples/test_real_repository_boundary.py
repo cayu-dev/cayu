@@ -23,8 +23,10 @@ class RecordingGitHubClient:
         self.published_branch = ""
         self.published_sha = ""
         self.ensure_calls = 0
+        self.repository_calls: list[tuple[str, str, str]] = []
 
     async def get_pull(self, owner: str, repo: str, number: int) -> dict[str, Any]:
+        self.repository_calls.append(("get_pull", owner, repo))
         if number == 1:
             return {
                 "number": 1,
@@ -46,6 +48,7 @@ class RecordingGitHubClient:
         repo: str,
         number: int,
     ) -> list[dict[str, Any]]:
+        self.repository_calls.append(("list_pull_files", owner, repo))
         if number == 1:
             return [{"filename": "test_calculator.py"}]
         return [{"filename": "calculator.py"}, {"filename": "test_calculator.py"}]
@@ -60,6 +63,7 @@ class RecordingGitHubClient:
         base: str,
         body: str,
     ) -> dict[str, Any]:
+        self.repository_calls.append(("ensure_pull", owner, repo))
         self.ensure_calls += 1
         self.published_branch = head
         self.published_sha = _git(
@@ -77,6 +81,7 @@ class RecordingGitHubClient:
         head: str,
         base: str,
     ) -> list[dict[str, Any]]:
+        self.repository_calls.append(("list_open_pulls", owner, repo))
         return [{"number": 2, "head": {"ref": head}, "base": {"ref": base}}]
 
 
@@ -147,8 +152,8 @@ def test_real_repository_boundary_pushes_and_verifies_one_pull_request(tmp_path:
     github = RecordingGitHubClient(source_sha, origin)
     boundary = RealRepositoryBoundary(
         LiveRepositoryConfig(
-            owner="vertexkg",
-            repo="fixture",
+            owner="fixture-owner",
+            repo="fixture-repository",
             source_pull_number=1,
             token="test-token",
             clone_url=str(origin),
@@ -174,6 +179,16 @@ def test_real_repository_boundary_pushes_and_verifies_one_pull_request(tmp_path:
     )
     assert all(promotion.assertions.values())
     assert github.ensure_calls == 2
+    assert {method for method, _, _ in github.repository_calls} == {
+        "ensure_pull",
+        "get_pull",
+        "list_open_pulls",
+        "list_pull_files",
+    }
+    assert all(
+        (owner, repo) == ("fixture-owner", "fixture-repository")
+        for _, owner, repo in github.repository_calls
+    )
     assert promotion.pull_request_number == 2
     assert _git(
         f"--git-dir={origin}",
@@ -190,7 +205,7 @@ def test_live_repository_config_is_explicit_and_requires_api_authority(
 
     monkeypatch.setenv(
         "CAYU_REPO_MAINTAINER_REPOSITORY",
-        "vertexkg/cayu-repo-maintainer-fixture",
+        "fixture-owner/fixture-repository",
     )
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     with pytest.raises(RuntimeError, match="GITHUB_TOKEN"):
@@ -201,7 +216,7 @@ def test_live_repository_config_is_explicit_and_requires_api_authority(
     config = LiveRepositoryConfig.from_environment()
 
     assert config is not None
-    assert config.full_name == "vertexkg/cayu-repo-maintainer-fixture"
+    assert config.full_name == "fixture-owner/fixture-repository"
     assert config.source_pull_number == 7
 
 
@@ -209,8 +224,8 @@ def test_real_gate_divergence_fails_before_push_or_pull_request(tmp_path: Path) 
     origin, source_sha = _seed_remote(tmp_path)
     github = RecordingGitHubClient(source_sha, origin)
     config = LiveRepositoryConfig(
-        owner="vertexkg",
-        repo="fixture",
+        owner="fixture-owner",
+        repo="fixture-repository",
         source_pull_number=1,
         token="test-token",
         clone_url=str(origin),

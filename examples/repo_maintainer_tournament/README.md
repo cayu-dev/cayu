@@ -28,8 +28,8 @@ OPENAI_API_KEY=... uv run python -m examples.repo_maintainer_tournament.app --mo
 # Claude
 ANTHROPIC_API_KEY=... uv run python -m examples.repo_maintainer_tournament.app --mode live --provider anthropic
 
-# Real private-repository boundary
-export CAYU_REPO_MAINTAINER_REPOSITORY=vertexkg/cayu-repo-maintainer-fixture
+# Real repository boundary
+export CAYU_REPO_MAINTAINER_REPOSITORY=owner/repository
 export CAYU_REPO_MAINTAINER_SOURCE_PULL=1
 export GITHUB_TOKEN=...
 OPENAI_API_KEY=... uv run python -m examples.repo_maintainer_tournament.app \

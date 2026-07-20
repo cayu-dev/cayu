@@ -54,6 +54,10 @@ _THIRD_PARTY_LICENSE_MARKERS = {
     "## tw-animate-css -",
 }
 _FORBIDDEN_PARTS = {".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".venv", "dist"}
+_NON_PUBLIC_IDENTIFIERS = (
+    b"vertex" + b"kg",
+    b"lane" + b"-" + b"agent",
+)
 
 
 def _fail(message: str) -> None:
@@ -61,6 +65,9 @@ def _fail(message: str) -> None:
 
 
 def _validate_safe_path(name: str, *, archive: Path) -> PurePosixPath:
+    normalized_name = name.casefold().encode("utf-8")
+    if any(identifier in normalized_name for identifier in _NON_PUBLIC_IDENTIFIERS):
+        _fail(f"{archive}: non-public identifier included in archive path: {name}")
     path = PurePosixPath(name)
     if path.is_absolute() or ".." in path.parts:
         _fail(f"{archive}: unsafe archive path: {name}")
@@ -80,6 +87,17 @@ def _validate_third_party_licenses(contents: bytes, *, archive: Path) -> None:
     missing = sorted(marker for marker in _THIRD_PARTY_LICENSE_MARKERS if marker not in notice)
     if missing:
         _fail(f"{archive}: third-party license inventory is incomplete: {', '.join(missing)}")
+
+
+def _validate_publication_contents(
+    contents: bytes,
+    *,
+    archive: Path,
+    member_name: str,
+) -> None:
+    normalized = contents.lower()
+    if any(identifier in normalized for identifier in _NON_PUBLIC_IDENTIFIERS):
+        _fail(f"{archive}: non-public identifier included in {member_name}")
 
 
 def validate_sdist(archive: Path) -> None:
@@ -111,6 +129,17 @@ def validate_sdist(archive: Path) -> None:
 
     notice_name = f"{root}/src/cayu/server/dashboard/THIRD_PARTY_LICENSES.md"
     with tarfile.open(archive, "r:gz") as source:
+        for member in source.getmembers():
+            if not member.isfile():
+                continue
+            extracted = source.extractfile(member)
+            if extracted is None:
+                raise ValueError(f"{archive}: could not read archive member {member.name}")
+            _validate_publication_contents(
+                extracted.read(),
+                archive=archive,
+                member_name=member.name,
+            )
         extracted = source.extractfile(notice_name)
         if extracted is None:
             raise ValueError(f"{archive}: could not read third-party license inventory")
@@ -130,6 +159,14 @@ def validate_wheel(archive: Path) -> None:
     if missing:
         _fail(f"{archive}: missing required wheel files: {', '.join(missing)}")
     with zipfile.ZipFile(archive) as wheel:
+        for member in wheel.infolist():
+            if member.is_dir():
+                continue
+            _validate_publication_contents(
+                wheel.read(member),
+                archive=archive,
+                member_name=member.filename,
+            )
         notice_contents = wheel.read("cayu/server/dashboard/THIRD_PARTY_LICENSES.md")
     _validate_third_party_licenses(notice_contents, archive=archive)
     if not any(

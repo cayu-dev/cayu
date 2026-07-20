@@ -112,9 +112,9 @@ The claim is origin-based authority control, not prompt-injection detection.
 
 ## Observed live evidence
 
-The following observations were recorded on July 11, 2026 from the PR #225
-branch. They are evidence that the examples exercised real provider and external
-boundaries; they are not universal benchmarks or pricing guarantees.
+The following observations were recorded during credentialed verification on
+July 11, 2026. They are evidence that the examples exercised real provider and
+external boundaries; they are not universal benchmarks or pricing guarantees.
 
 | Scenario | Provider and model | Trials | Observed result |
 | --- | --- | ---: | --- |

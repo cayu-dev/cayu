@@ -77,8 +77,7 @@ startup and cleanup under the explicit host or process entrypoint that owns them
 
 `cayu console`, `cayu inspect`, and `cayu check` use the declared factory today.
 Server, script, and worker integrations should follow the same contract, but
-`cayu server`, `cayu script`, and `cayu worker` are roadmap work tracked by
-issues #233, #234, and #236; they are not shipped commands.
+`cayu server`, `cayu script`, and `cayu worker` are not shipped commands.
 
 ## Console contract
 

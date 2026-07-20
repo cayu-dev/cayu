@@ -1,7 +1,7 @@
 # Nightly verification
 
 **Status:** capability-report runner exists; scheduled GitHub Actions automation
-is still future work and is tracked in #174.
+is not yet implemented.
 
 Run the current report with:
 
@@ -450,5 +450,5 @@ No capability in the current runner is classified as `unclaimed`, every
 registered successful check reports `hermetic` or `verified`, and the controlled
 fault-injection checks documented above are implemented.
 
-Scheduled automation in #174 should decide which skipped or unclaimed statuses
-are accepted for the nightly environment and which should fail the workflow.
+Scheduled automation should decide which skipped or unclaimed statuses are
+accepted for the nightly environment and which should fail the workflow.

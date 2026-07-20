@@ -46,9 +46,8 @@ cost-optimization examples:
   compares compacted and uncompacted branches, then runs evaluation and repair
   as separately attributed workflow sessions. A caller-supplied model catalog
   adds a provenance-gated, retry-inclusive dollar comparison across the paired
-  branch sessions. Issue
-  [#243](https://github.com/vertexkg/cayu/issues/243) will strengthen this into
-  an explicit same-checkpoint, pre-expiry compaction lifecycle.
+  branch sessions. It does not provide an explicit same-checkpoint, pre-expiry
+  compaction lifecycle.
 
 The other three advanced examples focus on authority during approval,
 verified repository repair, and taint-preserving incident response. They may
@@ -116,12 +115,12 @@ The intended application strategy is:
 6. fork full and compacted views from that same resolved checkpoint for paired
    evidence.
 
-PR #65 supplies the cache-aware compactor and paired bounded-control example.
-It intentionally does not add a hidden timer. Issue #243 owns normalized cache
-observations, the deadline decision, explicit `compact_session` operation,
-stale-version/idempotency protection, app-owned scheduling recipe, and
-same-checkpoint fork views. An unknown deadline or unknown economic result must
-remain explicit; neither should be silently treated as permission to spend.
+The cache-aware compactor and paired bounded-control example intentionally do
+not add a hidden timer or claim to provide normalized cache observations, the
+deadline decision, an explicit `compact_session` operation,
+stale-version/idempotency protection, app-owned scheduling, or same-checkpoint
+fork views. An unknown deadline or unknown economic result must remain
+explicit; neither should be silently treated as permission to spend.
 
 ## Start here
 

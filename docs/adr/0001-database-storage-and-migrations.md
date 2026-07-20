@@ -5,13 +5,14 @@
 - **Supersedes:** the ad-hoc `CREATE TABLE IF NOT EXISTS`-on-first-use scheme in
   `src/cayu/storage/*`.
 - **Source:** `cayu-database-storage-plan.html` (storage architecture plan), plus
-  review of the Postgres `SessionStore`/`TaskStore` backend (cayu#16) and findings
-  from running lane-agent on it (cayu#32).
+  review of the Postgres `SessionStore`/`TaskStore` backend and findings from its
+  first consumer application.
 
 > **Greenfield assumption.** Nothing is released yet; every schema, table name, and
-> default is freely modifiable. The only consumer (lane-agent) is a disposable test
-> deployment whose database can be recreated at will. We therefore design for the
-> *correct* end state, not for backward compatibility — there is no legacy to carry.
+> default is freely modifiable. The only consumer is an early internal application
+> with a disposable test deployment whose database can be recreated at will. We
+> therefore design for the *correct* end state, not for backward compatibility —
+> there is no legacy to carry.
 > Past incidents (e.g. the `processing_start_at` crash) are cited only as
 > motivation for the design, not as compatibility constraints.
 
@@ -28,15 +29,16 @@ lazily on first store use**, with:
 
 - **no revision record** — nothing says which schema version a Postgres DB is at;
 - **no fail-fast** — an app binary expecting a column the DB lacks just crashes at
-  query time (this hit lane-agent: a new `processing_start_at` column never got
-  added to the existing prod table → `UndefinedColumn` crash-loop);
+  query time (an early consumer application hit this when a new
+  `processing_start_at` column never got added to the existing prod table →
+  `UndefinedColumn` crash-loop);
 - **no concurrency coordination** — two stores sharing a pool
   (`PostgresSessionStore` + `PostgresTaskStore`, the production pattern) each run
   the full DDL; Postgres `CREATE … IF NOT EXISTS` is **not** atomic against a
   concurrent creator and can raise a duplicate-object error at startup;
 - **unprefixed table names** (`sessions`, `events`, `tasks`, `checkpoints`,
   `transcript_messages`) that can **collide** with an app's own tables in a shared
-  database (lane-agent's `sessions`-like app tables live in the same DB).
+  database (the first consumer's `sessions`-like app tables live in the same DB).
 
 The **SQLite** backend is further along: it already stamps `PRAGMA user_version`
 (currently `SCHEMA_VERSION = 6`) and fails fast on a too-new or unrecognized
@@ -123,11 +125,11 @@ SQLite-specific. This ADR generalizes versioning across backends: SQLite's
 | Q1 | Down-migrations & app rollback | **Forward-only**, no down-migrations. App rollback is safe **only across additive revisions** — the prior binary still satisfies the DB's `compatible_from` floor (Decision 7), so it validates. Across a **breaking** revision, an app-only rollback fails validation ("DB too new") and requires a DB **restore/export** to the pre-migration state. | Down-migrations double the test surface and are rarely safe on live data; the compatibility floor makes "can I roll back?" a precise, checkable rule. |
 | Q2 | Compatibility window | Each package declares `[min_supported_revision, latest_revision]`; startup validates per Decision 7. | Lets one binary span additive revisions; makes too-old / incompatibly-new explicit. |
 | Q3 | What may a **patch** release change? | **Additive revisions only**; **breaking** changes require a minor/major. Patch migrations apply via the **standard deploy `migrate` step** (no patch-specific manual step), and because they're additive, rolling deploys and rollbacks stay safe. | Keeps patch upgrades safe and reversible without a special path, and consistent with explicit-migrate (Decisions 6–7) — no silent startup DDL. |
-| Q4 | Auto-create schema in **production**? | **No by default for Postgres.** Default startup mode = `validate`; `create`/`migrate` are explicit. Keep auto-`create` default for SQLite/in-memory (dev/test). | Silent DDL-on-import is how the `processing_start_at` crash happened; prod schema should be a deliberate step. lane-agent (greenfield/test) builds in the explicit step from the start. |
+| Q4 | Auto-create schema in **production**? | **No by default for Postgres.** Default startup mode = `validate`; `create`/`migrate` are explicit. Keep auto-`create` default for SQLite/in-memory (dev/test). | Silent DDL-on-import is how the `processing_start_at` crash happened; prod schema should be a deliberate step. The greenfield test consumer builds in the explicit step from the start. |
 | Q5 | Auto-migrate in production? | **Opt-in only**, never on import; always under the backend lock. | Prevents N app instances racing to migrate. |
 | Q6 | Multi-instance coordination | Advisory lock during create/migrate; losers wait then validate. | Decision 4. |
 | Q7 | App vs Cayu table separation | The `cayu_` prefix (Decision 5), configurable. | Avoids collisions in app-owned DBs. |
-| Q8 | ~~Existing unprefixed deployments~~ | **N/A — greenfield.** The baseline revision creates every table with the `cayu_` prefix; there is no unprefixed legacy to migrate. The disposable lane-agent test DB is recreated on the new schema. | No legacy to carry. |
+| Q8 | ~~Existing unprefixed deployments~~ | **N/A — greenfield.** The baseline revision creates every table with the `cayu_` prefix; there is no unprefixed legacy to migrate. The disposable first-consumer test DB is recreated on the new schema. | No legacy to carry. |
 | Q9 | Other SQL backends (MySQL / SQL Server / Oracle) & ORM/migration libraries | **Postgres is the production standard; no ORM, no Alembic.** Add SQLAlchemy **Core** (dialect builder, below the contracts) only on a *third committed production dialect*; a lightweight internal dialect struct is the cheaper step before that. See Decision 8. | Avoids a speculative N-dialect tax (YAGNI); the store contracts already make a new backend a self-contained PR; lock coordination is dialect-specific in every framework, so no library makes it free. |
 
 ## Consequences
@@ -136,8 +138,8 @@ SQLite-specific. This ADR generalizes versioning across backends: SQLite's
   first schema revision simply *is* the correct schema: all tables `cayu_`-prefixed,
   created at the baseline revision. There is no rename migration, no `table_prefix=""`
   back-compat escape hatch, and no live data to preserve.
-- **lane-agent gets the clean design from the start.** Its disposable test DB is
-  recreated on the `cayu_` schema, and its deploy runs the explicit
+- **The first consumer gets the clean design from the start.** Its disposable test
+  DB is recreated on the `cayu_` schema, and its deploy runs the explicit
   `migrate`/`create` step (Q4) rather than relying on lazy auto-create. Cheap to do
   now precisely because there's no legacy.
 - **The advisory-lock init lands first** (Phase-1 step 1) — it fixes the real
@@ -146,7 +148,8 @@ SQLite-specific. This ADR generalizes versioning across backends: SQLite's
   patch releases (Q3), validate-at-startup (Q4), and opt-in migrate (Q5) cost
   nothing to adopt today but are expensive to retrofit after the first real release
   — so they go into the baseline contract.
-- Relation to cayu#32: this ADR addresses **schema** evolution. Before 1.0,
+- Relation to the first-consumer findings: this ADR addresses **schema**
+  evolution. Before 1.0,
   correctness-critical `SessionStore` operations can be required abstract methods
   so incomplete stores fail at instantiation instead of later in a recovery path;
   optional lifecycle additions can still use explicit default implementations.
