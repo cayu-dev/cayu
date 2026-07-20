@@ -1660,6 +1660,19 @@ Providers that require opaque response items for stateless continuation may retu
 
 `OpenAIProvider` adapts the OpenAI Responses API to the same Cayu transcript. It keeps Cayu `system` messages as OpenAI `instructions`, maps assistant tool calls to Responses `function_call` items, maps Cayu tool-result messages to `function_call_output` items, and sets `store: false` by default so Cayu remains the durable session source of truth. It uses OpenAI Responses server-sent-event streaming by default, normalizes typed text/function-call/completed events into Cayu provider stream events, and enforces a provider-event idle timeout so a stalled stream fails the model step instead of leaving the session running indefinitely. Callers can override OpenAI request options through `ModelRequest.options["openai"]` except for fields owned by the provider contract.
 
+`OpenAISubscriptionProvider` reuses that neutral Responses translation against
+the ChatGPT Codex backend after `cayu auth openai login`. It refreshes the
+user's OAuth credentials from a private local store, identifies requests as
+Cayu, and deliberately stops at upstream rejection rather than adopting a
+first-party Codex identity. The backend exposes no documented input-token
+counting or embeddings endpoint, so `count_input_tokens(...)` returns `None`
+and the provider does not implement `TextEmbeddingProvider`. Its provider name
+is `openai_subscription`; subscription usage is intentionally unpriced because
+flat-plan quota is not equivalent to per-token API spend. This adapter is an
+experimental local-testing path, not a documented OpenAI Platform API or a
+hosted multi-user authentication mechanism. See
+[`docs/openai-subscription.md`](openai-subscription.md).
+
 Configure OpenAI transport timeouts on the provider. `timeout_s` controls ordinary HTTP transport timeouts; `stream_idle_timeout_s` controls how long a streaming response may go without a parsed provider event before Cayu treats the model step as stalled:
 
 ```python

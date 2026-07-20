@@ -18,6 +18,22 @@ the same boundary; `copy_session_user_metadata` and
 `replace_session_user_metadata` provide the shared validation and transactional
 merge primitives.
 
+### Experimental OpenAI subscription sign-in
+
+Developers can now run local Cayu agents using their own ChatGPT subscription
+through `OpenAISubscriptionProvider`. `cayu auth openai login` provides a PKCE
+localhost flow, `--headless` provides device authorization, and
+`status`/`logout` manage Cayu's private `~/.cayu/auth.json` credential store.
+Access tokens refresh before expiry and requests use Cayu's existing Responses
+stream/tool normalization.
+
+This is an experimental Codex-backend integration rather than a documented
+OpenAI Platform API. Requests identify themselves as Cayu and never adopt a
+first-party Codex originator. The adapter stops at upstream rejection, exposes
+no embeddings or remote token-counting capability, and treats flat-plan usage
+as unpriced. See [OpenAI subscription authentication](openai-subscription.md)
+before enabling it.
+
 ### Custom SessionStore implementations must support event side-effect handoffs
 
 The `SessionStore` interface now requires durable persisted-event side-effect

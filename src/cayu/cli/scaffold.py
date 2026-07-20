@@ -26,6 +26,7 @@ from cayu import (
     CayuApp,
     ModelProvider,
     OpenAIProvider,
+    OpenAISubscriptionProvider,
     ScriptedModelProvider,
     SessionStore,
     SQLiteSessionStore,
@@ -50,6 +51,8 @@ def configured_provider() -> ModelProvider:
     Tests and evals inject their own ScriptedModelProvider explicitly.
     """
 
+    if os.environ.get("CAYU_OPENAI_SUBSCRIPTION") == "1":
+        return OpenAISubscriptionProvider()
     api_key = os.environ.get("OPENAI_API_KEY")
     if api_key:
         return OpenAIProvider(api_key=api_key)
@@ -69,7 +72,8 @@ def validate_run_configuration(app: CayuApp, agent_name: str) -> None:
     provider = app.get_provider(manifest_agent.resolved_provider)
     if provider.name == _UNCONFIGURED_PROVIDER_NAME:
         raise RuntimeError(
-            "OPENAI_API_KEY is not set; set it or update app.configured_provider()."
+            "no live OpenAI provider is configured; set OPENAI_API_KEY, or run "
+            "`cayu auth openai login` and set CAYU_OPENAI_SUBSCRIPTION=1."
         )
 
 
@@ -99,12 +103,19 @@ def build_app(
     return app
 '''
 
-_AGENT_PY = """from cayu import AgentSpec
+_AGENT_PY = """import os
+
+from cayu import AgentSpec
 
 
 AGENT = AgentSpec(
     name="__PROJECT_NAME__",
-    model="gpt-5.6-luna",
+    model=os.environ.get(
+        "CAYU_MODEL",
+        "gpt-5.4"
+        if os.environ.get("CAYU_OPENAI_SUBSCRIPTION") == "1"
+        else "gpt-5.6-luna",
+    ),
 )
 """
 
@@ -250,6 +261,24 @@ These commands require no model API key. They prove project construction,
 static wiring, a deterministic model response, and its eval.
 
 ## Run with a live provider
+
+Use your own ChatGPT subscription for local testing:
+
+```bash
+cayu auth openai login
+CAYU_OPENAI_SUBSCRIPTION=1 python run.py --message "YOUR REQUEST"
+```
+
+Subscription mode selects `gpt-5.4` by default. Set `CAYU_MODEL` if your plan
+offers a different model.
+
+This experimental path is intended for the subscription holder's own local
+development and evaluation. It is not intended for production, customer-facing
+or multi-user services, credential sharing, resale, or bypassing plan limits.
+For production, use the OpenAI Platform API or another officially supported
+provider. Read the full
+[support boundary](https://github.com/cayu-dev/cayu/blob/main/docs/openai-subscription.md).
+To use the documented OpenAI Platform API instead:
 
 ```bash
 export OPENAI_API_KEY=sk-...

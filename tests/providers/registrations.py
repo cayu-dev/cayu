@@ -20,6 +20,8 @@ from cayu.providers import (
     OpenAIAPIError,
     OpenAIContextOverflowError,
     OpenAIProvider,
+    OpenAISubscriptionCredentials,
+    OpenAISubscriptionProvider,
     VertexAPIError,
     VertexContextOverflowError,
     VertexProvider,
@@ -522,6 +524,26 @@ async def _openai_factory(scenario: ProviderScenario) -> ProviderHarness:
     return _async_transport_harness(provider, "gpt-conformance", transport)
 
 
+class _OpenAISubscriptionAuth:
+    async def credentials(self) -> OpenAISubscriptionCredentials:
+        return OpenAISubscriptionCredentials(
+            access_token="conformance-access",
+            refresh_token="conformance-refresh",
+            expires_at=2_000_000_000,
+            account_id="acct-conformance",
+        )
+
+
+async def _openai_subscription_factory(scenario: ProviderScenario) -> ProviderHarness:
+    transport = _OpenAITransport(scenario)
+    provider = OpenAISubscriptionProvider(
+        auth=_OpenAISubscriptionAuth(),
+        transport=transport,
+        stream_idle_timeout_s=0.02,
+    )
+    return _async_transport_harness(provider, "gpt-conformance", transport)
+
+
 async def _anthropic_factory(scenario: ProviderScenario) -> ProviderHarness:
     transport = _AnthropicTransport(scenario)
     provider = AnthropicProvider(
@@ -605,7 +627,13 @@ async def _bedrock_factory(scenario: ProviderScenario) -> ProviderHarness:
 
 
 def _async_transport_harness(
-    provider: OpenAIProvider | AnthropicProvider | ChatCompletionsProvider | VertexProvider,
+    provider: (
+        OpenAIProvider
+        | OpenAISubscriptionProvider
+        | AnthropicProvider
+        | ChatCompletionsProvider
+        | VertexProvider
+    ),
     model: str,
     transport: _AsyncTransport,
 ) -> ProviderHarness:
@@ -1354,6 +1382,22 @@ OPENAI = ProviderConformanceRegistration(
     ),
 )
 
+OPENAI_SUBSCRIPTION = ProviderConformanceRegistration(
+    name="openai-subscription",
+    provider_type=OpenAISubscriptionProvider,
+    factory=_openai_subscription_factory,
+    capabilities=ProviderCapabilities(
+        token_counting=CapabilityClaim.unsupported(
+            "The ChatGPT Codex backend exposes no documented input-token counting endpoint."
+        ),
+        native_structured_output=CapabilityClaim.supported(),
+        attachments=CapabilityClaim.supported(),
+        reasoning=CapabilityClaim.supported(),
+        provider_cache_observation=CapabilityClaim.supported(),
+    ),
+    error_provider="openai",
+)
+
 ANTHROPIC = ProviderConformanceRegistration(
     name="anthropic",
     provider_type=AnthropicProvider,
@@ -1410,4 +1454,11 @@ BEDROCK = ProviderConformanceRegistration(
     reports_model_identity=False,
 )
 
-REGISTRATIONS = (OPENAI, ANTHROPIC, CHAT_COMPLETIONS, VERTEX, BEDROCK)
+REGISTRATIONS = (
+    OPENAI,
+    OPENAI_SUBSCRIPTION,
+    ANTHROPIC,
+    CHAT_COMPLETIONS,
+    VERTEX,
+    BEDROCK,
+)

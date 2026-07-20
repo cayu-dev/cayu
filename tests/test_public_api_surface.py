@@ -34,6 +34,7 @@ REQUIRED_TOP_LEVEL_EXPORTS = (
     "ModelProvider",
     "ModelRequest",
     "ModelStreamEvent",
+    "OpenAISubscriptionProvider",
     "NativeStructuredOutputSchemaInvalid",
     "NativeStructuredOutputUnsupported",
     "Runner",

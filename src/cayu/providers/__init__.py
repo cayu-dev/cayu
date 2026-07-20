@@ -69,6 +69,15 @@ from cayu.providers.openai import (
     openai_response_events,
     preflight_openai_native_structured_output_schema,
 )
+from cayu.providers.openai_subscription import (
+    DEFAULT_OPENAI_SUBSCRIPTION_BASE_URL,
+    HttpxOpenAISubscriptionOAuthTransport,
+    OpenAISubscriptionAuth,
+    OpenAISubscriptionAuthError,
+    OpenAISubscriptionAuthStore,
+    OpenAISubscriptionCredentials,
+    OpenAISubscriptionProvider,
+)
 from cayu.providers.vertex import (
     HttpxVertexTransport,
     VertexAPIError,
@@ -80,6 +89,7 @@ from cayu.providers.vertex import (
 )
 
 __all__ = [
+    "DEFAULT_OPENAI_SUBSCRIPTION_BASE_URL",
     "AnthropicAPIError",
     "AnthropicContextOverflowError",
     "AnthropicError",
@@ -101,6 +111,7 @@ __all__ = [
     "ChatCompletionsTransport",
     "HttpxAnthropicTransport",
     "HttpxChatCompletionsTransport",
+    "HttpxOpenAISubscriptionOAuthTransport",
     "HttpxOpenAITransport",
     "HttpxVertexTransport",
     "InputTokenCountConfidence",
@@ -121,6 +132,11 @@ __all__ = [
     "OpenAIError",
     "OpenAIProtocolError",
     "OpenAIProvider",
+    "OpenAISubscriptionAuth",
+    "OpenAISubscriptionAuthError",
+    "OpenAISubscriptionAuthStore",
+    "OpenAISubscriptionCredentials",
+    "OpenAISubscriptionProvider",
     "OpenAITransport",
     "UsageDialect",
     "VertexAPIError",

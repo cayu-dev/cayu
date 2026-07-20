@@ -41,7 +41,7 @@ deployments.
 | Cost control | Usage events, run limits, budgets, pricing, causal-budget summaries |
 | Execution boundaries | Environments, workspaces, runners, artifacts, vaults, egress |
 | Reviewed knowledge | Durable entries, approval state, keyword/vector retrieval, recall tools |
-| Provider flexibility | OpenAI, Anthropic, Bedrock, Vertex, OpenAI-compatible APIs |
+| Provider flexibility | OpenAI API, experimental OpenAI subscription login, Anthropic, Bedrock, Vertex, OpenAI-compatible APIs |
 | Durable automation | Tasks, dispatchers, event watchers, subagents, runtime hooks |
 | Behavioral proof | Runtime tests, trajectory assertions, replay, eval reports |
 | Operations | FastAPI control plane and a packaged inspection dashboard |
@@ -251,7 +251,7 @@ lifecycle responsibilities.
 ## Providers and environments
 
 The base package includes the provider contracts and built-in OpenAI, Anthropic,
-and OpenAI-compatible HTTP adapters. Optional extras add integrations without
+OpenAI-compatible HTTP, and experimental OpenAI-subscription adapters. Optional extras add integrations without
 forcing their dependencies into every deployment:
 
 | Extra | Adds |
@@ -270,6 +270,36 @@ Providers normalize text, thinking, tool calls, usage, completion reasons, and
 typed failures behind one runtime contract. Cayu does not infer a provider from
 an arbitrary model name: applications register providers explicitly and may
 add deterministic model-pattern routing.
+
+For local development without separate OpenAI API billing, users can sign in
+with their own ChatGPT subscription:
+
+```bash
+cayu auth openai login
+# For SSH or a remote machine:
+cayu auth openai login --headless
+```
+
+```python
+from cayu import OpenAISubscriptionProvider
+
+app.register_provider(OpenAISubscriptionProvider(), default=True)
+```
+
+This integration is experimental and uses the Codex backend rather than the
+documented OpenAI Platform API. Cayu identifies itself with `originator: cayu`;
+it does not impersonate Codex or bypass an upstream rejection. OpenAI has not
+documented this raw backend as a general third-party provider API, so support
+may change or stop.
+
+> **Intended-use boundary:** This path is intended for a subscription holder's
+> own local development and evaluation. It is not intended for production,
+> customer-facing or multi-user services, credential sharing, resale, or
+> bypassing plan limits. For production, use the OpenAI Platform API or another
+> officially supported provider.
+
+See [OpenAI subscription authentication](docs/openai-subscription.md) for the
+support boundary, credential storage, and fallback options.
 
 The same agent can run in a local workspace, trusted Docker container, E2B,
 Microsandbox, Lambda MicroVM, or an application-owned runner without changing

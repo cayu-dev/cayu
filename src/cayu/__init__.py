@@ -221,6 +221,7 @@ from cayu.providers import (
     ModelStreamEvent,
     NativeStructuredOutputSchemaInvalid,
     OpenAIProvider,
+    OpenAISubscriptionProvider,
     UsageDialect,
     VertexProvider,
 )
@@ -989,6 +990,7 @@ __all__ = [
     "NoWorkspaceBinding",
     "ObservedDeltaContextEstimator",
     "OpenAIProvider",
+    "OpenAISubscriptionProvider",
     "OpenTelemetryEventSink",
     "ParallelResult",
     "ParallelStepError",

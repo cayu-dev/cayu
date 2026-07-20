@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import importlib.util
 import subprocess
@@ -13,8 +14,12 @@ from cayu import (
     EvalStatus,
     InMemorySessionStore,
     InMemoryTaskStore,
+    Message,
+    ModelStreamEvent,
+    RunRequest,
     ScriptedModelProvider,
     load_eval_run,
+    run_to_completion,
 )
 from cayu.cli import main
 from cayu.cli.project import project_context
@@ -52,6 +57,9 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     )
     assert first_app is not second_app
 
+    app_source = (proj / "app.py").read_text(encoding="utf-8")
+    assert "OpenAISubscriptionProvider" in app_source
+    assert 'CAYU_OPENAI_SUBSCRIPTION") == "1"' in app_source
     pyproject = (proj / "pyproject.toml").read_text(encoding="utf-8")
     assert 'dependencies = ["cayu"]' in pyproject
     assert '[project.optional-dependencies]\nconsole = ["cayu[console]"]' in pyproject
@@ -65,12 +73,57 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert "pip install -e '.[console,dev]'" in readme
     assert "uv sync --extra console --extra dev" in readme
     assert "cayu eval run" in readme
+    assert "cayu auth openai login" in readme
+    assert "CAYU_OPENAI_SUBSCRIPTION=1" in readme
+    assert "subscription holder's own local" in readme
+    assert "development and evaluation" in readme
+    assert "not intended for production" in readme
+    assert "bypassing plan limits" in readme
     assert "cayu eval run evals.agent:build_eval" not in readme
     assert "src/cayu/guides/authoring.md#cayu-map" in readme
     assert 'python run.py --message "YOUR REQUEST"' in readme
     assert "model-only" in readme
     assert "cayu generate slice" not in readme
     assert "cayu check --json" in capsys.readouterr().out
+
+
+def test_scaffold_subscription_mode_selects_a_compatible_model(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    assert main(["new", "myproj", "--dir", str(tmp_path)]) == 0
+    project = tmp_path / "myproj"
+    provider = ScriptedModelProvider(
+        [
+            ModelStreamEvent.text_delta("Subscription result."),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ],
+        name="openai_subscription",
+    )
+    monkeypatch.setenv("CAYU_OPENAI_SUBSCRIPTION", "1")
+    monkeypatch.setattr("cayu.OpenAISubscriptionProvider", lambda: provider)
+
+    spec = importlib.util.spec_from_file_location("subscription_scaffold_app", project / "app.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    with project_context(project):
+        spec.loader.exec_module(module)
+        app = module.build_app(
+            session_store=InMemorySessionStore(),
+            task_store=InMemoryTaskStore(),
+        )
+        outcome = asyncio.run(
+            run_to_completion(
+                app,
+                RunRequest(
+                    agent_name="myproj",
+                    messages=[Message.text("user", "Test with my subscription")],
+                ),
+            )
+        )
+
+    assert outcome.ok
+    assert provider.requests[0].model == "gpt-5.4"
 
 
 def test_python_m_cayu_routes_to_the_cli() -> None:

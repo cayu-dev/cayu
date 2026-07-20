@@ -32,6 +32,7 @@ def _scaffold(tmp_path: Path) -> Path:
 def _run_generated_subprocess(project: Path, *argv: str) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment.pop("OPENAI_API_KEY", None)
+    environment.pop("CAYU_OPENAI_SUBSCRIPTION", None)
     return subprocess.run(
         [sys.executable, "run.py", *argv],
         cwd=project,
@@ -128,7 +129,8 @@ def test_generated_command_explains_how_to_configure_a_live_provider(
     assert completed.returncode == 2
     assert completed.stdout == ""
     assert completed.stderr == (
-        "setup error: OPENAI_API_KEY is not set; set it or update app.configured_provider().\n"
+        "setup error: no live OpenAI provider is configured; set OPENAI_API_KEY, or run "
+        "`cayu auth openai login` and set CAYU_OPENAI_SUBSCRIPTION=1.\n"
     )
 
 
