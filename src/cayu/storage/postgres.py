@@ -39,6 +39,7 @@ from cayu.core.billing import BillingIdentity
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, MessageRole
 from cayu.embeddings import TextEmbeddingProvider, TextEmbeddingRequest
+from cayu.runtime.aggregates import EXACT_AGGREGATE, UsageRollupStoreResult
 from cayu.runtime.approvals import ResolutionActor, resolution_actor_payload
 from cayu.runtime.budgets import (
     DEFAULT_RESERVATION_TTL_SECONDS,
@@ -89,10 +90,12 @@ from cayu.runtime.sessions import (
     PersistedEventSideEffectStatus,
     RunRequest,
     Session,
+    SessionAggregateFilter,
     SessionIdentity,
     SessionListResult,
     SessionMessageDeliveryBatch,
     SessionMessageQueueStatus,
+    SessionOperationalSnapshot,
     SessionOperationPublication,
     SessionOperationTransform,
     SessionOrder,
@@ -104,10 +107,12 @@ from cayu.runtime.sessions import (
     SessionStateSnapshot,
     SessionStatus,
     SessionStatusConflict,
+    SessionStatusCounts,
     SessionStore,
     TranscriptPage,
     TranscriptQuery,
     TranscriptRecord,
+    UsageRollupQuery,
     _activate_session_run_fence,
     _active_unexpired_session_operation_id,
     _assert_session_run_epoch,
@@ -124,11 +129,13 @@ from cayu.runtime.sessions import (
     copy_enqueue_session_message_request,
     copy_event_query,
     copy_run_request,
+    copy_session_aggregate_filter,
     copy_session_identity,
     copy_session_query,
     copy_session_user_metadata,
     copy_transcript_messages,
     copy_transcript_query,
+    copy_usage_rollup_query,
     decode_session_cursor,
     encode_session_cursor,
     enforce_pending_action_result_size,
@@ -136,13 +143,17 @@ from cayu.runtime.sessions import (
     replace_session_user_metadata,
     session_next_cursor,
     session_outcome,
+    session_query_from_aggregate_filter,
 )
 from cayu.runtime.tasks import (
     Task,
+    TaskAggregateFilter,
     TaskCreate,
+    TaskOperationalSnapshot,
     TaskOrder,
     TaskQuery,
     TaskStatus,
+    TaskStatusCounts,
     TaskStore,
     _copy_optional_status_payload,
     _copy_optional_status_reason,
@@ -153,9 +164,12 @@ from cayu.runtime.tasks import (
     _ensure_not_terminal,
     _running_task_from_create,
     _task_from_create,
+    copy_task_aggregate_filter,
     copy_task_create,
     copy_task_query,
+    task_query_from_aggregate_filter,
 )
+from cayu.storage import _postgres_aggregates as postgres_aggregates
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import migrations as schema
@@ -5909,6 +5923,79 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     async def list_sessions(self, query: SessionQuery | None = None) -> SessionListResult:
         return await self._list_sessions(query, pending_interruption_cascade_only=False)
 
+    async def aggregate_operational_snapshot(
+        self,
+        filters: SessionAggregateFilter | None = None,
+    ) -> SessionOperationalSnapshot:
+        filters = copy_session_aggregate_filter(filters)
+        plan = session_store_sql.build_session_query_sql(
+            session_query_from_aggregate_filter(filters),
+            dialect=_SQL_DIALECT,
+        )
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                    await cur.execute("SELECT transaction_timestamp()")
+                    as_of_row = await cur.fetchone()
+                    if as_of_row is None:
+                        raise RuntimeError("Postgres did not return a snapshot timestamp.")
+                    await cur.execute(
+                        cast(
+                            "LiteralString",
+                            f"""
+                            SELECT status, COUNT(*)
+                            FROM cayu_sessions
+                            {plan.filter_where_sql}
+                            GROUP BY status
+                            """,
+                        ),
+                        plan.filter_params,
+                    )
+                    rows = await cur.fetchall()
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+
+        counts = {status: 0 for status in SessionStatus}
+        for row in rows:
+            counts[SessionStatus(row[0])] = row[1]
+        return SessionOperationalSnapshot(
+            as_of=as_of_row[0],
+            total_count=sum(counts.values()),
+            counts_by_status=SessionStatusCounts.model_validate(counts),
+            accuracy=EXACT_AGGREGATE.model_copy(),
+        )
+
+    async def aggregate_usage(self, query: UsageRollupQuery) -> UsageRollupStoreResult:
+        query = copy_usage_rollup_query(query)
+        plan = session_store_sql.build_session_query_sql(
+            session_query_from_aggregate_filter(query.sessions),
+            dialect=_SQL_DIALECT,
+        )
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                    await cur.execute("SELECT transaction_timestamp()")
+                    as_of_row = await cur.fetchone()
+                    if as_of_row is None:
+                        raise RuntimeError("Postgres did not return a snapshot timestamp.")
+                result = await postgres_aggregates.aggregate_session_usage(
+                    conn,
+                    session_plan=plan,
+                    query=query,
+                    as_of=as_of_row[0],
+                )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return result
+
     async def list_sessions_with_pending_interruption_cascade(
         self,
         query: SessionQuery | None = None,
@@ -6975,6 +7062,62 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
             )
             rows = await cur.fetchall()
             return [pg_support.task_from_row(row) for row in rows]
+
+    async def aggregate_operational_snapshot(
+        self,
+        filters: TaskAggregateFilter | None = None,
+    ) -> TaskOperationalSnapshot:
+        filters = copy_task_aggregate_filter(filters)
+        query = task_query_from_aggregate_filter(filters)
+        clauses: list[str] = []
+        params: list[object] = []
+        for column, value in (
+            ("type", query.type),
+            ("session_id", query.session_id),
+            ("parent_task_id", query.parent_task_id),
+            ("assigned_agent_name", query.assigned_agent_name),
+        ):
+            if value is not None:
+                clauses.append(f"{column} = %s")
+                params.append(value)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                    await cur.execute("SELECT transaction_timestamp()")
+                    as_of_row = await cur.fetchone()
+                    if as_of_row is None:
+                        raise RuntimeError("Postgres did not return a snapshot timestamp.")
+                    await cur.execute(
+                        cast(
+                            "LiteralString",
+                            f"""
+                            SELECT status, COUNT(*)
+                            FROM cayu_tasks
+                            {where_sql}
+                            GROUP BY status
+                            """,
+                        ),
+                        params,
+                    )
+                    rows = await cur.fetchall()
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+
+        counts = {status: 0 for status in TaskStatus}
+        for row in rows:
+            counts[TaskStatus(row[0])] = row[1]
+        return TaskOperationalSnapshot(
+            as_of=as_of_row[0],
+            total_count=sum(counts.values()),
+            counts_by_status=TaskStatusCounts.model_validate(counts),
+            accuracy=EXACT_AGGREGATE.model_copy(),
+        )
 
     async def start_task(
         self,

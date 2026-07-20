@@ -7,7 +7,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import quote
 from uuid import uuid4
 
@@ -67,6 +67,33 @@ def _register_sqlite_functions(connection: sqlite3.Connection) -> None:
         lookup_key,
         deterministic=True,
     )
+    connection.create_aggregate(
+        "cayu_exact_usage_sum",
+        11,
+        cast("Any", _ExactUsageSum),
+    )
+
+
+class _ExactUsageSum:
+    """Sum all normalized usage counters in one SQLite aggregate callback."""
+
+    # A SQLite table has at most 2**63 - 1 rows and each accepted JSON integer is
+    # at most 2**63 - 1, so every possible sum fits in 38 decimal digits.
+    _DECIMAL_WIDTH = 38
+
+    def __init__(self) -> None:
+        self._totals = [0] * 11
+
+    def step(self, *values: object) -> None:
+        for index, value in enumerate(values):
+            if type(value) is int and value >= 0:
+                self._totals[index] += value
+
+    def finalize(self) -> str:
+        return json.dumps(
+            [str(total).zfill(self._DECIMAL_WIDTH) for total in self._totals],
+            separators=(",", ":"),
+        )
 
 
 # Baseline-revision (ADR 0001 revision 1) DDL. Every table carries the cayu_ prefix

@@ -21,6 +21,7 @@ from cayu._validation import (
 )
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, MessageRole
+from cayu.runtime.aggregates import EXACT_AGGREGATE, UsageRollupStoreResult
 from cayu.runtime.approvals import ResolutionActor, resolution_actor_payload
 from cayu.runtime.sessions import (
     DELETE_BLOCKED_SESSION_STATUSES,
@@ -44,10 +45,12 @@ from cayu.runtime.sessions import (
     PersistedEventSideEffectStatus,
     RunRequest,
     Session,
+    SessionAggregateFilter,
     SessionIdentity,
     SessionListResult,
     SessionMessageDeliveryBatch,
     SessionMessageQueueStatus,
+    SessionOperationalSnapshot,
     SessionOperationPublication,
     SessionOperationTransform,
     SessionOrder,
@@ -59,10 +62,12 @@ from cayu.runtime.sessions import (
     SessionStateSnapshot,
     SessionStatus,
     SessionStatusConflict,
+    SessionStatusCounts,
     SessionStore,
     TranscriptPage,
     TranscriptQuery,
     TranscriptRecord,
+    UsageRollupQuery,
     _activate_session_run_fence,
     _active_unexpired_session_operation_id,
     _assert_session_run_epoch,
@@ -79,11 +84,13 @@ from cayu.runtime.sessions import (
     copy_enqueue_session_message_request,
     copy_event_query,
     copy_run_request,
+    copy_session_aggregate_filter,
     copy_session_identity,
     copy_session_query,
     copy_session_user_metadata,
     copy_transcript_messages,
     copy_transcript_query,
+    copy_usage_rollup_query,
     decode_session_cursor,
     encode_session_cursor,
     enforce_pending_action_result_size,
@@ -91,13 +98,17 @@ from cayu.runtime.sessions import (
     replace_session_user_metadata,
     session_next_cursor,
     session_outcome,
+    session_query_from_aggregate_filter,
 )
 from cayu.runtime.tasks import (
     Task,
+    TaskAggregateFilter,
     TaskCreate,
+    TaskOperationalSnapshot,
     TaskOrder,
     TaskQuery,
     TaskStatus,
+    TaskStatusCounts,
     TaskStore,
     _copy_optional_status_payload,
     _copy_optional_status_reason,
@@ -108,10 +119,13 @@ from cayu.runtime.tasks import (
     _ensure_not_terminal,
     _running_task_from_create,
     _task_from_create,
+    copy_task_aggregate_filter,
     copy_task_create,
     copy_task_query,
+    task_query_from_aggregate_filter,
 )
 from cayu.storage import _session_store_sql as session_store_sql
+from cayu.storage import _sqlite_aggregates as sqlite_aggregates
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 
@@ -2478,6 +2492,65 @@ class SQLiteSessionStore(SessionStore):
     async def list_sessions(self, query: SessionQuery | None = None) -> SessionListResult:
         return await self._list_sessions(query, pending_interruption_cascade_only=False)
 
+    async def aggregate_operational_snapshot(
+        self,
+        filters: SessionAggregateFilter | None = None,
+    ) -> SessionOperationalSnapshot:
+        filters = copy_session_aggregate_filter(filters)
+        plan = session_store_sql.build_session_query_sql(
+            session_query_from_aggregate_filter(filters),
+            dialect=_SQL_DIALECT,
+        )
+
+        def query_snapshot(connection: sqlite3.Connection) -> SessionOperationalSnapshot:
+            rows = connection.execute(
+                f"""
+                WITH
+                snapshot(as_of) AS (
+                    SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                ),
+                status_counts AS (
+                    SELECT status, COUNT(*) AS status_count
+                    FROM cayu_sessions
+                    {plan.filter_where_sql}
+                    GROUP BY status
+                )
+                SELECT snapshot.as_of, status_counts.status, status_counts.status_count
+                FROM snapshot
+                LEFT JOIN status_counts ON TRUE
+                """,
+                plan.filter_params,
+            ).fetchall()
+            counts = {status: 0 for status in SessionStatus}
+            for row in rows:
+                if row["status"] is not None:
+                    status = SessionStatus(row["status"])
+                    counts[status] = row["status_count"]
+            return SessionOperationalSnapshot(
+                as_of=sqlite_support.parse_datetime(rows[0]["as_of"]),
+                total_count=sum(counts.values()),
+                counts_by_status=SessionStatusCounts.model_validate(counts),
+                accuracy=EXACT_AGGREGATE.model_copy(),
+            )
+
+        return await self._run_read(query_snapshot)
+
+    async def aggregate_usage(self, query: UsageRollupQuery) -> UsageRollupStoreResult:
+        query = copy_usage_rollup_query(query)
+        plan = session_store_sql.build_session_query_sql(
+            session_query_from_aggregate_filter(query.sessions),
+            dialect=_SQL_DIALECT,
+        )
+
+        def query_aggregate(connection: sqlite3.Connection) -> UsageRollupStoreResult:
+            return sqlite_aggregates.aggregate_session_usage(
+                connection,
+                session_plan=plan,
+                query=query,
+            )
+
+        return await self._run_read(query_aggregate)
+
     async def list_sessions_with_pending_interruption_cascade(
         self,
         query: SessionQuery | None = None,
@@ -3618,6 +3691,44 @@ class SQLiteTaskStore(TaskStore):
                 params,
             ).fetchall()
             return [sqlite_support.task_from_row(row) for row in rows]
+
+    async def aggregate_operational_snapshot(
+        self,
+        filters: TaskAggregateFilter | None = None,
+    ) -> TaskOperationalSnapshot:
+        filters = copy_task_aggregate_filter(filters)
+        clauses, params = self._task_filter_clauses(task_query_from_aggregate_filter(filters))
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        async with self._lock:
+            rows = self._connection.execute(
+                f"""
+                WITH
+                snapshot(as_of) AS (
+                    SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                ),
+                status_counts AS (
+                    SELECT status, COUNT(*) AS status_count
+                    FROM cayu_tasks
+                    {where_sql}
+                    GROUP BY status
+                )
+                SELECT snapshot.as_of, status_counts.status, status_counts.status_count
+                FROM snapshot
+                LEFT JOIN status_counts ON TRUE
+                """,
+                params,
+            ).fetchall()
+            counts = {status: 0 for status in TaskStatus}
+            for row in rows:
+                if row["status"] is not None:
+                    status = TaskStatus(row["status"])
+                    counts[status] = row["status_count"]
+            return TaskOperationalSnapshot(
+                as_of=sqlite_support.parse_datetime(rows[0]["as_of"]),
+                total_count=sum(counts.values()),
+                counts_by_status=TaskStatusCounts.model_validate(counts),
+                accuracy=EXACT_AGGREGATE.model_copy(),
+            )
 
     async def start_task(
         self,
