@@ -162,6 +162,7 @@ def build_app(
             },
         ),
         runtime.environment_factory,
+        artifact_store=runtime.artifact_store,
         default=True,
     )
     app.register_agent(

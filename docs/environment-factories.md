@@ -90,6 +90,27 @@ Register it as the default (or under a name) instead of a static `register_envir
 app.register_environment_factory(EnvironmentSpec(name="local"), LocalNativeFactory(base), default=True)
 ```
 
+When a factory attaches an already-configured durable artifact store to every
+concrete environment, register that same store with the factory registration:
+
+```python
+app.register_environment_factory(
+    EnvironmentSpec(name="hosted"),
+    hosted_factory,
+    artifact_store=durable_artifact_store,
+    default=True,
+)
+```
+
+This does not create a session environment or transfer artifact ownership to
+Cayu. It gives control-plane endpoints such as `/api/artifacts` a stable handle
+for inventory and reads even after the per-session runner has been finalized.
+`CayuApp.attach_file(...)` also uses the handle for prompt-attachment writes
+without materializing the factory. Stores that exist only after
+`create(request)` cannot be listed outside that session or receive prompt
+attachments before the session environment exists unless the application
+exposes a stable store this way.
+
 `default=True` is an explicit application-wide choice: a `RunRequest` without
 `environment_name` selects this factory. Omit it (or pass `default=False`) when
 the factory should be available only by name, then set

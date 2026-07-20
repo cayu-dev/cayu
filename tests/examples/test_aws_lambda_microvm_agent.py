@@ -362,6 +362,7 @@ def test_build_app_declares_required_metadata_isolation() -> None:
     assert registration.spec.metadata["egress_configuration"] == {
         "metadata_isolation_mode": "required",
     }
+    assert registration.environment.artifact_store is runtime.artifact_store
 
 
 def test_build_runtime_can_opt_into_s3_files_workspace() -> None:

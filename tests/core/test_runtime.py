@@ -33613,6 +33613,23 @@ def test_attach_file_saves_reference_and_persists_bytes(tmp_path):
     assert read.content == png
 
 
+def test_attach_file_uses_factory_registered_store_without_materializing_factory(tmp_path):
+    store = LocalArtifactStore(tmp_path / "artifacts", store_id="factory-artifacts")
+    spec = EnvironmentSpec(name="factory-env")
+    factory = RecordingEnvironmentFactory(Environment(spec, artifact_store=store))
+    app = CayuApp(enable_logging=False)
+    app.register_environment_factory(spec, factory, artifact_store=store, default=True)
+    png = _valid_png_bytes()
+
+    part = asyncio.run(
+        app.attach_file(png, filename="pic.png", kind="image", session_id="sess_attach")
+    )
+
+    read = asyncio.run(store.read_bytes(part.attachment["artifact_id"]))
+    assert read.content == png
+    assert factory.requests == []
+
+
 def test_attach_file_runs_byte_validation_off_event_loop(tmp_path, monkeypatch):
     app, _ = _app_with_artifact_store(tmp_path)
     validation_threads: list[int] = []
@@ -33763,7 +33780,7 @@ def test_attach_file_requires_artifact_store(tmp_path):
     app = CayuApp(enable_logging=False)
     app.register_environment(Environment(EnvironmentSpec(name="local")), default=True)
 
-    with pytest.raises(RuntimeError, match="statically-registered artifact store"):
+    with pytest.raises(RuntimeError, match="environment registration with an artifact store"):
         asyncio.run(app.attach_file(_valid_png_bytes(), filename="pic.png", kind="image"))
 
 

@@ -33,6 +33,7 @@ from cayu.artifacts import (
     DEFAULT_MAX_FILE_ATTACHMENTS_PER_REQUEST,
     DEFAULT_MAX_TOTAL_FILE_ATTACHMENT_BYTES,
     ArtifactScope,
+    ArtifactStore,
     FileAttachmentKind,
     file_attachment,
     validate_file_attachment_bytes,
@@ -965,6 +966,7 @@ class CayuApp:
         spec: EnvironmentSpec,
         factory: EnvironmentFactory,
         *,
+        artifact_store: ArtifactStore | None = None,
         default: bool = False,
     ) -> EnvironmentFactory:
         if not isinstance(spec, EnvironmentSpec):
@@ -980,7 +982,7 @@ class CayuApp:
         registration_source, registration_symbol = _registration_site()
         self._environments[stored_spec.name] = runtime_records.RegisteredEnvironment(
             spec=stored_spec,
-            environment=Environment(stored_spec),
+            environment=Environment(stored_spec, artifact_store=artifact_store),
             factory=factory,
             registration_source=registration_source,
             registration_symbol=registration_symbol,
@@ -1103,10 +1105,10 @@ class CayuApp:
         The bytes are parsed to confirm they are a valid image/PDF whose detected format matches the
         declared/inferred content type before being stored, which requires the optional file
         dependencies (`cayu[files]`); without them this raises. The
-        (default or named) environment must expose a statically-registered artifact store.
-        Factory-backed environments create their store per session at run time, which does not exist
-        yet when you call `attach_file`, so this raises for them — register the artifact store on the
-        environment directly if you need to attach prompt files.
+        (default or named) environment registration must expose an artifact store. For a
+        factory-backed environment, pass the durable store to
+        `register_environment_factory(..., artifact_store=...)`; `attach_file` uses that stable
+        handle without materializing a session environment.
         """
         if type(content) is not bytes:
             raise TypeError("attach_file content must be bytes.")
@@ -1145,8 +1147,8 @@ class CayuApp:
         artifact_store = _artifact_store(registered_environment)
         if artifact_store is None:
             raise RuntimeError(
-                "attach_file requires an environment with a statically-registered artifact store; "
-                "factory-backed environments create their store per session at run time."
+                "attach_file requires an environment registration with an artifact store; "
+                "pass artifact_store when registering a factory-backed environment."
             )
         artifact = await artifact_store.put_bytes(
             content,

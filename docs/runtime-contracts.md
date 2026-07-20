@@ -383,6 +383,19 @@ binding that replaces a factory runner must therefore own both the source and
 replacement lifecycle after successful binding; Cayu does not also call the
 factory release callback and create a second cleanup owner.
 
+A factory registration may expose an already-configured durable
+`ArtifactStore` through `register_environment_factory(..., artifact_store=...)`.
+That store is a stable registration handle: registration does not materialize
+the factory, create a session environment, or transfer store ownership to
+Cayu. The optional server uses the handle for artifact inventory and reads, and
+`CayuApp.attach_file(...)` uses it for prompt-attachment writes without
+materializing the factory. A reconstructed application can therefore
+rediscover durable artifacts without reattaching the session runner. The
+factory's concrete environments must attach the same logical store. A store
+that exists only after `create(request)` has no stable registration handle and
+is not discoverable outside that live session or available for prompt
+attachments before the session environment exists.
+
 `VirtualEgressEnvironmentFactory` narrows that generic reconnect contract to a
 versioned envelope containing runner kind, owning session, environment name,
 an explicit supported/unsupported capability, and adapter-owned non-secret

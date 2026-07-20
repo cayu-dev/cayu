@@ -1323,6 +1323,84 @@ def test_server_artifact_inventory_paginates_across_registered_stores(tmp_path) 
     assert second_body["truncated"] is False
 
 
+def test_server_artifact_inventory_includes_factory_registered_store(tmp_path) -> None:
+    class Factory(EnvironmentFactory):
+        def __init__(self, artifact_store: ArtifactStore, *, allow_create: bool = True) -> None:
+            self.artifact_store = artifact_store
+            self.allow_create = allow_create
+            self.create_calls = 0
+
+        async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
+            self.create_calls += 1
+            if not self.allow_create:
+                raise AssertionError("artifact API must not materialize the environment factory")
+            return EnvironmentFactoryResult(
+                Environment(
+                    EnvironmentSpec(name=request.environment_name),
+                    artifact_store=self.artifact_store,
+                )
+            )
+
+    artifact_root = tmp_path / "artifacts"
+    first_store = LocalArtifactStore(artifact_root, store_id="factory-artifacts")
+    first_factory = Factory(first_store)
+    first_app = CayuApp()
+    first_app.register_environment_factory(
+        EnvironmentSpec(name="factory-env"),
+        first_factory,
+        artifact_store=first_store,
+        default=True,
+    )
+    created = asyncio.run(
+        first_app.get_environment_factory().create(
+            EnvironmentFactoryRequest(
+                session_id="sess_factory",
+                agent_name="agent",
+                environment_name="factory-env",
+            )
+        )
+    )
+    created_store = created.environment.artifact_store
+    assert created_store is first_store
+    artifact = asyncio.run(
+        created_store.put_bytes(
+            b"factory output",
+            filename="result.txt",
+            content_type="text/plain",
+            scope=ArtifactScope.SESSION,
+            session_id="sess_factory",
+            environment_name="factory-env",
+        )
+    )
+
+    restarted_store = LocalArtifactStore(artifact_root, store_id="factory-artifacts")
+    restarted_factory = Factory(restarted_store, allow_create=False)
+    restarted_app = CayuApp()
+    restarted_app.register_environment_factory(
+        EnvironmentSpec(name="factory-env"),
+        restarted_factory,
+        artifact_store=restarted_store,
+        default=True,
+    )
+    client = TestClient(create_server(restarted_app, dev=True))
+
+    environments = client.get("/api/environments")
+    artifacts = client.get("/api/artifacts", params={"session_id": "sess_factory"})
+    read = client.get(
+        f"/api/artifacts/{artifact.id}",
+        params={"artifact_store_id": "factory-artifacts"},
+    )
+
+    assert environments.status_code == 200
+    assert environments.json()["environments"][0]["artifact_store_id"] == "factory-artifacts"
+    assert artifacts.status_code == 200
+    assert [item["id"] for item in artifacts.json()["artifacts"]] == [artifact.id]
+    assert read.status_code == 200
+    assert read.json()["text_preview"] == "factory output"
+    assert first_factory.create_calls == 1
+    assert restarted_factory.create_calls == 0
+
+
 def test_server_artifact_inventory_rejects_unbounded_offsets(tmp_path) -> None:
     artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="test-artifacts")
     app = CayuApp()
