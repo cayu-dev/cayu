@@ -2,6 +2,26 @@
 
 ## v0.1.0 (unreleased)
 
+### Virtual egress supports GitHub-style CLI tokens
+
+`VirtualCredentialSpec(credential_kind="opaque_token")` now brokers opaque
+credentials carried as `Authorization: token …`. This enables unmodified
+GitHub CLI REST calls inside an enforced Linux runner while keeping the real
+token in the trusted vault/broker path. The new
+[GitHub CLI recipe](recipes/github-cli-virtual-egress.md) includes a runnable
+no-key proof, a strict REST-read profile, and the separate authorization
+requirements for GraphQL and mutations.
+
+Authorization parsing now preserves the presented scheme. A mismatched,
+unsupported, or omitted scheme is denied before vault resolution; a value in
+Cayu's virtual namespace therefore cannot fall through to credentialless
+egress merely because it used an unrecognized scheme.
+
+Virtual-egress leaf certificates now use a validity window of at most 398 days
+for compatibility with platform trust paths that reject longer-lived leaves,
+including the macOS certificate verification exercised by Go-based CLI
+clients. Session CA lifetime remains unchanged.
+
 ### Session metadata updates preserve runtime-owned state
 
 `SessionStore.update_metadata(...)` and

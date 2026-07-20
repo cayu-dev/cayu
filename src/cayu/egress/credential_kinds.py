@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Literal, TypeAlias, cast
@@ -11,7 +12,16 @@ _VIRTUAL_VALUE_TOKEN_HEX_CHARS = _VIRTUAL_VALUE_ENTROPY_BYTES * 2
 _HEX_CHARS = frozenset("0123456789abcdef")
 
 HeaderRewriter = Callable[[str, Mapping[str, str]], dict[str, str]]
-CredentialKind: TypeAlias = Literal["stripe_bearer", "opaque_bearer"]
+CredentialKind: TypeAlias = Literal["stripe_bearer", "opaque_bearer", "opaque_token"]
+AuthorizationScheme: TypeAlias = Literal["basic", "bearer", "token"]
+
+
+@dataclass(frozen=True)
+class PresentedCredential:
+    """A credential value plus the normalized HTTP authorization scheme used."""
+
+    value: str
+    authorization_scheme: AuthorizationScheme | None
 
 
 @dataclass(frozen=True)
@@ -20,6 +30,7 @@ class CredentialKindDescriptor:
 
     credential_kind: str
     virtual_prefix: str
+    accepted_authorization_schemes: tuple[AuthorizationScheme, ...]
     header_rewriter: HeaderRewriter | None = None
     test_mode_real_secret_prefixes: tuple[str, ...] = ()
 
@@ -27,6 +38,9 @@ class CredentialKindDescriptor:
         if self.header_rewriter is None:
             raise ValueError(f"Unsupported credential kind {self.credential_kind!r}.")
         return self.header_rewriter(secret, headers)
+
+    def accepts(self, presented: PresentedCredential) -> bool:
+        return presented.authorization_scheme in self.accepted_authorization_schemes
 
     def validate_presented_value(self, value: str) -> None:
         """Reject caller-supplied values outside Cayu's virtual namespace."""
@@ -50,23 +64,67 @@ def _without_header(headers: Mapping[str, str], name: str) -> dict[str, str]:
     return {key: value for key, value in headers.items() if key.lower() != lowered}
 
 
-def _bearer_rewriter(secret: str, headers: Mapping[str, str]) -> dict[str, str]:
-    rewritten = _without_header(headers, "authorization")
-    rewritten["Authorization"] = f"Bearer {secret}"
-    return rewritten
+def _authorization_rewriter(scheme: str) -> HeaderRewriter:
+    def rewrite(secret: str, headers: Mapping[str, str]) -> dict[str, str]:
+        rewritten = _without_header(headers, "authorization")
+        rewritten["Authorization"] = f"{scheme} {secret}"
+        return rewritten
+
+    return rewrite
+
+
+def extract_presented_credential(headers: Mapping[str, str]) -> PresentedCredential | None:
+    """Extract one authorization credential without losing its supported scheme."""
+
+    value = next(
+        (header_value for name, header_value in headers.items() if name.lower() == "authorization"),
+        None,
+    )
+    if value is None:
+        return None
+    value = value.strip()
+    scheme, separator, credential = value.partition(" ")
+    if not separator:
+        return PresentedCredential(value, None) if value else None
+    credential = credential.strip()
+    if not credential:
+        return None
+
+    normalized_scheme = scheme.lower()
+    if normalized_scheme == "bearer":
+        return PresentedCredential(credential, "bearer")
+    if normalized_scheme == "token":
+        return PresentedCredential(credential, "token")
+    if normalized_scheme == "basic":
+        try:
+            decoded = base64.b64decode(credential).decode("utf-8", "replace")
+        except (ValueError, UnicodeDecodeError):
+            return PresentedCredential(credential, "basic")
+        # Stripe-style basic auth carries the key as the username.
+        username = decoded.split(":", 1)[0]
+        return PresentedCredential(username, "basic") if username else None
+    return PresentedCredential(credential, None)
 
 
 SUPPORTED_CREDENTIAL_KINDS: dict[str, CredentialKindDescriptor] = {
     "stripe_bearer": CredentialKindDescriptor(
         credential_kind="stripe_bearer",
         virtual_prefix=_STRIPE_TEST_PREFIX,
-        header_rewriter=_bearer_rewriter,
+        accepted_authorization_schemes=("bearer", "basic"),
+        header_rewriter=_authorization_rewriter("Bearer"),
         test_mode_real_secret_prefixes=("sk_test_", "rk_test_"),
     ),
     "opaque_bearer": CredentialKindDescriptor(
         credential_kind="opaque_bearer",
         virtual_prefix=_GENERIC_PREFIX,
-        header_rewriter=_bearer_rewriter,
+        accepted_authorization_schemes=("bearer",),
+        header_rewriter=_authorization_rewriter("Bearer"),
+    ),
+    "opaque_token": CredentialKindDescriptor(
+        credential_kind="opaque_token",
+        virtual_prefix=_GENERIC_PREFIX,
+        accepted_authorization_schemes=("token",),
+        header_rewriter=_authorization_rewriter("token"),
     ),
 }
 

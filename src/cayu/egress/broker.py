@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
 import ipaddress
 import json
@@ -16,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from cayu._validation import require_clean_nonblank
 from cayu.egress.credential_kinds import (
+    extract_presented_credential,
     supported_credential_kind_descriptor,
     uses_virtual_credential_namespace,
 )
@@ -336,18 +336,18 @@ class TransparentEgressBroker:
         return bool(self._approved_destinations)
 
     async def handle_request(self, request: CapturedRequest) -> CapturedResponse:
-        presented = _extract_presented_credential(request.headers)
+        presented = extract_presented_credential(request.headers)
         if presented is None:
             if self._approved_destinations:
                 return await self._handle_credentialless(request)
             return self._deny(request, None, None, 401, "No credential presented to broker.")
 
         try:
-            lease = self._registry.acquire(presented)
+            lease = self._registry.acquire(presented.value)
         except Exception:  # unknown / expired / revoked — never echo the value
             if self._credentialless_destination(
                 request
-            ) is not None and not uses_virtual_credential_namespace(presented):
+            ) is not None and not uses_virtual_credential_namespace(presented.value):
                 return await self._handle_credentialless(request)
             return self._deny(request, None, None, 403, "Virtual credential is not valid.")
 
@@ -396,6 +396,14 @@ class TransparentEgressBroker:
                     policy.name,
                     403,
                     f"Unsupported credential kind {grant.credential_kind!r}.",
+                )
+            if not credential_kind.accepts(presented):
+                return self._deny(
+                    request,
+                    grant.grant_id,
+                    policy.name,
+                    403,
+                    "Virtual credential authentication scheme does not match its grant.",
                 )
 
             # Resolve + rewrite in one guarded step; a failure here (bad vault, etc.)
@@ -641,23 +649,6 @@ class TransparentEgressBroker:
         # already-fetched provider response or turn a success into an error.
         with contextlib.suppress(Exception):
             self._audit(decision)
-
-
-def _extract_presented_credential(headers: Mapping[str, str]) -> str | None:
-    value = _header_get(headers, "authorization")
-    if value is None:
-        return None
-    value = value.strip()
-    if value.lower().startswith("bearer "):
-        return value[7:].strip() or None
-    if value.lower().startswith("basic "):
-        try:
-            decoded = base64.b64decode(value[6:].strip()).decode("utf-8", "replace")
-        except (ValueError, UnicodeDecodeError):
-            return None
-        # Stripe-style basic auth carries the key as the username.
-        return decoded.split(":", 1)[0] or None
-    return value or None
 
 
 def _approved_destination_map(

@@ -6,6 +6,7 @@ import os
 import socket
 import ssl
 import tempfile
+from datetime import timedelta
 from typing import Any
 
 import httpx
@@ -21,6 +22,8 @@ from cayu.egress import (
 from cayu.vaults import StaticVault
 
 pytest.importorskip("cryptography")
+
+from cryptography import x509
 
 from cayu.egress.proxy_server import (
     DualStackLoopbackEgressProxyServer,
@@ -121,6 +124,34 @@ def test_tls_interception_swaps_credential_and_captures_traffic() -> None:
     assert upstream.sent.headers["Authorization"] == f"Bearer {REAL_SECRET}"
     # The sandbox-facing response carries no real secret.
     assert REAL_SECRET not in response.text
+
+
+def test_proxy_leaf_certificate_uses_standards_compliant_validity_window() -> None:
+    async def run() -> x509.Certificate:
+        loop = asyncio.get_running_loop()
+        broker, _registry = _broker(_CapturingUpstream())
+        server = TransparentEgressProxyServer(broker, loop=loop)
+        port = await server.start()
+
+        def fetch_certificate() -> x509.Certificate:
+            with socket.create_connection(("127.0.0.1", port), timeout=5.0) as conn:
+                conn.sendall(
+                    b"CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\n\r\n"
+                )
+                assert conn.recv(1024).startswith(b"HTTP/1.1 200 Connection Established")
+                context = ssl._create_unverified_context()
+                with context.wrap_socket(conn, server_hostname="api.github.com") as tls:
+                    cert_der = tls.getpeercert(binary_form=True)
+            return x509.load_der_x509_certificate(cert_der)
+
+        try:
+            return await asyncio.to_thread(fetch_certificate)
+        finally:
+            await server.close()
+
+    certificate = asyncio.run(run())
+
+    assert certificate.not_valid_after_utc - certificate.not_valid_before_utc <= timedelta(days=398)
 
 
 def test_denied_endpoint_blocked_through_proxy() -> None:

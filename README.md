@@ -347,6 +347,7 @@ Start with the document that matches the job:
 | Create per-session workspaces and runners | [Environment factories](https://github.com/cayu-dev/cayu/blob/main/docs/environment-factories.md) |
 | Implement a runner for your platform | [Build a runner](https://github.com/cayu-dev/cayu/blob/main/docs/build-a-runner.md) |
 | Configure network and credential boundaries | [Virtual egress](https://github.com/cayu-dev/cayu/blob/main/docs/virtual-egress.md) |
+| Run GitHub CLI without giving the runner a real token | [GitHub CLI through virtual egress](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/github-cli-virtual-egress.md) |
 | Design assertions and trajectory evals | [Evals](https://github.com/cayu-dev/cayu/blob/main/docs/evals.md) |
 | Estimate and govern cost | [Cost optimization](https://github.com/cayu-dev/cayu/blob/main/docs/cost-optimization.md) |
 | Use the application console | [Console](https://github.com/cayu-dev/cayu/blob/main/docs/console.md) |
@@ -370,6 +371,8 @@ and the [Glossary](https://github.com/cayu-dev/cayu/blob/main/docs/glossary.md).
   QA, and an explicit external effect.
 - [Business approvals](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/business-approvals.md) — domain approval routing
   over the binary runtime primitive.
+- [GitHub CLI through virtual egress](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/github-cli-virtual-egress.md) — an
+  unmodified CLI with a virtual token, exact REST policy, and explicit mutation boundary.
 - [Advanced runtime examples](https://github.com/cayu-dev/cayu/blob/main/examples/ADVANCED_RUNTIME_EXAMPLES.md) — forks,
   compaction, taint isolation, speculative approval, and measured evidence.
 

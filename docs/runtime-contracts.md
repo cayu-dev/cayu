@@ -1804,6 +1804,20 @@ unmanaged raw provider runner is not part of the contract. Workspace-factory
 failure or cancellation is still environment setup failure and triggers the
 same bounded, idempotent grant, runner, proxy/network, and CA cleanup.
 
+`VirtualCredentialSpec.credential_kind` is a closed authorization-shape
+contract. `stripe_bearer` accepts `Authorization: Bearer` and Stripe-style
+Basic username presentation, then forwards the resolved secret as Bearer;
+`opaque_bearer` accepts and forwards Bearer; `opaque_token` accepts and forwards
+the literal `Authorization: token …` scheme used by GitHub CLI. The broker
+retains the presented scheme during extraction and requires it to match the
+grant kind before resolving the vault reference. A mismatched or unsupported
+scheme is denied without resolving or forwarding the real credential. A bare
+`Authorization` value has no scheme and is unsupported. A value that uses any
+registered Cayu virtual-credential prefix remains on the credential-bearing
+deny path even when its scheme is missing or unrecognized; it cannot fall
+through to a credentialless destination. Header scheme selection is therefore
+part of the credential grant, not a caller-owned rewrite hint.
+
 A custom `Tool` uses those same services through `ctx`: `await ctx.runner.exec(ExecCommand.process(...))` runs a command in the environment's runner, while `ctx.workspace.write_bytes(path, data)` and `ctx.workspace.read_bytes(path)` (which returns a `WorkspaceReadResult` carrying `content` / `total_bytes`) write and read files. Guard against a missing service (`if ctx.runner is None: ...`), since not every environment configures one. See [`examples/custom_runner_tool.py`](../examples/custom_runner_tool.py) for a worked tool, and `src/cayu/tools/commands.py` (`ExecCommandTool`) for the framework's own reference.
 
 `ExecCommandTool(policy=...)` resolves the model-requested working directory through the active runner **before** it calls `CommandPolicy.evaluate(...)`. `CommandRequest.cwd` remains the original requested value (`None`, relative, normalized-relative, or contained absolute) for audit messages and backward compatibility. `CommandRequest.canonical_cwd` is the runner-resolved directory; it is always populated by `ExecCommandTool` at policy-evaluation time, and policies must use it for workspace-containment decisions. When a policy allows the request, the tool passes that exact canonical string to `runner.exec(...)`, including the canonical default when the request omitted `cwd`. `DENY` and `REQUIRE_COMMAND_APPROVAL` both refuse inline and emit the canonical `tool.call.blocked` event with `denied_by=command_policy`; the latter does not create a durable approval checkpoint. Applications that need pause/resume approval use `ToolPolicyDecision.REQUIRE_APPROVAL`. A command refusal never reaches `runner.exec(...)`, and resolution failures (blank paths, relative traversal that escapes the root, absolute paths outside the runner root, or runner-specific failures such as a missing local directory) happen before policy evaluation or command execution.

@@ -109,6 +109,25 @@ def test_credentialless_request_is_forwarded_unchanged_without_secret_resolution
     assert decisions[-1].policy_name == "public-docs"
 
 
+def test_virtual_namespace_under_unknown_authorization_scheme_cannot_fall_through() -> None:
+    upstream = _RecordingUpstream()
+    broker, resolver, decisions = _credentialless_broker(upstream=upstream)
+    request = CapturedRequest(
+        method="GET",
+        host="docs.example.com",
+        path="/sdk/index.json",
+        headers={"Authorization": "Digest cayu_vc_invalid"},
+    )
+
+    response = asyncio.run(broker.handle_request(request))
+
+    assert response.status_code == 403
+    assert resolver.calls == 0
+    assert upstream.requests == []
+    assert decisions[-1].allowed is False
+    assert decisions[-1].authorization_kind == "virtual_credential"
+
+
 @pytest.mark.parametrize(
     "captured_request",
     [

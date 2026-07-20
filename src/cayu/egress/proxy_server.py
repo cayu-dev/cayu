@@ -25,7 +25,8 @@ from cryptography.x509.oid import NameOID
 from cayu.egress.broker import CapturedRequest, CapturedResponse, TransparentEgressBroker
 
 _ONE_DAY = _dt.timedelta(days=1)
-_LEAF_VALIDITY = _dt.timedelta(days=825)
+_CA_VALIDITY = _dt.timedelta(days=825)
+_LEAF_VALIDITY = _dt.timedelta(days=365)
 _MAX_REQUEST_BYTES = 8 * 1024 * 1024
 _BROKER_TIMEOUT_S = 60.0
 _TRANSPORT_TUNNEL_TARGET = "cayu-transport.invalid:443"
@@ -79,7 +80,7 @@ class SessionCertificateAuthority:
             .public_key(public_key)
             .serial_number(x509.random_serial_number())
             .not_valid_before(now - _ONE_DAY)
-            .not_valid_after(now + _LEAF_VALIDITY)
+            .not_valid_after(now + _CA_VALIDITY)
             .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
             .add_extension(x509.SubjectKeyIdentifier.from_public_key(public_key), critical=False)
             .add_extension(

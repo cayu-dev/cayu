@@ -39,6 +39,7 @@ corresponding credentials or service.
 - [`artifact_file_live.py`](artifact_file_live.py) and
   [`artifact_workspace_bridge.py`](artifact_workspace_bridge.py) — durable files and mutable workspaces.
 - [`fastapi_stripe_virtual_egress.py`](fastapi_stripe_virtual_egress.py) — virtual credentials and restricted egress.
+- [`github_cli_virtual_egress.py`](github_cli_virtual_egress.py) — an unmodified CLI with a brokered token and restricted egress.
 - [`aws/`](aws/) — Bedrock, Lambda MicroVM, and AWS environment examples.
 
 ## Durable orchestration

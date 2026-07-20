@@ -110,8 +110,11 @@ egress adapter also creates its matching runner, so enforcement cannot be
 prepared and then accidentally discarded by an unrelated runner factory. Keep
 provider-specific business authorization in the app, provider-scoped
 credentials, or a custom policy.
-Supported credential shapes are closed for now: `stripe_bearer` and
-`opaque_bearer`.
+Supported credential shapes are closed for now: `stripe_bearer`,
+`opaque_bearer`, and `opaque_token`. The last shape carries an opaque secret as
+`Authorization: token …`; see the
+[GitHub CLI recipe](recipes/github-cli-virtual-egress.md) for the executable
+proof and its compatibility boundary.
 
 Install the TLS/Docker pieces with the optional extra:
 

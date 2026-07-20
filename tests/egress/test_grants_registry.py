@@ -85,6 +85,20 @@ def test_generic_kind_uses_generic_prefix() -> None:
     assert grant.presented_value.startswith("cayu_vc_")
 
 
+def test_opaque_token_kind_uses_generic_prefix() -> None:
+    registry, _ = _registry()
+
+    grant = registry.mint(
+        session_id="sess_1",
+        env_name="GH_TOKEN",
+        secret=SecretRef(name="github_token"),
+        destination="api.github.com",
+        credential_kind="opaque_token",
+    )
+
+    assert grant.presented_value.startswith("cayu_vc_")
+
+
 def test_unsupported_kind_is_rejected() -> None:
     registry, _ = _registry()
 

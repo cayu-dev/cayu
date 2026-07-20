@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import gzip
 from collections.abc import Mapping
 from dataclasses import asdict
@@ -25,6 +26,7 @@ from cayu.egress import (
 from cayu.vaults import ResolvedSecret, SecretRef, StaticVault
 
 REAL_SECRET = "sk_test_51RealDeadBeefSecretValue"
+GITHUB_SECRET = "github_pat_11RealDeadBeefSecretValue"
 
 
 def _destination_resolver(*addresses: str):  # type: ignore[no-untyped-def]
@@ -86,7 +88,14 @@ def _build(
     TransparentEgressBroker, VirtualCredentialRegistry, _RecordingResolver, list[EgressDecision]
 ]:
     registry = VirtualCredentialRegistry(clock=clock or _Clock(datetime(2026, 7, 6, tzinfo=UTC)))
-    resolver = _RecordingResolver(StaticVault({"stripe_test_key": REAL_SECRET}))
+    resolver = _RecordingResolver(
+        StaticVault(
+            {
+                "github_token": GITHUB_SECRET,
+                "stripe_test_key": REAL_SECRET,
+            }
+        )
+    )
     decisions: list[EgressDecision] = []
     if policies is None:
         policies = {"stripe-example": _stripe_example_policy()}
@@ -161,6 +170,123 @@ def test_allowed_request_injects_real_secret_upstream_only() -> None:
     assert resolver.resolve_count == 1
     assert decisions[-1].allowed is True
     _no_real_secret(decisions)
+
+
+def test_stripe_basic_request_injects_real_secret_as_bearer_upstream() -> None:
+    upstream = _FakeUpstream(CapturedResponse(status_code=200, body=b'{"id":"cus_1"}'))
+    broker, registry, resolver, decisions = _build(upstream=upstream)
+    grant = _mint(registry)
+    basic_value = base64.b64encode(f"{grant.presented_value}:".encode()).decode()
+    request = CapturedRequest(
+        method="POST",
+        host="api.stripe.com",
+        path="/v1/customers",
+        headers={
+            "Authorization": f"Basic {basic_value}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+
+    response = asyncio.run(broker.handle_request(request))
+
+    assert response.status_code == 200
+    assert upstream.sent is not None
+    assert upstream.sent.headers["Authorization"] == f"Bearer {REAL_SECRET}"
+    assert grant.presented_value not in str(upstream.sent.headers)
+    assert resolver.resolve_count == 1
+    assert decisions[-1].allowed is True
+    _no_real_secret(decisions)
+
+
+def test_opaque_token_request_injects_real_secret_upstream_only() -> None:
+    upstream = _FakeUpstream(
+        CapturedResponse(
+            status_code=200,
+            body=f'{{"debug":"{GITHUB_SECRET}"}}'.encode(),
+        )
+    )
+    github_policy = HttpEgressPolicy(
+        name="github-read",
+        allowed_hosts=["api.github.com"],
+        allowed_endpoints=[("GET", "/user")],
+    )
+    broker, registry, resolver, decisions = _build(
+        upstream=upstream,
+        policies={"github-read": github_policy},
+    )
+    grant = _mint(
+        registry,
+        env_name="GH_TOKEN",
+        secret=SecretRef(name="github_token"),
+        destination="api.github.com",
+        credential_kind="opaque_token",
+        policy_name="github-read",
+    )
+    request = CapturedRequest(
+        method="GET",
+        host="api.github.com",
+        path="/user",
+        headers={"Authorization": f"token {grant.presented_value}"},
+    )
+
+    response = asyncio.run(broker.handle_request(request))
+
+    assert response.status_code == 200
+    assert upstream.sent is not None
+    assert upstream.sent.headers["Authorization"] == f"token {GITHUB_SECRET}"
+    assert grant.presented_value not in str(upstream.sent.headers)
+    assert GITHUB_SECRET not in response.body.decode()
+    assert b"[REDACTED_SECRET]" in response.body
+    assert resolver.resolve_count == 1
+    assert decisions[-1].allowed is True
+    assert GITHUB_SECRET not in str(asdict(decisions[-1]))
+    _no_real_secret(decisions)
+
+
+@pytest.mark.parametrize(
+    ("credential_kind", "authorization_template"),
+    [
+        ("opaque_bearer", "token {credential}"),
+        ("opaque_token", "Bearer {credential}"),
+        ("opaque_token", "{credential}"),
+    ],
+)
+def test_opaque_credential_rejects_mismatched_or_missing_authorization_scheme(
+    credential_kind: str,
+    authorization_template: str,
+) -> None:
+    upstream = _FakeUpstream(CapturedResponse(status_code=200, body=b"{}"))
+    github_policy = HttpEgressPolicy(
+        name="github-read",
+        allowed_hosts=["api.github.com"],
+        allowed_endpoints=[("GET", "/user")],
+    )
+    broker, registry, resolver, decisions = _build(
+        upstream=upstream,
+        policies={"github-read": github_policy},
+    )
+    grant = _mint(
+        registry,
+        env_name="GH_TOKEN",
+        secret=SecretRef(name="github_token"),
+        destination="api.github.com",
+        credential_kind=credential_kind,
+        policy_name="github-read",
+    )
+    request = CapturedRequest(
+        method="GET",
+        host="api.github.com",
+        path="/user",
+        headers={"Authorization": authorization_template.format(credential=grant.presented_value)},
+    )
+
+    response = asyncio.run(broker.handle_request(request))
+
+    assert response.status_code == 403
+    assert b"authentication scheme does not match" in response.body
+    assert resolver.resolve_count == 0
+    assert upstream.sent is None
+    assert decisions[-1].allowed is False
 
 
 def test_allowed_response_redacts_echoed_real_secret() -> None:
