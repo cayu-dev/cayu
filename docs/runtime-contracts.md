@@ -1378,6 +1378,78 @@ token totals without guessing from session-level model lists. If the request bod
 includes a `PriceBook`, the `cost` field is populated with estimated cost
 line items and `unpriced_model_steps`; otherwise `cost` is `null`.
 
+Deployment-wide operational views should not derive totals from that paginated
+session summary. `POST /api/operations/snapshot` returns exact current session
+status counts from the configured `SessionStore` and, when requested and
+configured, exact task status counts from the `TaskStore`. The two sections
+carry independent `as_of` timestamps: applications may configure the stores on
+different databases, so the response explicitly reports `cross_store_atomic`
+as false instead of implying one distributed snapshot. Task availability is
+reported as `available`, `not_requested`, `not_configured`, or `unsupported`.
+Session counts always include `pending`, `running`, `interrupting`, `completed`,
+`failed`, and `interrupted`; task counts always include `pending`, `claimed`,
+`running`, `paused`, `blocked`, `needs_attention`, `completed`, `failed`, and
+`cancelled`, including zeroes. In-memory stores capture under their store lock,
+SQLite uses one read statement, and PostgreSQL uses a repeatable-read,
+read-only transaction. A concurrent write belongs either before or after that
+store-local snapshot; it cannot produce internally mixed status totals.
+SQLite captures `as_of` inside the aggregate statement, while PostgreSQL uses
+the transaction timestamp; the in-memory stores capture it while holding their
+store lock.
+
+`POST /api/usage/rollup` returns exact usage totals for the UTC-normalized,
+half-open event-time window `start_at <= event.timestamp < end_at`. Its optional
+session filters are evaluated against each session's current stored attributes;
+they are not historical attributes captured at event time. Active sessions are
+included. Provider and model detail is bounded by `group_limit`, with exact
+omitted totals in a `remainder`, so bounding detail does not understate the
+top-level totals. Windows are limited to 366 days and the SQL stores execute one
+database-side totals/breakdown aggregate over the event-type/time index rather
+than loading session histories into the server process. When pricing is
+requested, a second store-native grouped cursor runs inside the same SQLite or
+PostgreSQL read snapshot. Price-relevant JSON is stripped of unneeded evidence
+and size-classified in SQL before it crosses the database-driver boundary;
+oversized candidates become a small sentinel, and PostgreSQL fetches one
+candidate row at a time. The grouped query also reports its raw candidate count
+and returns at most 5,000 rows; if raw JSON variants exceed that independent work
+bound, pricing is conservatively marked truncated before canonicalization.
+Candidate rows are otherwise canonicalized incrementally and discarded as soon
+as `pricing_input_limit + 1` distinct canonical groups are known. Retained
+canonical pricing inputs have a separate 8 MiB serialized byte ceiling.
+Crossing any ceiling discards the partial pricing projection and reports
+truncated cost rather than retaining or pricing a partial result.
+The in-memory reference store keeps a bounded 512-entry heavy-hitter candidate
+set for provider and model detail. It returns exact breakdowns while cardinality
+fits that set; above it, only the breakdown is explicitly sampled while
+top-level activity and usage remain exact. Pricing and cost are unaffected by
+that sampling and retain their independent exact/truncated accuracy metadata.
+Event timestamps without an offset follow the durable-store convention and are
+interpreted as UTC. Aggregate provider/model identity uses Python's complete
+Unicode edge-whitespace definition in every store.
+Per-event usage counters are normalized only when they are nonnegative signed
+64-bit integers. Larger or malformed counters contribute zero in every store and
+make that event's pricing metrics unavailable, while sums of valid counters
+remain exact beyond signed 64-bit range.
+Aggregate session filters accept at most 50 exact labels, 25 label-selector
+clauses, and 100 values across those selectors, preventing a request body from
+expanding into an unbounded database predicate.
+
+Supplying `pricing` requests estimated cost. Price-relevant groups are separately
+bounded by `pricing_input_limit`; if that bound is exceeded, the response marks
+cost as truncated and reports all model steps as unevaluated instead of
+publishing a misleading partial total. Different currencies remain separate,
+and missing prices remain explicit. Cost accuracy can never be stronger than
+the store's totals accuracy: sampled totals produce sampled cost, while
+truncated totals are not partially priced. Request price books are bounded
+before nested validation to 2 MiB, 500 price rows, 2,000 match rules, 1,000
+resource mappings, 100 contextual requirements, and 2,000 contextual selector
+values. Selector values are included in the resolution-work calculation; the
+product of the price-input limit and resolution work is capped at 500,000. As
+with the other built-in control-plane
+reads, these endpoints cover the complete configured store. Authentication does
+not turn `AuthContext.tenant` into a row filter; tenant-facing applications must
+enforce their own complete storage or route boundary.
+
 ```bash
 curl -X POST \
   "http://localhost:8000/api/sessions/summary?label=organization=org_123&label_selector=project%20in%20(ap_q2,research)&debug_state=needs_attention" \

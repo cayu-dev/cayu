@@ -23,6 +23,53 @@
       "title": "AgentsResponse",
       "type": "object"
     },
+    "AggregateAccuracy": {
+      "additionalProperties": false,
+      "description": "Truthfulness metadata for a bounded aggregate or one of its sections.",
+      "properties": {
+        "kind": {
+          "$ref": "#/components/schemas/AggregateAccuracyKind"
+        },
+        "limit": {
+          "anyOf": [
+            {
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Limit"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Reason"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "AggregateAccuracy",
+      "type": "object"
+    },
+    "AggregateAccuracyKind": {
+      "description": "How completely an aggregate projection represents its requested scope.",
+      "enum": [
+        "exact",
+        "sampled",
+        "truncated"
+      ],
+      "title": "AggregateAccuracyKind",
+      "type": "string"
+    },
     "AggregateCostSummary": {
       "additionalProperties": false,
       "properties": {
@@ -3007,6 +3054,41 @@
       "title": "KnowledgeVisibility",
       "type": "string"
     },
+    "LabelSelectorOperator": {
+      "enum": [
+        "exists",
+        "not_exists",
+        "in",
+        "not_in"
+      ],
+      "title": "LabelSelectorOperator",
+      "type": "string"
+    },
+    "LabelSelectorRequirement": {
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "title": "Key",
+          "type": "string"
+        },
+        "operator": {
+          "$ref": "#/components/schemas/LabelSelectorOperator"
+        },
+        "values": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Values",
+          "type": "array"
+        }
+      },
+      "required": [
+        "key",
+        "operator"
+      ],
+      "title": "LabelSelectorRequirement",
+      "type": "object"
+    },
     "ListSessionEventsResponse": {
       "additionalProperties": false,
       "properties": {
@@ -3196,6 +3278,71 @@
         "schedules"
       ],
       "title": "ModelPrice",
+      "type": "object"
+    },
+    "OperationalSnapshotRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "include_tasks": {
+          "default": true,
+          "title": "Include Tasks",
+          "type": "boolean"
+        },
+        "session_filter": {
+          "$ref": "#/components/schemas/SessionAggregateFilter"
+        },
+        "task_filter": {
+          "$ref": "#/components/schemas/TaskAggregateFilter"
+        }
+      },
+      "title": "OperationalSnapshotRequest",
+      "type": "object"
+    },
+    "OperationalSnapshotResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "cross_store_atomic": {
+          "const": false,
+          "title": "Cross Store Atomic",
+          "type": "boolean"
+        },
+        "scope": {
+          "const": "configured_stores",
+          "title": "Scope",
+          "type": "string"
+        },
+        "sessions": {
+          "$ref": "#/components/schemas/SessionOperationalSnapshot"
+        },
+        "task_snapshot_status": {
+          "enum": [
+            "available",
+            "not_requested",
+            "not_configured",
+            "unsupported"
+          ],
+          "title": "Task Snapshot Status",
+          "type": "string"
+        },
+        "tasks": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/TaskOperationalSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "scope",
+        "cross_store_atomic",
+        "sessions",
+        "task_snapshot_status",
+        "tasks"
+      ],
+      "title": "OperationalSnapshotResponse",
       "type": "object"
     },
     "PendingActionKind": {
@@ -4189,6 +4336,96 @@
       "title": "ServerContractResponse",
       "type": "object"
     },
+    "SessionAggregateFilter": {
+      "additionalProperties": false,
+      "description": "Current session attributes that may scope a store-native aggregate.",
+      "properties": {
+        "agent_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Agent Name"
+        },
+        "causal_budget_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Causal Budget Id"
+        },
+        "environment_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Environment Name"
+        },
+        "label_selectors": {
+          "items": {
+            "$ref": "#/components/schemas/LabelSelectorRequirement"
+          },
+          "maxItems": 25,
+          "title": "Label Selectors",
+          "type": "array"
+        },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "maxProperties": 50,
+          "title": "Labels",
+          "type": "object"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Model"
+        },
+        "parent_session_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Parent Session Id"
+        },
+        "provider_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Provider Name"
+        }
+      },
+      "title": "SessionAggregateFilter",
+      "type": "object"
+    },
     "SessionCostBody": {
       "properties": {
         "currency": {
@@ -4276,6 +4513,36 @@
       "title": "SessionMessageDeliveryMode",
       "type": "string"
     },
+    "SessionOperationalSnapshot": {
+      "additionalProperties": false,
+      "description": "Exact current session counts captured by one store-local read snapshot.",
+      "properties": {
+        "accuracy": {
+          "$ref": "#/components/schemas/AggregateAccuracy"
+        },
+        "as_of": {
+          "format": "date-time",
+          "title": "As Of",
+          "type": "string"
+        },
+        "counts_by_status": {
+          "$ref": "#/components/schemas/SessionStatusCounts"
+        },
+        "total_count": {
+          "minimum": 0.0,
+          "title": "Total Count",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "as_of",
+        "total_count",
+        "counts_by_status",
+        "accuracy"
+      ],
+      "title": "SessionOperationalSnapshot",
+      "type": "object"
+    },
     "SessionOrder": {
       "enum": [
         "created_at_asc",
@@ -4344,6 +4611,52 @@
       ],
       "title": "SessionStatus",
       "type": "string"
+    },
+    "SessionStatusCounts": {
+      "additionalProperties": false,
+      "description": "Complete current-session counts for every lifecycle status.",
+      "properties": {
+        "completed": {
+          "minimum": 0.0,
+          "title": "Completed",
+          "type": "integer"
+        },
+        "failed": {
+          "minimum": 0.0,
+          "title": "Failed",
+          "type": "integer"
+        },
+        "interrupted": {
+          "minimum": 0.0,
+          "title": "Interrupted",
+          "type": "integer"
+        },
+        "interrupting": {
+          "minimum": 0.0,
+          "title": "Interrupting",
+          "type": "integer"
+        },
+        "pending": {
+          "minimum": 0.0,
+          "title": "Pending",
+          "type": "integer"
+        },
+        "running": {
+          "minimum": 0.0,
+          "title": "Running",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "pending",
+        "running",
+        "interrupting",
+        "completed",
+        "failed",
+        "interrupted"
+      ],
+      "title": "SessionStatusCounts",
+      "type": "object"
     },
     "SessionSummaryResponse": {
       "additionalProperties": false,
@@ -4868,6 +5181,58 @@
       "title": "StructuredOutputStrategy",
       "type": "string"
     },
+    "TaskAggregateFilter": {
+      "additionalProperties": false,
+      "description": "Current task attributes that may scope a store-native aggregate.",
+      "properties": {
+        "assigned_agent_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Assigned Agent Name"
+        },
+        "parent_task_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Parent Task Id"
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Session Id"
+        },
+        "type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Type"
+        }
+      },
+      "title": "TaskAggregateFilter",
+      "type": "object"
+    },
     "TaskHoldBody": {
       "properties": {
         "payload": {
@@ -4898,6 +5263,36 @@
       "title": "TaskHoldBody",
       "type": "object"
     },
+    "TaskOperationalSnapshot": {
+      "additionalProperties": false,
+      "description": "Exact current task counts captured by one store-local read snapshot.",
+      "properties": {
+        "accuracy": {
+          "$ref": "#/components/schemas/AggregateAccuracy"
+        },
+        "as_of": {
+          "format": "date-time",
+          "title": "As Of",
+          "type": "string"
+        },
+        "counts_by_status": {
+          "$ref": "#/components/schemas/TaskStatusCounts"
+        },
+        "total_count": {
+          "minimum": 0.0,
+          "title": "Total Count",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "as_of",
+        "total_count",
+        "counts_by_status",
+        "accuracy"
+      ],
+      "title": "TaskOperationalSnapshot",
+      "type": "object"
+    },
     "TaskOrder": {
       "enum": [
         "created_at_asc",
@@ -4922,6 +5317,70 @@
       ],
       "title": "TaskStatus",
       "type": "string"
+    },
+    "TaskStatusCounts": {
+      "additionalProperties": false,
+      "description": "Complete current-task counts for every lifecycle status.",
+      "properties": {
+        "blocked": {
+          "minimum": 0.0,
+          "title": "Blocked",
+          "type": "integer"
+        },
+        "cancelled": {
+          "minimum": 0.0,
+          "title": "Cancelled",
+          "type": "integer"
+        },
+        "claimed": {
+          "minimum": 0.0,
+          "title": "Claimed",
+          "type": "integer"
+        },
+        "completed": {
+          "minimum": 0.0,
+          "title": "Completed",
+          "type": "integer"
+        },
+        "failed": {
+          "minimum": 0.0,
+          "title": "Failed",
+          "type": "integer"
+        },
+        "needs_attention": {
+          "minimum": 0.0,
+          "title": "Needs Attention",
+          "type": "integer"
+        },
+        "paused": {
+          "minimum": 0.0,
+          "title": "Paused",
+          "type": "integer"
+        },
+        "pending": {
+          "minimum": 0.0,
+          "title": "Pending",
+          "type": "integer"
+        },
+        "running": {
+          "minimum": 0.0,
+          "title": "Running",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "pending",
+        "claimed",
+        "running",
+        "paused",
+        "blocked",
+        "needs_attention",
+        "completed",
+        "failed",
+        "cancelled"
+      ],
+      "title": "TaskStatusCounts",
+      "type": "object"
     },
     "ThinkingConfig": {
       "additionalProperties": false,
@@ -5519,6 +5978,136 @@
       "title": "UpdateSessionMetadataBody",
       "type": "object"
     },
+    "UsageAggregateBreakdown": {
+      "additionalProperties": false,
+      "description": "Deterministic top groups plus an exact remainder when detail is bounded.",
+      "properties": {
+        "accuracy": {
+          "$ref": "#/components/schemas/AggregateAccuracy"
+        },
+        "groups": {
+          "items": {
+            "$ref": "#/components/schemas/UsageAggregateGroup"
+          },
+          "maxItems": 100,
+          "title": "Groups",
+          "type": "array"
+        },
+        "remainder": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/UsageAggregateRemainder"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "groups",
+        "remainder",
+        "accuracy"
+      ],
+      "title": "UsageAggregateBreakdown",
+      "type": "object"
+    },
+    "UsageAggregateGroup": {
+      "additionalProperties": false,
+      "description": "One provider/model grouping inside a bounded usage breakdown.",
+      "properties": {
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Model"
+        },
+        "provider_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Provider Name"
+        },
+        "totals": {
+          "$ref": "#/components/schemas/UsageAggregateTotals"
+        }
+      },
+      "required": [
+        "provider_name",
+        "model",
+        "totals"
+      ],
+      "title": "UsageAggregateGroup",
+      "type": "object"
+    },
+    "UsageAggregateRemainder": {
+      "additionalProperties": false,
+      "description": "Exact totals represented by groups omitted from a bounded breakdown.",
+      "properties": {
+        "group_count": {
+          "minimum": 1.0,
+          "title": "Group Count",
+          "type": "integer"
+        },
+        "totals": {
+          "$ref": "#/components/schemas/UsageAggregateTotals"
+        }
+      },
+      "required": [
+        "group_count",
+        "totals"
+      ],
+      "title": "UsageAggregateRemainder",
+      "type": "object"
+    },
+    "UsageAggregateTotals": {
+      "additionalProperties": false,
+      "description": "Identity-free activity and token totals for one aggregate scope.",
+      "properties": {
+        "model_steps": {
+          "minimum": 0.0,
+          "title": "Model Steps",
+          "type": "integer"
+        },
+        "model_steps_with_usage": {
+          "minimum": 0.0,
+          "title": "Model Steps With Usage",
+          "type": "integer"
+        },
+        "session_count": {
+          "minimum": 0.0,
+          "title": "Session Count",
+          "type": "integer"
+        },
+        "tool_calls": {
+          "minimum": 0.0,
+          "title": "Tool Calls",
+          "type": "integer"
+        },
+        "usage": {
+          "$ref": "#/components/schemas/UsageMetrics"
+        }
+      },
+      "required": [
+        "session_count",
+        "model_steps",
+        "model_steps_with_usage",
+        "tool_calls",
+        "usage"
+      ],
+      "title": "UsageAggregateTotals",
+      "type": "object"
+    },
     "UsageBreakdownItem": {
       "additionalProperties": false,
       "properties": {
@@ -5566,6 +6155,99 @@
         "usage"
       ],
       "title": "UsageBreakdownItem",
+      "type": "object"
+    },
+    "UsageCostRollup": {
+      "additionalProperties": false,
+      "description": "Bounded cost result derived from grouped price-relevant inputs.",
+      "properties": {
+        "accuracy": {
+          "$ref": "#/components/schemas/AggregateAccuracy"
+        },
+        "currencies": {
+          "items": {
+            "$ref": "#/components/schemas/UsageCurrencyCost"
+          },
+          "maxItems": 5000,
+          "title": "Currencies",
+          "type": "array"
+        },
+        "evaluated_model_steps": {
+          "minimum": 0.0,
+          "title": "Evaluated Model Steps",
+          "type": "integer"
+        },
+        "price_book_generated_at": {
+          "title": "Price Book Generated At",
+          "type": "string"
+        },
+        "price_book_version": {
+          "title": "Price Book Version",
+          "type": "string"
+        },
+        "priced_model_steps": {
+          "minimum": 0.0,
+          "title": "Priced Model Steps",
+          "type": "integer"
+        },
+        "unevaluated_model_steps": {
+          "minimum": 0.0,
+          "title": "Unevaluated Model Steps",
+          "type": "integer"
+        },
+        "unpriced_model_steps": {
+          "minimum": 0.0,
+          "title": "Unpriced Model Steps",
+          "type": "integer"
+        },
+        "unpriced_reasons": {
+          "items": {
+            "$ref": "#/components/schemas/UsageUnpricedReason"
+          },
+          "maxItems": 5000,
+          "title": "Unpriced Reasons",
+          "type": "array"
+        }
+      },
+      "required": [
+        "price_book_version",
+        "price_book_generated_at",
+        "accuracy",
+        "evaluated_model_steps",
+        "priced_model_steps",
+        "unpriced_model_steps",
+        "unevaluated_model_steps",
+        "currencies",
+        "unpriced_reasons"
+      ],
+      "title": "UsageCostRollup",
+      "type": "object"
+    },
+    "UsageCurrencyCost": {
+      "additionalProperties": false,
+      "description": "Exact estimated cost for one currency; currencies are never combined.",
+      "properties": {
+        "currency": {
+          "title": "Currency",
+          "type": "string"
+        },
+        "model_steps": {
+          "minimum": 1.0,
+          "title": "Model Steps",
+          "type": "integer"
+        },
+        "total_cost": {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "title": "Total Cost",
+          "type": "string"
+        }
+      },
+      "required": [
+        "currency",
+        "model_steps",
+        "total_cost"
+      ],
+      "title": "UsageCurrencyCost",
       "type": "object"
     },
     "UsageMetrics": {
@@ -5644,6 +6326,165 @@
         }
       },
       "title": "UsageMetrics",
+      "type": "object"
+    },
+    "UsageRollupRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "end_at": {
+          "format": "date-time",
+          "title": "End At",
+          "type": "string"
+        },
+        "group_limit": {
+          "default": 20,
+          "maximum": 100.0,
+          "minimum": 1.0,
+          "title": "Group Limit",
+          "type": "integer"
+        },
+        "pricing": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/PriceBook"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional bounded price book. The serialized value may contain at most 2 MiB, 500 prices, 2,000 price match rules, 1,000 resource mappings, 100 contextual requirements, and 2,000 contextual selector values. The price-input limit multiplied by the resolution candidates may not exceed 500,000."
+        },
+        "pricing_input_limit": {
+          "default": 1000,
+          "maximum": 5000.0,
+          "minimum": 1.0,
+          "title": "Pricing Input Limit",
+          "type": "integer"
+        },
+        "session_filter": {
+          "$ref": "#/components/schemas/SessionAggregateFilter"
+        },
+        "start_at": {
+          "format": "date-time",
+          "title": "Start At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start_at",
+        "end_at"
+      ],
+      "title": "UsageRollupRequest",
+      "type": "object"
+    },
+    "UsageRollupResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "accuracy": {
+          "$ref": "#/components/schemas/AggregateAccuracy"
+        },
+        "active_session_count": {
+          "minimum": 0.0,
+          "title": "Active Session Count",
+          "type": "integer"
+        },
+        "as_of": {
+          "format": "date-time",
+          "title": "As Of",
+          "type": "string"
+        },
+        "cost": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/UsageCostRollup"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "end_at": {
+          "format": "date-time",
+          "title": "End At",
+          "type": "string"
+        },
+        "includes_active_sessions": {
+          "title": "Includes Active Sessions",
+          "type": "boolean"
+        },
+        "matching_session_count": {
+          "minimum": 0.0,
+          "title": "Matching Session Count",
+          "type": "integer"
+        },
+        "model_breakdown": {
+          "$ref": "#/components/schemas/UsageAggregateBreakdown"
+        },
+        "provider_breakdown": {
+          "$ref": "#/components/schemas/UsageAggregateBreakdown"
+        },
+        "scope": {
+          "const": "configured_session_store",
+          "title": "Scope",
+          "type": "string"
+        },
+        "session_filter_basis": {
+          "const": "current_session_attributes",
+          "title": "Session Filter Basis",
+          "type": "string"
+        },
+        "start_at": {
+          "format": "date-time",
+          "title": "Start At",
+          "type": "string"
+        },
+        "time_basis": {
+          "const": "event.timestamp",
+          "title": "Time Basis",
+          "type": "string"
+        },
+        "totals": {
+          "$ref": "#/components/schemas/UsageAggregateTotals"
+        }
+      },
+      "required": [
+        "scope",
+        "time_basis",
+        "session_filter_basis",
+        "as_of",
+        "start_at",
+        "end_at",
+        "accuracy",
+        "matching_session_count",
+        "active_session_count",
+        "includes_active_sessions",
+        "totals",
+        "provider_breakdown",
+        "model_breakdown",
+        "cost"
+      ],
+      "title": "UsageRollupResponse",
+      "type": "object"
+    },
+    "UsageUnpricedReason": {
+      "additionalProperties": false,
+      "description": "Model-step count that could not be priced for one explicit reason.",
+      "properties": {
+        "model_steps": {
+          "minimum": 1.0,
+          "title": "Model Steps",
+          "type": "integer"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "model_steps"
+      ],
+      "title": "UsageUnpricedReason",
       "type": "object"
     },
     "UserInputRecoveryBody": {
@@ -6929,6 +7770,43 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/operations/snapshot": {
+      "post": {
+        "operation_id": "get_operational_snapshot_api_operations_snapshot_post",
+        "parameters": [],
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/OperationalSnapshotRequest"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/OperationalSnapshotResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
               }
             }
           }
@@ -9174,6 +10052,43 @@
             }
           },
           "500": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/usage/rollup": {
+      "post": {
+        "operation_id": "get_usage_rollup_api_usage_rollup_post",
+        "parameters": [],
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/UsageRollupRequest"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/UsageRollupResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          },
+          "501": {
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/ApiErrorResponse"

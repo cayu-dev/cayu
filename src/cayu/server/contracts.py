@@ -2,18 +2,41 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from collections.abc import Sequence
+from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
+from cayu._validation import json_utf8_size_within_limit
 from cayu.core.events import EVENT_ID_MAX_CHARS
+from cayu.runtime.aggregates import (
+    AggregateAccuracy,
+    UsageAggregateBreakdown,
+    UsageAggregateTotals,
+    UsageCostRollup,
+)
 from cayu.runtime.costs import (
     CausalBudgetCostSummary,
     CostLineItem,
+    PriceBook,
     SessionCostSummary,
 )
+from cayu.runtime.sessions import (
+    MAX_USAGE_ROLLUP_WINDOW,
+    SessionAggregateFilter,
+    SessionOperationalSnapshot,
+)
+from cayu.runtime.tasks import TaskAggregateFilter, TaskOperationalSnapshot
 from cayu.runtime.usage import CausalBudgetUsageSummary, SessionUsageSummary, UsageMetrics
 from cayu.server.sse import (
     SSE_ERROR_TEXT_MAX_BYTES,
@@ -37,8 +60,271 @@ class HealthResponse(ApiBaseModel):
     ok: StrictBool
 
 
+class OperationalSnapshotRequest(ApiBaseModel):
+    session_filter: SessionAggregateFilter = Field(default_factory=SessionAggregateFilter)
+    task_filter: TaskAggregateFilter = Field(default_factory=TaskAggregateFilter)
+    include_tasks: StrictBool = True
+
+
+class OperationalSnapshotResponse(ApiBaseModel):
+    scope: Literal["configured_stores"]
+    cross_store_atomic: Literal[False]
+    sessions: SessionOperationalSnapshot
+    task_snapshot_status: Literal[
+        "available",
+        "not_requested",
+        "not_configured",
+        "unsupported",
+    ]
+    tasks: TaskOperationalSnapshot | None
+
+    @model_validator(mode="after")
+    def validate_task_availability(self) -> OperationalSnapshotResponse:
+        if self.task_snapshot_status == "available" and self.tasks is None:
+            raise ValueError("Available task snapshots must include tasks.")
+        if self.task_snapshot_status != "available" and self.tasks is not None:
+            raise ValueError("Unavailable task snapshots cannot include tasks.")
+        return self
+
+
+MAX_USAGE_ROLLUP_PRICE_BOOK_BYTES = 2 * 1024 * 1024
+MAX_USAGE_ROLLUP_PRICES = 500
+MAX_USAGE_ROLLUP_PRICE_MATCH_RULES = 2000
+MAX_USAGE_ROLLUP_RESOURCE_MAPPINGS = 1000
+MAX_USAGE_ROLLUP_CONTEXT_REQUIREMENTS = 100
+MAX_USAGE_ROLLUP_CONTEXT_SELECTOR_VALUES = 2000
+MAX_USAGE_ROLLUP_PRICE_RESOLUTION_WORK = 500_000
+
+
+class UsageRollupRequest(ApiBaseModel):
+    start_at: datetime
+    end_at: datetime
+    session_filter: SessionAggregateFilter = Field(default_factory=SessionAggregateFilter)
+    group_limit: StrictInt = Field(default=20, ge=1, le=100)
+    pricing_input_limit: StrictInt = Field(default=1000, ge=1, le=5000)
+    pricing: PriceBook | None = Field(
+        default=None,
+        description=(
+            "Optional bounded price book. The serialized value may contain at most "
+            "2 MiB, 500 prices, 2,000 price match rules, 1,000 resource mappings, "
+            "100 contextual requirements, and 2,000 contextual selector values. "
+            "The price-input limit multiplied by the resolution candidates may not "
+            "exceed 500,000."
+        ),
+    )
+
+    @field_validator("pricing", mode="before")
+    @classmethod
+    def bound_raw_pricing(cls, value: object) -> object:
+        if value is None or isinstance(value, PriceBook):
+            return value
+        if type(value) is not dict:
+            return value
+        raw_pricing = cast("dict[str, object]", value)
+        if not json_utf8_size_within_limit(value, MAX_USAGE_ROLLUP_PRICE_BOOK_BYTES):
+            raise ValueError(
+                f"pricing cannot exceed {MAX_USAGE_ROLLUP_PRICE_BOOK_BYTES} JSON bytes."
+            )
+        prices = _bounded_raw_sequence(
+            raw_pricing.get("prices"),
+            field_name="pricing.prices",
+            limit=MAX_USAGE_ROLLUP_PRICES,
+        )
+        _bounded_raw_sequence(
+            raw_pricing.get("resource_mappings", ()),
+            field_name="pricing.resource_mappings",
+            limit=MAX_USAGE_ROLLUP_RESOURCE_MAPPINGS,
+        )
+        _bounded_raw_sequence(
+            raw_pricing.get("contextual_pricing_requirements", ()),
+            field_name="pricing.contextual_pricing_requirements",
+            limit=MAX_USAGE_ROLLUP_CONTEXT_REQUIREMENTS,
+        )
+        match_rule_count = 0
+        context_selector_value_count = 0
+        for raw_price in prices:
+            match_rule_count += 1
+            if type(raw_price) is dict:
+                price = cast("dict[str, object]", raw_price)
+                match_rule_count += len(
+                    _bounded_raw_sequence(
+                        price.get("aliases", ()),
+                        field_name="pricing.prices[].aliases",
+                        limit=MAX_USAGE_ROLLUP_PRICE_MATCH_RULES,
+                    )
+                )
+                match_rule_count += len(
+                    _bounded_raw_sequence(
+                        price.get("match_prefixes", ()),
+                        field_name="pricing.prices[].match_prefixes",
+                        limit=MAX_USAGE_ROLLUP_PRICE_MATCH_RULES,
+                    )
+                )
+                raw_context = price.get("pricing_context")
+                if type(raw_context) is dict:
+                    raw_dimensions = cast("dict[str, object]", raw_context).get("dimensions")
+                    if type(raw_dimensions) is dict:
+                        for raw_values in cast("dict[object, object]", raw_dimensions).values():
+                            context_selector_value_count += len(
+                                _bounded_raw_sequence(
+                                    raw_values,
+                                    field_name=("pricing.prices[].pricing_context.dimensions[]"),
+                                    limit=MAX_USAGE_ROLLUP_CONTEXT_SELECTOR_VALUES,
+                                )
+                            )
+                            if (
+                                context_selector_value_count
+                                > MAX_USAGE_ROLLUP_CONTEXT_SELECTOR_VALUES
+                            ):
+                                raise ValueError(
+                                    "pricing cannot contain more than "
+                                    f"{MAX_USAGE_ROLLUP_CONTEXT_SELECTOR_VALUES} total "
+                                    "contextual selector values."
+                                )
+            if match_rule_count > MAX_USAGE_ROLLUP_PRICE_MATCH_RULES:
+                raise ValueError(
+                    "pricing cannot contain more than "
+                    f"{MAX_USAGE_ROLLUP_PRICE_MATCH_RULES} total match rules."
+                )
+        return value
+
+    @field_validator("start_at", "end_at")
+    @classmethod
+    def normalize_window_timestamp(cls, value: datetime, info) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(f"{info.field_name} must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def bound_pricing_resolution_work(self) -> UsageRollupRequest:
+        if self.start_at >= self.end_at:
+            raise ValueError("Usage rollup start_at must be before end_at.")
+        if self.end_at - self.start_at > MAX_USAGE_ROLLUP_WINDOW:
+            raise ValueError(
+                f"Usage rollup window cannot exceed {MAX_USAGE_ROLLUP_WINDOW.days} days."
+            )
+        if self.pricing is None:
+            return self
+        if not json_utf8_size_within_limit(
+            self.pricing.model_dump(mode="json"),
+            MAX_USAGE_ROLLUP_PRICE_BOOK_BYTES,
+        ):
+            raise ValueError(
+                f"pricing cannot exceed {MAX_USAGE_ROLLUP_PRICE_BOOK_BYTES} JSON bytes."
+            )
+        if len(self.pricing.prices) > MAX_USAGE_ROLLUP_PRICES:
+            raise ValueError(
+                f"pricing.prices cannot contain more than {MAX_USAGE_ROLLUP_PRICES} items."
+            )
+        if len(self.pricing.resource_mappings) > MAX_USAGE_ROLLUP_RESOURCE_MAPPINGS:
+            raise ValueError(
+                "pricing.resource_mappings cannot contain more than "
+                f"{MAX_USAGE_ROLLUP_RESOURCE_MAPPINGS} items."
+            )
+        if (
+            len(self.pricing.contextual_pricing_requirements)
+            > MAX_USAGE_ROLLUP_CONTEXT_REQUIREMENTS
+        ):
+            raise ValueError(
+                "pricing.contextual_pricing_requirements cannot contain more than "
+                f"{MAX_USAGE_ROLLUP_CONTEXT_REQUIREMENTS} items."
+            )
+        rule_counts = tuple(
+            1 + len(price.aliases) + len(price.match_prefixes) for price in self.pricing.prices
+        )
+        match_rules = sum(rule_counts)
+        if match_rules > MAX_USAGE_ROLLUP_PRICE_MATCH_RULES:
+            raise ValueError(
+                "pricing cannot contain more than "
+                f"{MAX_USAGE_ROLLUP_PRICE_MATCH_RULES} total match rules."
+            )
+        context_selector_values = sum(
+            len(values)
+            for price in self.pricing.prices
+            if price.pricing_context is not None
+            for values in price.pricing_context.dimensions.values()
+        )
+        if context_selector_values > MAX_USAGE_ROLLUP_CONTEXT_SELECTOR_VALUES:
+            raise ValueError(
+                "pricing cannot contain more than "
+                f"{MAX_USAGE_ROLLUP_CONTEXT_SELECTOR_VALUES} total contextual selector values."
+            )
+        match_work = sum(
+            rule_count
+            * (
+                1
+                + (
+                    0
+                    if price.pricing_context is None
+                    else len(price.pricing_context.dimensions)
+                    + sum(len(values) for values in price.pricing_context.dimensions.values())
+                )
+            )
+            for price, rule_count in zip(self.pricing.prices, rule_counts, strict=True)
+        )
+        schedule_work = max(
+            (
+                len(price.schedules)
+                + max(len(schedule.pricing.standard) for schedule in price.schedules)
+                for price in self.pricing.prices
+            ),
+            default=0,
+        )
+        resolution_work = (
+            1
+            + match_work
+            + len(self.pricing.resource_mappings)
+            + len(self.pricing.contextual_pricing_requirements)
+            + schedule_work
+        )
+        if self.pricing_input_limit * resolution_work > MAX_USAGE_ROLLUP_PRICE_RESOLUTION_WORK:
+            raise ValueError(
+                "pricing_input_limit and pricing candidates exceed the "
+                f"{MAX_USAGE_ROLLUP_PRICE_RESOLUTION_WORK}-candidate resolution bound."
+            )
+        return self
+
+
+def _bounded_raw_sequence(
+    value: object,
+    *,
+    field_name: str,
+    limit: int,
+) -> Sequence[object]:
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        if len(value) > limit:
+            raise ValueError(f"{field_name} cannot contain more than {limit} items.")
+        return value
+    return ()
+
+
+class UsageRollupResponse(ApiBaseModel):
+    scope: Literal["configured_session_store"]
+    time_basis: Literal["event.timestamp"]
+    session_filter_basis: Literal["current_session_attributes"]
+    as_of: datetime
+    start_at: datetime
+    end_at: datetime
+    accuracy: AggregateAccuracy
+    matching_session_count: StrictInt = Field(ge=0)
+    active_session_count: StrictInt = Field(ge=0)
+    includes_active_sessions: StrictBool
+    totals: UsageAggregateTotals
+    provider_breakdown: UsageAggregateBreakdown
+    model_breakdown: UsageAggregateBreakdown
+    cost: UsageCostRollup | None
+
+
 class ApiErrorResponse(ApiBaseModel):
     detail: str
+
+
+AGGREGATE_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
+    501: {
+        "description": "The configured store does not implement this aggregate read.",
+        "model": ApiErrorResponse,
+    }
+}
 
 
 class SseEventEnvelope(ApiBaseModel):

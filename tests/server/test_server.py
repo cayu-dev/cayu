@@ -2350,6 +2350,263 @@ def test_server_rejects_invalid_session_label_filters() -> None:
     assert client.get("/api/sessions?label_selector=project%20in%20ap_q2").status_code == 422
 
 
+def test_server_exposes_separate_store_local_operational_snapshots() -> None:
+    session_store = InMemorySessionStore()
+    task_store = InMemoryTaskStore()
+    app = CayuApp(session_store=session_store, task_store=task_store)
+
+    async def seed() -> None:
+        await session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="aggregate-running",
+                labels={"team": "red"},
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await session_store.update_status("aggregate-running", SessionStatus.RUNNING)
+        await task_store.create_task(
+            TaskCreate(
+                task_id="aggregate-task",
+                type="deploy",
+                assigned_agent_name="assistant",
+            )
+        )
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, dev=True))
+    response = client.post(
+        "/api/operations/snapshot",
+        json={
+            "session_filter": {"labels": {"team": "red"}},
+            "task_filter": {"assigned_agent_name": "assistant"},
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["scope"] == "configured_stores"
+    assert body["cross_store_atomic"] is False
+    assert body["sessions"]["total_count"] == 1
+    assert body["sessions"]["counts_by_status"]["running"] == 1
+    assert body["sessions"]["accuracy"] == {
+        "kind": "exact",
+        "reason": None,
+        "limit": None,
+    }
+    assert body["task_snapshot_status"] == "available"
+    assert body["tasks"]["counts_by_status"]["pending"] == 1
+
+    without_tasks = client.post(
+        "/api/operations/snapshot",
+        json={"include_tasks": False},
+    ).json()
+    assert without_tasks["task_snapshot_status"] == "not_requested"
+    assert without_tasks["tasks"] is None
+
+    not_configured = TestClient(create_server(CayuApp(), dev=True)).post(
+        "/api/operations/snapshot",
+        json={},
+    )
+    assert not_configured.status_code == 200
+    assert not_configured.json()["task_snapshot_status"] == "not_configured"
+
+    class UnsupportedTaskAggregateStore(InMemoryTaskStore):
+        async def aggregate_operational_snapshot(self, filters=None):
+            raise NotImplementedError
+
+    unsupported = TestClient(
+        create_server(CayuApp(task_store=UnsupportedTaskAggregateStore()), dev=True)
+    ).post("/api/operations/snapshot", json={})
+    assert unsupported.status_code == 200
+    assert unsupported.json()["task_snapshot_status"] == "unsupported"
+    assert unsupported.json()["tasks"] is None
+
+
+def test_server_exposes_bounded_event_time_usage_rollup_and_cost() -> None:
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store)
+    start = datetime(2026, 7, 1, tzinfo=UTC)
+
+    async def seed() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="aggregate-usage",
+                labels={"team": "red"},
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.append_events(
+            "aggregate-usage",
+            [
+                Event(
+                    id="aggregate-model",
+                    type=EventType.MODEL_COMPLETED,
+                    session_id="aggregate-usage",
+                    timestamp=start,
+                    payload={
+                        "usage_metrics": {
+                            "provider_name": "fake",
+                            "model": "fake-model",
+                            "input_tokens": 1_000_000,
+                            "output_tokens": 0,
+                            "total_tokens": 1_000_000,
+                        }
+                    },
+                ),
+                Event(
+                    id="aggregate-tool",
+                    type=EventType.TOOL_CALL_STARTED,
+                    session_id="aggregate-usage",
+                    timestamp=start + timedelta(minutes=1),
+                ),
+            ],
+        )
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, dev=True))
+    response = client.post(
+        "/api/usage/rollup",
+        json={
+            "start_at": start.isoformat(),
+            "end_at": (start + timedelta(days=1)).isoformat(),
+            "session_filter": {"labels": {"team": "red"}},
+            "group_limit": 10,
+            "pricing": _price_book_payload(),
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["scope"] == "configured_session_store"
+    assert body["time_basis"] == "event.timestamp"
+    assert body["session_filter_basis"] == "current_session_attributes"
+    assert body["matching_session_count"] == 1
+    assert body["active_session_count"] == 1
+    assert body["totals"]["model_steps"] == 1
+    assert body["totals"]["tool_calls"] == 1
+    assert body["provider_breakdown"]["groups"][0]["provider_name"] == "fake"
+    assert body["cost"]["accuracy"]["kind"] == "exact"
+    assert body["cost"]["currencies"] == [{"currency": "USD", "model_steps": 1, "total_cost": "1"}]
+    assert "pricing_inputs" not in body
+
+
+def test_server_rejects_price_books_and_resolution_work_above_rollup_bounds() -> None:
+    client = TestClient(create_server(CayuApp(), dev=True))
+    request: dict[str, Any] = {
+        "start_at": "2026-07-01T00:00:00Z",
+        "end_at": "2026-07-02T00:00:00Z",
+        "pricing": _price_book_payload(),
+    }
+    price = cast("list[dict[str, object]]", request["pricing"]["prices"])[0]
+
+    too_many_prices = json.loads(json.dumps(request))
+    too_many_prices["pricing"]["prices"] = [price] * 501
+    response = client.post("/api/usage/rollup", json=too_many_prices)
+    assert response.status_code == 422
+    assert "pricing.prices cannot contain more than 500 items" in response.text
+
+    oversized_price_book = json.loads(json.dumps(request))
+    oversized_price_book["pricing"]["price_book_version"] = "x" * (2 * 1024 * 1024)
+    response = client.post("/api/usage/rollup", json=oversized_price_book)
+    assert response.status_code == 422
+    assert "pricing cannot exceed 2097152 JSON bytes" in response.text
+
+    excessive_resolution_work = json.loads(json.dumps(request))
+    excessive_resolution_work["pricing_input_limit"] = 1000
+    excessive_resolution_work["pricing"]["prices"][0]["aliases"] = [
+        f"alias-{index}" for index in range(500)
+    ]
+    response = client.post("/api/usage/rollup", json=excessive_resolution_work)
+    assert response.status_code == 422
+    assert "500000-candidate resolution bound" in response.text
+
+    excessive_context_values = json.loads(json.dumps(request))
+    context_price = excessive_context_values["pricing"]["prices"][0]
+    context_price["match"] = "exact"
+    context_price["pricing_context"] = {
+        "dimensions": {
+            "region": [f"region-{index}" for index in range(1001)],
+            "tier": [f"tier-{index}" for index in range(1001)],
+        }
+    }
+    response = client.post("/api/usage/rollup", json=excessive_context_values)
+    assert response.status_code == 422
+    assert "2000 total contextual selector values" in response.text
+
+    excessive_context_work = json.loads(json.dumps(request))
+    excessive_context_work["pricing_input_limit"] = 1000
+    context_price = excessive_context_work["pricing"]["prices"][0]
+    context_price["match"] = "exact"
+    context_price["pricing_context"] = {
+        "dimensions": {"tier": [f"tier-{index}" for index in range(500)]}
+    }
+    response = client.post("/api/usage/rollup", json=excessive_context_work)
+    assert response.status_code == 422
+    assert "500000-candidate resolution bound" in response.text
+
+
+def test_server_aggregate_routes_reject_invalid_windows_and_unsupported_stores() -> None:
+    class UnsupportedAggregateStore(InMemorySessionStore):
+        async def aggregate_operational_snapshot(self, filters=None):
+            raise NotImplementedError
+
+        async def aggregate_usage(self, query):
+            raise NotImplementedError
+
+    client = TestClient(create_server(CayuApp(session_store=UnsupportedAggregateStore()), dev=True))
+    assert client.post("/api/operations/snapshot", json={}).status_code == 501
+    unsupported_usage = client.post(
+        "/api/usage/rollup",
+        json={
+            "start_at": "2026-07-01T00:00:00Z",
+            "end_at": "2026-07-02T00:00:00Z",
+        },
+    )
+    assert unsupported_usage.status_code == 501
+    openapi = client.get("/openapi.json").json()
+    for path in ("/api/operations/snapshot", "/api/usage/rollup"):
+        error_schema = openapi["paths"][path]["post"]["responses"]["501"]["content"][
+            "application/json"
+        ]["schema"]
+        assert error_schema == {"$ref": "#/components/schemas/ApiErrorResponse"}
+
+    valid_client = TestClient(create_server(CayuApp(), dev=True))
+    invalid_window = valid_client.post(
+        "/api/usage/rollup",
+        json={
+            "start_at": "2026-07-02T00:00:00Z",
+            "end_at": "2026-07-01T00:00:00Z",
+        },
+    )
+    assert invalid_window.status_code == 422
+    validation_errors = invalid_window.json()["detail"]
+    assert isinstance(validation_errors, list)
+    assert any("start_at must be before end_at" in error["msg"] for error in validation_errors)
+
+    class InvalidAggregateResultStore(InMemorySessionStore):
+        async def aggregate_usage(self, query):
+            from cayu.runtime.aggregates import UsageRollupStoreResult
+
+            return UsageRollupStoreResult.model_validate({})
+
+    invalid_store_client = TestClient(
+        create_server(CayuApp(session_store=InvalidAggregateResultStore()), dev=True),
+        raise_server_exceptions=False,
+    )
+    invalid_store_response = invalid_store_client.post(
+        "/api/usage/rollup",
+        json={
+            "start_at": "2026-07-01T00:00:00Z",
+            "end_at": "2026-07-02T00:00:00Z",
+        },
+    )
+    assert invalid_store_response.status_code == 500
+
+
 def test_server_exposes_filtered_sessions_summary() -> None:
     app = CayuApp()
     app.register_provider(UsageProvider(), default=True)

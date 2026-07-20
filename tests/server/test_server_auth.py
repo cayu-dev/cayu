@@ -217,6 +217,15 @@ def test_protected_server_can_expose_generated_docs_explicitly() -> None:
     [
         ("GET", "/api/sessions", None),
         ("POST", "/api/sessions/summary", None),
+        ("POST", "/api/operations/snapshot", {}),
+        (
+            "POST",
+            "/api/usage/rollup",
+            {
+                "start_at": "2026-07-01T00:00:00Z",
+                "end_at": "2026-07-02T00:00:00Z",
+            },
+        ),
         ("GET", "/api/sessions/session-1/usage", None),
         ("POST", "/api/sessions/session-1/cost", _PRICING_BODY),
         ("GET", "/api/causal-budgets/budget-1/usage", None),

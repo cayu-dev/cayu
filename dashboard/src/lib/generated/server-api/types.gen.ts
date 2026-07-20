@@ -19,6 +19,30 @@ export type AgentsResponse = {
 };
 
 /**
+ * AggregateAccuracy
+ *
+ * Truthfulness metadata for a bounded aggregate or one of its sections.
+ */
+export type AggregateAccuracy = {
+    kind: AggregateAccuracyKind;
+    /**
+     * Limit
+     */
+    limit?: number | null;
+    /**
+     * Reason
+     */
+    reason?: string | null;
+};
+
+/**
+ * AggregateAccuracyKind
+ *
+ * How completely an aggregate projection represents its requested scope.
+ */
+export type AggregateAccuracyKind = 'exact' | 'sampled' | 'truncated';
+
+/**
  * AggregateCostSummary
  */
 export type AggregateCostSummary = {
@@ -1595,6 +1619,26 @@ export type InterruptSessionBody = {
 export type KnowledgeVisibility = 'global' | 'organization' | 'project' | 'workspace' | 'user' | 'session' | 'task';
 
 /**
+ * LabelSelectorOperator
+ */
+export type LabelSelectorOperator = 'exists' | 'not_exists' | 'in' | 'not_in';
+
+/**
+ * LabelSelectorRequirement
+ */
+export type LabelSelectorRequirement = {
+    /**
+     * Key
+     */
+    key: string;
+    operator: LabelSelectorOperator;
+    /**
+     * Values
+     */
+    values?: Array<string>;
+};
+
+/**
  * ListSessionEventsResponse
  */
 export type ListSessionEventsResponse = {
@@ -1688,6 +1732,38 @@ export type ModelPrice = {
      * Schedules
      */
     schedules: Array<PriceSchedule>;
+};
+
+/**
+ * OperationalSnapshotRequest
+ */
+export type OperationalSnapshotRequest = {
+    /**
+     * Include Tasks
+     */
+    include_tasks?: boolean;
+    session_filter?: SessionAggregateFilter;
+    task_filter?: TaskAggregateFilter;
+};
+
+/**
+ * OperationalSnapshotResponse
+ */
+export type OperationalSnapshotResponse = {
+    /**
+     * Cross Store Atomic
+     */
+    cross_store_atomic: false;
+    /**
+     * Scope
+     */
+    scope: 'configured_stores';
+    sessions: SessionOperationalSnapshot;
+    /**
+     * Task Snapshot Status
+     */
+    task_snapshot_status: 'available' | 'not_requested' | 'not_configured' | 'unsupported';
+    tasks: TaskOperationalSnapshot | null;
 };
 
 /**
@@ -2230,6 +2306,48 @@ export type ServerContractResponse = {
 };
 
 /**
+ * SessionAggregateFilter
+ *
+ * Current session attributes that may scope a store-native aggregate.
+ */
+export type SessionAggregateFilter = {
+    /**
+     * Agent Name
+     */
+    agent_name?: string | null;
+    /**
+     * Causal Budget Id
+     */
+    causal_budget_id?: string | null;
+    /**
+     * Environment Name
+     */
+    environment_name?: string | null;
+    /**
+     * Label Selectors
+     */
+    label_selectors?: Array<LabelSelectorRequirement>;
+    /**
+     * Labels
+     */
+    labels?: {
+        [key: string]: string;
+    };
+    /**
+     * Model
+     */
+    model?: string | null;
+    /**
+     * Parent Session Id
+     */
+    parent_session_id?: string | null;
+    /**
+     * Provider Name
+     */
+    provider_name?: string | null;
+};
+
+/**
  * SessionCostBody
  */
 export type SessionCostBody = {
@@ -2287,6 +2405,24 @@ export type SessionDebugState = 'needs_attention' | 'session_failure' | 'tool_is
 export type SessionMessageDeliveryMode = 'next_turn' | 'on_idle';
 
 /**
+ * SessionOperationalSnapshot
+ *
+ * Exact current session counts captured by one store-local read snapshot.
+ */
+export type SessionOperationalSnapshot = {
+    accuracy: AggregateAccuracy;
+    /**
+     * As Of
+     */
+    as_of: string;
+    counts_by_status: SessionStatusCounts;
+    /**
+     * Total Count
+     */
+    total_count: number;
+};
+
+/**
  * SessionOrder
  */
 export type SessionOrder = 'created_at_asc' | 'created_at_desc' | 'updated_at_asc' | 'updated_at_desc';
@@ -2321,6 +2457,38 @@ export type SessionStateResponse = {
  * SessionStatus
  */
 export type SessionStatus = 'pending' | 'running' | 'interrupting' | 'completed' | 'failed' | 'interrupted';
+
+/**
+ * SessionStatusCounts
+ *
+ * Complete current-session counts for every lifecycle status.
+ */
+export type SessionStatusCounts = {
+    /**
+     * Completed
+     */
+    completed: number;
+    /**
+     * Failed
+     */
+    failed: number;
+    /**
+     * Interrupted
+     */
+    interrupted: number;
+    /**
+     * Interrupting
+     */
+    interrupting: number;
+    /**
+     * Pending
+     */
+    pending: number;
+    /**
+     * Running
+     */
+    running: number;
+};
 
 /**
  * SessionSummaryResponse
@@ -2621,6 +2789,30 @@ export type StructuredOutputSpec = {
 export type StructuredOutputStrategy = 'tool' | 'native';
 
 /**
+ * TaskAggregateFilter
+ *
+ * Current task attributes that may scope a store-native aggregate.
+ */
+export type TaskAggregateFilter = {
+    /**
+     * Assigned Agent Name
+     */
+    assigned_agent_name?: string | null;
+    /**
+     * Parent Task Id
+     */
+    parent_task_id?: string | null;
+    /**
+     * Session Id
+     */
+    session_id?: string | null;
+    /**
+     * Type
+     */
+    type?: string | null;
+};
+
+/**
  * TaskHoldBody
  */
 export type TaskHoldBody = {
@@ -2637,6 +2829,24 @@ export type TaskHoldBody = {
 };
 
 /**
+ * TaskOperationalSnapshot
+ *
+ * Exact current task counts captured by one store-local read snapshot.
+ */
+export type TaskOperationalSnapshot = {
+    accuracy: AggregateAccuracy;
+    /**
+     * As Of
+     */
+    as_of: string;
+    counts_by_status: TaskStatusCounts;
+    /**
+     * Total Count
+     */
+    total_count: number;
+};
+
+/**
  * TaskOrder
  */
 export type TaskOrder = 'created_at_asc' | 'created_at_desc' | 'updated_at_asc' | 'updated_at_desc';
@@ -2645,6 +2855,50 @@ export type TaskOrder = 'created_at_asc' | 'created_at_desc' | 'updated_at_asc' 
  * TaskStatus
  */
 export type TaskStatus = 'pending' | 'claimed' | 'running' | 'paused' | 'blocked' | 'needs_attention' | 'completed' | 'failed' | 'cancelled';
+
+/**
+ * TaskStatusCounts
+ *
+ * Complete current-task counts for every lifecycle status.
+ */
+export type TaskStatusCounts = {
+    /**
+     * Blocked
+     */
+    blocked: number;
+    /**
+     * Cancelled
+     */
+    cancelled: number;
+    /**
+     * Claimed
+     */
+    claimed: number;
+    /**
+     * Completed
+     */
+    completed: number;
+    /**
+     * Failed
+     */
+    failed: number;
+    /**
+     * Needs Attention
+     */
+    needs_attention: number;
+    /**
+     * Paused
+     */
+    paused: number;
+    /**
+     * Pending
+     */
+    pending: number;
+    /**
+     * Running
+     */
+    running: number;
+};
 
 /**
  * ThinkingConfig
@@ -2942,6 +3196,75 @@ export type UpdateSessionMetadataBody = {
 };
 
 /**
+ * UsageAggregateBreakdown
+ *
+ * Deterministic top groups plus an exact remainder when detail is bounded.
+ */
+export type UsageAggregateBreakdown = {
+    accuracy: AggregateAccuracy;
+    /**
+     * Groups
+     */
+    groups: Array<UsageAggregateGroup>;
+    remainder: UsageAggregateRemainder | null;
+};
+
+/**
+ * UsageAggregateGroup
+ *
+ * One provider/model grouping inside a bounded usage breakdown.
+ */
+export type UsageAggregateGroup = {
+    /**
+     * Model
+     */
+    model: string | null;
+    /**
+     * Provider Name
+     */
+    provider_name: string | null;
+    totals: UsageAggregateTotals;
+};
+
+/**
+ * UsageAggregateRemainder
+ *
+ * Exact totals represented by groups omitted from a bounded breakdown.
+ */
+export type UsageAggregateRemainder = {
+    /**
+     * Group Count
+     */
+    group_count: number;
+    totals: UsageAggregateTotals;
+};
+
+/**
+ * UsageAggregateTotals
+ *
+ * Identity-free activity and token totals for one aggregate scope.
+ */
+export type UsageAggregateTotals = {
+    /**
+     * Model Steps
+     */
+    model_steps: number;
+    /**
+     * Model Steps With Usage
+     */
+    model_steps_with_usage: number;
+    /**
+     * Session Count
+     */
+    session_count: number;
+    /**
+     * Tool Calls
+     */
+    tool_calls: number;
+    usage: UsageMetrics;
+};
+
+/**
  * UsageBreakdownItem
  */
 export type UsageBreakdownItem = {
@@ -2962,6 +3285,67 @@ export type UsageBreakdownItem = {
      */
     session_count: number;
     usage: UsageMetrics;
+};
+
+/**
+ * UsageCostRollup
+ *
+ * Bounded cost result derived from grouped price-relevant inputs.
+ */
+export type UsageCostRollup = {
+    accuracy: AggregateAccuracy;
+    /**
+     * Currencies
+     */
+    currencies: Array<UsageCurrencyCost>;
+    /**
+     * Evaluated Model Steps
+     */
+    evaluated_model_steps: number;
+    /**
+     * Price Book Generated At
+     */
+    price_book_generated_at: string;
+    /**
+     * Price Book Version
+     */
+    price_book_version: string;
+    /**
+     * Priced Model Steps
+     */
+    priced_model_steps: number;
+    /**
+     * Unevaluated Model Steps
+     */
+    unevaluated_model_steps: number;
+    /**
+     * Unpriced Model Steps
+     */
+    unpriced_model_steps: number;
+    /**
+     * Unpriced Reasons
+     */
+    unpriced_reasons: Array<UsageUnpricedReason>;
+};
+
+/**
+ * UsageCurrencyCost
+ *
+ * Exact estimated cost for one currency; currencies are never combined.
+ */
+export type UsageCurrencyCost = {
+    /**
+     * Currency
+     */
+    currency: string;
+    /**
+     * Model Steps
+     */
+    model_steps: number;
+    /**
+     * Total Cost
+     */
+    total_cost: string;
 };
 
 /**
@@ -3000,6 +3384,96 @@ export type UsageMetrics = {
      * Total Tokens
      */
     total_tokens?: number;
+};
+
+/**
+ * UsageRollupRequest
+ */
+export type UsageRollupRequest = {
+    /**
+     * End At
+     */
+    end_at: string;
+    /**
+     * Group Limit
+     */
+    group_limit?: number;
+    /**
+     * Optional bounded price book. The serialized value may contain at most 2 MiB, 500 prices, 2,000 price match rules, 1,000 resource mappings, 100 contextual requirements, and 2,000 contextual selector values. The price-input limit multiplied by the resolution candidates may not exceed 500,000.
+     */
+    pricing?: PriceBook | null;
+    /**
+     * Pricing Input Limit
+     */
+    pricing_input_limit?: number;
+    session_filter?: SessionAggregateFilter;
+    /**
+     * Start At
+     */
+    start_at: string;
+};
+
+/**
+ * UsageRollupResponse
+ */
+export type UsageRollupResponse = {
+    accuracy: AggregateAccuracy;
+    /**
+     * Active Session Count
+     */
+    active_session_count: number;
+    /**
+     * As Of
+     */
+    as_of: string;
+    cost: UsageCostRollup | null;
+    /**
+     * End At
+     */
+    end_at: string;
+    /**
+     * Includes Active Sessions
+     */
+    includes_active_sessions: boolean;
+    /**
+     * Matching Session Count
+     */
+    matching_session_count: number;
+    model_breakdown: UsageAggregateBreakdown;
+    provider_breakdown: UsageAggregateBreakdown;
+    /**
+     * Scope
+     */
+    scope: 'configured_session_store';
+    /**
+     * Session Filter Basis
+     */
+    session_filter_basis: 'current_session_attributes';
+    /**
+     * Start At
+     */
+    start_at: string;
+    /**
+     * Time Basis
+     */
+    time_basis: 'event.timestamp';
+    totals: UsageAggregateTotals;
+};
+
+/**
+ * UsageUnpricedReason
+ *
+ * Model-step count that could not be priced for one explicit reason.
+ */
+export type UsageUnpricedReason = {
+    /**
+     * Model Steps
+     */
+    model_steps: number;
+    /**
+     * Reason
+     */
+    reason: string;
 };
 
 /**
@@ -3731,6 +4205,35 @@ export type RejectKnowledgeApiKnowledgeEntryIdRejectPostResponses = {
 };
 
 export type RejectKnowledgeApiKnowledgeEntryIdRejectPostResponse = RejectKnowledgeApiKnowledgeEntryIdRejectPostResponses[keyof RejectKnowledgeApiKnowledgeEntryIdRejectPostResponses];
+
+export type GetOperationalSnapshotApiOperationsSnapshotPostData = {
+    body: OperationalSnapshotRequest;
+    path?: never;
+    query?: never;
+    url: '/api/operations/snapshot';
+};
+
+export type GetOperationalSnapshotApiOperationsSnapshotPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+    /**
+     * The configured store does not implement this aggregate read.
+     */
+    501: ApiErrorResponse;
+};
+
+export type GetOperationalSnapshotApiOperationsSnapshotPostError = GetOperationalSnapshotApiOperationsSnapshotPostErrors[keyof GetOperationalSnapshotApiOperationsSnapshotPostErrors];
+
+export type GetOperationalSnapshotApiOperationsSnapshotPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: OperationalSnapshotResponse;
+};
+
+export type GetOperationalSnapshotApiOperationsSnapshotPostResponse = GetOperationalSnapshotApiOperationsSnapshotPostResponses[keyof GetOperationalSnapshotApiOperationsSnapshotPostResponses];
 
 export type ListPendingActionsApiPendingActionsGetData = {
     body?: never;
@@ -4926,6 +5429,35 @@ export type RecoverToolRoundApiToolRoundsRecoverPostResponses = {
 };
 
 export type RecoverToolRoundApiToolRoundsRecoverPostResponse = RecoverToolRoundApiToolRoundsRecoverPostResponses[keyof RecoverToolRoundApiToolRoundsRecoverPostResponses];
+
+export type GetUsageRollupApiUsageRollupPostData = {
+    body: UsageRollupRequest;
+    path?: never;
+    query?: never;
+    url: '/api/usage/rollup';
+};
+
+export type GetUsageRollupApiUsageRollupPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+    /**
+     * The configured store does not implement this aggregate read.
+     */
+    501: ApiErrorResponse;
+};
+
+export type GetUsageRollupApiUsageRollupPostError = GetUsageRollupApiUsageRollupPostErrors[keyof GetUsageRollupApiUsageRollupPostErrors];
+
+export type GetUsageRollupApiUsageRollupPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: UsageRollupResponse;
+};
+
+export type GetUsageRollupApiUsageRollupPostResponse = GetUsageRollupApiUsageRollupPostResponses[keyof GetUsageRollupApiUsageRollupPostResponses];
 
 export type RecoverUserInputApiUserInputRecoverPostData = {
     body: UserInputRecoveryBody;

@@ -48,6 +48,7 @@ from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, MessageRole
 from cayu.core.thinking import ThinkingConfig
 from cayu.runtime._binding_cleanup import is_containable_cleanup_error
+from cayu.runtime.aggregates import estimate_usage_rollup_cost
 from cayu.runtime.approvals import (
     ResolutionActor,
     ResolutionActorSource,
@@ -93,6 +94,7 @@ from cayu.runtime.sessions import (
     SessionQuery,
     SessionStatus,
     TranscriptQuery,
+    UsageRollupQuery,
     decode_session_cursor,
     event_summary_from_records,
     session_outcome_from_records,
@@ -112,6 +114,7 @@ from cayu.runtime.usage import (
 from cayu.runtime.user_input import UserInputRecoveryRequest, UserInputResponse
 from cayu.server.auth import AuthContext, AuthDependency, server_auth_dependency
 from cayu.server.contracts import (
+    AGGREGATE_ENDPOINT_RESPONSES,
     ARTIFACT_CONTENT_ENDPOINT_RESPONSES,
     ARTIFACT_ENDPOINT_ERROR_RESPONSES,
     PENDING_ACTION_ENDPOINT_RESPONSES,
@@ -130,6 +133,8 @@ from cayu.server.contracts import (
     HealthResponse,
     ListSessionEventsResponse,
     ListSessionsResponse,
+    OperationalSnapshotRequest,
+    OperationalSnapshotResponse,
     PendingActionsResponse,
     PendingKnowledgeDetailResponse,
     PendingKnowledgeListResponse,
@@ -139,6 +144,8 @@ from cayu.server.contracts import (
     SessionSummaryResponse,
     SessionTranscriptResponse,
     UsageBreakdownItem,
+    UsageRollupRequest,
+    UsageRollupResponse,
 )
 from cayu.server.sse import (
     SSE_ERROR_TEXT_MAX_BYTES,
@@ -1950,6 +1957,97 @@ def create_router(
         return ServerContractResponse(
             api_prefix=api_prefix,
             client_generation=ClientGenerationContract(openapi_url=openapi_url),
+        )
+
+    @router.post(
+        "/operations/snapshot",
+        response_model=OperationalSnapshotResponse,
+        responses=AGGREGATE_ENDPOINT_RESPONSES,
+        dependencies=protected,
+        description=(
+            "Return exact current status counts from each configured store. Session and "
+            "task sections are separate store-local snapshots and are not presented as "
+            "one cross-store atomic read. Scope is the configured stores; authentication "
+            "does not add tenant filtering."
+        ),
+    )
+    async def get_operational_snapshot(body: OperationalSnapshotRequest):
+        try:
+            session_snapshot = await session_store.aggregate_operational_snapshot(
+                body.session_filter
+            )
+        except NotImplementedError as exc:
+            raise HTTPException(
+                status_code=501,
+                detail="The configured session store does not support aggregate snapshots.",
+            ) from exc
+
+        task_snapshot = None
+        if not body.include_tasks:
+            task_snapshot_status = "not_requested"
+        elif task_store is None:
+            task_snapshot_status = "not_configured"
+        else:
+            try:
+                task_snapshot = await task_store.aggregate_operational_snapshot(body.task_filter)
+            except NotImplementedError:
+                task_snapshot_status = "unsupported"
+            else:
+                task_snapshot_status = "available"
+        return OperationalSnapshotResponse(
+            scope="configured_stores",
+            cross_store_atomic=False,
+            sessions=session_snapshot,
+            task_snapshot_status=task_snapshot_status,
+            tasks=task_snapshot,
+        )
+
+    @router.post(
+        "/usage/rollup",
+        response_model=UsageRollupResponse,
+        responses=AGGREGATE_ENDPOINT_RESPONSES,
+        dependencies=protected,
+        description=(
+            "Aggregate usage-bearing events in a UTC-normalized half-open event-time "
+            "window. Session filters apply to current session attributes. Totals remain "
+            "exact when provider/model detail is bounded into an explicit remainder; "
+            "cost is omitted from evaluation rather than reported partially when its "
+            "price-input bound is exceeded. Scope is the configured session store; "
+            "authentication does not add tenant filtering."
+        ),
+    )
+    async def get_usage_rollup(body: UsageRollupRequest):
+        query = UsageRollupQuery(
+            start_at=body.start_at,
+            end_at=body.end_at,
+            sessions=body.session_filter,
+            group_limit=body.group_limit,
+            include_pricing_inputs=body.pricing is not None,
+            pricing_input_limit=body.pricing_input_limit,
+        )
+        try:
+            result = await session_store.aggregate_usage(query)
+        except NotImplementedError as exc:
+            raise HTTPException(
+                status_code=501,
+                detail="The configured session store does not support usage aggregates.",
+            ) from exc
+        cost = None if body.pricing is None else estimate_usage_rollup_cost(result, body.pricing)
+        return UsageRollupResponse(
+            scope="configured_session_store",
+            time_basis="event.timestamp",
+            session_filter_basis="current_session_attributes",
+            as_of=result.as_of,
+            start_at=result.start_at,
+            end_at=result.end_at,
+            accuracy=result.totals_accuracy,
+            matching_session_count=result.matching_session_count,
+            active_session_count=result.active_session_count,
+            includes_active_sessions=result.includes_active_sessions,
+            totals=result.totals,
+            provider_breakdown=result.provider_breakdown,
+            model_breakdown=result.model_breakdown,
+            cost=cost,
         )
 
     async def _marker_record(session_id: str, event_id: str) -> EventRecord:
