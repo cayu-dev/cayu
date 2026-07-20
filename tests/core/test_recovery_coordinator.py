@@ -3,6 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from cayu.core.thinking import ThinkingConfig
+from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._recovery_coordinator import (
     _DEFAULT_APPROVAL_MAX_STEPS,
     _effective_approval_budget_limits,
@@ -10,6 +11,7 @@ from cayu.runtime._recovery_coordinator import (
     _effective_approval_retry_policy,
     _effective_approval_run_limits,
     _effective_approval_thinking,
+    _interrupted_tool_round_results,
 )
 from cayu.runtime.approvals import PendingToolApproval, PendingToolCallApproval
 from cayu.runtime.budgets import BudgetLimit
@@ -113,3 +115,28 @@ def test_effective_approval_thinking_restores_pending_run_config() -> None:
 
     override = ThinkingConfig(effort="low")
     assert _effective_approval_thinking(thinking=override, pending_approval=pending) is override
+
+
+def test_interrupted_tool_round_results_attaches_artifacts_by_tool_call_id() -> None:
+    # Parallel cleanup artifacts stay with their producing call. The unkeyed
+    # sequential fallback belongs only to the first unfinished call.
+    a = runtime_records.ToolCallRequest(id="A", name="tool_a", arguments={})
+    b = runtime_records.ToolCallRequest(id="B", name="tool_b", arguments={})
+
+    keyed = _interrupted_tool_round_results(
+        tool_calls=[a, b],
+        completed_outcomes=[],
+        cancellation_artifacts_by_id={"B": [{"producer": "B"}]},
+    )
+    by_id = {outcome.call.id: outcome for outcome in keyed}
+    assert by_id["B"].result.artifacts == [{"producer": "B"}]
+    assert by_id["A"].result.artifacts == []
+
+    fallback = _interrupted_tool_round_results(
+        tool_calls=[a, b],
+        completed_outcomes=[],
+        cancellation_artifacts=[{"producer": "unknown"}],
+    )
+    by_id = {outcome.call.id: outcome for outcome in fallback}
+    assert by_id["A"].result.artifacts == [{"producer": "unknown"}]
+    assert by_id["B"].result.artifacts == []

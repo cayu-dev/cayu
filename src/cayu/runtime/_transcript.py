@@ -18,6 +18,7 @@ from cayu.core.messages import (
     copy_message_part,
 )
 from cayu.runtime._runtime_records import ToolCallOutcome, ToolCallRequest
+from cayu.runtime.sessions import SessionStore
 from cayu.runtime.usage import strip_provider_billing_identity
 
 
@@ -43,6 +44,26 @@ def initial_messages(
         messages.append(Message.text("system", system_prompt))
     messages.extend(message.model_copy(deep=True) for message in request_messages)
     return messages
+
+
+async def tool_round_has_result_messages(
+    session_store: SessionStore,
+    session_id: str,
+    tool_calls: list[ToolCallRequest],
+) -> bool:
+    """Return whether one stored tool message closes every call in the round."""
+    expected_ids = {tool_call.id for tool_call in tool_calls}
+    if not expected_ids:
+        return True
+    transcript = await session_store.load_transcript(session_id)
+    for message in reversed(transcript):
+        result_ids = {part.tool_call_id for part in message.content if type(part) is ToolResultPart}
+        if expected_ids.issubset(result_ids):
+            return True
+        call_ids = {part.tool_call_id for part in message.content if type(part) is ToolCallPart}
+        if expected_ids & call_ids:
+            return False
+    return False
 
 
 def assistant_message(

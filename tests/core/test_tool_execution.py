@@ -552,34 +552,6 @@ def test_max_parallel_one_runs_sequentially() -> None:
     assert recorder.max_active == 1
 
 
-def test_interrupted_tool_round_results_attaches_artifacts_by_tool_call_id() -> None:
-    # Parallel interrupt cleanup artifacts must attach to the producing call (keyed), not the
-    # first-unfinished-in-model-order call; the bare-list fallback (sequential) keeps first-unfinished.
-    from cayu.runtime import _runtime_records as runtime_records
-    from cayu.runtime.app import _interrupted_tool_round_results
-
-    a = runtime_records.ToolCallRequest(id="A", name="tool_a", arguments={})
-    b = runtime_records.ToolCallRequest(id="B", name="tool_b", arguments={})
-
-    keyed = _interrupted_tool_round_results(
-        tool_calls=[a, b],
-        completed_outcomes=[],
-        cancellation_artifacts_by_id={"B": [{"producer": "B"}]},
-    )
-    by_id = {outcome.call.id: outcome for outcome in keyed}
-    assert by_id["B"].result.artifacts == [{"producer": "B"}]  # attached to the producer
-    assert by_id["A"].result.artifacts == []
-
-    fallback = _interrupted_tool_round_results(
-        tool_calls=[a, b],
-        completed_outcomes=[],
-        cancellation_artifacts=[{"producer": "unknown"}],
-    )
-    fb = {outcome.call.id: outcome for outcome in fallback}
-    assert fb["A"].result.artifacts == [{"producer": "unknown"}]  # first-unfinished fallback
-    assert fb["B"].result.artifacts == []
-
-
 def test_limit_stop_mid_round_does_not_strand_later_segment_tool_calls(monkeypatch) -> None:
     # A parallel_safe=False barrier splits a round into multiple sequential segments. When a run
     # limit trips in a non-last segment, the limit-close must record a tool_result for EVERY

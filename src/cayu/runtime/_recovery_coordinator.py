@@ -1,22 +1,27 @@
-"""Approval and user-input continuation and recovery ownership.
+"""Durable runtime continuation and crash-recovery ownership.
 
-The coordinator owns durable paused-round continuation behavior without
-importing or accepting :class:`CayuApp`. Public request validation and registry
-selection remain on the application façade. Session execution and terminal
-hook orchestration are narrow callbacks until the session engine is extracted.
+The coordinator owns paused-round continuation, recorded tool-round repair,
+incomplete-session recovery, subagent reattachment, and abandoned-stream
+finalization without importing or accepting :class:`CayuApp`. Public request
+validation and registry lookup remain on the application façade. Session
+execution, interruption, turn accounting, and terminal hook orchestration are
+narrow callbacks until the session engine is extracted.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+from uuid import uuid4
 
-from cayu._validation import copy_json_value
+from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message
 from cayu.core.thinking import ThinkingConfig
@@ -26,16 +31,21 @@ from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_results as tool_results
+from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime._environment_lifecycle import (
     EnvironmentLifecycle,
     exception_failure_payload,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._interruption_coordinator import _is_background_subagent_session
 from cayu.runtime._run_limits import RunLimitController, SessionUsageTracker
-from cayu.runtime._session_control import SessionControl
+from cayu.runtime._session_control import ActiveSessionRun, SessionControl
+from cayu.runtime._session_queries import query_all_sessions
 from cayu.runtime._tool_round_executor import (
+    InterruptedToolRoundRequest,
     ToolRoundExecutor,
+    ordered_tool_result_messages,
     policy_denial_payload_fields,
 )
 from cayu.runtime.approvals import (
@@ -57,7 +67,19 @@ from cayu.runtime.costs import SessionCostSummary
 from cayu.runtime.hooks import RuntimeHookPhase
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.runtime.retry_policy import RetryPolicy
-from cayu.runtime.sessions import CheckpointTransform, Session, SessionStatus, SessionStore
+from cayu.runtime.sessions import (
+    CheckpointTransform,
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    IncompleteSessionRecoveryResult,
+    IncompleteSessionsRecoveryRequest,
+    Session,
+    SessionOrder,
+    SessionQuery,
+    SessionStatus,
+    SessionStore,
+    _current_session_run_epoch,
+)
 from cayu.runtime.stop_policy import RunLimits, StopDecision, copy_run_limits, has_run_limits
 from cayu.runtime.structured_output import (
     StructuredOutputSpec,
@@ -65,21 +87,31 @@ from cayu.runtime.structured_output import (
 )
 from cayu.runtime.tasks import Task, TaskStore
 from cayu.runtime.tool_policy import ToolPolicyDecision
+from cayu.runtime.tool_rounds import ToolRoundRecoveryRequest
 from cayu.runtime.usage import SessionUsageSummary, session_usage_summary
 from cayu.runtime.user_input import (
     PENDING_USER_INPUT_CHECKPOINT_KEY,
     PendingUserInput,
     UserInputRecoveryRequest,
     UserInputResponse,
+    pending_user_input_from_checkpoint,
 )
 from cayu.vaults import SecretRedactor
 
 _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED = "tool_approval_required"
 _INTERRUPTION_TYPE_USER_INPUT_REQUIRED = "user_input_required"
+_INTERRUPTION_TYPE_RUNTIME_INTERRUPTED = "runtime_interrupted"
 _DEFAULT_APPROVAL_MAX_STEPS = 16
+_ABANDONED_RUN_REASON = "event_stream_closed"
+_RECOVERY_RESUMABLE_SESSION_STATUSES = {
+    SessionStatus.COMPLETED,
+    SessionStatus.FAILED,
+    SessionStatus.INTERRUPTED,
+}
+
+logger = logging.getLogger(__name__)
 
 CheckpointTransformFactory = Callable[[dict[str, Any]], CheckpointTransform]
-FinalizeAbandonedSession = Callable[[str], Awaitable[None]]
 EffectiveRetryPolicy = Callable[[RetryPolicy | None], RetryPolicy]
 RecoveryCleanup = Callable[[], Awaitable[None]]
 
@@ -199,14 +231,48 @@ class RecoveryTaskEventRequest:
     registered_environment: runtime_records.RegisteredEnvironment | None
 
 
+@dataclass(frozen=True)
+class RecoveryInterruptionRequest:
+    session: Session
+    registered_agent: runtime_records.RegisteredAgentState
+    registered_environment: runtime_records.RegisteredEnvironment | None
+    environment_name: str | None
+
+
+@dataclass(frozen=True)
+class RecoveryAbandonedTurnRequest:
+    session: Session
+    registered_agent: runtime_records.RegisteredAgentState
+    environment_name: str | None
+    run_started_at: float
+    usage_tracker: SessionUsageTracker
+    active_run: ActiveSessionRun[SessionUsageTracker] | None
+
+
+@dataclass(frozen=True)
+class RecoveryAbandonedSessionRequest:
+    session: Session
+    registered_agent: runtime_records.RegisteredAgentState
+    registered_environment: runtime_records.RegisteredEnvironment | None
+    environment_name: str | None
+    run_started_at: float | None = None
+    turn_usage_tracker: SessionUsageTracker | None = None
+    active_run: ActiveSessionRun[SessionUsageTracker] | None = None
+
+
 RunSession = Callable[[RecoverySessionRunRequest], AsyncGenerator[Event, None]]
 TerminalEventStream = Callable[[RecoveryTerminalEventRequest], AsyncIterator[Event]]
 LimitStopEventStream = Callable[[RecoveryLimitStopRequest], AsyncIterator[Event]]
 TaskEventFactory = Callable[[RecoveryTaskEventRequest], Event]
+RegisteredAgentResolver = Callable[[str], runtime_records.RegisteredAgentState]
+RegisteredEnvironmentResolver = Callable[[str | None], runtime_records.RegisteredEnvironment | None]
+RecoveryInterruptionStream = Callable[[RecoveryInterruptionRequest], AsyncIterator[Event]]
+PendingSessionInterruptCheckpoint = Callable[[dict[str, Any], datetime], CheckpointTransform]
+AbandonedTurnCompleted = Callable[[RecoveryAbandonedTurnRequest], Awaitable[Event]]
 
 
 class RecoveryCoordinator:
-    """Continue approval and user-input pauses from durable state."""
+    """Continue paused work and repair incomplete sessions from durable state."""
 
     def __init__(
         self,
@@ -224,9 +290,13 @@ class RecoveryCoordinator:
         effective_retry_policy: EffectiveRetryPolicy,
         run_session: RunSession,
         emit_terminal_event_with_hooks: TerminalEventStream,
-        finalize_abandoned_session_by_id: FinalizeAbandonedSession,
         stop_session_for_limit_reached: LimitStopEventStream,
         task_event: TaskEventFactory,
+        resolve_registered_agent: RegisteredAgentResolver,
+        resolve_registered_environment: RegisteredEnvironmentResolver,
+        interrupt_session_for_recovery: RecoveryInterruptionStream,
+        pending_session_interrupt_checkpoint: PendingSessionInterruptCheckpoint,
+        abandoned_turn_completed: AbandonedTurnCompleted,
     ) -> None:
         self._session_store = session_store
         self._task_store = task_store
@@ -241,9 +311,13 @@ class RecoveryCoordinator:
         self._effective_retry_policy = effective_retry_policy
         self._run_session = run_session
         self._emit_terminal_event_with_hooks = emit_terminal_event_with_hooks
-        self._finalize_abandoned_session_by_id = finalize_abandoned_session_by_id
         self._stop_session_for_limit_reached = stop_session_for_limit_reached
         self._task_event = task_event
+        self._resolve_registered_agent = resolve_registered_agent
+        self._resolve_registered_environment = resolve_registered_environment
+        self._interrupt_session_for_recovery = interrupt_session_for_recovery
+        self._pending_session_interrupt_checkpoint = pending_session_interrupt_checkpoint
+        self._abandoned_turn_completed = abandoned_turn_completed
 
     async def _cleanup_recovery_handoff(
         self,
@@ -261,7 +335,7 @@ class RecoveryCoordinator:
             cleanup_steps.append(
                 (
                     "abandoned session finalization",
-                    lambda: self._finalize_abandoned_session_by_id(session_id),
+                    lambda: self.finalize_abandoned_session_by_id(session_id),
                 )
             )
         if authoritative_failure is not None:
@@ -1084,7 +1158,7 @@ class RecoveryCoordinator:
                 await session_stream.aclose()
                 raise
         except GeneratorExit:
-            await self._finalize_abandoned_session_by_id(session.id)
+            await self.finalize_abandoned_session_by_id(session.id)
             raise
         except Exception as exc:
             if isinstance(exc, approval_support.ToolApprovalManualRecoveryRequired):
@@ -1611,6 +1685,1078 @@ class RecoveryCoordinator:
                 finalize_abandoned=abandoned,
                 release_run_fence=True,
             )
+
+    async def recover_tool_round(
+        self,
+        *,
+        request: ToolRoundRecoveryRequest,
+        loaded_session: Session,
+        session: Session,
+        pending_round: tool_round_recovery.PendingToolRound,
+        pending_tool_call: PendingToolCallApproval,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        effective_structured_output: StructuredOutputSpec | None,
+    ) -> AsyncGenerator[Event, None]:
+        """Persist one operator-verified ordinary tool outcome and continue safely."""
+        recovered_result = ToolResult(
+            content=request.message,
+            structured=request.structured,
+            artifacts=request.artifacts,
+            is_error=request.outcome == ToolApprovalRecoveryOutcome.FAILED,
+        )
+        event_type = (
+            EventType.TOOL_CALL_FAILED
+            if recovered_result.is_error
+            else EventType.TOOL_CALL_COMPLETED
+        )
+        environment_name = _environment_name(registered_environment)
+        recovery_persisted = False
+
+        try:
+            events = await self._session_store.load_events(session.id)
+            tool_round_recovery.validate_tool_round_recovery_target(
+                events=events,
+                pending_round=pending_round,
+                tool_call_id=request.tool_call_id,
+            )
+            factory_started_event = await self._environment_lifecycle.emit_factory_started(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
+            if factory_started_event is not None:
+                yield factory_started_event
+            factory_resolution = await self._environment_lifecycle.resolve_factory(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                started_event=factory_started_event,
+                operation=EnvironmentFactoryOperation.RECONNECT,
+            )
+            registered_environment = factory_resolution.registered_environment
+            environment_name = _environment_name(registered_environment)
+            for event in factory_resolution.events:
+                yield event
+            if factory_resolution.error is not None:
+                session = await self._session_store.update_status(
+                    session.id,
+                    SessionStatus.INTERRUPTED,
+                )
+                async for event in self._emit_terminal_event_with_hooks(
+                    RecoveryTerminalEventRequest(
+                        event=Event(
+                            type=EventType.SESSION_INTERRUPTED,
+                            session_id=session.id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=environment_name,
+                            payload={
+                                "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                                "tool_round_id": pending_round.round_id,
+                                "error": str(factory_resolution.error),
+                                "error_type": type(factory_resolution.error).__name__,
+                            },
+                        ),
+                        phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                    )
+                ):
+                    yield event
+                return
+            recovery_tool_event, recovered_result = tool_results.redact_tool_result_event(
+                event=Event(
+                    type=event_type,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    tool_name=pending_tool_call.tool_name,
+                    payload={
+                        "tool_round_id": pending_round.round_id,
+                        "tool_call_id": pending_tool_call.tool_call_id,
+                        "idempotency_key": tool_execution.tool_idempotency_key(
+                            session_id=session.id,
+                            tool_round_id=pending_round.round_id,
+                            tool_call_id=pending_tool_call.tool_call_id,
+                        ),
+                        "manual_recovery": True,
+                        "reason": request.reason,
+                        "metadata": request.metadata,
+                        "resolved_by": resolution_actor_payload(request.resolved_by),
+                        "result": recovered_result.model_dump(),
+                    },
+                ),
+                result=recovered_result,
+                redactor=self._secret_redactor,
+            )
+            recovery_events = [
+                Event(
+                    type=EventType.SESSION_RESUMED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload={
+                        "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                        "tool_round_id": pending_round.round_id,
+                        "tool_call_id": pending_tool_call.tool_call_id,
+                        "resolved_by": resolution_actor_payload(request.resolved_by),
+                    },
+                ),
+                recovery_tool_event,
+            ]
+            emitted_recovery_events = await self._event_writer.emit_many(
+                session.id, recovery_events
+            )
+            recovery_persisted = True
+            for event in emitted_recovery_events:
+                yield event
+            tool_call = runtime_records.ToolCallRequest(
+                id=pending_tool_call.tool_call_id,
+                name=pending_tool_call.tool_name,
+                arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
+            )
+            tool_event = emitted_recovery_events[-1]
+            # The operator outcome is durable before hooks run. Recovery hooks are
+            # observe-only so they cannot rewrite externally verified evidence.
+            async for event, _modified in self._tool_round_executor.run_tool_call_hooks(
+                session=session,
+                tool_event=tool_event,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                tool_call=tool_call,
+                result=recovered_result,
+                task_id=pending_round.task_id,
+                redactor=self._secret_redactor,
+                allow_modification=False,
+            ):
+                yield event
+
+            events = await self._session_store.load_events(session.id)
+            recorded_outcomes, started_ids = tool_round_recovery.recorded_tool_outcomes(
+                events=events,
+                pending_round=pending_round,
+            )
+            remaining_ids = started_ids - set(recorded_outcomes)
+            if remaining_ids:
+                next_call = next(
+                    call for call in pending_round.tool_calls if call.tool_call_id in remaining_ids
+                )
+                session = await self._session_store.update_status(
+                    session.id, SessionStatus.INTERRUPTED
+                )
+                async for event in self._emit_terminal_event_with_hooks(
+                    RecoveryTerminalEventRequest(
+                        event=Event(
+                            type=EventType.SESSION_INTERRUPTED,
+                            session_id=session.id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=environment_name,
+                            payload={
+                                "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                                "manual_recovery_required": True,
+                                "tool_round_id": pending_round.round_id,
+                                "tool_call_id": next_call.tool_call_id,
+                                "tool_name": next_call.tool_name,
+                            },
+                        ),
+                        phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                    )
+                ):
+                    yield event
+                return
+        except GeneratorExit:
+            await self.finalize_abandoned_session_by_id(session.id)
+            raise
+        except Exception as exc:
+            if not recovery_persisted:
+                await self._session_store.update_status(session.id, loaded_session.status)
+                raise
+            session = await self._session_store.update_status(session.id, SessionStatus.INTERRUPTED)
+            async for event in self._emit_terminal_event_with_hooks(
+                RecoveryTerminalEventRequest(
+                    event=Event(
+                        type=EventType.SESSION_INTERRUPTED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload={
+                            "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                            "tool_round_id": pending_round.round_id,
+                            "tool_call_id": pending_tool_call.tool_call_id,
+                            "error": str(exc),
+                            "error_type": type(exc).__name__,
+                            "resolved_by": resolution_actor_payload(request.resolved_by),
+                        },
+                    ),
+                    phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                )
+            ):
+                yield event
+            return
+
+        try:
+            transcript = await self._session_store.load_transcript(session.id)
+            session_stream = self._run_session(
+                RecoverySessionRunRequest(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_provider=registered_provider,
+                    registered_environment=registered_environment,
+                    messages=transcript,
+                    messages_to_append=[],
+                    max_steps=request.max_steps or _DEFAULT_APPROVAL_MAX_STEPS,
+                    limits=request.limits or RunLimits(),
+                    budget_limits=request.budget_limits or (),
+                    retry_policy=self._effective_retry_policy(request.retry_policy),
+                    structured_output=effective_structured_output,
+                    thinking=request.thinking,
+                    request_loop_policies=request.loop_policies,
+                    request_metadata=request.metadata,
+                    task_id=pending_round.task_id,
+                    task_worker_id=None,
+                    start_event_type=None,
+                    start_event_payload={},
+                    start_task_on_enter=False,
+                    release_run_fence_on_exit=False,
+                )
+            )
+            try:
+                async for event in session_stream:
+                    yield event
+            except GeneratorExit:
+                await session_stream.aclose()
+                raise
+        except GeneratorExit:
+            await self.finalize_abandoned_session_by_id(session.id)
+            raise
+
+    async def close_interrupted_tool_round(
+        self,
+        request: InterruptedToolRoundRequest,
+    ) -> AsyncGenerator[Event, None]:
+        """Close an interrupted round without replaying unfinished tools."""
+        if await transcript_helpers.tool_round_has_result_messages(
+            self._session_store,
+            request.session.id,
+            request.tool_calls,
+        ):
+            return
+        terminal_event_exists = (
+            await self._session_control.latest_interrupted_event(request.session.id) is not None
+        )
+        interrupted_results = _interrupted_tool_round_results(
+            tool_calls=request.tool_calls,
+            completed_outcomes=request.tool_outcomes,
+            tool_round_id=request.tool_round_id,
+            cancellation_artifacts=request.cancellation_artifacts,
+            cancellation_artifacts_by_id=request.cancellation_artifacts_by_id,
+        )
+        interrupted_results = await self.reattach_subagent_children_in_outcomes(
+            session_id=request.session.id,
+            tool_round_id=request.tool_round_id,
+            outcomes=interrupted_results,
+        )
+        tool_outcomes = tool_results.redact_tool_call_outcomes(
+            request.tool_outcomes,
+            self._secret_redactor,
+        )
+        interrupted_results = tool_results.redact_tool_call_outcomes(
+            interrupted_results,
+            self._secret_redactor,
+        )
+        if not interrupted_results and not tool_outcomes:
+            return
+        if not terminal_event_exists:
+            for interrupted_result in interrupted_results:
+                yield await self._event_writer.emit(
+                    _interrupted_tool_call_event(
+                        session=request.session,
+                        registered_agent=request.registered_agent,
+                        registered_environment=request.registered_environment,
+                        tool_call_outcome=interrupted_result,
+                        tool_round_id=request.tool_round_id,
+                    )
+                )
+        tool_outcomes.extend(interrupted_results)
+        interrupted_messages = ordered_tool_result_messages(
+            request.tool_calls,
+            tool_outcomes,
+            parallel=True,
+        )
+        request.messages.extend(interrupted_messages)
+        cleared_checkpoint = await self._tool_round_executor.checkpoint_without_pending_tool_round(
+            request.session.id
+        )
+        await self._session_store.append_transcript_messages_and_transform_checkpoint(
+            request.session.id,
+            interrupted_messages,
+            self._checkpoint_transform(cleared_checkpoint),
+        )
+
+    async def reattach_subagent_children_in_outcomes(
+        self,
+        *,
+        session_id: str,
+        tool_round_id: str | None,
+        outcomes: list[runtime_records.ToolCallOutcome],
+    ) -> list[runtime_records.ToolCallOutcome]:
+        """Replace unfinished spawn outcomes with matching durable child references."""
+        if tool_round_id is None or not outcomes:
+            return outcomes
+        children = await self._subagent_children_by_idempotency_key(session_id)
+        if not children:
+            return outcomes
+        reattached: list[runtime_records.ToolCallOutcome] = []
+        for outcome in outcomes:
+            result = self._reattached_subagent_result(
+                children,
+                tool_execution.tool_idempotency_key(
+                    session_id=session_id,
+                    tool_round_id=tool_round_id,
+                    tool_call_id=outcome.call.id,
+                ),
+                tool_call_id=outcome.call.id,
+                tool_name=outcome.call.name,
+                tool_round_id=tool_round_id,
+            )
+            reattached.append(
+                outcome
+                if result is None
+                else runtime_records.ToolCallOutcome(call=outcome.call, result=result)
+            )
+        return reattached
+
+    async def recover_pending_tool_round(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        messages: list[Message],
+        tail_message_count: int = 0,
+    ) -> AsyncGenerator[Event, None]:
+        """Repair one durable pending round strictly from recorded evidence."""
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        if pending_round is None:
+            return
+        environment_name = _environment_name(registered_environment)
+        if pending_round.agent_name != registered_agent.spec.name:
+            raise RuntimeError(
+                f"Pending tool round belongs to a different agent: {pending_round.agent_name}."
+            )
+        if pending_round.environment_name != environment_name:
+            raise RuntimeError(
+                "Pending tool round belongs to a different environment: "
+                f"{pending_round.environment_name}."
+            )
+
+        pending_tool_calls = tool_round_recovery.pending_round_tool_calls(pending_round)
+        if await transcript_helpers.tool_round_has_result_messages(
+            self._session_store,
+            session.id,
+            pending_tool_calls,
+        ):
+            await self._clear_pending_tool_round_if_matches(session.id, pending_round)
+            yield await self._event_writer.emit(
+                Event(
+                    type=EventType.SESSION_CHECKPOINTED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload={
+                        "checkpoint": tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY,
+                        "tool_round_id": pending_round.round_id,
+                        "cleared": True,
+                    },
+                )
+            )
+            return
+
+        events = await self._session_store.load_events(session.id)
+        recorded_outcomes, started_ids = tool_round_recovery.recorded_tool_outcomes(
+            events=events,
+            pending_round=pending_round,
+        )
+        subagent_children: dict[str, Session] = {}
+        if any(
+            recorded_outcomes.get(call.tool_call_id) is None for call in pending_round.tool_calls
+        ):
+            subagent_children = await self._subagent_children_by_idempotency_key(session.id)
+        tool_outcomes: list[runtime_records.ToolCallOutcome] = []
+        for pending_tool_call in pending_round.tool_calls:
+            recorded_outcome = recorded_outcomes.get(pending_tool_call.tool_call_id)
+            if recorded_outcome is not None:
+                tool_outcomes.append(recorded_outcome)
+                continue
+
+            tool_call = runtime_records.ToolCallRequest(
+                id=pending_tool_call.tool_call_id,
+                name=pending_tool_call.tool_name,
+                arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
+            )
+            expected_idempotency_key = tool_execution.tool_idempotency_key(
+                session_id=session.id,
+                tool_round_id=pending_round.round_id,
+                tool_call_id=pending_tool_call.tool_call_id,
+            )
+            result = self._reattached_subagent_result(
+                subagent_children,
+                expected_idempotency_key,
+                tool_call_id=pending_tool_call.tool_call_id,
+                tool_name=pending_tool_call.tool_name,
+                tool_round_id=pending_round.round_id,
+            )
+            if result is None:
+                result = tool_round_recovery.unknown_recovered_tool_result(
+                    pending_tool_call=pending_tool_call,
+                    pending_round=pending_round,
+                    started=pending_tool_call.tool_call_id in started_ids,
+                )
+            event_type = (
+                EventType.TOOL_CALL_FAILED if result.is_error else EventType.TOOL_CALL_COMPLETED
+            )
+            async for event, outcome in self._tool_round_executor.emit_tool_call_result_with_hooks(
+                event=Event(
+                    type=event_type,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    tool_name=tool_call.name,
+                    payload={
+                        "tool_round_id": pending_round.round_id,
+                        "tool_call_id": tool_call.id,
+                        "idempotency_key": expected_idempotency_key,
+                        "recovered": True,
+                        "result": result.model_dump(),
+                    },
+                ),
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                tool_call=tool_call,
+                result=result,
+                task_id=pending_round.task_id,
+            ):
+                yield event
+                if outcome is not None:
+                    tool_outcomes.append(outcome)
+
+        tool_result_messages = transcript_helpers.tool_result_messages(tool_outcomes)
+        insert_at = len(messages) - tail_message_count
+        if insert_at < 0:
+            raise RuntimeError("Pending tool round recovery received an invalid tail size.")
+        messages[insert_at:insert_at] = tool_result_messages
+        cleared_checkpoint = await self._tool_round_executor.checkpoint_without_pending_tool_round(
+            session.id
+        )
+        await self._session_store.append_transcript_messages_and_transform_checkpoint(
+            session.id,
+            tool_result_messages,
+            self._checkpoint_transform(cleared_checkpoint),
+        )
+        yield await self._event_writer.emit(
+            Event(
+                type=EventType.SESSION_CHECKPOINTED,
+                session_id=session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                payload={
+                    "checkpoint": tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY,
+                    "tool_round_id": pending_round.round_id,
+                    "cleared": True,
+                    "recovered_tool_calls": len(tool_outcomes),
+                },
+            )
+        )
+
+    async def finalize_abandoned_session_run(
+        self,
+        request: RecoveryAbandonedSessionRequest,
+    ) -> None:
+        """Best-effort finalization for a live session whose event stream closed."""
+        try:
+            finalized = await self._session_store.transition_status(
+                request.session.id,
+                from_statuses={
+                    SessionStatus.PENDING,
+                    SessionStatus.RUNNING,
+                    SessionStatus.INTERRUPTING,
+                },
+                to_status=SessionStatus.INTERRUPTED,
+            )
+        except (KeyError, ValueError):
+            return
+        if request.run_started_at is not None and request.turn_usage_tracker is not None:
+            with contextlib.suppress(Exception):
+                await self._abandoned_turn_completed(
+                    RecoveryAbandonedTurnRequest(
+                        session=finalized,
+                        registered_agent=request.registered_agent,
+                        environment_name=request.environment_name,
+                        run_started_at=request.run_started_at,
+                        usage_tracker=request.turn_usage_tracker,
+                        active_run=request.active_run,
+                    )
+                )
+        with contextlib.suppress(BaseException):
+            async for _ in self._emit_terminal_event_with_hooks(
+                RecoveryTerminalEventRequest(
+                    event=Event(
+                        type=EventType.SESSION_INTERRUPTED,
+                        session_id=finalized.id,
+                        agent_name=request.registered_agent.spec.name,
+                        environment_name=request.environment_name,
+                        payload={
+                            "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                            "reason": _ABANDONED_RUN_REASON,
+                            "abandoned": True,
+                        },
+                    ),
+                    phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
+                    session=finalized,
+                    registered_agent=request.registered_agent,
+                    registered_environment=request.registered_environment,
+                )
+            ):
+                pass
+
+    async def finalize_abandoned_session_by_id(self, session_id: str) -> None:
+        """Idempotently finalize a live session when setup-time streaming is abandoned."""
+        try:
+            session = await self._session_store.load(session_id)
+        except Exception:
+            return
+        if session is None or session.status not in {
+            SessionStatus.PENDING,
+            SessionStatus.RUNNING,
+            SessionStatus.INTERRUPTING,
+        }:
+            return
+        try:
+            registered_agent = self._resolve_registered_agent(session.agent_name)
+        except Exception:
+            with contextlib.suppress(KeyError, ValueError):
+                await self._session_store.transition_status(
+                    session.id,
+                    from_statuses={
+                        SessionStatus.PENDING,
+                        SessionStatus.RUNNING,
+                        SessionStatus.INTERRUPTING,
+                    },
+                    to_status=SessionStatus.INTERRUPTED,
+                )
+            return
+        registered_environment = self._resolve_registered_environment(session.environment_name)
+        with contextlib.suppress(BaseException):
+            await self.finalize_abandoned_session_run(
+                RecoveryAbandonedSessionRequest(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=_environment_name(registered_environment),
+                )
+            )
+
+    async def recover_incomplete_session(
+        self,
+        request: IncompleteSessionRecoveryRequest,
+    ) -> IncompleteSessionRecoveryResult:
+        """Repair one incomplete session without executing providers or tools."""
+        session = await self._session_store.load(request.session_id)
+        if session is None:
+            raise KeyError(f"Session not found: {request.session_id}") from None
+        return await self._recover_incomplete_session_scoped(
+            session=session,
+            inactive_before=request.inactive_before,
+            reason=request.reason,
+            metadata=request.metadata,
+        )
+
+    async def recover_incomplete_sessions(
+        self,
+        request: IncompleteSessionsRecoveryRequest,
+    ) -> list[IncompleteSessionRecoveryResult]:
+        """Fault-isolate recovery across the requested non-terminal sessions."""
+        sessions: list[Session] = []
+        seen_session_ids: set[str] = set()
+        for status in (
+            SessionStatus.INTERRUPTING,
+            SessionStatus.RUNNING,
+            SessionStatus.PENDING,
+        ):
+            if status not in request.statuses:
+                continue
+            if len(sessions) >= request.limit:
+                break
+            candidates = (
+                await self._session_store.list_sessions(
+                    SessionQuery(
+                        status=status,
+                        last_activity_before=request.inactive_before,
+                        limit=min(1000, request.limit - len(sessions)),
+                    )
+                )
+            ).sessions
+            for candidate in candidates:
+                if (
+                    request.inactive_before is not None
+                    and candidate.last_activity_at > request.inactive_before
+                ):
+                    continue
+                if candidate.id in seen_session_ids:
+                    continue
+                seen_session_ids.add(candidate.id)
+                sessions.append(candidate)
+                if len(sessions) >= request.limit:
+                    break
+
+        results: list[IncompleteSessionRecoveryResult] = []
+        for session in sessions:
+            try:
+                result = await self._recover_incomplete_session_scoped(
+                    session=session,
+                    inactive_before=request.inactive_before,
+                    reason=request.reason,
+                    metadata=request.metadata,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Recovery failed for session %s (agent %s): %s",
+                    session.id,
+                    session.agent_name,
+                    exc,
+                )
+                try:
+                    reloaded = await self._session_store.load(session.id)
+                except Exception:
+                    reloaded = None
+                result = IncompleteSessionRecoveryResult(
+                    session_id=session.id,
+                    previous_status=session.status,
+                    status=session.status if reloaded is None else reloaded.status,
+                    actions=(IncompleteSessionRecoveryAction.FAILED,),
+                    message=f"Recovery failed: {type(exc).__name__}: {exc}",
+                )
+            results.append(result)
+        return results
+
+    async def _recover_incomplete_session_scoped(
+        self,
+        *,
+        session: Session,
+        inactive_before: datetime | None,
+        reason: str,
+        metadata: dict[str, Any],
+    ) -> IncompleteSessionRecoveryResult:
+        owned_epoch_before = _current_session_run_epoch(session.id)
+        try:
+            return await self._recover_incomplete_session(
+                session=session,
+                inactive_before=inactive_before,
+                reason=reason,
+                metadata=metadata,
+            )
+        finally:
+            owned_epoch_after = _current_session_run_epoch(session.id)
+            if (
+                inactive_before is not None
+                and owned_epoch_after is not None
+                and owned_epoch_after != owned_epoch_before
+            ):
+                await self._session_store.release_run_fence(session.id)
+
+    async def _recover_incomplete_session(
+        self,
+        *,
+        session: Session,
+        inactive_before: datetime | None,
+        reason: str,
+        metadata: dict[str, Any],
+    ) -> IncompleteSessionRecoveryResult:
+        reason = require_clean_nonblank(reason, "reason")
+        metadata = copy_json_value(metadata, "metadata")
+        previous_status = session.status
+        actions: list[IncompleteSessionRecoveryAction] = []
+        events: list[Event] = []
+
+        if self._session_control.has_active_tasks(session.id):
+            return IncompleteSessionRecoveryResult(
+                session_id=session.id,
+                previous_status=previous_status,
+                status=session.status,
+                actions=(IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,),
+                events=(),
+                message="Session has active work in this CayuApp process; recovery skipped.",
+            )
+
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
+        pending_user_input = pending_user_input_from_checkpoint(checkpoint)
+        pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        if (
+            session.status in _RECOVERY_RESUMABLE_SESSION_STATUSES
+            and pending_approval is None
+            and pending_user_input is None
+            and pending_tool_round is None
+        ):
+            return IncompleteSessionRecoveryResult(
+                session_id=session.id,
+                previous_status=previous_status,
+                status=session.status,
+                actions=(IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,),
+                events=(),
+                message="Session is terminal; recovery skipped.",
+            )
+
+        try:
+            registered_agent = self._resolve_registered_agent(session.agent_name)
+        except KeyError:
+            return IncompleteSessionRecoveryResult(
+                session_id=session.id,
+                previous_status=previous_status,
+                status=session.status,
+                actions=(IncompleteSessionRecoveryAction.SKIPPED_UNREGISTERED_AGENT,),
+                events=(),
+                message=(f"Agent not registered: {session.agent_name!r}; session left untouched."),
+            )
+        registered_environment = self._resolve_registered_environment(session.environment_name)
+        environment_name = _environment_name(registered_environment)
+
+        if inactive_before is not None:
+            fenced = await self._session_store.fence_stalled_run(
+                session.id,
+                statuses={session.status},
+                inactive_before=inactive_before,
+            )
+            if fenced is None:
+                current = await self._require_session(session.id)
+                return IncompleteSessionRecoveryResult(
+                    session_id=session.id,
+                    previous_status=previous_status,
+                    status=current.status,
+                    actions=(IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,),
+                    events=(),
+                    message="Session activity changed during recovery; recovery skipped.",
+                )
+            events.append(
+                await self._event_writer.emit(
+                    Event(
+                        type=EventType.SESSION_RUN_FENCED,
+                        session_id=session.id,
+                        agent_name=session.agent_name,
+                        environment_name=environment_name,
+                        payload={
+                            "previous_run_epoch": session.run_epoch,
+                            "run_epoch": fenced.run_epoch,
+                            "inactive_before": inactive_before.isoformat(),
+                            "reason": reason,
+                            "metadata": metadata,
+                        },
+                    )
+                )
+            )
+            session = fenced
+
+        if session.status in {SessionStatus.PENDING, SessionStatus.RUNNING}:
+            if pending_approval is not None:
+                interrupt_payload = {
+                    "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
+                    "approval": pending_approval.model_dump(mode="json"),
+                    "recovered": True,
+                    "reason": reason,
+                    "metadata": metadata,
+                }
+            elif pending_user_input is not None:
+                interrupt_payload = {
+                    "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
+                    "user_input": pending_user_input.model_dump(mode="json"),
+                    "recovered": True,
+                    "reason": reason,
+                    "metadata": metadata,
+                }
+            else:
+                interrupt_payload = {
+                    "reason": reason,
+                    "metadata": metadata,
+                    "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                    "recovered": True,
+                }
+            interrupt_payload["interruption_request_id"] = str(uuid4())
+            try:
+                session = await self._session_store.transition_status_and_checkpoint(
+                    session.id,
+                    from_statuses={SessionStatus.PENDING, SessionStatus.RUNNING},
+                    to_status=SessionStatus.INTERRUPTING,
+                    checkpoint_transform=self._pending_session_interrupt_checkpoint(
+                        interrupt_payload,
+                        self._clock(),
+                    ),
+                )
+            except ValueError:
+                session = await self._require_session(session.id)
+                if session.status in _RECOVERY_RESUMABLE_SESSION_STATUSES:
+                    return IncompleteSessionRecoveryResult(
+                        session_id=session.id,
+                        previous_status=previous_status,
+                        status=session.status,
+                        actions=(IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,),
+                        events=(),
+                        message="Session changed during recovery; recovery skipped.",
+                    )
+                raise
+            session = await self._require_session(session.id)
+            checkpoint = await self._session_store.load_checkpoint(session.id)
+            pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+
+        if pending_tool_round is not None:
+            transcript = await self._session_store.load_transcript(session.id)
+            async for event in self.recover_pending_tool_round(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                messages=transcript,
+            ):
+                events.append(event)
+            actions.append(IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND)
+            session = await self._require_session(session.id)
+            checkpoint = await self._session_store.load_checkpoint(session.id)
+
+        pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
+        if pending_approval is not None:
+            session = await self._finalize_interrupting_for_recovery(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                environment_name=environment_name,
+                events=events,
+            )
+            actions.append(IncompleteSessionRecoveryAction.PENDING_APPROVAL)
+            return IncompleteSessionRecoveryResult(
+                session_id=session.id,
+                previous_status=previous_status,
+                status=session.status,
+                actions=tuple(actions),
+                events=tuple(events),
+                pending_approval_id=pending_approval.approval_id,
+                message="Session has a pending tool approval; resolve it with ToolApprovalRequest.",
+            )
+
+        pending_user_input = pending_user_input_from_checkpoint(checkpoint)
+        if pending_user_input is not None:
+            session = await self._finalize_interrupting_for_recovery(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                environment_name=environment_name,
+                events=events,
+            )
+            actions.append(IncompleteSessionRecoveryAction.PENDING_USER_INPUT)
+            return IncompleteSessionRecoveryResult(
+                session_id=session.id,
+                previous_status=previous_status,
+                status=session.status,
+                actions=tuple(actions),
+                events=tuple(events),
+                pending_user_input_id=pending_user_input.input_id,
+                message="Session is awaiting user input; answer it with UserInputResponse.",
+            )
+
+        if session.status == SessionStatus.INTERRUPTING:
+            session = await self._finalize_interrupting_for_recovery(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                environment_name=environment_name,
+                events=events,
+            )
+            actions.append(
+                IncompleteSessionRecoveryAction.FINALIZED_INTERRUPT
+                if previous_status == SessionStatus.INTERRUPTING
+                else IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED
+            )
+        elif not actions:
+            actions.append(IncompleteSessionRecoveryAction.SKIPPED_TERMINAL)
+
+        message = "Recovered incomplete session."
+        if actions == [IncompleteSessionRecoveryAction.SKIPPED_TERMINAL]:
+            message = "Session is terminal; recovery skipped."
+        return IncompleteSessionRecoveryResult(
+            session_id=session.id,
+            previous_status=previous_status,
+            status=session.status,
+            actions=tuple(actions),
+            events=tuple(events),
+            message=message,
+        )
+
+    async def _finalize_interrupting_for_recovery(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        environment_name: str | None,
+        events: list[Event],
+    ) -> Session:
+        if session.status == SessionStatus.INTERRUPTING:
+            async for event in self._interrupt_session_for_recovery(
+                RecoveryInterruptionRequest(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=environment_name,
+                )
+            ):
+                events.append(event)
+            session = await self._require_session(session.id)
+        return session
+
+    async def _require_session(self, session_id: str) -> Session:
+        loaded = await self._session_store.load(session_id)
+        if loaded is None:
+            raise KeyError(f"Session not found: {session_id}") from None
+        return loaded
+
+    async def _clear_pending_tool_round_if_matches(
+        self,
+        session_id: str,
+        pending_round: tool_round_recovery.PendingToolRound,
+    ) -> None:
+        checkpoint = await self._session_store.load_checkpoint(session_id)
+        if checkpoint is None:
+            return
+        copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
+        current = tool_round_recovery.pending_tool_round_from_checkpoint(copied_checkpoint)
+        if current is None or current.round_id != pending_round.round_id:
+            return
+        copied_checkpoint.pop(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY, None)
+        await self._session_store.transform_checkpoint(
+            session_id,
+            self._checkpoint_transform(copied_checkpoint),
+        )
+
+    async def _subagent_children_by_idempotency_key(
+        self,
+        parent_session_id: str,
+    ) -> dict[str, Session]:
+        children: dict[str, Session] = {}
+        sessions = await query_all_sessions(
+            self._session_store,
+            SessionQuery(
+                parent_session_id=parent_session_id,
+                order_by=SessionOrder.CREATED_AT_ASC,
+            ),
+        )
+        for child in sessions:
+            if not _is_background_subagent_session(child):
+                continue
+            idempotency_key = tool_round_recovery.subagent_child_idempotency_key(child)
+            if idempotency_key is not None:
+                children[idempotency_key] = child
+        return children
+
+    @staticmethod
+    def _reattached_subagent_result(
+        children: dict[str, Session],
+        idempotency_key: str,
+        *,
+        tool_call_id: str,
+        tool_name: str,
+        tool_round_id: str,
+    ) -> ToolResult | None:
+        child = children.get(idempotency_key)
+        if child is None:
+            return None
+        return tool_round_recovery.recovered_subagent_tool_result(
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            tool_round_id=tool_round_id,
+            child=child,
+        )
+
+
+def _interrupted_tool_round_results(
+    *,
+    tool_calls: list[runtime_records.ToolCallRequest],
+    completed_outcomes: list[runtime_records.ToolCallOutcome],
+    tool_round_id: str | None = None,
+    cancellation_artifacts: list[dict[str, Any]] | None = None,
+    cancellation_artifacts_by_id: dict[str, list[dict[str, Any]]] | None = None,
+) -> list[runtime_records.ToolCallOutcome]:
+    completed_ids = {outcome.call.id for outcome in completed_outcomes}
+    artifacts_for_interrupted_tool = (
+        [] if cancellation_artifacts is None else cancellation_artifacts
+    )
+    interrupted_outcomes: list[runtime_records.ToolCallOutcome] = []
+    for tool_call in tool_calls:
+        if tool_call.id in completed_ids:
+            continue
+        if cancellation_artifacts_by_id is not None:
+            result_artifacts = cancellation_artifacts_by_id.get(tool_call.id, [])
+        else:
+            result_artifacts = artifacts_for_interrupted_tool
+            artifacts_for_interrupted_tool = []
+        structured = {
+            "interrupted": True,
+            "tool_call_id": tool_call.id,
+            "tool_name": tool_call.name,
+        }
+        if tool_round_id is not None:
+            structured["tool_round_id"] = tool_round_id
+        interrupted_outcomes.append(
+            runtime_records.ToolCallOutcome(
+                call=tool_call,
+                result=ToolResult(
+                    content="Tool call interrupted before completion.",
+                    structured=structured,
+                    artifacts=result_artifacts,
+                    is_error=True,
+                ),
+            )
+        )
+    return interrupted_outcomes
+
+
+def _interrupted_tool_call_event(
+    *,
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+    tool_call_outcome: runtime_records.ToolCallOutcome,
+    tool_round_id: str | None = None,
+) -> Event:
+    payload = {
+        "tool_call_id": tool_call_outcome.call.id,
+        "idempotency_key": tool_execution.tool_idempotency_key(
+            session_id=session.id,
+            tool_round_id=tool_round_id,
+            tool_call_id=tool_call_outcome.call.id,
+        ),
+        "result": tool_call_outcome.result.model_dump(),
+    }
+    if tool_round_id is not None:
+        payload["tool_round_id"] = tool_round_id
+    return Event(
+        type=(
+            EventType.TOOL_CALL_FAILED
+            if tool_call_outcome.result.is_error
+            else EventType.TOOL_CALL_COMPLETED
+        ),
+        session_id=session.id,
+        agent_name=registered_agent.spec.name,
+        environment_name=_environment_name(registered_environment),
+        tool_name=tool_call_outcome.call.name,
+        payload=payload,
+    )
 
 
 def _effective_user_input_max_steps(

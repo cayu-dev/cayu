@@ -6,6 +6,7 @@ from typing import Any
 from cayu._validation import copy_json_value
 from cayu.core.events import Event
 from cayu.core.tools import ToolResult
+from cayu.runtime import _runtime_records as runtime_records
 from cayu.vaults import SecretRedactor
 
 
@@ -57,6 +58,22 @@ def redact_tool_result_event(
         raise AssertionError("Event payload redaction returned non-object payload.")
     payload["result"] = redacted_result.model_dump()
     return event.model_copy(update={"payload": payload}), redacted_result
+
+
+def redact_tool_call_outcomes(
+    outcomes: list[runtime_records.ToolCallOutcome],
+    redactor: SecretRedactor,
+) -> list[runtime_records.ToolCallOutcome]:
+    """Redact tool outcomes while preserving their call identity and order."""
+    if not redactor.has_values:
+        return outcomes
+    return [
+        runtime_records.ToolCallOutcome(
+            call=outcome.call,
+            result=redact_tool_result(outcome.result, redactor),
+        )
+        for outcome in outcomes
+    ]
 
 
 def tool_result_from_payload(payload: dict[str, Any]) -> ToolResult:

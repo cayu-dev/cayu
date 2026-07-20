@@ -20415,7 +20415,7 @@ async def _reattach_interrupted_spawn(*, tool_round_id, child_round_id):
             is_error=True,
         ),
     )
-    outcomes = await app._reattach_subagent_children_in_outcomes(
+    outcomes = await app._recovery_coordinator.reattach_subagent_children_in_outcomes(
         session_id="parent", tool_round_id=tool_round_id, outcomes=[interrupted]
     )
     return outcomes[0].result
@@ -20445,10 +20445,11 @@ def test_interrupt_close_ignores_child_from_a_different_round():
 
 
 async def _close_interrupted_spawn_and_collect_events(child_status):
-    """Drive `_close_interrupted_tool_round` for an interrupted `subagent` spawn whose background child is
+    """Drive coordinator round closure for an interrupted `subagent` spawn whose background child is
     in `child_status`, returning the emitted events. Exercises the event-type derivation on that path."""
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime import _tool_execution as tool_execution
+    from cayu.runtime._tool_round_executor import InterruptedToolRoundRequest
 
     store = InMemorySessionStore()
     app = CayuApp(session_store=store, enable_logging=False)
@@ -20485,16 +20486,20 @@ async def _close_interrupted_spawn_and_collect_events(child_status):
     await store.update_status("child", child_status)
     parent = await store.load("parent")
     events = []
-    async for event in app._close_interrupted_tool_round(
-        session=parent,
-        registered_agent=app._get_registered_agent("parent"),
-        registered_environment=None,
-        messages=[],
-        tool_calls=[
-            runtime_records.ToolCallRequest(id="call_spawn", name="subagent", arguments={})
-        ],
-        tool_outcomes=[],
-        tool_round_id="round-1",
+    async for event in app._recovery_coordinator.close_interrupted_tool_round(
+        InterruptedToolRoundRequest(
+            session=parent,
+            registered_agent=app._get_registered_agent("parent"),
+            registered_environment=None,
+            messages=[],
+            tool_calls=[
+                runtime_records.ToolCallRequest(id="call_spawn", name="subagent", arguments={})
+            ],
+            tool_outcomes=[],
+            tool_round_id="round-1",
+            cancellation_artifacts=None,
+            cancellation_artifacts_by_id=None,
+        )
     ):
         events.append(event)
     return [event for event in events if event.payload.get("tool_call_id") == "call_spawn"]
@@ -21696,6 +21701,7 @@ def test_cayu_app_recover_incomplete_session_repairs_tool_round_before_interrupt
     assert checkpoint is not None
     assert "pending_tool_round" in checkpoint
     asyncio.run(store.update_status("sess_recover_incomplete_tool_round", SessionStatus.RUNNING))
+    provider_requests_before_recovery = len(provider.requests)
 
     result = asyncio.run(
         app.recover_incomplete_session(
@@ -21712,6 +21718,7 @@ def test_cayu_app_recover_incomplete_session_repairs_tool_round_before_interrupt
         IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,
     )
     assert tool.calls == []
+    assert len(provider.requests) == provider_requests_before_recovery
     assert [message.role for message in transcript] == ["user", "assistant", "tool"]
     assert transcript[2].content[0].tool_call_id == "call_1"
     assert "was not executed" in transcript[2].content[0].content
