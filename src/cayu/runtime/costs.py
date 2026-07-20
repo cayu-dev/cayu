@@ -880,6 +880,37 @@ class CostLineItem(BaseModel):
         return require_clean_nonblank(value, info.field_name)
 
 
+class ModelStepCostEstimate(BaseModel):
+    """Currency-local cost outcome for one normalized model step."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    priced: StrictBool
+    currency: str | None = None
+    total_cost: Decimal = Field(ge=0)
+    missing_pricing_reason: str | None = None
+
+    @field_validator("currency", "missing_pricing_reason")
+    @classmethod
+    def validate_optional_text(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> ModelStepCostEstimate:
+        if self.priced:
+            if self.currency is None or self.missing_pricing_reason is not None:
+                raise ValueError("Priced model steps require currency and no missing reason.")
+        elif (
+            self.currency is not None or self.total_cost != 0 or self.missing_pricing_reason is None
+        ):
+            raise ValueError(
+                "Unpriced model steps require a missing reason and zero currency-local cost."
+            )
+        return self
+
+
 class SessionCostSummary(BaseModel):
     """Estimated session cost derived from durable model.completed events."""
 
@@ -1144,6 +1175,51 @@ def resolve_price_book(
     ).resolved
 
 
+def estimate_model_step_cost(
+    *,
+    metrics: UsageMetrics,
+    pricing: PriceBook,
+    effective_on: date,
+) -> ModelStepCostEstimate:
+    """Estimate one normalized model step in its price-book-native currency."""
+
+    if type(metrics) is not UsageMetrics:
+        raise TypeError("metrics must be a UsageMetrics instance.")
+    if type(pricing) is not PriceBook:
+        raise TypeError("pricing must be a PriceBook instance.")
+    if type(effective_on) is not date:
+        raise TypeError("effective_on must be a date.")
+    resolution = _resolve_price(metrics=metrics, pricing=pricing, effective_on=effective_on)
+    if resolution.resolved is None:
+        return ModelStepCostEstimate(
+            priced=False,
+            total_cost=Decimal(0),
+            missing_pricing_reason=(resolution.missing_reason or "no matching model pricing"),
+        )
+    currency = resolution.resolved.currency.upper()
+    line_item = _cost_line_item(
+        model_step=1,
+        metrics=metrics,
+        pricing=pricing,
+        currency=currency,
+        effective_on=effective_on,
+        price_resolution=resolution,
+    )
+    if not line_item.priced:
+        return ModelStepCostEstimate(
+            priced=False,
+            total_cost=Decimal(0),
+            missing_pricing_reason=(
+                line_item.missing_pricing_reason or "no matching model pricing"
+            ),
+        )
+    return ModelStepCostEstimate(
+        priced=True,
+        currency=currency,
+        total_cost=line_item.total_cost,
+    )
+
+
 def _resolve_price_book(
     price_book: PriceBook,
     *,
@@ -1227,8 +1303,13 @@ def _cost_line_item(
     pricing: PriceBook,
     currency: str,
     effective_on: date,
+    price_resolution: _PriceResolution | None = None,
 ) -> CostLineItem:
-    resolution = _resolve_price(metrics=metrics, pricing=pricing, effective_on=effective_on)
+    resolution = price_resolution or _resolve_price(
+        metrics=metrics,
+        pricing=pricing,
+        effective_on=effective_on,
+    )
     if resolution.resolved is None:
         return _unpriced_line_item(
             model_step=model_step,

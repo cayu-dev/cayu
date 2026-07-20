@@ -40,6 +40,7 @@ from cayu._validation import (
 from cayu.core.events import Event, EventType, copy_event
 from cayu.core.messages import Message, MessageRole, ThinkingPart, copy_message, detach_message
 from cayu.core.thinking import ThinkingConfig
+from cayu.runtime.aggregates import AggregateAccuracy, UsageRollupStoreResult
 from cayu.runtime.approvals import (
     ResolutionActor,
     copy_resolution_actor,
@@ -1102,6 +1103,140 @@ class SessionQuery(BaseModel):
         return copy_label_selector_requirements(value)
 
 
+MAX_AGGREGATE_LABEL_FILTERS = 50
+MAX_AGGREGATE_LABEL_SELECTORS = 25
+MAX_AGGREGATE_LABEL_SELECTOR_VALUES = 100
+
+
+class SessionAggregateFilter(BaseModel):
+    """Current session attributes that may scope a store-native aggregate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_name: str | None = None
+    provider_name: str | None = None
+    model: str | None = None
+    environment_name: str | None = None
+    parent_session_id: str | None = None
+    causal_budget_id: str | None = None
+    labels: dict[str, str] = Field(
+        default_factory=dict,
+        max_length=MAX_AGGREGATE_LABEL_FILTERS,
+    )
+    label_selectors: tuple[LabelSelectorRequirement, ...] = Field(
+        default_factory=tuple,
+        max_length=MAX_AGGREGATE_LABEL_SELECTORS,
+    )
+
+    @field_validator(
+        "agent_name",
+        "provider_name",
+        "model",
+        "environment_name",
+        "parent_session_id",
+        "causal_budget_id",
+    )
+    @classmethod
+    def validate_optional_nonblank_fields(
+        cls,
+        value: str | None,
+        info,
+    ) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("labels", mode="before")
+    @classmethod
+    def copy_filter_labels(cls, value) -> dict[str, str]:
+        return copy_label_map(value, "labels")
+
+    @field_validator("label_selectors", mode="before")
+    @classmethod
+    def copy_filter_label_selectors(cls, value) -> tuple[LabelSelectorRequirement, ...]:
+        return copy_label_selector_requirements(value)
+
+    @model_validator(mode="after")
+    def validate_selector_value_count(self) -> SessionAggregateFilter:
+        value_count = sum(len(selector.values) for selector in self.label_selectors)
+        if value_count > MAX_AGGREGATE_LABEL_SELECTOR_VALUES:
+            raise ValueError(
+                "Aggregate label selectors cannot contain more than "
+                f"{MAX_AGGREGATE_LABEL_SELECTOR_VALUES} total values."
+            )
+        return self
+
+
+class SessionStatusCounts(BaseModel):
+    """Complete current-session counts for every lifecycle status."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    pending: StrictInt = Field(ge=0)
+    running: StrictInt = Field(ge=0)
+    interrupting: StrictInt = Field(ge=0)
+    completed: StrictInt = Field(ge=0)
+    failed: StrictInt = Field(ge=0)
+    interrupted: StrictInt = Field(ge=0)
+
+
+class SessionOperationalSnapshot(BaseModel):
+    """Exact current session counts captured by one store-local read snapshot."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    as_of: datetime
+    total_count: StrictInt = Field(ge=0)
+    counts_by_status: SessionStatusCounts
+    accuracy: AggregateAccuracy
+
+    @field_validator("as_of")
+    @classmethod
+    def normalize_as_of(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("as_of must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def validate_total(self) -> SessionOperationalSnapshot:
+        if sum(self.counts_by_status.model_dump().values()) != self.total_count:
+            raise ValueError("Session status counts must sum to total_count.")
+        return self
+
+
+MAX_USAGE_ROLLUP_WINDOW = timedelta(days=366)
+
+
+class UsageRollupQuery(BaseModel):
+    """Bounded event-time usage query with explicit current-session filtering."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    start_at: datetime
+    end_at: datetime
+    sessions: SessionAggregateFilter = Field(default_factory=SessionAggregateFilter)
+    group_limit: StrictInt = Field(default=20, ge=1, le=100)
+    include_pricing_inputs: StrictBool = False
+    pricing_input_limit: StrictInt = Field(default=1000, ge=1, le=5000)
+
+    @field_validator("start_at", "end_at")
+    @classmethod
+    def normalize_window_timestamp(cls, value: datetime, info) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(f"{info.field_name} must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def validate_window(self) -> UsageRollupQuery:
+        if self.start_at >= self.end_at:
+            raise ValueError("Usage rollup start_at must be before end_at.")
+        if self.end_at - self.start_at > MAX_USAGE_ROLLUP_WINDOW:
+            raise ValueError(
+                f"Usage rollup window cannot exceed {MAX_USAGE_ROLLUP_WINDOW.days} days."
+            )
+        return self
+
+
 class EventRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -2056,6 +2191,27 @@ class SessionStore(ABC):
     @abstractmethod
     async def list_sessions(self, query: SessionQuery | None = None) -> SessionListResult:
         """List sessions (filtered/sorted/paginated) with a keyset cursor and total count."""
+
+    async def aggregate_operational_snapshot(
+        self,
+        filters: SessionAggregateFilter | None = None,
+    ) -> SessionOperationalSnapshot:
+        """Count current session states in one store-local read snapshot.
+
+        Default raises ``NotImplementedError`` so adding this control-plane read
+        model does not make existing out-of-tree stores uninstantiable.
+        """
+        raise NotImplementedError(
+            "This SessionStore does not support operational aggregate snapshots."
+        )
+
+    async def aggregate_usage(self, query: UsageRollupQuery) -> UsageRollupStoreResult:
+        """Aggregate bounded event-time activity and usage without loading histories.
+
+        Default raises ``NotImplementedError`` so adding this control-plane read
+        model does not make existing out-of-tree stores uninstantiable.
+        """
+        raise NotImplementedError("This SessionStore does not support usage aggregates.")
 
     @abstractmethod
     async def list_sessions_with_pending_interruption_cascade(
@@ -4387,6 +4543,36 @@ def copy_session_query(query: SessionQuery | None) -> SessionQuery:
         include_total_count=query.include_total_count,
         order_by=query.order_by,
     )
+
+
+def copy_session_aggregate_filter(
+    filters: SessionAggregateFilter | None,
+) -> SessionAggregateFilter:
+    if filters is None:
+        return SessionAggregateFilter()
+    if type(filters) is not SessionAggregateFilter:
+        raise TypeError("Session aggregate filters must be SessionAggregateFilter instances.")
+    return SessionAggregateFilter.model_validate(filters.model_dump(mode="python"))
+
+
+def session_query_from_aggregate_filter(filters: SessionAggregateFilter) -> SessionQuery:
+    filters = copy_session_aggregate_filter(filters)
+    return SessionQuery(
+        agent_name=filters.agent_name,
+        provider_name=filters.provider_name,
+        model=filters.model,
+        environment_name=filters.environment_name,
+        parent_session_id=filters.parent_session_id,
+        causal_budget_id=filters.causal_budget_id,
+        labels=filters.labels,
+        label_selectors=filters.label_selectors,
+    )
+
+
+def copy_usage_rollup_query(query: UsageRollupQuery) -> UsageRollupQuery:
+    if type(query) is not UsageRollupQuery:
+        raise TypeError("Usage aggregate queries must be UsageRollupQuery instances.")
+    return UsageRollupQuery.model_validate(query.model_dump(mode="python"))
 
 
 def copy_event_query(query: EventQuery | None) -> EventQuery:

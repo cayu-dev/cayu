@@ -8,9 +8,10 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from cayu._validation import copy_json_object, require_clean_nonblank, require_nonblank
+from cayu.runtime.aggregates import AggregateAccuracy
 
 
 class TaskStatus(StrEnum):
@@ -175,6 +176,68 @@ class TaskQuery(BaseModel):
         return require_clean_nonblank(value, info.field_name)
 
 
+class TaskAggregateFilter(BaseModel):
+    """Current task attributes that may scope a store-native aggregate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: str | None = None
+    session_id: str | None = None
+    parent_task_id: str | None = None
+    assigned_agent_name: str | None = None
+
+    @field_validator("type", "session_id", "parent_task_id", "assigned_agent_name")
+    @classmethod
+    def validate_optional_nonblank_strings(
+        cls,
+        value: str | None,
+        info,
+    ) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, info.field_name)
+
+
+class TaskStatusCounts(BaseModel):
+    """Complete current-task counts for every lifecycle status."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    pending: StrictInt = Field(ge=0)
+    claimed: StrictInt = Field(ge=0)
+    running: StrictInt = Field(ge=0)
+    paused: StrictInt = Field(ge=0)
+    blocked: StrictInt = Field(ge=0)
+    needs_attention: StrictInt = Field(ge=0)
+    completed: StrictInt = Field(ge=0)
+    failed: StrictInt = Field(ge=0)
+    cancelled: StrictInt = Field(ge=0)
+
+
+class TaskOperationalSnapshot(BaseModel):
+    """Exact current task counts captured by one store-local read snapshot."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    as_of: datetime
+    total_count: StrictInt = Field(ge=0)
+    counts_by_status: TaskStatusCounts
+    accuracy: AggregateAccuracy
+
+    @field_validator("as_of")
+    @classmethod
+    def normalize_as_of(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("as_of must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def validate_total(self) -> TaskOperationalSnapshot:
+        if sum(self.counts_by_status.model_dump().values()) != self.total_count:
+            raise ValueError("Task status counts must sum to total_count.")
+        return self
+
+
 class TaskStore(ABC):
     """Persistent store for durable work items."""
 
@@ -198,6 +261,19 @@ class TaskStore(ABC):
     @abstractmethod
     async def list_tasks(self, query: TaskQuery | None = None) -> list[Task]:
         """List tasks for dashboards, queues, and orchestration."""
+
+    async def aggregate_operational_snapshot(
+        self,
+        filters: TaskAggregateFilter | None = None,
+    ) -> TaskOperationalSnapshot:
+        """Count current task states in one store-local read snapshot.
+
+        Default raises ``NotImplementedError`` so existing out-of-tree stores
+        remain instantiable when they do not expose this control-plane read model.
+        """
+        raise NotImplementedError(
+            "This TaskStore does not support operational aggregate snapshots."
+        )
 
     @abstractmethod
     async def start_task(
@@ -795,6 +871,26 @@ def copy_task_query(query: TaskQuery | None) -> TaskQuery:
         limit=query.limit,
         offset=query.offset,
         order_by=query.order_by,
+    )
+
+
+def copy_task_aggregate_filter(
+    filters: TaskAggregateFilter | None,
+) -> TaskAggregateFilter:
+    if filters is None:
+        return TaskAggregateFilter()
+    if type(filters) is not TaskAggregateFilter:
+        raise TypeError("Task aggregate filters must be TaskAggregateFilter instances.")
+    return TaskAggregateFilter.model_validate(filters.model_dump(mode="python"))
+
+
+def task_query_from_aggregate_filter(filters: TaskAggregateFilter) -> TaskQuery:
+    filters = copy_task_aggregate_filter(filters)
+    return TaskQuery(
+        type=filters.type,
+        session_id=filters.session_id,
+        parent_task_id=filters.parent_task_id,
+        assigned_agent_name=filters.assigned_agent_name,
     )
 
 
