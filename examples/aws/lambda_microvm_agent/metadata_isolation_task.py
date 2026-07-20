@@ -449,18 +449,27 @@ def _assert_audit_observations(
     }
     network_namespace = observations.get("network_namespace")
     init_network_namespace = observations.get("init_network_namespace")
+    init_network_namespace_access = observations.get("init_network_namespace_access")
+    init_namespace_verified = (
+        init_network_namespace_access == "readable"
+        and type(init_network_namespace) is str
+        and init_network_namespace.startswith("net:[")
+        and network_namespace != init_network_namespace
+    ) or (init_network_namespace_access == "permission-denied" and init_network_namespace is None)
     if (
         type(network_namespace) is not str
         or not network_namespace.startswith("net:[")
-        or type(init_network_namespace) is not str
-        or not init_network_namespace.startswith("net:[")
-        or network_namespace == init_network_namespace
+        or not init_namespace_verified
     ):
         mismatches["network_namespace"] = {
-            "expected": "agent namespace distinct from init namespace",
+            "expected": (
+                "agent namespace distinct from readable init namespace, or init namespace "
+                "read denied"
+            ),
             "actual": {
                 "agent": network_namespace,
                 "init": init_network_namespace,
+                "init_access": init_network_namespace_access,
             },
         }
     raw_fingerprints = observations.get("candidate_fingerprints")

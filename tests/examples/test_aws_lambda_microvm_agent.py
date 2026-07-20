@@ -169,6 +169,7 @@ def _valid_audit_observations(**overrides: Any) -> dict[str, Any]:
         "effective_uid": 1000,
         "filesystem_files_inspected": 3,
         "init_network_namespace": "net:[root]",
+        "init_network_namespace_access": "readable",
         "metadata_credentials_present": False,
         "metadata_network_reachable": False,
         "network_namespace": "net:[agent]",
@@ -471,6 +472,46 @@ def test_guest_audit_treats_unreadable_root_paths_as_absent() -> None:
     root_probe = script.split("filesystem_files = []", 1)[1].split("filesystem_sources = []", 1)[0]
     assert root_probe.count("except OSError:") == 2
     assert '"/root/.aws"' in root_probe
+
+
+def test_guest_audit_records_unreadable_init_network_namespace() -> None:
+    script = Path("examples/aws/lambda_microvm_agent/metadata_isolation_guest.py").read_text(
+        encoding="utf-8"
+    )
+
+    namespace_probe = script.split("def read_init_network_namespace", 1)[1].split(
+        "def process_status", 1
+    )[0]
+    assert "except PermissionError:" in namespace_probe
+    assert 'return None, "permission-denied"' in namespace_probe
+
+
+def test_live_boundary_validation_accepts_denied_init_namespace_read() -> None:
+    observations = _valid_audit_observations(
+        init_network_namespace=None,
+        init_network_namespace_access="permission-denied",
+    )
+
+    metadata_isolation_task._assert_audit_observations(
+        observations,
+        trusted_values=[],
+        fingerprint_key=b"k" * 32,
+    )
+
+
+@pytest.mark.parametrize("access", ["missing", "os-error", None])
+def test_live_boundary_validation_rejects_unverified_init_namespace(access: str | None) -> None:
+    observations = _valid_audit_observations(
+        init_network_namespace=None,
+        init_network_namespace_access=access,
+    )
+
+    with pytest.raises(RuntimeError, match="network_namespace"):
+        metadata_isolation_task._assert_audit_observations(
+            observations,
+            trusted_values=[],
+            fingerprint_key=b"k" * 32,
+        )
 
 
 def test_live_boundary_validation_rejects_agent_access_to_trusted_sidecar() -> None:

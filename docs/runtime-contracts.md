@@ -2332,12 +2332,16 @@ The opt-in deployed contract uses the exact
 the configured MicroVM execution role and fails unless the agent command
 reports UID/GID 1000, empty capability sets, `no_new_privs`, a network namespace
 distinct from the trusted sidecar, only the point-to-point relay route, and
-denial of sidecar port 8080. The guest returns bounded keyed HMAC fingerprints
-of candidate values; expected vault/server/database values stay in the trusted
-control task, which alone performs the comparison. Missing, extra, duplicate,
-or non-verifying evidence fails the launcher. These guest observations
-corroborate the deployed contract; the load-bearing `verified` capability still
-comes from the control-plane-observed preflight before agent-submitted code.
+denial of sidecar port 8080. The namespace comparison accepts either a readable,
+well-formed `/proc/1/ns/net` link different from the agent namespace or an
+explicit `PermissionError` from the unprivileged guest; a missing path, another
+OS error, an equal namespace, or malformed evidence fails. The guest returns
+bounded keyed HMAC fingerprints of candidate values; expected
+vault/server/database values stay in the trusted control task, which alone
+performs the comparison. Missing, extra, duplicate, or non-verifying evidence
+fails the launcher. These guest observations corroborate the deployed contract;
+the load-bearing `verified` capability still comes from the
+control-plane-observed preflight before agent-submitted code.
 
 The integrated AWS image supports required mode by placing the unprivileged
 agent in a route-less network namespace whose only accepted root-gateway port

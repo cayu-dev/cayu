@@ -147,6 +147,9 @@ and AWS-credential non-possession, revocation, a credential-free synced
 workspace release, and MicroVM cleanup. The guest returns bounded keyed HMAC
 fingerprints of observed candidate values; expected vault/server/database
 values remain in the trusted control task and are never passed to guest argv.
+For the init network namespace, the verifier accepts either a namespace link
+that differs from the agent namespace or an explicit permission denial from
+the unprivileged guest; missing paths and other read failures remain errors.
 The launcher, trusted control-task probe, and unrestricted guest audit live in
 separate modules so each execution boundary remains explicit:
 

@@ -56,6 +56,17 @@ def read_bounded(path, limit=262144):
         return b""
 
 
+def read_init_network_namespace():
+    try:
+        return os.readlink("/proc/1/ns/net"), "readable"
+    except PermissionError:
+        return None, "permission-denied"
+    except FileNotFoundError:
+        return None, "missing"
+    except OSError:
+        return None, "os-error"
+
+
 def process_status():
     fields = {}
     for line in read_bounded("/proc/self/status").decode("utf-8", errors="replace").splitlines():
@@ -152,7 +163,7 @@ if mode == "revoked":
 
 status = process_status()
 network_namespace = os.readlink("/proc/self/ns/net")
-init_network_namespace = os.readlink("/proc/1/ns/net")
+init_network_namespace, init_network_namespace_access = read_init_network_namespace()
 
 
 process_environment_paths = []
@@ -305,6 +316,7 @@ print(
             "effective_uid": os.geteuid(),
             "filesystem_files_inspected": len(filesystem_sources),
             "init_network_namespace": init_network_namespace,
+            "init_network_namespace_access": init_network_namespace_access,
             "metadata_credentials_present": metadata_credentials_present,
             "metadata_network_reachable": metadata_reachable,
             "network_namespace": network_namespace,
