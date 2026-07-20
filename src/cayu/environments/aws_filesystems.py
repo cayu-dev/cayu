@@ -79,7 +79,7 @@ class _AccessPointBinding(WorkspaceBinding):
         if await self._is_mounted(runner):
             await self._required(
                 runner,
-                ExecCommand.process("umount", "--", self.path),
+                self._unmount_command(),
                 action="replace existing mount",
                 timeout_s=self.unmount_timeout_s,
             )
@@ -148,7 +148,7 @@ class _AccessPointBinding(WorkspaceBinding):
         if await self._is_mounted(bound.runner):
             await self._required(
                 bound.runner,
-                ExecCommand.process("umount", "--", self.path),
+                self._unmount_command(),
                 action="unmount workspace",
                 timeout_s=self.unmount_timeout_s,
             )
@@ -191,12 +191,18 @@ class _AccessPointBinding(WorkspaceBinding):
     async def _best_effort_unmount(self, runner: Runner) -> None:
         try:
             await runner.exec_system(
-                ExecCommand.process("umount", "--", self.path),
+                self._unmount_command(),
                 timeout_s=self.unmount_timeout_s,
                 output_limit_bytes=_COMMAND_OUTPUT_LIMIT_BYTES,
             )
         except Exception:
             return
+
+    def _unmount_command(self) -> ExecCommand:
+        # A runner commonly roots commands at the mounted workspace itself. Move
+        # the unmount process to the guest root first so its cwd does not keep the
+        # mount busy while preserving the runner's cwd containment contract.
+        return ExecCommand.process("env", "--chdir=/", "umount", "--", self.path)
 
     def _binding_metadata(self) -> dict[str, str]:
         return {

@@ -20,10 +20,11 @@ class _MountRunner(Runner):
     isolation = "lambda-microvm"
     default_cwd = "/workspace"
 
-    def __init__(self, *, fail_mount: bool = False) -> None:
+    def __init__(self, *, fail_mount: bool = False, reject_busy_unmount: bool = False) -> None:
         self.calls: list[tuple[ExecCommand, str | None, int | None]] = []
         self.mountpoint_checks = 0
         self.fail_mount = fail_mount
+        self.reject_busy_unmount = reject_busy_unmount
 
     async def exec(
         self,
@@ -43,6 +44,8 @@ class _MountRunner(Runner):
             return ExecResult(exit_code=1 if self.mountpoint_checks == 1 else 0)
         if argv and argv[0] == "mount" and self.fail_mount:
             return ExecResult(exit_code=32, stderr="access point denied")
+        if argv[:1] == ["umount"] and self.reject_busy_unmount:
+            return ExecResult(exit_code=16, stderr=f"umount: {self.default_cwd}: device is busy")
         return ExecResult()
 
 
@@ -146,8 +149,23 @@ def test_access_point_binding_syncs_and_unmounts_on_finalize() -> None:
     assert _argv_calls(runner)[-3:] == [
         ["sync", "-f", "/workspace"],
         ["mountpoint", "-q", "--", "/workspace"],
-        ["umount", "--", "/workspace"],
+        ["env", "--chdir=/", "umount", "--", "/workspace"],
     ]
+
+
+def test_access_point_binding_unmounts_when_runner_root_is_the_mount() -> None:
+    runner = _MountRunner(reject_busy_unmount=True)
+    binding = EFSAccessPointBinding(
+        file_system_id="fs-1",
+        access_point_id="fsap-1",
+        mount_target_ip="10.0.0.10",
+    )
+
+    async def run() -> None:
+        bound = await binding.bind(None, runner, session_id="sess_busy_cwd")
+        assert await binding.finalize(bound, outcome="completed") is None
+
+    asyncio.run(run())
 
 
 def test_access_point_binding_fails_closed_when_mount_fails() -> None:

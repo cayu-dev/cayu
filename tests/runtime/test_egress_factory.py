@@ -2534,7 +2534,14 @@ def test_factory_preserves_trusted_execution_for_aws_workspace_lifecycle(
         "mountpoint",
         "sync",
         "mountpoint",
+        "env",
+    ]
+    assert transport.payloads[-1]["argv"] == [
+        "env",
+        "--chdir=/",
         "umount",
+        "--",
+        "/workspace",
     ]
 
 
