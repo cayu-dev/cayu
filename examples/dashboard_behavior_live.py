@@ -663,6 +663,8 @@ async def _run_browser_contract(
             "session_cursor_pagination",
             "session_filter_url_state",
             "session_query_cancellation",
+            "overview_truthful_scope",
+            "usage_loaded_scope",
         ],
         "console_errors": 0,
         "page_errors": 0,
@@ -680,6 +682,7 @@ async def _exercise_dashboard(
     provider: DashboardContractProvider,
     faults: MutationDisconnectFaults,
 ) -> None:
+    await _exercise_operational_scope(page, base_url)
     await _exercise_mutation_recovery(page, base_url)
     await page.goto(f"{base_url}/cayu/sessions", wait_until="networkidle")
     require((await page.locator("body").inner_text()).strip() != "", "dashboard rendered blank")
@@ -750,6 +753,94 @@ async def _exercise_dashboard(
     await expect(include_thinking).to_be_checked()
     await expect(thinking_payload).to_be_visible()
     await _exercise_existing_session_mutations(page, base_url, provider)
+
+
+async def _exercise_operational_scope(page: Page, base_url: str) -> None:
+    summary_path = "**/api/sessions/summary*"
+    summary_started = asyncio.Event()
+    release_summary = asyncio.Event()
+    summary_continued = asyncio.Event()
+
+    async def delay_overview_summary(route) -> None:
+        summary_started.set()
+        await release_summary.wait()
+        try:
+            await route.continue_()
+        finally:
+            summary_continued.set()
+
+    await page.route(summary_path, delay_overview_summary)
+    try:
+        await page.goto(f"{base_url}/cayu/", wait_until="domcontentloaded")
+        await asyncio.wait_for(summary_started.wait(), timeout=5)
+        token_metric = page.get_by_text("Session Tokens", exact=True).locator("..").locator("..")
+        await expect(token_metric.get_by_text("—", exact=True)).to_be_visible()
+        await expect(
+            token_metric.get_by_text("Loading up to 25 most recently updated sessions.", exact=True)
+        ).to_be_visible()
+        await expect(token_metric.get_by_text(re.compile(r"0 in / 0 out"))).to_have_count(0)
+        await expect(page.get_by_text("Loading recent sessions...", exact=True)).to_be_visible()
+        await expect(page.get_by_text("No sessions yet.", exact=True)).to_have_count(0)
+    finally:
+        release_summary.set()
+        if summary_started.is_set():
+            await asyncio.wait_for(summary_continued.wait(), timeout=5)
+        await page.unroute(summary_path, delay_overview_summary)
+
+    await page.wait_for_load_state("networkidle")
+    await expect(page.get_by_role("heading", name="Dashboard", exact=True)).to_be_visible()
+    overview_scope = page.get_by_test_id("overview-sample-scope")
+    await expect(overview_scope).to_be_visible()
+    await expect(
+        overview_scope.get_by_text("Recent sample — not deployment totals", exact=True)
+    ).to_be_visible()
+    await expect(
+        overview_scope.get_by_text(
+            re.compile(r"latest 25 of \d+ sessions by updated time \(25-session limit\)")
+        )
+    ).to_be_visible()
+    for label in (
+        "Active Sessions",
+        "Completed Sessions",
+        "Failed Sessions",
+        "Session Tokens",
+    ):
+        await expect(page.get_by_text(label, exact=True)).to_be_visible()
+    await expect(page.get_by_text("Active Work", exact=True)).to_have_count(0)
+    await expect(page.get_by_text("Recent Needs Attention", exact=True)).to_be_visible()
+
+    await page.goto(f"{base_url}/cayu/usage", wait_until="networkidle")
+    await expect(page.get_by_role("heading", name="Usage", exact=True)).to_be_visible()
+    await expect(
+        page.get_by_text(
+            "Client-side usage rollup over at most 10,000 most recently updated matching "
+            "sessions. The current loaded scope is shown below.",
+            exact=True,
+        )
+    ).to_be_visible()
+    usage_scope = page.get_by_test_id("usage-loaded-scope")
+    await expect(usage_scope).to_be_visible()
+    await expect(usage_scope.get_by_text("Complete loaded scope", exact=True)).to_be_visible()
+    await expect(
+        usage_scope.get_by_text(
+            re.compile(
+                r"All \d+ matching sessions reported by this paginated request are included "
+                r"in the client-side rollup\."
+            )
+        )
+    ).to_be_visible()
+    for label in (
+        "Loaded Sessions",
+        "Tokens",
+        "Model Steps",
+        "Estimated Cost",
+        "Unpriced Steps",
+    ):
+        await expect(page.get_by_text(label, exact=True)).to_be_visible()
+    unpriced_metric = page.get_by_text("Unpriced Steps", exact=True).locator("..").locator("..")
+    await expect(unpriced_metric.get_by_text("—", exact=True)).to_be_visible()
+    await expect(unpriced_metric.get_by_text("0", exact=True)).to_have_count(0)
+    await expect(unpriced_metric.get_by_text(re.compile(r"Cost not estimated;"))).to_be_visible()
 
 
 async def _exercise_session_annotations(page: Page) -> None:

@@ -18,6 +18,33 @@ import {
 import { formatCount, formatDateTime, numericValue } from "../lib/format"
 import { summarizeSessionDebugState } from "../lib/session-debug"
 
+const OVERVIEW_SOURCE_LIMIT = 25
+const OVERVIEW_VISIBLE_LIST_LIMIT = 8
+
+function describeOverviewSessionScope(
+  loadedCount: number,
+  totalCount: number | null,
+  hasMore: boolean,
+) {
+  const reliableTotal =
+    totalCount !== null && Number.isSafeInteger(totalCount) && totalCount >= loadedCount
+      ? totalCount
+      : null
+  if (hasMore) {
+    if (reliableTotal !== null) {
+      return `latest ${formatCount(loadedCount)} of ${formatCount(reliableTotal)} sessions by updated time (${OVERVIEW_SOURCE_LIMIT}-session limit)`
+    }
+    return `${formatCount(loadedCount)} most recently updated sessions loaded (${OVERVIEW_SOURCE_LIMIT}-session limit; more available; total unavailable)`
+  }
+  if (reliableTotal === loadedCount) {
+    return `all ${formatCount(loadedCount)} sessions loaded (${OVERVIEW_SOURCE_LIMIT}-session limit)`
+  }
+  if (reliableTotal !== null) {
+    return `${formatCount(loadedCount)} of ${formatCount(reliableTotal)} reported sessions loaded (${OVERVIEW_SOURCE_LIMIT}-session limit; no continuation reported)`
+  }
+  return `${formatCount(loadedCount)} sessions loaded (${OVERVIEW_SOURCE_LIMIT}-session limit; total unavailable)`
+}
+
 function StatusBadge({ status }: { status: string }) {
   const variant =
     status === "completed"
@@ -32,12 +59,6 @@ function StatusBadge({ status }: { status: string }) {
 
 function isActiveSession(session: Session) {
   return ["pending", "running", "interrupting"].includes(session.status)
-}
-
-function isActiveTask(task: Task) {
-  return ["pending", "claimed", "running", "paused", "blocked", "needs_attention"].includes(
-    task.status,
-  )
 }
 
 function needsAttentionTask(task: Task) {
@@ -87,17 +108,18 @@ function pendingActionLabel(action: PendingAction) {
 export function DashboardPage() {
   const summary = useQuery({
     queryKey: ["sessions-summary", "dashboard"],
-    queryFn: () => fetchSessionsSummary({ limit: 25, order_by: "updated_at_desc" }),
+    queryFn: () =>
+      fetchSessionsSummary({ limit: OVERVIEW_SOURCE_LIMIT, order_by: "updated_at_desc" }),
     refetchInterval: 5000,
   })
   const tasks = useQuery({
     queryKey: ["tasks", "dashboard"],
-    queryFn: () => fetchTasks({ limit: 25 }),
+    queryFn: () => fetchTasks({ limit: OVERVIEW_SOURCE_LIMIT }),
     refetchInterval: 5000,
   })
   const pendingActions = useQuery({
     queryKey: ["pending-actions", "dashboard"],
-    queryFn: () => fetchPendingActions({ limit: 25 }),
+    queryFn: () => fetchPendingActions({ limit: OVERVIEW_SOURCE_LIMIT }),
     retry: (failureCount, error) => !isApiPayloadTooLarge(error) && failureCount < 3,
     refetchInterval: (query) => (isApiPayloadTooLarge(query.state.error) ? false : 5000),
     refetchIntervalInBackground: false,
@@ -112,7 +134,6 @@ export function DashboardPage() {
   const sessionsError = summary.error instanceof Error ? summary.error.message : null
   const tasksError = tasks.error instanceof Error ? tasks.error.message : null
   const activeSessions = list.filter(isActiveSession)
-  const activeTasks = taskList.filter(isActiveTask)
   const completed = list.filter((s) => s.status === "completed").length
   const failed = list.filter((s) => s.status === "failed").length
   const attentionTasks = taskList.filter(needsAttentionTask)
@@ -120,6 +141,27 @@ export function DashboardPage() {
   const attentionSessions = attentionSessionItems.map((item) => item.session)
   const usage = summary.data?.usage.usage
   const totalTokens = numericValue(usage?.total_tokens)
+  const sessionScope = summary.data
+    ? describeOverviewSessionScope(
+        list.length,
+        summary.data.total_count,
+        Boolean(summary.data.next_cursor),
+      )
+    : `up to ${OVERVIEW_SOURCE_LIMIT} most recently updated sessions`
+  const sessionMetricAvailable = summary.data !== undefined
+  const sessionSampleLoading = summary.isLoading && summary.data === undefined
+  const taskSampleLoading = tasks.isLoading && tasks.data === undefined
+  const attentionSampleLoading =
+    sessionSampleLoading ||
+    taskSampleLoading ||
+    (pendingActions.isLoading && pendingActions.data === undefined)
+  const sessionMetricDetail = sessionMetricAvailable
+    ? summary.isError
+      ? `Last loaded values across ${sessionScope}; refresh failed.`
+      : `Across ${sessionScope}.`
+    : summary.isError
+      ? "Session sample unavailable."
+      : `Loading ${sessionScope}.`
 
   return (
     <Page>
@@ -132,31 +174,48 @@ export function DashboardPage() {
         }
       />
 
+      <div
+        className="flex items-start gap-3 rounded-md border border-border bg-muted/40 px-4 py-3 text-sm"
+        data-testid="overview-sample-scope"
+      >
+        <Database className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+        <div className="space-y-1">
+          <div className="font-medium">Recent sample — not deployment totals</div>
+          <div className="text-muted-foreground">
+            Session cards cover {sessionScope}. Recent attention entries independently load up to{" "}
+            {OVERVIEW_SOURCE_LIMIT} tasks and {OVERVIEW_SOURCE_LIMIT} pending actions; categories
+            can overlap.
+          </div>
+        </div>
+      </div>
+
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
         {[
           {
             icon: Activity,
-            label: "Active Work",
-            value: activeSessions.length + activeTasks.length + pendingActionList.length,
-            detail: `${activeSessions.length} sessions / ${activeTasks.length} tasks / ${pendingActionList.length} pending`,
+            label: "Active Sessions",
+            value: sessionMetricAvailable ? activeSessions.length : "—",
+            detail: sessionMetricDetail,
           },
           {
             icon: CheckCircle,
-            label: "Completed",
-            value: completed,
-            detail: "sessions in current view",
+            label: "Completed Sessions",
+            value: sessionMetricAvailable ? completed : "—",
+            detail: sessionMetricDetail,
           },
           {
             icon: XCircle,
-            label: "Failed",
-            value: failed,
-            detail: "sessions in current view",
+            label: "Failed Sessions",
+            value: sessionMetricAvailable ? failed : "—",
+            detail: sessionMetricDetail,
           },
           {
             icon: Database,
-            label: "Tokens",
-            value: formatCount(totalTokens),
-            detail: `${formatCount(usage?.input_tokens)} in / ${formatCount(usage?.output_tokens)} out`,
+            label: "Session Tokens",
+            value: sessionMetricAvailable ? formatCount(totalTokens) : "—",
+            detail: sessionMetricAvailable
+              ? `${formatCount(usage?.input_tokens)} in / ${formatCount(usage?.output_tokens)} out across ${sessionScope}${summary.isError ? "; refresh failed" : ""}.`
+              : sessionMetricDetail,
           },
         ].map(({ icon: Icon, label, value, detail }) => (
           <Card key={label}>
@@ -166,18 +225,24 @@ export function DashboardPage() {
             </CardHeader>
             <CardContent>
               <div className="text-3xl font-bold">{value}</div>
-              <div className="mt-1 truncate text-sm text-muted-foreground">{detail}</div>
+              <div className="mt-1 text-sm text-muted-foreground">{detail}</div>
             </CardContent>
           </Card>
         ))}
       </div>
 
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">
-        <DataCard title="Recent Sessions" contentClassName="p-4">
+        <DataCard
+          title="Recent Sessions"
+          description={`Showing up to ${OVERVIEW_VISIBLE_LIST_LIMIT} rows from ${sessionScope}.`}
+          contentClassName="p-4"
+        >
           {summary.isError ? (
             <StateMessage tone="danger" className="py-6">
               {sessionsError || "Failed to load sessions."}
             </StateMessage>
+          ) : sessionSampleLoading ? (
+            <StateMessage className="py-6">Loading recent sessions...</StateMessage>
           ) : list.length === 0 ? (
             <StateMessage className="py-6">
               No sessions yet.{" "}
@@ -187,7 +252,7 @@ export function DashboardPage() {
             </StateMessage>
           ) : (
             <div className="space-y-2">
-              {sessionItems.slice(0, 8).map(({ session: s, events }) => (
+              {sessionItems.slice(0, OVERVIEW_VISIBLE_LIST_LIMIT).map(({ session: s, events }) => (
                 <Link
                   key={s.id}
                   to="/sessions/$sessionId"
@@ -212,7 +277,8 @@ export function DashboardPage() {
         </DataCard>
 
         <DataCard
-          title="Needs Attention"
+          title="Recent Needs Attention"
+          description={`Showing up to 20 entries from ${sessionScope}, ${OVERVIEW_SOURCE_LIMIT} recent tasks, and a pending-action page with a ${OVERVIEW_SOURCE_LIMIT}-action limit. Categories can overlap.`}
           contentClassName="p-4"
           actions={
             <Link
@@ -230,12 +296,14 @@ export function DashboardPage() {
                 (pendingActions.error instanceof Error ? pendingActions.error.message : null) ||
                 "Failed to load dashboard state."}
             </StateMessage>
+          ) : attentionSampleLoading ? (
+            <StateMessage className="py-6">Loading recent attention samples...</StateMessage>
           ) : attentionSessions.length === 0 &&
             attentionTasks.length === 0 &&
             pendingActionList.length === 0 &&
             pendingActionIssues.length === 0 ? (
             <StateMessage className="py-6">
-              No sessions, tasks, or pending actions need attention in the current view.
+              No sampled sessions, tasks, or pending actions need attention.
             </StateMessage>
           ) : (
             <div className="space-y-2">
@@ -310,7 +378,7 @@ export function DashboardPage() {
                       <span className="truncate">{t.title || t.type}</span>
                     </div>
                     <div className="text-xs text-muted-foreground">
-                      {t.status_reason || formatDateTime(t.created_at)}
+                      {t.status_reason || `Updated ${formatDateTime(t.updated_at || t.created_at)}`}
                     </div>
                   </div>
                   <StatusBadge status={t.status} />
@@ -320,16 +388,22 @@ export function DashboardPage() {
           )}
         </DataCard>
 
-        <DataCard title="Recent Tasks" contentClassName="p-4">
+        <DataCard
+          title="Recent Tasks"
+          description={`Showing up to ${OVERVIEW_VISIBLE_LIST_LIMIT} of the ${OVERVIEW_SOURCE_LIMIT} most recently updated tasks; no deployment-wide task total is shown.`}
+          contentClassName="p-4"
+        >
           {tasks.isError ? (
             <StateMessage tone="danger" className="py-6">
               {tasksError || "Failed to load tasks."}
             </StateMessage>
+          ) : taskSampleLoading ? (
+            <StateMessage className="py-6">Loading recent tasks...</StateMessage>
           ) : taskList.length === 0 ? (
             <StateMessage className="py-6">No tasks yet.</StateMessage>
           ) : (
             <div className="space-y-2">
-              {taskList.slice(0, 8).map((t) => (
+              {taskList.slice(0, OVERVIEW_VISIBLE_LIST_LIMIT).map((t) => (
                 <div
                   key={t.id}
                   className="flex items-center justify-between gap-3 rounded-md bg-muted/50 p-3"
@@ -337,7 +411,7 @@ export function DashboardPage() {
                   <div className="min-w-0">
                     <div className="truncate text-sm">{t.title || t.type}</div>
                     <div className="text-xs text-muted-foreground">
-                      {formatDateTime(t.created_at)}
+                      Updated {formatDateTime(t.updated_at || t.created_at)}
                     </div>
                   </div>
                   <div className="shrink-0">

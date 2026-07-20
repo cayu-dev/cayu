@@ -19,6 +19,12 @@ import { bedrockBillingRows } from "../lib/bedrock-billing"
 import { dashboardConfig } from "../lib/config"
 import { addDecimalStrings } from "../lib/decimal"
 import { formatCount, formatDateTime, formatDecimal, numericValue } from "../lib/format"
+import {
+  describeUsageRollupScope,
+  USAGE_ROLLUP_MAX_PAGES,
+  USAGE_ROLLUP_PAGE_LIMIT,
+  USAGE_ROLLUP_SESSION_LIMIT,
+} from "../lib/usage-rollup-scope"
 import { cn } from "../lib/utils"
 
 type SessionStatusFilter = "all" | Exclude<SessionsSummaryQuery["status"], null | undefined>
@@ -41,8 +47,6 @@ type UsageRollup = {
   cost: SessionsSummary["cost"]
 }
 
-const PAGE_LIMIT = 1000
-const MAX_PAGES = 10
 const SESSION_STATUSES: SessionStatusFilter[] = [
   "pending",
   "running",
@@ -173,7 +177,7 @@ async function fetchUsageRollup(query: SessionsSummaryQuery): Promise<UsageRollu
     const page = await fetchSessionsSummary(
       {
         ...query,
-        limit: PAGE_LIMIT,
+        limit: USAGE_ROLLUP_PAGE_LIMIT,
         cursor,
         offset: undefined,
       },
@@ -200,7 +204,7 @@ async function fetchUsageRollup(query: SessionsSummaryQuery): Promise<UsageRollu
     )
     cost = mergeCost(cost, page.cost)
     cursor = page.next_cursor
-  } while (cursor && pages < MAX_PAGES)
+  } while (cursor && pages < USAGE_ROLLUP_MAX_PAGES)
 
   return {
     sessions,
@@ -236,7 +240,7 @@ function MetricCard({
         <div className="min-w-0">
           <div className="text-xs font-medium uppercase text-muted-foreground">{label}</div>
           <div className="mt-2 truncate text-2xl font-semibold">{value}</div>
-          <div className="mt-1 truncate text-xs text-muted-foreground">{detail}</div>
+          <div className="mt-1 text-xs text-muted-foreground">{detail}</div>
         </div>
         <div
           className={cn(
@@ -313,9 +317,11 @@ function BreakdownTable({
 function BedrockBillingBreakdown({
   lineItems,
   currency,
+  scopeDescription,
 }: {
   lineItems: UsageCostLineItem[]
   currency: string
+  scopeDescription: string
 }) {
   const rows = useMemo(() => bedrockBillingRows(lineItems), [lineItems])
 
@@ -323,7 +329,7 @@ function BedrockBillingBreakdown({
   return (
     <DataCard
       title="Bedrock Billing Breakdown"
-      description="Exact invocation identity used for pricing; regions, profiles, and tiers are never combined."
+      description={`Exact invocation identity within ${scopeDescription}; regions, profiles, and tiers are never combined.`}
     >
       <Table>
         <TableHeader>
@@ -391,6 +397,12 @@ export function UsagePage() {
     queryFn: () => fetchUsageRollup(query),
   })
   const data = usage.data
+  const scope = describeUsageRollupScope({
+    hasMore: Boolean(data?.nextCursor),
+    loadedCount: data?.loadedCount ?? 0,
+    totalCount: data?.totalCount ?? null,
+  })
+  const ScopeIcon = scope.kind === "partial" ? AlertTriangle : Database
   const hasFilters = search.trim() !== "" || status !== "all"
   const costBySessionId = useMemo(() => {
     const bySessionId = new Map<string, UsageSessionCost>()
@@ -427,7 +439,10 @@ export function UsagePage() {
 
   return (
     <Page>
-      <PageHeader title="Usage" description="Token and model usage across matching sessions." />
+      <PageHeader
+        title="Usage"
+        description={`Client-side usage rollup over at most ${formatCount(USAGE_ROLLUP_SESSION_LIMIT)} most recently updated matching sessions. The current loaded scope is shown below.`}
+      />
 
       <DataCard>
         <div className="flex min-w-0 flex-wrap items-center gap-2 border-b border-border p-4">
@@ -469,52 +484,62 @@ export function UsagePage() {
         <StateMessage>Loading usage...</StateMessage>
       ) : (
         <>
-          {data.nextCursor && (
-            <div className="flex items-start gap-3 rounded-md border border-chart-1/30 bg-chart-1/5 px-4 py-3 text-sm text-chart-1">
-              <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
-              <div>
-                Usage is partial: loaded {formatCount(data.loadedCount)} of{" "}
-                {formatCount(data.totalCount ?? data.loadedCount)} matching sessions. Narrow filters
-                to inspect the full set.
-              </div>
+          <div
+            className={cn(
+              "flex items-start gap-3 rounded-md border px-4 py-3 text-sm",
+              scope.kind === "complete"
+                ? "border-border bg-muted/40 text-foreground"
+                : "border-chart-1/30 bg-chart-1/5 text-chart-1",
+            )}
+            data-testid="usage-loaded-scope"
+            role={scope.kind === "partial" ? "alert" : "status"}
+          >
+            <ScopeIcon className="mt-0.5 h-4 w-4 flex-shrink-0" />
+            <div className="space-y-1">
+              <div className="font-medium">{scope.label}</div>
+              <div>{scope.description}</div>
             </div>
-          )}
+          </div>
 
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-5">
             <MetricCard
               icon={Database}
-              label="Sessions"
+              label="Loaded Sessions"
               value={formatCount(data.loadedCount)}
-              detail={
-                data.totalCount !== null
-                  ? `${formatCount(data.totalCount)} matching`
-                  : "matching sessions"
-              }
+              detail={scope.metricQualifier}
             />
             <MetricCard
               icon={Hash}
               label="Tokens"
               value={formatCount(data.usage.total_tokens)}
-              detail={`${formatCount(data.usage.input_tokens)} in / ${formatCount(data.usage.output_tokens)} out`}
+              detail={`${formatCount(data.usage.input_tokens)} in / ${formatCount(data.usage.output_tokens)} out across ${scope.metricQualifier}`}
             />
             <MetricCard
               icon={Workflow}
               label="Model Steps"
               value={formatCount(data.modelSteps)}
-              detail={`${formatCount(data.toolCalls)} tool calls`}
+              detail={`${formatCount(data.toolCalls)} tool calls across ${scope.metricQualifier}`}
             />
             <MetricCard
               icon={Coins}
               label="Estimated Cost"
-              value={data.cost ? formatDecimal(data.cost.total_cost) : "-"}
-              detail={data.cost ? data.cost.currency : "pricing not supplied"}
+              value={data.cost ? formatDecimal(data.cost.total_cost) : "—"}
+              detail={
+                data.cost
+                  ? `${data.cost.currency} across ${scope.metricQualifier}`
+                  : `Pricing not supplied; ${scope.metricQualifier}`
+              }
               tone={data.cost?.unpriced_model_steps ? "warning" : "default"}
             />
             <MetricCard
               icon={AlertTriangle}
               label="Unpriced Steps"
-              value={formatCount(data.cost?.unpriced_model_steps)}
-              detail={data.cost ? "from price book" : "cost not estimated"}
+              value={data.cost ? formatCount(data.cost.unpriced_model_steps) : "—"}
+              detail={
+                data.cost
+                  ? `From the price book across ${scope.metricQualifier}`
+                  : `Cost not estimated; ${scope.metricQualifier}`
+              }
               tone={data.cost?.unpriced_model_steps ? "warning" : "default"}
             />
           </div>
@@ -522,12 +547,12 @@ export function UsagePage() {
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
             <BreakdownTable
               title="Provider Breakdown"
-              description="Provider-level token totals from model.completed events."
+              description={`Provider-level token totals from model.completed events across ${scope.metricQualifier}.`}
               rows={data.providerBreakdown}
             />
             <BreakdownTable
               title="Model Breakdown"
-              description="Provider/model token totals from model.completed events."
+              description={`Provider/model token totals from model.completed events across ${scope.metricQualifier}.`}
               rows={data.modelBreakdown}
               includeModel
             />
@@ -537,6 +562,7 @@ export function UsagePage() {
             <BedrockBillingBreakdown
               lineItems={data.cost.line_items}
               currency={data.cost.currency}
+              scopeDescription={scope.metricQualifier}
             />
           )}
 
@@ -544,8 +570,8 @@ export function UsagePage() {
             title={data.cost ? "Highest Cost Sessions" : "Highest Token Sessions"}
             description={
               data.cost
-                ? "Top matching sessions by estimated cost."
-                : "Top matching sessions by total tokens."
+                ? `Up to 20 sessions by estimated cost within ${scope.metricQualifier}.`
+                : `Up to 20 sessions by total tokens within ${scope.metricQualifier}.`
             }
           >
             <Table>
