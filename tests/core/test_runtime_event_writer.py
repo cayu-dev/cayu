@@ -793,6 +793,42 @@ def test_emit_many_copies_events_before_persisting_and_fanout() -> None:
     assert [event.payload for event in sink_events] == expected
 
 
+def test_persist_many_exposes_durable_boundary_before_fanout() -> None:
+    async def scenario() -> tuple[list[Event], list[Event], list[Event], list[Event]]:
+        store = await _session_store("writer_persist_batch")
+        sink = _RecordingSink()
+        writer = RuntimeEventWriter(
+            session_store=store,
+            budget_store=InMemoryBudgetStore(),
+            event_sinks=[sink],
+        )
+        source = [
+            Event(
+                type="custom.example.persisted",
+                session_id="writer_persist_batch",
+                payload={"value": 1},
+            )
+        ]
+
+        persisted_result = await writer.persist_many("writer_persist_batch", source)
+        source[0].payload["value"] = 99
+        before_fanout = list(sink.events)
+        await writer.fan_out_persisted(persisted_result)
+        return (
+            persisted_result,
+            await store.load_events("writer_persist_batch"),
+            before_fanout,
+            sink.events,
+        )
+
+    persisted_result, stored, before_fanout, after_fanout = asyncio.run(scenario())
+
+    assert [event.payload for event in persisted_result] == [{"value": 1}]
+    assert [event.payload for event in stored] == [{"value": 1}]
+    assert before_fanout == []
+    assert [event.payload for event in after_fanout] == [{"value": 1}]
+
+
 def test_emit_many_rejects_event_for_different_session() -> None:
     async def scenario() -> None:
         writer = RuntimeEventWriter(

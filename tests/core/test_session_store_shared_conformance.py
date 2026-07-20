@@ -639,6 +639,60 @@ def test_session_store_conformance_blocks_delete_during_explicit_compaction(
     asyncio.run(run())
 
 
+def test_session_store_conformance_blocks_delete_during_incomplete_recovery_claim(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            created = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_recovery_claim_delete_conformance",
+                    messages=[Message.text("user", "create only")],
+                ),
+                identity=_identity(),
+            )
+            claimed_at = datetime.now(UTC)
+            claim_id = "recovery-delete-conformance"
+            await store.checkpoint(
+                created.id,
+                {
+                    "incomplete_session_recovery_claim": {
+                        "version": 1,
+                        "claim_id": claim_id,
+                        "claimed_at": claimed_at.isoformat(),
+                        "claim_expires_at": (claimed_at + timedelta(minutes=5)).isoformat(),
+                    }
+                },
+            )
+
+            with pytest.raises(
+                ValueError,
+                match=f"incomplete-session recovery claim {claim_id} is active",
+            ):
+                await store.delete_session(created.id)
+            assert await store.load(created.id) is not None
+
+            await store.checkpoint(
+                created.id,
+                {
+                    "incomplete_session_recovery_claim": {
+                        "version": 1,
+                        "claim_id": claim_id,
+                        "claimed_at": (claimed_at - timedelta(minutes=10)).isoformat(),
+                        "claim_expires_at": (claimed_at - timedelta(minutes=5)).isoformat(),
+                    }
+                },
+            )
+            await store.delete_session(created.id)
+            assert await store.load(created.id) is None
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
 def test_session_store_conformance_durable_session_message_queue(session_store_case) -> None:
     async def run() -> None:
         store = await _open_store(session_store_case)

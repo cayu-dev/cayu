@@ -69,6 +69,7 @@ from cayu.runtime.sessions import (
     TranscriptRecord,
     UsageRollupQuery,
     _activate_session_run_fence,
+    _active_unexpired_incomplete_recovery_claim_id,
     _active_unexpired_session_operation_id,
     _assert_session_run_epoch,
     _assert_session_run_epoch_value,
@@ -936,9 +937,20 @@ class SQLiteSessionStore(SessionStore):
                         f"Cannot delete a session while it is {session.status}; "
                         f"interrupt it first: {session_id}"
                     )
+                checkpoint = self._load_checkpoint_unlocked(session_id)
+                deletion_now = datetime.now(UTC)
+                active_recovery_claim_id = _active_unexpired_incomplete_recovery_claim_id(
+                    checkpoint,
+                    now=deletion_now,
+                )
+                if active_recovery_claim_id is not None:
+                    raise ValueError(
+                        "Cannot delete a session while incomplete-session recovery claim "
+                        f"{active_recovery_claim_id} is active: {session_id}"
+                    )
                 active_operation_id = _active_unexpired_session_operation_id(
-                    self._load_checkpoint_unlocked(session_id),
-                    now=datetime.now(UTC),
+                    checkpoint,
+                    now=deletion_now,
                 )
                 if active_operation_id is not None:
                     raise ValueError(

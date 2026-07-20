@@ -112,8 +112,10 @@ from cayu.runtime._recovery_coordinator import (
     RecoverySessionRunRequest,
     RecoveryTaskEventRequest,
     RecoveryTerminalEventRequest,
+    _checkpoint_without_active_incomplete_recovery_claim,
     _effective_approval_structured_output,
     _effective_user_input_structured_output,
+    _recovery_abandonment_signal,
     _run_recovery_cleanup_steps,
 )
 from cayu.runtime._run_limits import (
@@ -247,6 +249,7 @@ from cayu.runtime.retry_policy import (
     copy_retry_policy,
 )
 from cayu.runtime.sessions import (
+    _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
     CompactSessionRequest,
     EnqueueSessionMessageRequest,
     EnqueueSessionMessageResult,
@@ -272,6 +275,7 @@ from cayu.runtime.sessions import (
     SessionStore,
     _activate_session_run_fence,
     _deactivate_session_run_fence,
+    _incomplete_recovery_claim_from_checkpoint,
     copy_compact_session_request,
     copy_enqueue_session_message_request,
     copy_fork_session_request,
@@ -349,6 +353,12 @@ class _SessionCompactionReplay(Exception):
     def __init__(self, event_ids: Iterable[str]) -> None:
         self.event_ids = tuple(event_ids)
         super().__init__("Replay an existing durable session compaction outcome.")
+
+
+class _ExpiredIncompleteRecoveryClaim(Exception):
+    def __init__(self, claim_id: str) -> None:
+        self.claim_id = claim_id
+        super().__init__("Fence an expired incomplete-session recovery owner.")
 
 
 class SessionCompactionAttemptSuperseded(RuntimeError):
@@ -1860,6 +1870,13 @@ class CayuApp:
                     "Session compaction source run epoch is stale: expected "
                     f"{request.expected_run_epoch}, current {current_session.run_epoch}."
                 )
+            recovery_claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
+            if recovery_claim is not None and recovery_claim[1] <= claim_now:
+                raise _ExpiredIncompleteRecoveryClaim(recovery_claim[0])
+            checkpoint = _checkpoint_without_active_incomplete_recovery_claim(
+                checkpoint,
+                now=claim_now,
+            )
             _reject_unresumable_session_checkpoint(
                 current_session,
                 checkpoint,
@@ -1974,6 +1991,22 @@ class CayuApp:
                 expected_run_epoch=request.expected_run_epoch,
                 expected_transcript_cursor=request.expected_transcript_cursor,
             )
+        except _ExpiredIncompleteRecoveryClaim as expired_claim:
+            current = await self._require_session(loaded_session.id)
+            fenced = await self._recovery_coordinator.fence_expired_incomplete_recovery_claim(
+                session=current,
+                claim_id=expired_claim.claim_id,
+            )
+            if not fenced:
+                raise RuntimeError(
+                    "Expired incomplete-session recovery ownership changed while compaction "
+                    "was fencing it; retry with current session state."
+                ) from None
+            current = await self._require_session(loaded_session.id)
+            raise ValueError(
+                "Session compaction fenced an expired incomplete-session recovery owner; "
+                f"retry with run epoch {current.run_epoch}."
+            ) from None
         except _SessionCompactionReplay as replay:
             replay_event_ids = replay.event_ids
         if replay_event_ids is not None:
@@ -3614,6 +3647,10 @@ class CayuApp:
                 if current_checkpoint is None
                 else copy_json_value(current_checkpoint, "checkpoint")
             )
+            updated_checkpoint = _checkpoint_without_active_incomplete_recovery_claim(
+                updated_checkpoint,
+                now=self._clock(),
+            )
             if (
                 updated_checkpoint is not None
                 and _SESSION_OPERATIONS_CHECKPOINT_KEY in updated_checkpoint
@@ -3791,6 +3828,10 @@ class CayuApp:
                 current_source: Session,
                 source_checkpoint: dict[str, Any] | None,
             ) -> dict[str, Any] | None:
+                source_checkpoint = _checkpoint_without_active_incomplete_recovery_claim(
+                    source_checkpoint,
+                    now=self._clock(),
+                )
                 if (
                     source_checkpoint is not None
                     and _SESSION_OPERATIONS_CHECKPOINT_KEY in source_checkpoint
@@ -3834,6 +3875,10 @@ class CayuApp:
                 _current_source: Session,
                 source_checkpoint: dict[str, Any] | None,
             ) -> None:
+                source_checkpoint = _checkpoint_without_active_incomplete_recovery_claim(
+                    source_checkpoint,
+                    now=self._clock(),
+                )
                 if (
                     source_checkpoint is not None
                     and _SESSION_OPERATIONS_CHECKPOINT_KEY in source_checkpoint
@@ -4015,6 +4060,16 @@ class CayuApp:
                     lambda: self._recovery_coordinator.finalize_abandoned_session_by_id(session_id),
                 )
             )
+        if authoritative_failure is not None:
+            cleanup_steps.append(
+                (
+                    "environment setup abort",
+                    lambda: self._environment_lifecycle.abort_environment_setup(
+                        session_id=session_id,
+                        original_error=authoritative_failure,
+                    ),
+                )
+            )
         if release_run_fence:
             cleanup_steps.append(
                 ("run fence release", lambda: self.session_store.release_run_fence(session_id))
@@ -4029,7 +4084,12 @@ class CayuApp:
             # context. Clear the caller's task-local epoch as the handoff ends too.
             _deactivate_session_run_fence(session_id)
 
-    async def _transition_recovery_session_to_running(self, session_id: str) -> Session:
+    async def _transition_recovery_session_to_running(
+        self,
+        session_id: str,
+        *,
+        from_statuses: set[SessionStatus] | None = None,
+    ) -> Session:
         """Claim a paused session without leaving cancellation outcome-uncertain.
 
         Session stores activate run fences in task-local context after the durable
@@ -4039,11 +4099,25 @@ class CayuApp:
         arrived, the claim is finalized and released before that cancellation is
         propagated.
         """
+        expected_statuses = (
+            {SessionStatus.INTERRUPTED} if from_statuses is None else set(from_statuses)
+        )
+
+        def reject_active_incomplete_recovery(
+            _session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any] | None:
+            return _checkpoint_without_active_incomplete_recovery_claim(
+                checkpoint,
+                now=self._clock(),
+            )
+
         transition_task = asyncio.create_task(
-            self.session_store.transition_status(
+            self.session_store.transition_status_and_checkpoint(
                 session_id,
-                from_statuses={SessionStatus.INTERRUPTED},
+                from_statuses=expected_statuses,
                 to_status=SessionStatus.RUNNING,
+                checkpoint_transform=reject_active_incomplete_recovery,
             )
         )
         cancellation: asyncio.CancelledError | None = None
@@ -4080,7 +4154,7 @@ class CayuApp:
                 raise RuntimeError("Continuation recovery transition completed without a session.")
             raise transition_failure
 
-        # transition_status() activated this epoch only in the child task's copied
+        # The transition activated this epoch only in the child task's copied
         # context. The caller owns all subsequent writes and cleanup.
         _activate_session_run_fence(session)
         if cancellation is None:
@@ -4164,7 +4238,7 @@ class CayuApp:
                 yield event
         except BaseException as exc:
             authoritative_failure = exc
-            abandoned = isinstance(exc, GeneratorExit | asyncio.CancelledError)
+            abandoned = _recovery_abandonment_signal(exc) is not None
             raise
         finally:
             await self._cleanup_recovery_handoff(
@@ -4293,7 +4367,7 @@ class CayuApp:
                 yield event
         except BaseException as exc:
             authoritative_failure = exc
-            abandoned = isinstance(exc, GeneratorExit | asyncio.CancelledError)
+            abandoned = _recovery_abandonment_signal(exc) is not None
             raise
         finally:
             await self._cleanup_recovery_handoff(
@@ -4441,40 +4515,44 @@ class CayuApp:
                 task_finished=False,
             )
         try:
-            session = await self.session_store.transition_status(
+            session = await self._transition_recovery_session_to_running(
                 loaded_session.id,
                 from_statuses=_TOOL_ROUND_RECOVERABLE_SESSION_STATUSES,
-                to_status=SessionStatus.RUNNING,
             )
         except BaseException:
             if current_task is not None:
                 self._session_control.unregister_active_task(loaded_session.id, current_task)
             raise
+        recovery_stream = self._recovery_coordinator.recover_tool_round(
+            request=request,
+            loaded_session=loaded_session,
+            session=session,
+            pending_round=pending_round,
+            pending_tool_call=pending_tool_call,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            registered_environment=registered_environment,
+            effective_structured_output=effective_structured_output,
+        )
+        authoritative_failure: BaseException | None = None
         try:
-            async for event in self._recovery_coordinator.recover_tool_round(
-                request=request,
-                loaded_session=loaded_session,
-                session=session,
-                pending_round=pending_round,
-                pending_tool_call=pending_tool_call,
-                registered_agent=registered_agent,
-                registered_provider=registered_provider,
-                registered_environment=registered_environment,
-                effective_structured_output=effective_structured_output,
-            ):
+            async for event in recovery_stream:
                 yield event
+        except BaseException as exc:
+            authoritative_failure = exc
+            raise
         finally:
             try:
-                await self._environment_lifecycle.abort_environment_setup(
+                await self._cleanup_recovery_handoff(
+                    stream=recovery_stream,
                     session_id=session.id,
-                    original_error=sys.exception(),
+                    authoritative_failure=authoritative_failure,
+                    finalize_abandoned=False,
+                    release_run_fence=True,
                 )
             finally:
-                try:
-                    await self.session_store.release_run_fence(session.id)
-                finally:
-                    if current_task is not None:
-                        self._session_control.unregister_active_task(session.id, current_task)
+                if current_task is not None:
+                    self._session_control.unregister_active_task(session.id, current_task)
 
     async def _run_session(
         self,
@@ -7864,6 +7942,10 @@ def _replace_checkpoint_preserving_runtime_state(
             (_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY, "pending_session_interrupt"),
             (_PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY, "pending_interruption_cascade"),
             (_SESSION_OPERATIONS_CHECKPOINT_KEY, "session_operations"),
+            (
+                _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
+                "incomplete_session_recovery_claim",
+            ),
         ):
             updated.pop(key, None)
             if current is not None and key in current:

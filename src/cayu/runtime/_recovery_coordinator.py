@@ -17,10 +17,11 @@ import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
+from cayu._task_wait import await_shielded_task_outcome
 from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message
@@ -68,6 +69,7 @@ from cayu.runtime.hooks import RuntimeHookPhase
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.sessions import (
+    _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
     CheckpointTransform,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
@@ -77,8 +79,10 @@ from cayu.runtime.sessions import (
     SessionOrder,
     SessionQuery,
     SessionStatus,
+    SessionStatusConflict,
     SessionStore,
-    _current_session_run_epoch,
+    _deactivate_session_run_fence,
+    _incomplete_recovery_claim_from_checkpoint,
 )
 from cayu.runtime.stop_policy import RunLimits, StopDecision, copy_run_limits, has_run_limits
 from cayu.runtime.structured_output import (
@@ -103,6 +107,9 @@ _INTERRUPTION_TYPE_USER_INPUT_REQUIRED = "user_input_required"
 _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED = "runtime_interrupted"
 _DEFAULT_APPROVAL_MAX_STEPS = 16
 _ABANDONED_RUN_REASON = "event_stream_closed"
+_INCOMPLETE_RECOVERY_CLAIM_LEASE = timedelta(minutes=5)
+_INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_INTERVAL_SECONDS = 30.0
+_INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_RETRY_SECONDS = 5.0
 _RECOVERY_RESUMABLE_SESSION_STATUSES = {
     SessionStatus.COMPLETED,
     SessionStatus.FAILED,
@@ -114,6 +121,24 @@ logger = logging.getLogger(__name__)
 CheckpointTransformFactory = Callable[[dict[str, Any]], CheckpointTransform]
 EffectiveRetryPolicy = Callable[[RetryPolicy | None], RetryPolicy]
 RecoveryCleanup = Callable[[], Awaitable[None]]
+
+
+def _recovery_abandonment_signal(
+    error: BaseException | None,
+) -> GeneratorExit | asyncio.CancelledError | None:
+    """Find explicit abandonment, preferring cancellation for cleanup shielding."""
+    if isinstance(error, GeneratorExit | asyncio.CancelledError):
+        return error
+    if isinstance(error, BaseExceptionGroup):
+        generator_exit: GeneratorExit | None = None
+        for child in error.exceptions:
+            abandonment = _recovery_abandonment_signal(child)
+            if isinstance(abandonment, asyncio.CancelledError):
+                return abandonment
+            if isinstance(abandonment, GeneratorExit) and generator_exit is None:
+                generator_exit = abandonment
+        return generator_exit
+    return None
 
 
 async def _run_recovery_cleanup_steps(
@@ -140,7 +165,8 @@ async def _run_recovery_cleanup_steps(
                 cleanup_failures.append((operation, cleanup_failure))
         return cleanup_failures
 
-    if isinstance(authoritative_failure, asyncio.CancelledError):
+    abandonment = _recovery_abandonment_signal(authoritative_failure)
+    if isinstance(abandonment, asyncio.CancelledError):
         cleanup_task = asyncio.create_task(run_steps())
         while not cleanup_task.done():
             try:
@@ -258,6 +284,25 @@ class RecoveryAbandonedSessionRequest:
     run_started_at: float | None = None
     turn_usage_tracker: SessionUsageTracker | None = None
     active_run: ActiveSessionRun[SessionUsageTracker] | None = None
+
+
+@dataclass(frozen=True)
+class _IncompleteRecoveryClaim:
+    claim_id: str
+    claim_expires_at: datetime
+    session_before_fence: Session
+    session: Session
+
+
+class _IncompleteRecoveryClaimLost(RuntimeError):
+    """The durable incomplete-session recovery lease is no longer owned."""
+
+
+@dataclass(frozen=True)
+class _ManualRecoveryPersistenceReconciliation:
+    persisted: bool | None
+    error: Exception | None = None
+    cancellation: asyncio.CancelledError | None = None
 
 
 RunSession = Callable[[RecoverySessionRunRequest], AsyncGenerator[Event, None]]
@@ -1270,6 +1315,112 @@ class RecoveryCoordinator:
             ):
                 yield event
 
+    async def _interrupt_for_resumable_manual_recovery(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        payload: dict[str, Any],
+    ) -> AsyncGenerator[Event, None]:
+        """Close a durable or acknowledgement-ambiguous recovery to resumable state."""
+        try:
+            interrupted = await self._session_store.transition_status(
+                session.id,
+                from_statuses={SessionStatus.RUNNING},
+                to_status=SessionStatus.INTERRUPTED,
+            )
+        except SessionStatusConflict:
+            current = await self._require_session(session.id)
+            if current.status not in {SessionStatus.INTERRUPTING, SessionStatus.INTERRUPTED}:
+                raise
+            # An operator interruption won the status transition. Finalize its
+            # durable request so its identity, reason, and cascade are preserved.
+            async for event in self._interrupt_session_for_recovery(
+                RecoveryInterruptionRequest(
+                    session=current,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=_environment_name(registered_environment),
+                )
+            ):
+                yield event
+            return
+        async for event in self._emit_terminal_event_with_hooks(
+            RecoveryTerminalEventRequest(
+                event=Event(
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=interrupted.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=_environment_name(registered_environment),
+                    payload=payload,
+                ),
+                phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
+                session=interrupted,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
+        ):
+            yield event
+
+    async def _reconcile_manual_recovery_persistence(
+        self,
+        event: Event,
+    ) -> _ManualRecoveryPersistenceReconciliation:
+        """Classify an append failure using the preassigned durable event id."""
+        outcome = await await_shielded_task_outcome(
+            asyncio.create_task(self._event_writer.is_persisted(event))
+        )
+        if outcome.error is None:
+            return _ManualRecoveryPersistenceReconciliation(
+                persisted=bool(outcome.result),
+                cancellation=outcome.cancellation,
+            )
+        if isinstance(outcome.error, asyncio.CancelledError):
+            return _ManualRecoveryPersistenceReconciliation(
+                persisted=None,
+                cancellation=outcome.cancellation or outcome.error,
+            )
+        if not isinstance(outcome.error, Exception):
+            raise outcome.error
+        return _ManualRecoveryPersistenceReconciliation(
+            persisted=None,
+            error=outcome.error,
+            cancellation=outcome.cancellation,
+        )
+
+    async def fence_expired_incomplete_recovery_claim(
+        self,
+        *,
+        session: Session,
+        claim_id: str,
+    ) -> bool:
+        """Fence and clear one observed expired recovery owner.
+
+        The claim id makes the takeover conditional: a concurrent heartbeat or
+        claimant that changes ownership causes this operation to leave the
+        session untouched.
+        """
+        claim: _IncompleteRecoveryClaim | None = None
+        authoritative_failure: BaseException | None = None
+        try:
+            claim = await self._claim_incomplete_recovery(
+                session=session,
+                inactive_before=None,
+                required_expired_claim_id=claim_id,
+            )
+            return claim is not None
+        except BaseException as exc:
+            authoritative_failure = exc
+            raise
+        finally:
+            if claim is not None:
+                await self._cleanup_incomplete_recovery_claim(
+                    session_id=session.id,
+                    claim_id=claim.claim_id,
+                    authoritative_failure=authoritative_failure,
+                )
+
     async def recover_user_input(
         self,
         *,
@@ -1283,6 +1434,8 @@ class RecoveryCoordinator:
         registered_environment: runtime_records.RegisteredEnvironment | None,
     ) -> AsyncGenerator[Event, None]:
         recovery_prepared = False
+        recovery_persisted = False
+        recovery_event_to_reconcile: Event | None = None
         authoritative_failure: BaseException | None = None
         abandoned = False
         try:
@@ -1374,6 +1527,7 @@ class RecoveryCoordinator:
                 result=recovered_result,
                 redactor=self._secret_redactor,
             )
+            recovery_event_to_reconcile = recovery_tool_event
             recovery_events = [
                 Event(
                     type=EventType.SESSION_RESUMED,
@@ -1389,9 +1543,11 @@ class RecoveryCoordinator:
                 ),
                 recovery_tool_event,
             ]
-            emitted_recovery_events = await self._event_writer.emit_many(
+            emitted_recovery_events = await self._event_writer.persist_many(
                 session.id, recovery_events
             )
+            recovery_persisted = True
+            await self._event_writer.fan_out_persisted(emitted_recovery_events)
             for event in emitted_recovery_events:
                 yield event
             tool_call = runtime_records.ToolCallRequest(
@@ -1421,7 +1577,66 @@ class RecoveryCoordinator:
             raise
         except Exception as exc:
             authoritative_failure = exc
+            reconciliation_error: Exception | None = None
+            if not recovery_persisted and recovery_event_to_reconcile is not None:
+                try:
+                    reconciliation = await self._reconcile_manual_recovery_persistence(
+                        recovery_event_to_reconcile
+                    )
+                except BaseException as reconciliation_failure:
+                    authoritative_failure = reconciliation_failure
+                    abandoned = _recovery_abandonment_signal(reconciliation_failure) is not None
+                    raise
+                if reconciliation.cancellation is not None:
+                    reconciliation.cancellation.add_note(
+                        "Manual user-input recovery append failed while persistence "
+                        "reconciliation was running."
+                    )
+                    authoritative_failure = reconciliation.cancellation
+                    abandoned = True
+                    raise reconciliation.cancellation from exc
+                recovery_persisted = reconciliation.persisted is True
+                reconciliation_error = reconciliation.error
+            if recovery_persisted or reconciliation_error is not None:
+                persistence_payload = (
+                    {"manual_recovery_persisted": True}
+                    if recovery_persisted
+                    else {
+                        "manual_recovery_persistence_unknown": True,
+                        "persistence_reconciliation_error_type": type(
+                            reconciliation_error
+                        ).__name__,
+                    }
+                )
+                try:
+                    async for event in self._interrupt_for_resumable_manual_recovery(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        payload={
+                            "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
+                            "user_input": pending.model_dump(mode="json"),
+                            "input_id": pending.input_id,
+                            "tool_call_id": pending_tool_call.tool_call_id,
+                            **persistence_payload,
+                            "error": str(exc),
+                            "error_type": type(exc).__name__,
+                        },
+                    ):
+                        yield event
+                except BaseException as interruption_failure:
+                    authoritative_failure = interruption_failure
+                    abandoned = _recovery_abandonment_signal(interruption_failure) is not None
+                    raise
+                # The original failure is now represented by durable interrupted
+                # state. It must not suppress a later fence-release failure.
+                authoritative_failure = None
+                return
             await self._session_store.update_status(session.id, loaded_session.status)
+            raise
+        except BaseExceptionGroup as exc:
+            authoritative_failure = exc
+            abandoned = _recovery_abandonment_signal(exc) is not None
             raise
         finally:
             if not recovery_prepared:
@@ -1466,7 +1681,7 @@ class RecoveryCoordinator:
                 yield event
         except BaseException as exc:
             authoritative_failure = exc
-            abandoned = isinstance(exc, GeneratorExit | asyncio.CancelledError)
+            abandoned = _recovery_abandonment_signal(exc) is not None
             raise
         finally:
             await self._cleanup_recovery_handoff(
@@ -1490,6 +1705,8 @@ class RecoveryCoordinator:
         registered_environment: runtime_records.RegisteredEnvironment | None,
     ) -> AsyncGenerator[Event, None]:
         recovery_prepared = False
+        recovery_persisted = False
+        recovery_event_to_reconcile: Event | None = None
         authoritative_failure: BaseException | None = None
         abandoned = False
         try:
@@ -1586,6 +1803,7 @@ class RecoveryCoordinator:
                 result=recovered_result,
                 redactor=self._secret_redactor,
             )
+            recovery_event_to_reconcile = recovery_tool_event
             recovery_events = [
                 approval_support.resumed_event(
                     session=session,
@@ -1598,9 +1816,11 @@ class RecoveryCoordinator:
                 ),
                 recovery_tool_event,
             ]
-            emitted_recovery_events = await self._event_writer.emit_many(
+            emitted_recovery_events = await self._event_writer.persist_many(
                 session.id, recovery_events
             )
+            recovery_persisted = True
+            await self._event_writer.fan_out_persisted(emitted_recovery_events)
             for event in emitted_recovery_events:
                 yield event
             tool_call = runtime_records.ToolCallRequest(
@@ -1630,7 +1850,66 @@ class RecoveryCoordinator:
             raise
         except Exception as exc:
             authoritative_failure = exc
+            reconciliation_error: Exception | None = None
+            if not recovery_persisted and recovery_event_to_reconcile is not None:
+                try:
+                    reconciliation = await self._reconcile_manual_recovery_persistence(
+                        recovery_event_to_reconcile
+                    )
+                except BaseException as reconciliation_failure:
+                    authoritative_failure = reconciliation_failure
+                    abandoned = _recovery_abandonment_signal(reconciliation_failure) is not None
+                    raise
+                if reconciliation.cancellation is not None:
+                    reconciliation.cancellation.add_note(
+                        "Manual tool-approval recovery append failed while persistence "
+                        "reconciliation was running."
+                    )
+                    authoritative_failure = reconciliation.cancellation
+                    abandoned = True
+                    raise reconciliation.cancellation from exc
+                recovery_persisted = reconciliation.persisted is True
+                reconciliation_error = reconciliation.error
+            if recovery_persisted or reconciliation_error is not None:
+                persistence_payload = (
+                    {"manual_recovery_persisted": True}
+                    if recovery_persisted
+                    else {
+                        "manual_recovery_persistence_unknown": True,
+                        "persistence_reconciliation_error_type": type(
+                            reconciliation_error
+                        ).__name__,
+                    }
+                )
+                try:
+                    async for event in self._interrupt_for_resumable_manual_recovery(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        payload={
+                            "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
+                            "approval": pending_approval.model_dump(mode="json"),
+                            "approval_id": pending_approval.approval_id,
+                            "tool_call_id": pending_tool_call.tool_call_id,
+                            **persistence_payload,
+                            "error": str(exc),
+                            "error_type": type(exc).__name__,
+                        },
+                    ):
+                        yield event
+                except BaseException as interruption_failure:
+                    authoritative_failure = interruption_failure
+                    abandoned = _recovery_abandonment_signal(interruption_failure) is not None
+                    raise
+                # The original failure is now represented by durable interrupted
+                # state. It must not suppress a later fence-release failure.
+                authoritative_failure = None
+                return
             await self._session_store.update_status(session.id, loaded_session.status)
+            raise
+        except BaseExceptionGroup as exc:
+            authoritative_failure = exc
+            abandoned = _recovery_abandonment_signal(exc) is not None
             raise
         finally:
             if not recovery_prepared:
@@ -1675,7 +1954,7 @@ class RecoveryCoordinator:
                 yield event
         except BaseException as exc:
             authoritative_failure = exc
-            abandoned = isinstance(exc, GeneratorExit | asyncio.CancelledError)
+            abandoned = _recovery_abandonment_signal(exc) is not None
             raise
         finally:
             await self._cleanup_recovery_handoff(
@@ -1713,6 +1992,7 @@ class RecoveryCoordinator:
         )
         environment_name = _environment_name(registered_environment)
         recovery_persisted = False
+        recovery_event_to_reconcile: Event | None = None
 
         try:
             events = await self._session_store.load_events(session.id)
@@ -1791,6 +2071,7 @@ class RecoveryCoordinator:
                 result=recovered_result,
                 redactor=self._secret_redactor,
             )
+            recovery_event_to_reconcile = recovery_tool_event
             recovery_events = [
                 Event(
                     type=EventType.SESSION_RESUMED,
@@ -1806,10 +2087,11 @@ class RecoveryCoordinator:
                 ),
                 recovery_tool_event,
             ]
-            emitted_recovery_events = await self._event_writer.emit_many(
+            emitted_recovery_events = await self._event_writer.persist_many(
                 session.id, recovery_events
             )
             recovery_persisted = True
+            await self._event_writer.fan_out_persisted(emitted_recovery_events)
             for event in emitted_recovery_events:
                 yield event
             tool_call = runtime_records.ToolCallRequest(
@@ -1869,39 +2151,95 @@ class RecoveryCoordinator:
                 ):
                     yield event
                 return
-        except GeneratorExit:
-            await self.finalize_abandoned_session_by_id(session.id)
+        except (GeneratorExit, asyncio.CancelledError) as abandonment:
+            await _run_recovery_cleanup_steps(
+                authoritative_failure=abandonment,
+                steps=(
+                    (
+                        "abandoned session finalization",
+                        lambda: self.finalize_abandoned_session_by_id(session.id),
+                    ),
+                ),
+            )
             raise
         except Exception as exc:
-            if not recovery_persisted:
+            reconciliation_error: Exception | None = None
+            if not recovery_persisted and recovery_event_to_reconcile is not None:
+                try:
+                    reconciliation = await self._reconcile_manual_recovery_persistence(
+                        recovery_event_to_reconcile
+                    )
+                except BaseException as reconciliation_failure:
+                    if _recovery_abandonment_signal(reconciliation_failure) is not None:
+                        await _run_recovery_cleanup_steps(
+                            authoritative_failure=reconciliation_failure,
+                            steps=(
+                                (
+                                    "abandoned session finalization",
+                                    lambda: self.finalize_abandoned_session_by_id(session.id),
+                                ),
+                            ),
+                        )
+                    raise
+                if reconciliation.cancellation is not None:
+                    reconciliation.cancellation.add_note(
+                        "Manual tool-round recovery append failed while persistence "
+                        "reconciliation was running."
+                    )
+                    await _run_recovery_cleanup_steps(
+                        authoritative_failure=reconciliation.cancellation,
+                        steps=(
+                            (
+                                "abandoned session finalization",
+                                lambda: self.finalize_abandoned_session_by_id(session.id),
+                            ),
+                        ),
+                    )
+                    raise reconciliation.cancellation from exc
+                recovery_persisted = reconciliation.persisted is True
+                reconciliation_error = reconciliation.error
+            if not recovery_persisted and reconciliation_error is None:
                 await self._session_store.update_status(session.id, loaded_session.status)
                 raise
-            session = await self._session_store.update_status(session.id, SessionStatus.INTERRUPTED)
-            async for event in self._emit_terminal_event_with_hooks(
-                RecoveryTerminalEventRequest(
-                    event=Event(
-                        type=EventType.SESSION_INTERRUPTED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        payload={
-                            "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
-                            "tool_round_id": pending_round.round_id,
-                            "tool_call_id": pending_tool_call.tool_call_id,
-                            "error": str(exc),
-                            "error_type": type(exc).__name__,
-                            "resolved_by": resolution_actor_payload(request.resolved_by),
-                        },
-                    ),
-                    phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                )
+            persistence_payload = (
+                {"manual_recovery_persisted": True}
+                if recovery_persisted
+                else {
+                    "manual_recovery_persistence_unknown": True,
+                    "persistence_reconciliation_error_type": type(reconciliation_error).__name__,
+                }
+            )
+            async for event in self._interrupt_for_resumable_manual_recovery(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                payload={
+                    "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                    "tool_round_id": pending_round.round_id,
+                    "tool_call_id": pending_tool_call.tool_call_id,
+                    **persistence_payload,
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                    "resolved_by": resolution_actor_payload(request.resolved_by),
+                },
             ):
                 yield event
             return
+        except BaseExceptionGroup as exc:
+            if _recovery_abandonment_signal(exc) is not None:
+                await _run_recovery_cleanup_steps(
+                    authoritative_failure=exc,
+                    steps=(
+                        (
+                            "abandoned session finalization",
+                            lambda: self.finalize_abandoned_session_by_id(session.id),
+                        ),
+                    ),
+                )
+            raise
 
+        session_stream: AsyncGenerator[Event, None] | None = None
+        authoritative_failure: BaseException | None = None
         try:
             transcript = await self._session_store.load_transcript(session.id)
             session_stream = self._run_session(
@@ -1928,15 +2266,21 @@ class RecoveryCoordinator:
                     release_run_fence_on_exit=False,
                 )
             )
-            try:
-                async for event in session_stream:
-                    yield event
-            except GeneratorExit:
-                await session_stream.aclose()
-                raise
-        except GeneratorExit:
-            await self.finalize_abandoned_session_by_id(session.id)
+            async for event in session_stream:
+                yield event
+        except BaseException as exc:
+            authoritative_failure = exc
             raise
+        finally:
+            await self._cleanup_recovery_handoff(
+                stream=session_stream,
+                session_id=session.id,
+                authoritative_failure=authoritative_failure,
+                finalize_abandoned=(
+                    _recovery_abandonment_signal(authoritative_failure) is not None
+                ),
+                release_run_fence=False,
+            )
 
     async def close_interrupted_tool_round(
         self,
@@ -2244,18 +2588,13 @@ class RecoveryCoordinator:
         try:
             registered_agent = self._resolve_registered_agent(session.agent_name)
         except Exception:
-            with contextlib.suppress(KeyError, ValueError):
-                await self._session_store.transition_status(
-                    session.id,
-                    from_statuses={
-                        SessionStatus.PENDING,
-                        SessionStatus.RUNNING,
-                        SessionStatus.INTERRUPTING,
-                    },
-                    to_status=SessionStatus.INTERRUPTED,
-                )
+            await self._finalize_abandoned_without_registered_runtime(session.id)
             return
-        registered_environment = self._resolve_registered_environment(session.environment_name)
+        try:
+            registered_environment = self._resolve_registered_environment(session.environment_name)
+        except Exception:
+            await self._finalize_abandoned_without_registered_runtime(session.id)
+            return
         with contextlib.suppress(BaseException):
             await self.finalize_abandoned_session_run(
                 RecoveryAbandonedSessionRequest(
@@ -2263,6 +2602,34 @@ class RecoveryCoordinator:
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
                     environment_name=_environment_name(registered_environment),
+                )
+            )
+
+    async def _finalize_abandoned_without_registered_runtime(self, session_id: str) -> None:
+        try:
+            finalized = await self._session_store.transition_status(
+                session_id,
+                from_statuses={
+                    SessionStatus.PENDING,
+                    SessionStatus.RUNNING,
+                    SessionStatus.INTERRUPTING,
+                },
+                to_status=SessionStatus.INTERRUPTED,
+            )
+        except Exception:
+            return
+        with contextlib.suppress(Exception):
+            await self._event_writer.emit(
+                Event(
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=finalized.id,
+                    agent_name=finalized.agent_name,
+                    environment_name=finalized.environment_name,
+                    payload={
+                        "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                        "reason": _ABANDONED_RUN_REASON,
+                        "abandoned": True,
+                    },
                 )
             )
 
@@ -2357,36 +2724,9 @@ class RecoveryCoordinator:
         reason: str,
         metadata: dict[str, Any],
     ) -> IncompleteSessionRecoveryResult:
-        owned_epoch_before = _current_session_run_epoch(session.id)
-        try:
-            return await self._recover_incomplete_session(
-                session=session,
-                inactive_before=inactive_before,
-                reason=reason,
-                metadata=metadata,
-            )
-        finally:
-            owned_epoch_after = _current_session_run_epoch(session.id)
-            if (
-                inactive_before is not None
-                and owned_epoch_after is not None
-                and owned_epoch_after != owned_epoch_before
-            ):
-                await self._session_store.release_run_fence(session.id)
-
-    async def _recover_incomplete_session(
-        self,
-        *,
-        session: Session,
-        inactive_before: datetime | None,
-        reason: str,
-        metadata: dict[str, Any],
-    ) -> IncompleteSessionRecoveryResult:
         reason = require_clean_nonblank(reason, "reason")
         metadata = copy_json_value(metadata, "metadata")
         previous_status = session.status
-        actions: list[IncompleteSessionRecoveryAction] = []
-        events: list[Event] = []
 
         if self._session_control.has_active_tasks(session.id):
             return IncompleteSessionRecoveryResult(
@@ -2397,6 +2737,24 @@ class RecoveryCoordinator:
                 events=(),
                 message="Session has active work in this CayuApp process; recovery skipped.",
             )
+
+        return await self._recover_incomplete_session_owned(
+            session=session,
+            inactive_before=inactive_before,
+            reason=reason,
+            metadata=metadata,
+            previous_status=previous_status,
+        )
+
+    async def _recover_incomplete_session_owned(
+        self,
+        *,
+        session: Session,
+        inactive_before: datetime | None,
+        reason: str,
+        metadata: dict[str, Any],
+        previous_status: SessionStatus,
+    ) -> IncompleteSessionRecoveryResult:
 
         checkpoint = await self._session_store.load_checkpoint(session.id)
         pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
@@ -2429,15 +2787,15 @@ class RecoveryCoordinator:
                 message=(f"Agent not registered: {session.agent_name!r}; session left untouched."),
             )
         registered_environment = self._resolve_registered_environment(session.environment_name)
-        environment_name = _environment_name(registered_environment)
 
-        if inactive_before is not None:
-            fenced = await self._session_store.fence_stalled_run(
-                session.id,
-                statuses={session.status},
+        claim: _IncompleteRecoveryClaim | None = None
+        authoritative_failure: BaseException | None = None
+        try:
+            claim = await self._claim_incomplete_recovery(
+                session=session,
                 inactive_before=inactive_before,
             )
-            if fenced is None:
+            if claim is None:
                 current = await self._require_session(session.id)
                 return IncompleteSessionRecoveryResult(
                     session_id=session.id,
@@ -2445,8 +2803,337 @@ class RecoveryCoordinator:
                     status=current.status,
                     actions=(IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,),
                     events=(),
-                    message="Session activity changed during recovery; recovery skipped.",
+                    message="Session activity or recovery ownership changed; recovery skipped.",
                 )
+            return await self._recover_incomplete_session_with_heartbeat(
+                claim=claim,
+                recovery=lambda: self._recover_incomplete_session(
+                    session=claim.session,
+                    session_before_fence=claim.session_before_fence,
+                    previous_status=previous_status,
+                    inactive_before=inactive_before,
+                    reason=reason,
+                    metadata=metadata,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                ),
+            )
+        except BaseException as exc:
+            authoritative_failure = exc
+            raise
+        finally:
+            if claim is not None:
+                await self._cleanup_incomplete_recovery_claim(
+                    session_id=session.id,
+                    claim_id=claim.claim_id,
+                    authoritative_failure=authoritative_failure,
+                )
+
+    async def _cleanup_incomplete_recovery_claim(
+        self,
+        *,
+        session_id: str,
+        claim_id: str,
+        authoritative_failure: BaseException | None,
+    ) -> None:
+        try:
+            await _run_recovery_cleanup_steps(
+                authoritative_failure=authoritative_failure,
+                steps=(
+                    (
+                        "run fence release",
+                        lambda: self._session_store.release_run_fence(session_id),
+                    ),
+                    (
+                        "incomplete recovery claim release",
+                        lambda: self._release_incomplete_recovery_claim(
+                            session_id,
+                            claim_id,
+                        ),
+                    ),
+                ),
+            )
+        finally:
+            _deactivate_session_run_fence(session_id)
+
+    async def _claim_incomplete_recovery(
+        self,
+        *,
+        session: Session,
+        inactive_before: datetime | None,
+        required_expired_claim_id: str | None = None,
+    ) -> _IncompleteRecoveryClaim | None:
+        if required_expired_claim_id is not None:
+            required_expired_claim_id = require_clean_nonblank(
+                required_expired_claim_id,
+                "required_expired_claim_id",
+            )
+        claim_id = str(uuid4())
+        claim_expires_at: datetime | None = None
+
+        def claim_checkpoint(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any] | None:
+            nonlocal claim_expires_at
+            if current_session.status != session.status:
+                return None
+            if inactive_before is not None and current_session.last_activity_at > inactive_before:
+                return None
+            claimed_at = self._clock()
+            _require_aware_datetime(claimed_at, "recovery claim clock")
+            existing = _incomplete_recovery_claim_from_checkpoint(checkpoint)
+            if required_expired_claim_id is None:
+                if existing is not None and existing[1] > claimed_at:
+                    return None
+            elif (
+                existing is None
+                or existing[0] != required_expired_claim_id
+                or existing[1] > claimed_at
+            ):
+                return None
+            claim_expires_at = claimed_at + _INCOMPLETE_RECOVERY_CLAIM_LEASE
+            updated = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+            updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY] = {
+                "version": 1,
+                "claim_id": claim_id,
+                "claimed_at": claimed_at.isoformat(),
+                "claim_expires_at": claim_expires_at.isoformat(),
+            }
+            return updated
+
+        fence_claimed = False
+        try:
+            await self._session_store.transform_checkpoint(session.id, claim_checkpoint)
+            if claim_expires_at is None:
+                return None
+            checkpoint = await self._session_store.load_checkpoint(session.id)
+            persisted_claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
+            if persisted_claim is None or persisted_claim[0] != claim_id:
+                return None
+
+            session_before_fence = await self._require_session(session.id)
+            fenced = await self._session_store.fence_stalled_run(
+                session.id,
+                statuses={session_before_fence.status},
+                inactive_before=session_before_fence.last_activity_at,
+            )
+            if fenced is None:
+                await self._release_incomplete_recovery_claim(session.id, claim_id)
+                return None
+            fence_claimed = True
+            checkpoint = await self._session_store.load_checkpoint(session.id)
+            persisted_claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
+            if persisted_claim is None or persisted_claim[0] != claim_id:
+                await self._session_store.release_run_fence(session.id)
+                return None
+            renewed_until = await self._renew_incomplete_recovery_claim(
+                session.id,
+                claim_id,
+            )
+            if renewed_until is None:
+                await self._session_store.release_run_fence(session.id)
+                return None
+            return _IncompleteRecoveryClaim(
+                claim_id=claim_id,
+                claim_expires_at=renewed_until,
+                session_before_fence=session_before_fence,
+                session=fenced,
+            )
+        except BaseException as exc:
+            cleanup_steps: list[tuple[str, RecoveryCleanup]] = []
+            if fence_claimed:
+                cleanup_steps.append(
+                    (
+                        "run fence release",
+                        lambda: self._session_store.release_run_fence(session.id),
+                    )
+                )
+            cleanup_steps.append(
+                (
+                    "incomplete recovery claim release",
+                    lambda: self._release_incomplete_recovery_claim(session.id, claim_id),
+                )
+            )
+            try:
+                await _run_recovery_cleanup_steps(
+                    authoritative_failure=exc,
+                    steps=tuple(cleanup_steps),
+                )
+            finally:
+                if fence_claimed:
+                    _deactivate_session_run_fence(session.id)
+            raise
+
+    async def _recover_incomplete_session_with_heartbeat(
+        self,
+        *,
+        claim: _IncompleteRecoveryClaim,
+        recovery: Callable[[], Awaitable[IncompleteSessionRecoveryResult]],
+    ) -> IncompleteSessionRecoveryResult:
+        stop_heartbeat = asyncio.Event()
+
+        async def run_recovery() -> IncompleteSessionRecoveryResult:
+            return await recovery()
+
+        recovery_task = asyncio.create_task(run_recovery())
+        heartbeat_task = asyncio.create_task(
+            self._heartbeat_incomplete_recovery_claim(
+                session_id=claim.session.id,
+                claim_id=claim.claim_id,
+                claim_expires_at=claim.claim_expires_at,
+                stop=stop_heartbeat,
+            )
+        )
+        authoritative_failure: BaseException | None = None
+
+        async def stop_workers() -> None:
+            stop_heartbeat.set()
+            for task in (recovery_task, heartbeat_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(recovery_task, heartbeat_task, return_exceptions=True)
+
+        try:
+            done, _pending = await asyncio.wait(
+                {recovery_task, heartbeat_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if heartbeat_task in done:
+                heartbeat_failure = heartbeat_task.exception()
+                if heartbeat_failure is None:
+                    raise RuntimeError(
+                        "Incomplete-session recovery claim heartbeat stopped unexpectedly."
+                    )
+                raise heartbeat_failure
+            result = recovery_task.result()
+            stop_heartbeat.set()
+            await heartbeat_task
+            return result
+        except BaseException as exc:
+            authoritative_failure = exc
+            raise
+        finally:
+            await _run_recovery_cleanup_steps(
+                authoritative_failure=authoritative_failure,
+                steps=(("incomplete recovery worker shutdown", stop_workers),),
+            )
+
+    async def _heartbeat_incomplete_recovery_claim(
+        self,
+        *,
+        session_id: str,
+        claim_id: str,
+        claim_expires_at: datetime,
+        stop: asyncio.Event,
+    ) -> None:
+        sleep_seconds = _INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_INTERVAL_SECONDS
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(
+                    stop.wait(),
+                    timeout=sleep_seconds,
+                )
+            except TimeoutError:
+                try:
+                    renewed_until = await self._renew_incomplete_recovery_claim(
+                        session_id,
+                        claim_id,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    now = self._clock()
+                    _require_aware_datetime(now, "recovery claim clock")
+                    if now >= claim_expires_at:
+                        raise _IncompleteRecoveryClaimLost(
+                            "Incomplete-session recovery claim could not be renewed before "
+                            f"expiry for session {session_id}."
+                        ) from exc
+                    sleep_seconds = min(
+                        _INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_RETRY_SECONDS,
+                        max(0.0, (claim_expires_at - now).total_seconds()),
+                    )
+                    continue
+                if renewed_until is None:
+                    raise _IncompleteRecoveryClaimLost(
+                        f"Incomplete-session recovery claim lost for session {session_id}."
+                    ) from None
+                claim_expires_at = renewed_until
+                sleep_seconds = _INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_INTERVAL_SECONDS
+
+    async def _renew_incomplete_recovery_claim(
+        self,
+        session_id: str,
+        claim_id: str,
+    ) -> datetime | None:
+        renewed_until: datetime | None = None
+
+        def renew_claim(
+            _session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any] | None:
+            nonlocal renewed_until
+            existing = _incomplete_recovery_claim_from_checkpoint(checkpoint)
+            now = self._clock()
+            _require_aware_datetime(now, "recovery claim clock")
+            if existing is None or existing[0] != claim_id or existing[1] <= now:
+                return None
+            updated = copy_json_value(checkpoint, "checkpoint")
+            marker = copy_json_value(
+                updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY],
+                "incomplete_session_recovery_claim",
+            )
+            renewed_until = now + _INCOMPLETE_RECOVERY_CLAIM_LEASE
+            marker["claim_expires_at"] = renewed_until.isoformat()
+            marker["renewed_at"] = now.isoformat()
+            updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY] = marker
+            return updated
+
+        await self._session_store.transform_checkpoint(session_id, renew_claim)
+        return renewed_until
+
+    async def _release_incomplete_recovery_claim(
+        self,
+        session_id: str,
+        claim_id: str,
+    ) -> None:
+        def release_claim(
+            _session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any] | None:
+            if checkpoint is None:
+                return None
+            existing = _incomplete_recovery_claim_from_checkpoint(checkpoint)
+            if existing is None or existing[0] != claim_id:
+                return None
+            updated = copy_json_value(checkpoint, "checkpoint")
+            updated.pop(_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY, None)
+            return updated
+
+        await self._session_store.transform_checkpoint(session_id, release_claim)
+
+    async def _recover_incomplete_session(
+        self,
+        *,
+        session: Session,
+        session_before_fence: Session,
+        previous_status: SessionStatus,
+        inactive_before: datetime | None,
+        reason: str,
+        metadata: dict[str, Any],
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+    ) -> IncompleteSessionRecoveryResult:
+        actions: list[IncompleteSessionRecoveryAction] = []
+        events: list[Event] = []
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
+        pending_user_input = pending_user_input_from_checkpoint(checkpoint)
+        pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        environment_name = _environment_name(registered_environment)
+
+        if inactive_before is not None:
             events.append(
                 await self._event_writer.emit(
                     Event(
@@ -2455,8 +3142,8 @@ class RecoveryCoordinator:
                         agent_name=session.agent_name,
                         environment_name=environment_name,
                         payload={
-                            "previous_run_epoch": session.run_epoch,
-                            "run_epoch": fenced.run_epoch,
+                            "previous_run_epoch": session_before_fence.run_epoch,
+                            "run_epoch": session.run_epoch,
                             "inactive_before": inactive_before.isoformat(),
                             "reason": reason,
                             "metadata": metadata,
@@ -2464,7 +3151,6 @@ class RecoveryCoordinator:
                     )
                 )
             )
-            session = fenced
 
         if session.status in {SessionStatus.PENDING, SessionStatus.RUNNING}:
             if pending_approval is not None:
@@ -2682,6 +3368,31 @@ class RecoveryCoordinator:
             tool_round_id=tool_round_id,
             child=child,
         )
+
+
+def _checkpoint_without_active_incomplete_recovery_claim(
+    checkpoint: dict[str, Any] | None,
+    *,
+    now: datetime,
+) -> dict[str, Any] | None:
+    """Reject live recovery ownership and remove an expired internal marker."""
+    _require_aware_datetime(now, "now")
+    if checkpoint is None:
+        return None
+    updated = copy_json_value(checkpoint, "checkpoint")
+    existing = _incomplete_recovery_claim_from_checkpoint(updated)
+    if existing is None:
+        return updated
+    if existing[1] > now:
+        raise RuntimeError("Session has an active incomplete-session recovery operation.")
+    updated.pop(_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY, None)
+    return updated
+
+
+def _require_aware_datetime(value: datetime, field_name: str) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{field_name} must be timezone-aware.")
+    return value
 
 
 def _interrupted_tool_round_results(

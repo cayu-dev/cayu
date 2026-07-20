@@ -74,6 +74,18 @@ class RuntimeEventWriter:
         This matters for store-atomic publications that include cost-bearing
         events, such as explicit compaction recovery.
         """
+        copied_events = await self.persist_many(session_id, events)
+        await self.fan_out_persisted(copied_events)
+        return copied_events
+
+    async def persist_many(self, session_id: str, events: list[Event]) -> list[Event]:
+        """Persist a defensive event batch without delivering its side effects.
+
+        Callers that must distinguish a failed durable append from failed
+        post-commit delivery can persist first and then call
+        :meth:`fan_out_persisted`. The store-owned side-effect handoff keeps a
+        committed batch recoverable if fan-out is interrupted or fails.
+        """
         if type(events) is not list:
             raise TypeError("Runtime events must be a list.")
         copied_events: list[Event] = []
@@ -85,7 +97,6 @@ class RuntimeEventWriter:
             copied_events.append(event.model_copy(deep=True))
 
         await self._session_store.append_events(session_id, copied_events)
-        await self.fan_out_persisted(copied_events)
         return copied_events
 
     async def fan_out_persisted(self, events: list[Event]) -> list[Event]:

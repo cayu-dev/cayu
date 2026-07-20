@@ -251,6 +251,43 @@ def test_abandoned_session_contains_cancellation_group_from_terminal_cleanup() -
     asyncio.run(scenario())
 
 
+def test_finalize_abandoned_session_does_not_require_registered_environment() -> None:
+    h = _build([_batch("x")])
+
+    async def scenario() -> None:
+        await h.store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_missing_environment",
+                environment_name="retired-environment",
+                messages=[Message.text("user", "hi")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await h.store.transition_status(
+            "sess_missing_environment",
+            from_statuses={SessionStatus.PENDING},
+            to_status=SessionStatus.RUNNING,
+        )
+
+        try:
+            await h.app._recovery_coordinator.finalize_abandoned_session_by_id(
+                "sess_missing_environment"
+            )
+            session = await h.store.load("sess_missing_environment")
+            assert session is not None
+            assert session.status == SessionStatus.INTERRUPTED
+            terminal = _abandoned_terminal_event(
+                await h.store.load_events("sess_missing_environment")
+            )
+            assert terminal.payload["reason"] == "event_stream_closed"
+            assert terminal.environment_name == "retired-environment"
+        finally:
+            await h.store.release_run_fence("sess_missing_environment")
+
+    asyncio.run(scenario())
+
+
 def test_completed_run_stream_close_is_a_no_op() -> None:
     # Closing an already-finished stream must not rewrite the terminal status.
     h = _build([_batch("first answer")])

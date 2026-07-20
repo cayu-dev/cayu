@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
 
 from cayu.core.thinking import ThinkingConfig
@@ -12,6 +13,7 @@ from cayu.runtime._recovery_coordinator import (
     _effective_approval_run_limits,
     _effective_approval_thinking,
     _interrupted_tool_round_results,
+    _recovery_abandonment_signal,
 )
 from cayu.runtime.approvals import PendingToolApproval, PendingToolCallApproval
 from cayu.runtime.budgets import BudgetLimit
@@ -140,3 +142,20 @@ def test_interrupted_tool_round_results_attaches_artifacts_by_tool_call_id() -> 
     by_id = {outcome.call.id: outcome for outcome in fallback}
     assert by_id["A"].result.artifacts == [{"producer": "unknown"}]
     assert by_id["B"].result.artifacts == []
+
+
+def test_recovery_abandonment_signal_finds_nested_grouped_cancellation() -> None:
+    cancellation = asyncio.CancelledError("cancel recovery")
+    grouped = BaseExceptionGroup(
+        "recovery failed during cancellation",
+        [
+            GeneratorExit(),
+            RuntimeError("cleanup failed"),
+            BaseExceptionGroup("nested", [cancellation]),
+        ],
+    )
+
+    assert _recovery_abandonment_signal(grouped) is cancellation
+    assert (
+        _recovery_abandonment_signal(ExceptionGroup("ordinary", [RuntimeError("failed")])) is None
+    )

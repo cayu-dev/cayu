@@ -40,6 +40,7 @@ from cayu.runtime import (
     RunLimits,
     RunRequest,
     SessionIdentity,
+    SessionRunFenced,
     SessionStatus,
 )
 from cayu.runtime.context import ContextBuildError
@@ -483,6 +484,115 @@ def test_compact_session_preserves_transcript_and_replays_original_outcome() -> 
             assert "instructions" not in event.payload
             assert event.payload["operation_id"]
             assert event.payload["reason"] == "application_requested"
+
+    asyncio.run(run())
+
+
+def test_compact_session_fences_expired_recovery_owner_before_retry() -> None:
+    async def run() -> None:
+        now = datetime(2026, 7, 18, tzinfo=UTC)
+        session_id = "sess_compact_expired_recovery_owner"
+        store = InMemorySessionStore()
+        compactor = RecordingCompactor()
+        app = CayuApp(session_store=store, enable_logging=False, clock=lambda: now)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=compactor,
+                max_user_turns=1,
+                compact_after_messages=100,
+            ),
+        )
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "create only")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        transcript = [
+            Message.text("user", "old request"),
+            Message.text("assistant", "old answer"),
+            Message.text("user", "current request"),
+            Message.text("assistant", "current answer"),
+        ]
+        await store.append_transcript_messages(session_id, transcript)
+        completed = await store.update_status(session_id, SessionStatus.COMPLETED)
+        stale_owner_ready = asyncio.Event()
+        release_stale_owner = asyncio.Event()
+
+        async def stale_recovery_owner() -> None:
+            fenced = await store.fence_stalled_run(
+                session_id,
+                statuses={SessionStatus.COMPLETED},
+                inactive_before=completed.last_activity_at,
+            )
+            assert fenced is not None
+
+            def add_expired_claim(_session, checkpoint):
+                updated = {} if checkpoint is None else dict(checkpoint)
+                updated["incomplete_session_recovery_claim"] = {
+                    "version": 1,
+                    "claim_id": "stale-recovery-owner",
+                    "claimed_at": (now - timedelta(minutes=10)).isoformat(),
+                    "claim_expires_at": (now - timedelta(minutes=5)).isoformat(),
+                }
+                return updated
+
+            await store.transform_checkpoint(session_id, add_expired_claim)
+            stale_owner_ready.set()
+            await release_stale_owner.wait()
+            try:
+                with pytest.raises(SessionRunFenced):
+                    await store.update_metadata(session_id, {"stale_owner_write": True})
+            finally:
+                await store.release_run_fence(session_id)
+
+        stale_owner_task = asyncio.create_task(stale_recovery_owner())
+        await asyncio.wait_for(stale_owner_ready.wait(), timeout=5)
+        owned = await store.load(session_id)
+        assert owned is not None
+        stale_epoch = owned.run_epoch
+
+        with pytest.raises(
+            ValueError,
+            match="fenced an expired incomplete-session recovery owner",
+        ):
+            async for _event in app.compact_session(
+                CompactSessionRequest(
+                    session_id=session_id,
+                    idempotency_key="compact-after-expired-recovery",
+                    expected_run_epoch=stale_epoch,
+                    expected_transcript_cursor=len(transcript),
+                )
+            ):
+                pytest.fail("Compaction emitted an event before fencing the stale owner.")
+
+        after_takeover = await store.load(session_id)
+        assert after_takeover is not None
+        assert after_takeover.run_epoch > stale_epoch
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        assert "incomplete_session_recovery_claim" not in checkpoint
+        assert compactor.requests == []
+
+        release_stale_owner.set()
+        await asyncio.wait_for(stale_owner_task, timeout=5)
+
+        compacted = [
+            event
+            async for event in app.compact_session(
+                CompactSessionRequest(
+                    session_id=session_id,
+                    idempotency_key="compact-after-expired-recovery",
+                    expected_run_epoch=after_takeover.run_epoch,
+                    expected_transcript_cursor=len(transcript),
+                )
+            )
+        ]
+        assert compacted[-1].type == EventType.SESSION_CHECKPOINTED
+        assert len(compactor.requests) == 1
 
     asyncio.run(run())
 

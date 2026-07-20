@@ -195,17 +195,19 @@ class _BlockingCommittedRunningTransitionStore(_RecordingReleaseStore):
         self.transition_committed: asyncio.Event | None = None
         self.finish_transition: asyncio.Event | None = None
 
-    async def transition_status(
+    async def transition_status_and_checkpoint(
         self,
         session_id: str,
         *,
         from_statuses: set[SessionStatus],
         to_status: SessionStatus,
+        checkpoint_transform,
     ) -> Session:
-        session = await super().transition_status(
+        session = await super().transition_status_and_checkpoint(
             session_id,
             from_statuses=from_statuses,
             to_status=to_status,
+            checkpoint_transform=checkpoint_transform,
         )
         if self.block_next_running_transition and to_status == SessionStatus.RUNNING:
             self.block_next_running_transition = False
@@ -1506,6 +1508,302 @@ def test_recover_user_input_supplies_outcome_and_completes() -> None:
     results = {part.tool_call_id: part.content for part in parts}
     assert results["call_1"] == "recovered externally"  # operator-supplied outcome
     assert results["call_2"] == "a"  # ask_user answer injected on continuation
+
+
+def test_recover_user_input_reconciles_ambiguous_append_acknowledgement() -> None:
+    class AmbiguousRecoveryAppendStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed_recovery_ack = False
+
+        async def append_events(self, session_id: str, events: list[Event]) -> None:
+            manual_recovery = any(event.payload.get("manual_recovery") is True for event in events)
+            await super().append_events(session_id, events)
+            if manual_recovery and not self.failed_recovery_ack:
+                self.failed_recovery_ack = True
+                raise RuntimeError("user-input recovery commit acknowledgement lost")
+
+    async def scenario() -> None:
+        session_id = "s_rec_ambiguous_append"
+        store = AmbiguousRecoveryAppendStore()
+        counting = _CountingTool()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(
+            _ScriptedProvider(
+                [("call_1", "count", {}), ("call_2", "ask_user", {"question": "q"})],
+                final_text="all done",
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[UserInputTool(), counting],
+        )
+        paused = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        input_id = next(
+            event for event in paused if event.type == EventType.SESSION_AWAITING_USER_INPUT
+        ).payload["input_id"]
+        await store.append_event(
+            session_id,
+            Event(
+                type=EventType.TOOL_CALL_STARTED,
+                session_id=session_id,
+                agent_name="assistant",
+                tool_name="count",
+                payload={"tool_call_id": "call_1"},
+            ),
+        )
+        stuck = await _drain(
+            app.resolve_user_input(
+                UserInputResponse(session_id=session_id, input_id=input_id, answer="a")
+            )
+        )
+        assert stuck[-1].payload.get("manual_recovery_required") is True
+
+        recovery = await _drain(
+            app.recover_user_input(
+                UserInputRecoveryRequest(
+                    session_id=session_id,
+                    input_id=input_id,
+                    answer="a",
+                    tool_call_id="call_1",
+                    outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                    message="recovered externally",
+                )
+            )
+        )
+        session = await store.load(session_id)
+        assert session is not None and session.status == SessionStatus.INTERRUPTED
+        assert recovery[-1].type == EventType.SESSION_INTERRUPTED
+        assert recovery[-1].payload["manual_recovery_persisted"] is True
+        persisted = await store.load_events(session_id)
+        recovered = [
+            event
+            for event in persisted
+            if event.payload.get("manual_recovery") is True
+            and event.payload.get("tool_call_id") == "call_1"
+        ]
+        assert len(recovered) == 1
+
+        resumed = await _drain(
+            app.resolve_user_input(
+                UserInputResponse(session_id=session_id, input_id=input_id, answer="a")
+            )
+        )
+        assert resumed[-1].type == EventType.SESSION_COMPLETED
+        assert counting.calls == 0
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "grouped_cancellation",
+    [False, True],
+    ids=["ordinary-error", "grouped-cancellation"],
+)
+def test_recover_user_input_post_persist_fanout_failure_stays_resumable(
+    grouped_cancellation: bool,
+) -> None:
+    async def scenario() -> None:
+        failure_kind = "grouped" if grouped_cancellation else "ordinary"
+        session_id = f"s_rec_post_persist_failure_{failure_kind}"
+        store = InMemorySessionStore()
+        counting = _CountingTool()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(
+            _ScriptedProvider(
+                [("call_1", "count", {}), ("call_2", "ask_user", {"question": "q"})],
+                final_text="all done",
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[UserInputTool(), counting],
+        )
+        paused = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        input_id = next(
+            event for event in paused if event.type == EventType.SESSION_AWAITING_USER_INPUT
+        ).payload["input_id"]
+        await store.append_event(
+            session_id,
+            Event(
+                type=EventType.TOOL_CALL_STARTED,
+                session_id=session_id,
+                agent_name="assistant",
+                tool_name="count",
+                payload={"tool_call_id": "call_1"},
+            ),
+        )
+        stuck = await _drain(
+            app.resolve_user_input(
+                UserInputResponse(session_id=session_id, input_id=input_id, answer="a")
+            )
+        )
+        assert stuck[-1].payload.get("manual_recovery_required") is True
+
+        original_fan_out = app._event_writer.fan_out_persisted
+        failed = False
+        fan_out_failure: BaseException = (
+            BaseExceptionGroup(
+                "user-input recovery fan-out cancelled and failed",
+                [asyncio.CancelledError("fan-out cancelled"), RuntimeError("fan-out failed")],
+            )
+            if grouped_cancellation
+            else RuntimeError("user-input recovery fan-out unavailable")
+        )
+
+        async def fail_recovery_fan_out(events: list[Event]) -> list[Event]:
+            nonlocal failed
+            if not failed and any(event.payload.get("manual_recovery") is True for event in events):
+                failed = True
+                raise fan_out_failure
+            return await original_fan_out(events)
+
+        app._event_writer.fan_out_persisted = fail_recovery_fan_out
+        recovery_request = UserInputRecoveryRequest(
+            session_id=session_id,
+            input_id=input_id,
+            answer="a",
+            tool_call_id="call_1",
+            outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+            message="recovered externally",
+        )
+        recovery: list[Event] = []
+        if grouped_cancellation:
+            with pytest.raises(BaseExceptionGroup) as raised:
+                await _drain(app.recover_user_input(recovery_request))
+            assert raised.value is fan_out_failure
+        else:
+            recovery = await _drain(app.recover_user_input(recovery_request))
+        session = await store.load(session_id)
+        assert session is not None and session.status == SessionStatus.INTERRUPTED
+        persisted = await store.load_events(session_id)
+        terminal = [event for event in persisted if event.type == EventType.SESSION_INTERRUPTED][-1]
+        if grouped_cancellation:
+            assert terminal.payload["abandoned"] is True
+        else:
+            assert recovery[-1].id == terminal.id
+            assert terminal.payload["manual_recovery_persisted"] is True
+        assert (
+            len(
+                [
+                    event
+                    for event in persisted
+                    if event.payload.get("manual_recovery") is True
+                    and event.payload.get("tool_call_id") == "call_1"
+                ]
+            )
+            == 1
+        )
+
+        resumed = await _drain(
+            app.resolve_user_input(
+                UserInputResponse(session_id=session_id, input_id=input_id, answer="a")
+            )
+        )
+        assert resumed[-1].type == EventType.SESSION_COMPLETED
+        assert counting.calls == 0
+
+    asyncio.run(scenario())
+
+
+def test_recover_user_input_post_persist_cleanup_failure_is_not_suppressed() -> None:
+    async def scenario() -> None:
+        session_id = "s_rec_post_persist_cleanup_failure"
+        store = _FailingReleaseBeforeCleanupStore()
+        counting = _CountingTool()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(
+            _ScriptedProvider(
+                [("call_1", "count", {}), ("call_2", "ask_user", {"question": "q"})],
+                final_text="all done",
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[UserInputTool(), counting],
+        )
+        paused = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        input_id = next(
+            event for event in paused if event.type == EventType.SESSION_AWAITING_USER_INPUT
+        ).payload["input_id"]
+        await store.append_event(
+            session_id,
+            Event(
+                type=EventType.TOOL_CALL_STARTED,
+                session_id=session_id,
+                agent_name="assistant",
+                tool_name="count",
+                payload={"tool_call_id": "call_1"},
+            ),
+        )
+        stuck = await _drain(
+            app.resolve_user_input(
+                UserInputResponse(session_id=session_id, input_id=input_id, answer="a")
+            )
+        )
+        assert stuck[-1].payload.get("manual_recovery_required") is True
+
+        original_fan_out = app._event_writer.fan_out_persisted
+        failed = False
+
+        async def fail_recovery_fan_out(events: list[Event]) -> list[Event]:
+            nonlocal failed
+            if not failed and any(event.payload.get("manual_recovery") is True for event in events):
+                failed = True
+                raise RuntimeError("user-input recovery fan-out unavailable")
+            return await original_fan_out(events)
+
+        app._event_writer.fan_out_persisted = fail_recovery_fan_out
+        store.fail_next_release = True
+        with pytest.raises(
+            RuntimeError,
+            match="run fence release unavailable before cleanup",
+        ):
+            await _drain(
+                app.recover_user_input(
+                    UserInputRecoveryRequest(
+                        session_id=session_id,
+                        input_id=input_id,
+                        answer="a",
+                        tool_call_id="call_1",
+                        outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                        message="recovered externally",
+                    )
+                )
+            )
+
+        session = await store.load(session_id)
+        assert session is not None and session.status == SessionStatus.INTERRUPTED
+        persisted = await store.load_events(session_id)
+        assert persisted[-1].type == EventType.SESSION_INTERRUPTED
+        assert persisted[-1].payload["manual_recovery_persisted"] is True
+        assert counting.calls == 0
+
+    asyncio.run(scenario())
 
 
 def test_recover_user_input_closes_continuation_before_aclose_returns() -> None:
