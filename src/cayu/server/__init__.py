@@ -33,6 +33,9 @@ from cayu.runtime.app import CayuApp
 from cayu.runtime.sessions import IncompleteSessionsRecoveryRequest, SessionStatus
 
 try:
+    from fastapi import Request  # noqa: TC002 - FastAPI resolves endpoint annotations at runtime
+    from starlette.responses import RedirectResponse
+
     from cayu.server.auth import AuthContext, AuthDependency, BasicAuth
     from cayu.server.contracts import SERVER_API_PREFIX
     from cayu.server.routes import create_router
@@ -400,16 +403,32 @@ def mount_dashboard(
     if not dist_path.exists():
         return False
 
+    dashboard_app = DashboardStaticFiles(
+        directory=str(dist_path),
+        html=True,
+        auth=auth,
+        base_path=mount_path,
+        api_base_url=api_url,
+        dashboard_config=dashboard_config,
+    )
+
+    if mount_path != "/":
+
+        async def redirect_to_dashboard(request: Request) -> RedirectResponse:
+            canonical_url = request.url.replace(path=f"{request.url.path}/")
+            return RedirectResponse(canonical_url, status_code=307)
+
+        server.add_api_route(
+            mount_path,
+            redirect_to_dashboard,
+            methods=["GET", "HEAD"],
+            include_in_schema=False,
+            name=f"{name}-slash-redirect",
+        )
+
     server.mount(
         mount_path,
-        DashboardStaticFiles(
-            directory=str(dist_path),
-            html=True,
-            auth=auth,
-            base_path=mount_path,
-            api_base_url=api_url,
-            dashboard_config=dashboard_config,
-        ),
+        dashboard_app,
         name=name,
     )
     return True

@@ -325,6 +325,15 @@ Cayu makes safety boundaries explicit, but configuration still matters:
   filter or isolate Cayu data. See [Server authentication and tenant
   isolation](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/server-auth-tenancy.md).
   Generated API documentation is a separate exposure decision.
+- When embedding with `mount_cayu(..., path="/your/path")` or the lower-level
+  `mount_dashboard(...)`, use `/your/path/` as the canonical dashboard URL.
+  Cayu redirects an exact GET or HEAD of the slashless non-root mount after a
+  successful dashboard mount. That public 307 may be returned without
+  credentials; dashboard HTML, assets, deep links, and other protected content
+  at the canonical target still require configured authentication.
+  `mount_cayu(...)` places its control-plane API under `/your/path/api`;
+  `mount_dashboard(...)` configures `apiBaseUrl` independently and defaults it
+  to `/api`.
 - Usage is derived from recorded events and survives restarts when those events
   use a durable store; cost remains an estimate against the price book your
   application selects.

@@ -4,6 +4,7 @@ import asyncio
 import base64
 import importlib.util
 import os
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -284,17 +285,21 @@ def test_sidecar_times_out_and_stops_process_group(tmp_path: Path) -> None:
 def test_sidecar_timeout_kills_sigterm_ignoring_descendant(tmp_path: Path) -> None:
     supervisor = CommandSupervisor(root=tmp_path)
     pid_file = tmp_path / "descendant.pid"
-    child = (
-        "import os,signal,time; "
-        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-        f"open({str(pid_file)!r}, 'w').write(str(os.getpid())); "
-        "time.sleep(30)"
+    child = "import time; time.sleep(30)"
+    shell = (
+        "trap '' TERM; "
+        f"{sys.executable} -c {shlex.quote(child)} & "
+        "descendant_pid=$!; "
+        "trap - TERM; "
+        'kill -0 "$descendant_pid"; '
+        f"printf '%s' \"$descendant_pid\" > {shlex.quote(str(pid_file))}; "
+        "wait"
     )
     supervisor.start(
         "cmd-stubborn-descendant",
         {
             "kind": "shell",
-            "shell": f"{sys.executable} -c {child!r} & wait",
+            "shell": shell,
             "cwd": str(tmp_path),
             "env": {},
             "stdin_base64": None,

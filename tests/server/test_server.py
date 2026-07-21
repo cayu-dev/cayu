@@ -4796,6 +4796,127 @@ def test_mount_dashboard_helper_supports_composed_apps() -> None:
     assert '"basePath":"/inspector"' in response.text
 
 
+def test_mount_dashboard_owns_slashless_path_before_host_fallback() -> None:
+    app = FastAPI()
+
+    assert mount_dashboard(app, dashboard_path="/internal/agents") is True
+
+    @app.get("/{path:path}")
+    async def host_fallback(path: str) -> dict[str, str]:
+        return {"app": "host", "path": path}
+
+    client = TestClient(app)
+    redirect = client.get(
+        "/internal/agents?source=embed",
+        follow_redirects=False,
+    )
+
+    assert redirect.status_code == 307
+    assert redirect.headers["location"] == "http://testserver/internal/agents/?source=embed"
+
+    head_redirect = client.head(
+        "/internal/agents?source=probe",
+        follow_redirects=False,
+    )
+    assert head_redirect.status_code == 307
+    assert head_redirect.headers["location"] == ("http://testserver/internal/agents/?source=probe")
+
+    dashboard = client.get(redirect.headers["location"])
+    assert dashboard.status_code == 200
+    assert '<div id="root"></div>' in dashboard.text
+    assert '"basePath":"/internal/agents"' in dashboard.text
+    assert '"apiBaseUrl":"/api"' in dashboard.text
+    assert client.get("/elsewhere").json() == {"app": "host", "path": "elsewhere"}
+
+
+@pytest.mark.parametrize("dashboard_path", [None, "/missing"])
+def test_mount_dashboard_does_not_claim_unavailable_slashless_path(
+    tmp_path, dashboard_path
+) -> None:
+    app = FastAPI()
+    dashboard_dir = tmp_path / "missing" if dashboard_path is not None else None
+
+    assert (
+        mount_dashboard(
+            app,
+            dashboard_dir=dashboard_dir,
+            dashboard_path=dashboard_path,
+        )
+        is False
+    )
+
+    @app.get("/{path:path}")
+    async def host_fallback(path: str) -> dict[str, str]:
+        return {"app": "host", "path": path}
+
+    requested_path = "/missing" if dashboard_path is not None else "/cayu"
+    response = TestClient(app).get(requested_path, follow_redirects=False)
+    assert response.status_code == 200
+    assert response.json()["app"] == "host"
+
+
+def test_mount_dashboard_construction_failure_does_not_claim_slashless_path(
+    tmp_path,
+) -> None:
+    app = FastAPI()
+    invalid_dashboard = tmp_path / "dashboard.html"
+    invalid_dashboard.write_text("not a directory")
+
+    routes_before = list(app.routes)
+    with pytest.raises(RuntimeError, match="Directory .* does not exist"):
+        mount_dashboard(
+            app,
+            dashboard_dir=invalid_dashboard,
+            dashboard_path="/inspector",
+        )
+    assert app.routes == routes_before
+
+    @app.get("/{path:path}")
+    async def host_fallback(path: str) -> dict[str, str]:
+        return {"app": "host", "path": path}
+
+    response = TestClient(app).get("/inspector", follow_redirects=False)
+    assert response.status_code == 200
+    assert response.json() == {"app": "host", "path": "inspector"}
+
+
+def test_root_dashboard_mount_does_not_register_redirect() -> None:
+    app = FastAPI()
+
+    assert mount_dashboard(app, dashboard_path="/") is True
+
+    response = TestClient(app).get("/", follow_redirects=False)
+    assert response.status_code == 200
+    assert '"basePath":"/"' in response.text
+
+
+def test_slashless_dashboard_head_redirects_to_canonical_path() -> None:
+    app = FastAPI()
+    assert mount_dashboard(app, dashboard_path="/inspector") is True
+
+    response = TestClient(app).head("/inspector", follow_redirects=False)
+
+    assert response.status_code == 307
+    assert response.headers["location"] == "http://testserver/inspector/"
+
+
+@pytest.mark.parametrize(
+    "method",
+    ["POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
+def test_slashless_dashboard_redirect_is_limited_to_get_and_head(method: str) -> None:
+    app = FastAPI()
+    assert mount_dashboard(app, dashboard_path="/inspector") is True
+
+    response = TestClient(app).request(
+        method,
+        "/inspector",
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 405
+
+
 def test_mount_dashboard_injects_base_before_custom_shell_assets(tmp_path) -> None:
     dashboard_dir = tmp_path / "dashboard"
     assets_dir = dashboard_dir / "assets"
@@ -4856,7 +4977,24 @@ def test_mount_cayu_mounts_api_and_dashboard_under_product_path() -> None:
 
     mount_cayu(server, cayu_app, path="/cayu", dev=True)
 
+    @server.get("/{path:path}")
+    async def host_fallback(path: str) -> dict[str, str]:
+        return {"app": "host", "path": path}
+
     client = TestClient(server)
+    redirect = client.get("/cayu", follow_redirects=False)
+    assert redirect.status_code == 307
+    assert redirect.headers["location"] == "http://testserver/cayu/"
+
+    head_redirect = client.head("/cayu", follow_redirects=False)
+    assert head_redirect.status_code == 307
+    assert head_redirect.headers["location"] == "http://testserver/cayu/"
+
+    dashboard_root = client.get(redirect.headers["location"])
+    assert dashboard_root.status_code == 200
+    assert '"basePath":"/cayu"' in dashboard_root.text
+    assert '"apiBaseUrl":"/cayu/api"' in dashboard_root.text
+
     dashboard = client.get("/cayu/knowledge")
 
     assert dashboard.status_code == 200
@@ -4865,7 +5003,8 @@ def test_mount_cayu_mounts_api_and_dashboard_under_product_path() -> None:
     assert '"basePath":"/cayu"' in dashboard.text
     assert '"apiBaseUrl":"/cayu/api"' in dashboard.text
     assert client.get("/cayu/api/health").json() == {"ok": True}
-    assert client.get("/api/health").status_code == 404
+    assert client.get("/api/health").json() == {"app": "host", "path": "api/health"}
+    assert client.get("/elsewhere").json() == {"app": "host", "path": "elsewhere"}
     assert client.get("/cayu/api/missing").status_code == 404
 
 
@@ -4875,9 +5014,13 @@ def test_mount_cayu_can_disable_dashboard_for_api_only_services() -> None:
 
     mount_cayu(server, cayu_app, path="/cayu", dashboard=False, dev=True)
 
+    @server.get("/{path:path}")
+    async def host_fallback(path: str) -> dict[str, str]:
+        return {"app": "host", "path": path}
+
     client = TestClient(server)
     assert client.get("/cayu/api/health").json() == {"ok": True}
-    assert client.get("/cayu/").status_code == 404
+    assert client.get("/cayu", follow_redirects=False).json()["app"] == "host"
 
 
 def test_mount_cayu_composes_background_interruption_drain() -> None:

@@ -760,7 +760,17 @@ control remain the host application's responsibility.
 `create_server(...)` serves the API at `/api` and the dashboard at `/cayu`
 by default; `api_path` and `dashboard_path` change those mounts, and
 `dashboard_path=None` disables the dashboard. `mount_cayu(..., path=...)`
-places both surfaces below one application-owned path.
+places both surfaces below one application-owned path, with API routes under
+`{path}/api`. The lower-level `mount_dashboard(...)` helper does not place API
+routes beneath its dashboard path: its `api_base_url` is configured
+independently and defaults to `/api`. For every successfully mounted non-root
+dashboard, the canonical dashboard URL ends in `/`; an exact GET or HEAD of the
+slashless mount path redirects there with HTTP 307 before host routes registered
+later can claim it, preserving the query string. This public redirect may be
+returned without credentials; dashboard HTML, assets, client-side deep links,
+and other protected content at the canonical target remain subject to configured
+authentication.
+Root, disabled, and unavailable dashboard mounts add no redirect.
 
 The optional server exposes `GET /api/sessions/{session_id}/summary` for compact
 session health views. It combines session identity/status, storage-backed event

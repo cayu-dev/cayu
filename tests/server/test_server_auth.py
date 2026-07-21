@@ -413,6 +413,12 @@ def test_mount_cayu_authenticates_embedded_api_and_dashboard() -> None:
 
     assert client.get("/cayu/api/health").json() == {"ok": True}
 
+    redirect = client.get("/cayu", follow_redirects=False)
+    assert redirect.status_code == 307
+
+    denied_redirect_target = client.get(redirect.headers["location"])
+    assert denied_redirect_target.status_code == 401
+
     denied_api = client.get("/cayu/api/sessions")
     assert denied_api.status_code == 401
     assert denied_api.headers["www-authenticate"] == 'Basic realm="Cayu"'
@@ -427,6 +433,11 @@ def test_mount_cayu_authenticates_embedded_api_and_dashboard() -> None:
     assert accepted_dashboard.status_code == 200
     assert '"basePath":"/cayu"' in accepted_dashboard.text
     assert '"apiBaseUrl":"/cayu/api"' in accepted_dashboard.text
+
+    denied_deep_link = client.get("/cayu/sessions/example")
+    assert denied_deep_link.status_code == 401
+    denied_asset = client.get("/cayu/assets/missing.js")
+    assert denied_asset.status_code == 401
 
 
 def test_custom_auth_dependency_may_return_mapping_context() -> None:
