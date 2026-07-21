@@ -3,9 +3,10 @@
 The coordinator owns paused-round continuation, recorded tool-round repair,
 incomplete-session recovery, subagent reattachment, and abandoned-stream
 finalization without importing or accepting :class:`CayuApp`. Public request
-validation and registry lookup remain on the application façade. Session
-execution, interruption, turn accounting, and terminal hook orchestration are
-narrow callbacks until the session engine is extracted.
+validation and registry ownership remain on the application façade; the
+coordinator resolves registrations through narrow callbacks. Session execution,
+interruption, turn accounting, and terminal hook orchestration are likewise
+supplied through narrow callbacks by the composition root.
 """
 
 from __future__ import annotations
@@ -95,6 +96,9 @@ from cayu.runtime.structured_output import (
     StructuredOutputSpec,
     copy_structured_output_spec,
 )
+from cayu.runtime.structured_output import (
+    _require_native_structured_output_support as _require_provider_native_output_support,
+)
 from cayu.runtime.tasks import Task, TaskStore
 from cayu.runtime.tool_policy import ToolPolicyDecision
 from cayu.runtime.tool_rounds import ToolRoundRecoveryRequest
@@ -135,6 +139,18 @@ logger = logging.getLogger(__name__)
 CheckpointTransformFactory = Callable[[dict[str, Any]], CheckpointTransform]
 EffectiveRetryPolicy = Callable[[RetryPolicy | None], RetryPolicy]
 RecoveryCleanup = Callable[[], Awaitable[None]]
+
+
+def _require_native_structured_output_support(
+    structured_output: StructuredOutputSpec | None,
+    *,
+    registered_provider: runtime_records.RegisteredProvider,
+) -> None:
+    _require_provider_native_output_support(
+        structured_output,
+        provider_name=registered_provider.name,
+        provider=registered_provider.provider,
+    )
 
 
 def _recovery_abandonment_signal(
@@ -398,6 +414,7 @@ TerminalEventStream = Callable[[RecoveryTerminalEventRequest], AsyncIterator[Eve
 LimitStopEventStream = Callable[[RecoveryLimitStopRequest], AsyncIterator[Event]]
 TaskEventFactory = Callable[[RecoveryTaskEventRequest], Event]
 RegisteredAgentResolver = Callable[[str], runtime_records.RegisteredAgentState]
+RegisteredProviderResolver = Callable[[str], runtime_records.RegisteredProvider]
 RegisteredEnvironmentResolver = Callable[[str | None], runtime_records.RegisteredEnvironment | None]
 RecoveryInterruptionStream = Callable[[RecoveryInterruptionRequest], AsyncIterator[Event]]
 PendingSessionInterruptCheckpoint = Callable[[dict[str, Any], datetime], CheckpointTransform]
@@ -426,6 +443,7 @@ class RecoveryCoordinator:
         stop_session_for_limit_reached: LimitStopEventStream,
         task_event: TaskEventFactory,
         resolve_registered_agent: RegisteredAgentResolver,
+        resolve_registered_provider: RegisteredProviderResolver,
         resolve_registered_environment: RegisteredEnvironmentResolver,
         interrupt_session_for_recovery: RecoveryInterruptionStream,
         pending_session_interrupt_checkpoint: PendingSessionInterruptCheckpoint,
@@ -447,6 +465,7 @@ class RecoveryCoordinator:
         self._stop_session_for_limit_reached = stop_session_for_limit_reached
         self._task_event = task_event
         self._resolve_registered_agent = resolve_registered_agent
+        self._resolve_registered_provider = resolve_registered_provider
         self._resolve_registered_environment = resolve_registered_environment
         self._interrupt_session_for_recovery = interrupt_session_for_recovery
         self._pending_session_interrupt_checkpoint = pending_session_interrupt_checkpoint
@@ -490,6 +509,477 @@ class RecoveryCoordinator:
             authoritative_failure=authoritative_failure,
             steps=tuple(cleanup_steps),
         )
+
+    async def _cleanup_entrypoint_handoff(
+        self,
+        *,
+        stream: AsyncGenerator[Event, None] | None,
+        session_id: str,
+        authoritative_failure: BaseException | None,
+        finalize_abandoned: bool,
+        release_run_fence: bool,
+        abort_environment_setup: bool = True,
+    ) -> None:
+        try:
+            await self._cleanup_recovery_handoff(
+                stream=stream,
+                session_id=session_id,
+                authoritative_failure=authoritative_failure,
+                finalize_abandoned=finalize_abandoned,
+                release_run_fence=release_run_fence,
+                abort_environment_setup=abort_environment_setup,
+            )
+        finally:
+            # Cleanup can run in a shielded child task with copied context. The
+            # public caller must never retain a stale run epoch after handoff.
+            _deactivate_session_run_fence(session_id)
+
+    async def _transition_recovery_session_to_running(
+        self,
+        session_id: str,
+        *,
+        from_statuses: set[SessionStatus] | None = None,
+    ) -> Session:
+        """Claim a paused session without leaving cancellation outcome-uncertain.
+
+        Session stores activate run fences in task-local context after the durable
+        transition commits. Keeping the transition in a shielded child task lets it
+        reach a definite result even if the caller is cancelled at that boundary.
+        A successful claim is then activated in the caller's context. If cancellation
+        arrived, the claim is finalized and released before that cancellation is
+        propagated.
+        """
+        expected_statuses = (
+            {SessionStatus.INTERRUPTED} if from_statuses is None else set(from_statuses)
+        )
+
+        def reject_active_incomplete_recovery(
+            _session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any] | None:
+            return _checkpoint_without_active_incomplete_recovery_claim(
+                checkpoint,
+                now=self._clock(),
+            )
+
+        transition_task = asyncio.create_task(
+            self._session_store.transition_status_and_checkpoint(
+                session_id,
+                from_statuses=expected_statuses,
+                to_status=SessionStatus.RUNNING,
+                checkpoint_transform=reject_active_incomplete_recovery,
+            )
+        )
+        cancellation: asyncio.CancelledError | None = None
+        transition_failure: BaseException | None = None
+        while not transition_task.done():
+            try:
+                await asyncio.shield(transition_task)
+            except asyncio.CancelledError as exc:
+                if transition_task.cancelled():
+                    transition_failure = exc
+                    break
+                if cancellation is None:
+                    cancellation = exc
+            except BaseException as exc:
+                transition_failure = exc
+                break
+
+        session: Session | None = None
+        if transition_failure is None:
+            try:
+                session = transition_task.result()
+            except BaseException as exc:
+                transition_failure = exc
+
+        if session is None:
+            if cancellation is not None:
+                if transition_failure is not None:
+                    cancellation.add_note(
+                        "Continuation recovery transition also failed after cancellation: "
+                        f"{type(transition_failure).__name__}."
+                    )
+                raise cancellation from transition_failure
+            if transition_failure is None:
+                raise RuntimeError("Continuation recovery transition completed without a session.")
+            raise transition_failure
+
+        # The transition activated this epoch only in the child task's copied
+        # context. The caller owns all subsequent writes and cleanup.
+        _activate_session_run_fence(session)
+        if cancellation is None:
+            return session
+
+        try:
+            await _run_recovery_cleanup_steps(
+                authoritative_failure=cancellation,
+                steps=(
+                    (
+                        "abandoned session finalization",
+                        lambda: self.finalize_abandoned_session_by_id(session.id),
+                    ),
+                    (
+                        "run fence release",
+                        lambda: self._session_store.release_run_fence(session.id),
+                    ),
+                ),
+            )
+        finally:
+            # Shielded cleanup runs in a copied context. Never leave the caller's
+            # task-local epoch active if it catches and handles the cancellation.
+            _deactivate_session_run_fence(session.id)
+        raise cancellation
+
+    async def resolve_user_input(
+        self,
+        response: UserInputResponse,
+    ) -> AsyncGenerator[Event, None]:
+        """Resume a session paused by ``ask_user`` with the user's answer.
+
+        The answer becomes the ``ask_user`` tool result; any other tool calls in the same
+        round (none ran before the pause) execute now, and the session continues.
+        """
+        loaded_session = await self._session_store.load(response.session_id)
+        if loaded_session is None:
+            raise KeyError(f"Session not found: {response.session_id}")
+
+        checkpoint = await self._session_store.load_checkpoint(loaded_session.id)
+        pending = pending_user_input_from_checkpoint(checkpoint)
+        if pending is None:
+            raise RuntimeError("Session has no pending user input.")
+        if pending.input_id != response.input_id:
+            raise ValueError(f"User input id does not match pending input: {response.input_id}")
+        # The output-schema contract is fixed by the paused run's provider history; a resolver
+        # cannot swap it (a spec matching or absent is fine; a differing one is rejected). Checked
+        # before the status transition so it surfaces to the caller rather than being caught by the
+        # resume's failure handler. (thinking is a safe override.)
+        effective_structured_output = _effective_user_input_structured_output(
+            structured_output=response.structured_output,
+            pending=pending,
+        )
+
+        registered_agent = self._resolve_registered_agent(loaded_session.agent_name)
+        registered_provider = self._resolve_registered_provider(loaded_session.provider_name)
+        _require_native_structured_output_support(
+            effective_structured_output, registered_provider=registered_provider
+        )
+        registered_environment = self._resolve_registered_environment(
+            loaded_session.environment_name
+        )
+        session = await self._transition_recovery_session_to_running(loaded_session.id)
+
+        continuation_stream = self.continue_user_input_resolution(
+            response=response,
+            session=session,
+            pending=pending,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            registered_environment=registered_environment,
+        )
+        authoritative_failure: BaseException | None = None
+        abandoned = False
+        try:
+            async for event in continuation_stream:
+                yield event
+        except BaseException as exc:
+            authoritative_failure = exc
+            abandoned = _recovery_abandonment_signal(exc) is not None
+            raise
+        finally:
+            await self._cleanup_entrypoint_handoff(
+                stream=continuation_stream,
+                session_id=session.id,
+                authoritative_failure=authoritative_failure,
+                finalize_abandoned=abandoned,
+                release_run_fence=True,
+            )
+
+    async def recover_user_input_request(
+        self,
+        request: UserInputRecoveryRequest,
+    ) -> AsyncGenerator[Event, None]:
+        """Recover a user-input round stuck on `manual_recovery_required`.
+
+        A tool in the paused round started on a prior resume but recorded no terminal event
+        (a crash mid-tool), so it cannot be re-run automatically. The caller supplies the
+        externally verified outcome for that `tool_call_id`; Cayu persists it as the tool's
+        terminal result and continues the round (re-supplying `answer` in case the `ask_user`
+        result was not recorded before the crash). Cayu does not infer the outcome itself.
+        """
+        loaded_session = await self._session_store.load(request.session_id)
+        if loaded_session is None:
+            raise KeyError(f"Session not found: {request.session_id}")
+
+        checkpoint = await self._session_store.load_checkpoint(loaded_session.id)
+        pending = pending_user_input_from_checkpoint(checkpoint)
+        if pending is None:
+            raise RuntimeError("Session has no pending user input.")
+        if pending.input_id != request.input_id:
+            raise ValueError(f"User input id does not match pending input: {request.input_id}")
+        effective_structured_output = _effective_user_input_structured_output(
+            structured_output=request.structured_output,
+            pending=pending,
+        )
+
+        pending_tool_call = approval_support.round_tool_call_for_recovery(
+            pending_calls=pending.tool_calls,
+            tool_call_id=request.tool_call_id,
+        )
+        registered_agent = self._resolve_registered_agent(loaded_session.agent_name)
+        registered_provider = self._resolve_registered_provider(loaded_session.provider_name)
+        _require_native_structured_output_support(
+            effective_structured_output, registered_provider=registered_provider
+        )
+        registered_environment = self._resolve_registered_environment(
+            loaded_session.environment_name
+        )
+        session = await self._transition_recovery_session_to_running(loaded_session.id)
+        recovery_stream = self.recover_user_input(
+            request=request,
+            loaded_session=loaded_session,
+            session=session,
+            pending=pending,
+            pending_tool_call=pending_tool_call,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            registered_environment=registered_environment,
+        )
+        authoritative_failure: BaseException | None = None
+        try:
+            async for event in recovery_stream:
+                yield event
+        except BaseException as exc:
+            authoritative_failure = exc
+            raise
+        finally:
+            await self._cleanup_entrypoint_handoff(
+                stream=recovery_stream,
+                session_id=session.id,
+                authoritative_failure=authoritative_failure,
+                finalize_abandoned=False,
+                release_run_fence=False,
+            )
+
+    async def resolve_tool_approval(
+        self,
+        request: ToolApprovalRequest,
+    ) -> AsyncGenerator[Event, None]:
+        loaded_session = await self._session_store.load(request.session_id)
+        if loaded_session is None:
+            raise KeyError(f"Session not found: {request.session_id}")
+
+        checkpoint = await self._session_store.load_checkpoint(loaded_session.id)
+        pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
+        if pending_approval is None:
+            raise RuntimeError("Session has no pending tool approval.")
+        if pending_approval.approval_id != request.approval_id:
+            raise ValueError(
+                f"Tool approval id does not match pending approval: {request.approval_id}"
+            )
+        effective_structured_output = _effective_approval_structured_output(
+            structured_output=request.structured_output,
+            pending_approval=pending_approval,
+        )
+
+        registered_agent = self._resolve_registered_agent(loaded_session.agent_name)
+        registered_provider = self._resolve_registered_provider(loaded_session.provider_name)
+        _require_native_structured_output_support(
+            effective_structured_output, registered_provider=registered_provider
+        )
+        registered_environment = self._resolve_registered_environment(
+            loaded_session.environment_name
+        )
+        session = await self._transition_recovery_session_to_running(loaded_session.id)
+
+        continuation_stream = self.continue_tool_approval_resolution(
+            request=request,
+            session=session,
+            pending_approval=pending_approval,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            registered_environment=registered_environment,
+        )
+        authoritative_failure: BaseException | None = None
+        abandoned = False
+        try:
+            async for event in continuation_stream:
+                yield event
+        except BaseException as exc:
+            authoritative_failure = exc
+            abandoned = _recovery_abandonment_signal(exc) is not None
+            raise
+        finally:
+            await self._cleanup_entrypoint_handoff(
+                stream=continuation_stream,
+                session_id=session.id,
+                authoritative_failure=authoritative_failure,
+                finalize_abandoned=abandoned,
+                release_run_fence=True,
+            )
+
+    async def recover_tool_approval_request(
+        self,
+        request: ToolApprovalRecoveryRequest,
+    ) -> AsyncGenerator[Event, None]:
+        loaded_session = await self._session_store.load(request.session_id)
+        if loaded_session is None:
+            raise KeyError(f"Session not found: {request.session_id}")
+
+        checkpoint = await self._session_store.load_checkpoint(loaded_session.id)
+        pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
+        if pending_approval is None:
+            raise RuntimeError("Session has no pending tool approval.")
+        if pending_approval.approval_id != request.approval_id:
+            raise ValueError(
+                f"Tool approval id does not match pending approval: {request.approval_id}"
+            )
+        effective_structured_output = _effective_approval_structured_output(
+            structured_output=request.structured_output,
+            pending_approval=pending_approval,
+        )
+
+        pending_tool_call = approval_support.pending_tool_call_for_recovery(
+            approval=pending_approval,
+            tool_call_id=request.tool_call_id,
+        )
+        registered_agent = self._resolve_registered_agent(loaded_session.agent_name)
+        registered_provider = self._resolve_registered_provider(loaded_session.provider_name)
+        _require_native_structured_output_support(
+            effective_structured_output, registered_provider=registered_provider
+        )
+        registered_environment = self._resolve_registered_environment(
+            loaded_session.environment_name
+        )
+        session = await self._transition_recovery_session_to_running(loaded_session.id)
+        recovery_stream = self.recover_tool_approval(
+            request=request,
+            loaded_session=loaded_session,
+            session=session,
+            pending_approval=pending_approval,
+            pending_tool_call=pending_tool_call,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            registered_environment=registered_environment,
+        )
+        authoritative_failure: BaseException | None = None
+        try:
+            async for event in recovery_stream:
+                yield event
+        except BaseException as exc:
+            authoritative_failure = exc
+            raise
+        finally:
+            await self._cleanup_entrypoint_handoff(
+                stream=recovery_stream,
+                session_id=session.id,
+                authoritative_failure=authoritative_failure,
+                finalize_abandoned=False,
+                release_run_fence=False,
+            )
+
+    async def recover_tool_round_request(
+        self,
+        request: ToolRoundRecoveryRequest,
+    ) -> AsyncGenerator[Event, None]:
+        """Recover a crashed ordinary tool round with an operator-verified outcome.
+
+        A tool call in a non-approval round started but recorded no terminal event
+        (a crash mid-tool), so an automatic resume would close it as an
+        unknown-outcome failure. The caller supplies the externally verified outcome
+        for that `tool_call_id`; Cayu persists it as the call's terminal result and
+        never re-runs the tool. One call per invocation: if other
+        started-but-unresolved calls remain, the session returns to INTERRUPTED with
+        `manual_recovery_required` naming the next call; otherwise the round closes
+        from the recorded outcomes and the model loop continues. A crashed round can
+        leave the session FAILED (an in-process persistence error) or in a stale live
+        status (a process kill), so FAILED and RUNNING are accepted alongside
+        INTERRUPTED. An existing INTERRUPTING transition wins rather than being
+        reopened by recovery. The in-process claim registered while this recovery
+        streams blocks duplicate work in this process, while a durable recovery
+        claim serializes other workers and fences an expired owner. If this call
+        fails after claiming a stale live session, the session closes to the
+        resumable INTERRUPTED state. When the recovered terminal event is already
+        durable, the evidence remains authoritative: do not retry the same
+        `tool_call_id` — `resume(...)` finishes the round from the persisted outcome.
+        """
+        loaded_session = await self._session_store.load(request.session_id)
+        if loaded_session is None:
+            raise KeyError(f"Session not found: {request.session_id}")
+
+        checkpoint = await self._session_store.load_checkpoint(loaded_session.id)
+        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        if pending_round is None:
+            raise RuntimeError("Session has no pending tool round.")
+        if pending_round.round_id != request.round_id:
+            raise ValueError(f"Tool round id does not match pending round: {request.round_id}")
+        effective_structured_output = _effective_tool_round_structured_output(
+            structured_output=request.structured_output,
+            pending_round=pending_round,
+        )
+
+        pending_tool_call = approval_support.round_tool_call_for_recovery(
+            pending_calls=pending_round.tool_calls,
+            tool_call_id=request.tool_call_id,
+        )
+        registered_agent = self._resolve_registered_agent(loaded_session.agent_name)
+        if pending_round.agent_name != registered_agent.spec.name:
+            raise RuntimeError(
+                f"Pending tool round belongs to a different agent: {pending_round.agent_name}."
+            )
+        registered_provider = self._resolve_registered_provider(loaded_session.provider_name)
+        _require_native_structured_output_support(
+            effective_structured_output, registered_provider=registered_provider
+        )
+        registered_environment = self._resolve_registered_environment(
+            loaded_session.environment_name
+        )
+        if self._session_control.has_active_tasks(loaded_session.id):
+            raise RuntimeError(f"Session has active work in this process: {loaded_session.id}")
+        # Reserve the in-process slot before awaiting the durable transition. The
+        # check and registration are await-free, so another local recovery cannot
+        # advance the run epoch while this claimant is waiting on storage.
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            self._session_control.register_active_task(
+                loaded_session.id,
+                current_task,
+                task_id=None,
+                task_started=False,
+                task_finished=False,
+            )
+        recovery_stream = self.recover_tool_round(
+            request=request,
+            loaded_session=loaded_session,
+            pending_round=pending_round,
+            pending_tool_call=pending_tool_call,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            registered_environment=registered_environment,
+            effective_structured_output=effective_structured_output,
+        )
+        authoritative_failure: BaseException | None = None
+        try:
+            async for event in recovery_stream:
+                yield event
+        except BaseException as exc:
+            authoritative_failure = exc
+            raise
+        finally:
+            try:
+                await self._cleanup_entrypoint_handoff(
+                    stream=recovery_stream,
+                    session_id=loaded_session.id,
+                    authoritative_failure=authoritative_failure,
+                    finalize_abandoned=False,
+                    release_run_fence=False,
+                    abort_environment_setup=False,
+                )
+            finally:
+                if current_task is not None:
+                    self._session_control.unregister_active_task(
+                        loaded_session.id,
+                        current_task,
+                    )
 
     async def continue_user_input_resolution(
         self,
@@ -4599,6 +5089,24 @@ def _interrupted_tool_call_event(
         tool_name=tool_call_outcome.call.name,
         payload=payload,
     )
+
+
+def _effective_tool_round_structured_output(
+    *,
+    structured_output: StructuredOutputSpec | None,
+    pending_round: tool_round_recovery.PendingToolRound,
+) -> StructuredOutputSpec | None:
+    if type(pending_round) is not tool_round_recovery.PendingToolRound:
+        raise TypeError("Pending tool round must be a PendingToolRound.")
+    if structured_output is None:
+        return copy_structured_output_spec(pending_round.structured_output)
+    if pending_round.structured_output is None:
+        return copy_structured_output_spec(structured_output)
+    if structured_output.model_dump(mode="json") != pending_round.structured_output.model_dump(
+        mode="json"
+    ):
+        raise ValueError("structured_output does not match the crashed run contract.")
+    return copy_structured_output_spec(pending_round.structured_output)
 
 
 def _effective_user_input_max_steps(

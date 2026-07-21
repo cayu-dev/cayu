@@ -9,6 +9,7 @@ from jsonschema.exceptions import SchemaError
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationInfo, field_validator
 
 from cayu._validation import copy_json_value, escape_json_pointer_segment, require_clean_nonblank
+from cayu.providers import ModelProvider
 
 STRUCTURED_OUTPUT_TOOL_NAME = "__cayu_submit_structured_output"
 
@@ -96,6 +97,25 @@ class StructuredOutputValidation(BaseModel):
         if value is None:
             return None
         return copy_json_value(value, "output")
+
+
+def _require_native_structured_output_support(
+    structured_output: StructuredOutputSpec | None,
+    *,
+    provider_name: str,
+    provider: ModelProvider,
+) -> None:
+    """Reject native structured output before durable session state changes."""
+
+    if structured_output is None or structured_output.strategy != StructuredOutputStrategy.NATIVE:
+        return
+    if not provider.supports_native_structured_output:
+        raise NativeStructuredOutputUnsupported(
+            f"Native structured output is not supported by provider: {provider_name}"
+        )
+    provider.preflight_native_structured_output_schema(
+        copy_json_value(structured_output.json_schema, "json_schema")
+    )
 
 
 def copy_structured_output_spec(
