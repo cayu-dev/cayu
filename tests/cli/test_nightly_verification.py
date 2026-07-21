@@ -809,6 +809,14 @@ def test_lambda_metadata_isolation_live_check_retains_verified_adapter_evidence(
 
     assert check.status_on_success == nightly.STATUS_VERIFIED
     assert "required metadata-isolation" in check.capability
+    assert check.command[:6] == (
+        "uv",
+        "run",
+        "--extra",
+        "aws",
+        "--extra",
+        "egress",
+    )
     assert result.status == nightly.STATUS_VERIFIED
     assert result.evidence["harness"] == evidence
 

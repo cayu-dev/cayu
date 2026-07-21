@@ -621,6 +621,8 @@ CHECKS: tuple[VerificationCheck, ...] = (
             "run",
             "--extra",
             "aws",
+            "--extra",
+            "egress",
             "python",
             "-m",
             "examples.aws.lambda_microvm_agent.metadata_isolation_live",

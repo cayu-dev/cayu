@@ -157,7 +157,7 @@ separate modules so each execution boundary remains explicit:
 CAYU_AWS_METADATA_ISOLATION_LIVE=1 \
 CAYU_AWS_METADATA_ISOLATION_STACK=cayu-aws-agent \
 AWS_REGION=us-east-1 \
-  uv run --extra aws python -m \
+  uv run --extra aws --extra egress python -m \
   examples.aws.lambda_microvm_agent.metadata_isolation_live
 ```
 
@@ -178,7 +178,23 @@ workspace. For tenant-isolated production use, provision a distinct access
 point (and binding instance) per tenant or project; do not share this root
 across unrelated trust domains.
 
-Before deleting a throwaway stack, empty its artifact bucket and, when S3 Files
-was selected, its workspace bucket; S3 will otherwise reject their deletion.
-The stack deliberately leaves the externally managed PostgreSQL database and
-its connection secret untouched.
+Delete a throwaway stack with the example's explicit teardown command:
+
+```bash
+uv run --extra aws python -m examples.aws.lambda_microvm_agent.teardown \
+  --stack-name cayu-aws-agent \
+  --region us-east-1 \
+  --purge-data
+```
+
+`--purge-data` is required because this operation is irreversible. The command
+discovers the stack-managed artifact bucket and optional S3 Files workspace
+bucket, deletes the stack, and waits for every stack-managed writer to stop.
+Both buckets use CloudFormation retention policies, so the command then deletes
+their object versions and delete markers in bounded passes until a fresh listing
+is empty before deleting the retained buckets themselves. Ordinary stack deletion
+therefore preserves durable bucket data. The stack deliberately leaves the
+externally managed PostgreSQL database and its connection secret untouched.
+If bucket cleanup fails after the stack is deleted, rerun the same command
+promptly; it resolves the most recent deleted stack record by name and resumes
+cleanup, treating only a confirmed missing bucket as already complete.

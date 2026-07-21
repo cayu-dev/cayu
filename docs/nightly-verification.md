@@ -101,7 +101,7 @@ or in CI.
 | Docker runner live | Docker daemon | $0 | `docker-runner`, `docker-live-*` |
 | microsandbox live | `cayu[microsandbox]` runtime support; explicit opt-in for network-default, virtual-egress, and guest-agent-liveness checks | $0 | `microsandbox-live-*` |
 | E2B live | `cayu[e2b]`, `E2B_API_KEY`; IPv4-literal raw TCP tunnel inputs and explicit opt-in for virtual egress | E2B quota | `e2b-live-*` |
-| AWS Lambda MicroVM live | `cayu[aws]`, AWS credentials/region, built sidecar image; deployed integrated stack for the metadata-boundary task | AWS MicroVM/Fargate charges | `lambda-microvm-live`, `aws-lambda-microvm-metadata-isolation-live` |
+| AWS Lambda MicroVM live | `cayu[aws]`, plus `cayu[egress]` for the metadata-isolation check, AWS credentials/region, built sidecar image; deployed integrated stack for the metadata-boundary task | AWS MicroVM/Fargate charges | `lambda-microvm-live`, `aws-lambda-microvm-metadata-isolation-live` |
 | Chat Completions live | `GEMINI_API_KEY` | provider-dependent | `gemini-eval`, `chat-completions-contract` |
 | Amazon Bedrock contract | `cayu[aws]`, AWS credentials/region/model | provider-dependent | `bedrock-provider-live` |
 | OpenAI/Anthropic contracts | provider API key; file readers for artifact files | provider-dependent | `context-counting-live`, `artifact-file-live`, `structured-output-live` |

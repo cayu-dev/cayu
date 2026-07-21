@@ -53,6 +53,8 @@ Conditions:
 Resources:
   ArtifactBucket:
     Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       BucketEncryption:
         ServerSideEncryptionConfiguration:
@@ -69,6 +71,8 @@ Resources:
   WorkspaceBucket:
     Type: AWS::S3::Bucket
     Condition: UseS3Files
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       BucketEncryption:
         ServerSideEncryptionConfiguration:

@@ -606,6 +606,15 @@ def test_cloudformation_makes_s3_files_opt_in_and_uses_https() -> None:
     assert "Ready: ENABLED" in template
 
 
+def test_cloudformation_retains_durable_buckets_until_stack_writers_stop() -> None:
+    template = Path("examples/aws/lambda_microvm_agent/infra.yaml").read_text(encoding="utf-8")
+
+    for resource in ("ArtifactBucket", "WorkspaceBucket"):
+        section = _cloudformation_resource_body(template, resource)
+        assert "DeletionPolicy: Retain" in section
+        assert "UpdateReplacePolicy: Retain" in section
+
+
 def test_cloudformation_keeps_control_api_outside_microvm_proxy_port_range() -> None:
     template = Path("examples/aws/lambda_microvm_agent/infra.yaml").read_text(encoding="utf-8")
 
