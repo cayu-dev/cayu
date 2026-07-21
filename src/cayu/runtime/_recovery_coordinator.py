@@ -39,7 +39,11 @@ from cayu.runtime._environment_lifecycle import (
     exception_failure_payload,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
-from cayu.runtime._interruption_coordinator import _is_background_subagent_session
+from cayu.runtime._interruption_coordinator import (
+    _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY,
+    _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY,
+    _is_background_subagent_session,
+)
 from cayu.runtime._run_limits import RunLimitController, SessionUsageTracker
 from cayu.runtime._session_control import ActiveSessionRun, SessionControl
 from cayu.runtime._session_queries import query_all_sessions
@@ -78,9 +82,11 @@ from cayu.runtime.sessions import (
     Session,
     SessionOrder,
     SessionQuery,
+    SessionRunFenced,
     SessionStatus,
     SessionStatusConflict,
     SessionStore,
+    _activate_session_run_fence,
     _deactivate_session_run_fence,
     _incomplete_recovery_claim_from_checkpoint,
 )
@@ -105,15 +111,23 @@ from cayu.vaults import SecretRedactor
 _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED = "tool_approval_required"
 _INTERRUPTION_TYPE_USER_INPUT_REQUIRED = "user_input_required"
 _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED = "runtime_interrupted"
+_INTERRUPTION_TYPE_OPERATOR_REQUESTED = "operator_requested"
 _DEFAULT_APPROVAL_MAX_STEPS = 16
 _ABANDONED_RUN_REASON = "event_stream_closed"
 _INCOMPLETE_RECOVERY_CLAIM_LEASE = timedelta(minutes=5)
 _INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_INTERVAL_SECONDS = 30.0
 _INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_RETRY_SECONDS = 5.0
+_MANUAL_RECOVERY_INTERRUPT_POLL_INTERVAL_SECONDS = 0.25
 _RECOVERY_RESUMABLE_SESSION_STATUSES = {
     SessionStatus.COMPLETED,
     SessionStatus.FAILED,
     SessionStatus.INTERRUPTED,
+}
+_TOOL_ROUND_RECOVERABLE_SESSION_STATUSES = {
+    SessionStatus.RUNNING,
+    SessionStatus.INTERRUPTING,
+    SessionStatus.INTERRUPTED,
+    SessionStatus.FAILED,
 }
 
 logger = logging.getLogger(__name__)
@@ -125,15 +139,25 @@ RecoveryCleanup = Callable[[], Awaitable[None]]
 
 def _recovery_abandonment_signal(
     error: BaseException | None,
+    *,
+    cancellation_baseline: int = 0,
 ) -> GeneratorExit | asyncio.CancelledError | None:
     """Find explicit abandonment, preferring cancellation for cleanup shielding."""
     if isinstance(error, GeneratorExit | asyncio.CancelledError):
         return error
     if isinstance(error, BaseExceptionGroup):
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            task = None
+        cancellation_delivered = task is None or task.cancelling() > cancellation_baseline
         generator_exit: GeneratorExit | None = None
         for child in error.exceptions:
-            abandonment = _recovery_abandonment_signal(child)
-            if isinstance(abandonment, asyncio.CancelledError):
+            abandonment = _recovery_abandonment_signal(
+                child,
+                cancellation_baseline=cancellation_baseline,
+            )
+            if isinstance(abandonment, asyncio.CancelledError) and cancellation_delivered:
                 return abandonment
             if isinstance(abandonment, GeneratorExit) and generator_exit is None:
                 generator_exit = abandonment
@@ -141,11 +165,24 @@ def _recovery_abandonment_signal(
     return None
 
 
+def _task_cancellation_count() -> int:
+    """Return the current task's cancellation generation for boundary tracking."""
+    task = asyncio.current_task()
+    return 0 if task is None else task.cancelling()
+
+
+def _prepend_exception_cause(error: BaseException, cause: BaseException) -> None:
+    """Preserve a new structured cause without discarding an existing chain."""
+    cause.__cause__ = error.__cause__
+    error.__cause__ = cause
+
+
 async def _run_recovery_cleanup_steps(
     *,
     authoritative_failure: BaseException | None,
     steps: tuple[tuple[str, RecoveryCleanup], ...],
-) -> None:
+    cancellation_baseline: int = 0,
+) -> tuple[tuple[str, BaseException], ...]:
     """Run every handoff cleanup without obscuring its triggering failure.
 
     Once task cancellation starts a continuation handoff, a later ``cancel()``
@@ -165,7 +202,10 @@ async def _run_recovery_cleanup_steps(
                 cleanup_failures.append((operation, cleanup_failure))
         return cleanup_failures
 
-    abandonment = _recovery_abandonment_signal(authoritative_failure)
+    abandonment = _recovery_abandonment_signal(
+        authoritative_failure,
+        cancellation_baseline=cancellation_baseline,
+    )
     if isinstance(abandonment, asyncio.CancelledError):
         cleanup_task = asyncio.create_task(run_steps())
         while not cleanup_task.done():
@@ -180,23 +220,39 @@ async def _run_recovery_cleanup_steps(
         cleanup_failures = await run_steps()
 
     if not cleanup_failures:
-        return
+        return ()
     if authoritative_failure is not None and not isinstance(authoritative_failure, GeneratorExit):
+        failures = tuple(cleanup_failures)
         for operation, cleanup_failure in cleanup_failures:
             authoritative_failure.add_note(
                 "Continuation recovery cleanup failed during "
                 f"{operation}: {type(cleanup_failure).__name__}. "
                 "The original failure remains authoritative."
             )
-        return
+        _prepend_exception_cause(
+            authoritative_failure,
+            BaseExceptionGroup(
+                "Continuation recovery cleanup failures",
+                [failure for _operation, failure in failures],
+            ),
+        )
+        return failures
 
     operation, first_failure = cleanup_failures[0]
     for later_operation, later_failure in cleanup_failures[1:]:
         first_failure.add_note(
             "Additional continuation recovery cleanup failure during "
-            f"{later_operation}: {type(later_failure).__name__}."
+            f"{later_operation}: {later_failure!r}."
         )
     first_failure.add_note(f"Continuation recovery cleanup failed during {operation}.")
+    if len(cleanup_failures) > 1:
+        _prepend_exception_cause(
+            first_failure,
+            BaseExceptionGroup(
+                "Additional continuation recovery cleanup failures",
+                [failure for _operation, failure in cleanup_failures[1:]],
+            ),
+        )
     raise first_failure
 
 
@@ -298,6 +354,38 @@ class _IncompleteRecoveryClaimLost(RuntimeError):
     """The durable incomplete-session recovery lease is no longer owned."""
 
 
+class _ManualRecoveryInterrupted(RuntimeError):
+    """A durable interruption won before manual recovery could claim the session."""
+
+
+class _ManualRecoveryCascadePending(RuntimeError):
+    """Descendant interruption must finish before manual recovery can continue."""
+
+
+@dataclass(frozen=True)
+class _ManualRecoveryInterruptionFence:
+    session: Session
+    claim_id: str
+    error: BaseException | None
+
+
+@dataclass(frozen=True)
+class _ManualRecoveryEventDelivery:
+    event: Event
+    consumed: asyncio.Event
+
+
+@dataclass(frozen=True)
+class _ManualRecoveryStreamOutcome:
+    error: BaseException | None
+
+
+@dataclass(frozen=True)
+class _ManualRecoverySupervisorResult:
+    error: BaseException | None
+    cleanup_failure: BaseException | None
+
+
 @dataclass(frozen=True)
 class _ManualRecoveryPersistenceReconciliation:
     persisted: bool | None
@@ -372,6 +460,7 @@ class RecoveryCoordinator:
         authoritative_failure: BaseException | None,
         finalize_abandoned: bool,
         release_run_fence: bool,
+        abort_environment_setup: bool = True,
     ) -> None:
         cleanup_steps: list[tuple[str, RecoveryCleanup]] = []
         if stream is not None:
@@ -383,7 +472,7 @@ class RecoveryCoordinator:
                     lambda: self.finalize_abandoned_session_by_id(session_id),
                 )
             )
-        if authoritative_failure is not None:
+        if abort_environment_setup and authoritative_failure is not None:
             cleanup_steps.append(
                 (
                     "environment setup abort",
@@ -1435,6 +1524,7 @@ class RecoveryCoordinator:
     ) -> AsyncGenerator[Event, None]:
         recovery_prepared = False
         recovery_persisted = False
+        cancellation_baseline = _task_cancellation_count()
         recovery_event_to_reconcile: Event | None = None
         authoritative_failure: BaseException | None = None
         abandoned = False
@@ -1585,7 +1675,13 @@ class RecoveryCoordinator:
                     )
                 except BaseException as reconciliation_failure:
                     authoritative_failure = reconciliation_failure
-                    abandoned = _recovery_abandonment_signal(reconciliation_failure) is not None
+                    abandoned = (
+                        _recovery_abandonment_signal(
+                            reconciliation_failure,
+                            cancellation_baseline=cancellation_baseline,
+                        )
+                        is not None
+                    )
                     raise
                 if reconciliation.cancellation is not None:
                     reconciliation.cancellation.add_note(
@@ -1626,7 +1722,13 @@ class RecoveryCoordinator:
                         yield event
                 except BaseException as interruption_failure:
                     authoritative_failure = interruption_failure
-                    abandoned = _recovery_abandonment_signal(interruption_failure) is not None
+                    abandoned = (
+                        _recovery_abandonment_signal(
+                            interruption_failure,
+                            cancellation_baseline=cancellation_baseline,
+                        )
+                        is not None
+                    )
                     raise
                 # The original failure is now represented by durable interrupted
                 # state. It must not suppress a later fence-release failure.
@@ -1636,7 +1738,23 @@ class RecoveryCoordinator:
             raise
         except BaseExceptionGroup as exc:
             authoritative_failure = exc
-            abandoned = _recovery_abandonment_signal(exc) is not None
+            abandoned = (
+                _recovery_abandonment_signal(
+                    exc,
+                    cancellation_baseline=cancellation_baseline,
+                )
+                is not None
+            )
+            if recovery_persisted and not abandoned:
+                async for event in self._interrupt_session_for_recovery(
+                    RecoveryInterruptionRequest(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=_environment_name(registered_environment),
+                    )
+                ):
+                    yield event
             raise
         finally:
             if not recovery_prepared:
@@ -1681,7 +1799,13 @@ class RecoveryCoordinator:
                 yield event
         except BaseException as exc:
             authoritative_failure = exc
-            abandoned = _recovery_abandonment_signal(exc) is not None
+            abandoned = (
+                _recovery_abandonment_signal(
+                    exc,
+                    cancellation_baseline=cancellation_baseline,
+                )
+                is not None
+            )
             raise
         finally:
             await self._cleanup_recovery_handoff(
@@ -1706,6 +1830,7 @@ class RecoveryCoordinator:
     ) -> AsyncGenerator[Event, None]:
         recovery_prepared = False
         recovery_persisted = False
+        cancellation_baseline = _task_cancellation_count()
         recovery_event_to_reconcile: Event | None = None
         authoritative_failure: BaseException | None = None
         abandoned = False
@@ -1858,7 +1983,13 @@ class RecoveryCoordinator:
                     )
                 except BaseException as reconciliation_failure:
                     authoritative_failure = reconciliation_failure
-                    abandoned = _recovery_abandonment_signal(reconciliation_failure) is not None
+                    abandoned = (
+                        _recovery_abandonment_signal(
+                            reconciliation_failure,
+                            cancellation_baseline=cancellation_baseline,
+                        )
+                        is not None
+                    )
                     raise
                 if reconciliation.cancellation is not None:
                     reconciliation.cancellation.add_note(
@@ -1899,7 +2030,13 @@ class RecoveryCoordinator:
                         yield event
                 except BaseException as interruption_failure:
                     authoritative_failure = interruption_failure
-                    abandoned = _recovery_abandonment_signal(interruption_failure) is not None
+                    abandoned = (
+                        _recovery_abandonment_signal(
+                            interruption_failure,
+                            cancellation_baseline=cancellation_baseline,
+                        )
+                        is not None
+                    )
                     raise
                 # The original failure is now represented by durable interrupted
                 # state. It must not suppress a later fence-release failure.
@@ -1909,7 +2046,23 @@ class RecoveryCoordinator:
             raise
         except BaseExceptionGroup as exc:
             authoritative_failure = exc
-            abandoned = _recovery_abandonment_signal(exc) is not None
+            abandoned = (
+                _recovery_abandonment_signal(
+                    exc,
+                    cancellation_baseline=cancellation_baseline,
+                )
+                is not None
+            )
+            if recovery_persisted and not abandoned:
+                async for event in self._interrupt_session_for_recovery(
+                    RecoveryInterruptionRequest(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=_environment_name(registered_environment),
+                    )
+                ):
+                    yield event
             raise
         finally:
             if not recovery_prepared:
@@ -1954,7 +2107,13 @@ class RecoveryCoordinator:
                 yield event
         except BaseException as exc:
             authoritative_failure = exc
-            abandoned = _recovery_abandonment_signal(exc) is not None
+            abandoned = (
+                _recovery_abandonment_signal(
+                    exc,
+                    cancellation_baseline=cancellation_baseline,
+                )
+                is not None
+            )
             raise
         finally:
             await self._cleanup_recovery_handoff(
@@ -1965,7 +2124,634 @@ class RecoveryCoordinator:
                 release_run_fence=True,
             )
 
+    async def _claim_manual_tool_round_recovery(
+        self,
+        *,
+        session: Session,
+        pending_round: tool_round_recovery.PendingToolRound,
+        pending_tool_call: PendingToolCallApproval,
+    ) -> _IncompleteRecoveryClaim | _ManualRecoveryInterruptionFence:
+        """Claim recovery or fence an operator interruption that won the race."""
+        claim_id = str(uuid4())
+        claim_expires_at: datetime | None = None
+        claim_run_epoch: int | None = None
+        session_before_fence: Session | None = None
+
+        def require_matching_pending_call(checkpoint: dict[str, Any] | None) -> None:
+            current_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+            if current_round is None:
+                raise RuntimeError("Session has no pending tool round.")
+            if current_round.round_id != pending_round.round_id:
+                raise RuntimeError("Pending tool round changed before recovery claimed it.")
+            if current_round != pending_round:
+                raise RuntimeError("Pending tool round changed before recovery claimed it.")
+            current_tool_call = approval_support.round_tool_call_for_recovery(
+                pending_calls=current_round.tool_calls,
+                tool_call_id=pending_tool_call.tool_call_id,
+            )
+            if current_tool_call != pending_tool_call:
+                raise RuntimeError("Pending tool call changed before recovery claimed it.")
+
+        def claim_checkpoint(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any]:
+            nonlocal claim_expires_at, claim_run_epoch, session_before_fence
+            claimed_at = self._clock()
+            _require_aware_datetime(claimed_at, "manual recovery claim clock")
+            pending_operator_interruption = (
+                checkpoint is not None and _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY in checkpoint
+            )
+            interruption_advanced = (
+                pending_operator_interruption
+                or current_session.status == SessionStatus.INTERRUPTING
+                or (
+                    current_session.status == SessionStatus.INTERRUPTED
+                    and (
+                        session.status != SessionStatus.INTERRUPTED
+                        or current_session.run_epoch != session.run_epoch
+                    )
+                )
+            )
+            if interruption_advanced:
+                raise _ManualRecoveryInterrupted(
+                    "Session interruption became durable before manual recovery claimed it."
+                )
+            if (
+                checkpoint is not None
+                and _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY in checkpoint
+            ):
+                raise _ManualRecoveryCascadePending(
+                    "Session has an incomplete background interruption cascade."
+                )
+            checkpoint = _checkpoint_without_active_incomplete_recovery_claim(
+                checkpoint,
+                now=claimed_at,
+            )
+            require_matching_pending_call(checkpoint)
+            claim_expires_at = claimed_at + _INCOMPLETE_RECOVERY_CLAIM_LEASE
+            claim_run_epoch = current_session.run_epoch + 1
+            session_before_fence = current_session.model_copy(deep=True)
+            updated = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+            updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY] = {
+                "version": 1,
+                "claim_id": claim_id,
+                "claimed_at": claimed_at.isoformat(),
+                "claim_expires_at": claim_expires_at.isoformat(),
+                "operation": "manual_tool_round_recovery",
+                "tool_round_id": pending_round.round_id,
+                "tool_call_id": pending_tool_call.tool_call_id,
+            }
+            return updated
+
+        transition_task = asyncio.create_task(
+            self._session_store.transition_status_and_checkpoint(
+                session.id,
+                from_statuses=_TOOL_ROUND_RECOVERABLE_SESSION_STATUSES,
+                to_status=SessionStatus.RUNNING,
+                checkpoint_transform=claim_checkpoint,
+            )
+        )
+        outcome = await await_shielded_task_outcome(transition_task)
+
+        if outcome.error is not None:
+            if isinstance(outcome.error, _ManualRecoveryCascadePending):
+                if outcome.cancellation is not None:
+                    outcome.cancellation.add_note(
+                        "Manual tool-round recovery was blocked by an incomplete "
+                        "background interruption cascade."
+                    )
+                    raise outcome.cancellation from outcome.error
+                raise outcome.error
+            if isinstance(outcome.error, _ManualRecoveryInterrupted):
+
+                def fence_interruption(
+                    _current_session: Session,
+                    checkpoint: dict[str, Any] | None,
+                ) -> dict[str, Any]:
+                    nonlocal claim_expires_at, claim_run_epoch
+                    require_matching_pending_call(checkpoint)
+                    claimed_at = self._clock()
+                    _require_aware_datetime(claimed_at, "manual recovery fence clock")
+                    claim_expires_at = claimed_at + _INCOMPLETE_RECOVERY_CLAIM_LEASE
+                    claim_run_epoch = _current_session.run_epoch + 1
+                    updated = (
+                        {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+                    )
+                    updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY] = {
+                        "version": 1,
+                        "claim_id": claim_id,
+                        "claimed_at": claimed_at.isoformat(),
+                        "claim_expires_at": claim_expires_at.isoformat(),
+                        "operation": "manual_tool_round_interruption_fence",
+                        "tool_round_id": pending_round.round_id,
+                        "tool_call_id": pending_tool_call.tool_call_id,
+                    }
+                    return updated
+
+                fence_outcome = await await_shielded_task_outcome(
+                    asyncio.create_task(
+                        self._session_store.fence_run_and_transform_checkpoint(
+                            session.id,
+                            statuses={
+                                SessionStatus.INTERRUPTING,
+                                SessionStatus.INTERRUPTED,
+                            },
+                            checkpoint_transform=fence_interruption,
+                        )
+                    ),
+                    cancellation=outcome.cancellation,
+                )
+                interruption_error: BaseException | None = fence_outcome.cancellation
+                if fence_outcome.error is not None:
+                    interruption_error = fence_outcome.cancellation or fence_outcome.error
+                    reconciliation_outcome = await await_shielded_task_outcome(
+                        asyncio.create_task(
+                            self._load_owned_incomplete_recovery_claim(
+                                session.id,
+                                claim_id,
+                                expected_run_epoch=claim_run_epoch,
+                            )
+                        ),
+                        cancellation=fence_outcome.cancellation,
+                    )
+                    reconciliation_cancellation = reconciliation_outcome.cancellation
+                    reconciliation_failure = reconciliation_outcome.error
+                    if reconciliation_failure is not None:
+                        if not isinstance(
+                            reconciliation_failure,
+                            Exception | asyncio.CancelledError,
+                        ):
+                            raise reconciliation_failure from fence_outcome.error
+                        interruption_error.add_note(
+                            "Could not reconcile whether the interrupted manual recovery "
+                            "fence committed: "
+                            f"{type(reconciliation_failure).__name__}."
+                        )
+                        if reconciliation_cancellation is not None:
+                            reconciliation_cancellation.add_note(
+                                "Interrupted manual recovery fence transition also failed: "
+                                f"{type(fence_outcome.error).__name__}."
+                            )
+                            raise reconciliation_cancellation from fence_outcome.error
+                        raise fence_outcome.error
+                    elif reconciliation_outcome.result is not None:
+                        fenced_session = reconciliation_outcome.result
+                        if reconciliation_cancellation is not None:
+                            interruption_error = reconciliation_cancellation
+                            interruption_error.add_note(
+                                "Interrupted manual recovery fence transition also failed: "
+                                f"{type(fence_outcome.error).__name__}."
+                            )
+                    else:
+                        if reconciliation_cancellation is not None:
+                            reconciliation_cancellation.add_note(
+                                "Interrupted manual recovery fence transition also failed: "
+                                f"{type(fence_outcome.error).__name__}."
+                            )
+                            raise reconciliation_cancellation from fence_outcome.error
+                        raise fence_outcome.error
+                else:
+                    fenced_session = fence_outcome.result
+                if fenced_session is None:
+                    raise RuntimeError("Interrupted manual recovery fence returned no session.")
+                if claim_expires_at is None or claim_run_epoch is None:
+                    raise RuntimeError("Interrupted manual recovery fence persisted no claim.")
+                if fenced_session.run_epoch != claim_run_epoch:
+                    raise RuntimeError(
+                        "Interrupted manual recovery fence returned an unexpected run epoch."
+                    )
+                _activate_session_run_fence(fenced_session)
+                return _ManualRecoveryInterruptionFence(
+                    session=fenced_session,
+                    claim_id=claim_id,
+                    error=interruption_error,
+                )
+
+            reconciliation_outcome = await await_shielded_task_outcome(
+                asyncio.create_task(
+                    self._load_owned_incomplete_recovery_claim(
+                        session.id,
+                        claim_id,
+                        expected_run_epoch=claim_run_epoch,
+                    )
+                ),
+                cancellation=outcome.cancellation,
+            )
+            reconciliation_cancellation = reconciliation_outcome.cancellation
+            reconciliation_failure = reconciliation_outcome.error
+            if reconciliation_cancellation is None and isinstance(
+                reconciliation_failure,
+                asyncio.CancelledError,
+            ):
+                reconciliation_cancellation = reconciliation_failure
+            authoritative_failure = reconciliation_cancellation or outcome.error
+            if reconciliation_failure is not None:
+                if not isinstance(reconciliation_failure, Exception | asyncio.CancelledError):
+                    raise reconciliation_failure from outcome.error
+                authoritative_failure.add_note(
+                    "Could not reconcile whether the manual tool-round recovery claim "
+                    f"committed: {type(reconciliation_failure).__name__}."
+                )
+            elif reconciliation_outcome.result is not None:
+                reconciled_session = reconciliation_outcome.result
+                _activate_session_run_fence(reconciled_session)
+                await _run_recovery_cleanup_steps(
+                    authoritative_failure=authoritative_failure,
+                    steps=(
+                        (
+                            "ambiguous manual recovery claim finalization",
+                            lambda: self.finalize_abandoned_session_by_id(reconciled_session.id),
+                        ),
+                        (
+                            "ambiguous manual recovery claim cleanup",
+                            lambda: self._cleanup_incomplete_recovery_claim(
+                                session_id=reconciled_session.id,
+                                claim_id=claim_id,
+                                authoritative_failure=authoritative_failure,
+                            ),
+                        ),
+                    ),
+                )
+            if reconciliation_cancellation is not None:
+                reconciliation_cancellation.add_note(
+                    "Manual tool-round recovery claim transition also failed: "
+                    f"{type(outcome.error).__name__}."
+                )
+                raise reconciliation_cancellation from outcome.error
+            raise outcome.error
+        claimed_session = outcome.result
+        if claimed_session is None:
+            raise RuntimeError("Manual tool-round recovery claim returned no session.")
+
+        # The durable transition ran in a shielded child task. Bind its epoch to
+        # the caller that will perform recovery writes and eventual cleanup.
+        _activate_session_run_fence(claimed_session)
+        if (
+            claim_expires_at is None
+            or claim_run_epoch is None
+            or session_before_fence is None
+            or claimed_session.run_epoch != claim_run_epoch
+        ):
+            invariant_failure = RuntimeError(
+                "Manual tool-round recovery transition did not persist its claim."
+            )
+            await _run_recovery_cleanup_steps(
+                authoritative_failure=invariant_failure,
+                steps=(
+                    (
+                        "abandoned manual recovery finalization",
+                        lambda: self.finalize_abandoned_session_by_id(claimed_session.id),
+                    ),
+                    (
+                        "manual recovery claim cleanup",
+                        lambda: self._cleanup_incomplete_recovery_claim(
+                            session_id=claimed_session.id,
+                            claim_id=claim_id,
+                            authoritative_failure=invariant_failure,
+                        ),
+                    ),
+                ),
+            )
+            raise invariant_failure
+
+        claim = _IncompleteRecoveryClaim(
+            claim_id=claim_id,
+            claim_expires_at=claim_expires_at,
+            session_before_fence=session_before_fence,
+            session=claimed_session,
+        )
+        if outcome.cancellation is None:
+            return claim
+
+        await _run_recovery_cleanup_steps(
+            authoritative_failure=outcome.cancellation,
+            steps=(
+                (
+                    "abandoned manual recovery finalization",
+                    lambda: self.finalize_abandoned_session_by_id(claimed_session.id),
+                ),
+                (
+                    "manual recovery claim cleanup",
+                    lambda: self._cleanup_incomplete_recovery_claim(
+                        session_id=claimed_session.id,
+                        claim_id=claim.claim_id,
+                        authoritative_failure=outcome.cancellation,
+                    ),
+                ),
+            ),
+        )
+        raise outcome.cancellation
+
     async def recover_tool_round(
+        self,
+        *,
+        request: ToolRoundRecoveryRequest,
+        loaded_session: Session,
+        pending_round: tool_round_recovery.PendingToolRound,
+        pending_tool_call: PendingToolCallApproval,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        effective_structured_output: StructuredOutputSpec | None,
+    ) -> AsyncGenerator[Event, None]:
+        """Claim one manual recovery durably and stream its owned continuation."""
+        caller_runtime_task = asyncio.current_task()
+        interrupted_baseline = await self._session_control.latest_interrupted_event(
+            loaded_session.id
+        )
+        interrupted_baseline_id = None if interrupted_baseline is None else interrupted_baseline.id
+        claim = await self._claim_manual_tool_round_recovery(
+            session=loaded_session,
+            pending_round=pending_round,
+            pending_tool_call=pending_tool_call,
+        )
+        if isinstance(claim, _ManualRecoveryInterruptionFence):
+            authoritative_failure = claim.error
+            interruption_request = RecoveryInterruptionRequest(
+                session=claim.session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                environment_name=_environment_name(registered_environment),
+            )
+
+            async def finalize_owned_interruption() -> None:
+                async for _ in self._interrupt_session_for_recovery(interruption_request):
+                    pass
+
+            try:
+                if claim.error is not None:
+                    # Reconciliation proved this exact fence committed. Finish
+                    # its operator interruption directly even when the session
+                    # was already INTERRUPTED; the generic abandoned-session
+                    # finalizer deliberately ignores terminal statuses.
+                    await _run_recovery_cleanup_steps(
+                        authoritative_failure=claim.error,
+                        steps=(
+                            (
+                                "interrupted manual recovery finalization",
+                                finalize_owned_interruption,
+                            ),
+                        ),
+                    )
+                    raise claim.error
+                async for event in self._interrupt_session_for_recovery(interruption_request):
+                    yield event
+            except BaseException as exc:
+                authoritative_failure = exc
+                raise
+            finally:
+                await _run_recovery_cleanup_steps(
+                    authoritative_failure=authoritative_failure,
+                    steps=(
+                        (
+                            "interrupted manual recovery claim release",
+                            lambda: self._cleanup_incomplete_recovery_claim(
+                                session_id=claim.session.id,
+                                claim_id=claim.claim_id,
+                                authoritative_failure=authoritative_failure,
+                            ),
+                        ),
+                    ),
+                )
+            return
+        stop_heartbeat = asyncio.Event()
+        heartbeat_task = asyncio.create_task(
+            self._heartbeat_incomplete_recovery_claim(
+                session_id=claim.session.id,
+                claim_id=claim.claim_id,
+                claim_expires_at=claim.claim_expires_at,
+                stop=stop_heartbeat,
+            )
+        )
+        stop_interruption_watch = asyncio.Event()
+        interruption_watch_task = asyncio.create_task(
+            self._watch_manual_recovery_interruption(
+                session_id=claim.session.id,
+                interrupted_baseline_id=interrupted_baseline_id,
+                stop=stop_interruption_watch,
+            )
+        )
+        recovery_stream = self._recover_tool_round_claimed(
+            request=request,
+            loaded_session=claim.session_before_fence,
+            session=claim.session,
+            pending_round=pending_round,
+            pending_tool_call=pending_tool_call,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            registered_environment=registered_environment,
+            effective_structured_output=effective_structured_output,
+        )
+        deliveries: asyncio.Queue[_ManualRecoveryEventDelivery | _ManualRecoveryStreamOutcome] = (
+            asyncio.Queue(maxsize=2)
+        )
+        consumer_stopped = asyncio.Event()
+        supervisor_started = asyncio.Event()
+        consumer_stop_failure: BaseException | None = None
+
+        def heartbeat_failure() -> BaseException | None:
+            if not heartbeat_task.done():
+                return None
+            if heartbeat_task.cancelled():
+                return _IncompleteRecoveryClaimLost(
+                    "Manual tool-round recovery claim heartbeat was cancelled unexpectedly."
+                )
+            failure = heartbeat_task.exception()
+            if failure is not None:
+                return failure
+            return _IncompleteRecoveryClaimLost(
+                "Manual tool-round recovery claim heartbeat stopped unexpectedly."
+            )
+
+        def interruption_watch_failure() -> BaseException | None:
+            if not interruption_watch_task.done():
+                return None
+            if interruption_watch_task.cancelled():
+                return RuntimeError(
+                    "Manual tool-round recovery interruption watcher was cancelled unexpectedly."
+                )
+            failure = interruption_watch_task.exception()
+            if failure is not None:
+                return failure
+            if interruption_watch_task.result():
+                return asyncio.CancelledError(
+                    "Manual tool-round recovery was interrupted by a durable request."
+                )
+            return RuntimeError(
+                "Manual tool-round recovery interruption watcher stopped unexpectedly."
+            )
+
+        async def stop_claim_heartbeat() -> None:
+            stop_heartbeat.set()
+            await heartbeat_task
+
+        async def stop_interruption_watcher() -> None:
+            stop_interruption_watch.set()
+            await interruption_watch_task
+
+        async def forward_recovery_events() -> None:
+            async for event in recovery_stream:
+                delivery = _ManualRecoveryEventDelivery(
+                    event=event,
+                    consumed=asyncio.Event(),
+                )
+                await deliveries.put(delivery)
+                await delivery.consumed.wait()
+                if consumer_stopped.is_set():
+                    raise asyncio.CancelledError
+
+        async def supervise_recovery() -> _ManualRecoverySupervisorResult:
+            recovery_task = asyncio.create_task(forward_recovery_events())
+            supervisor_runtime_task = asyncio.current_task()
+            authoritative_failure: BaseException | None = None
+            cleanup_failure: BaseException | None = None
+            if supervisor_runtime_task is not None:
+                self._session_control.register_active_control_task(
+                    claim.session.id,
+                    supervisor_runtime_task,
+                )
+            supervisor_started.set()
+
+            async def stop_recovery_worker() -> None:
+                if not recovery_task.done():
+                    recovery_task.cancel()
+                await asyncio.gather(recovery_task, return_exceptions=True)
+
+            try:
+                done, _pending = await asyncio.wait(
+                    {recovery_task, heartbeat_task, interruption_watch_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if interruption_watch_task in done:
+                    failure = interruption_watch_failure()
+                    if failure is None:  # pragma: no cover - task completion is exhaustive.
+                        raise AssertionError(
+                            "Recovery interruption watcher completed without an outcome."
+                        )
+                    raise failure
+                if heartbeat_task in done:
+                    failure = heartbeat_failure()
+                    if failure is None:  # pragma: no cover - task completion is exhaustive.
+                        raise AssertionError("Recovery heartbeat completed without an outcome.")
+                    raise failure
+                recovery_task.result()
+            except BaseException as exc:
+                authoritative_failure = (
+                    consumer_stop_failure
+                    if (
+                        consumer_stopped.is_set()
+                        and consumer_stop_failure is not None
+                        and isinstance(exc, asyncio.CancelledError)
+                    )
+                    else exc
+                )
+
+            try:
+                try:
+                    cleanup_failures = await _run_recovery_cleanup_steps(
+                        authoritative_failure=authoritative_failure,
+                        steps=(
+                            ("manual tool-round recovery event worker stop", stop_recovery_worker),
+                            (
+                                "manual tool-round recovery interruption watcher stop",
+                                stop_interruption_watcher,
+                            ),
+                            (
+                                "manual tool-round recovery handoff cleanup",
+                                lambda: self._cleanup_recovery_handoff(
+                                    stream=recovery_stream,
+                                    session_id=claim.session.id,
+                                    authoritative_failure=authoritative_failure,
+                                    finalize_abandoned=authoritative_failure is not None,
+                                    release_run_fence=False,
+                                ),
+                            ),
+                            ("manual tool-round recovery heartbeat stop", stop_claim_heartbeat),
+                            (
+                                "manual tool-round recovery claim release",
+                                lambda: self._cleanup_incomplete_recovery_claim(
+                                    session_id=claim.session.id,
+                                    claim_id=claim.claim_id,
+                                    authoritative_failure=authoritative_failure,
+                                ),
+                            ),
+                        ),
+                    )
+                    if cleanup_failures:
+                        cleanup_failure = BaseExceptionGroup(
+                            "Manual recovery cleanup failed",
+                            [failure for _operation, failure in cleanup_failures],
+                        )
+                except BaseException as cleanup_error:
+                    cleanup_failure = cleanup_error
+                    authoritative_failure = cleanup_error
+                await deliveries.put(_ManualRecoveryStreamOutcome(error=authoritative_failure))
+            finally:
+                if supervisor_runtime_task is not None:
+                    self._session_control.unregister_active_control_task(
+                        claim.session.id,
+                        supervisor_runtime_task,
+                    )
+            return _ManualRecoverySupervisorResult(
+                error=authoritative_failure,
+                cleanup_failure=cleanup_failure,
+            )
+
+        supervisor_task = asyncio.create_task(supervise_recovery())
+        supervisor_start_outcome = await await_shielded_task_outcome(
+            asyncio.create_task(supervisor_started.wait())
+        )
+        if caller_runtime_task is not None:
+            # CayuApp reserves the caller task before the durable claim. Once
+            # the supervisor is live, transfer process-local ownership so an
+            # operator interrupt targets one recovery layer rather than both.
+            self._session_control.unregister_active_task(
+                claim.session.id,
+                caller_runtime_task,
+            )
+        pending_delivery: _ManualRecoveryEventDelivery | None = None
+        authoritative_failure: BaseException | None = None
+
+        async def stop_supervisor() -> None:
+            nonlocal consumer_stop_failure
+            consumer_stop_failure = authoritative_failure
+            consumer_stopped.set()
+            if pending_delivery is not None:
+                pending_delivery.consumed.set()
+            if not supervisor_task.done():
+                supervisor_task.cancel()
+            await asyncio.gather(supervisor_task, return_exceptions=True)
+            if isinstance(consumer_stop_failure, GeneratorExit):
+                supervisor_result = supervisor_task.result()
+                if supervisor_result.cleanup_failure is not None:
+                    raise supervisor_result.cleanup_failure
+
+        try:
+            if supervisor_start_outcome.error is not None:
+                raise supervisor_start_outcome.error
+            if supervisor_start_outcome.cancellation is not None:
+                raise supervisor_start_outcome.cancellation
+            while True:
+                item = await deliveries.get()
+                if isinstance(item, _ManualRecoveryStreamOutcome):
+                    if item.error is not None:
+                        raise item.error
+                    return
+                pending_delivery = item
+                yield item.event
+                item.consumed.set()
+                pending_delivery = None
+        except BaseException as exc:
+            authoritative_failure = exc
+            raise
+        finally:
+            await _run_recovery_cleanup_steps(
+                authoritative_failure=authoritative_failure,
+                steps=(("manual tool-round recovery supervisor stop", stop_supervisor),),
+            )
+
+    async def _recover_tool_round_claimed(
         self,
         *,
         request: ToolRoundRecoveryRequest,
@@ -1992,6 +2778,7 @@ class RecoveryCoordinator:
         )
         environment_name = _environment_name(registered_environment)
         recovery_persisted = False
+        cancellation_baseline = _task_cancellation_count()
         recovery_event_to_reconcile: Event | None = None
 
         try:
@@ -2020,29 +2807,16 @@ class RecoveryCoordinator:
             for event in factory_resolution.events:
                 yield event
             if factory_resolution.error is not None:
-                session = await self._session_store.update_status(
-                    session.id,
-                    SessionStatus.INTERRUPTED,
-                )
-                async for event in self._emit_terminal_event_with_hooks(
-                    RecoveryTerminalEventRequest(
-                        event=Event(
-                            type=EventType.SESSION_INTERRUPTED,
-                            session_id=session.id,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            payload={
-                                "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
-                                "tool_round_id": pending_round.round_id,
-                                "error": str(factory_resolution.error),
-                                "error_type": type(factory_resolution.error).__name__,
-                            },
-                        ),
-                        phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                    )
+                async for event in self._interrupt_for_resumable_manual_recovery(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    payload={
+                        "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                        "tool_round_id": pending_round.round_id,
+                        "error": str(factory_resolution.error),
+                        "error_type": type(factory_resolution.error).__name__,
+                    },
                 ):
                     yield event
                 return
@@ -2125,29 +2899,17 @@ class RecoveryCoordinator:
                 next_call = next(
                     call for call in pending_round.tool_calls if call.tool_call_id in remaining_ids
                 )
-                session = await self._session_store.update_status(
-                    session.id, SessionStatus.INTERRUPTED
-                )
-                async for event in self._emit_terminal_event_with_hooks(
-                    RecoveryTerminalEventRequest(
-                        event=Event(
-                            type=EventType.SESSION_INTERRUPTED,
-                            session_id=session.id,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            payload={
-                                "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
-                                "manual_recovery_required": True,
-                                "tool_round_id": pending_round.round_id,
-                                "tool_call_id": next_call.tool_call_id,
-                                "tool_name": next_call.tool_name,
-                            },
-                        ),
-                        phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                    )
+                async for event in self._interrupt_for_resumable_manual_recovery(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    payload={
+                        "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                        "manual_recovery_required": True,
+                        "tool_round_id": pending_round.round_id,
+                        "tool_call_id": next_call.tool_call_id,
+                        "tool_name": next_call.tool_name,
+                    },
                 ):
                     yield event
                 return
@@ -2170,7 +2932,13 @@ class RecoveryCoordinator:
                         recovery_event_to_reconcile
                     )
                 except BaseException as reconciliation_failure:
-                    if _recovery_abandonment_signal(reconciliation_failure) is not None:
+                    if (
+                        _recovery_abandonment_signal(
+                            reconciliation_failure,
+                            cancellation_baseline=cancellation_baseline,
+                        )
+                        is not None
+                    ):
                         await _run_recovery_cleanup_steps(
                             authoritative_failure=reconciliation_failure,
                             steps=(
@@ -2199,7 +2967,57 @@ class RecoveryCoordinator:
                 recovery_persisted = reconciliation.persisted is True
                 reconciliation_error = reconciliation.error
             if not recovery_persisted and reconciliation_error is None:
-                await self._session_store.update_status(session.id, loaded_session.status)
+                if isinstance(exc, SessionRunFenced):
+                    raise
+                if loaded_session.status in {
+                    SessionStatus.RUNNING,
+                    SessionStatus.INTERRUPTING,
+                }:
+                    if loaded_session.status == SessionStatus.INTERRUPTING:
+                        session = await self._session_store.transition_status(
+                            session.id,
+                            from_statuses={SessionStatus.RUNNING},
+                            to_status=SessionStatus.INTERRUPTING,
+                        )
+                    async for event in self._interrupt_for_resumable_manual_recovery(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        payload={
+                            "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                            "tool_round_id": pending_round.round_id,
+                            "tool_call_id": pending_tool_call.tool_call_id,
+                            "manual_recovery_stale_live_failure": True,
+                            "error": str(exc),
+                            "error_type": type(exc).__name__,
+                            "resolved_by": resolution_actor_payload(request.resolved_by),
+                        },
+                    ):
+                        yield event
+                    return
+                try:
+                    await self._session_store.transition_status(
+                        session.id,
+                        from_statuses={SessionStatus.RUNNING},
+                        to_status=loaded_session.status,
+                    )
+                except SessionStatusConflict:
+                    current = await self._require_session(session.id)
+                    if current.status not in {
+                        SessionStatus.INTERRUPTING,
+                        SessionStatus.INTERRUPTED,
+                    }:
+                        raise
+                    async for event in self._interrupt_session_for_recovery(
+                        RecoveryInterruptionRequest(
+                            session=current,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            environment_name=_environment_name(registered_environment),
+                        )
+                    ):
+                        yield event
+                    return
                 raise
             persistence_payload = (
                 {"manual_recovery_persisted": True}
@@ -2226,7 +3044,21 @@ class RecoveryCoordinator:
                 yield event
             return
         except BaseExceptionGroup as exc:
-            if _recovery_abandonment_signal(exc) is not None:
+            abandonment = _recovery_abandonment_signal(
+                exc,
+                cancellation_baseline=cancellation_baseline,
+            )
+            if recovery_persisted and abandonment is None:
+                async for event in self._interrupt_session_for_recovery(
+                    RecoveryInterruptionRequest(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=_environment_name(registered_environment),
+                    )
+                ):
+                    yield event
+            if abandonment is not None:
                 await _run_recovery_cleanup_steps(
                     authoritative_failure=exc,
                     steps=(
@@ -2277,9 +3109,14 @@ class RecoveryCoordinator:
                 session_id=session.id,
                 authoritative_failure=authoritative_failure,
                 finalize_abandoned=(
-                    _recovery_abandonment_signal(authoritative_failure) is not None
+                    _recovery_abandonment_signal(
+                        authoritative_failure,
+                        cancellation_baseline=cancellation_baseline,
+                    )
+                    is not None
                 ),
                 release_run_fence=False,
+                abort_environment_setup=False,
             )
 
     async def close_interrupted_tool_round(
@@ -2595,6 +3432,22 @@ class RecoveryCoordinator:
         except Exception:
             await self._finalize_abandoned_without_registered_runtime(session.id)
             return
+        if session.status == SessionStatus.INTERRUPTING:
+            try:
+                async for _ in self._interrupt_session_for_recovery(
+                    RecoveryInterruptionRequest(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=_environment_name(registered_environment),
+                    )
+                ):
+                    pass
+                return
+            except BaseException:
+                # Preserve the existing best-effort fallback if the durable
+                # operator-interruption payload cannot be finalized.
+                pass
         with contextlib.suppress(BaseException):
             await self.finalize_abandoned_session_run(
                 RecoveryAbandonedSessionRequest(
@@ -2618,7 +3471,7 @@ class RecoveryCoordinator:
             )
         except Exception:
             return
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(BaseException):
             await self._event_writer.emit(
                 Event(
                     type=EventType.SESSION_INTERRUPTED,
@@ -2856,6 +3709,25 @@ class RecoveryCoordinator:
         finally:
             _deactivate_session_run_fence(session_id)
 
+    async def _load_owned_incomplete_recovery_claim(
+        self,
+        session_id: str,
+        claim_id: str,
+        *,
+        expected_run_epoch: int | None,
+    ) -> Session | None:
+        """Return the session only while the exact claim and its epoch are owned."""
+        if expected_run_epoch is None:
+            return None
+        checkpoint = await self._session_store.load_checkpoint(session_id)
+        persisted_claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
+        if persisted_claim is None or persisted_claim[0] != claim_id:
+            return None
+        session = await self._require_session(session_id)
+        if session.run_epoch != expected_run_epoch:
+            return None
+        return session
+
     async def _claim_incomplete_recovery(
         self,
         *,
@@ -2870,29 +3742,171 @@ class RecoveryCoordinator:
             )
         claim_id = str(uuid4())
         claim_expires_at: datetime | None = None
+        claim_run_epoch: int | None = None
+
+        if required_expired_claim_id is not None:
+            session_before_fence: Session | None = None
+
+            def replace_expired_claim(
+                current_session: Session,
+                checkpoint: dict[str, Any] | None,
+            ) -> dict[str, Any]:
+                nonlocal claim_expires_at, claim_run_epoch, session_before_fence
+                claimed_at = self._clock()
+                _require_aware_datetime(claimed_at, "recovery claim clock")
+                existing = _incomplete_recovery_claim_from_checkpoint(checkpoint)
+                if (
+                    existing is None
+                    or existing[0] != required_expired_claim_id
+                    or existing[1] > claimed_at
+                ):
+                    raise _IncompleteRecoveryClaimLost(
+                        "Expired incomplete-session recovery ownership changed."
+                    )
+                claim_expires_at = claimed_at + _INCOMPLETE_RECOVERY_CLAIM_LEASE
+                claim_run_epoch = current_session.run_epoch + 1
+                session_before_fence = current_session.model_copy(deep=True)
+                updated = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+                updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY] = {
+                    "version": 1,
+                    "claim_id": claim_id,
+                    "claimed_at": claimed_at.isoformat(),
+                    "claim_expires_at": claim_expires_at.isoformat(),
+                }
+                return updated
+
+            fence_task = asyncio.create_task(
+                self._session_store.fence_run_and_transform_checkpoint(
+                    session.id,
+                    statuses={session.status},
+                    checkpoint_transform=replace_expired_claim,
+                )
+            )
+            outcome = await await_shielded_task_outcome(fence_task)
+            if isinstance(
+                outcome.error,
+                _IncompleteRecoveryClaimLost | SessionStatusConflict,
+            ):
+                if outcome.cancellation is not None:
+                    outcome.cancellation.add_note(
+                        "Expired recovery takeover was rejected while cancellation was pending."
+                    )
+                    raise outcome.cancellation from outcome.error
+                return None
+
+            authoritative_failure = outcome.cancellation or outcome.error
+            fenced = outcome.result
+            if outcome.error is not None:
+                reconciliation_outcome = await await_shielded_task_outcome(
+                    asyncio.create_task(
+                        self._load_owned_incomplete_recovery_claim(
+                            session.id,
+                            claim_id,
+                            expected_run_epoch=claim_run_epoch,
+                        )
+                    ),
+                    cancellation=outcome.cancellation,
+                )
+                reconciliation_cancellation = reconciliation_outcome.cancellation
+                reconciliation_failure = reconciliation_outcome.error
+                if reconciliation_cancellation is None and isinstance(
+                    reconciliation_failure,
+                    asyncio.CancelledError,
+                ):
+                    reconciliation_cancellation = reconciliation_failure
+                authoritative_failure = (
+                    reconciliation_cancellation or outcome.cancellation or outcome.error
+                )
+                if reconciliation_failure is not None:
+                    if not isinstance(
+                        reconciliation_failure,
+                        Exception | asyncio.CancelledError,
+                    ):
+                        raise reconciliation_failure from outcome.error
+                    authoritative_failure.add_note(
+                        "Could not reconcile whether the expired recovery takeover "
+                        f"committed: {type(reconciliation_failure).__name__}."
+                    )
+                    if reconciliation_cancellation is not None:
+                        reconciliation_cancellation.add_note(
+                            "Expired recovery takeover also failed: "
+                            f"{type(outcome.error).__name__}."
+                        )
+                        raise reconciliation_cancellation from outcome.error
+                    raise outcome.error
+                fenced = reconciliation_outcome.result
+                if fenced is None:
+                    if reconciliation_cancellation is not None:
+                        reconciliation_cancellation.add_note(
+                            "Expired recovery takeover also failed: "
+                            f"{type(outcome.error).__name__}."
+                        )
+                        raise reconciliation_cancellation from outcome.error
+                    raise outcome.error
+
+            if fenced is None:
+                raise RuntimeError("Expired recovery takeover returned no session.")
+            _activate_session_run_fence(fenced)
+            if (
+                claim_expires_at is None
+                or claim_run_epoch is None
+                or session_before_fence is None
+                or fenced.run_epoch != claim_run_epoch
+            ):
+                invariant_failure = RuntimeError(
+                    "Expired recovery takeover did not persist its claim."
+                )
+                await self._cleanup_incomplete_recovery_claim(
+                    session_id=session.id,
+                    claim_id=claim_id,
+                    authoritative_failure=invariant_failure,
+                )
+                raise invariant_failure
+            claim = _IncompleteRecoveryClaim(
+                claim_id=claim_id,
+                claim_expires_at=claim_expires_at,
+                session_before_fence=session_before_fence,
+                session=fenced,
+            )
+            if authoritative_failure is None:
+                return claim
+            await self._cleanup_incomplete_recovery_claim(
+                session_id=session.id,
+                claim_id=claim_id,
+                authoritative_failure=authoritative_failure,
+            )
+            if outcome.cancellation is not None:
+                if outcome.error is not None:
+                    outcome.cancellation.add_note(
+                        f"Expired recovery takeover also failed: {type(outcome.error).__name__}."
+                    )
+                raise outcome.cancellation from outcome.error
+            raise outcome.error
+
+        session_before_fence: Session | None = None
 
         def claim_checkpoint(
             current_session: Session,
             checkpoint: dict[str, Any] | None,
-        ) -> dict[str, Any] | None:
-            nonlocal claim_expires_at
-            if current_session.status != session.status:
-                return None
-            if inactive_before is not None and current_session.last_activity_at > inactive_before:
-                return None
+        ) -> dict[str, Any]:
+            nonlocal claim_expires_at, claim_run_epoch, session_before_fence
             claimed_at = self._clock()
             _require_aware_datetime(claimed_at, "recovery claim clock")
             existing = _incomplete_recovery_claim_from_checkpoint(checkpoint)
-            if required_expired_claim_id is None:
-                if existing is not None and existing[1] > claimed_at:
-                    return None
-            elif (
-                existing is None
-                or existing[0] != required_expired_claim_id
-                or existing[1] > claimed_at
+            if (
+                current_session.status != session.status
+                or (
+                    inactive_before is not None
+                    and current_session.last_activity_at > inactive_before
+                )
+                or (existing is not None and existing[1] > claimed_at)
             ):
-                return None
+                raise _IncompleteRecoveryClaimLost(
+                    "Incomplete-session recovery ownership changed before it was claimed."
+                )
             claim_expires_at = claimed_at + _INCOMPLETE_RECOVERY_CLAIM_LEASE
+            claim_run_epoch = current_session.run_epoch + 1
+            session_before_fence = current_session.model_copy(deep=True)
             updated = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
             updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY] = {
                 "version": 1,
@@ -2904,35 +3918,119 @@ class RecoveryCoordinator:
 
         fence_claimed = False
         try:
-            await self._session_store.transform_checkpoint(session.id, claim_checkpoint)
-            if claim_expires_at is None:
-                return None
-            checkpoint = await self._session_store.load_checkpoint(session.id)
-            persisted_claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
-            if persisted_claim is None or persisted_claim[0] != claim_id:
+            fence_task = asyncio.create_task(
+                self._session_store.fence_run_and_transform_checkpoint(
+                    session.id,
+                    statuses={session.status},
+                    checkpoint_transform=claim_checkpoint,
+                )
+            )
+            outcome = await await_shielded_task_outcome(fence_task)
+            if isinstance(
+                outcome.error,
+                _IncompleteRecoveryClaimLost | SessionStatusConflict,
+            ):
+                if outcome.cancellation is not None:
+                    outcome.cancellation.add_note(
+                        "Incomplete-session recovery claim was rejected while cancellation "
+                        "was pending."
+                    )
+                    raise outcome.cancellation from outcome.error
                 return None
 
-            session_before_fence = await self._require_session(session.id)
-            fenced = await self._session_store.fence_stalled_run(
-                session.id,
-                statuses={session_before_fence.status},
-                inactive_before=session_before_fence.last_activity_at,
-            )
+            authoritative_failure = outcome.cancellation or outcome.error
+            fenced = outcome.result
+            if outcome.error is not None:
+                reconciliation_outcome = await await_shielded_task_outcome(
+                    asyncio.create_task(
+                        self._load_owned_incomplete_recovery_claim(
+                            session.id,
+                            claim_id,
+                            expected_run_epoch=claim_run_epoch,
+                        )
+                    ),
+                    cancellation=outcome.cancellation,
+                )
+                reconciliation_cancellation = reconciliation_outcome.cancellation
+                reconciliation_failure = reconciliation_outcome.error
+                if reconciliation_cancellation is None and isinstance(
+                    reconciliation_failure,
+                    asyncio.CancelledError,
+                ):
+                    reconciliation_cancellation = reconciliation_failure
+                authoritative_failure = (
+                    reconciliation_cancellation or outcome.cancellation or outcome.error
+                )
+                if reconciliation_failure is not None:
+                    if not isinstance(
+                        reconciliation_failure,
+                        Exception | asyncio.CancelledError,
+                    ):
+                        raise reconciliation_failure from outcome.error
+                    authoritative_failure.add_note(
+                        "Could not reconcile whether the incomplete-session recovery claim "
+                        f"committed: {type(reconciliation_failure).__name__}."
+                    )
+                    if reconciliation_cancellation is not None:
+                        reconciliation_cancellation.add_note(
+                            "Incomplete-session recovery claim also failed: "
+                            f"{type(outcome.error).__name__}."
+                        )
+                        raise reconciliation_cancellation from outcome.error
+                    raise outcome.error
+                fenced = reconciliation_outcome.result
+                if fenced is None:
+                    if reconciliation_cancellation is not None:
+                        reconciliation_cancellation.add_note(
+                            "Incomplete-session recovery claim also failed: "
+                            f"{type(outcome.error).__name__}."
+                        )
+                        raise reconciliation_cancellation from outcome.error
+                    raise outcome.error
+
             if fenced is None:
-                await self._release_incomplete_recovery_claim(session.id, claim_id)
-                return None
+                raise RuntimeError("Incomplete-session recovery claim returned no session.")
+            _activate_session_run_fence(fenced)
             fence_claimed = True
-            checkpoint = await self._session_store.load_checkpoint(session.id)
-            persisted_claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
-            if persisted_claim is None or persisted_claim[0] != claim_id:
-                await self._session_store.release_run_fence(session.id)
+            if (
+                claim_expires_at is None
+                or claim_run_epoch is None
+                or session_before_fence is None
+                or fenced.run_epoch != claim_run_epoch
+            ):
+                raise RuntimeError(
+                    "Incomplete-session recovery claim was not persisted atomically."
+                )
+            if authoritative_failure is not None:
+                if outcome.cancellation is not None:
+                    if outcome.error is not None:
+                        outcome.cancellation.add_note(
+                            "Incomplete-session recovery claim also failed: "
+                            f"{type(outcome.error).__name__}."
+                        )
+                    raise outcome.cancellation from outcome.error
+                raise outcome.error
+
+            try:
+                renewed_until = await self._renew_incomplete_recovery_claim(
+                    session.id,
+                    claim_id,
+                )
+            except SessionRunFenced:
+                await self._cleanup_incomplete_recovery_claim(
+                    session_id=session.id,
+                    claim_id=claim_id,
+                    authoritative_failure=None,
+                )
+                fence_claimed = False
                 return None
-            renewed_until = await self._renew_incomplete_recovery_claim(
-                session.id,
-                claim_id,
-            )
             if renewed_until is None:
-                await self._session_store.release_run_fence(session.id)
+                await self._cleanup_incomplete_recovery_claim(
+                    session_id=session.id,
+                    claim_id=claim_id,
+                    authoritative_failure=None,
+                )
+                fence_claimed = False
                 return None
             return _IncompleteRecoveryClaim(
                 claim_id=claim_id,
@@ -3061,6 +4159,38 @@ class RecoveryCoordinator:
                     ) from None
                 claim_expires_at = renewed_until
                 sleep_seconds = _INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_INTERVAL_SECONDS
+
+    async def _watch_manual_recovery_interruption(
+        self,
+        *,
+        session_id: str,
+        interrupted_baseline_id: str | None,
+        stop: asyncio.Event,
+    ) -> bool:
+        """Observe another worker's durable stop request while delivery is paused."""
+        while not stop.is_set():
+            session = await self._require_session(session_id)
+            if session.status == SessionStatus.INTERRUPTING:
+                return True
+            if session.status == SessionStatus.INTERRUPTED:
+                latest_interrupted = await self._session_control.latest_interrupted_event(
+                    session_id
+                )
+                if (
+                    latest_interrupted is not None
+                    and latest_interrupted.id != interrupted_baseline_id
+                    and latest_interrupted.payload.get("interruption_type")
+                    == _INTERRUPTION_TYPE_OPERATOR_REQUESTED
+                ):
+                    return True
+            try:
+                await asyncio.wait_for(
+                    stop.wait(),
+                    timeout=_MANUAL_RECOVERY_INTERRUPT_POLL_INTERVAL_SECONDS,
+                )
+            except TimeoutError:
+                continue
+        return False
 
     async def _renew_incomplete_recovery_claim(
         self,

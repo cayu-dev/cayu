@@ -207,6 +207,77 @@ def test_active_run_registry_cancels_other_owners_and_cleans_empty_sessions() ->
     asyncio.run(scenario())
 
 
+def test_control_task_registry_cancels_without_creating_run_delivery_state() -> None:
+    control = SessionControl[object](session_store=InMemorySessionStore())
+
+    async def scenario() -> None:
+        release = asyncio.Event()
+        control_task = asyncio.create_task(release.wait())
+        control.register_active_control_task("sess_control", control_task)
+        try:
+            assert control.active_runs("sess_control") == ()
+            assert control.has_active_tasks("sess_control") is True
+            assert control.cancel_active_runs("sess_control") is True
+            with pytest.raises(asyncio.CancelledError):
+                await control_task
+        finally:
+            control.unregister_active_control_task("sess_control", control_task)
+            if not control_task.done():
+                release.set()
+                await control_task
+
+        assert control.active_runs("sess_control") == ()
+        assert control.has_active_tasks("sess_control") is False
+
+    asyncio.run(scenario())
+
+
+def test_active_run_cancellation_precedes_control_supervisor_cancellation() -> None:
+    control = SessionControl[object](session_store=InMemorySessionStore())
+
+    async def scenario() -> None:
+        run_release = asyncio.Event()
+        supervisor_release = asyncio.Event()
+        run_task = asyncio.create_task(run_release.wait())
+        supervisor_task = asyncio.create_task(supervisor_release.wait())
+        control.register_active_task(
+            "sess_hierarchical_cancellation",
+            run_task,
+            task_id=None,
+            task_started=False,
+            task_finished=False,
+        )
+        control.register_active_control_task(
+            "sess_hierarchical_cancellation",
+            supervisor_task,
+        )
+        try:
+            assert control.cancel_active_runs("sess_hierarchical_cancellation") is True
+            with pytest.raises(asyncio.CancelledError):
+                await run_task
+            assert supervisor_task.done() is False
+
+            assert control.cancel_active_runs("sess_hierarchical_cancellation") is True
+            with pytest.raises(asyncio.CancelledError):
+                await supervisor_task
+        finally:
+            control.unregister_active_task("sess_hierarchical_cancellation", run_task)
+            control.unregister_active_control_task(
+                "sess_hierarchical_cancellation",
+                supervisor_task,
+            )
+            if not run_task.done():
+                run_release.set()
+                await run_task
+            if not supervisor_task.done():
+                supervisor_release.set()
+                await supervisor_task
+
+        assert control.has_active_tasks("sess_hierarchical_cancellation") is False
+
+    asyncio.run(scenario())
+
+
 def test_interruption_markers_keep_active_wait_alive_until_terminal_event(
     monkeypatch,
 ) -> None:

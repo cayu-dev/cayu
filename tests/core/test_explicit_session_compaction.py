@@ -492,7 +492,19 @@ def test_compact_session_fences_expired_recovery_owner_before_retry() -> None:
     async def run() -> None:
         now = datetime(2026, 7, 18, tzinfo=UTC)
         session_id = "sess_compact_expired_recovery_owner"
-        store = InMemorySessionStore()
+
+        class InterleavedTakeoverStore(InMemorySessionStore):
+            def __init__(self) -> None:
+                super().__init__()
+                self.takeover_started = asyncio.Event()
+                self.allow_takeover = asyncio.Event()
+
+            async def fence_run_and_transform_checkpoint(self, *args, **kwargs):
+                self.takeover_started.set()
+                await self.allow_takeover.wait()
+                return await super().fence_run_and_transform_checkpoint(*args, **kwargs)
+
+        store = InterleavedTakeoverStore()
         compactor = RecordingCompactor()
         app = CayuApp(session_store=store, enable_logging=False, clock=lambda: now)
         app.register_agent(
@@ -542,6 +554,12 @@ def test_compact_session_fences_expired_recovery_owner_before_retry() -> None:
 
             await store.transform_checkpoint(session_id, add_expired_claim)
             stale_owner_ready.set()
+            await store.takeover_started.wait()
+            await store.update_metadata(
+                session_id,
+                {"stale_owner_write_before_atomic_takeover": True},
+            )
+            store.allow_takeover.set()
             await release_stale_owner.wait()
             try:
                 with pytest.raises(SessionRunFenced):
@@ -572,6 +590,7 @@ def test_compact_session_fences_expired_recovery_owner_before_retry() -> None:
         after_takeover = await store.load(session_id)
         assert after_takeover is not None
         assert after_takeover.run_epoch > stale_epoch
+        assert after_takeover.metadata == {"stale_owner_write_before_atomic_takeover": True}
         checkpoint = await store.load_checkpoint(session_id)
         assert checkpoint is not None
         assert "incomplete_session_recovery_claim" not in checkpoint

@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
+
+if TYPE_CHECKING:
+    import pytest
 
 from cayu.core import AgentSpec, Message
 from cayu.core.events import Event, EventType
@@ -251,7 +254,9 @@ def test_abandoned_session_contains_cancellation_group_from_terminal_cleanup() -
     asyncio.run(scenario())
 
 
-def test_finalize_abandoned_session_does_not_require_registered_environment() -> None:
+def test_finalize_abandoned_session_does_not_require_registered_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     h = _build([_batch("x")])
 
     async def scenario() -> None:
@@ -268,6 +273,20 @@ def test_finalize_abandoned_session_does_not_require_registered_environment() ->
             "sess_missing_environment",
             from_statuses={SessionStatus.PENDING},
             to_status=SessionStatus.RUNNING,
+        )
+        original_emit = h.app._recovery_coordinator._event_writer.emit
+
+        async def emit_then_cancel(event: Event) -> Event:
+            await original_emit(event)
+            raise BaseExceptionGroup(
+                "terminal cleanup cancelled and failed",
+                [asyncio.CancelledError(), RuntimeError("cleanup failed")],
+            )
+
+        monkeypatch.setattr(
+            h.app._recovery_coordinator._event_writer,
+            "emit",
+            emit_then_cancel,
         )
 
         try:

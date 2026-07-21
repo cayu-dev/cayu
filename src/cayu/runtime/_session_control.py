@@ -110,6 +110,7 @@ class SessionControl(Generic[UsageTrackerT]):
     def __init__(self, *, session_store: SessionStore) -> None:
         self._session_store = session_store
         self._active_runs: dict[str, dict[asyncio.Task[Any], ActiveSessionRun[UsageTrackerT]]] = {}
+        self._active_control_tasks: dict[str, set[asyncio.Task[Any]]] = {}
         self._sessions_emitting_interrupted: set[str] = set()
         self._sessions_requesting_interruption: set[str] = set()
         self._interrupt_signals: dict[str, asyncio.Event] = {}
@@ -257,18 +258,44 @@ class SessionControl(Generic[UsageTrackerT]):
     def active_runs(self, session_id: str) -> tuple[ActiveSessionRun[UsageTrackerT], ...]:
         return tuple(self._active_runs.get(session_id, {}).values())
 
+    def register_active_control_task(self, session_id: str, task: asyncio.Task[Any]) -> None:
+        """Register cancellable ownership that carries no run or event-delivery state."""
+        session_id = require_clean_nonblank(session_id, "session_id")
+        self._active_control_tasks.setdefault(session_id, set()).add(task)
+
+    def unregister_active_control_task(self, session_id: str, task: asyncio.Task[Any]) -> None:
+        control_tasks = self._active_control_tasks.get(session_id)
+        if control_tasks is None:
+            return
+        control_tasks.discard(task)
+        if not control_tasks:
+            self._active_control_tasks.pop(session_id, None)
+
     def has_active_tasks(self, session_id: str) -> bool:
-        return any(
+        active_run_exists = any(
             not active_run.runtime_task.done() for active_run in self.active_runs(session_id)
+        )
+        return active_run_exists or any(
+            not task.done() for task in self._active_control_tasks.get(session_id, ())
         )
 
     def cancel_active_runs(self, session_id: str) -> bool:
         current_task = asyncio.current_task()
         signalled = False
-        for active_run in self.active_runs(session_id):
-            task = active_run.runtime_task
-            if task is current_task or task.done():
-                continue
+        run_tasks = {
+            active_run.runtime_task
+            for active_run in self.active_runs(session_id)
+            if active_run.runtime_task is not current_task and not active_run.runtime_task.done()
+        }
+        # Control tasks supervise phases that have no active run worker. Once a
+        # run worker exists, cancel it exactly once and leave the supervisor
+        # alive to coordinate terminal persistence and owned cleanup.
+        tasks = run_tasks or {
+            task
+            for task in self._active_control_tasks.get(session_id, ())
+            if task is not current_task and not task.done()
+        }
+        for task in tasks:
             task.cancel()
             signalled = True
         return signalled

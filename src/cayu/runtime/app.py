@@ -87,6 +87,8 @@ from cayu.runtime._environment_lifecycle import (
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._interruption_coordinator import (
+    _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY,
+    _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY,
     BackgroundInterruptionCoordinator,
     _copy_interruption_cascade_retry_request,
     _interruption_cascade_marker_datetime,
@@ -368,16 +370,6 @@ class SessionCompactionAttemptSuperseded(RuntimeError):
 logger = logging.getLogger(__name__)
 
 
-# A crashed ordinary tool round can leave the session FAILED (in-process
-# persistence error) or in a stale live status (process kill), so operator
-# reconciliation accepts all of them; INTERRUPTED covers interrupt-adjacent
-# shapes that preserved the pending round.
-_TOOL_ROUND_RECOVERABLE_SESSION_STATUSES = {
-    SessionStatus.RUNNING,
-    SessionStatus.INTERRUPTING,
-    SessionStatus.INTERRUPTED,
-    SessionStatus.FAILED,
-}
 _RESUMABLE_SESSION_STATUSES = {
     SessionStatus.COMPLETED,
     SessionStatus.FAILED,
@@ -388,8 +380,6 @@ _INTERRUPTIBLE_SESSION_STATUSES = {
     SessionStatus.PENDING,
     SessionStatus.RUNNING,
 }
-_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY = "pending_session_interrupt"
-_PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY = "pending_interruption_cascade"
 _SESSION_OPERATIONS_CHECKPOINT_KEY = "session_operations"
 _CONTEXT_COMPACTION_OPERATION_KIND = "context_compaction"
 _SESSION_OPERATION_CLAIM_LEASE = timedelta(minutes=5)
@@ -3821,6 +3811,18 @@ class CayuApp:
         )
         registered_environment = self._get_registered_environment_for_session(environment_name)
 
+        def reject_active_or_expired_recovery_claim(
+            source_checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any] | None:
+            claim_now = self._clock()
+            recovery_claim = _incomplete_recovery_claim_from_checkpoint(source_checkpoint)
+            if recovery_claim is not None and recovery_claim[1] <= claim_now:
+                raise _ExpiredIncompleteRecoveryClaim(recovery_claim[0])
+            return _checkpoint_without_active_incomplete_recovery_claim(
+                source_checkpoint,
+                now=claim_now,
+            )
+
         checkpoint_transform = None
         if request.copy_checkpoint:
 
@@ -3828,10 +3830,7 @@ class CayuApp:
                 current_source: Session,
                 source_checkpoint: dict[str, Any] | None,
             ) -> dict[str, Any] | None:
-                source_checkpoint = _checkpoint_without_active_incomplete_recovery_claim(
-                    source_checkpoint,
-                    now=self._clock(),
-                )
+                source_checkpoint = reject_active_or_expired_recovery_claim(source_checkpoint)
                 if (
                     source_checkpoint is not None
                     and _SESSION_OPERATIONS_CHECKPOINT_KEY in source_checkpoint
@@ -3875,10 +3874,7 @@ class CayuApp:
                 _current_source: Session,
                 source_checkpoint: dict[str, Any] | None,
             ) -> None:
-                source_checkpoint = _checkpoint_without_active_incomplete_recovery_claim(
-                    source_checkpoint,
-                    now=self._clock(),
-                )
+                source_checkpoint = reject_active_or_expired_recovery_claim(source_checkpoint)
                 if (
                     source_checkpoint is not None
                     and _SESSION_OPERATIONS_CHECKPOINT_KEY in source_checkpoint
@@ -3919,14 +3915,30 @@ class CayuApp:
             labels=source_session.labels,
             metadata=copy_json_value(fork_metadata, "metadata"),
         )
-        created = await self.session_store.create_fork(
-            source_session_id=source_session.id,
-            fork=fork_session,
-            source_statuses=_FORKABLE_SESSION_STATUSES,
-            transcript_cursor=request.transcript_cursor,
-            checkpoint_transform=checkpoint_transform,
-            expected_source_run_epoch=source_session.run_epoch,
-        )
+        try:
+            created = await self.session_store.create_fork(
+                source_session_id=source_session.id,
+                fork=fork_session,
+                source_statuses=_FORKABLE_SESSION_STATUSES,
+                transcript_cursor=request.transcript_cursor,
+                checkpoint_transform=checkpoint_transform,
+                expected_source_run_epoch=source_session.run_epoch,
+            )
+        except _ExpiredIncompleteRecoveryClaim as expired_claim:
+            current = await self._require_session(source_session.id)
+            fenced = await self._recovery_coordinator.fence_expired_incomplete_recovery_claim(
+                session=current,
+                claim_id=expired_claim.claim_id,
+            )
+            if not fenced:
+                raise RuntimeError(
+                    "Expired incomplete-session recovery ownership changed while the fork "
+                    "was fencing it; retry with current session state."
+                ) from None
+            raise ValueError(
+                "Session fork fenced an expired incomplete-session recovery owner; retry "
+                "with current session state."
+            ) from None
         yield await self._event_writer.emit(
             Event(
                 type=EventType.SESSION_FORKED,
@@ -4049,6 +4061,7 @@ class CayuApp:
         authoritative_failure: BaseException | None,
         finalize_abandoned: bool,
         release_run_fence: bool,
+        abort_environment_setup: bool = True,
     ) -> None:
         cleanup_steps: list[tuple[str, Callable[[], Awaitable[None]]]] = [
             ("nested stream close", stream.aclose)
@@ -4060,7 +4073,7 @@ class CayuApp:
                     lambda: self._recovery_coordinator.finalize_abandoned_session_by_id(session_id),
                 )
             )
-        if authoritative_failure is not None:
+        if abort_environment_setup and authoritative_failure is not None:
             cleanup_steps.append(
                 (
                     "environment setup abort",
@@ -4456,15 +4469,15 @@ class CayuApp:
         `manual_recovery_required` naming the next call; otherwise the round closes
         from the recorded outcomes and the model loop continues. A crashed round can
         leave the session FAILED (an in-process persistence error) or in a stale live
-        status (a process kill), so FAILED, RUNNING, and INTERRUPTING are accepted
-        alongside INTERRUPTED; the in-process claim registered while this recovery
-        streams blocks concurrent recoveries and the sweep, but — like the sweep —
-        it cannot see work active on another worker. If this call fails AFTER the
-        recovered terminal event persisted, the session closes to the resumable
-        INTERRUPTED state with the failure on the `session.interrupted` event and
-        the evidence stays durable: do not retry the same `tool_call_id` (the
-        guard rejects it) — `resume(...)` finishes the round from the persisted
-        outcome.
+        status (a process kill), so FAILED and RUNNING are accepted alongside
+        INTERRUPTED. An existing INTERRUPTING transition wins rather than being
+        reopened by recovery. The in-process claim registered while this recovery
+        streams blocks duplicate work in this process, while a durable recovery
+        claim serializes other workers and fences an expired owner. If this call
+        fails after claiming a stale live session, the session closes to the
+        resumable INTERRUPTED state. When the recovered terminal event is already
+        durable, the evidence remains authoritative: do not retry the same
+        `tool_call_id` — `resume(...)` finishes the round from the persisted outcome.
         """
         if type(request) is not ToolRoundRecoveryRequest:
             raise TypeError("Runtime tool round recovery requires a ToolRoundRecoveryRequest.")
@@ -4514,19 +4527,9 @@ class CayuApp:
                 task_started=False,
                 task_finished=False,
             )
-        try:
-            session = await self._transition_recovery_session_to_running(
-                loaded_session.id,
-                from_statuses=_TOOL_ROUND_RECOVERABLE_SESSION_STATUSES,
-            )
-        except BaseException:
-            if current_task is not None:
-                self._session_control.unregister_active_task(loaded_session.id, current_task)
-            raise
         recovery_stream = self._recovery_coordinator.recover_tool_round(
             request=request,
             loaded_session=loaded_session,
-            session=session,
             pending_round=pending_round,
             pending_tool_call=pending_tool_call,
             registered_agent=registered_agent,
@@ -4545,14 +4548,18 @@ class CayuApp:
             try:
                 await self._cleanup_recovery_handoff(
                     stream=recovery_stream,
-                    session_id=session.id,
+                    session_id=loaded_session.id,
                     authoritative_failure=authoritative_failure,
                     finalize_abandoned=False,
-                    release_run_fence=True,
+                    release_run_fence=False,
+                    abort_environment_setup=False,
                 )
             finally:
                 if current_task is not None:
-                    self._session_control.unregister_active_task(session.id, current_task)
+                    self._session_control.unregister_active_task(
+                        loaded_session.id,
+                        current_task,
+                    )
 
     async def _run_session(
         self,

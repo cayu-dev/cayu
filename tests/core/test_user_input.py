@@ -1695,7 +1695,7 @@ def test_recover_user_input_post_persist_fanout_failure_stays_resumable(
         persisted = await store.load_events(session_id)
         terminal = [event for event in persisted if event.type == EventType.SESSION_INTERRUPTED][-1]
         if grouped_cancellation:
-            assert terminal.payload["abandoned"] is True
+            assert terminal.payload.get("abandoned") is not True
         else:
             assert recovery[-1].id == terminal.id
             assert terminal.payload["manual_recovery_persisted"] is True
