@@ -2073,6 +2073,24 @@ class SessionStore(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    async def fence_run_and_transform_checkpoint(
+        self,
+        session_id: str,
+        *,
+        statuses: set[SessionStatus],
+        checkpoint_transform: CheckpointTransform,
+    ) -> Session:
+        """Atomically transform a checkpoint and claim a newly incremented epoch.
+
+        The transform must return the replacement checkpoint. An exception or
+        ``None`` result aborts both the checkpoint update and the epoch fence.
+        This operation is for ownership that must persist a checkpoint lease
+        and fence the prior run as one transaction. Recovery that needs only an
+        inactivity predicate should continue to use :meth:`fence_stalled_run`.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     async def release_run_fence(self, session_id: str) -> None:
         """Revoke this task's epoch after all trailing writes finish."""
         _deactivate_session_run_fence(require_clean_nonblank(session_id, "session_id"))
@@ -2866,6 +2884,43 @@ class InMemorySessionStore(SessionStore):
                     "last_activity_at": datetime.now(UTC),
                 }
             )
+            self._sessions[session_id] = fenced
+            result = fenced.model_copy(deep=True)
+            _activate_session_run_fence(result)
+            return result
+
+    async def fence_run_and_transform_checkpoint(
+        self,
+        session_id: str,
+        *,
+        statuses: set[SessionStatus],
+        checkpoint_transform: CheckpointTransform,
+    ) -> Session:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        allowed_statuses = _validate_status_set(statuses, "statuses")
+        if checkpoint_transform is None:
+            raise TypeError("checkpoint_transform is required.")
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            if session.status not in allowed_statuses:
+                raise SessionStatusConflict(f"Session status cannot be fenced: {session.status}")
+            current = self._checkpoints.get(session_id)
+            transformed = checkpoint_transform(
+                session.model_copy(deep=True),
+                None if current is None else deepcopy(current),
+            )
+            if transformed is None:
+                raise ValueError("Fenced checkpoint transform must return a checkpoint.")
+            transformed = copy_json_value(transformed, "checkpoint")
+            fenced = session.model_copy(
+                update={
+                    "run_epoch": session.run_epoch + 1,
+                    "last_activity_at": datetime.now(UTC),
+                }
+            )
+            self._store_checkpoint_unlocked(session_id, transformed)
             self._sessions[session_id] = fenced
             result = fenced.model_copy(deep=True)
             _activate_session_run_fence(result)

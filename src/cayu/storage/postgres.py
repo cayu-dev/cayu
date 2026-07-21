@@ -4664,6 +4664,55 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             _activate_session_run_fence(loaded)
             return loaded
 
+    async def fence_run_and_transform_checkpoint(
+        self,
+        session_id: str,
+        *,
+        statuses: set[SessionStatus],
+        checkpoint_transform: CheckpointTransform,
+    ) -> Session:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        allowed_statuses = _validate_status_set(statuses, "statuses")
+        if checkpoint_transform is None:
+            raise TypeError("checkpoint_transform is required.")
+        await self._ensure_ready()
+        updated_at = datetime.now(UTC)
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    loaded = await self._load_for_update(cur, session_id)
+                    if loaded is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    if loaded.status not in allowed_statuses:
+                        raise SessionStatusConflict(
+                            f"Session status cannot be fenced: {loaded.status}"
+                        )
+                    transformed = checkpoint_transform(
+                        loaded,
+                        await self._load_checkpoint(cur, session_id),
+                    )
+                    if transformed is None:
+                        raise ValueError("Fenced checkpoint transform must return a checkpoint.")
+                    transformed = copy_json_value(transformed, "checkpoint")
+                    await cur.execute(
+                        "UPDATE cayu_sessions SET run_epoch = run_epoch + 1, "
+                        "last_activity_at = %s WHERE id = %s",
+                        (updated_at, session_id),
+                    )
+                    await self._upsert_checkpoint(cur, session_id, transformed, updated_at)
+                    fenced = loaded.model_copy(
+                        update={
+                            "run_epoch": loaded.run_epoch + 1,
+                            "last_activity_at": updated_at,
+                        }
+                    )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+            _activate_session_run_fence(fenced)
+            return fenced
+
     async def release_run_fence(self, session_id: str) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
         expected_run_epoch = _current_session_run_epoch(session_id)

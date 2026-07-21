@@ -693,6 +693,118 @@ def test_session_store_conformance_blocks_delete_during_incomplete_recovery_clai
     asyncio.run(run())
 
 
+def test_session_store_conformance_atomically_fences_checkpoint_owner(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            created = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_atomic_checkpoint_fence_conformance",
+                    messages=[Message.text("user", "create only")],
+                ),
+                identity=_identity(),
+            )
+            completed = await store.update_status(created.id, SessionStatus.COMPLETED)
+            original_checkpoint = {"owner": "expired", "preserved": {"value": 1}}
+            await store.checkpoint(created.id, original_checkpoint)
+
+            def replace_owner(
+                current: Session,
+                checkpoint: dict[str, Any] | None,
+            ) -> dict[str, Any]:
+                assert current.run_epoch == completed.run_epoch
+                assert checkpoint == original_checkpoint
+                assert checkpoint is not None
+                updated = dict(checkpoint)
+                updated["owner"] = "replacement"
+                return updated
+
+            fenced = await store.fence_run_and_transform_checkpoint(
+                created.id,
+                statuses={SessionStatus.COMPLETED},
+                checkpoint_transform=replace_owner,
+            )
+            assert fenced.run_epoch == completed.run_epoch + 1
+            persisted = await store.load(created.id)
+            assert persisted is not None
+            assert persisted.run_epoch == fenced.run_epoch
+            assert await store.load_checkpoint(created.id) == {
+                "owner": "replacement",
+                "preserved": {"value": 1},
+            }
+            await store.release_run_fence(created.id)
+
+            before_rejected_fence = await store.load(created.id)
+            before_rejected_checkpoint = await store.load_checkpoint(created.id)
+            assert before_rejected_fence is not None
+
+            def reject_fence(
+                _current: Session,
+                _checkpoint: dict[str, Any] | None,
+            ) -> dict[str, Any]:
+                raise RuntimeError("checkpoint owner changed")
+
+            with pytest.raises(RuntimeError, match="checkpoint owner changed"):
+                await store.fence_run_and_transform_checkpoint(
+                    created.id,
+                    statuses={SessionStatus.COMPLETED},
+                    checkpoint_transform=reject_fence,
+                )
+            assert await store.load(created.id) == before_rejected_fence
+            assert await store.load_checkpoint(created.id) == before_rejected_checkpoint
+
+            def cancel_fence(
+                _current: Session,
+                _checkpoint: dict[str, Any] | None,
+            ) -> dict[str, Any]:
+                raise asyncio.CancelledError("cancel atomic fence")
+
+            with pytest.raises(asyncio.CancelledError, match="cancel atomic fence"):
+                await store.fence_run_and_transform_checkpoint(
+                    created.id,
+                    statuses={SessionStatus.COMPLETED},
+                    checkpoint_transform=cancel_fence,
+                )
+            assert await store.load(created.id) == before_rejected_fence
+            assert await store.load_checkpoint(created.id) == before_rejected_checkpoint
+
+            fenced_after_cancel = await store.fence_run_and_transform_checkpoint(
+                created.id,
+                statuses={SessionStatus.COMPLETED},
+                checkpoint_transform=lambda _session, checkpoint: checkpoint,
+            )
+            assert fenced_after_cancel.run_epoch == before_rejected_fence.run_epoch + 1
+            await store.release_run_fence(created.id)
+            before_rejected_fence = await store.load(created.id)
+            before_rejected_checkpoint = await store.load_checkpoint(created.id)
+            assert before_rejected_fence is not None
+
+            def omit_replacement(
+                _current: Session,
+                _checkpoint: dict[str, Any] | None,
+            ) -> None:
+                return None
+
+            with pytest.raises(
+                ValueError,
+                match="Fenced checkpoint transform must return a checkpoint",
+            ):
+                await store.fence_run_and_transform_checkpoint(
+                    created.id,
+                    statuses={SessionStatus.COMPLETED},
+                    checkpoint_transform=omit_replacement,
+                )
+            assert await store.load(created.id) == before_rejected_fence
+            assert await store.load_checkpoint(created.id) == before_rejected_checkpoint
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
 def test_session_store_conformance_durable_session_message_queue(session_store_case) -> None:
     async def run() -> None:
         store = await _open_store(session_store_case)

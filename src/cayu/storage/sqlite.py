@@ -1241,6 +1241,75 @@ class SQLiteSessionStore(SessionStore):
             _activate_session_run_fence(loaded)
             return loaded
 
+    async def fence_run_and_transform_checkpoint(
+        self,
+        session_id: str,
+        *,
+        statuses: set[SessionStatus],
+        checkpoint_transform: CheckpointTransform,
+    ) -> Session:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        allowed_statuses = _validate_status_set(statuses, "statuses")
+        if checkpoint_transform is None:
+            raise TypeError("checkpoint_transform is required.")
+        updated_at = datetime.now(UTC)
+        async with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                loaded = self._load_unlocked(session_id)
+                if loaded is None:
+                    raise KeyError(f"Session not found: {session_id}")
+                if loaded.status not in allowed_statuses:
+                    raise SessionStatusConflict(f"Session status cannot be fenced: {loaded.status}")
+                transformed = checkpoint_transform(
+                    loaded,
+                    self._load_checkpoint_unlocked(session_id),
+                )
+                if transformed is None:
+                    raise ValueError("Fenced checkpoint transform must return a checkpoint.")
+                transformed = copy_json_value(transformed, "checkpoint")
+                self._connection.execute(
+                    "UPDATE cayu_sessions SET run_epoch = run_epoch + 1, "
+                    "last_activity_at = ? WHERE id = ?",
+                    (sqlite_support.format_datetime(updated_at), session_id),
+                )
+                self._connection.execute(
+                    """
+                    INSERT INTO cayu_checkpoints (
+                        session_id, state_json, updated_at,
+                        pending_action_source_bytes,
+                        pending_action_tool_call_count,
+                        pending_action_flags,
+                        pending_action_metrics_ready
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        state_json = excluded.state_json,
+                        updated_at = excluded.updated_at,
+                        pending_action_source_bytes = excluded.pending_action_source_bytes,
+                        pending_action_tool_call_count = excluded.pending_action_tool_call_count,
+                        pending_action_flags = excluded.pending_action_flags,
+                        pending_action_metrics_ready = excluded.pending_action_metrics_ready
+                    """,
+                    sqlite_support.checkpoint_row_values(
+                        session_id,
+                        transformed,
+                        updated_at,
+                    ),
+                )
+                self._connection.commit()
+                fenced = loaded.model_copy(
+                    update={
+                        "run_epoch": loaded.run_epoch + 1,
+                        "last_activity_at": updated_at,
+                    }
+                )
+            except BaseException:
+                self._connection.rollback()
+                raise
+            _activate_session_run_fence(fenced)
+            return fenced
+
     async def transition_status_if_no_queued_messages(
         self,
         session_id: str,
