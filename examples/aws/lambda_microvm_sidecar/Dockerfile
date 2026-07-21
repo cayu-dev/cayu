@@ -1,9 +1,12 @@
 FROM public.ecr.aws/lambda/microvms:al2023-minimal
 
 RUN dnf install -y \
+        amazon-efs-utils \
         bash \
+        findutils \
         iproute \
         iptables-nft \
+        nfs-utils \
         python3.11 \
         python3.11-pip \
         shadow-utils \
@@ -18,13 +21,11 @@ ENV CAYU_MICROVM_AGENT_UID=1000 \
     CAYU_MICROVM_AGENT_NETNS=cayu-agent
 
 WORKDIR /opt/cayu
-COPY requirements.txt /opt/cayu/requirements.txt
-RUN python3.11 -m pip install --no-cache-dir -r /opt/cayu/requirements.txt
-
-RUN mkdir -p /opt/cayu/lambda_microvm_sidecar
-COPY __init__.py app.py supervisor.py /opt/cayu/lambda_microvm_sidecar/
-COPY entrypoint.sh /opt/cayu/entrypoint.sh
-RUN install -d -o 1000 -g 1000 /workspace
+COPY . /opt/cayu/lambda_microvm_sidecar
+RUN python3.11 -m pip install --no-cache-dir \
+        -r /opt/cayu/lambda_microvm_sidecar/requirements.txt \
+        "botocore>=1.43.44,<2" \
+    && install -d -o 1000 -g 1000 /workspace
 
 EXPOSE 8080
-CMD ["bash", "/opt/cayu/entrypoint.sh"]
+CMD ["bash", "/opt/cayu/lambda_microvm_sidecar/entrypoint.sh"]

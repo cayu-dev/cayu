@@ -161,8 +161,12 @@ artifacts = [
   "src/cayu/server/dashboard/**",
 ]
 
+[tool.hatch.build.targets.wheel.force-include]
+"examples/aws/lambda_microvm_sidecar" = "cayu/data/lambda_microvm_sidecar"
+
 [tool.hatch.build.targets.sdist]
 include = [
+  "/examples/aws/lambda_microvm_sidecar",
   "/src/cayu",
   "/LICENSE",
   "/NOTICE",

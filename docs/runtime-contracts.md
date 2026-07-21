@@ -2377,6 +2377,22 @@ grace period, so a responsive but wedged supervisor cannot poll forever.
 `close_action` is `terminate`, `suspend`, or `none`, and explicit `suspend()` / `resume()` /
 `terminate()` methods support app-owned lifecycle policy.
 
+The installed distribution provides the matching guest build context through
+`cayu lambda-microvm sidecar export DESTINATION`. Export is local and credential-free; it does
+not require `cayu[aws]` or perform AWS discovery. Its versioned manifest binds an exact,
+sorted file inventory to the Cayu version, artifact version, protocol version, per-file hashes,
+and one aggregate SHA-256 digest. The exporter validates all resources before destination
+mutation and stages replacement of non-empty directories behind explicit `--replace`, which
+deletes all existing destination contents. The staged tree is renamed into place. If publication
+fails after the previous directory has been renamed aside, Cayu preserves it at the backup path
+reported by the CLI for operator recovery; it does not attempt a second destructive rollback.
+Filesystem roots, the current working directory and its ancestors, and the user's home directory
+and its ancestors are protected export targets.
+Artifact metadata is provenance, not a substitute for the authenticated runtime handshake.
+The canonical source remains `examples/aws/lambda_microvm_sidecar/`; wheel resources, sdists,
+release checks, and repository image builders consume that source rather than maintaining a
+second implementation.
+
 The first-party AWS image keeps the supervisor in a trusted root profile and
 runs ordinary `exec()` commands in a dedicated network namespace with no
 default route. Its only interface is a point-to-point veth whose root-side

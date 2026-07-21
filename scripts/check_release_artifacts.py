@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import stat
 import sys
 import tarfile
 import zipfile
+from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
 
+from cayu.cli.lambda_microvm import _SidecarArtifactError, _validate_artifact_contents
+
+_SIDECAR_MANIFEST = "cayu-lambda-microvm-sidecar-manifest.json"
+_SDIST_SIDECAR_PREFIX = "examples/aws/lambda_microvm_sidecar"
+_WHEEL_SIDECAR_PREFIX = "cayu/data/lambda_microvm_sidecar"
 _SDIST_REQUIRED = {
     "LICENSE",
     "NOTICE",
@@ -19,6 +26,7 @@ _SDIST_REQUIRED = {
     "src/cayu/data/default_model_catalog.json",
     "src/cayu/data/default_price_book.json",
     "src/cayu/server/dashboard/THIRD_PARTY_LICENSES.md",
+    f"{_SDIST_SIDECAR_PREFIX}/{_SIDECAR_MANIFEST}",
 }
 _SDIST_ALLOWED_ROOTS = {
     ".gitignore",
@@ -43,6 +51,7 @@ _WHEEL_REQUIRED = {
     "cayu/guides/tool-effects.md",
     "cayu/server/dashboard/THIRD_PARTY_LICENSES.md",
     "cayu/server/dashboard/index.html",
+    f"{_WHEEL_SIDECAR_PREFIX}/{_SIDECAR_MANIFEST}",
 }
 _THIRD_PARTY_LICENSE_MARKERS = {
     "## @base-ui/react -",
@@ -65,7 +74,10 @@ def _fail(message: str) -> None:
 
 
 def _validate_safe_path(name: str, *, archive: Path) -> PurePosixPath:
-    normalized_name = name.casefold().encode("utf-8")
+    try:
+        normalized_name = name.casefold().encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"{archive}: archive path is not valid UTF-8: {name!r}") from exc
     if any(identifier in normalized_name for identifier in _NON_PUBLIC_IDENTIFIERS):
         _fail(f"{archive}: non-public identifier included in archive path: {name}")
     path = PurePosixPath(name)
@@ -78,12 +90,20 @@ def _validate_safe_path(name: str, *, archive: Path) -> PurePosixPath:
     return path
 
 
+def _validate_unique_paths(paths: list[PurePosixPath], *, archive: Path) -> None:
+    normalized = [str(path) for path in paths]
+    if len(normalized) != len(set(normalized)):
+        _fail(f"{archive}: archive contains duplicate member paths")
+    casefolded = [name.casefold() for name in normalized]
+    if len(casefolded) != len(set(casefolded)):
+        _fail(f"{archive}: archive contains case-colliding member paths")
+
+
 def _validate_third_party_licenses(contents: bytes, *, archive: Path) -> None:
     try:
         notice = contents.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ValueError(f"{archive}: third-party license inventory is not UTF-8") from exc
-
     missing = sorted(marker for marker in _THIRD_PARTY_LICENSE_MARKERS if marker not in notice)
     if missing:
         _fail(f"{archive}: third-party license inventory is incomplete: {', '.join(missing)}")
@@ -100,75 +120,120 @@ def _validate_publication_contents(
         _fail(f"{archive}: non-public identifier included in {member_name}")
 
 
-def validate_sdist(archive: Path) -> None:
+def _metadata_version(contents: bytes, *, archive: Path, member_name: str) -> str:
+    version = BytesParser().parsebytes(contents).get("Version")
+    if version is None or not version.strip():
+        _fail(f"{archive}: {member_name} has no package version")
+    return version.strip()
+
+
+def _validate_sidecar(
+    contents: dict[str, bytes],
+    *,
+    archive: Path,
+    package_version: str,
+) -> dict[str, bytes]:
+    try:
+        artifact = _validate_artifact_contents(
+            contents,
+            expected_cayu_version=package_version,
+        )
+    except _SidecarArtifactError as exc:
+        raise ValueError(f"{archive}: invalid sidecar artifact: {exc}") from exc
+    return artifact.contents
+
+
+def validate_sdist(archive: Path) -> dict[str, bytes]:
     with tarfile.open(archive, "r:gz") as source:
         members = source.getmembers()
-    if not members:
-        _fail(f"{archive}: source distribution is empty")
-    if any(member.issym() or member.islnk() for member in members):
-        _fail(f"{archive}: source distribution must not contain links")
+        if not members:
+            _fail(f"{archive}: source distribution is empty")
+        if any(member.issym() or member.islnk() for member in members):
+            _fail(f"{archive}: source distribution must not contain links")
 
-    paths = [_validate_safe_path(member.name, archive=archive) for member in members]
-    roots = {path.parts[0] for path in paths if path.parts}
-    if len(roots) != 1:
-        _fail(f"{archive}: expected one source-distribution root, found {sorted(roots)}")
-    root = next(iter(roots))
-    relative_names: set[str] = set()
-    for path in paths:
-        relative = path.relative_to(root)
-        if not relative.parts:
-            continue
-        relative_names.add(str(relative))
-        top = relative.parts[0]
-        if top not in _SDIST_ALLOWED_ROOTS and top not in _SDIST_ALLOWED_TREES:
-            _fail(f"{archive}: unexpected source-distribution path: {relative}")
-
-    missing = sorted(_SDIST_REQUIRED - relative_names)
-    if missing:
-        _fail(f"{archive}: missing required source files: {', '.join(missing)}")
-
-    notice_name = f"{root}/src/cayu/server/dashboard/THIRD_PARTY_LICENSES.md"
-    with tarfile.open(archive, "r:gz") as source:
-        for member in source.getmembers():
+        paths = [_validate_safe_path(member.name, archive=archive) for member in members]
+        _validate_unique_paths(paths, archive=archive)
+        roots = {path.parts[0] for path in paths if path.parts}
+        if len(roots) != 1:
+            _fail(f"{archive}: expected one source-distribution root, found {sorted(roots)}")
+        root = next(iter(roots))
+        relative_names: set[str] = set()
+        contents_by_relative_name: dict[str, bytes] = {}
+        for member, path in zip(members, paths, strict=True):
+            relative = path.relative_to(root)
+            if not relative.parts:
+                continue
+            relative_name = str(relative)
+            relative_names.add(relative_name)
+            top = relative.parts[0]
+            if top == "examples":
+                if relative.parts[:3] != ("examples", "aws", "lambda_microvm_sidecar"):
+                    _fail(f"{archive}: unexpected source-distribution path: {relative}")
+            elif top not in _SDIST_ALLOWED_ROOTS and top not in _SDIST_ALLOWED_TREES:
+                _fail(f"{archive}: unexpected source-distribution path: {relative}")
             if not member.isfile():
                 continue
             extracted = source.extractfile(member)
             if extracted is None:
-                raise ValueError(f"{archive}: could not read archive member {member.name}")
-            _validate_publication_contents(
-                extracted.read(),
-                archive=archive,
-                member_name=member.name,
-            )
-        extracted = source.extractfile(notice_name)
-        if extracted is None:
-            raise ValueError(f"{archive}: could not read third-party license inventory")
-        notice_contents = extracted.read()
-    _validate_third_party_licenses(notice_contents, archive=archive)
+                _fail(f"{archive}: could not read archive member {member.name}")
+            content = extracted.read()
+            contents_by_relative_name[relative_name] = content
+            _validate_publication_contents(content, archive=archive, member_name=member.name)
+
+    missing = sorted(_SDIST_REQUIRED - relative_names)
+    if missing:
+        _fail(f"{archive}: missing required source files: {', '.join(missing)}")
+    notice_name = "src/cayu/server/dashboard/THIRD_PARTY_LICENSES.md"
+    _validate_third_party_licenses(contents_by_relative_name[notice_name], archive=archive)
+    package_version = _metadata_version(
+        contents_by_relative_name["PKG-INFO"], archive=archive, member_name="PKG-INFO"
+    )
+    prefix = f"{_SDIST_SIDECAR_PREFIX}/"
+    sidecar_contents = {
+        name.removeprefix(prefix): content
+        for name, content in contents_by_relative_name.items()
+        if name.startswith(prefix)
+    }
+    return _validate_sidecar(
+        sidecar_contents,
+        archive=archive,
+        package_version=package_version,
+    )
 
 
-def validate_wheel(archive: Path) -> None:
+def validate_wheel(archive: Path) -> dict[str, bytes]:
     with zipfile.ZipFile(archive) as wheel:
-        names = wheel.namelist()
-    if not names:
-        _fail(f"{archive}: wheel is empty")
-    paths = [_validate_safe_path(name, archive=archive) for name in names]
-    name_set = {str(path) for path in paths}
+        members = wheel.infolist()
+        if not members:
+            _fail(f"{archive}: wheel is empty")
+        links = [
+            member.filename
+            for member in members
+            if member.create_system == 3 and stat.S_ISLNK((member.external_attr >> 16) & 0xFFFF)
+        ]
+        if links:
+            _fail(f"{archive}: wheel must not contain links: {', '.join(sorted(links))}")
+        paths = [_validate_safe_path(member.filename, archive=archive) for member in members]
+        _validate_unique_paths(paths, archive=archive)
+        name_set = {str(path) for path in paths}
+        file_contents: dict[str, bytes] = {}
+        for member in members:
+            if member.is_dir():
+                continue
+            content = wheel.read(member)
+            file_contents[member.filename] = content
+            _validate_publication_contents(
+                content,
+                archive=archive,
+                member_name=member.filename,
+            )
 
     missing = sorted(_WHEEL_REQUIRED - name_set)
     if missing:
         _fail(f"{archive}: missing required wheel files: {', '.join(missing)}")
-    with zipfile.ZipFile(archive) as wheel:
-        for member in wheel.infolist():
-            if member.is_dir():
-                continue
-            _validate_publication_contents(
-                wheel.read(member),
-                archive=archive,
-                member_name=member.filename,
-            )
-        notice_contents = wheel.read("cayu/server/dashboard/THIRD_PARTY_LICENSES.md")
-    _validate_third_party_licenses(notice_contents, archive=archive)
+    _validate_third_party_licenses(
+        file_contents["cayu/server/dashboard/THIRD_PARTY_LICENSES.md"], archive=archive
+    )
     if not any(
         name.startswith("cayu/server/dashboard/assets/") and name.endswith(".js")
         for name in name_set
@@ -200,18 +265,57 @@ def validate_wheel(archive: Path) -> None:
     if missing_metadata:
         _fail(f"{archive}: missing wheel metadata: {', '.join(missing_metadata)}")
 
+    metadata_name = f"{metadata_root}/METADATA"
+    package_version = _metadata_version(
+        file_contents[metadata_name], archive=archive, member_name=metadata_name
+    )
+    prefix = f"{_WHEEL_SIDECAR_PREFIX}/"
+    sidecar_contents = {
+        name.removeprefix(prefix): content
+        for name, content in file_contents.items()
+        if name.startswith(prefix)
+    }
+    return _validate_sidecar(
+        sidecar_contents,
+        archive=archive,
+        package_version=package_version,
+    )
+
+
+def validate_sidecar_equivalence(
+    sdist: Path,
+    wheel: Path,
+    *,
+    sdist_contents: dict[str, bytes] | None = None,
+    wheel_contents: dict[str, bytes] | None = None,
+) -> None:
+    source_contents = sdist_contents if sdist_contents is not None else validate_sdist(sdist)
+    package_contents = wheel_contents if wheel_contents is not None else validate_wheel(wheel)
+    if source_contents.keys() != package_contents.keys():
+        _fail(f"{wheel}: packaged sidecar inventory differs from the sdist source")
+    mismatched = sorted(
+        name for name in source_contents if source_contents[name] != package_contents[name]
+    )
+    if mismatched:
+        _fail(f"{wheel}: packaged sidecar differs from the sdist source: {', '.join(mismatched)}")
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archives", nargs="+", type=Path)
     args = parser.parse_args(argv)
-
     sdists = [path for path in args.archives if path.name.endswith(".tar.gz")]
     wheels = [path for path in args.archives if path.suffix == ".whl"]
     if len(sdists) != 1 or len(wheels) != 1:
         parser.error("pass exactly one .tar.gz source distribution and one .whl wheel")
-    validate_sdist(sdists[0])
-    validate_wheel(wheels[0])
+    sdist_contents = validate_sdist(sdists[0])
+    wheel_contents = validate_wheel(wheels[0])
+    validate_sidecar_equivalence(
+        sdists[0],
+        wheels[0],
+        sdist_contents=sdist_contents,
+        wheel_contents=wheel_contents,
+    )
     print(f"validated {sdists[0]} and {wheels[0]}")
     return 0
 

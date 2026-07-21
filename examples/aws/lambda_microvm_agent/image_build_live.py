@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import boto3  # ty: ignore[unresolved-import]
-from examples.aws.lambda_microvm_agent.package_microvm import package
+from examples.aws.lambda_microvm_agent.package_microvm import _package_with_sidecar_provenance
 
 from cayu import ExecCommand, LambdaMicroVMRunner
 
@@ -46,7 +46,9 @@ async def main() -> None:
     started = time.monotonic()
 
     with tempfile.TemporaryDirectory(prefix="cayu-microvm-live-") as directory:
-        archive = package(Path(directory) / "cayu-microvm.zip")
+        archive, sidecar_provenance = _package_with_sidecar_provenance(
+            Path(directory) / "cayu-microvm.zip"
+        )
         try:
             await asyncio.to_thread(s3.create_bucket, **_create_bucket_options(bucket, region))
             bucket_created = True
@@ -164,6 +166,7 @@ async def main() -> None:
                         "region": region,
                         "s3_files_mount_helper": "verified",
                         "seconds": round(time.monotonic() - started, 1),
+                        **sidecar_provenance,
                     },
                     sort_keys=True,
                 )

@@ -84,6 +84,11 @@ uv run python examples/aws/lambda_microvm_agent/package_microvm.py /tmp/cayu-mic
 aws s3 cp /tmp/cayu-microvm.zip "s3://$BUILD_BUCKET/cayu-microvm.zip"
 ```
 
+The packager validates and consumes the same versioned sidecar resource produced by
+`cayu lambda-microvm sidecar export`. The canonical Dockerfile and entrypoint include the
+integrated example's EFS/S3 Files mount helpers, watchdog lifecycle, and agent network boundary;
+this example does not maintain a second image implementation or file inventory.
+
 Before deploying, you can ask AWS to build and boot that exact package, verify
 the EFS and S3 Files mount helpers, and clean up every temporary resource:
 

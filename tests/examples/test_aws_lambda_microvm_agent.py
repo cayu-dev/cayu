@@ -6,13 +6,18 @@ import hmac
 import json
 import re
 import sys
+import tomllib
 import types
 import zipfile
 from pathlib import Path
 from typing import Any
 
 import pytest
-from examples.aws.lambda_microvm_agent import metadata_isolation_live, metadata_isolation_task
+from examples.aws.lambda_microvm_agent import (
+    metadata_isolation_live,
+    metadata_isolation_task,
+    package_microvm,
+)
 from examples.aws.lambda_microvm_agent.package_microvm import package
 from examples.aws.lambda_microvm_agent.runtime import (
     AwsAgentRuntimeConfig,
@@ -441,27 +446,68 @@ def test_internal_action_tool_uses_microvm_virtual_token_and_persists_artifact()
 
 def test_microvm_package_contains_build_context(tmp_path) -> None:
     archive = package(tmp_path / "microvm.zip")
+    second_archive = package(tmp_path / "microvm-second.zip")
+    sidecar = package_microvm._load_validated_artifact(
+        package_microvm.SIDECAR,
+        expected_cayu_version=tomllib.loads(
+            (package_microvm.PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        )["project"]["version"],
+    )
 
     with zipfile.ZipFile(archive) as bundle:
-        assert set(bundle.namelist()) == {
-            "Dockerfile",
-            "entrypoint.sh",
-            "__init__.py",
-            "app.py",
-            "supervisor.py",
-            "requirements.txt",
-        }
+        assert set(bundle.namelist()) == set(sidecar.contents)
         dockerfile = bundle.read("Dockerfile").decode("utf-8")
         entrypoint = bundle.read("entrypoint.sh").decode("utf-8")
-        assert "COPY requirements.txt /opt/cayu/requirements.txt" in dockerfile
-        assert "COPY __init__.py app.py supervisor.py" in dockerfile
-        assert "COPY entrypoint.sh /opt/cayu/entrypoint.sh" in dockerfile
-        assert "COPY examples/" not in dockerfile
+        assert "COPY . /opt/cayu/lambda_microvm_sidecar" in dockerfile
+        assert "botocore>=1.43.44,<2" in dockerfile
+        assert "amazon-efs-utils" in dockerfile
         assert "iptables-nft" in dockerfile
         assert "useradd --uid 1000" in dockerfile
         assert 'ip netns add "$CAYU_MICROVM_AGENT_NETNS"' in entrypoint
+        assert "amazon-efs-mount-watchdog" in entrypoint
         assert "--dport 18080 -j ACCEPT" in entrypoint
         assert "-i cayu-root -j REJECT" in entrypoint
+    assert archive.read_bytes() == second_archive.read_bytes()
+
+
+def test_microvm_package_binds_provenance_to_the_packaged_sidecar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_version = tomllib.loads(
+        (package_microvm.PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]["version"]
+    sidecar = package_microvm._load_validated_artifact(
+        package_microvm.SIDECAR,
+        expected_cayu_version=project_version,
+    )
+    load_calls = 0
+
+    def load_sidecar_once(root: Path, *, expected_cayu_version: str):
+        nonlocal load_calls
+        load_calls += 1
+        assert root == package_microvm.SIDECAR
+        assert expected_cayu_version == project_version
+        if load_calls > 1:
+            raise AssertionError("packaging reloaded sidecar provenance")
+        return sidecar
+
+    monkeypatch.setattr(
+        package_microvm,
+        "_load_validated_artifact",
+        load_sidecar_once,
+    )
+
+    archive, provenance = package_microvm._package_with_sidecar_provenance(tmp_path / "microvm.zip")
+
+    assert load_calls == 1
+    with zipfile.ZipFile(archive) as bundle:
+        for name in sidecar.contents:
+            assert bundle.read(name) == sidecar.contents[name]
+    assert provenance["sidecar_artifact_version"] == 1
+    assert provenance["sidecar_cayu_version"] == project_version
+    assert provenance["sidecar_content_digest"].startswith("sha256:")
+    assert provenance["sidecar_protocol_version"] == "1"
 
 
 def test_guest_audit_treats_unreadable_root_paths_as_absent() -> None:

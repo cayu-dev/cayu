@@ -27,6 +27,7 @@ def main(argv: list[str] | None = None) -> int:
     from cayu.cli.generate import add_generate_parser, run_generate
     from cayu.cli.guide import add_guide_parser, run_guide
     from cayu.cli.inspect import add_inspect_parser, run_inspect
+    from cayu.cli.lambda_microvm import add_lambda_microvm_parser, run_lambda_microvm
     from cayu.cli.scaffold import add_new_parser, run_new
     from cayu.cli.storage import add_storage_parser, run_storage
 
@@ -37,6 +38,7 @@ def main(argv: list[str] | None = None) -> int:
     add_generate_parser(subparsers)
     add_guide_parser(subparsers)
     add_inspect_parser(subparsers)
+    add_lambda_microvm_parser(subparsers)
     add_new_parser(subparsers)
     add_storage_parser(subparsers)
 
@@ -72,6 +74,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "inspect":
         return run_inspect(args)
+
+    if args.command == "lambda-microvm":
+        return run_lambda_microvm(args)
 
     parser.print_help()
     return 0

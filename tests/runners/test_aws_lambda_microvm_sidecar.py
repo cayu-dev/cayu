@@ -12,6 +12,9 @@ from typing import Any
 
 import pytest
 
+from cayu.cli.lambda_microvm import _export_sidecar
+from cayu.runners.aws_lambda_microvm import LAMBDA_MICROVM_PROTOCOL_VERSION
+
 SUPERVISOR_PATH = (
     Path(__file__).resolve().parents[2]
     / "examples"
@@ -38,7 +41,10 @@ def test_sidecar_dockerfile_pins_supported_python() -> None:
     assert "ln -sf /usr/bin/python3.11 /usr/bin/python3" in dockerfile
     assert "useradd --uid 1000" in dockerfile
     assert "CAYU_MICROVM_AGENT_UID=1000" in dockerfile
-    assert 'CMD ["bash", "/opt/cayu/entrypoint.sh"]' in dockerfile
+    assert 'CMD ["bash", "/opt/cayu/lambda_microvm_sidecar/entrypoint.sh"]' in dockerfile
+    assert "COPY . /opt/cayu/lambda_microvm_sidecar" in dockerfile
+    assert "amazon-efs-utils" in dockerfile
+    assert '"botocore>=1.43.44,<2"' in dockerfile
 
 
 def test_sidecar_entrypoint_forwards_signals_and_reaps_adopted_children() -> None:
@@ -50,8 +56,9 @@ def test_sidecar_entrypoint_forwards_signals_and_reaps_adopted_children() -> Non
     assert "--dport 18080 -j ACCEPT" in entrypoint
     assert "-i cayu-root -j REJECT" in entrypoint
     assert "trap 'forward_signal TERM' TERM" in entrypoint
+    assert "amazon-efs-mount-watchdog" in entrypoint
     assert "wait -n || true" in entrypoint
-    assert 'wait "$child_pid"' in entrypoint
+    assert 'wait "$sidecar_pid"' in entrypoint
 
 
 def test_agent_execution_boundary_drops_identity_and_capabilities() -> None:
@@ -173,11 +180,63 @@ def test_sidecar_health_reports_protocol_version(
     try:
         assert asyncio.run(app_module.health()) == {
             "status": "ok",
-            "protocol_version": "1",
+            "protocol_version": LAMBDA_MICROVM_PROTOCOL_VERSION,
         }
         assert asyncio.run(app_module.ready_hook()) == {"status": "ok"}
     finally:
         sys.modules.pop("examples.aws.lambda_microvm_sidecar.app", None)
+
+
+def test_exported_sidecar_preserves_guest_runtime_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exported = tmp_path / "exported_sidecar"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _export_sidecar(exported, replace=False)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setenv("CAYU_MICROVM_WORKSPACE_ROOT", str(workspace))
+    app_name = "exported_sidecar.app"
+    supervisor_name = "exported_sidecar.supervisor"
+    sys.modules.pop(app_name, None)
+    sys.modules.pop(supervisor_name, None)
+    sys.modules.pop("exported_sidecar", None)
+    try:
+        app_module = importlib.import_module(app_name)
+        assert asyncio.run(app_module.health()) == {
+            "status": "ok",
+            "protocol_version": LAMBDA_MICROVM_PROTOCOL_VERSION,
+        }
+        assert asyncio.run(app_module.ready_hook()) == {"status": "ok"}
+        assert asyncio.run(app_module.run_hook()) == {"status": "ok"}
+        assert asyncio.run(app_module.resume_hook()) == {"status": "ok"}
+        assert asyncio.run(app_module.suspend_hook()) == {"status": "ok"}
+        assert asyncio.run(app_module.terminate_hook()) == {"status": "ok"}
+
+        exported_supervisor = importlib.import_module(supervisor_name)
+        supervisor = exported_supervisor.CommandSupervisor(root=workspace)
+        supervisor.start(
+            "exported-command",
+            {
+                "kind": "process",
+                "argv": [sys.executable, "-c", "print('exported-sidecar-ready')"],
+                "cwd": str(workspace),
+                "env": {},
+                "stdin_base64": None,
+                "timeout_s": 2,
+                "output_limit_bytes": 8,
+            },
+        )
+        result = wait_for_terminal(supervisor, "exported-command")
+        assert base64.b64decode(result["stdout_base64"]) == b"exported"
+        assert result["stdout_truncated"] is True
+        assert result["exit_code"] == 0
+        assert "wait -n || true" in (exported / "entrypoint.sh").read_text(encoding="utf-8")
+    finally:
+        sys.modules.pop(app_name, None)
+        sys.modules.pop(supervisor_name, None)
+        sys.modules.pop("exported_sidecar", None)
 
 
 def wait_for_terminal(

@@ -26,6 +26,7 @@ jobs:
       - run: uv run ruff check src/ tests/ examples/ scripts/ maintenance/
       - run: uv run ruff format --check src/ tests/ examples/ scripts/ maintenance/
       - run: uv run ty check src/cayu examples maintenance
+      - run: uv run python scripts/generate_sidecar_manifest.py --check
       - run: uv lock --check
 
   test:
@@ -151,6 +152,82 @@ jobs:
                       model=f"{prefix}fixture",
                   ) == model
           PY
+      # The AWS Lambda MicroVM base image is published for ARM64 only. Register
+      # emulation so the amd64 GitHub runner can verify the exact exported image.
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: arm64
+      - name: Verify installed wheel and source-distribution sidecar exports
+        run: |
+          uv venv --python 3.11 .release-sdist-venv
+          uv pip install --python .release-sdist-venv/bin/python dist/first/*.tar.gz
+          proof_root="$(mktemp -d)"
+          cd "$proof_root"
+          unset PYTHONPATH
+          "$GITHUB_WORKSPACE/.release-venv/bin/cayu" \
+            lambda-microvm sidecar export "$proof_root/wheel"
+          "$GITHUB_WORKSPACE/.release-sdist-venv/bin/cayu" \
+            lambda-microvm sidecar export "$proof_root/sdist"
+          diff -ru "$proof_root/wheel" "$proof_root/sdist"
+          "$GITHUB_WORKSPACE/.release-venv/bin/python" - <<'PY'
+          import hashlib
+          import importlib.metadata
+          import importlib.util
+          import json
+          from pathlib import Path
+
+          from cayu.runners.aws_lambda_microvm import LAMBDA_MICROVM_PROTOCOL_VERSION
+
+          root = Path("wheel")
+          manifest = json.loads(
+              (root / "cayu-lambda-microvm-sidecar-manifest.json").read_text()
+          )
+          assert manifest["schema_version"] == 1
+          assert manifest["artifact_version"] == 1
+          assert manifest["cayu_version"] == importlib.metadata.version("cayu")
+          assert manifest["protocol_version"] == LAMBDA_MICROVM_PROTOCOL_VERSION
+          expected_paths = {
+              "cayu-lambda-microvm-sidecar-manifest.json",
+              *(item["path"] for item in manifest["files"]),
+          }
+          assert {
+              path.relative_to(root).as_posix()
+              for path in root.rglob("*")
+              if path.is_file()
+          } == expected_paths
+          for item in manifest["files"]:
+              content = (root / item["path"]).read_bytes()
+              assert len(content) == item["size"]
+              assert "sha256:" + hashlib.sha256(content).hexdigest() == item["sha256"]
+          canonical_files = json.dumps(
+              manifest["files"],
+              ensure_ascii=False,
+              sort_keys=True,
+              separators=(",", ":"),
+          ).encode()
+          assert (
+              "sha256:" + hashlib.sha256(canonical_files).hexdigest()
+              == manifest["content_digest"]
+          )
+          assert importlib.util.find_spec("boto3") is None
+          assert importlib.util.find_spec("fastapi") is None
+          PY
+          docker build --platform linux/arm64 \
+            -t cayu-lambda-microvm-sidecar-proof "$proof_root/wheel"
+          docker run --rm --platform linux/arm64 --entrypoint python3.11 \
+            cayu-lambda-microvm-sidecar-proof -c \
+            'import asyncio; from lambda_microvm_sidecar.app import health; result = asyncio.run(health()); assert result == {"status": "ok", "protocol_version": "1"}'
+          "$GITHUB_WORKSPACE/.release-sdist-venv/bin/python" - <<'PY'
+          from importlib.resources import files
+
+          resource = files("cayu.data").joinpath("lambda_microvm_sidecar", "app.py")
+          resource.write_bytes(resource.read_bytes() + b"\n# tampered\n")
+          PY
+          if "$GITHUB_WORKSPACE/.release-sdist-venv/bin/cayu" \
+            lambda-microvm sidecar export "$proof_root/tampered"; then
+            echo "tampered installed sidecar unexpectedly exported"
+            exit 1
+          fi
       - name: Check built-wheel authoring contract
         run: |
           uv pip install --python .release-venv/bin/python pytest
