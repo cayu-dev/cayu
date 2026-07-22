@@ -17,8 +17,11 @@ from cayu.core.events import Event, EventType
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.server import (
     AuthContext,
+    AuthenticatedAccess,
     BasicAuth,
     DashboardStaticFiles,
+    DocsConfig,
+    ServerConfig,
     create_router,
     create_server,
     mount_cayu,
@@ -63,7 +66,15 @@ def _make_client(*, expose_docs: bool | None = None) -> TestClient:
     app = CayuApp(task_store=InMemoryTaskStore())
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-    return TestClient(create_server(app, auth=_require_bearer_token, expose_docs=expose_docs))
+    return TestClient(
+        create_server(
+            app,
+            config=ServerConfig.protected(
+                _require_bearer_token,
+                docs=DocsConfig(enabled=expose_docs is True),
+            ),
+        )
+    )
 
 
 @pytest.mark.parametrize(
@@ -339,13 +350,13 @@ def test_authenticated_requests_reach_read_handlers() -> None:
     assert missing.json()["detail"] == "Session not found"
 
 
-def test_create_server_requires_auth_unless_dev_mode() -> None:
-    with pytest.raises(ValueError, match="requires auth"):
+def test_create_server_requires_explicit_config() -> None:
+    with pytest.raises(TypeError, match="required keyword-only argument: 'config'"):
         create_server(CayuApp())
 
 
-def test_mount_cayu_requires_auth_unless_dev_mode() -> None:
-    with pytest.raises(ValueError, match="requires auth"):
+def test_mount_cayu_requires_explicit_access() -> None:
+    with pytest.raises(TypeError, match="required keyword-only argument: 'access'"):
         mount_cayu(FastAPI(), CayuApp())
 
 
@@ -356,11 +367,13 @@ def test_basic_auth_dependency_authenticates_control_plane() -> None:
     client = TestClient(
         create_server(
             app,
-            auth=BasicAuth(
-                username="operator",
-                password="secret-password",
-                tenant="tenant-a",
-                claims={"role": "admin"},
+            config=ServerConfig.protected(
+                BasicAuth(
+                    username="operator",
+                    password="secret-password",
+                    tenant="tenant-a",
+                    claims={"role": "admin"},
+                )
             ),
         )
     )
@@ -376,6 +389,53 @@ def test_basic_auth_dependency_authenticates_control_plane() -> None:
     assert accepted.status_code == 200
 
 
+@pytest.mark.parametrize("realm", ["Бишкек", "bad\r\nX-Evil: yes", "bad\tvalue"])
+def test_basic_auth_rejects_realms_that_cannot_be_emitted_safely(realm: str) -> None:
+    with pytest.raises(ValueError, match="visible ASCII"):
+        BasicAuth(username="operator", password="secret-password", realm=realm)
+
+
+def test_basic_auth_escapes_quoted_realm_characters() -> None:
+    client = TestClient(
+        create_server(
+            CayuApp(),
+            config=ServerConfig.protected(
+                BasicAuth(
+                    username="operator",
+                    password="secret-password",
+                    realm='Operations "blue" \\ realm',
+                )
+            ),
+        )
+    )
+
+    denied = client.get("/api/sessions")
+
+    assert denied.status_code == 401
+    assert denied.headers["www-authenticate"] == 'Basic realm="Operations \\"blue\\" \\\\ realm"'
+
+
+@pytest.mark.parametrize("field_name", ["username", "password", "realm", "subject", "tenant"])
+def test_basic_auth_rejects_non_scalar_text_before_runtime_encoding(field_name: str) -> None:
+    values = {"username": "operator", "password": "secret-password"}
+    values[field_name] = f"bad{chr(0xD800)}value"
+
+    with pytest.raises(ValueError, match="Unicode surrogate"):
+        BasicAuth(**values)
+
+
+def test_basic_auth_rejects_username_delimiter_and_non_scalar_claims() -> None:
+    with pytest.raises(ValueError, match="must not contain a colon"):
+        BasicAuth(username="operator:admin", password="secret-password")
+
+    with pytest.raises(ValueError, match="Unicode surrogate"):
+        BasicAuth(
+            username="operator",
+            password="secret-password",
+            claims={"role": f"bad{chr(0xD800)}value"},
+        )
+
+
 def test_basic_auth_dependency_authenticates_dashboard_shell() -> None:
     app = CayuApp(task_store=InMemoryTaskStore())
     app.register_provider(OneShotProvider(), default=True)
@@ -383,7 +443,9 @@ def test_basic_auth_dependency_authenticates_dashboard_shell() -> None:
     client = TestClient(
         create_server(
             app,
-            auth=BasicAuth(username="operator", password="secret-password"),
+            config=ServerConfig.protected(
+                BasicAuth(username="operator", password="secret-password")
+            ),
         )
     )
 
@@ -407,7 +469,9 @@ def test_mount_cayu_authenticates_embedded_api_and_dashboard() -> None:
     mount_cayu(
         server,
         app,
-        auth=BasicAuth(username="operator", password="secret-password"),
+        access=AuthenticatedAccess(
+            dependency=BasicAuth(username="operator", password="secret-password")
+        ),
     )
     client = TestClient(server)
 
@@ -449,7 +513,7 @@ def test_custom_auth_dependency_may_return_mapping_context() -> None:
     app = CayuApp(task_store=InMemoryTaskStore())
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-    client = TestClient(create_server(app, auth=mapping_auth))
+    client = TestClient(create_server(app, config=ServerConfig.protected(mapping_auth)))
 
     assert client.get("/api/sessions").status_code == 401
     assert client.get("/api/sessions", headers=_AUTH_HEADERS).status_code == 200
@@ -464,17 +528,17 @@ def test_custom_auth_dependency_may_be_async() -> None:
     app = CayuApp(task_store=InMemoryTaskStore())
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-    client = TestClient(create_server(app, auth=async_auth))
+    client = TestClient(create_server(app, config=ServerConfig.protected(async_auth)))
 
     assert client.get("/api/sessions").status_code == 401
     assert client.get("/api/sessions", headers=_AUTH_HEADERS).status_code == 200
 
 
-def test_dev_server_without_auth_keeps_routes_open() -> None:
+def test_local_development_server_keeps_routes_open() -> None:
     app = CayuApp(task_store=InMemoryTaskStore())
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-    client = TestClient(create_server(app, dev=True))
+    client = TestClient(create_server(app, config=ServerConfig.local_development()))
 
     with client.stream("POST", "/api/run", json={"prompt": "hello"}) as response:
         assert response.status_code == 200
@@ -522,7 +586,7 @@ def test_authenticated_resolution_derives_resolved_by_from_auth_context() -> Non
     from cayu import ResolutionActorSource
 
     app, captured = _approval_capture_app()
-    client = TestClient(create_server(app, auth=_require_bearer_token))
+    client = TestClient(create_server(app, config=ServerConfig.protected(_require_bearer_token)))
 
     with client.stream(
         "POST",
@@ -552,7 +616,7 @@ def test_authenticated_resolution_reserved_auth_subject_returns_400() -> None:
         return AuthContext(subject="cayu:ops", claims={"scheme": "bearer"})
 
     app, captured = _approval_capture_app()
-    client = TestClient(create_server(app, auth=reserved_subject_auth))
+    client = TestClient(create_server(app, config=ServerConfig.protected(reserved_subject_auth)))
 
     response = client.post(
         "/api/tool-approvals/resolve",
@@ -571,7 +635,7 @@ def test_authenticated_resolution_reserved_auth_subject_returns_400() -> None:
 
 def test_authenticated_resolution_rejects_body_resolved_by() -> None:
     app, captured = _approval_capture_app()
-    client = TestClient(create_server(app, auth=_require_bearer_token))
+    client = TestClient(create_server(app, config=ServerConfig.protected(_require_bearer_token)))
 
     response = client.post(
         "/api/tool-approvals/resolve",
@@ -629,7 +693,7 @@ def test_authenticated_interruption_derives_requested_by_from_auth_context() -> 
     from cayu import ResolutionActorSource
 
     app, captured = _interrupt_capture_app()
-    client = TestClient(create_server(app, auth=_require_bearer_token))
+    client = TestClient(create_server(app, config=ServerConfig.protected(_require_bearer_token)))
 
     with client.stream(
         "POST",
@@ -650,7 +714,7 @@ def test_authenticated_interruption_derives_requested_by_from_auth_context() -> 
 
 def test_authenticated_interruption_rejects_body_requested_by() -> None:
     app, captured = _interrupt_capture_app()
-    client = TestClient(create_server(app, auth=_require_bearer_token))
+    client = TestClient(create_server(app, config=ServerConfig.protected(_require_bearer_token)))
 
     response = client.post(
         "/api/sessions/session_interrupt_actor/interrupt",

@@ -20,6 +20,20 @@ prerelease convention change: Cayu does not discover
 or migrate alternate filenames. Applications that intentionally use another
 path must configure or pass that path explicitly.
 
+### Server configuration is explicit and source-agnostic
+
+`create_server(...)` now accepts one immutable `ServerConfig` covering access,
+API and dashboard exposure, generated docs, CORS, and lifecycle policy.
+`deployment_name` is descriptive metadata only: changing it never relaxes or
+tightens server policy. Applications must select `AuthenticatedAccess` or
+deliberate `OpenAccess`, and can resolve credentials through any external
+provider before constructing the config.
+
+`create_server(...)` requires the resolved configuration, and
+`mount_cayu(...)` requires an explicit access policy; there is no parallel
+flag-based policy path. See [server configuration](server-configuration.md)
+for profiles and external authentication.
+
 ### Virtual egress supports GitHub-style CLI tokens
 
 `VirtualCredentialSpec(credential_kind="opaque_token")` now brokers opaque

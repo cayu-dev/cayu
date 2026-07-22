@@ -319,8 +319,11 @@ Cayu makes safety boundaries explicit, but configuration still matters:
   credentials, and destination controls where consequences require them.
 - SQLite is appropriate for local and single-writer deployments. Use PostgreSQL
   or another conforming shared store for sustained multi-process concurrency.
-- The FastAPI control plane requires authentication outside explicit
-  `dev=True`; protect it as an operator surface, not an end-user endpoint.
+- The FastAPI control plane requires an explicit `ServerConfig` access policy.
+  Use `AuthenticatedAccess` for deployed operator surfaces; `OpenAccess` and
+  `ServerConfig.local_development()` are deliberate local-only choices.
+  Deployment names are descriptive metadata and never relax security policy.
+  See [server configuration](docs/server-configuration.md).
   `AuthContext.tenant` records authenticated operator provenance but does not
   filter or isolate Cayu data. See [Server authentication and tenant
   isolation](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/server-auth-tenancy.md).
@@ -362,6 +365,7 @@ Start with the document that matches the job:
 | Use the application console | [Console](https://github.com/cayu-dev/cayu/blob/main/docs/console.md) |
 | Configure CLI session-store discovery | [Session-store targets](https://github.com/cayu-dev/cayu/blob/main/docs/session-store-targets.md) |
 | Inspect durable sessions safely | [Session inspection](https://github.com/cayu-dev/cayu/blob/main/docs/session-inspection.md) |
+| Configure a control-plane server deployment | [Server configuration](https://github.com/cayu-dev/cayu/blob/main/docs/server-configuration.md) |
 | Embed Cayu behind tenant-aware product APIs | [Server authentication and tenant isolation](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/server-auth-tenancy.md) |
 | Inspect supported model metadata | [Model catalog](https://github.com/cayu-dev/cayu/blob/main/docs/model-catalog.md) |
 | Look up exact runtime behavior | [Runtime contracts](https://github.com/cayu-dev/cayu/blob/main/docs/runtime-contracts.md) |

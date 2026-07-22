@@ -41,7 +41,7 @@ from cayu import (
     WriteFileTool,
     trim_context_turns,
 )
-from cayu.server import BasicAuth, create_server
+from cayu.server import BasicAuth, ServerConfig, create_server
 
 WORKSPACE = Path(__file__).parent / ".examples-workspaces" / "server"
 DATA_DIR = WORKSPACE / "data"
@@ -82,7 +82,13 @@ def main() -> None:
         context_policy=RecentContextPolicy(),
     )
 
-    server = create_server(app, auth=_server_auth())
+    server = create_server(
+        app,
+        config=ServerConfig.protected(
+            _server_auth(),
+            deployment_name=os.environ.get("CAYU_SERVER_DEPLOYMENT_NAME", "development"),
+        ),
+    )
     uvicorn.run(server, host="0.0.0.0", port=8000)
 
 

@@ -4059,7 +4059,7 @@
       "type": "object"
     },
     "ResolutionActorSource": {
-      "description": "How a ``ResolutionActor``'s identity claim was established.\n\n``HTTP_AUTH`` is produced only by the server layer from a verified\n``AuthContext``; ``REQUEST`` marks a caller-asserted identity (SDK or\ndev-mode HTTP body); ``SYSTEM`` marks runtime-generated actors such as\ndeterministic approval expiry. Direct SDK callers are a trusted boundary\nand may construct system actors; HTTP bodies cannot \u2014 the server re-stamps\ndev-mode bodies to ``REQUEST`` and rejects them entirely under auth.",
+      "description": "How a ``ResolutionActor``'s identity claim was established.\n\n``HTTP_AUTH`` is produced only by the server layer from a verified\n``AuthContext``; ``REQUEST`` marks a caller-asserted identity (SDK or\nopen-access HTTP body); ``SYSTEM`` marks runtime-generated actors such as\ndeterministic approval expiry. Direct SDK callers are a trusted boundary\nand may construct system actors; HTTP bodies cannot \u2014 the server re-stamps\nopen-access bodies to ``REQUEST`` and rejects them entirely under auth.",
       "enum": [
         "http_auth",
         "request",

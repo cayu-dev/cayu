@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 
 from cayu import AgentSpec, CayuApp, Message, RunRequest
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.server import create_server
+from cayu.server import ServerConfig, create_server
 
 
 class UsageProvider(ModelProvider):
@@ -77,7 +77,7 @@ def main() -> None:
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
     asyncio.run(seed_sessions(app))
 
-    client = TestClient(create_server(app, dev=True))
+    client = TestClient(create_server(app, config=ServerConfig.local_development()))
     response = client.post(
         "/api/sessions/summary",
         params=[

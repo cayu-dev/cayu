@@ -48,7 +48,7 @@ from cayu import (
     ToolSpec,
 )
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.server import create_server
+from cayu.server import DashboardConfig, ServerConfig, create_server
 from cayu.tools import UserInputTool
 
 WORKSPACE = Path(__file__).parent / ".examples-workspaces" / "dashboard-pending-actions"
@@ -741,8 +741,11 @@ def main() -> None:
     asyncio.run(seed_pending_knowledge(knowledge_store))
     server = create_server(
         app,
-        dev=True,
-        dashboard_config={"priceBook": DEMO_PRICING.model_dump(mode="json")},
+        config=ServerConfig.local_development(
+            dashboard=DashboardConfig(
+                runtime_config={"priceBook": DEMO_PRICING.model_dump(mode="json")}
+            )
+        ),
     )
     host = os.environ.get("CAYU_DASHBOARD_HOST", "127.0.0.1")
     port = int(os.environ.get("CAYU_DASHBOARD_PORT", "8001"))

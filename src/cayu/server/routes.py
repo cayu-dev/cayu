@@ -7,6 +7,7 @@ import base64
 import contextlib
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
+from math import isfinite
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 from unicodedata import category as unicode_category
 from urllib.parse import quote
@@ -113,6 +114,7 @@ from cayu.runtime.usage import (
 )
 from cayu.runtime.user_input import UserInputRecoveryRequest, UserInputResponse
 from cayu.server.auth import AuthContext, AuthDependency, server_auth_dependency
+from cayu.server.config import normalize_api_path
 from cayu.server.contracts import (
     AGGREGATE_ENDPOINT_RESPONSES,
     ARTIFACT_CONTENT_ENDPOINT_RESPONSES,
@@ -1106,7 +1108,7 @@ def _request_actor(
     With auth configured, provenance comes from the verified caller and a
     body-supplied actor is rejected loudly (mirroring the reserved ``cayu:``
     label rejection) — a silent override would let clients believe they
-    recorded an actor the audit trail replaced. Dev-mode bodies are accepted
+    recorded an actor the audit trail replaced. Open-access bodies are accepted
     but re-stamped ``source="request"``, so a request can never claim
     server-verified (``http_auth``) or system provenance.
     """
@@ -1850,13 +1852,13 @@ def create_router(
 
     Args:
         auth: FastAPI-compatible dependency guarding the CAYU control plane.
-            Production callers should pass this through ``create_server``; only
-            explicit dev-mode callers should leave it unset. It protects every
-            control-plane route that can start, change, inspect, or reveal runtime
-            state; only the health route stays open for load balancers. It must
-            return ``AuthContext`` or a compatible mapping and raise
-            ``HTTPException`` (401/403) to deny a request. Authentication does not
-            add tenant-level authorization or storage isolation:
+            ``create_server`` callers normally supply this through
+            ``AuthenticatedAccess``; only deliberate ``OpenAccess`` should leave
+            it unset. It protects every control-plane route that can start, change,
+            inspect, or reveal runtime state; only the health route stays open for
+            load balancers. It must return ``AuthContext`` or a compatible mapping
+            and raise ``HTTPException`` (401/403) to deny a request. Authentication
+            does not add tenant-level authorization or storage isolation:
             ``AuthContext.tenant`` is operator provenance only.
         api_path: URL path prefix for the CAYU control plane. Defaults to
             ``/api``.
@@ -1869,17 +1871,18 @@ def create_router(
     if (
         isinstance(replay_idle_timeout_s, bool)
         or not isinstance(replay_idle_timeout_s, (int, float))
+        or not isfinite(replay_idle_timeout_s)
         or replay_idle_timeout_s <= 0
     ):
-        raise ValueError("replay_idle_timeout_s must be a positive number.")
+        raise ValueError("replay_idle_timeout_s must be a finite positive number.")
     replay_idle_timeout_s = float(replay_idle_timeout_s)
 
-    api_prefix = _normalize_api_path(api_path)
+    api_prefix = normalize_api_path(api_path, field_name="api_path")
     router = APIRouter(prefix=api_prefix)
     auth_context_openapi_schema = AuthContext.model_json_schema()
 
     # Shared dependency list for control-plane routes. FastAPI treats an empty
-    # sequence like no dependencies, so `auth=None` keeps current dev behavior.
+    # sequence like no dependencies, so `auth=None` keeps explicit open access.
     auth_dependency = server_auth_dependency(auth) if auth is not None else None
     protected: list[Any] = [Depends(auth_dependency)] if auth_dependency is not None else []
 
@@ -4125,15 +4128,3 @@ def create_router(
         return {"ok": True}
 
     return router
-
-
-def _normalize_api_path(path: str) -> str:
-    value = path.strip()
-    if not value:
-        raise ValueError("api_path must not be blank.")
-    if "?" in value or "#" in value or "://" in value:
-        raise ValueError("api_path must be a URL path, not a URL.")
-    value = "/" + value.strip("/")
-    if value == "/":
-        raise ValueError("api_path must not be the site root.")
-    return value

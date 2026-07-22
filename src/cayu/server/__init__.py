@@ -5,14 +5,17 @@ Usage::
     import os
 
     from cayu import CayuApp
-    from cayu.server import BasicAuth, create_server
+    from cayu.server import BasicAuth, ServerConfig, create_server
 
     app = CayuApp(session_store=..., task_store=..., knowledge_store=...)
     app.register_agent(...)
 
     server = create_server(
         app,
-        auth=BasicAuth(username="admin", password=os.environ["CAYU_SERVER_PASSWORD"]),
+        config=ServerConfig.protected(
+            BasicAuth(username="admin", password=os.environ["CAYU_SERVER_PASSWORD"]),
+            deployment_name="production",
+        ),
     )
 
     # Run with: uvicorn my_module:server --port 8000
@@ -23,20 +26,41 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
+from inspect import Parameter, signature
 from math import isfinite
 from pathlib import Path
 from typing import Any
 
+from cayu._validation import require_clean_nonblank, thaw_json_value
 from cayu.runtime.app import CayuApp
-from cayu.runtime.sessions import IncompleteSessionsRecoveryRequest, SessionStatus
+from cayu.runtime.sessions import IncompleteSessionsRecoveryRequest
 
 try:
     from fastapi import Request  # noqa: TC002 - FastAPI resolves endpoint annotations at runtime
     from starlette.responses import RedirectResponse
 
     from cayu.server.auth import AuthContext, AuthDependency, BasicAuth
+    from cayu.server.config import (
+        DEFAULT_EVENT_SIDE_EFFECT_STARTUP_TIMEOUT_SECONDS,
+        DEFAULT_INTERRUPTION_SHUTDOWN_GRACE_SECONDS,
+        DEFAULT_RECOVERY_INACTIVE_AFTER_SECONDS,
+        DEFAULT_REPLAY_IDLE_TIMEOUT_SECONDS,
+        AuthenticatedAccess,
+        CorsConfig,
+        DashboardConfig,
+        DocsConfig,
+        OpenAccess,
+        ServerAccessConfig,
+        ServerApiConfig,
+        ServerConfig,
+        ServerLifecycleConfig,
+        auth_dependency_for,
+        normalize_api_path,
+        normalize_dashboard_path,
+    )
     from cayu.server.contracts import SERVER_API_PREFIX
     from cayu.server.routes import create_router
     from cayu.server.sse import event_to_sse_data
@@ -61,8 +85,17 @@ except ModuleNotFoundError as exc:
 __all__ = [
     "AuthContext",
     "AuthDependency",
+    "AuthenticatedAccess",
     "BasicAuth",
+    "CorsConfig",
+    "DashboardConfig",
     "DashboardStaticFiles",
+    "DocsConfig",
+    "OpenAccess",
+    "ServerAccessConfig",
+    "ServerApiConfig",
+    "ServerConfig",
+    "ServerLifecycleConfig",
     "create_router",
     "create_server",
     "event_to_sse_data",
@@ -74,29 +107,28 @@ logger = logging.getLogger(__name__)
 
 _PERSISTED_EVENT_SIDE_EFFECT_RECOVERY_INTERVAL_SECONDS = 30.0
 _PERSISTED_EVENT_SIDE_EFFECT_RECOVERY_BATCH_SIZE = 1000
-_DEFAULT_EVENT_SIDE_EFFECT_STARTUP_TIMEOUT_SECONDS = 30.0
+_ALLOWED_FASTAPI_OPTIONS = frozenset(
+    {
+        "contact",
+        "description",
+        "license_info",
+        "lifespan",
+        "openapi_tags",
+        "root_path",
+        "root_path_in_servers",
+        "servers",
+        "summary",
+        "terms_of_service",
+        "version",
+    }
+)
 
 
 def create_server(
     app: CayuApp,
     *,
-    title: str = "Cayu",
-    cors_origins: list[str] | None = None,
-    dashboard_dir: str | Path | None = None,
-    dashboard_path: str | None = "/cayu",
-    api_path: str = SERVER_API_PREFIX,
-    auth: AuthDependency | None = None,
-    dev: bool = False,
-    expose_docs: bool | None = None,
-    dashboard_config: dict[str, Any] | None = None,
-    replay_idle_timeout_s: float = 300.0,
-    startup_recovery_statuses: set[SessionStatus] | None = None,
-    recovery_inactive_after_seconds: int = 300,
-    event_side_effect_startup_timeout_seconds: float = (
-        _DEFAULT_EVENT_SIDE_EFFECT_STARTUP_TIMEOUT_SECONDS
-    ),
-    interruption_shutdown_grace_seconds: float = 10.0,
-    **fastapi_kwargs: Any,
+    config: ServerConfig,
+    fastapi_options: Mapping[str, Any] | None = None,
 ) -> Any:
     """Create a FastAPI server wired to a CayuApp.
 
@@ -105,93 +137,51 @@ def create_server(
 
     Args:
         app: The CayuApp instance with registered agents/providers.
-        title: FastAPI app title.
-        cors_origins: Allowed CORS origins. Defaults to localhost:5173 (Vite dev).
-        dashboard_dir: Path to pre-built dashboard static files. Defaults to the
-            bundled CAYU dashboard build.
-        dashboard_path: URL path for the bundled dashboard. Defaults to
-            ``/cayu``. Pass ``None`` to disable dashboard mounting.
-        api_path: URL path prefix for the CAYU control plane. Defaults to
-            ``/api``. Use ``/cayu/api`` when embedding dashboard and API under
-            one product path.
-        auth: FastAPI-compatible dependency guarding the CAYU control plane. It
-            must accept ``Request`` and return ``AuthContext``; raise
-            ``fastapi.HTTPException`` (401/403) inside it to reject a request.
-            It protects every control-plane route that can start, change,
-            inspect, or reveal runtime state; only the health route stays open
-            for load balancers. This authenticates access but does not provide
-            tenant authorization or storage isolation. ``AuthContext.tenant``
-            is operator-action provenance only and does not filter Cayu data.
-        dev: Explicit opt-in for unauthenticated local/dev servers. Without
-            ``auth`` or ``dev=True``, ``create_server`` raises instead of
-            accidentally exposing the control plane.
-        expose_docs: Whether to expose FastAPI's generated ``/openapi.json``,
-            ``/docs``, and ``/redoc`` routes. Defaults to ``True`` in dev mode
-            and ``False`` in protected deployments. Set this explicitly for
-            production deployments that intentionally expose generated docs.
-        dashboard_config: Optional JSON-serializable runtime config injected
-            into the bundled dashboard shell. ``basePath`` and ``apiBaseUrl``
-            are owned by the server mount and cannot be overridden here.
-        replay_idle_timeout_s: Maximum time a replay stream waits without a
-            persisted event before emitting an error and closing.
-        startup_recovery_statuses: Explicit statuses for a bounded recovery sweep
-            during server startup. ``None`` disables it. Include ``pending`` or
-            ``running`` only when the deployment boundary proves they are abandoned.
-        recovery_inactive_after_seconds: Minimum inactivity required before the
-            startup sweep atomically fences and recovers a session.
-        event_side_effect_startup_timeout_seconds: Maximum startup wait for
-            persisted event side-effect recovery. Unfinished durable handoffs
-            remain eligible for the lifecycle-managed recovery loop.
-        interruption_shutdown_grace_seconds: Maximum server-shutdown wait for
-            accepted background interruption cascades.
-        **fastapi_kwargs: Additional kwargs passed to FastAPI().
+        config: Fully resolved server identity and policy. Construct it directly
+            after resolving any external settings or secrets. An authenticated
+            policy's dependency returns ``AuthContext``; its ``tenant`` value is
+            operator-action provenance only and does not filter Cayu data or
+            provide tenant isolation.
+        fastapi_options: Optional non-policy FastAPI constructor options. Cayu
+            validates the option names and retains ownership of its title,
+            documentation routes, and lifespan composition.
     """
     from fastapi import FastAPI
     from fastapi.middleware.cors import CORSMiddleware
 
-    if auth is None and not dev:
-        raise ValueError(
-            "create_server requires auth=... for protected deployments. "
-            "Pass dev=True only for local development or tests."
+    if type(config) is not ServerConfig:
+        raise TypeError("config must be a resolved ServerConfig instance.")
+    resolved_config = config
+    api_auth = auth_dependency_for(resolved_config.access)
+    dashboard_auth = auth_dependency_for(resolved_config.dashboard.access or resolved_config.access)
+    lifecycle = resolved_config.lifecycle
+    resolved_fastapi_options = _validate_fastapi_options(FastAPI, fastapi_options)
+    if resolved_config.dashboard.enabled:
+        _require_dashboard_assets(
+            resolved_config.dashboard.directory,
+            disable_with="dashboard.enabled=False",
         )
-    if type(recovery_inactive_after_seconds) is not int or recovery_inactive_after_seconds < 0:
-        raise ValueError("recovery_inactive_after_seconds must be a non-negative integer.")
-    event_side_effect_startup_timeout_seconds = _validate_positive_seconds(
-        event_side_effect_startup_timeout_seconds,
-        "event_side_effect_startup_timeout_seconds",
-    )
-    interruption_shutdown_grace_seconds = _validate_positive_seconds(
-        interruption_shutdown_grace_seconds,
-        "interruption_shutdown_grace_seconds",
-    )
-
-    docs_enabled = dev if expose_docs is None else expose_docs
-    fastapi_options = dict(fastapi_kwargs)
-    user_lifespan = fastapi_options.pop("lifespan", None)
-    recovery_statuses = None
-    if startup_recovery_statuses is not None:
-        recovery_statuses = IncompleteSessionsRecoveryRequest(
-            statuses=startup_recovery_statuses
-        ).statuses
+    user_lifespan = resolved_fastapi_options.pop("lifespan", None)
+    recovery_statuses = lifecycle.startup_recovery_statuses
 
     async def recover_startup_state() -> None:
         await _recover_persisted_event_side_effects_during_startup(
             app,
-            timeout_s=event_side_effect_startup_timeout_seconds,
+            timeout_s=lifecycle.event_side_effect_startup_timeout_seconds,
         )
         if recovery_statuses is not None:
             await app.recover_incomplete_sessions(
                 IncompleteSessionsRecoveryRequest(
-                    statuses=recovery_statuses,
+                    statuses=set(recovery_statuses),
                     inactive_before=datetime.now(UTC)
-                    - timedelta(seconds=recovery_inactive_after_seconds),
+                    - timedelta(seconds=lifecycle.recovery_inactive_after_seconds),
                     reason="server_startup_recovery",
                     metadata={"source": "create_server"},
                 )
             )
         await app.resume_pending_interruption_cascades(
             interrupting_inactive_before=datetime.now(UTC)
-            - timedelta(seconds=recovery_inactive_after_seconds)
+            - timedelta(seconds=lifecycle.recovery_inactive_after_seconds)
         )
 
     @asynccontextmanager
@@ -206,7 +196,7 @@ def create_server(
                 await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
                 await _drain_background_interruptions(
                     app,
-                    timeout_s=interruption_shutdown_grace_seconds,
+                    timeout_s=lifecycle.interruption_shutdown_grace_seconds,
                 )
             return
         async with user_lifespan(server) as state:
@@ -218,63 +208,99 @@ def create_server(
                 await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
                 await _drain_background_interruptions(
                     app,
-                    timeout_s=interruption_shutdown_grace_seconds,
+                    timeout_s=lifecycle.interruption_shutdown_grace_seconds,
                 )
 
-    fastapi_options["lifespan"] = cayu_lifespan
-    if docs_enabled:
-        fastapi_options.setdefault("docs_url", "/docs")
-        fastapi_options.setdefault("redoc_url", "/redoc")
-        fastapi_options.setdefault("openapi_url", "/openapi.json")
+    resolved_fastapi_options["lifespan"] = cayu_lifespan
+    resolved_fastapi_options["debug"] = False
+    if resolved_config.docs.enabled:
+        resolved_fastapi_options["docs_url"] = "/docs"
+        resolved_fastapi_options["redoc_url"] = "/redoc"
+        resolved_fastapi_options["openapi_url"] = "/openapi.json"
     else:
-        fastapi_options["docs_url"] = None
-        fastapi_options["redoc_url"] = None
-        fastapi_options["openapi_url"] = None
+        resolved_fastapi_options["docs_url"] = None
+        resolved_fastapi_options["redoc_url"] = None
+        resolved_fastapi_options["openapi_url"] = None
 
-    server = FastAPI(title=title, **fastapi_options)
+    server = FastAPI(title=resolved_config.title, **resolved_fastapi_options)
+    server.state.cayu_server_config = resolved_config
+    server.state.cayu_server_config_summary = resolved_config.safe_summary()
 
-    origins = cors_origins or ["http://localhost:5173"]
-    server.add_middleware(
-        CORSMiddleware,
-        allow_origins=origins,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    if resolved_config.cors.allowed_origins:
+        server.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(resolved_config.cors.allowed_origins),
+            allow_methods=list(resolved_config.cors.allow_methods),
+            allow_headers=list(resolved_config.cors.allow_headers),
+            allow_credentials=resolved_config.cors.allow_credentials,
+        )
 
     session_store = app.session_store
     task_store = app.task_store
     knowledge_store = app.knowledge_store
-    control_plane_path = _normalize_api_path(api_path)
-    dashboard_mount_path = (
-        _normalize_dashboard_path(dashboard_path, api_path=control_plane_path)
-        if dashboard_path is not None
-        else None
-    )
+    control_plane_path = resolved_config.api.path
+    if resolved_config.api.enabled:
+        router = create_router(
+            cayu_app=app,
+            session_store=session_store,
+            task_store=task_store,
+            knowledge_store=knowledge_store,
+            knowledge_review_namespace=app.knowledge_review_namespace,
+            knowledge_review_labels=app.knowledge_review_labels,
+            auth=api_auth,
+            api_path=control_plane_path,
+            openapi_url=server.openapi_url,
+            replay_idle_timeout_s=lifecycle.replay_idle_timeout_s,
+        )
+        server.include_router(router)
 
-    router = create_router(
-        cayu_app=app,
-        session_store=session_store,
-        task_store=task_store,
-        knowledge_store=knowledge_store,
-        knowledge_review_namespace=app.knowledge_review_namespace,
-        knowledge_review_labels=app.knowledge_review_labels,
-        auth=auth,
-        api_path=control_plane_path,
-        openapi_url=server.openapi_url,
-        replay_idle_timeout_s=replay_idle_timeout_s,
-    )
-    server.include_router(router)
-
-    mount_dashboard(
-        server,
-        dashboard_dir=dashboard_dir,
-        dashboard_path=dashboard_mount_path,
-        auth=auth,
-        api_base_url=control_plane_path,
-        dashboard_config=dashboard_config,
-    )
+    if resolved_config.dashboard.enabled:
+        dashboard_mounted = mount_dashboard(
+            server,
+            dashboard_dir=resolved_config.dashboard.directory,
+            dashboard_path=resolved_config.dashboard.path,
+            auth=dashboard_auth,
+            api_base_url=control_plane_path,
+            dashboard_config=dict(thaw_json_value(resolved_config.dashboard.runtime_config)),
+        )
+        if not dashboard_mounted:
+            raise _dashboard_assets_unavailable_error(
+                resolved_config.dashboard.directory,
+                disable_with="dashboard.enabled=False",
+            )
 
     return server
+
+
+def _validate_fastapi_options(
+    fastapi_cls: type[Any],
+    options: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if options is None:
+        return {}
+    if not isinstance(options, Mapping):
+        raise TypeError("fastapi_options must be a mapping of FastAPI constructor options.")
+    if any(not isinstance(name, str) for name in options):
+        raise TypeError("fastapi_options keys must be strings.")
+
+    resolved_options = dict(options)
+    disallowed = sorted(resolved_options.keys() - _ALLOWED_FASTAPI_OPTIONS)
+    if disallowed:
+        raise ValueError(
+            "Unsupported or policy-bearing FastAPI options: "
+            f"{', '.join(disallowed)}. Use ServerConfig for Cayu policy or "
+            "mount_cayu() when the host application must own broader FastAPI behavior."
+        )
+
+    supported_options = {
+        name
+        for name, parameter in signature(fastapi_cls).parameters.items()
+        if parameter.kind is not Parameter.VAR_KEYWORD
+    }
+    unsupported = sorted(resolved_options.keys() - supported_options)
+    if unsupported:
+        raise ValueError(f"Unsupported FastAPI options: {', '.join(unsupported)}.")
+    return resolved_options
 
 
 def mount_cayu(
@@ -284,15 +310,14 @@ def mount_cayu(
     path: str = "/cayu",
     dashboard: bool = True,
     dashboard_dir: str | Path | None = None,
-    auth: AuthDependency | None = None,
-    dev: bool = False,
+    access: ServerAccessConfig,
     dashboard_config: dict[str, Any] | None = None,
-    replay_idle_timeout_s: float = 300.0,
+    replay_idle_timeout_s: float = DEFAULT_REPLAY_IDLE_TIMEOUT_SECONDS,
     event_side_effect_startup_timeout_seconds: float = (
-        _DEFAULT_EVENT_SIDE_EFFECT_STARTUP_TIMEOUT_SECONDS
+        DEFAULT_EVENT_SIDE_EFFECT_STARTUP_TIMEOUT_SECONDS
     ),
-    interruption_shutdown_grace_seconds: float = 10.0,
-    interruption_recovery_inactive_after_seconds: int = 300,
+    interruption_shutdown_grace_seconds: float = DEFAULT_INTERRUPTION_SHUTDOWN_GRACE_SECONDS,
+    interruption_recovery_inactive_after_seconds: int = DEFAULT_RECOVERY_INACTIVE_AFTER_SECONDS,
     name: str = "cayu-dashboard",
 ) -> None:
     """Mount CAYU's control plane and dashboard into an existing FastAPI app.
@@ -305,17 +330,34 @@ def mount_cayu(
     drains accepted background interruption cascades for up to
     ``interruption_shutdown_grace_seconds`` before the host shuts down.
 
-    ``auth`` authenticates access to the complete mounted surface. It does not
-    make that surface tenant-scoped: ``AuthContext.tenant`` is operator-action
-    provenance only, and Cayu's built-in reads are not filtered by it. Treat the
-    mount as an operator surface unless the host application enforces
-    end-to-end tenant authorization and storage isolation.
+    ``access`` explicitly selects authenticated or deliberately open access to
+    the complete mounted surface. ``AuthenticatedAccess`` wraps the existing
+    auth dependency contract. Authentication does not make the surface
+    tenant-scoped: ``AuthContext.tenant`` is operator-action provenance only,
+    and Cayu's built-in reads are not filtered by it. Treat the mount as an
+    operator surface unless the host application enforces end-to-end tenant
+    authorization and storage isolation.
+
+    ``dashboard_config`` must be a JSON object. Cayu validates and copies it
+    before modifying the host application.
     """
-    if auth is None and not dev:
-        raise ValueError(
-            "mount_cayu requires auth=... for protected deployments. "
-            "Pass dev=True only for local development or tests."
+    auth = auth_dependency_for(access)
+    mount_path = normalize_dashboard_path(path, field_name="path")
+    api_path = _join_public_paths(mount_path, "api")
+    prepared_dashboard: tuple[str, DashboardStaticFiles] | None = None
+    if dashboard:
+        prepared_dashboard = _prepare_dashboard_mount(
+            dashboard_dir=dashboard_dir,
+            dashboard_path=mount_path,
+            auth=auth,
+            api_base_url=api_path,
+            dashboard_config=dashboard_config,
         )
+        if prepared_dashboard is None:
+            raise _dashboard_assets_unavailable_error(
+                dashboard_dir,
+                disable_with="dashboard=False",
+            )
     event_side_effect_startup_timeout_seconds = _validate_positive_seconds(
         event_side_effect_startup_timeout_seconds,
         "event_side_effect_startup_timeout_seconds",
@@ -331,16 +373,6 @@ def mount_cayu(
         raise ValueError(
             "interruption_recovery_inactive_after_seconds must be a non-negative integer."
         )
-    _compose_interruption_drain_lifespan(
-        server,
-        app,
-        timeout_s=interruption_shutdown_grace_seconds,
-        recovery_inactive_after_seconds=interruption_recovery_inactive_after_seconds,
-        side_effect_startup_timeout_s=event_side_effect_startup_timeout_seconds,
-    )
-
-    mount_path = _normalize_dashboard_path(path, api_path=None)
-    api_path = _join_public_paths(mount_path, "api")
     router = create_router(
         cayu_app=app,
         session_store=app.session_store,
@@ -353,15 +385,23 @@ def mount_cayu(
         openapi_url=getattr(server, "openapi_url", None),
         replay_idle_timeout_s=replay_idle_timeout_s,
     )
+
+    # All caller-controlled values and route construction are validated before
+    # changing the host application. A rejected mount must leave it reusable.
+    _compose_interruption_drain_lifespan(
+        server,
+        app,
+        timeout_s=interruption_shutdown_grace_seconds,
+        recovery_inactive_after_seconds=interruption_recovery_inactive_after_seconds,
+        side_effect_startup_timeout_s=event_side_effect_startup_timeout_seconds,
+    )
     server.include_router(router)
-    if dashboard:
-        mount_dashboard(
+    if prepared_dashboard is not None:
+        prepared_mount_path, dashboard_app = prepared_dashboard
+        _attach_dashboard_mount(
             server,
-            dashboard_dir=dashboard_dir,
-            dashboard_path=mount_path,
-            auth=auth,
-            api_base_url=api_path,
-            dashboard_config=dashboard_config,
+            mount_path=prepared_mount_path,
+            dashboard_app=dashboard_app,
             name=name,
         )
 
@@ -389,19 +429,49 @@ def mount_dashboard(
     API data. Treat this helper as an operator surface unless the host proves
     end-to-end tenant authorization and storage isolation.
 
+    ``dashboard_config`` must be a JSON object. Cayu validates and takes an
+    owned copy before registering any dashboard route.
+
     Returns ``True`` when a dashboard was mounted and ``False`` when mounting
-    was disabled or the dashboard directory is absent.
+    was disabled, the dashboard directory is absent, or its ``index.html``
+    entrypoint is unavailable.
     """
-    if dashboard_path is None:
+    prepared_dashboard = _prepare_dashboard_mount(
+        dashboard_dir=dashboard_dir,
+        dashboard_path=dashboard_path,
+        auth=auth,
+        api_base_url=api_base_url,
+        dashboard_config=dashboard_config,
+    )
+    if prepared_dashboard is None:
         return False
 
-    mount_path = _normalize_dashboard_path(dashboard_path, api_path=None)
-    api_url = _normalize_api_base_url(api_base_url)
-    dist_path = (
-        Path(dashboard_dir) if dashboard_dir is not None else Path(__file__).parent / "dashboard"
+    mount_path, dashboard_app = prepared_dashboard
+    _attach_dashboard_mount(
+        server,
+        mount_path=mount_path,
+        dashboard_app=dashboard_app,
+        name=name,
     )
-    if not dist_path.exists():
-        return False
+    return True
+
+
+def _prepare_dashboard_mount(
+    *,
+    dashboard_dir: str | Path | None,
+    dashboard_path: str | None,
+    auth: AuthDependency | None,
+    api_base_url: str,
+    dashboard_config: dict[str, Any] | None,
+) -> tuple[str, DashboardStaticFiles] | None:
+    if dashboard_path is None:
+        return None
+
+    mount_path = normalize_dashboard_path(dashboard_path, field_name="dashboard_path")
+    api_url = _normalize_api_base_url(api_base_url)
+    dist_path = _dashboard_assets_path(dashboard_dir)
+    if not dist_path.is_dir() or not (dist_path / "index.html").is_file():
+        return None
 
     dashboard_app = DashboardStaticFiles(
         directory=str(dist_path),
@@ -411,6 +481,16 @@ def mount_dashboard(
         api_base_url=api_url,
         dashboard_config=dashboard_config,
     )
+    return mount_path, dashboard_app
+
+
+def _attach_dashboard_mount(
+    server: Any,
+    *,
+    mount_path: str,
+    dashboard_app: DashboardStaticFiles,
+    name: str,
+) -> None:
 
     if mount_path != "/":
 
@@ -431,7 +511,37 @@ def mount_dashboard(
         dashboard_app,
         name=name,
     )
-    return True
+
+
+def _dashboard_assets_path(dashboard_dir: str | Path | None) -> Path:
+    if isinstance(dashboard_dir, str):
+        dashboard_dir = require_clean_nonblank(dashboard_dir, "dashboard_dir")
+    return Path(dashboard_dir) if dashboard_dir is not None else Path(__file__).parent / "dashboard"
+
+
+def _dashboard_assets_unavailable_error(
+    dashboard_dir: str | Path | None,
+    *,
+    disable_with: str,
+) -> RuntimeError:
+    return RuntimeError(
+        "Dashboard assets are unavailable at "
+        f"{_dashboard_assets_path(dashboard_dir)}. The directory must contain index.html. "
+        f"Set {disable_with} when the dashboard is intentionally omitted."
+    )
+
+
+def _require_dashboard_assets(
+    dashboard_dir: str | Path | None,
+    *,
+    disable_with: str,
+) -> None:
+    dashboard_path = _dashboard_assets_path(dashboard_dir)
+    if not dashboard_path.is_dir() or not (dashboard_path / "index.html").is_file():
+        raise _dashboard_assets_unavailable_error(
+            dashboard_dir,
+            disable_with=disable_with,
+        )
 
 
 def _validate_positive_seconds(value: float, field_name: str) -> float:
@@ -555,38 +665,13 @@ def _compose_interruption_drain_lifespan(
     server.router.lifespan_context = lifespan
 
 
-def _normalize_dashboard_path(path: str, *, api_path: str | None) -> str:
-    value = path.strip()
-    if not value:
-        raise ValueError("dashboard_path must not be blank.")
-    if "?" in value or "#" in value:
-        raise ValueError("dashboard_path must be a URL path, not a URL.")
-    value = "/" + value.strip("/")
-    normalized = "/" if value == "/" else value
-    if api_path is not None and _is_same_or_child_path(normalized, api_path):
-        raise ValueError("dashboard_path must not live inside the CAYU api_path.")
-    return normalized
-
-
-def _normalize_api_path(path: str) -> str:
-    value = path.strip()
-    if not value:
-        raise ValueError("api_path must not be blank.")
-    if "?" in value or "#" in value or "://" in value:
-        raise ValueError("api_path must be a URL path, not a URL.")
-    value = "/" + value.strip("/")
-    if value == "/":
-        raise ValueError("api_path must not be the site root.")
-    return value
-
-
 def _normalize_api_base_url(value: str) -> str:
     stripped = value.strip()
     if not stripped:
         raise ValueError("api_base_url must not be blank.")
     if _is_absolute_url(stripped):
         return stripped.rstrip("/")
-    return _normalize_api_path(stripped)
+    return normalize_api_path(stripped, field_name="api_base_url")
 
 
 def _join_public_paths(base: str, child: str) -> str:
@@ -594,14 +679,6 @@ def _join_public_paths(base: str, child: str) -> str:
     if not suffix:
         return base
     return f"/{suffix}" if base == "/" else f"{base}/{suffix}"
-
-
-def _is_same_or_child_path(path: str, parent: str) -> bool:
-    if path == parent:
-        return True
-    if parent == "/":
-        return True
-    return path.startswith(f"{parent}/")
 
 
 def _is_absolute_url(value: str) -> bool:

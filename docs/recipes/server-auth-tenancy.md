@@ -5,8 +5,9 @@ mistaking authenticated tenant provenance for data authorization.
 
 ## The contract
 
-`create_server(..., auth=...)` and `mount_cayu(..., auth=...)` authenticate
-access to Cayu's protected server surfaces. An auth dependency may return:
+`AuthenticatedAccess(dependency=...)` configures `create_server()` or
+`mount_cayu()` to authenticate Cayu's protected server surfaces. An auth
+dependency may return:
 
 ```python
 AuthContext(subject="user-123", tenant="org-456", claims={"role": "member"})
@@ -232,11 +233,15 @@ The simplest safe hosted layout keeps Cayu's complete control plane on an
 operator-only boundary:
 
 ```python
+from cayu.server import AuthenticatedAccess, mount_cayu
+
 mount_cayu(
     server,
     cayu_app,
     path="/internal/cayu",
-    auth=require_operator,  # rejects ordinary product members
+    access=AuthenticatedAccess(
+        dependency=require_operator,  # rejects ordinary product members
+    ),
 )
 ```
 

@@ -44,9 +44,9 @@ def main() -> int:
 
 def _openapi_json() -> str:
     from cayu import CayuApp
-    from cayu.server import create_server
+    from cayu.server import ServerConfig, create_server
 
-    server = create_server(CayuApp(), dev=True)
+    server = create_server(CayuApp(), config=ServerConfig.local_development())
     return json.dumps(server.openapi(), indent=2, sort_keys=True) + "\n"
 
 

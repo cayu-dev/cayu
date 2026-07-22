@@ -11,7 +11,12 @@ from typing import Any, cast
 from fastapi import Request  # noqa: TC002 - FastAPI inspects this annotation at runtime.
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import (
+    copy_json_value,
+    require_clean_nonblank,
+    require_unicode_scalar_json,
+    require_unicode_scalar_text,
+)
 
 
 class AuthContext(BaseModel):
@@ -110,12 +115,15 @@ class BasicAuth:
         tenant: str | None = None,
         claims: dict[str, Any] | None = None,
     ) -> None:
-        self.username = require_clean_nonblank(username, "username")
-        self.password = require_clean_nonblank(password, "password")
-        self.realm = require_clean_nonblank(realm, "realm")
-        self.subject = require_clean_nonblank(subject, "subject") if subject is not None else None
-        self.tenant = require_clean_nonblank(tenant, "tenant") if tenant is not None else None
-        copied_claims = copy_json_value(claims or {}, "claims")
+        self.username = _require_basic_auth_username(username)
+        self.password = _require_basic_auth_text(password, "password")
+        self.realm = _require_basic_auth_realm(realm)
+        self.subject = _require_basic_auth_text(subject, "subject") if subject is not None else None
+        self.tenant = _require_basic_auth_text(tenant, "tenant") if tenant is not None else None
+        copied_claims = require_unicode_scalar_json(
+            copy_json_value(claims or {}, "claims"),
+            "claims",
+        )
         if type(copied_claims) is not dict:
             raise ValueError("claims must be an object.")
         self.claims = copied_claims
@@ -155,5 +163,28 @@ class BasicAuth:
         return HTTPException(
             status_code=401,
             detail="Missing or invalid credentials.",
-            headers={"WWW-Authenticate": f'Basic realm="{self.realm}"'},
+            headers={"WWW-Authenticate": f'Basic realm="{_quote_http_string(self.realm)}"'},
         )
+
+
+def _require_basic_auth_text(value: str, field_name: str) -> str:
+    value = require_clean_nonblank(value, field_name)
+    return require_unicode_scalar_text(value, field_name)
+
+
+def _require_basic_auth_username(value: str) -> str:
+    value = _require_basic_auth_text(value, "username")
+    if ":" in value:
+        raise ValueError("`username` must not contain a colon.")
+    return value
+
+
+def _require_basic_auth_realm(value: str) -> str:
+    value = _require_basic_auth_text(value, "realm")
+    if any(not 0x20 <= ord(character) < 0x7F for character in value):
+        raise ValueError("`realm` must contain only visible ASCII characters.")
+    return value
+
+
+def _quote_http_string(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')

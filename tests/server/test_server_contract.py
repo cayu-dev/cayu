@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 
 from cayu import CayuApp
 from cayu.core.events import EVENT_ID_MAX_CHARS, Event, EventType
-from cayu.server import AuthContext, create_server
+from cayu.server import AuthContext, ServerApiConfig, ServerConfig, create_server
 from cayu.server.contracts import SSE_LAST_EVENT_ID_FORMAT
 from cayu.server.sse import (
     SSE_ERROR_SESSION_ID_MAX_BYTES,
@@ -44,7 +44,7 @@ _STREAMING_ROUTES = {
 
 
 def _client() -> TestClient:
-    return TestClient(create_server(CayuApp(), dev=True))
+    return TestClient(create_server(CayuApp(), config=ServerConfig.local_development()))
 
 
 def _normalize_schema_node(value):
@@ -184,7 +184,12 @@ def test_openapi_declares_auth_tenant_as_provenance_only() -> None:
 
 
 def test_custom_api_path_updates_contract_and_openapi_paths() -> None:
-    client = TestClient(create_server(CayuApp(), dev=True, api_path="/cayu/api"))
+    client = TestClient(
+        create_server(
+            CayuApp(),
+            config=ServerConfig.local_development(api=ServerApiConfig(path="/cayu/api")),
+        )
+    )
 
     response = client.get("/cayu/api/contract")
 

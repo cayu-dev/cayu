@@ -2178,10 +2178,10 @@ export type ResolutionActor = {
  *
  * ``HTTP_AUTH`` is produced only by the server layer from a verified
  * ``AuthContext``; ``REQUEST`` marks a caller-asserted identity (SDK or
- * dev-mode HTTP body); ``SYSTEM`` marks runtime-generated actors such as
+ * open-access HTTP body); ``SYSTEM`` marks runtime-generated actors such as
  * deterministic approval expiry. Direct SDK callers are a trusted boundary
  * and may construct system actors; HTTP bodies cannot — the server re-stamps
- * dev-mode bodies to ``REQUEST`` and rejects them entirely under auth.
+ * open-access bodies to ``REQUEST`` and rejects them entirely under auth.
  */
 export type ResolutionActorSource = 'http_auth' | 'request' | 'system';
 

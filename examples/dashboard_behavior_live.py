@@ -50,7 +50,7 @@ from cayu.providers import (
     completed_bedrock_billing_identity,
 )
 from cayu.runtime import EventQuery, InMemorySessionStore, SessionIdentity, SessionStatus
-from cayu.server import create_server
+from cayu.server import DashboardConfig, ServerConfig, create_server
 
 if TYPE_CHECKING:
     from starlette.types import ASGIApp, Receive, Scope, Send
@@ -255,8 +255,11 @@ async def main() -> None:
     server_app = MutationDisconnectFaults(
         create_server(
             app,
-            dev=True,
-            dashboard_config={"priceBook": price_book.model_dump(mode="json")},
+            config=ServerConfig.local_development(
+                dashboard=DashboardConfig(
+                    runtime_config={"priceBook": price_book.model_dump(mode="json")}
+                )
+            ),
         ),
         provider,
     )

@@ -14,7 +14,7 @@ from examples.aws.lambda_microvm_agent.runtime import (
 )
 
 from cayu import PostgresSessionStore, PostgresTaskStore
-from cayu.server import BasicAuth, create_server
+from cayu.server import BasicAuth, ServerConfig, create_server
 from cayu.storage.migrations import SchemaMode
 
 
@@ -31,7 +31,13 @@ def create_application() -> Any:
         username=os.environ.get("CAYU_SERVER_USERNAME", "admin"),
         password=_required_env("CAYU_SERVER_PASSWORD"),
     )
-    return create_server(cayu_app, auth=auth, expose_docs=False)
+    return create_server(
+        cayu_app,
+        config=ServerConfig.protected(
+            auth,
+            deployment_name=os.environ.get("CAYU_SERVER_DEPLOYMENT_NAME", "production"),
+        ),
+    )
 
 
 def _config_from_environment() -> AwsAgentRuntimeConfig:

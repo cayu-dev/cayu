@@ -23,7 +23,7 @@ from cayu import (
     SQLiteSessionStore,
     SQLiteTaskStore,
 )
-from cayu.server import create_server
+from cayu.server import ServerConfig, create_server
 
 WORKSPACE = Path(__file__).parent / ".examples-workspaces" / "dashboard-knowledge-review"
 DATA_DIR = WORKSPACE / "data"
@@ -146,7 +146,7 @@ def main() -> None:
         task_store=task_store,
         knowledge_store=knowledge_store,
     )
-    server = create_server(app, dev=True)
+    server = create_server(app, config=ServerConfig.local_development())
     uvicorn.run(
         server,
         host=os.environ.get("CAYU_DASHBOARD_HOST", "127.0.0.1"),
