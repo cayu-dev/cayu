@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 import cayu.runtime._model_step_executor as model_step_executor_module
-import cayu.runtime.app as runtime_app_module
+import cayu.runtime._session_engine as session_engine_module
 from cayu import SQLiteSessionStore
 from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.core.billing import BillingIdentity
@@ -1052,6 +1052,107 @@ def test_session_store_conformance_fences_reclaimed_compaction_attempts(
             assert checkpoint is not None
             assert checkpoint["context_compaction"]["summary"] == "summary from attempt 2"
         finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_heartbeats_active_compaction_claim(
+    session_store_case,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        accepted_at = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
+        now = {"value": accepted_at}
+        monkeypatch.setattr(
+            session_engine_module,
+            "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
+            0.01,
+        )
+        store = await _open_store(session_store_case)
+        compactor = _ConformanceBlockingCompactor()
+        task: asyncio.Task[list[Event]] | None = None
+        try:
+            app = CayuApp(
+                session_store=store,
+                enable_logging=False,
+                clock=lambda: now["value"],
+            )
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                context_policy=CheckpointCompactionContextPolicy(
+                    compactor=compactor,
+                    max_user_turns=1,
+                ),
+            )
+            created = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_compaction_heartbeat_conformance",
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            transcript = [
+                Message.text("user", "old request"),
+                Message.text("assistant", "old answer"),
+                Message.text("user", "current request"),
+            ]
+            await store.append_transcript_messages(created.id, transcript)
+            completed = await store.update_status(created.id, SessionStatus.COMPLETED)
+            request = CompactSessionRequest(
+                session_id=created.id,
+                idempotency_key="compact-heartbeat-conformance",
+                expected_run_epoch=completed.run_epoch,
+                expected_transcript_cursor=len(transcript),
+            )
+
+            async def collect() -> list[Event]:
+                return [event async for event in app.compact_session(request)]
+
+            task = asyncio.create_task(collect())
+            await asyncio.wait_for(compactor.started.wait(), timeout=5)
+            now["value"] = accepted_at + timedelta(minutes=4)
+            first_renewal_expiry = accepted_at + timedelta(minutes=9)
+            async with asyncio.timeout(5):
+                while True:
+                    checkpoint = await store.load_checkpoint(created.id)
+                    assert checkpoint is not None
+                    record = checkpoint["session_operations"]["records"][request.idempotency_key]
+                    if datetime.fromisoformat(record["claim_expires_at"]) >= first_renewal_expiry:
+                        break
+                    await asyncio.sleep(0)
+
+            now["value"] = accepted_at + timedelta(minutes=6)
+            expected_expiry = accepted_at + timedelta(minutes=11)
+            async with asyncio.timeout(5):
+                while True:
+                    checkpoint = await store.load_checkpoint(created.id)
+                    assert checkpoint is not None
+                    record = checkpoint["session_operations"]["records"][request.idempotency_key]
+                    if datetime.fromisoformat(record["claim_expires_at"]) >= expected_expiry:
+                        break
+                    await asyncio.sleep(0)
+
+            with pytest.raises(RuntimeError, match="already running"):
+                async for _event in app.compact_session(request):
+                    pass
+            assert compactor.calls == 1
+
+            compactor.release.set()
+            events = await task
+            task = None
+            assert events[-1].type == EventType.SESSION_CHECKPOINTED
+            assert compactor.calls == 1
+
+            store = await _reopen_store(session_store_case, store)
+            operation = await store.load_session_operation(created.id, request.idempotency_key)
+            assert operation is not None
+            assert operation["status"] == "completed"
+        finally:
+            compactor.release.set()
+            if task is not None:
+                await asyncio.gather(task, return_exceptions=True)
             await _close_store(store)
 
     asyncio.run(run())

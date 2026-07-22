@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import sys
+import threading
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable
 from datetime import UTC, datetime, timedelta
@@ -16,6 +17,11 @@ from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 from uuid import uuid4
 
+from cayu._task_wait import (
+    ShieldedTaskOutcome,
+    await_shielded_task_outcome,
+    unexpected_child_cancellation_error,
+)
 from cayu._validation import (
     copy_json_value,
     copy_label_map,
@@ -79,6 +85,7 @@ from cayu.runtime._recovery_coordinator import (
     RecoveryAbandonedSessionRequest,
     RecoveryCoordinator,
     _checkpoint_without_active_incomplete_recovery_claim,
+    _run_recovery_cleanup_steps,
 )
 from cayu.runtime._run_limits import (
     BudgetEvaluation,
@@ -126,13 +133,18 @@ from cayu.runtime.budgets import (
     request_budget_limits_for_session,
 )
 from cayu.runtime.context import (
+    _COMPACTION_ATTEMPT_ID_KEY,
     CheckpointCompactionContextPolicy,
     ContextBuildError,
     ContextBuildResult,
     ContextCompactionTelemetry,
     ContextRequest,
+    _attach_context_build_termination_diagnostics,
     _automatic_compaction_dispatch_runner_scope,
+    _compaction_completion_publisher_scope,
     _compaction_model_completed_payload,
+    context_build_termination_compaction_telemetry,
+    sanitize_context_compaction_telemetry,
 )
 from cayu.runtime.costs import (
     SessionCostSummary,
@@ -226,9 +238,7 @@ from cayu.runtime.tool_policy import (
 )
 from cayu.runtime.usage import (
     SessionUsageSummary,
-    UsageMetrics,
     session_usage_summary,
-    usage_metrics_from_event_payload,
 )
 from cayu.runtime.user_input import (
     pending_user_input_from_checkpoint,
@@ -275,6 +285,14 @@ _CONTEXT_COMPACTION_OPERATION_KIND = "context_compaction"
 
 _SESSION_OPERATION_CLAIM_LEASE = timedelta(minutes=5)
 
+_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS = 30.0
+
+_SESSION_OPERATION_CLAIM_HEARTBEAT_RETRY_SECONDS = 5.0
+
+_SESSION_OPERATION_CLAIM_HEARTBEAT_STOP_TIMEOUT_SECONDS = 0.1
+
+_SESSION_OPERATION_STORE_WAIT_TIMEOUT_SECONDS = 5.0
+
 _INTERRUPTION_TYPE_OPERATOR_REQUESTED = "operator_requested"
 
 _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED = "runtime_interrupted"
@@ -284,6 +302,227 @@ _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED = "tool_approval_required"
 _INTERRUPTION_TYPE_USER_INPUT_REQUIRED = "user_input_required"
 
 _INTERRUPTION_TYPE_LIMIT_REACHED = "limit_reached"
+
+
+def _session_operation_heartbeat_failure(task: asyncio.Task[None]) -> BaseException:
+    if task.cancelled():
+        try:
+            task.result()
+        except asyncio.CancelledError as cancellation:
+            concurrent_failure = cancellation.__cause__
+            if concurrent_failure is not None:
+                return concurrent_failure
+        return SessionCompactionAttemptSuperseded(
+            "Session compaction operation heartbeat was cancelled unexpectedly."
+        )
+    failure = task.exception()
+    if failure is None:
+        return SessionCompactionAttemptSuperseded(
+            "Session compaction operation heartbeat stopped unexpectedly."
+        )
+    return failure
+
+
+def _completed_session_operation_child_failure(
+    task: asyncio.Task[Any],
+    *,
+    operation: str,
+) -> BaseException | None:
+    try:
+        task.result()
+    except asyncio.CancelledError as child_cancellation:
+        return unexpected_child_cancellation_error(
+            child_cancellation,
+            operation=operation,
+        )
+    except BaseException as child_failure:
+        return child_failure
+    return None
+
+
+def _consume_detached_session_operation_task(task: asyncio.Task[Any]) -> None:
+    """Observe a renewal task that was detached after its lease deadline."""
+
+    # Cancelled tasks do not emit an un-retrieved-exception warning, and calling
+    # result() here would consume their cancellation message before the owning
+    # heartbeat can classify and preserve it.
+    if task.cancelled():
+        return
+    with contextlib.suppress(BaseException):
+        task.result()
+
+
+class _SessionOperationClaimHeartbeatState:
+    """Expose a heartbeat store call that may still own the session boundary."""
+
+    def __init__(self) -> None:
+        self.pending_store_task: asyncio.Task[Any] | None = None
+        self.confirmed_claim_expires_at: datetime | None = None
+
+    def confirm_claim(self, expires_at: datetime) -> None:
+        confirmed = self.confirmed_claim_expires_at
+        if confirmed is None or expires_at > confirmed:
+            self.confirmed_claim_expires_at = expires_at
+
+    def observe_store_task(self, task: asyncio.Task[Any]) -> None:
+        if self.pending_store_task is task:
+            self.pending_store_task = None
+        _consume_detached_session_operation_task(task)
+
+
+def _require_unexpired_session_operation_commit(
+    *,
+    clock: Callable[[], datetime],
+    claim_expires_at: datetime,
+    operation: str,
+) -> None:
+    commit_at = clock()
+    if commit_at.tzinfo is None or commit_at.utcoffset() is None:
+        raise ValueError(f"{operation} commit time must be timezone-aware.")
+    if claim_expires_at <= commit_at:
+        raise SessionCompactionAttemptSuperseded(f"{operation} claim expired before commit.")
+
+
+def _require_unexpired_session_operation_claim(
+    *,
+    clock: Callable[[], datetime],
+    claim_expires_at: datetime,
+    operation: str,
+) -> None:
+    observed_at = clock()
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        raise ValueError(f"{operation} observation time must be timezone-aware.")
+    if claim_expires_at.tzinfo is None or claim_expires_at.utcoffset() is None:
+        raise ValueError(f"{operation} claim expiry must be timezone-aware.")
+    if claim_expires_at <= observed_at:
+        raise SessionCompactionAttemptSuperseded(
+            f"{operation} returned a claim that had already expired."
+        )
+
+
+async def _run_while_session_operation_claimed(
+    operation: Callable[[], Awaitable[tuple[ContextBuildResult, BaseException | None]]],
+    *,
+    heartbeat_task: asyncio.Task[None],
+) -> tuple[ContextBuildResult, BaseException | None]:
+    heartbeat_observed = False
+    heartbeat_failure: BaseException | None = None
+
+    def observe_heartbeat_failure() -> BaseException:
+        nonlocal heartbeat_failure
+        nonlocal heartbeat_observed
+        if not heartbeat_observed:
+            heartbeat_failure = _session_operation_heartbeat_failure(heartbeat_task)
+            heartbeat_observed = True
+        if heartbeat_failure is None:
+            raise AssertionError("Completed session operation heartbeat had no outcome.")
+        return heartbeat_failure
+
+    async def run_operation() -> tuple[ContextBuildResult, BaseException | None]:
+        if heartbeat_task.done():
+            raise observe_heartbeat_failure()
+        return await operation()
+
+    if heartbeat_task.done():
+        raise observe_heartbeat_failure()
+    operation_task = asyncio.create_task(run_operation())
+    try:
+        done, _pending = await asyncio.wait(
+            {operation_task, heartbeat_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if heartbeat_task not in done:
+            try:
+                return operation_task.result()
+            except asyncio.CancelledError as child_cancellation:
+                raise unexpected_child_cancellation_error(
+                    child_cancellation,
+                    operation="Session compaction operation",
+                ) from child_cancellation
+
+        heartbeat_failure = observe_heartbeat_failure()
+        if not operation_task.done():
+            operation_task.cancel()
+        outcome = await await_shielded_task_outcome(operation_task)
+        if outcome.result is not None:
+            _attach_context_build_termination_diagnostics(
+                heartbeat_failure,
+                compaction_telemetry=outcome.result[0].compaction_telemetry,
+            )
+        if outcome.error is not None:
+            _preserve_context_build_termination_diagnostics(
+                outcome.error,
+                heartbeat_failure,
+            )
+        if outcome.cancellation is not None:
+            outcome.cancellation.add_note(
+                "Session compaction operation ownership was also lost: "
+                f"{type(heartbeat_failure).__name__}: {heartbeat_failure}"
+            )
+            raise outcome.cancellation from heartbeat_failure
+        if outcome.error is not None and not isinstance(
+            outcome.error,
+            asyncio.CancelledError,
+        ):
+            heartbeat_failure.add_note(
+                "Compaction also failed while operation ownership loss was handled: "
+                f"{type(outcome.error).__name__}: {outcome.error}"
+            )
+            raise heartbeat_failure from outcome.error
+        raise heartbeat_failure
+    except asyncio.CancelledError as exc:
+        if not operation_task.done():
+            operation_task.cancel()
+        outcome = await await_shielded_task_outcome(
+            operation_task,
+            cancellation=exc,
+        )
+        cancellation = outcome.cancellation or exc
+        if outcome.result is not None:
+            _attach_context_build_termination_diagnostics(
+                cancellation,
+                compaction_telemetry=outcome.result[0].compaction_telemetry,
+            )
+        if outcome.error is not None:
+            _preserve_context_build_termination_diagnostics(
+                outcome.error,
+                cancellation,
+            )
+        if heartbeat_task.done():
+            heartbeat_failure = observe_heartbeat_failure()
+            cancellation.add_note(
+                "Session compaction operation ownership was also lost during caller "
+                f"cancellation: {type(heartbeat_failure).__name__}: {heartbeat_failure}"
+            )
+        if outcome.error is not None and not isinstance(
+            outcome.error,
+            asyncio.CancelledError,
+        ):
+            cancellation.add_note(
+                "Compaction also failed while caller cancellation was handled: "
+                f"{type(outcome.error).__name__}: {outcome.error}"
+            )
+        raise cancellation from cancellation.__cause__
+    finally:
+        if not operation_task.done():
+            operation_task.cancel()
+            await asyncio.gather(operation_task, return_exceptions=True)
+
+
+def _preserve_context_build_termination_diagnostics(
+    source: BaseException,
+    target: BaseException,
+) -> None:
+    telemetry = (
+        source.compaction_telemetry
+        if isinstance(source, ContextBuildError)
+        else context_build_termination_compaction_telemetry(source)
+    )
+    if telemetry:
+        _attach_context_build_termination_diagnostics(
+            target,
+            compaction_telemetry=list(telemetry),
+        )
 
 
 def _compact_session_request_digest(request: CompactSessionRequest) -> str:
@@ -474,8 +713,6 @@ def _application_compaction_causal_payload(
 
 _APPLICATION_COMPACTION_EVENT_TEXT_MAX_BYTES = 512
 
-_APPLICATION_COMPACTION_EVENT_INTEGER_MAX = 9_223_372_036_854_775_807
-
 
 def _application_compaction_event_text(value: Any) -> str | None:
     if type(value) is not str or not value or value != value.strip():
@@ -499,85 +736,6 @@ def _require_application_compaction_event_text(value: Any, field_name: str) -> s
     return value
 
 
-def _application_compaction_event_integer(value: Any) -> int | None:
-    if type(value) is not int or value < 0 or value > _APPLICATION_COMPACTION_EVENT_INTEGER_MAX:
-        return None
-    return value
-
-
-def _application_compaction_raw_usage(value: Any) -> dict[str, Any] | None:
-    if type(value) is not dict:
-        return None
-    raw_usage: dict[str, Any] = {}
-    for key in (
-        "input_tokens",
-        "prompt_tokens",
-        "output_tokens",
-        "completion_tokens",
-        "total_tokens",
-        "cache_read_input_tokens",
-        "cache_creation_input_tokens",
-    ):
-        bounded = _application_compaction_event_integer(value.get(key))
-        if bounded is not None:
-            raw_usage[key] = bounded
-    for key, allowed_keys in (
-        ("input_tokens_details", ("cached_tokens",)),
-        ("prompt_tokens_details", ("cached_tokens",)),
-        ("output_tokens_details", ("reasoning_tokens", "thinking_tokens")),
-        ("completion_tokens_details", ("reasoning_tokens", "thinking_tokens")),
-    ):
-        details = value.get(key)
-        if type(details) is not dict:
-            continue
-        bounded_details = {
-            detail_key: bounded
-            for detail_key in allowed_keys
-            if (bounded := _application_compaction_event_integer(details.get(detail_key)))
-            is not None
-        }
-        if bounded_details:
-            raw_usage[key] = bounded_details
-    cache_creation = value.get("cache_creation")
-    if type(cache_creation) is dict:
-        cache_creation_total = 0
-        for index, cache_value in enumerate(cache_creation.values()):
-            if index >= 16:
-                break
-            bounded = _application_compaction_event_integer(cache_value)
-            if bounded is not None:
-                cache_creation_total += bounded
-        if cache_creation_total:
-            raw_usage["cache_creation"] = {"bounded_total": cache_creation_total}
-    return raw_usage or None
-
-
-def _application_compaction_usage_metrics(payload: dict[str, Any]) -> UsageMetrics | None:
-    supplied_metrics = payload.get("usage_metrics")
-    identity_source = supplied_metrics if type(supplied_metrics) is dict else payload
-    provider_name = _application_compaction_event_text(identity_source.get("provider_name"))
-    requested_model = _application_compaction_event_text(identity_source.get("requested_model"))
-    model = _application_compaction_event_text(identity_source.get("model"))
-    if type(supplied_metrics) is dict:
-        return usage_metrics_from_event_payload(
-            {
-                "billing_identity": payload.get("billing_identity"),
-                "usage_metrics": copy_json_value(supplied_metrics, "usage_metrics"),
-            }
-        )
-    raw_usage = _application_compaction_raw_usage(payload.get("usage"))
-    if raw_usage is None:
-        return None
-    return usage_metrics_from_event_payload(
-        {
-            "provider_name": provider_name,
-            "requested_model": requested_model,
-            "model": model,
-            "usage": raw_usage,
-        }
-    )
-
-
 def _application_compaction_event(
     *,
     telemetry: ContextCompactionTelemetry,
@@ -589,50 +747,10 @@ def _application_compaction_event(
     environment_name: str | None,
     compactor: str,
 ) -> Event:
-    telemetry_payload = telemetry.payload
-    payload: dict[str, Any] = {}
-    if telemetry.event_type == EventType.MODEL_COMPLETED:
-        metrics = _application_compaction_usage_metrics(telemetry_payload)
-        raw_billing_identity = telemetry_payload.get("billing_identity")
-        billing_identity = (
-            BillingIdentity.model_validate(raw_billing_identity)
-            if type(raw_billing_identity) is dict
-            else None
-        )
-        if billing_identity is None and metrics is not None:
-            billing_identity = metrics.billing_identity
-        payload["purpose"] = "context_compaction"
-        if billing_identity is not None:
-            payload["billing_identity"] = billing_identity.model_dump(mode="json")
-        if metrics is not None:
-            serialized_metrics = metrics.model_dump()
-            serialized_metrics.pop("billing_identity", None)
-            payload["usage_metrics"] = serialized_metrics
-            for key in ("provider_name", "requested_model", "model"):
-                value = getattr(metrics, key)
-                if value is not None:
-                    payload[key] = value
-        else:
-            for key in ("provider_name", "requested_model", "model"):
-                value = _application_compaction_event_text(telemetry_payload.get(key))
-                if value is not None:
-                    payload[key] = value
-        for key in ("compaction_outcome", "usage_unavailable_reason"):
-            value = _application_compaction_event_text(telemetry_payload.get(key))
-            if value is not None:
-                payload[key] = value
-    elif telemetry.event_type == EventType.CONTEXT_COMPACTION_COMPLETED:
-        payload["checkpoint"] = "context_compaction"
-        for key in (
-            "compacted_transcript_cursor",
-            "previous_compacted_transcript_cursor",
-            "newly_compacted_message_count",
-            "recent_message_count",
-            "summary_chars",
-        ):
-            value = _application_compaction_event_integer(telemetry_payload.get(key))
-            if value is not None:
-                payload[key] = value
+    sanitized = sanitize_context_compaction_telemetry(telemetry)
+    payload = copy_json_value(sanitized.payload, "compaction_telemetry_payload")
+    if sanitized.event_type == EventType.CONTEXT_COMPACTION_FAILED:
+        payload.pop("compacted_transcript_cursor", None)
     payload.update(
         _application_compaction_causal_payload(
             request=request,
@@ -644,7 +762,7 @@ def _application_compaction_event(
         )
     )
     return Event(
-        type=telemetry.event_type,
+        type=sanitized.event_type,
         session_id=session.id,
         agent_name=registered_agent.spec.name,
         environment_name=environment_name,
@@ -734,7 +852,10 @@ def _complete_session_operation_checkpoint(
     event_ids: list[str],
     result_cursor: Any,
     completed_at: datetime,
+    on_terminalize: Callable[[datetime], None],
 ) -> SessionOperationPublication:
+    if completed_at.tzinfo is None or completed_at.utcoffset() is None:
+        raise ValueError("Session compaction completion time must be timezone-aware.")
     if checkpoint is None:
         raise SessionCompactionAttemptSuperseded(
             "Session compaction attempt was superseded before publication."
@@ -756,6 +877,11 @@ def _complete_session_operation_checkpoint(
         raise SessionCompactionAttemptSuperseded(
             "Session compaction attempt was superseded before publication."
         )
+    claim_expires_at = _operation_claim_expiry(record)
+    if claim_expires_at is None or claim_expires_at <= completed_at:
+        raise SessionCompactionAttemptSuperseded(
+            "Session compaction operation claim expired before terminal publication."
+        )
     if persisted_record is not None:
         if persisted_record.get("operation_id") != operation_id:
             raise RuntimeError(
@@ -765,6 +891,7 @@ def _complete_session_operation_checkpoint(
             raise SessionCompactionAttemptSuperseded(
                 "Session compaction attempt was superseded before publication."
             )
+    on_terminalize(claim_expires_at)
     compacted_state = copy_json_value(compacted_checkpoint, "compacted_checkpoint")
     compacted_context = compacted_state.get(_CONTEXT_COMPACTION_OPERATION_KIND)
     if type(compacted_context) is not dict:
@@ -789,13 +916,71 @@ def _complete_session_operation_checkpoint(
     )
 
 
+def _renew_session_operation_claim_publication(
+    *,
+    checkpoint: dict[str, Any] | None,
+    idempotency_key: str,
+    operation_id: str,
+    attempt_id: str,
+    event_ids: list[str],
+    renewed_at: datetime,
+    persisted_record: dict[str, Any] | None,
+    on_renew: Callable[[datetime], None] | None = None,
+    on_renewed: Callable[[datetime], None] | None = None,
+) -> tuple[SessionOperationPublication, datetime]:
+    if renewed_at.tzinfo is None or renewed_at.utcoffset() is None:
+        raise ValueError("Session compaction claim renewal time must be timezone-aware.")
+    if checkpoint is None:
+        raise SessionCompactionAttemptSuperseded(
+            "Session compaction attempt was superseded before claim renewal."
+        )
+    updated = copy_json_value(checkpoint, "checkpoint")
+    operations = _session_operation_state(updated)
+    record = operations["records"].get(idempotency_key)
+    if type(record) is not dict or record.get("operation_id") != operation_id:
+        if persisted_record is not None and persisted_record.get("operation_id") == operation_id:
+            raise SessionCompactionAttemptSuperseded(
+                "Session compaction attempt was superseded before claim renewal."
+            )
+        raise RuntimeError("Session compaction operation claim was lost before renewal.")
+    if (
+        record.get("status") != "running"
+        or record.get("current_attempt_id") != attempt_id
+        or operations.get("active_operation_id") != operation_id
+    ):
+        raise SessionCompactionAttemptSuperseded(
+            "Session compaction attempt was superseded before claim renewal."
+        )
+    current_expiry = _operation_claim_expiry(record)
+    if current_expiry is None or current_expiry <= renewed_at:
+        raise SessionCompactionAttemptSuperseded(
+            "Session compaction operation claim expired before renewal."
+        )
+    if on_renew is not None:
+        on_renew(current_expiry)
+    existing_event_ids = record.get("event_ids", [])
+    record["event_ids"] = [
+        *existing_event_ids,
+        *(event_id for event_id in event_ids if event_id not in existing_event_ids),
+    ]
+    renewed_until = renewed_at + _SESSION_OPERATION_CLAIM_LEASE
+    record["updated_at"] = renewed_at.isoformat()
+    record["claim_expires_at"] = renewed_until.isoformat()
+    if on_renewed is not None:
+        on_renewed(renewed_until)
+    updated[_SESSION_OPERATIONS_CHECKPOINT_KEY] = operations
+    return SessionOperationPublication(checkpoint=updated), renewed_until
+
+
 def _append_session_operation_attempt_events(
     *,
     idempotency_key: str,
     operation_id: str,
     attempt_id: str,
     event_ids: list[str],
-    updated_at: datetime,
+    clock: Callable[[], datetime],
+    on_renew: Callable[[datetime], None],
+    on_renewed: Callable[[datetime], None],
 ) -> Callable[
     [Session, dict[str, Any] | None, dict[str, Any] | None],
     SessionOperationPublication,
@@ -805,38 +990,18 @@ def _append_session_operation_attempt_events(
         checkpoint: dict[str, Any] | None,
         persisted_record: dict[str, Any] | None,
     ) -> SessionOperationPublication:
-        if checkpoint is None:
-            raise SessionCompactionAttemptSuperseded(
-                "Session compaction attempt was superseded before event publication."
-            )
-        updated = copy_json_value(checkpoint, "checkpoint")
-        operations = _session_operation_state(updated)
-        record = operations["records"].get(idempotency_key)
-        if type(record) is not dict or record.get("operation_id") != operation_id:
-            if (
-                persisted_record is not None
-                and persisted_record.get("operation_id") == operation_id
-            ):
-                raise SessionCompactionAttemptSuperseded(
-                    "Session compaction attempt was superseded before event publication."
-                )
-            raise RuntimeError("Session compaction operation claim was lost before publication.")
-        if (
-            record.get("status") != "running"
-            or record.get("current_attempt_id") != attempt_id
-            or operations.get("active_operation_id") != operation_id
-        ):
-            raise SessionCompactionAttemptSuperseded(
-                "Session compaction attempt was superseded before event publication."
-            )
-        existing_event_ids = record.get("event_ids", [])
-        record["event_ids"] = [
-            *existing_event_ids,
-            *(event_id for event_id in event_ids if event_id not in existing_event_ids),
-        ]
-        record["updated_at"] = updated_at.isoformat()
-        updated[_SESSION_OPERATIONS_CHECKPOINT_KEY] = operations
-        return SessionOperationPublication(checkpoint=updated)
+        publication, _renewed_until = _renew_session_operation_claim_publication(
+            checkpoint=checkpoint,
+            idempotency_key=idempotency_key,
+            operation_id=operation_id,
+            attempt_id=attempt_id,
+            event_ids=event_ids,
+            renewed_at=clock(),
+            persisted_record=persisted_record,
+            on_renew=on_renew,
+            on_renewed=on_renewed,
+        )
+        return publication
 
     return append_events
 
@@ -849,7 +1014,8 @@ def _fail_session_operation_checkpoint(
     failed_event_id: str,
     attempt_event_ids: list[str],
     error_type: str,
-    completed_at: datetime,
+    clock: Callable[[], datetime],
+    on_terminalize: Callable[[datetime], None],
 ) -> Callable[
     [Session, dict[str, Any] | None, dict[str, Any] | None],
     SessionOperationPublication,
@@ -859,6 +1025,9 @@ def _fail_session_operation_checkpoint(
         checkpoint: dict[str, Any] | None,
         persisted_record: dict[str, Any] | None,
     ) -> SessionOperationPublication:
+        completed_at = clock()
+        if completed_at.tzinfo is None or completed_at.utcoffset() is None:
+            raise ValueError("Session compaction failure time must be timezone-aware.")
         updated = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
         operations = _session_operation_state(updated)
         record = operations["records"].get(idempotency_key)
@@ -867,6 +1036,14 @@ def _fail_session_operation_checkpoint(
                 persisted_record is not None
                 and persisted_record.get("operation_id") == operation_id
             ):
+                if (
+                    persisted_record.get("status") in {"completed", "failed"}
+                    and persisted_record.get("current_attempt_id") == attempt_id
+                ):
+                    raise SessionCompactionAttemptSuperseded(
+                        "Session compaction attempt was already terminal before failure "
+                        "publication."
+                    )
                 terminal_record = copy_json_value(persisted_record, "session_operation")
                 existing_event_ids = terminal_record.get("event_ids", [])
                 terminal_record["event_ids"] = [
@@ -898,6 +1075,11 @@ def _fail_session_operation_checkpoint(
         ):
             updated[_SESSION_OPERATIONS_CHECKPOINT_KEY] = operations
             return SessionOperationPublication(checkpoint=updated)
+        claim_expires_at = _operation_claim_expiry(record)
+        if claim_expires_at is None or claim_expires_at <= completed_at:
+            updated[_SESSION_OPERATIONS_CHECKPOINT_KEY] = operations
+            return SessionOperationPublication(checkpoint=updated)
+        on_terminalize(claim_expires_at)
         record["status"] = "failed"
         record["error_type"] = error_type
         record["completed_at"] = completed_at.isoformat()
@@ -1550,6 +1732,79 @@ class SessionEngine:
         self._get_registered_environment = get_registered_environment
         self._get_registered_environment_for_session = get_registered_environment_for_session
         self._effective_retry_policy = effective_retry_policy
+        self._detached_session_operation_tasks: set[asyncio.Task[Any]] = set()
+
+    def _track_detached_session_operation_task(self, task: asyncio.Task[Any]) -> None:
+        """Retain and observe best-effort work that cannot block its caller."""
+
+        if task in self._detached_session_operation_tasks:
+            return
+        self._detached_session_operation_tasks.add(task)
+
+        def observe(completed: asyncio.Task[Any]) -> None:
+            self._detached_session_operation_tasks.discard(completed)
+            _consume_detached_session_operation_task(completed)
+
+        task.add_done_callback(observe)
+
+    async def _await_session_operation_store_task(
+        self,
+        task: asyncio.Task[Any],
+        *,
+        cancellation: asyncio.CancelledError | None = None,
+        claim_expires_at: datetime | None = None,
+    ) -> ShieldedTaskOutcome[Any]:
+        """Bound a shielded store wait and retain any write that outlives it."""
+
+        timeout_s = _SESSION_OPERATION_STORE_WAIT_TIMEOUT_SECONDS
+        if claim_expires_at is not None:
+            now = self._clock()
+            if now.tzinfo is None or now.utcoffset() is None:
+                raise ValueError("Session operation store wait clock must be timezone-aware.")
+            timeout_s = min(
+                timeout_s,
+                max(0.0, (claim_expires_at - now).total_seconds()),
+            )
+        outcome = await await_shielded_task_outcome(
+            task,
+            cancellation=cancellation,
+            timeout_s=timeout_s,
+        )
+        if outcome.timed_out:
+            task.cancel()
+            self._track_detached_session_operation_task(task)
+        return outcome
+
+    async def _fan_out_reconciled_session_operation_events(
+        self,
+        events: list[Event],
+        *,
+        cancellation: asyncio.CancelledError | None = None,
+    ) -> tuple[BaseException | None, asyncio.CancelledError | None]:
+        """Retry durable side effects without letting an unavailable sink hang cleanup."""
+
+        if not events:
+            return None, cancellation
+        fan_out_task = asyncio.create_task(self._event_writer.fan_out_persisted(events))
+        outcome = await self._await_session_operation_store_task(
+            fan_out_task,
+            cancellation=cancellation,
+        )
+        if outcome.timed_out:
+            return (
+                TimeoutError(
+                    "Session operation event side-effect delivery exceeded "
+                    f"{_SESSION_OPERATION_STORE_WAIT_TIMEOUT_SECONDS:g} seconds."
+                ),
+                outcome.cancellation,
+            )
+        error = outcome.error
+        if isinstance(error, asyncio.CancelledError):
+            error = unexpected_child_cancellation_error(
+                error,
+                operation="Session operation event side-effect delivery",
+            )
+        return error, outcome.cancellation
 
     async def drain_background_interruptions(self, *, timeout_s: float = 10.0) -> bool:
         """Wait for accepted background interruption cascades to finish.
@@ -2235,17 +2490,29 @@ class SessionEngine:
         )
         compactor_provider_name: str | None = None
         compactor_model: str | None = None
-        if candidate_app_policy_budget_limits or candidate_request_budget_limits:
+        uses_forced_dispatch_boundary = (
+            context_policy.compactor._uses_runtime_provider_dispatch_runner_for_forced_compaction()
+        )
+        if (
+            candidate_app_policy_budget_limits
+            or candidate_request_budget_limits
+            or has_run_limits(request.limits)
+        ):
             try:
                 provider_budget_identity = context_policy.compactor.provider_budget_identity(
                     loaded_session
                 )
             except NotImplementedError as exc:
                 raise RuntimeError(
-                    "Explicit compaction with cost budgets requires the ContextCompactor "
-                    "to declare provider_budget_identity(session), returning provider/model "
-                    "or None for deterministic execution."
+                    "Explicit provider-backed compaction under run or cost limits requires "
+                    "the ContextCompactor to declare provider_budget_identity(session), "
+                    "returning provider/model or None for deterministic execution."
                 ) from exc
+            if provider_budget_identity is None and uses_forced_dispatch_boundary:
+                raise RuntimeError(
+                    "Provider-backed compaction cannot declare a deterministic budget "
+                    "identity under run or cost limits."
+                )
             if provider_budget_identity is not None:
                 if (
                     type(provider_budget_identity) is not tuple
@@ -2269,23 +2536,40 @@ class SessionEngine:
         else:
             app_policy_budget_limits = candidate_app_policy_budget_limits
             budget_limits = (*app_policy_budget_limits, *candidate_request_budget_limits)
-        contextual_dispatch_budget_limits = tuple(
+        dispatch_settlement_budget_limits = tuple(
             limit
             for limit in budget_limits
-            if has_deferred_contextual_price(
-                limit.pricing,
-                provider_name=compactor_provider_name,
-                model=compactor_model,
+            if (
+                limit.reservation is not None
+                or has_deferred_contextual_price(
+                    limit.pricing,
+                    provider_name=compactor_provider_name,
+                    model=compactor_model,
+                )
             )
         )
-        if (
-            contextual_dispatch_budget_limits
-            and not context_policy.compactor._uses_runtime_provider_dispatch_runner_for_forced_compaction()
-        ):
+        outer_budget_limits = tuple(
+            limit
+            for limit in budget_limits
+            if not any(
+                limit is dispatch_limit for dispatch_limit in dispatch_settlement_budget_limits
+            )
+        )
+        outer_app_policy_budget_limits = tuple(
+            limit
+            for limit in app_policy_budget_limits
+            if not any(
+                limit is dispatch_limit for dispatch_limit in dispatch_settlement_budget_limits
+            )
+        )
+        needs_dispatch_admission = compactor_provider_name is not None and (
+            has_run_limits(request.limits) or bool(budget_limits)
+        )
+        if needs_dispatch_admission and not uses_forced_dispatch_boundary:
             raise RuntimeError(
-                "Explicit compaction with contextual pricing requires an "
-                "unmodified built-in provider compactor so Cayu can admit every "
-                "resolved provider dispatch before execution."
+                "Explicit provider-backed compaction under run or cost limits requires "
+                "an unmodified built-in provider compactor so Cayu can admit every "
+                "provider dispatch before execution."
             )
         operation_started_at = time.monotonic()
 
@@ -2338,13 +2622,14 @@ class SessionEngine:
             ),
         )
         claimed_checkpoint: dict[str, Any] | None = None
+        claimed_operation_expires_at: datetime | None = None
 
         def claim_operation(
             current_session: Session,
             checkpoint: dict[str, Any] | None,
             persisted_record: dict[str, Any] | None,
         ) -> SessionOperationPublication:
-            nonlocal operation_id, claimed_checkpoint
+            nonlocal operation_id, claimed_checkpoint, claimed_operation_expires_at
             claim_now = self._clock()
             claim_expires_at = claim_now + _SESSION_OPERATION_CLAIM_LEASE
             if current_session.run_epoch != request.expected_run_epoch:
@@ -2412,6 +2697,7 @@ class SessionEngine:
                     existing.pop("abandoned_at", None)
                     updated[_SESSION_OPERATIONS_CHECKPOINT_KEY] = operations
                     claimed_checkpoint = copy_json_value(updated, "checkpoint")
+                    claimed_operation_expires_at = claim_expires_at
                     archived_records = _archive_inactive_session_operation_records(
                         updated,
                         except_idempotency_key=request.idempotency_key,
@@ -2453,6 +2739,7 @@ class SessionEngine:
             }
             updated[_SESSION_OPERATIONS_CHECKPOINT_KEY] = operations
             claimed_checkpoint = copy_json_value(updated, "checkpoint")
+            claimed_operation_expires_at = claim_expires_at
             archived_records = _archive_inactive_session_operation_records(
                 updated,
                 except_idempotency_key=request.idempotency_key,
@@ -2463,11 +2750,24 @@ class SessionEngine:
             )
 
         replay_event_ids: tuple[str, ...] | None = None
+
+        def require_unexpired_initial_claim_commit() -> None:
+            if claimed_operation_expires_at is None:
+                raise AssertionError(
+                    "Session compaction initial publication did not capture its claim."
+                )
+            _require_unexpired_session_operation_commit(
+                clock=self._clock,
+                claim_expires_at=claimed_operation_expires_at,
+                operation="Session compaction initial publication",
+            )
+
         try:
-            await self.session_store.publish_session_operation(
+            await self.session_store.publish_session_operation_guarded(
                 loaded_session.id,
                 idempotency_key=request.idempotency_key,
                 operation_transform=claim_operation,
+                commit_guard=require_unexpired_initial_claim_commit,
                 events=[started_event],
                 expected_statuses=_RESUMABLE_SESSION_STATUSES,
                 expected_run_epoch=request.expected_run_epoch,
@@ -2500,15 +2800,119 @@ class SessionEngine:
             return
         if claimed_checkpoint is None:
             raise AssertionError("New session compaction did not persist its operation claim.")
+        if claimed_operation_expires_at is None:
+            raise AssertionError("New session compaction did not persist its claim expiry.")
+        _require_unexpired_session_operation_claim(
+            clock=self._clock,
+            claim_expires_at=claimed_operation_expires_at,
+            operation="Session compaction initial publication",
+        )
 
-        await self._event_writer.fan_out_persisted([started_event])
-        yield started_event
+        operation_published = False
+        operation_failure: BaseException | None = None
+        stop_operation_heartbeat = asyncio.Event()
+        operation_heartbeat_state = _SessionOperationClaimHeartbeatState()
+        operation_heartbeat_state.confirm_claim(claimed_operation_expires_at)
+        operation_heartbeat_task = asyncio.create_task(
+            self._heartbeat_compaction_operation_claim(
+                session=loaded_session,
+                request=request,
+                operation_id=operation_id,
+                attempt_id=attempt_id,
+                claim_expires_at=claimed_operation_expires_at,
+                stop=stop_operation_heartbeat,
+                state=operation_heartbeat_state,
+            )
+        )
+
+        async def stop_claim_heartbeat() -> asyncio.Task[Any] | None:
+            stop_operation_heartbeat.set()
+            if not operation_heartbeat_task.done():
+                operation_heartbeat_task.cancel()
+            outcome = await await_shielded_task_outcome(
+                operation_heartbeat_task,
+                timeout_s=_SESSION_OPERATION_CLAIM_HEARTBEAT_STOP_TIMEOUT_SECONDS,
+            )
+            pending_renewal = operation_heartbeat_state.pending_store_task
+            if outcome.timed_out:
+                if pending_renewal is not None and not pending_renewal.done():
+                    pending_outcome = await await_shielded_task_outcome(
+                        pending_renewal,
+                        timeout_s=_SESSION_OPERATION_CLAIM_HEARTBEAT_STOP_TIMEOUT_SECONDS,
+                    )
+                    if pending_outcome.timed_out:
+                        return pending_renewal
+                    if pending_outcome.cancellation is not None:
+                        raise pending_outcome.cancellation
+                outcome = await await_shielded_task_outcome(
+                    operation_heartbeat_task,
+                    timeout_s=_SESSION_OPERATION_CLAIM_HEARTBEAT_STOP_TIMEOUT_SECONDS,
+                )
+                if outcome.timed_out:
+                    return operation_heartbeat_task
+            if pending_renewal is not None and not pending_renewal.done():
+                pending_outcome = await await_shielded_task_outcome(
+                    pending_renewal,
+                    timeout_s=_SESSION_OPERATION_CLAIM_HEARTBEAT_STOP_TIMEOUT_SECONDS,
+                )
+                if pending_outcome.timed_out:
+                    return pending_renewal
+                if pending_outcome.cancellation is not None:
+                    raise pending_outcome.cancellation
+            if outcome.cancellation is not None:
+                raise outcome.cancellation
+            heartbeat_failure = outcome.error
+            if heartbeat_failure is None:
+                return None
+            if isinstance(heartbeat_failure, asyncio.CancelledError):
+                concurrent_failure = heartbeat_failure.__cause__
+                if concurrent_failure is None:
+                    return None
+                heartbeat_failure = concurrent_failure
+            if operation_published or heartbeat_failure is operation_failure:
+                return None
+            raise heartbeat_failure
+
+        async def stop_claim_heartbeat_and_track() -> None:
+            blocker = await stop_claim_heartbeat()
+            if blocker is not None:
+                self._track_detached_session_operation_task(blocker)
+
+        initial_event_delivered = False
+        initial_delivery_failure: BaseException | None = None
+        try:
+            await self._event_writer.fan_out_persisted([started_event])
+            yield started_event
+            initial_event_delivered = True
+        except BaseException as exc:
+            initial_delivery_failure = exc
+            raise
+        finally:
+            if not initial_event_delivered:
+                await _run_recovery_cleanup_steps(
+                    authoritative_failure=initial_delivery_failure,
+                    steps=(
+                        (
+                            "explicit compaction claim heartbeat stop",
+                            stop_claim_heartbeat_and_track,
+                        ),
+                    ),
+                )
+
         attempt_events: list[Event] = []
         prepublished_dispatch_events: list[Event] = []
+        deferred_dispatch_settlement_events: list[Event] = []
+        observed_dispatch_completion_events: list[Event] = []
+        materialized_compaction_attempt_ids: set[str] = set()
+        persisted_attempt_event_ids: set[str] = set()
+        yielded_attempt_event_ids: set[str] = set()
+        attempt_event_inventory: dict[str, Event] = {}
+        completion_event_attempt_ids: dict[str, str] = {}
+        unresolved_attempt_publication_tasks: set[asyncio.Task[Any]] = set()
+        unresolved_completion_publication_tasks: set[asyncio.Task[Any]] = set()
         reached_budget_keys: set[tuple[str, str | None, str, str, Decimal]] = set()
         budget_reservations: list[BudgetStepReservation] = []
         budget_reservations_settled = False
-        operation_published = False
         try:
             limit_decision = await self._run_limit_controller.evaluate_operation_run_limit(
                 session=loaded_session,
@@ -2520,8 +2924,8 @@ class SessionEngine:
                 raise RuntimeError(f"Compaction limit reached: {limit_decision.message}")
             budget_error = await self._enforce_compaction_budget_limits(
                 session=loaded_session,
-                budget_limits=budget_limits,
-                app_policy_budget_limits=app_policy_budget_limits,
+                budget_limits=outer_budget_limits,
+                app_policy_budget_limits=outer_app_policy_budget_limits,
                 attempt_events=attempt_events,
                 reached_budget_keys=reached_budget_keys,
                 request=request,
@@ -2541,10 +2945,15 @@ class SessionEngine:
                     operation_id=operation_id,
                     attempt_id=attempt_id,
                     events=persisted_attempt_events,
+                    heartbeat_state=operation_heartbeat_state,
+                    persisted_event_ids=persisted_attempt_event_ids,
+                    event_inventory=attempt_event_inventory,
+                    unresolved_store_tasks=unresolved_attempt_publication_tasks,
                 )
                 attempt_events.clear()
                 await self._event_writer.fan_out_persisted(persisted_attempt_events)
                 for event in persisted_attempt_events:
+                    yielded_attempt_event_ids.add(event.id)
                     yield event
             if budget_error is not None:
                 raise budget_error
@@ -2553,7 +2962,7 @@ class SessionEngine:
                 session=loaded_session,
                 registered_agent=registered_agent,
                 environment_name=environment_name,
-                budget_limits=(() if contextual_dispatch_budget_limits else budget_limits),
+                budget_limits=outer_budget_limits,
                 provider_name=compactor_provider_name,
                 model=compactor_model,
                 request=request,
@@ -2590,10 +2999,15 @@ class SessionEngine:
                     operation_id=operation_id,
                     attempt_id=attempt_id,
                     events=persisted_attempt_events,
+                    heartbeat_state=operation_heartbeat_state,
+                    persisted_event_ids=persisted_attempt_event_ids,
+                    event_inventory=attempt_event_inventory,
+                    unresolved_store_tasks=unresolved_attempt_publication_tasks,
                 )
                 attempt_events.clear()
                 await self._event_writer.fan_out_persisted(persisted_attempt_events)
                 for event in persisted_attempt_events:
+                    yielded_attempt_event_ids.add(event.id)
                     yield event
             if reservation_error is not None:
                 raise reservation_error
@@ -2608,6 +3022,10 @@ class SessionEngine:
                     operation_id=operation_id,
                     attempt_id=attempt_id,
                     events=events,
+                    heartbeat_state=operation_heartbeat_state,
+                    persisted_event_ids=persisted_attempt_event_ids,
+                    event_inventory=attempt_event_inventory,
+                    unresolved_store_tasks=unresolved_attempt_publication_tasks,
                 )
                 attempt_events.clear()
                 await self._event_writer.fan_out_persisted(events)
@@ -2626,23 +3044,125 @@ class SessionEngine:
                     environment_name=environment_name,
                     payload=_compaction_model_completed_payload(
                         completed_payload=completed_metadata,
-                        provider_name=actual_provider.name,
+                        provider_name=(
+                            actual_provider.billing_provider_name or actual_provider.name
+                        ),
                         fallback_model=actual_model,
                         compactor=type(context_policy.compactor).__name__,
                         usage_dialect=actual_provider.usage_dialect,
                     ),
                 )
 
-            async def settle_contextual_dispatch(
+            async def publish_compaction_completions(
+                payloads: list[dict[str, Any]],
+            ) -> None:
+                pending: list[tuple[str, Event]] = []
+                for payload in payloads:
+                    compaction_attempt_id = payload.get(_COMPACTION_ATTEMPT_ID_KEY)
+                    if type(compaction_attempt_id) is not str:
+                        raise RuntimeError(
+                            "Compaction completion evidence lost its attempt identity."
+                        )
+                    if compaction_attempt_id in materialized_compaction_attempt_ids:
+                        continue
+                    pending.append(
+                        (
+                            compaction_attempt_id,
+                            _application_compaction_event(
+                                telemetry=ContextCompactionTelemetry(
+                                    event_type=EventType.MODEL_COMPLETED,
+                                    payload=payload,
+                                ),
+                                request=request,
+                                operation_id=operation_id,
+                                attempt_id=attempt_id,
+                                session=loaded_session,
+                                registered_agent=registered_agent,
+                                environment_name=environment_name,
+                                compactor=type(context_policy.compactor).__name__,
+                            ),
+                        )
+                    )
+                if not pending and not deferred_dispatch_settlement_events:
+                    return
+
+                completion_events = [event for _attempt_id, event in pending]
+                completion_event_attempt_ids.update(
+                    (event.id, compaction_attempt_id) for compaction_attempt_id, event in pending
+                )
+                events = [
+                    *completion_events,
+                    *deferred_dispatch_settlement_events,
+                ]
+
+                def record_durable_completion_batch() -> None:
+                    materialized_compaction_attempt_ids.update(
+                        compaction_attempt_id for compaction_attempt_id, _event in pending
+                    )
+                    observed_dispatch_completion_events.extend(completion_events)
+                    prepublished_dispatch_events.extend(events)
+                    deferred_dispatch_settlement_events.clear()
+
+                try:
+                    await self._persist_compaction_attempt_events(
+                        session=loaded_session,
+                        request=request,
+                        operation_id=operation_id,
+                        attempt_id=attempt_id,
+                        events=events,
+                        heartbeat_state=operation_heartbeat_state,
+                        persisted_event_ids=persisted_attempt_event_ids,
+                        event_inventory=attempt_event_inventory,
+                        unresolved_store_tasks=unresolved_attempt_publication_tasks,
+                        cost_bearing_store_tasks=(unresolved_completion_publication_tasks),
+                    )
+                except BaseException:
+                    # The helper records IDs only after an ambiguous write is
+                    # confirmed atomic and durable. Preserve that exact attempt
+                    # identity before propagating the lost acknowledgement.
+                    if all(event.id in persisted_attempt_event_ids for event in events):
+                        record_durable_completion_batch()
+                    raise
+                record_durable_completion_batch()
+                (
+                    fan_out_error,
+                    cancellation,
+                ) = await self._fan_out_reconciled_session_operation_events(events)
+                if cancellation is not None:
+                    if fan_out_error is not None:
+                        cancellation.add_note(
+                            "Explicit compaction completion side-effect delivery also "
+                            f"failed during cancellation: {type(fan_out_error).__name__}: "
+                            f"{fan_out_error}"
+                        )
+                        raise cancellation from fan_out_error
+                    raise cancellation
+                if fan_out_error is not None:
+                    raise fan_out_error
+
+            async def settle_provider_dispatch(
                 dispatch_reservations: list[BudgetStepReservation],
                 *,
                 completed_event: Event | None,
                 uncertain_reason: str,
+                release_reason: str | None = None,
             ) -> None:
                 dispatch_reservation_ids = {
                     reservation.record.reservation_id for reservation in dispatch_reservations
                 }
-                if completed_event is None:
+                if release_reason is not None:
+                    settlement = self._release_compaction_budget_reservations(
+                        dispatch_reservations,
+                        session=loaded_session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        request=request,
+                        operation_id=operation_id,
+                        attempt_id=attempt_id,
+                        compactor=type(context_policy.compactor).__name__,
+                        reason=release_reason,
+                    )
+                elif completed_event is None:
                     settlement = self._reconcile_uncertain_compaction_budget_reservations(
                         dispatch_reservations,
                         session=loaded_session,
@@ -2665,13 +3185,20 @@ class SessionEngine:
                         attempt_id=attempt_id,
                         compactor=type(context_policy.compactor).__name__,
                     )
+                settlement_events: list[Event] = []
                 try:
                     async for event in settlement:
-                        attempt_events.append(event)
+                        settlement_events.append(event)
                 except Exception as exc:
                     exc.add_note(uncertain_reason)
                     raise
                 finally:
+                    # Provider completion telemetry is finalized by the context
+                    # policy (including outcome annotations such as
+                    # ``invalid_summary``). Keep reconciliation events in memory
+                    # until that authoritative completion evidence can be
+                    # published first.
+                    deferred_dispatch_settlement_events.extend(settlement_events)
                     unsettled_ids = {
                         reservation.record.reservation_id for reservation in dispatch_reservations
                     }
@@ -2682,17 +3209,33 @@ class SessionEngine:
                         if reservation.record.reservation_id not in settled_ids
                     ]
 
-            async def run_contextual_provider_dispatch(
+            async def run_provider_dispatch(
                 actual_provider: ModelProvider,
                 actual_model: str,
                 billing_identity: BillingIdentity | None,
                 dispatch: Callable[[], Awaitable[tuple[str, dict[str, Any]]]],
             ) -> tuple[str, dict[str, Any]]:
+                actual_pricing_provider_name = (
+                    actual_provider.billing_provider_name or actual_provider.name
+                )
+                limit_decision = await self._run_limit_controller.evaluate_operation_run_limit(
+                    session=loaded_session,
+                    limits=request.limits,
+                    operation_events=observed_dispatch_completion_events,
+                    operation_started_at=operation_started_at,
+                )
+                if limit_decision is not None:
+                    raise RuntimeError(f"Compaction limit reached: {limit_decision.message}")
+                budget_operation_events = [
+                    *attempt_events,
+                    *observed_dispatch_completion_events,
+                ]
+                budget_operation_event_count = len(budget_operation_events)
                 budget_error = await self._enforce_compaction_budget_limits(
                     session=loaded_session,
                     budget_limits=budget_limits,
                     app_policy_budget_limits=app_policy_budget_limits,
-                    attempt_events=attempt_events,
+                    attempt_events=budget_operation_events,
                     reached_budget_keys=reached_budget_keys,
                     request=request,
                     operation_id=operation_id,
@@ -2700,10 +3243,11 @@ class SessionEngine:
                     registered_agent=registered_agent,
                     environment_name=environment_name,
                     compactor=type(context_policy.compactor).__name__,
-                    provider_name=actual_provider.name,
+                    provider_name=actual_pricing_provider_name,
                     model=actual_model,
                     billing_identity_state=resolved_billing_identity(billing_identity),
                 )
+                attempt_events.extend(budget_operation_events[budget_operation_event_count:])
                 if budget_error is not None:
                     await publish_dispatch_budget_events()
                     raise budget_error
@@ -2713,8 +3257,8 @@ class SessionEngine:
                     session=loaded_session,
                     registered_agent=registered_agent,
                     environment_name=environment_name,
-                    budget_limits=budget_limits,
-                    provider_name=actual_provider.name,
+                    budget_limits=dispatch_settlement_budget_limits,
+                    provider_name=actual_pricing_provider_name,
                     model=actual_model,
                     request=request,
                     operation_id=operation_id,
@@ -2745,12 +3289,19 @@ class SessionEngine:
                     )
                 await publish_dispatch_budget_events()
 
+                provider_dispatch_started = False
+
+                async def tracked_dispatch() -> tuple[str, dict[str, Any]]:
+                    nonlocal provider_dispatch_started
+                    provider_dispatch_started = True
+                    return await dispatch()
+
                 try:
                     (
                         dispatch_result,
                         lease_failure,
                     ) = await self._run_limit_controller.run_operation_with_reservation_heartbeat(
-                        dispatch,
+                        tracked_dispatch,
                         reservations=dispatch_reservations,
                         authoritative_failure_types=(ContextBuildError,),
                         lease_lost_before_dispatch_message=(
@@ -2762,16 +3313,32 @@ class SessionEngine:
                         concurrent_failure_note=(
                             "Compactor also failed while reservation lease loss was handled"
                         ),
+                        completed_metadata_from_result=lambda completed: completed[1],
                     )
                 except asyncio.CancelledError as exc:
+                    raw_completed = getattr(exc, "completed_metadata", None)
+                    completed_event = (
+                        dispatch_completion_event(
+                            actual_provider=actual_provider,
+                            actual_model=actual_model,
+                            completed_metadata=raw_completed,
+                        )
+                        if type(raw_completed) is dict
+                        else None
+                    )
 
                     async def settle_cancelled_dispatch() -> None:
-                        await settle_contextual_dispatch(
+                        await settle_provider_dispatch(
                             dispatch_reservations,
-                            completed_event=None,
+                            completed_event=completed_event,
                             uncertain_reason=(
-                                "Contextual compaction dispatch settlement failed "
+                                "Compaction provider dispatch settlement failed "
                                 "during cancellation."
+                            ),
+                            release_reason=(
+                                None
+                                if provider_dispatch_started
+                                else "compaction cancelled before provider dispatch"
                             ),
                         )
                         await publish_dispatch_budget_events()
@@ -2793,7 +3360,7 @@ class SessionEngine:
                             settlement_failure = candidate
                     if settlement_failure is not None:
                         exc.add_note(
-                            "Contextual compaction cancellation settlement also failed: "
+                            "Compaction provider cancellation settlement also failed: "
                             f"{type(settlement_failure).__name__}: {settlement_failure}"
                         )
                     raise
@@ -2809,23 +3376,33 @@ class SessionEngine:
                         else None
                     )
                     try:
-                        await settle_contextual_dispatch(
+                        await settle_provider_dispatch(
                             dispatch_reservations,
                             completed_event=completed_event,
                             uncertain_reason=(
-                                "Contextual compaction dispatch settlement failed after "
+                                "Compaction provider dispatch settlement failed after "
                                 "provider error."
+                            ),
+                            release_reason=(
+                                "compaction reservation lease lost before provider dispatch"
+                                if not provider_dispatch_started
+                                else None
                             ),
                         )
                         await publish_dispatch_budget_events()
                     except BaseException as settlement_failure:
-                        if not isinstance(settlement_failure, Exception):
-                            raise settlement_failure from exc
-                        add_budget_failure_note(
-                            exc,
-                            operation="contextual compaction dispatch settlement",
-                            accounting_failure=settlement_failure,
-                        )
+                        if isinstance(settlement_failure, Exception):
+                            add_budget_failure_note(
+                                exc,
+                                operation="compaction provider dispatch settlement",
+                                accounting_failure=settlement_failure,
+                            )
+                        else:
+                            exc.add_note(
+                                "Compaction provider dispatch settlement also ended with "
+                                f"{type(settlement_failure).__name__}; "
+                                "the original failure remains authoritative."
+                            )
                     raise
 
                 completed_event = dispatch_completion_event(
@@ -2833,49 +3410,87 @@ class SessionEngine:
                     actual_model=actual_model,
                     completed_metadata=dispatch_result[1],
                 )
-                await settle_contextual_dispatch(
-                    dispatch_reservations,
-                    completed_event=completed_event,
-                    uncertain_reason=(
-                        "Contextual compaction dispatch settlement failed after completion."
-                    ),
-                )
-                await publish_dispatch_budget_events()
+
+                async def settle_completed_dispatch() -> None:
+                    await settle_provider_dispatch(
+                        dispatch_reservations,
+                        completed_event=completed_event,
+                        uncertain_reason=(
+                            "Compaction provider dispatch settlement failed after completion."
+                        ),
+                    )
+                    await publish_dispatch_budget_events()
+
+                settlement_task = asyncio.create_task(settle_completed_dispatch())
+                settlement_outcome = await await_shielded_task_outcome(settlement_task)
+                settlement_cancellation = settlement_outcome.cancellation
+                if settlement_outcome.error is not None:
+                    settlement_failure = settlement_outcome.error
+                    if (
+                        isinstance(settlement_failure, asyncio.CancelledError)
+                        and settlement_cancellation is None
+                    ):
+                        settlement_failure = unexpected_child_cancellation_error(
+                            settlement_failure,
+                            operation="Completed compaction provider dispatch settlement",
+                        )
+                    if settlement_cancellation is not None:
+                        settlement_cancellation.__dict__["completed_metadata"] = copy_json_value(
+                            dispatch_result[1],
+                            "completed_metadata",
+                        )
+                        settlement_cancellation.add_note(
+                            "Completed compaction provider dispatch settlement also failed: "
+                            f"{type(settlement_failure).__name__}: {settlement_failure}"
+                        )
+                        raise settlement_cancellation from settlement_failure
+                    raise settlement_failure
+                if settlement_outcome.result is not None:
+                    raise RuntimeError(
+                        "Completed compaction provider dispatch settlement returned an "
+                        "unexpected result."
+                    )
+                if settlement_cancellation is not None:
+                    settlement_cancellation.__dict__["completed_metadata"] = copy_json_value(
+                        dispatch_result[1],
+                        "completed_metadata",
+                    )
+                    raise settlement_cancellation
                 if lease_failure is not None:
                     raise lease_failure
                 return dispatch_result
 
             async def execute_compaction() -> ContextBuildResult:
-                return await context_policy.build_with_checkpoint(
-                    ContextRequest(
-                        session=loaded_session,
-                        agent=_session_agent_spec(
-                            registered_agent=registered_agent,
+                with _compaction_completion_publisher_scope(publish_compaction_completions):
+                    return await context_policy.build_with_checkpoint(
+                        ContextRequest(
                             session=loaded_session,
+                            agent=_session_agent_spec(
+                                registered_agent=registered_agent,
+                                session=loaded_session,
+                            ),
+                            messages=transcript,
+                            step=1,
+                            environment_name=environment_name,
+                            metadata={
+                                "operation_id": operation_id,
+                                "reason": request.reason,
+                            },
+                            force_compaction=True,
+                            force_bounded_compaction=True,
+                            compaction_instructions=request.instructions,
                         ),
-                        messages=transcript,
-                        step=1,
-                        environment_name=environment_name,
-                        metadata={
-                            "operation_id": operation_id,
-                            "reason": request.reason,
-                        },
-                        force_compaction=True,
-                        force_bounded_compaction=True,
-                        compaction_instructions=request.instructions,
-                    ),
-                    checkpoint=claimed_checkpoint,
-                )
+                        checkpoint=claimed_checkpoint,
+                    )
 
-            if contextual_dispatch_budget_limits:
-                with _automatic_compaction_dispatch_runner_scope(run_contextual_provider_dispatch):
-                    result = await execute_compaction()
-                reservation_lease_failure = None
-            else:
-                (
-                    result,
-                    reservation_lease_failure,
-                ) = await self._run_limit_controller.run_operation_with_reservation_heartbeat(
+            async def execute_compaction_with_limits() -> tuple[
+                ContextBuildResult,
+                BaseException | None,
+            ]:
+                if needs_dispatch_admission:
+                    with _automatic_compaction_dispatch_runner_scope(run_provider_dispatch):
+                        return await execute_compaction(), None
+                return await self._run_limit_controller.run_operation_with_reservation_heartbeat(
                     execute_compaction,
                     reservations=budget_reservations,
                     authoritative_failure_types=(ContextBuildError,),
@@ -2889,9 +3504,14 @@ class SessionEngine:
                         "Compactor also failed while reservation lease loss was handled"
                     ),
                 )
-            for event in prepublished_dispatch_events:
-                yield event
-            prepublished_dispatch_events.clear()
+
+            (
+                result,
+                reservation_lease_failure,
+            ) = await _run_while_session_operation_claimed(
+                execute_compaction_with_limits,
+                heartbeat_task=operation_heartbeat_task,
+            )
             if result.checkpoint is None or result.checkpoint_event_payload is None:
                 raise ValueError("Session has no complete older context to compact.")
 
@@ -2908,10 +3528,24 @@ class SessionEngine:
                 )
                 for telemetry in result.compaction_telemetry
                 if telemetry.event_type != EventType.CONTEXT_COMPACTION_STARTED
+                and not (
+                    telemetry.event_type == EventType.MODEL_COMPLETED
+                    and telemetry.payload.get(_COMPACTION_ATTEMPT_ID_KEY)
+                    in materialized_compaction_attempt_ids
+                )
             ]
             attempt_events.extend(
                 event for event in telemetry_events if event.type == EventType.MODEL_COMPLETED
             )
+            materialized_compaction_attempt_ids.update(
+                completion_attempt_id
+                for telemetry in result.compaction_telemetry
+                if telemetry.event_type == EventType.MODEL_COMPLETED
+                and type(completion_attempt_id := telemetry.payload.get(_COMPACTION_ATTEMPT_ID_KEY))
+                is str
+            )
+            attempt_events.extend(deferred_dispatch_settlement_events)
+            deferred_dispatch_settlement_events.clear()
             async for event in self._reconcile_compaction_budget_reservations(
                 budget_reservations,
                 model_completed_events=[
@@ -2932,16 +3566,24 @@ class SessionEngine:
             limit_decision = await self._run_limit_controller.evaluate_operation_run_limit(
                 session=loaded_session,
                 limits=request.limits,
-                operation_events=attempt_events,
+                operation_events=[
+                    *attempt_events,
+                    *observed_dispatch_completion_events,
+                ],
                 operation_started_at=operation_started_at,
             )
             if limit_decision is not None:
                 raise RuntimeError(f"Compaction limit reached: {limit_decision.message}")
+            final_budget_operation_events = [
+                *attempt_events,
+                *observed_dispatch_completion_events,
+            ]
+            final_budget_operation_event_count = len(final_budget_operation_events)
             budget_error = await self._enforce_compaction_budget_limits(
                 session=loaded_session,
                 budget_limits=budget_limits,
                 app_policy_budget_limits=app_policy_budget_limits,
-                attempt_events=attempt_events,
+                attempt_events=final_budget_operation_events,
                 reached_budget_keys=reached_budget_keys,
                 request=request,
                 operation_id=operation_id,
@@ -2951,6 +3593,9 @@ class SessionEngine:
                 compactor=type(context_policy.compactor).__name__,
                 provider_name=compactor_provider_name,
                 model=compactor_model,
+            )
+            attempt_events.extend(
+                final_budget_operation_events[final_budget_operation_event_count:]
             )
             if budget_error is not None:
                 raise budget_error
@@ -2982,65 +3627,296 @@ class SessionEngine:
                 checkpoint_event,
             ]
             event_ids = [started_event.id, *[event.id for event in published_events]]
-            await self.session_store.publish_session_operation(
-                loaded_session.id,
-                idempotency_key=request.idempotency_key,
-                operation_transform=lambda _session, checkpoint, persisted_record: (
-                    _complete_session_operation_checkpoint(
-                        checkpoint=checkpoint,
-                        persisted_record=persisted_record,
-                        compacted_checkpoint=result.checkpoint,
-                        idempotency_key=request.idempotency_key,
-                        operation_id=operation_id,
-                        attempt_id=attempt_id,
-                        event_ids=event_ids,
-                        result_cursor=result.checkpoint_event_payload.get(
-                            "compacted_transcript_cursor"
-                        ),
-                        completed_at=self._clock(),
+            try:
+                heartbeat_blocker = await stop_claim_heartbeat()
+            except BaseException as heartbeat_failure:
+                _attach_context_build_termination_diagnostics(
+                    heartbeat_failure,
+                    compaction_telemetry=result.compaction_telemetry,
+                )
+                raise heartbeat_failure
+            if heartbeat_blocker is not None:
+                heartbeat_failure = SessionCompactionAttemptSuperseded(
+                    "Session compaction operation heartbeat could not stop before "
+                    "terminal publication."
+                )
+                _attach_context_build_termination_diagnostics(
+                    heartbeat_failure,
+                    compaction_telemetry=result.compaction_telemetry,
+                )
+                raise heartbeat_failure
+            terminal_claim_expires_at: datetime | None = None
+
+            def capture_terminal_claim_expiry(expires_at: datetime) -> None:
+                nonlocal terminal_claim_expires_at
+                terminal_claim_expires_at = expires_at
+
+            def require_unexpired_terminal_commit() -> None:
+                if terminal_claim_expires_at is None:
+                    raise AssertionError(
+                        "Session compaction terminal publication did not capture its claim."
                     )
-                ),
-                events=published_events,
-                expected_statuses=_RESUMABLE_SESSION_STATUSES,
-                expected_run_epoch=request.expected_run_epoch,
-                expected_transcript_cursor=request.expected_transcript_cursor,
+                _require_unexpired_session_operation_commit(
+                    clock=self._clock,
+                    claim_expires_at=terminal_claim_expires_at,
+                    operation="Session compaction terminal publication",
+                )
+
+            async def publish_terminal_success() -> None:
+                await self.session_store.publish_session_operation_guarded(
+                    loaded_session.id,
+                    idempotency_key=request.idempotency_key,
+                    operation_transform=lambda _session, checkpoint, persisted_record: (
+                        _complete_session_operation_checkpoint(
+                            checkpoint=checkpoint,
+                            persisted_record=persisted_record,
+                            compacted_checkpoint=result.checkpoint,
+                            idempotency_key=request.idempotency_key,
+                            operation_id=operation_id,
+                            attempt_id=attempt_id,
+                            event_ids=event_ids,
+                            result_cursor=result.checkpoint_event_payload.get(
+                                "compacted_transcript_cursor"
+                            ),
+                            completed_at=self._clock(),
+                            on_terminalize=capture_terminal_claim_expiry,
+                        )
+                    ),
+                    commit_guard=require_unexpired_terminal_commit,
+                    events=published_events,
+                    expected_statuses=_RESUMABLE_SESSION_STATUSES,
+                    expected_run_epoch=request.expected_run_epoch,
+                    expected_transcript_cursor=request.expected_transcript_cursor,
+                )
+
+            terminal_publication_task = asyncio.create_task(publish_terminal_success())
+            terminal_outcome = await self._await_session_operation_store_task(
+                terminal_publication_task,
+                claim_expires_at=operation_heartbeat_state.confirmed_claim_expires_at,
             )
+            terminal_cancellation = terminal_outcome.cancellation
+            terminal_publication_unknown = terminal_outcome.timed_out
+            if terminal_publication_unknown:
+                publication_failure: BaseException | None = TimeoutError(
+                    "Session compaction terminal publication exceeded its bounded store wait."
+                )
+            else:
+                publication_failure = terminal_outcome.error
+            if isinstance(publication_failure, asyncio.CancelledError):
+                publication_failure = unexpected_child_cancellation_error(
+                    publication_failure,
+                    operation="Session compaction terminal publication",
+                )
+            if publication_failure is not None:
+
+                async def reconcile_terminal_success() -> tuple[
+                    list[bool],
+                    dict[str, Any] | None,
+                    dict[str, Any] | None,
+                ]:
+                    commit_states = [
+                        await self._event_writer.is_persisted(event) for event in published_events
+                    ]
+                    operation_record = await self.session_store.load_session_operation(
+                        loaded_session.id,
+                        request.idempotency_key,
+                    )
+                    checkpoint = await self.session_store.load_checkpoint(loaded_session.id)
+                    return commit_states, operation_record, checkpoint
+
+                reconciliation_task = asyncio.create_task(reconcile_terminal_success())
+                reconciliation_outcome = await self._await_session_operation_store_task(
+                    reconciliation_task,
+                    cancellation=terminal_cancellation,
+                    claim_expires_at=operation_heartbeat_state.confirmed_claim_expires_at,
+                )
+                terminal_cancellation = reconciliation_outcome.cancellation
+                reconciliation_error: BaseException | None
+                if reconciliation_outcome.timed_out:
+                    reconciliation_error = TimeoutError(
+                        "Session compaction terminal publication reconciliation exceeded "
+                        "its bounded store wait."
+                    )
+                else:
+                    reconciliation_error = reconciliation_outcome.error
+                if isinstance(reconciliation_error, asyncio.CancelledError):
+                    reconciliation_error = unexpected_child_cancellation_error(
+                        reconciliation_error,
+                        operation="Session compaction terminal publication reconciliation",
+                    )
+                if reconciliation_error is not None:
+                    if terminal_publication_unknown:
+                        # The guarded write can still resolve after this caller
+                        # returns. Leave the durable claim for replay/recovery
+                        # instead of racing it with a contradictory failure.
+                        operation_published = True
+                    publication_failure.add_note(
+                        "Session compaction terminal publication reconciliation also "
+                        f"failed: {type(reconciliation_error).__name__}: "
+                        f"{reconciliation_error}"
+                    )
+                    if terminal_cancellation is not None:
+                        terminal_cancellation.add_note(
+                            "Terminal publication and reconciliation failed during cancellation."
+                        )
+                        raise terminal_cancellation from publication_failure
+                    _attach_context_build_termination_diagnostics(
+                        publication_failure,
+                        compaction_telemetry=result.compaction_telemetry,
+                    )
+                    raise publication_failure from reconciliation_error
+                reconciled = reconciliation_outcome.result
+                if reconciled is None:
+                    raise AssertionError(
+                        "Session compaction terminal reconciliation lost its result."
+                    ) from publication_failure
+                commit_states, operation_record, durable_checkpoint = reconciled
+                durable_event_ids = (
+                    operation_record.get("event_ids", []) if type(operation_record) is dict else []
+                )
+                operation_completed = (
+                    type(operation_record) is dict
+                    and operation_record.get("status") == "completed"
+                    and operation_record.get("operation_id") == operation_id
+                    and operation_record.get("current_attempt_id") == attempt_id
+                    and operation_record.get("result_transcript_cursor")
+                    == result.checkpoint_event_payload.get("compacted_transcript_cursor")
+                    and all(event_id in durable_event_ids for event_id in event_ids)
+                )
+                expected_compaction_checkpoint = result.checkpoint.get(
+                    _CONTEXT_COMPACTION_OPERATION_KIND
+                )
+                checkpoint_completed = (
+                    type(durable_checkpoint) is dict
+                    and durable_checkpoint.get(_CONTEXT_COMPACTION_OPERATION_KIND)
+                    == expected_compaction_checkpoint
+                    and _active_session_operation_id(durable_checkpoint) != operation_id
+                )
+                events_completed = all(commit_states)
+                fully_committed = operation_completed and checkpoint_completed and events_completed
+                anything_committed = (
+                    operation_completed or checkpoint_completed or any(commit_states)
+                )
+                if anything_committed and not fully_committed:
+                    operation_published = True
+                    committed_events = [
+                        event
+                        for event, committed in zip(
+                            published_events,
+                            commit_states,
+                            strict=True,
+                        )
+                        if committed
+                    ]
+                    (
+                        fan_out_error,
+                        terminal_cancellation,
+                    ) = await self._fan_out_reconciled_session_operation_events(
+                        committed_events,
+                        cancellation=terminal_cancellation,
+                    )
+                    atomicity_error = RuntimeError(
+                        "The session store violated atomic terminal compaction publication."
+                    )
+                    if fan_out_error is not None:
+                        atomicity_error.add_note(
+                            "Committed terminal event side-effect delivery also failed: "
+                            f"{type(fan_out_error).__name__}: {fan_out_error}"
+                        )
+                    if terminal_cancellation is not None:
+                        terminal_cancellation.add_note(str(atomicity_error))
+                        raise terminal_cancellation from publication_failure
+                    raise atomicity_error from publication_failure
+                if fully_committed:
+                    operation_published = True
+                    (
+                        fan_out_error,
+                        terminal_cancellation,
+                    ) = await self._fan_out_reconciled_session_operation_events(
+                        published_events,
+                        cancellation=terminal_cancellation,
+                    )
+                    if fan_out_error is not None:
+                        publication_failure.add_note(
+                            "Committed terminal event side-effect delivery also failed: "
+                            f"{type(fan_out_error).__name__}: {fan_out_error}"
+                        )
+                    publication_failure.add_note(
+                        "Session compaction completed durably before its publication "
+                        "acknowledgement failed; retry will replay the committed result."
+                    )
+                    if terminal_cancellation is not None:
+                        raise terminal_cancellation from publication_failure
+                    raise publication_failure
+                _attach_context_build_termination_diagnostics(
+                    publication_failure,
+                    compaction_telemetry=result.compaction_telemetry,
+                )
+                if terminal_publication_unknown:
+                    operation_published = True
+                if terminal_cancellation is not None:
+                    raise terminal_cancellation from publication_failure
+                raise publication_failure
             operation_published = True
-            await self._event_writer.fan_out_persisted(published_events)
+            (
+                fan_out_error,
+                terminal_cancellation,
+            ) = await self._fan_out_reconciled_session_operation_events(
+                published_events,
+                cancellation=terminal_cancellation,
+            )
+            if terminal_cancellation is not None:
+                if fan_out_error is not None:
+                    terminal_cancellation.add_note(
+                        "Terminal event side-effect delivery also failed: "
+                        f"{type(fan_out_error).__name__}: {fan_out_error}"
+                    )
+                raise terminal_cancellation
+            if fan_out_error is not None:
+                raise fan_out_error
+            for event in prepublished_dispatch_events:
+                yield event
+            prepublished_dispatch_events.clear()
             for event in published_events:
                 yield event
-        except GeneratorExit:
-            if budget_reservations and not budget_reservations_settled:
-                release_events: list[Event] = []
-                try:
-                    async for event in self._release_compaction_budget_reservations(
-                        budget_reservations,
-                        session=loaded_session,
-                        registered_agent=registered_agent,
-                        environment_name=environment_name,
-                        request=request,
-                        operation_id=operation_id,
-                        attempt_id=attempt_id,
-                        compactor=type(context_policy.compactor).__name__,
-                        reason="compaction operation abandoned",
-                    ):
-                        release_events.append(event)
-                finally:
-                    if release_events:
-                        await self._persist_compaction_attempt_events(
+        except GeneratorExit as exc:
+            operation_failure = exc
+            if operation_published:
+                raise
+            termination_telemetry = context_build_termination_compaction_telemetry(exc)
+            if not termination_telemetry:
+                if budget_reservations and not budget_reservations_settled:
+                    release_events: list[Event] = []
+                    try:
+                        async for event in self._release_compaction_budget_reservations(
+                            budget_reservations,
                             session=loaded_session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
                             request=request,
                             operation_id=operation_id,
                             attempt_id=attempt_id,
-                            events=release_events,
-                        )
-                        await self._event_writer.fan_out_persisted(release_events)
-                    budget_reservations_settled = not budget_reservations
-            raise
-        except BaseException as exc:
-            if operation_published:
+                            compactor=type(context_policy.compactor).__name__,
+                            reason="compaction operation abandoned",
+                        ):
+                            release_events.append(event)
+                    finally:
+                        if release_events:
+                            await self._persist_compaction_attempt_events(
+                                session=loaded_session,
+                                request=request,
+                                operation_id=operation_id,
+                                attempt_id=attempt_id,
+                                events=release_events,
+                                heartbeat_state=operation_heartbeat_state,
+                                persisted_event_ids=persisted_attempt_event_ids,
+                                event_inventory=attempt_event_inventory,
+                                unresolved_store_tasks=(unresolved_attempt_publication_tasks),
+                            )
+                            await self._event_writer.fan_out_persisted(release_events)
+                        budget_reservations_settled = not budget_reservations
                 raise
-            if isinstance(exc, ContextBuildError):
+            try:
                 failed_model_events = [
                     _application_compaction_event(
                         telemetry=telemetry,
@@ -3052,119 +3928,467 @@ class SessionEngine:
                         environment_name=environment_name,
                         compactor=type(context_policy.compactor).__name__,
                     )
-                    for telemetry in exc.compaction_telemetry
+                    for telemetry in termination_telemetry
                     if telemetry.event_type == EventType.MODEL_COMPLETED
+                    and telemetry.payload.get(_COMPACTION_ATTEMPT_ID_KEY)
+                    not in materialized_compaction_attempt_ids
                 ]
-                existing_attempt_event_ids = {event.id for event in attempt_events}
-                attempt_events.extend(
-                    event
-                    for event in failed_model_events
-                    if event.id not in existing_attempt_event_ids
-                )
-            if budget_reservations and not budget_reservations_settled:
-                model_completed_events = [
-                    event for event in attempt_events if event.type == EventType.MODEL_COMPLETED
-                ]
-                if model_completed_events:
-                    settlement_stream = self._reconcile_compaction_budget_reservations(
-                        budget_reservations,
-                        model_completed_events=model_completed_events,
-                        session=loaded_session,
-                        registered_agent=registered_agent,
-                        environment_name=environment_name,
-                        request=request,
-                        operation_id=operation_id,
-                        attempt_id=attempt_id,
-                        compactor=type(context_policy.compactor).__name__,
+                attempt_events.extend(failed_model_events)
+                attempt_events.extend(deferred_dispatch_settlement_events)
+                deferred_dispatch_settlement_events.clear()
+                if budget_reservations and not budget_reservations_settled:
+                    model_completed_events = [
+                        event for event in attempt_events if event.type == EventType.MODEL_COMPLETED
+                    ]
+                    settlement_stream = (
+                        self._reconcile_compaction_budget_reservations(
+                            budget_reservations,
+                            model_completed_events=model_completed_events,
+                            session=loaded_session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                            request=request,
+                            operation_id=operation_id,
+                            attempt_id=attempt_id,
+                            compactor=type(context_policy.compactor).__name__,
+                        )
+                        if model_completed_events
+                        else self._release_compaction_budget_reservations(
+                            budget_reservations,
+                            session=loaded_session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                            request=request,
+                            operation_id=operation_id,
+                            attempt_id=attempt_id,
+                            compactor=type(context_policy.compactor).__name__,
+                            reason="compaction operation abandoned",
+                        )
                     )
-                elif isinstance(exc, BudgetReservationLeaseLostBeforeModelDispatch):
-                    settlement_stream = self._release_compaction_budget_reservations(
-                        budget_reservations,
-                        session=loaded_session,
-                        registered_agent=registered_agent,
-                        environment_name=environment_name,
-                        request=request,
-                        operation_id=operation_id,
-                        attempt_id=attempt_id,
-                        compactor=type(context_policy.compactor).__name__,
-                        reason="compaction reservation lease lost before provider dispatch",
-                    )
-                elif isinstance(exc, BudgetReservationLeaseLost):
-                    settlement_stream = self._reconcile_uncertain_compaction_budget_reservations(
-                        budget_reservations,
-                        session=loaded_session,
-                        registered_agent=registered_agent,
-                        environment_name=environment_name,
-                        request=request,
-                        operation_id=operation_id,
-                        attempt_id=attempt_id,
-                        compactor=type(context_policy.compactor).__name__,
-                    )
-                else:
-                    settlement_stream = self._release_compaction_budget_reservations(
-                        budget_reservations,
-                        session=loaded_session,
-                        registered_agent=registered_agent,
-                        environment_name=environment_name,
-                        request=request,
-                        operation_id=operation_id,
-                        attempt_id=attempt_id,
-                        compactor=type(context_policy.compactor).__name__,
-                        reason="compaction provider step did not complete",
-                    )
-                settlement_failure: BaseException | None = None
-                try:
                     async for event in settlement_stream:
                         attempt_events.append(event)
-                except BaseException as candidate:
-                    settlement_failure = candidate
-                budget_reservations_settled = not budget_reservations
-                if settlement_failure is not None:
-                    if not isinstance(settlement_failure, Exception):
-                        raise settlement_failure from exc
-                    add_budget_failure_note(
-                        exc,
-                        operation="compaction settlement",
-                        accounting_failure=settlement_failure,
-                    )
-            failed_event = Event(
-                type=EventType.CONTEXT_COMPACTION_FAILED,
-                session_id=loaded_session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=environment_name,
-                payload={
-                    **_application_compaction_causal_payload(
+                    budget_reservations_settled = True
+                failed_telemetry = next(
+                    (
+                        telemetry
+                        for telemetry in reversed(termination_telemetry)
+                        if telemetry.event_type == EventType.CONTEXT_COMPACTION_FAILED
+                    ),
+                    None,
+                )
+                failed_payload = _application_compaction_causal_payload(
+                    request=request,
+                    operation_id=operation_id,
+                    attempt_id=attempt_id,
+                    source_cursor=request.expected_transcript_cursor,
+                    compactor=type(context_policy.compactor).__name__,
+                )
+                if failed_telemetry is not None:
+                    failed_payload = _application_compaction_event(
+                        telemetry=failed_telemetry,
                         request=request,
                         operation_id=operation_id,
                         attempt_id=attempt_id,
-                        source_cursor=request.expected_transcript_cursor,
+                        session=loaded_session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
                         compactor=type(context_policy.compactor).__name__,
-                    ),
-                    "error_type": type(exc).__name__,
-                },
-            )
-            await self.session_store.publish_session_operation(
-                loaded_session.id,
-                idempotency_key=request.idempotency_key,
-                operation_transform=_fail_session_operation_checkpoint(
+                    ).payload
+                safe_error_type = (
+                    _application_compaction_event_text(type(exc).__name__) or "BaseException"
+                )
+                failed_payload["error_type"] = safe_error_type
+                failed_event = Event(
+                    type=EventType.CONTEXT_COMPACTION_FAILED,
+                    session_id=loaded_session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload=failed_payload,
+                )
+                unpublished_attempt_events = [
+                    event for event in attempt_events if event.id not in persisted_attempt_event_ids
+                ]
+                failed_terminal_claim_expires_at: datetime | None = None
+
+                def capture_failed_terminal_claim_expiry(expires_at: datetime) -> None:
+                    nonlocal failed_terminal_claim_expires_at
+                    failed_terminal_claim_expires_at = expires_at
+
+                def require_unexpired_failed_terminal_commit() -> None:
+                    if failed_terminal_claim_expires_at is None:
+                        return
+                    _require_unexpired_session_operation_commit(
+                        clock=self._clock,
+                        claim_expires_at=failed_terminal_claim_expires_at,
+                        operation="Session compaction failure publication",
+                    )
+
+                await self.session_store.publish_session_operation_guarded(
+                    loaded_session.id,
                     idempotency_key=request.idempotency_key,
+                    operation_transform=_fail_session_operation_checkpoint(
+                        idempotency_key=request.idempotency_key,
+                        operation_id=operation_id,
+                        attempt_id=attempt_id,
+                        failed_event_id=failed_event.id,
+                        attempt_event_ids=[event.id for event in unpublished_attempt_events],
+                        error_type=safe_error_type,
+                        clock=self._clock,
+                        on_terminalize=capture_failed_terminal_claim_expiry,
+                    ),
+                    commit_guard=require_unexpired_failed_terminal_commit,
+                    events=[*unpublished_attempt_events, failed_event],
+                )
+                operation_published = True
+                await self._event_writer.fan_out_persisted(
+                    [*unpublished_attempt_events, failed_event]
+                )
+            except BaseException as cleanup_error:
+                cleanup_error.add_note(
+                    "Compaction was abandoned by GeneratorExit, but its usage and "
+                    "failure accounting could not be durably published. "
+                    "The accounting failure is authoritative."
+                )
+                operation_failure = cleanup_error
+                raise cleanup_error from exc
+            raise
+        except BaseException as exc:
+            operation_failure = exc
+            if operation_published:
+                raise
+            authoritative_failure = exc
+            failed_events: list[Event] = []
+            failure_accounting_published = False
+
+            async def finalize_failed_operation() -> None:
+                nonlocal budget_reservations_settled
+                nonlocal failed_events
+                nonlocal failure_accounting_published
+                nonlocal operation_published
+
+                failure_telemetry = (
+                    authoritative_failure.compaction_telemetry
+                    if isinstance(authoritative_failure, ContextBuildError)
+                    else context_build_termination_compaction_telemetry(authoritative_failure)
+                )
+                if failure_telemetry:
+                    failed_model_events = [
+                        _application_compaction_event(
+                            telemetry=telemetry,
+                            request=request,
+                            operation_id=operation_id,
+                            attempt_id=attempt_id,
+                            session=loaded_session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                            compactor=type(context_policy.compactor).__name__,
+                        )
+                        for telemetry in failure_telemetry
+                        if telemetry.event_type == EventType.MODEL_COMPLETED
+                        and telemetry.payload.get(_COMPACTION_ATTEMPT_ID_KEY)
+                        not in materialized_compaction_attempt_ids
+                    ]
+                    existing_completion_attempt_ids = {
+                        completion_attempt_id
+                        for event in attempt_events
+                        if event.type == EventType.MODEL_COMPLETED
+                        and type(
+                            completion_attempt_id := event.payload.get(_COMPACTION_ATTEMPT_ID_KEY)
+                        )
+                        is str
+                    }
+                    for event in failed_model_events:
+                        completion_attempt_id = event.payload.get(_COMPACTION_ATTEMPT_ID_KEY)
+                        if (
+                            type(completion_attempt_id) is str
+                            and completion_attempt_id in existing_completion_attempt_ids
+                        ):
+                            continue
+                        attempt_events.append(event)
+                        if type(completion_attempt_id) is str:
+                            existing_completion_attempt_ids.add(completion_attempt_id)
+                attempt_events.extend(deferred_dispatch_settlement_events)
+                deferred_dispatch_settlement_events.clear()
+                if budget_reservations and not budget_reservations_settled:
+                    model_completed_events = [
+                        event for event in attempt_events if event.type == EventType.MODEL_COMPLETED
+                    ]
+                    if model_completed_events:
+                        settlement_stream = self._reconcile_compaction_budget_reservations(
+                            budget_reservations,
+                            model_completed_events=model_completed_events,
+                            session=loaded_session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                            request=request,
+                            operation_id=operation_id,
+                            attempt_id=attempt_id,
+                            compactor=type(context_policy.compactor).__name__,
+                        )
+                    elif isinstance(
+                        authoritative_failure,
+                        BudgetReservationLeaseLostBeforeModelDispatch,
+                    ):
+                        settlement_stream = self._release_compaction_budget_reservations(
+                            budget_reservations,
+                            session=loaded_session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                            request=request,
+                            operation_id=operation_id,
+                            attempt_id=attempt_id,
+                            compactor=type(context_policy.compactor).__name__,
+                            reason="compaction reservation lease lost before provider dispatch",
+                        )
+                    elif isinstance(authoritative_failure, BudgetReservationLeaseLost):
+                        settlement_stream = (
+                            self._reconcile_uncertain_compaction_budget_reservations(
+                                budget_reservations,
+                                session=loaded_session,
+                                registered_agent=registered_agent,
+                                environment_name=environment_name,
+                                request=request,
+                                operation_id=operation_id,
+                                attempt_id=attempt_id,
+                                compactor=type(context_policy.compactor).__name__,
+                            )
+                        )
+                    else:
+                        settlement_stream = self._release_compaction_budget_reservations(
+                            budget_reservations,
+                            session=loaded_session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                            request=request,
+                            operation_id=operation_id,
+                            attempt_id=attempt_id,
+                            compactor=type(context_policy.compactor).__name__,
+                            reason="compaction provider step did not complete",
+                        )
+                    settlement_failure: BaseException | None = None
+                    try:
+                        async for event in settlement_stream:
+                            attempt_events.append(event)
+                    except BaseException as candidate:
+                        settlement_failure = candidate
+                    budget_reservations_settled = not budget_reservations
+                    if settlement_failure is not None:
+                        if isinstance(settlement_failure, Exception):
+                            add_budget_failure_note(
+                                authoritative_failure,
+                                operation="compaction settlement",
+                                accounting_failure=settlement_failure,
+                            )
+                        else:
+                            authoritative_failure.add_note(
+                                "Compaction settlement also ended with "
+                                f"{type(settlement_failure).__name__}; "
+                                "the original failure remains authoritative."
+                            )
+                failed_payload = _application_compaction_causal_payload(
+                    request=request,
                     operation_id=operation_id,
                     attempt_id=attempt_id,
-                    failed_event_id=failed_event.id,
-                    attempt_event_ids=[event.id for event in attempt_events],
-                    error_type=type(exc).__name__,
-                    completed_at=self._clock(),
+                    source_cursor=request.expected_transcript_cursor,
+                    compactor=type(context_policy.compactor).__name__,
+                )
+                if failure_telemetry:
+                    failed_telemetry = next(
+                        (
+                            telemetry
+                            for telemetry in reversed(failure_telemetry)
+                            if telemetry.event_type == EventType.CONTEXT_COMPACTION_FAILED
+                        ),
+                        None,
+                    )
+                    if failed_telemetry is not None:
+                        failed_payload = _application_compaction_event(
+                            telemetry=failed_telemetry,
+                            request=request,
+                            operation_id=operation_id,
+                            attempt_id=attempt_id,
+                            session=loaded_session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                            compactor=type(context_policy.compactor).__name__,
+                        ).payload
+                safe_error_type = (
+                    _application_compaction_event_text(type(authoritative_failure).__name__)
+                    or "BaseException"
+                )
+                failed_payload["error_type"] = safe_error_type
+                failed_event = Event(
+                    type=EventType.CONTEXT_COMPACTION_FAILED,
+                    session_id=loaded_session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload=failed_payload,
+                )
+                unpublished_attempt_events = [
+                    event for event in attempt_events if event.id not in persisted_attempt_event_ids
+                ]
+                failed_events = [*unpublished_attempt_events, failed_event]
+                failed_terminal_claim_expires_at: datetime | None = None
+
+                def capture_failed_terminal_claim_expiry(expires_at: datetime) -> None:
+                    nonlocal failed_terminal_claim_expires_at
+                    failed_terminal_claim_expires_at = expires_at
+
+                def require_unexpired_failed_terminal_commit() -> None:
+                    if failed_terminal_claim_expires_at is None:
+                        return
+                    _require_unexpired_session_operation_commit(
+                        clock=self._clock,
+                        claim_expires_at=failed_terminal_claim_expires_at,
+                        operation="Session compaction failure publication",
+                    )
+
+                await self.session_store.publish_session_operation_guarded(
+                    loaded_session.id,
+                    idempotency_key=request.idempotency_key,
+                    operation_transform=_fail_session_operation_checkpoint(
+                        idempotency_key=request.idempotency_key,
+                        operation_id=operation_id,
+                        attempt_id=attempt_id,
+                        failed_event_id=failed_event.id,
+                        attempt_event_ids=[event.id for event in unpublished_attempt_events],
+                        error_type=safe_error_type,
+                        clock=self._clock,
+                        on_terminalize=capture_failed_terminal_claim_expiry,
+                    ),
+                    commit_guard=require_unexpired_failed_terminal_commit,
+                    events=failed_events,
+                )
+                operation_published = True
+                failure_accounting_published = True
+                await self._event_writer.fan_out_persisted(failed_events)
+
+            async def stop_heartbeat_and_finalize_failed_operation() -> None:
+                heartbeat_blocker = await stop_claim_heartbeat()
+                uncertain_publication_tasks = set(unresolved_attempt_publication_tasks)
+                publication_blockers = {
+                    task for task in uncertain_publication_tasks if not task.done()
+                }
+                cost_bearing_publication_blockers = {
+                    task for task in unresolved_completion_publication_tasks if not task.done()
+                }
+                if not uncertain_publication_tasks and heartbeat_blocker is None:
+                    await finalize_failed_operation()
+                    return
+
+                store_blockers = set(publication_blockers)
+                if heartbeat_blocker is not None:
+                    store_blockers.add(heartbeat_blocker)
+
+                async def finalize_after_pending_store_writes() -> None:
+                    await asyncio.gather(*store_blockers, return_exceptions=True)
+                    await asyncio.gather(operation_heartbeat_task, return_exceptions=True)
+                    reconciled_events: list[Event] = []
+                    existing_attempt_event_ids = {event.id for event in attempt_events}
+                    for event in attempt_event_inventory.values():
+                        durable = event.id in persisted_attempt_event_ids
+                        if not durable:
+                            durable = await self._event_writer.is_persisted(event)
+                        if durable:
+                            persisted_attempt_event_ids.add(event.id)
+                            reconciled_events.append(event)
+                            if (
+                                all(
+                                    published.id != event.id
+                                    for published in prepublished_dispatch_events
+                                )
+                                and event.id not in yielded_attempt_event_ids
+                            ):
+                                prepublished_dispatch_events.append(event.model_copy(deep=True))
+                            compaction_attempt_id = completion_event_attempt_ids.get(event.id)
+                            if (
+                                event.type == EventType.MODEL_COMPLETED
+                                and type(compaction_attempt_id) is str
+                            ):
+                                materialized_compaction_attempt_ids.add(compaction_attempt_id)
+                                if event.id not in existing_attempt_event_ids:
+                                    attempt_events.append(event.model_copy(deep=True))
+                                    existing_attempt_event_ids.add(event.id)
+                                if all(
+                                    observed.id != event.id
+                                    for observed in observed_dispatch_completion_events
+                                ):
+                                    observed_dispatch_completion_events.append(
+                                        event.model_copy(deep=True)
+                                    )
+                    fan_out_failure: BaseException | None = None
+                    if reconciled_events:
+                        try:
+                            await self._event_writer.fan_out_persisted(reconciled_events)
+                        except BaseException as exc:
+                            fan_out_failure = exc
+                    try:
+                        await finalize_failed_operation()
+                    except BaseException as finalization_failure:
+                        if fan_out_failure is not None:
+                            raise BaseExceptionGroup(
+                                "Explicit compaction failure accounting and reconciled "
+                                "event delivery both failed.",
+                                [fan_out_failure, finalization_failure],
+                            ) from None
+                        raise
+                    if fan_out_failure is not None:
+                        raise fan_out_failure
+
+                authoritative_failure.add_note(
+                    "Explicit compaction failure accounting waited for an in-flight "
+                    "operation write to release the session store."
+                )
+                if cost_bearing_publication_blockers:
+                    # A completion publication can be the sole durable owner of
+                    # already-incurred provider spend. Do not return while only
+                    # volatile background work owns that evidence.
+                    await finalize_after_pending_store_writes()
+                    return
+
+                if (
+                    uncertain_publication_tasks
+                    and not publication_blockers
+                    and heartbeat_blocker is None
+                ):
+                    # A timed-out write can finish after its first reconciliation
+                    # but before failure cleanup begins. Rescan the complete event
+                    # inventory even when no task remains live so a late durable
+                    # completion retains its original identity and accounting.
+                    await finalize_after_pending_store_writes()
+                    return
+
+                deferred = asyncio.create_task(finalize_after_pending_store_writes())
+                self._track_detached_session_operation_task(deferred)
+
+            await _run_recovery_cleanup_steps(
+                authoritative_failure=authoritative_failure,
+                steps=(
+                    (
+                        "explicit compaction failure accounting",
+                        stop_heartbeat_and_finalize_failed_operation,
+                    ),
                 ),
-                events=[*attempt_events, failed_event],
             )
-            failed_events = [*attempt_events, failed_event]
-            await self._event_writer.fan_out_persisted(failed_events)
-            for event in prepublished_dispatch_events:
-                yield event
-            prepublished_dispatch_events.clear()
-            for event in failed_events:
-                yield event
+            # Fatal BaseExceptions cannot safely yield from an async generator.
+            # Ordinary exceptions retain the explicit API's durable replay stream.
+            if isinstance(authoritative_failure, Exception) and failure_accounting_published:
+                for event in prepublished_dispatch_events:
+                    yield event
+                prepublished_dispatch_events.clear()
+                for event in failed_events:
+                    yield event
             raise
+        finally:
+            await _run_recovery_cleanup_steps(
+                authoritative_failure=operation_failure,
+                steps=(
+                    (
+                        "explicit compaction claim heartbeat stop",
+                        stop_claim_heartbeat_and_track,
+                    ),
+                ),
+            )
 
     async def _load_session_compaction_replay_events(
         self,
@@ -3315,6 +4539,371 @@ class SessionEngine:
                 interrupt_error = RuntimeError(f"Compaction budget limit reached: {check.message}")
         return interrupt_error
 
+    async def _renew_compaction_operation_claim(
+        self,
+        *,
+        session: Session,
+        request: CompactSessionRequest,
+        operation_id: str,
+        attempt_id: str,
+        claim_expires_at: datetime,
+        commit_started: threading.Event,
+    ) -> datetime:
+        renewed_until: datetime | None = None
+
+        def require_unexpired_claim_commit() -> None:
+            _require_unexpired_session_operation_commit(
+                clock=self._clock,
+                claim_expires_at=claim_expires_at,
+                operation="Session compaction operation renewal",
+            )
+            commit_started.set()
+
+        def renew(
+            _session: Session,
+            checkpoint: dict[str, Any] | None,
+            persisted_record: dict[str, Any] | None,
+        ) -> SessionOperationPublication:
+            nonlocal renewed_until
+            publication, renewed_until = _renew_session_operation_claim_publication(
+                checkpoint=checkpoint,
+                idempotency_key=request.idempotency_key,
+                operation_id=operation_id,
+                attempt_id=attempt_id,
+                event_ids=[],
+                renewed_at=self._clock(),
+                persisted_record=persisted_record,
+            )
+            return publication
+
+        await self.session_store.publish_session_operation_guarded(
+            session.id,
+            idempotency_key=request.idempotency_key,
+            operation_transform=renew,
+            commit_guard=require_unexpired_claim_commit,
+            events=[],
+            expected_statuses=_RESUMABLE_SESSION_STATUSES,
+            expected_run_epoch=request.expected_run_epoch,
+            expected_transcript_cursor=request.expected_transcript_cursor,
+        )
+        if renewed_until is None:
+            raise AssertionError("Session compaction claim renewal did not update its lease.")
+        return renewed_until
+
+    async def _reconcile_compaction_operation_claim_expiry(
+        self,
+        *,
+        session_id: str,
+        idempotency_key: str,
+        operation_id: str,
+        attempt_id: str,
+    ) -> datetime:
+        checkpoint = await self.session_store.load_checkpoint(session_id)
+        if checkpoint is None:
+            raise SessionCompactionAttemptSuperseded(
+                "Session compaction operation claim disappeared during renewal reconciliation."
+            )
+        operations = _session_operation_state(checkpoint)
+        record = operations["records"].get(idempotency_key)
+        if (
+            type(record) is not dict
+            or record.get("operation_id") != operation_id
+            or record.get("status") != "running"
+            or record.get("current_attempt_id") != attempt_id
+            or operations.get("active_operation_id") != operation_id
+        ):
+            raise SessionCompactionAttemptSuperseded(
+                "Session compaction operation ownership changed during renewal reconciliation."
+            )
+        claim_expires_at = _operation_claim_expiry(record)
+        if claim_expires_at is None:
+            raise RuntimeError(
+                "Session compaction operation claim has no valid expiry after renewal."
+            )
+        return claim_expires_at
+
+    async def _reconcile_compaction_operation_claim_before_deadline(
+        self,
+        *,
+        session_id: str,
+        idempotency_key: str,
+        operation_id: str,
+        attempt_id: str,
+        local_claim_expires_at: datetime,
+        state: _SessionOperationClaimHeartbeatState,
+    ) -> datetime:
+        confirmed_claim_expires_at = state.confirmed_claim_expires_at
+        if (
+            confirmed_claim_expires_at is not None
+            and confirmed_claim_expires_at > local_claim_expires_at
+        ):
+            local_claim_expires_at = confirmed_claim_expires_at
+        started_at = self._clock()
+        if started_at.tzinfo is None or started_at.utcoffset() is None:
+            raise ValueError(
+                "Session compaction claim reconciliation clock must be timezone-aware."
+            )
+        remaining_seconds = (local_claim_expires_at - started_at).total_seconds()
+        if remaining_seconds <= 0:
+            raise SessionCompactionAttemptSuperseded(
+                "Session compaction operation claim expired before reconciliation."
+            )
+        reconciliation_task = asyncio.create_task(
+            self._reconcile_compaction_operation_claim_expiry(
+                session_id=session_id,
+                idempotency_key=idempotency_key,
+                operation_id=operation_id,
+                attempt_id=attempt_id,
+            )
+        )
+        state.pending_store_task = reconciliation_task
+        reconciliation_task.add_done_callback(state.observe_store_task)
+        try:
+            done, _pending = await asyncio.wait(
+                {reconciliation_task},
+                timeout=remaining_seconds,
+            )
+        except asyncio.CancelledError as cancellation:
+            reconciliation_failure: BaseException | None = None
+            if reconciliation_task.done():
+                reconciliation_failure = _completed_session_operation_child_failure(
+                    reconciliation_task,
+                    operation="Session compaction claim reconciliation",
+                )
+            else:
+                reconciliation_task.cancel()
+            if reconciliation_failure is not None:
+                cancellation.add_note(
+                    "Session compaction claim reconciliation also failed during "
+                    f"cancellation: {type(reconciliation_failure).__name__}: "
+                    f"{reconciliation_failure}"
+                )
+                raise cancellation from reconciliation_failure
+            raise
+        if reconciliation_task not in done:
+            reconciliation_task.cancel()
+            confirmed_claim_expires_at = state.confirmed_claim_expires_at
+            if (
+                confirmed_claim_expires_at is not None
+                and confirmed_claim_expires_at > local_claim_expires_at
+            ):
+                _require_unexpired_session_operation_claim(
+                    clock=self._clock,
+                    claim_expires_at=confirmed_claim_expires_at,
+                    operation="Session compaction operation publication",
+                )
+                return confirmed_claim_expires_at
+            raise SessionCompactionAttemptSuperseded(
+                "Session compaction operation claim reconciliation was not confirmed "
+                "before its lease deadline."
+            )
+        try:
+            durable_claim_expires_at = reconciliation_task.result()
+        except asyncio.CancelledError as child_cancellation:
+            raise unexpected_child_cancellation_error(
+                child_cancellation,
+                operation="Session compaction claim reconciliation",
+            ) from child_cancellation
+        observed_at = self._clock()
+        if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+            raise ValueError(
+                "Session compaction claim reconciliation clock must be timezone-aware."
+            )
+        if local_claim_expires_at <= observed_at:
+            raise SessionCompactionAttemptSuperseded(
+                "Session compaction operation claim expired during reconciliation."
+            )
+        _require_unexpired_session_operation_claim(
+            clock=lambda: observed_at,
+            claim_expires_at=durable_claim_expires_at,
+            operation="Session compaction operation reconciliation",
+        )
+        state.confirm_claim(durable_claim_expires_at)
+        return state.confirmed_claim_expires_at or durable_claim_expires_at
+
+    async def _heartbeat_compaction_operation_claim(
+        self,
+        *,
+        session: Session,
+        request: CompactSessionRequest,
+        operation_id: str,
+        attempt_id: str,
+        claim_expires_at: datetime,
+        stop: asyncio.Event,
+        state: _SessionOperationClaimHeartbeatState,
+    ) -> None:
+        sleep_seconds = _SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=sleep_seconds)
+            except TimeoutError:
+                confirmed_claim_expires_at = state.confirmed_claim_expires_at
+                if (
+                    confirmed_claim_expires_at is not None
+                    and confirmed_claim_expires_at > claim_expires_at
+                ):
+                    claim_expires_at = confirmed_claim_expires_at
+                heartbeat_at = self._clock()
+                if heartbeat_at.tzinfo is None or heartbeat_at.utcoffset() is None:
+                    raise ValueError(
+                        "Session compaction operation heartbeat clock must be timezone-aware."
+                    ) from None
+                try:
+                    claim_expires_at = (
+                        await self._reconcile_compaction_operation_claim_before_deadline(
+                            session_id=session.id,
+                            idempotency_key=request.idempotency_key,
+                            operation_id=operation_id,
+                            attempt_id=attempt_id,
+                            local_claim_expires_at=claim_expires_at,
+                            state=state,
+                        )
+                    )
+                except SessionCompactionAttemptSuperseded:
+                    raise
+                except Exception as reconciliation_failure:
+                    failed_at = self._clock()
+                    if failed_at.tzinfo is None or failed_at.utcoffset() is None:
+                        raise ValueError(
+                            "Session compaction operation heartbeat clock must be timezone-aware."
+                        ) from reconciliation_failure
+                    if claim_expires_at <= failed_at:
+                        raise SessionCompactionAttemptSuperseded(
+                            "Session compaction operation claim could not be reconciled "
+                            "before its local lease deadline."
+                        ) from reconciliation_failure
+                renewal_started_at = self._clock()
+                if renewal_started_at.tzinfo is None or renewal_started_at.utcoffset() is None:
+                    raise ValueError(
+                        "Session compaction operation heartbeat clock must be timezone-aware."
+                    ) from None
+                remaining_seconds = (claim_expires_at - renewal_started_at).total_seconds()
+                if remaining_seconds <= 0:
+                    raise SessionCompactionAttemptSuperseded(
+                        "Session compaction operation claim expired before renewal started."
+                    ) from None
+                renewal_task = asyncio.create_task(
+                    self._renew_compaction_operation_claim(
+                        session=session,
+                        request=request,
+                        operation_id=operation_id,
+                        attempt_id=attempt_id,
+                        claim_expires_at=claim_expires_at,
+                        commit_started=(renewal_commit_started := threading.Event()),
+                    )
+                )
+                state.pending_store_task = renewal_task
+                renewal_task.add_done_callback(state.observe_store_task)
+                try:
+                    done, _pending = await asyncio.wait(
+                        {renewal_task},
+                        timeout=remaining_seconds,
+                    )
+                    if renewal_task not in done:
+                        if not renewal_commit_started.is_set():
+                            renewal_task.cancel()
+                        confirmed_claim_expires_at = state.confirmed_claim_expires_at
+                        if (
+                            confirmed_claim_expires_at is not None
+                            and confirmed_claim_expires_at > claim_expires_at
+                        ):
+                            _require_unexpired_session_operation_claim(
+                                clock=self._clock,
+                                claim_expires_at=confirmed_claim_expires_at,
+                                operation="Session compaction operation publication",
+                            )
+                            claim_expires_at = confirmed_claim_expires_at
+                            now = self._clock()
+                            if now.tzinfo is None or now.utcoffset() is None:
+                                raise ValueError(
+                                    "Session compaction operation heartbeat clock must be "
+                                    "timezone-aware."
+                                )
+                            sleep_seconds = min(
+                                _SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS,
+                                max(0.0, (claim_expires_at - now).total_seconds()),
+                            )
+                            continue
+                        raise SessionCompactionAttemptSuperseded(
+                            "Session compaction operation claim renewal was not confirmed "
+                            "before its lease deadline."
+                        )
+                    claim_expires_at = renewal_task.result()
+                    _require_unexpired_session_operation_claim(
+                        clock=self._clock,
+                        claim_expires_at=claim_expires_at,
+                        operation="Session compaction operation renewal",
+                    )
+                    state.confirm_claim(claim_expires_at)
+                except asyncio.CancelledError as cancellation:
+                    renewal_failure: BaseException | None = None
+                    if renewal_task.done():
+                        renewal_failure = _completed_session_operation_child_failure(
+                            renewal_task,
+                            operation="Session compaction claim renewal",
+                        )
+                    elif not renewal_commit_started.is_set():
+                        renewal_task.cancel()
+                    if renewal_failure is not None:
+                        cancellation.add_note(
+                            "Session compaction claim renewal also failed during "
+                            f"cancellation: {type(renewal_failure).__name__}: "
+                            f"{renewal_failure}"
+                        )
+                        raise cancellation from renewal_failure
+                    raise
+                except SessionCompactionAttemptSuperseded:
+                    raise
+                except Exception as exc:
+                    try:
+                        durable_claim_expires_at = (
+                            await self._reconcile_compaction_operation_claim_before_deadline(
+                                session_id=session.id,
+                                idempotency_key=request.idempotency_key,
+                                operation_id=operation_id,
+                                attempt_id=attempt_id,
+                                local_claim_expires_at=claim_expires_at,
+                                state=state,
+                            )
+                        )
+                    except SessionCompactionAttemptSuperseded as ownership_failure:
+                        raise ownership_failure from exc
+                    except Exception as reconciliation_failure:
+                        exc.add_note(
+                            "Session compaction claim renewal reconciliation also failed: "
+                            f"{type(reconciliation_failure).__name__}: "
+                            f"{reconciliation_failure}"
+                        )
+                    else:
+                        if durable_claim_expires_at > claim_expires_at:
+                            claim_expires_at = durable_claim_expires_at
+                            now = self._clock()
+                            if now.tzinfo is None or now.utcoffset() is None:
+                                raise ValueError(
+                                    "Session compaction operation heartbeat clock must be "
+                                    "timezone-aware."
+                                ) from exc
+                            sleep_seconds = min(
+                                _SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS,
+                                max(0.0, (claim_expires_at - now).total_seconds()),
+                            )
+                            continue
+                    now = self._clock()
+                    if now.tzinfo is None or now.utcoffset() is None:
+                        raise ValueError(
+                            "Session compaction operation heartbeat clock must be timezone-aware."
+                        ) from exc
+                    if now >= claim_expires_at:
+                        raise SessionCompactionAttemptSuperseded(
+                            "Session compaction operation claim could not be renewed before expiry."
+                        ) from exc
+                    sleep_seconds = min(
+                        _SESSION_OPERATION_CLAIM_HEARTBEAT_RETRY_SECONDS,
+                        max(0.0, (claim_expires_at - now).total_seconds()),
+                    )
+                    continue
+                sleep_seconds = _SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS
+
     async def _persist_compaction_attempt_events(
         self,
         *,
@@ -3323,24 +4912,244 @@ class SessionEngine:
         operation_id: str,
         attempt_id: str,
         events: list[Event],
+        heartbeat_state: _SessionOperationClaimHeartbeatState,
+        persisted_event_ids: set[str],
+        event_inventory: dict[str, Event],
+        unresolved_store_tasks: set[asyncio.Task[Any]],
+        cost_bearing_store_tasks: set[asyncio.Task[Any]] | None = None,
     ) -> None:
         if not events:
             return
-        await self.session_store.publish_session_operation(
-            session.id,
-            idempotency_key=request.idempotency_key,
-            operation_transform=_append_session_operation_attempt_events(
+        event_inventory.update((event.id, event.model_copy(deep=True)) for event in events)
+        publication_claim_expires_at: datetime | None = None
+        renewed_claim_expires_at: datetime | None = None
+
+        def capture_publication_claim_expiry(expires_at: datetime) -> None:
+            nonlocal publication_claim_expires_at
+            publication_claim_expires_at = expires_at
+
+        def capture_renewed_claim_expiry(expires_at: datetime) -> None:
+            nonlocal renewed_claim_expires_at
+            if renewed_claim_expires_at is None or expires_at > renewed_claim_expires_at:
+                renewed_claim_expires_at = expires_at
+
+        def require_unexpired_publication_commit() -> None:
+            if publication_claim_expires_at is None:
+                raise AssertionError(
+                    "Session compaction event publication did not capture its claim."
+                )
+            _require_unexpired_session_operation_commit(
+                clock=self._clock,
+                claim_expires_at=publication_claim_expires_at,
+                operation="Session compaction event publication",
+            )
+
+        event_ids = [event.id for event in events]
+
+        async def publish() -> None:
+            await self.session_store.publish_session_operation_guarded(
+                session.id,
                 idempotency_key=request.idempotency_key,
-                operation_id=operation_id,
-                attempt_id=attempt_id,
-                event_ids=[event.id for event in events],
-                updated_at=self._clock(),
-            ),
-            events=events,
-            expected_statuses=_RESUMABLE_SESSION_STATUSES,
-            expected_run_epoch=request.expected_run_epoch,
-            expected_transcript_cursor=request.expected_transcript_cursor,
+                operation_transform=_append_session_operation_attempt_events(
+                    idempotency_key=request.idempotency_key,
+                    operation_id=operation_id,
+                    attempt_id=attempt_id,
+                    event_ids=event_ids,
+                    clock=self._clock,
+                    on_renew=capture_publication_claim_expiry,
+                    on_renewed=capture_renewed_claim_expiry,
+                ),
+                commit_guard=require_unexpired_publication_commit,
+                events=events,
+                expected_statuses=_RESUMABLE_SESSION_STATUSES,
+                expected_run_epoch=request.expected_run_epoch,
+                expected_transcript_cursor=request.expected_transcript_cursor,
+            )
+
+        publication_task = asyncio.create_task(publish())
+        publication_outcome = await self._await_session_operation_store_task(
+            publication_task,
+            claim_expires_at=heartbeat_state.confirmed_claim_expires_at,
         )
+        if publication_outcome.timed_out:
+            unresolved_store_tasks.add(publication_task)
+            if cost_bearing_store_tasks is not None:
+                cost_bearing_store_tasks.add(publication_task)
+        cancellation = publication_outcome.cancellation
+        if publication_outcome.timed_out:
+            publication_error: BaseException | None = TimeoutError(
+                "Session compaction event publication exceeded its bounded store wait."
+            )
+        else:
+            publication_error = publication_outcome.error
+        if isinstance(publication_error, asyncio.CancelledError):
+            publication_error = unexpected_child_cancellation_error(
+                publication_error,
+                operation="Session compaction event publication",
+            )
+
+        async def confirm_current_claim(record: dict[str, Any] | None = None) -> None:
+            nonlocal renewed_claim_expires_at
+            if renewed_claim_expires_at is None and record is not None:
+                renewed_claim_expires_at = _operation_claim_expiry(record)
+            confirmed_expiry = heartbeat_state.confirmed_claim_expires_at
+            if renewed_claim_expires_at is not None and (
+                confirmed_expiry is None or renewed_claim_expires_at > confirmed_expiry
+            ):
+                heartbeat_state.confirm_claim(renewed_claim_expires_at)
+                confirmed_expiry = renewed_claim_expires_at
+            if confirmed_expiry is None:
+                raise AssertionError(
+                    "Session compaction event publication did not renew its claim."
+                )
+            _require_unexpired_session_operation_claim(
+                clock=self._clock,
+                claim_expires_at=confirmed_expiry,
+                operation="Session compaction event publication acknowledgement",
+            )
+
+        if publication_error is not None:
+
+            async def reconcile() -> tuple[list[bool], dict[str, Any] | None]:
+                commit_states = [await self._event_writer.is_persisted(event) for event in events]
+                checkpoint = await self.session_store.load_checkpoint(session.id)
+                record = None
+                if type(checkpoint) is dict:
+                    record = _session_operation_state(checkpoint)["records"].get(
+                        request.idempotency_key
+                    )
+                return commit_states, record
+
+            reconciliation_task = asyncio.create_task(reconcile())
+            reconciliation_outcome = await self._await_session_operation_store_task(
+                reconciliation_task,
+                cancellation=cancellation,
+                claim_expires_at=heartbeat_state.confirmed_claim_expires_at,
+            )
+            cancellation = reconciliation_outcome.cancellation
+            reconciliation_error: BaseException | None
+            if reconciliation_outcome.timed_out:
+                reconciliation_error = TimeoutError(
+                    "Session compaction event publication reconciliation exceeded its "
+                    "bounded store wait."
+                )
+            else:
+                reconciliation_error = reconciliation_outcome.error
+            if isinstance(reconciliation_error, asyncio.CancelledError):
+                reconciliation_error = unexpected_child_cancellation_error(
+                    reconciliation_error,
+                    operation="Session compaction event publication reconciliation",
+                )
+            if reconciliation_error is not None:
+                publication_error.add_note(
+                    "Session compaction event publication reconciliation also failed: "
+                    f"{type(reconciliation_error).__name__}: {reconciliation_error}"
+                )
+                if cancellation is not None:
+                    cancellation.add_note(
+                        "Session compaction event publication and reconciliation "
+                        "failed during cancellation."
+                    )
+                    raise cancellation from publication_error
+                raise publication_error from reconciliation_error
+            reconciled = reconciliation_outcome.result
+            if reconciled is None:
+                raise AssertionError(
+                    "Session compaction event publication reconciliation lost its result."
+                ) from publication_error
+            commit_states, record = reconciled
+            record_event_ids = record.get("event_ids", []) if type(record) is dict else []
+            record_has_all_events = all(event_id in record_event_ids for event_id in event_ids)
+            # The guarded store commits the operation record and event batch
+            # atomically. A per-event read can be stale when the physical write
+            # lands between that read and the later checkpoint read, so the
+            # operation record is the authoritative confirmation of the batch.
+            fully_committed = record_has_all_events
+            anything_committed = any(commit_states) or any(
+                event_id in record_event_ids for event_id in event_ids
+            )
+            if anything_committed and not fully_committed:
+                atomicity_error = RuntimeError(
+                    "The session store violated atomic compaction event publication."
+                )
+                if cancellation is not None:
+                    cancellation.add_note(str(atomicity_error))
+                    raise cancellation from publication_error
+                raise atomicity_error from publication_error
+            if not fully_committed:
+                if cancellation is not None:
+                    raise cancellation from publication_error
+                raise publication_error
+            persisted_event_ids.update(event_ids)
+            fan_out_error, cancellation = await self._fan_out_reconciled_session_operation_events(
+                events,
+                cancellation=cancellation,
+            )
+            if fan_out_error is not None:
+                publication_error.add_note(
+                    "Committed compaction event side-effect delivery also failed: "
+                    f"{type(fan_out_error).__name__}: {fan_out_error}"
+                )
+            try:
+                await confirm_current_claim(record)
+            except BaseException as claim_error:
+                if cancellation is not None:
+                    cancellation.add_note(
+                        "The compaction claim became unusable while publication "
+                        "cancellation was being reconciled."
+                    )
+                    raise cancellation from claim_error
+                raise claim_error from publication_error
+            publication_error.add_note(
+                "Session compaction events were durable; the operation will fail "
+                "closed after the lost acknowledgement."
+            )
+            if cancellation is not None:
+                raise cancellation from publication_error
+            raise publication_error
+
+        persisted_event_ids.update(event_ids)
+        try:
+            await confirm_current_claim()
+        except BaseException as claim_error:
+            authoritative_cancellation = cancellation
+            (
+                fan_out_error,
+                later_cancellation,
+            ) = await self._fan_out_reconciled_session_operation_events(
+                events,
+                cancellation=authoritative_cancellation,
+            )
+            cancellation = later_cancellation or authoritative_cancellation
+            if fan_out_error is not None:
+                claim_error.add_note(
+                    "Committed compaction event side-effect delivery also failed "
+                    "before claim rejection: "
+                    f"{type(fan_out_error).__name__}: {fan_out_error}"
+                )
+            if cancellation is not None:
+                cancellation.add_note(
+                    "The compaction claim became unusable after event publication."
+                )
+                raise cancellation from claim_error
+            raise
+        if cancellation is not None:
+            authoritative_cancellation = cancellation
+            (
+                fan_out_error,
+                later_cancellation,
+            ) = await self._fan_out_reconciled_session_operation_events(
+                events,
+                cancellation=authoritative_cancellation,
+            )
+            cancellation = later_cancellation or authoritative_cancellation
+            if fan_out_error is not None:
+                cancellation.add_note(
+                    "Committed compaction event side-effect delivery also failed "
+                    f"during cancellation: {type(fan_out_error).__name__}: "
+                    f"{fan_out_error}"
+                )
+            raise cancellation
 
     async def _reserve_compaction_budget(
         self,

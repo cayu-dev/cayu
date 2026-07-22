@@ -50,7 +50,7 @@ Context output must preserve complete tool rounds: assistant tool calls must be 
 
 Built-in policies include `RecentTurnsContextPolicy`, `MessageWindowContextPolicy`, `UsageTriggeredContextPolicy`, `CheckpointCompactionContextPolicy`, and `KnowledgeInjectionPolicy`. Recent-turn and message-window policies are pure projections over the current transcript. Built-in policies keep only the latest file-attachment tool result provider-resolvable by default; older attachment references are replaced with text/structured summaries using `strip_old_file_attachments(...)` so providers do not receive the same file bytes on every later request. The same helper keeps user-prompt `FilePart`s provider-resolvable only on the current attach turn — once a file's turn has been answered and a newer user turn begins, its bytes are projected to a short text note (see "Files in prompts" under ArtifactStore). Checkpoint-backed compaction is runtime-managed: it summarizes older messages through a `ContextCompactor`, stores summary state in the session checkpoint under `context_compaction`, emits `context.compaction.started`, `context.compaction.completed` or `context.compaction.failed`, emits `session.checkpointed` after successful checkpoint writes, and sends leading system messages, compacted user-context summary, and recent complete turns to the provider. It does not delete or rewrite transcript messages.
 
-Compaction checkpoints store the summary and `compacted_transcript_cursor`, the provider-neutral transcript position covered by that summary. The model-facing summary is injected as synthetic user context, not as a system instruction, and is not appended to the durable transcript. Compaction events include cursor, compactor, count, error, and provider metadata needed for audit/debugging, but they do not include the summary text.
+Compaction checkpoints store the summary and `compacted_transcript_cursor`, the provider-neutral transcript position covered by that summary. A compactor may advance this cursor only across a contiguous source prefix represented in the returned summary; omitted history remains eligible for a later compaction and is included verbatim between the synthetic summary and recent turns in every model-facing projection. Coverage boundaries may not split an assistant tool call from its matching tool result. A custom provider-backed prompt must cover at least one source message. When recompacting an existing checkpoint, every positive-coverage `CompactionResult` must set `represented_existing_summary_sha256` to the lowercase SHA-256 digest of the exact UTF-8 `CompactionRequest.existing_summary` it represents. A zero-coverage result instead must return that existing summary byte-for-byte unchanged. These checks prevent a valid old cursor from outliving the summary that represents its source range. A result may report zero coverage only as validated `progress_exhausted` state for the current compactor configuration; an ordinary zero-coverage success is rejected so it cannot trigger recurring paid work without cursor progress. Version-1 compaction checkpoints predate explicit source coverage and are invalidated on read; the next eligible compaction rebuilds them from the authoritative transcript as version 2. The model-facing summary is injected as synthetic user context, not as a system instruction, and is not appended to the durable transcript. The authoritative transcript remains immutable and complete, while the checkpoint controls only the model-facing projection. Compaction lifecycle events report requested and represented source ranges, coverage mode, source chunk count/mode, bounded-input state, and failure state through allowlisted scalar fields; they do not include summary, transcript, attachment, provider-state, or instruction content.
 
 When reservation-bearing cost budgets apply, automatic provider-backed
 compaction participates in the same atomic ledger as the following model step.
@@ -60,26 +60,39 @@ reserve the main provider call. Once a dispatch may have spent money, settlement
 finishes despite caller cancellation and attempts every applicable limit even if
 a sibling reconciliation fails. Built-in compactor retries and cache-aware
 fallback calls reserve and settle independently at the provider-stream boundary.
+The causal `context.compaction.started` event is durable before the first
+provider dispatch. Every finalized hierarchy, retry, and fallback attempt then
+publishes its own `model.completed` evidence before another provider dispatch
+may begin. An attempt that reached provider-controlled execution but returned
+no authoritative completion usage is recorded as usage-unavailable and makes a
+strict event-backed budget fail closed on retry and after process restart.
 A dispatched compaction without authoritative priced usage is charged at its
 reserved amount; mixed known and uncertain completions retain the known cost and
 add one reserved amount for each uncertain completion. Failures before a built-in
 compactor reaches provider-controlled stream execution create no reservation.
 Deterministic compactors and context builds that do not compact create no
-compaction reservation. After successful compaction telemetry and its
-checkpoint are durable, the runtime also re-evaluates event-backed budget and
-run/request limits before invoking the main provider. Thus reported compaction
+compaction reservation. Automatic compaction publishes the final
+`context.compaction.completed` and `session.checkpointed` evidence atomically
+with the checkpoint cursor; a pre-commit failure publishes none of those three
+success representations, while a lost commit acknowledgement is reconciled
+without duplicating them. After that atomic outcome is durable, the runtime also
+re-evaluates event-backed budget and run/request limits before invoking the main
+provider. Thus reported compaction
 spend and active or reconciled strict-ledger usage enforce the same boundary,
 including when each component is individually below the configured maximum.
 Provider-backed custom compactors used on this path must declare their charged
 provider and model through `provider_budget_identity(session)`. That identity
-does not declare provider-call cardinality: when reservation-bearing limits
-apply, automatic compaction fails before invoking an opaque custom compactor
-because Cayu cannot reserve each hidden dispatch independently. A strict
-contextual-pricing limit likewise requires the built-in observable dispatch
-boundary so the provider-resolved billing identity can be admitted immediately
-before spend, even when the limit has no reservation. Opaque custom compactors
-remain compatible with event-backed budgets only when pricing does not require
-that request-specific contextual preflight.
+does not declare provider-call cardinality. Whenever run limits or cost budgets
+apply, every automatic compaction provider dispatch must cross Cayu's observable
+dispatch boundary so prior hierarchy/retry usage can be admitted before the next
+call. Automatic compaction therefore fails before invoking an opaque custom
+provider-backed compactor under those controls, including event-backed budgets
+without reservations; evaluating only the aggregate result after hidden calls
+would permit individually affordable dispatches to exceed the combined limit.
+Strict contextual-pricing limits additionally use the provider-resolved billing
+identity immediately before spend. Custom deterministic compactors remain
+supported under limits but must explicitly return `None` from
+`provider_budget_identity(session)`.
 
 ### Explicit application-requested compaction
 
@@ -132,19 +145,63 @@ lifecycle events are durably linked to the active compaction attempt before the
 provider runs; deterministic compactors perform no provider-cost check or
 reservation. Custom `ContextCompactor` implementations used with cost budgets
 must implement `provider_budget_identity(session)`, returning the charged
-provider/model pair or `None` only when they perform no provider work. Provider
-usage is persisted even when a limit rejects the new checkpoint, so its cost
-cannot disappear on retry. The server adapter exposes the same contract at
+provider/model pair or `None` only when they perform no provider work. Each
+finalized provider attempt is appended to the live operation before an explicit
+compactor retry or later hierarchy call can dispatch. Lost acknowledgements are
+reconciled by event identity, and an uncertain attempt remains durable across
+worker reconstruction, so provider cost cannot disappear on retry or when a
+limit rejects the new checkpoint. The server adapter exposes the same contract at
 `POST /api/sessions/{session_id}/compact` through the replayable mutation
 protocol; mutation and authenticated actor identity are server concerns, while
 compaction policy remains runtime-owned.
+The operation claim has a five-minute lease and each durable provider-attempt
+publication renews it. A retry may recover a genuinely abandoned operation
+after the renewed lease expires, but cannot reclaim a healthy long-running
+hierarchy merely because its original claim time is old.
 
 This explicit primitive is separate from automatic checkpoint compaction during
 a provider loop. It also does not choose when cache deadlines or economics make
 compaction desirable; higher-level scheduling policy may call this primitive
 after making that decision.
 
-`TranscriptDigestCompactor` is the deterministic fallback. It converts older messages into a clipped text digest and does not perform semantic summarization. `ModelCompactor` is the provider-backed implementation for production semantic summaries: it sends a text-only compaction request with no tools to a configured `ModelProvider`, rejects tool calls from the compaction model, and stores the returned text as the checkpoint summary. Model compaction bounds the serialized compaction input with `max_input_chars` by default so very large transcripts cannot create unbounded provider requests; the default prompt preserves compaction instructions and existing summary while clipping only the newly compacted transcript digest. Callers can tune or disable that bound explicitly. Callers can provide `system_prompt` to change compaction-model behavior and `prompt_builder` to replace the user prompt body.
+`TranscriptDigestCompactor` is the deterministic fallback. It converts older
+messages into a bounded text digest and reports the exact protocol-safe prefix
+represented by that digest. It never clips an existing summary while advancing
+over new source. If the existing summary already exceeds the configured bound,
+or no new atomic unit fits beside it, the compactor preserves that summary,
+leaves the cursor unchanged, and keeps the unacknowledged source verbatim in the
+effective projection. The checkpoint records that this exact digest
+configuration cannot progress, so automatic builds do not repeat identical
+work and event churn. Explicitly forced compaction still retries, and changing
+the digest configuration invalidates the marker.
+
+`ModelCompactor` is the provider-backed implementation for production semantic
+summaries: it sends text-only compaction requests with no tools to a configured
+`ModelProvider`, rejects tool calls from the compaction model, and stores the
+returned text as the checkpoint summary. Model compaction bounds each serialized
+input with `max_input_chars` and chooses the largest complete protocol-safe
+prefix that fits. When the first message or assistant/tool-result round exceeds
+one request, it summarizes Unicode-safe source fragments and merges the ordered
+summaries through bounded hierarchical calls; it acknowledges the atomic unit
+only after the complete hierarchy succeeds. Explicit compaction instructions
+are included in every hierarchy phase; if they leave no capacity for source
+text under the configured bound, compaction fails before provider dispatch
+instead of silently ignoring them. Every hierarchy dispatch crosses the normal
+usage, budget, retry, and run-limit boundary, and `max_hierarchy_calls` fails
+closed instead of allowing unbounded auxiliary work. A provider-backed built-in
+cannot opt out of that boundary by declaring a deterministic (`None`) budget
+identity. Callers can tune or disable the input bound explicitly.
+
+Custom prompt builders must return `CompactionPrompt`, declare the contiguous
+source coverage represented by their prompt, and fit the configured bound
+without runtime truncation. A bare-string result is rejected before provider
+dispatch. During recompaction, Cayu prepends the existing checkpoint summary to
+the builder's prompt through runtime-owned composition and includes that text in
+the same input bound; builders should therefore describe the new source work and
+must not repeat the existing summary themselves. This intentionally replaces
+the former compatibility behavior:
+silently assigning zero coverage could overwrite an existing summary and
+retrigger paid compaction forever without advancing the cursor.
 
 `PromptCacheCompactor` is the cache-aware first-checkpoint strategy. On its
 first compaction, `CayuApp` rebuilds the actual runtime `ModelRequest` from the
@@ -1624,9 +1681,10 @@ budget id, so parent and child sessions can share a single work-item budget.
 
 The runtime checks matching app-policy budget limits before every model step and
 again after each completed model step. After a successful provider-backed context
-compaction, Cayu first persists its `model.completed` telemetry and checkpoint,
-then rechecks app-policy budgets and run/request limits before invoking the main
-model. The same boundary applies when model-backed compaction rebuilds context
+compaction, Cayu first persists each dispatch's `model.completed` telemetry and
+then atomically publishes the final checkpoint with its compaction-completed and
+checkpointed events. It rechecks app-policy budgets and run/request limits before
+invoking the main model. The same boundary applies when model-backed compaction rebuilds context
 after a provider context-overflow response: Cayu reconciles the overflowed
 dispatch before the recheck and does not reserve, announce, or invoke the recovery
 dispatch when a limit stops the session. A pre-model check also verifies that the
