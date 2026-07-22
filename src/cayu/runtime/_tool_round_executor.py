@@ -1702,6 +1702,9 @@ class ToolRoundRun:
                         "tool_call_id": pending_input.tool_call_id,
                         "question": pending_input.question,
                         "options": list(pending_input.options),
+                        "tool_calls": [
+                            call.model_dump(mode="json") for call in pending_input.tool_calls
+                        ],
                     },
                 )
             )

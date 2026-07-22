@@ -352,6 +352,18 @@ def json_utf8_size_within_limit(
     return JsonUtf8SizeCounter(max_bytes, ensure_ascii=ensure_ascii).value(value)
 
 
+def compact_json_utf8_size(value: Any) -> int:
+    """Exact UTF-8 size of Cayu's canonical compact JSON representation."""
+    return len(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+
 def require_nonblank_keys(value: dict[str, Any], field_name: str) -> dict[str, Any]:
     if type(value) is not dict:
         raise ValueError(f"`{field_name}` must be a dictionary.")

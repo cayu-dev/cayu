@@ -22,14 +22,178 @@ from cayu.runtime import (
     ResumeRequest,
     RunRequest,
     Session,
+    SessionAggregateFilter,
     SessionIdentity,
     SessionQuery,
     SessionStatus,
+    UsageRollupQuery,
 )
 from cayu.runtime.pending_actions import pending_action_lookup_key
 from cayu.runtime.sessions import PendingActionQuery
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema_migrations
+
+
+def test_read_only_session_store_does_not_create_missing_database(tmp_path) -> None:
+    missing = tmp_path / "missing" / "data" / "cayu.db"
+
+    with pytest.raises(sqlite3.OperationalError):
+        SQLiteSessionStore(
+            missing,
+            schema_mode=schema_migrations.SchemaMode.VALIDATE,
+            read_only=True,
+        )
+
+    assert not missing.exists()
+    assert not missing.parent.exists()
+
+
+def test_read_only_session_store_loads_existing_state_and_rejects_writes(tmp_path) -> None:
+    path = tmp_path / "data" / "cayu.db"
+
+    async def exercise() -> None:
+        writer = SQLiteSessionStore(path)
+        try:
+            created = await writer.create(
+                RunRequest(agent_name="reader", messages=[Message.text("user", "hello")]),
+                identity=SessionIdentity(provider_name="test", model="model"),
+            )
+        finally:
+            await writer.close()
+
+        reader = SQLiteSessionStore(
+            path,
+            schema_mode=schema_migrations.SchemaMode.VALIDATE,
+            read_only=True,
+        )
+        try:
+            assert await reader.load(created.id) == created
+            with pytest.raises(sqlite3.OperationalError, match="readonly|read-only"):
+                await reader.create(
+                    RunRequest(
+                        agent_name="reader",
+                        messages=[Message.text("user", "do not write")],
+                    ),
+                    identity=SessionIdentity(provider_name="test", model="model"),
+                )
+        finally:
+            await reader.close()
+
+    asyncio.run(exercise())
+
+
+def test_read_only_session_store_reads_while_wal_writer_remains_open(tmp_path) -> None:
+    path = tmp_path / "data" / "cayu.db"
+
+    async def exercise() -> None:
+        writer = SQLiteSessionStore(path)
+        reader = None
+        try:
+            created = await writer.create(
+                RunRequest(
+                    agent_name="writer",
+                    session_id="sess_live_reader",
+                    messages=[Message.text("user", "before")],
+                ),
+                identity=SessionIdentity(provider_name="test", model="model"),
+            )
+            await writer.append_transcript_messages(
+                created.id,
+                [Message.text("assistant", "visible through wal")],
+            )
+
+            reader = SQLiteSessionStore(
+                path,
+                schema_mode=schema_migrations.SchemaMode.VALIDATE,
+                read_only=True,
+            )
+
+            loaded = await reader.load(created.id)
+            assert loaded is not None
+            assert loaded.id == created.id
+            transcript = await reader.load_transcript(created.id)
+            assert len(transcript) == 1
+            assert transcript[0].content[0].text == "visible through wal"
+        finally:
+            if reader is not None:
+                await reader.close()
+            await writer.close()
+
+    asyncio.run(exercise())
+
+
+def test_session_inspection_summary_conforms_to_native_event_and_usage_aggregates(
+    tmp_path,
+) -> None:
+    path = tmp_path / "data" / "cayu.db"
+
+    class BoundedInspectionStore(SQLiteSessionStore):
+        async def load(self, session_id: str) -> Session | None:
+            raise AssertionError("inspect_summary must not materialize session metadata")
+
+    async def exercise() -> None:
+        store = BoundedInspectionStore(path)
+        timestamp = datetime(2026, 7, 20, 12, 0, tzinfo=UTC)
+        try:
+            await store.create(
+                RunRequest(
+                    agent_name="inspector",
+                    session_id="sess_inspection_conformance",
+                    labels={
+                        "inspection": "conformance",
+                        **{f"label_{index:03d}": "value" for index in range(205)},
+                    },
+                    metadata={"customer_payload": "x" * 1_000_000},
+                    messages=[Message.text("user", "inspect")],
+                ),
+                identity=SessionIdentity(provider_name="fake", model="model"),
+            )
+            for event in (
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id="sess_inspection_conformance",
+                    timestamp=timestamp,
+                    payload={
+                        "usage_metrics": {
+                            "input_tokens": 5,
+                            "output_tokens": 2,
+                            "total_tokens": 7,
+                        }
+                    },
+                ),
+                Event(
+                    type=EventType.TOOL_CALL_STARTED,
+                    session_id="sess_inspection_conformance",
+                    timestamp=timestamp + timedelta(seconds=1),
+                    tool_name="read_file",
+                    payload={"tool_call_id": "call-1", "arguments": {}},
+                ),
+            ):
+                await store.append_event("sess_inspection_conformance", event)
+
+            inspection = await store.inspect_summary("sess_inspection_conformance")
+            event_summary = await store.summarize_events("sess_inspection_conformance")
+            usage = await store.aggregate_usage(
+                UsageRollupQuery(
+                    start_at=timestamp - timedelta(seconds=1),
+                    end_at=timestamp + timedelta(days=1),
+                    sessions=SessionAggregateFilter(labels={"inspection": "conformance"}),
+                )
+            )
+
+            assert inspection.events.record_count == event_summary.total_events
+            assert inspection.session.label_count == 206
+            assert len(inspection.session.labels) == 200
+            assert inspection.session.labels["inspection"] == "conformance"
+            assert inspection.session.labels_truncated is True
+            assert inspection.model_calls == usage.totals.model_steps
+            assert inspection.tool_calls == usage.totals.tool_calls
+            assert inspection.model_calls_with_usage == usage.totals.model_steps_with_usage
+            assert inspection.usage.usage == usage.totals.usage
+        finally:
+            await store.close()
+
+    asyncio.run(exercise())
 
 
 class FakeProvider(ModelProvider):

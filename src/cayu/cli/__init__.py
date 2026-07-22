@@ -29,6 +29,7 @@ def main(argv: list[str] | None = None) -> int:
     from cayu.cli.inspect import add_inspect_parser, run_inspect
     from cayu.cli.lambda_microvm import add_lambda_microvm_parser, run_lambda_microvm
     from cayu.cli.scaffold import add_new_parser, run_new
+    from cayu.cli.session import add_session_parser, run_session
     from cayu.cli.storage import add_storage_parser, run_storage
 
     add_auth_parser(subparsers)
@@ -40,6 +41,7 @@ def main(argv: list[str] | None = None) -> int:
     add_inspect_parser(subparsers)
     add_lambda_microvm_parser(subparsers)
     add_new_parser(subparsers)
+    add_session_parser(subparsers)
     add_storage_parser(subparsers)
 
     args = parser.parse_args(argv)
@@ -56,6 +58,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "storage":
         return run_storage(args)
+
+    if args.command == "session":
+        return run_session(args)
 
     if args.command == "console":
         return run_console(args)

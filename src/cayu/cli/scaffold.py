@@ -259,6 +259,7 @@ cayu inspect --json
 cayu check --json
 pytest
 cayu eval run
+cayu session list
 ```
 
 These commands require no model API key. They prove project construction,

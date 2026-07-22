@@ -2,6 +2,15 @@
 
 ## v0.1.0 (unreleased)
 
+### Read-only session inspection
+
+`cayu session` now provides bounded, backend-neutral `list`, `show`, `usage`,
+`tools`, `events`, and `transcript` views through public `SessionStore`
+contracts. Project-aware target resolution uses explicit flags first, followed
+by `CAYU_DATABASE_URL`, typed `[tool.cayu.session_store]` configuration, and the
+single conventional local target `data/cayu.db`. Inspection validates existing
+SQLite/PostgreSQL schema and never creates or migrates it.
+
 ### One local SQLite convention
 
 New scaffolds and examples place Cayu's SQLite-backed runtime state in

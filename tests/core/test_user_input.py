@@ -283,6 +283,7 @@ def test_ask_user_pauses_the_session() -> None:
     assert awaiting.payload["question"] == "Which env?"
     assert awaiting.payload["options"] == ["dev", "prod"]
     assert awaiting.payload["input_id"]
+    assert [call["tool_call_id"] for call in awaiting.payload["tool_calls"]] == ["call_1"]
     interrupted = next(e for e in events if e.type == EventType.SESSION_INTERRUPTED)
     assert interrupted.payload["interruption_type"] == "user_input_required"
     assert asyncio.run(store.load("s_pause")).status == SessionStatus.INTERRUPTED
@@ -816,6 +817,12 @@ def test_mixed_round_executes_other_tools_and_keeps_model_order() -> None:
     input_id = next(
         e for e in pause_events if e.type == EventType.SESSION_AWAITING_USER_INPUT
     ).payload["input_id"]
+    awaiting = next(e for e in pause_events if e.type == EventType.SESSION_AWAITING_USER_INPUT)
+    assert [call["tool_call_id"] for call in awaiting.payload["tool_calls"]] == [
+        "call_1",
+        "call_2",
+        "call_3",
+    ]
 
     resume_events = asyncio.run(
         _drain(
@@ -1092,7 +1099,8 @@ def test_denied_sibling_is_blocked_not_executed_on_resume() -> None:
         )
     )
     assert resume_events[-1].type == EventType.SESSION_COMPLETED
-    assert any(e.type == EventType.TOOL_CALL_BLOCKED for e in resume_events)
+    blocked = next(e for e in resume_events if e.type == EventType.TOOL_CALL_BLOCKED)
+    assert blocked.payload["input_id"] == input_id
     parts = {
         p.tool_call_id: p for p in _tool_result_parts(asyncio.run(store.load_transcript("s_deny")))
     }

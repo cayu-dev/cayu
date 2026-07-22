@@ -77,6 +77,7 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert "pip install -e '.[console,dev]'" in readme
     assert "uv sync --extra console --extra dev" in readme
     assert "cayu eval run" in readme
+    assert "cayu session list" in readme
     assert "cayu auth openai login" in readme
     assert "CAYU_OPENAI_SUBSCRIPTION=1" in readme
     assert "subscription holder's own local" in readme

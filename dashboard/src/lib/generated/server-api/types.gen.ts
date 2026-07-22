@@ -2425,7 +2425,7 @@ export type SessionOperationalSnapshot = {
 /**
  * SessionOrder
  */
-export type SessionOrder = 'created_at_asc' | 'created_at_desc' | 'updated_at_asc' | 'updated_at_desc';
+export type SessionOrder = 'created_at_asc' | 'created_at_desc' | 'updated_at_asc' | 'updated_at_desc' | 'last_activity_at_asc' | 'last_activity_at_desc';
 
 /**
  * SessionStateResponse

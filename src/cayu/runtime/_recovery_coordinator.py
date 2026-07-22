@@ -706,6 +706,7 @@ class RecoveryCoordinator:
                             payload={
                                 "tool_call_id": tool_call.id,
                                 "idempotency_key": idempotency_key,
+                                "input_id": pending.input_id,
                                 **policy_denial_payload_fields(
                                     tool_name=tool_call.name,
                                     denied_by=_TOOL_POLICY_DENIAL_SOURCE,

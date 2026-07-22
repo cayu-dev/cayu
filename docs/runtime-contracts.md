@@ -520,12 +520,23 @@ Hook helper side effects are persisted and sent to event sinks; the parent run s
 
 `SQLiteSessionStore` is the durable local implementation. New projects conventionally place session, task, and knowledge tables in one `data/cayu.db`; applications may select a different path explicitly. It stores sessions, append-only events, provider-neutral transcript messages, and the latest checkpoint in SQLite, while keeping session identity and event identity fields queryable as columns. Session identity includes agent, provider, active model, runtime, environment, and parent session. Event identity includes event type, agent, environment, workflow, and tool. `InMemorySessionStore` remains for tests and small examples. Hosted use can later provide a different `SessionStore`, such as Postgres, without changing runtime behavior.
 
-JSONL can be added later as an export/debug format. It should not be the primary Cayu session store because dashboards, replay, task orchestration, retries, and hosted runtimes need indexed structured queries and transactional state updates.
+JSONL is available from bounded CLI inspection and complete storage exports. It should not be the primary Cayu session store because dashboards, replay, task orchestration, retries, and hosted runtimes need indexed structured queries and transactional state updates.
 
 Session stores expose two read surfaces:
 
 - `load_events(session_id)` returns the full event list for one session.
 - `query_events(EventQuery(...))` returns `EventRecord` values with durable sequence numbers for filtered timeline/dashboard reads. `EventQuery` filters by a single `event_type` or by several at once via `event_types` (mutually exclusive).
+- `inspect_summary(session_id)` returns a content-free `SessionInspectionSummary`
+  with identity, serialized transcript/event sizes, usage, pending/queued/operation
+  state, terminal failure state, and explicit budget availability. Its default
+  implementation composes public paginated store queries with a 100,000-record
+  safety ceiling; custom stores may provide an equivalent native aggregate.
+
+The read-only `cayu session` CLI composes these public contracts for `list`,
+`show`, `usage`, `tools`, `events`, and `transcript`. SQLite opens in read-only
+`validate` mode and PostgreSQL uses `validate` mode, so inspection never creates
+or migrates schema. Full event payloads and transcript content require explicit
+byte-bounded flags. See [Session inspection](session-inspection.md).
 
 `after_sequence` is the forward cursor for event consumers. `before_sequence`
 is an exclusive backward bound for one-session history reads and requires

@@ -1257,6 +1257,7 @@ class RunLimitController:
                     window=resolved.limit.window,
                     currency=resolved.limit.currency,
                     maximum=resolved.limit.max_estimated_cost,
+                    action=resolved.limit.action,
                     requested=Decimal("0"),
                     actual=resolved.check.actual,
                     message=resolved.check.message,

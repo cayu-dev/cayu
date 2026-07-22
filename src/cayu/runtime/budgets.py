@@ -54,6 +54,330 @@ _ROLLING_PREFIX = "rolling:"
 _ROLLING_SUFFIX = "s"
 _CALENDAR_PREFIX = "calendar:"
 
+_BUDGET_INSPECTION_EVENT_TYPES = frozenset(
+    {
+        EventType.BUDGET_CHECKED,
+        EventType.BUDGET_LIMIT_REACHED,
+        EventType.BUDGET_RESERVED,
+        EventType.BUDGET_RECONCILED,
+        EventType.BUDGET_RESERVATION_FAILED,
+        EventType.BUDGET_RESERVATION_RELEASED,
+    }
+)
+
+
+class SessionBudgetInspection(BaseModel):
+    """Availability of durable budget and price-ledger evidence."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_count: StrictInt = Field(ge=0)
+    reservation_count: StrictInt = Field(ge=0)
+    reconciliation_count: StrictInt = Field(ge=0)
+    cost_state: Literal["unknown", "unpriced", "partial", "mixed_currency", "priced"]
+    amount: str | None = None
+    currency: str | None = None
+
+
+def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
+    """Project durable budget events into one honest session cost state."""
+    budget_events = [event for event in events if event.type in _BUDGET_INSPECTION_EVENT_TYPES]
+    checks = [
+        event
+        for event in budget_events
+        if event.type in {EventType.BUDGET_CHECKED, EventType.BUDGET_LIMIT_REACHED}
+    ]
+    reservations = [event for event in budget_events if event.type == EventType.BUDGET_RESERVED]
+    reconciliations = [
+        event for event in budget_events if event.type == EventType.BUDGET_RECONCILED
+    ]
+    releases = [
+        event for event in budget_events if event.type == EventType.BUDGET_RESERVATION_RELEASED
+    ]
+    failures = [
+        event for event in budget_events if event.type == EventType.BUDGET_RESERVATION_FAILED
+    ]
+    reservation_ids: set[str] = set()
+    reservation_ids_by_limit: dict[tuple[str, str | None, str, Decimal, str, str], set[str]] = {}
+    currencies_by_reservation: dict[str, str] = {}
+    invalid_reservation_limit_identity = False
+    invalid_reservation_evidence = False
+    for event in reservations:
+        reservation_id = event.payload.get("reservation_id")
+        currency = event.payload.get("currency")
+        if type(reservation_id) is not str:
+            invalid_reservation_evidence = True
+            continue
+        if reservation_id in reservation_ids:
+            invalid_reservation_evidence = True
+        reservation_ids.add(reservation_id)
+        scope = event.payload.get("scope")
+        key = event.payload.get("key")
+        window = event.payload.get("window")
+        maximum = _inspection_decimal(event.payload.get("maximum"), positive=True)
+        action = event.payload.get("action")
+        if (
+            type(scope) is str
+            and (key is None or type(key) is str)
+            and type(window) is str
+            and maximum is not None
+            and type(action) is str
+            and action in {"interrupt", "notify"}
+            and type(currency) is str
+            and bool(currency.strip())
+        ):
+            limit_identity = (scope, key, window, maximum, action, currency.upper())
+            reservation_ids_by_limit.setdefault(limit_identity, set()).add(reservation_id)
+        else:
+            invalid_reservation_limit_identity = True
+        if type(currency) is str:
+            currencies_by_reservation[reservation_id] = currency.upper()
+
+    priced_amount_by_reservation: dict[str, Decimal] = {}
+    priced_reservation_ids: set[str] = set()
+    reconciled_reservation_ids: set[str] = set()
+    terminal_count_by_reservation: dict[str, int] = {}
+    for event in reconciliations:
+        reservation_id = event.payload.get("reservation_id")
+        if type(reservation_id) is not str:
+            invalid_reservation_evidence = True
+            continue
+        reconciled_reservation_ids.add(reservation_id)
+        terminal_count_by_reservation[reservation_id] = (
+            terminal_count_by_reservation.get(reservation_id, 0) + 1
+        )
+        amount = event.payload.get("actual_amount")
+        pricing = event.payload.get("pricing")
+        if type(amount) is not str or type(pricing) is not dict:
+            continue
+        currency = currencies_by_reservation.get(reservation_id)
+        if currency is None:
+            continue
+        try:
+            parsed_amount = Decimal(amount)
+        except ArithmeticError:
+            continue
+        if parsed_amount < 0 or not parsed_amount.is_finite():
+            continue
+        priced_amount_by_reservation[reservation_id] = parsed_amount
+        priced_reservation_ids.add(reservation_id)
+
+    released_reservation_ids: set[str] = set()
+    for event in releases:
+        reservation_id = event.payload.get("reservation_id")
+        if type(reservation_id) is not str:
+            invalid_reservation_evidence = True
+            continue
+        released_reservation_ids.add(reservation_id)
+        terminal_count_by_reservation[reservation_id] = (
+            terminal_count_by_reservation.get(reservation_id, 0) + 1
+        )
+    settled_reservation_ids = reconciled_reservation_ids | released_reservation_ids
+    complete_priced_coverage = (
+        bool(reservation_ids)
+        and not invalid_reservation_limit_identity
+        and not invalid_reservation_evidence
+        and all(
+            len(limit_reservation_ids & reconciled_reservation_ids) <= 1
+            for limit_reservation_ids in reservation_ids_by_limit.values()
+        )
+        and settled_reservation_ids == reservation_ids
+        and priced_reservation_ids == reconciled_reservation_ids
+        and all(
+            terminal_count_by_reservation.get(reservation_id) == 1
+            for reservation_id in reservation_ids
+        )
+    )
+
+    cost_state: Literal["unknown", "unpriced", "partial", "mixed_currency", "priced"]
+    amount: str | None = None
+    currency: str | None = None
+    if complete_priced_coverage:
+        limit_totals: set[tuple[Decimal, str]] = set()
+        mixed_currency = False
+        for limit_reservation_ids in reservation_ids_by_limit.values():
+            currencies = {
+                currencies_by_reservation[reservation_id]
+                for reservation_id in limit_reservation_ids
+                if reservation_id in currencies_by_reservation
+            }
+            if len(currencies) != 1:
+                mixed_currency = True
+                continue
+            limit_total = sum(
+                (
+                    priced_amount_by_reservation.get(reservation_id, Decimal("0"))
+                    for reservation_id in limit_reservation_ids
+                ),
+                Decimal("0"),
+            )
+            limit_totals.add((limit_total, next(iter(currencies))))
+        if mixed_currency or len({item_currency for _, item_currency in limit_totals}) > 1:
+            cost_state = "mixed_currency"
+        elif len(limit_totals) == 1:
+            priced_amount, priced_currency = next(iter(limit_totals))
+            cost_state = "priced"
+            amount = str(priced_amount)
+            currency = priced_currency
+        else:
+            # Parallel budget-limit ledgers must agree on the session's actual
+            # spend. Divergent totals are evidence we cannot safely collapse.
+            cost_state = "partial"
+    elif invalid_reservation_evidence:
+        cost_state = "partial"
+    elif not reservations and checks and not (reconciliations or releases or failures):
+        latest_checks: dict[
+            tuple[str, str | None, str, Decimal, str, str], tuple[Decimal, str, int]
+        ] = {}
+        invalid_check = False
+        for event in checks:
+            scope = event.payload.get("scope")
+            key = event.payload.get("key")
+            window = event.payload.get("window")
+            maximum = _inspection_decimal(event.payload.get("maximum"), positive=True)
+            action = event.payload.get("action")
+            actual = _inspection_decimal(event.payload.get("actual"))
+            currency_value = event.payload.get("currency")
+            unpriced_steps = event.payload.get("unpriced_model_steps")
+            cost_summary = event.payload.get("cost_summary")
+            if (
+                type(scope) is not str
+                or (key is not None and type(key) is not str)
+                or type(window) is not str
+                or maximum is None
+                or type(action) is not str
+                or action not in {"interrupt", "notify"}
+                or actual is None
+                or type(currency_value) is not str
+                or not currency_value.strip()
+                or type(unpriced_steps) is not int
+                or unpriced_steps < 0
+                or type(cost_summary) is not dict
+            ):
+                invalid_check = True
+                continue
+            checked_currency = currency_value.upper()
+            identity = (scope, key, window, maximum, action, checked_currency)
+            latest_checks[identity] = (actual, checked_currency, unpriced_steps)
+
+        if invalid_check:
+            cost_state = "partial"
+        elif any(unpriced_steps > 0 for _, _, unpriced_steps in latest_checks.values()):
+            cost_state = (
+                "unpriced"
+                if all(unpriced_steps > 0 for _, _, unpriced_steps in latest_checks.values())
+                else "partial"
+            )
+        else:
+            check_totals = {
+                (actual, checked_currency) for actual, checked_currency, _ in latest_checks.values()
+            }
+            if len({checked_currency for _, checked_currency in check_totals}) > 1:
+                cost_state = "mixed_currency"
+            elif len(check_totals) == 1:
+                checked_amount, checked_currency = next(iter(check_totals))
+                cost_state = "priced"
+                amount = str(checked_amount)
+                currency = checked_currency
+            else:
+                cost_state = "partial"
+    elif not reservation_ids and failures:
+        failure_currencies = {
+            currency for event in failures if type(currency := event.payload.get("currency")) is str
+        }
+        if len(failure_currencies) == 1 and len(failure_currencies) == len(
+            {event.payload.get("currency") for event in failures}
+        ):
+            cost_state = "priced"
+            amount = "0"
+            currency = next(iter(failure_currencies))
+        elif len(failure_currencies) > 1:
+            cost_state = "mixed_currency"
+        else:
+            cost_state = "partial"
+    elif priced_amount_by_reservation:
+        cost_state = "partial"
+    elif budget_events:
+        cost_state = "unpriced"
+    else:
+        # No ledger evidence is unknown even when observed token counters are zero.
+        # A zero-priced reconciliation is represented above as amount="0".
+        cost_state = "unknown"
+
+    return SessionBudgetInspection(
+        event_count=len(budget_events),
+        reservation_count=len(reservations),
+        reconciliation_count=len(reconciliations),
+        cost_state=cost_state,
+        amount=amount,
+        currency=currency,
+    )
+
+
+def _inspection_decimal(value: Any, *, positive: bool = False) -> Decimal | None:
+    if type(value) is not str:
+        return None
+    try:
+        parsed = Decimal(value)
+    except ArithmeticError:
+        return None
+    if not parsed.is_finite() or parsed < 0 or (positive and parsed == 0):
+        return None
+    return parsed
+
+
+def is_budget_inspection_event(event: Event) -> bool:
+    """Whether an event contributes to the session budget inspection projection."""
+    return event.type in _BUDGET_INSPECTION_EVENT_TYPES
+
+
+def project_budget_inspection_event(event: Event) -> Event:
+    """Retain only the durable fields consumed by budget inspection."""
+    retained_keys: tuple[str, ...]
+    if event.type in {EventType.BUDGET_CHECKED, EventType.BUDGET_LIMIT_REACHED}:
+        retained_keys = (
+            "scope",
+            "key",
+            "window",
+            "currency",
+            "maximum",
+            "actual",
+            "action",
+            "unpriced_model_steps",
+        )
+    elif event.type == EventType.BUDGET_RESERVED:
+        retained_keys = (
+            "reservation_id",
+            "scope",
+            "key",
+            "window",
+            "currency",
+            "maximum",
+            "action",
+        )
+    elif event.type == EventType.BUDGET_RECONCILED:
+        retained_keys = ("reservation_id", "actual_amount")
+    elif event.type == EventType.BUDGET_RESERVATION_RELEASED:
+        retained_keys = ("reservation_id",)
+    elif event.type == EventType.BUDGET_RESERVATION_FAILED:
+        retained_keys = ("currency",)
+    else:
+        retained_keys = ()
+
+    payload = {key: event.payload[key] for key in retained_keys if key in event.payload}
+    if (
+        event.type
+        in {
+            EventType.BUDGET_CHECKED,
+            EventType.BUDGET_LIMIT_REACHED,
+        }
+        and type(event.payload.get("cost_summary")) is dict
+    ):
+        payload["cost_summary"] = {}
+    if event.type == EventType.BUDGET_RECONCILED and type(event.payload.get("pricing")) is dict:
+        payload["pricing"] = {}
+    return event.model_copy(update={"payload": payload})
+
 
 class BudgetWindow(BaseModel):
     """Time window used when selecting events for budget accounting."""
@@ -388,6 +712,7 @@ class BudgetReservationResult(BaseModel):
     window: BudgetWindow = Field(default_factory=BudgetWindow.all_time)
     currency: str
     maximum: Decimal = Field(gt=0)
+    action: BudgetAction
     requested: Decimal = Field(ge=0)
     actual: Decimal = Field(ge=0)
     message: str
@@ -1220,6 +1545,7 @@ def budget_reservation_payload(result: BudgetReservationResult) -> dict[str, Any
         "window_details": result.window.model_dump(mode="json"),
         "currency": result.currency,
         "maximum": str(result.maximum),
+        "action": result.action,
         "requested": str(result.requested),
         "actual": str(result.actual),
         "message": result.message,
@@ -1511,6 +1837,7 @@ def _reservation_result(
         window=limit.window,
         currency=limit.currency,
         maximum=limit.max_estimated_cost,
+        action=limit.action,
         requested=requested,
         actual=actual,
         message=message,

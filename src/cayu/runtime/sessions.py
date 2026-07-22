@@ -31,6 +31,7 @@ from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs 
 
 from cayu._validation import (
     JsonUtf8SizeCounter,
+    compact_json_utf8_size,
     copy_json_object,
     copy_json_value,
     copy_label_map,
@@ -62,12 +63,25 @@ from cayu.runtime.approvals import (
     copy_resolution_actor,
     resolution_actor_payload,
 )
-from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
+from cayu.runtime.budgets import (
+    BudgetLimit,
+    SessionBudgetInspection,
+    copy_request_budget_limits,
+    is_budget_inspection_event,
+    project_budget_inspection_event,
+    session_budget_inspection,
+)
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.runtime.structured_output import StructuredOutputSpec, copy_structured_output_spec
-from cayu.runtime.usage import UsageMetrics
+from cayu.runtime.usage import (
+    SessionUsageSummary,
+    UsageMetrics,
+    count_model_steps_with_usage,
+    project_usage_inspection_event,
+    session_usage_summary,
+)
 
 
 class SessionStatusConflict(ValueError):
@@ -912,6 +926,8 @@ class SessionOrder(StrEnum):
     CREATED_AT_DESC = "created_at_desc"
     UPDATED_AT_ASC = "updated_at_asc"
     UPDATED_AT_DESC = "updated_at_desc"
+    LAST_ACTIVITY_AT_ASC = "last_activity_at_asc"
+    LAST_ACTIVITY_AT_DESC = "last_activity_at_desc"
 
 
 class EventOrder(StrEnum):
@@ -1623,6 +1639,91 @@ class EventSummary(BaseModel):
         return require_clean_nonblank(value, "session_id")
 
 
+class SerializedRecordSummary(BaseModel):
+    """Exact serialized-size totals for one kind of durable session record."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    record_count: StrictInt = Field(ge=0)
+    total_bytes: StrictInt = Field(ge=0)
+    largest_record_bytes: StrictInt = Field(ge=0)
+
+
+class SessionInspectionIdentity(BaseModel):
+    """Bounded, metadata-free identity used by operator inspection."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    agent_name: str
+    provider_name: str
+    model: str
+    parent_session_id: str | None
+    causal_budget_id: str
+    runtime_name: str
+    runtime_version: str | None
+    environment_name: str | None
+    status: SessionStatus
+    created_at: datetime
+    updated_at: datetime
+    last_activity_at: datetime
+    run_epoch: StrictInt = Field(ge=0)
+    labels: dict[str, str] = Field(default_factory=dict)
+    label_count: StrictInt = Field(ge=0)
+    labels_truncated: StrictBool = False
+
+
+class SessionInspectionSummary(BaseModel):
+    """Bounded backend-neutral diagnostic overview for one durable session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session: SessionInspectionIdentity
+    transcript: SerializedRecordSummary
+    events: SerializedRecordSummary
+    usage: SessionUsageSummary
+    model_calls: StrictInt = Field(ge=0)
+    model_calls_with_usage: StrictInt = Field(ge=0)
+    tool_calls: StrictInt = Field(ge=0)
+    pending_action_count: StrictInt = Field(ge=0)
+    pending_action_kinds: tuple[PendingActionKind, ...] = ()
+    pending_action_issue_count: StrictInt = Field(ge=0)
+    queued_message_count: StrictInt = Field(ge=0)
+    delivered_message_count: StrictInt = Field(ge=0)
+    outstanding_message_count: StrictInt = Field(ge=0)
+    operation_event_count: StrictInt = Field(ge=0)
+    terminal_failure_state: Literal["none", "failed", "interrupted"]
+    budget: SessionBudgetInspection
+
+
+_SESSION_INSPECTION_MAX_RECORDS = 100_000
+_SESSION_INSPECTION_MAX_RETAINED_EVENT_BYTES = 64 * 1024 * 1024
+_SESSION_INSPECTION_PAGE_SIZE = 200
+SESSION_INSPECTION_LABEL_LIMIT = 200
+
+
+def _bounded_session_inspection_labels(
+    labels: dict[str, str],
+) -> tuple[dict[str, str], int, bool]:
+    label_count = len(labels)
+    retained_keys = heapq.nsmallest(SESSION_INSPECTION_LABEL_LIMIT, labels)
+    return (
+        {key: labels[key] for key in retained_keys},
+        label_count,
+        label_count > len(retained_keys),
+    )
+
+
+def _retain_session_inspection_event(current_bytes: int, event: Event) -> int:
+    retained_bytes = current_bytes + compact_json_utf8_size(event.model_dump(mode="json"))
+    if retained_bytes > _SESSION_INSPECTION_MAX_RETAINED_EVENT_BYTES:
+        raise ValueError(
+            "Session inspection exceeds the retained-event safety limit of "
+            f"{_SESSION_INSPECTION_MAX_RETAINED_EVENT_BYTES} bytes."
+        )
+    return retained_bytes
+
+
 class SessionOutcome(BaseModel):
     """Derived reason for the current session state.
 
@@ -2019,6 +2120,10 @@ class SessionStore(ABC):
         """Load bounded mutable state without labels or unbounded metadata."""
 
     @abstractmethod
+    async def inspect_identity(self, session_id: str) -> SessionInspectionIdentity:
+        """Load bounded session identity without materializing session metadata."""
+
+    @abstractmethod
     async def update_status(self, session_id: str, status: SessionStatus) -> Session:
         """Update session status and return the updated session."""
 
@@ -2222,6 +2327,141 @@ class SessionStore(ABC):
     @abstractmethod
     async def summarize_outcome(self, session_id: str) -> SessionOutcome:
         """Derive the current session outcome from durable events."""
+
+    async def inspect_summary(self, session_id: str) -> SessionInspectionSummary:
+        """Return one exact, content-free diagnostic summary.
+
+        The default implementation deliberately composes the public paginated
+        query contracts so out-of-tree stores gain the same semantics without a
+        backend-specific schema dependency. Implementations may replace it with
+        an equivalent bounded native aggregate.
+        """
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        identity = await self.inspect_identity(session_id)
+
+        event_count = 0
+        event_total_bytes = 0
+        event_largest_bytes = 0
+        usage_events: list[Event] = []
+        budget_events: list[Event] = []
+        retained_event_bytes = 0
+        queued_message_count = 0
+        delivered_message_count = 0
+        operation_event_count = 0
+        after_sequence = 0
+        while True:
+            records = await self.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    after_sequence=after_sequence,
+                    limit=_SESSION_INSPECTION_PAGE_SIZE,
+                    order_by=EventOrder.SEQUENCE_ASC,
+                )
+            )
+            if not records:
+                break
+            event_count += len(records)
+            if event_count > _SESSION_INSPECTION_MAX_RECORDS:
+                raise ValueError(
+                    "Session inspection exceeds the "
+                    f"{_SESSION_INSPECTION_MAX_RECORDS}-event safety limit."
+                )
+            for record in records:
+                payload_bytes = compact_json_utf8_size(record.event.payload)
+                event_total_bytes += payload_bytes
+                event_largest_bytes = max(event_largest_bytes, payload_bytes)
+                event = record.event
+                if event.type in {EventType.MODEL_COMPLETED, EventType.TOOL_CALL_STARTED}:
+                    usage_event = project_usage_inspection_event(event)
+                    retained_event_bytes = _retain_session_inspection_event(
+                        retained_event_bytes,
+                        usage_event,
+                    )
+                    usage_events.append(usage_event)
+                if is_budget_inspection_event(event):
+                    budget_event = project_budget_inspection_event(event)
+                    retained_event_bytes = _retain_session_inspection_event(
+                        retained_event_bytes,
+                        budget_event,
+                    )
+                    budget_events.append(budget_event)
+                queued_message_count += event.type == EventType.SESSION_MESSAGE_QUEUED
+                delivered_message_count += event.type == EventType.SESSION_MESSAGE_DELIVERED
+                operation_event_count += event.type == EventType.SERVER_MUTATION_ACCEPTED
+            after_sequence = records[-1].sequence
+            if len(records) < _SESSION_INSPECTION_PAGE_SIZE:
+                break
+
+        transcript_count = 0
+        transcript_total_bytes = 0
+        transcript_largest_bytes = 0
+        offset = 0
+        while True:
+            page = await self.query_transcript(
+                TranscriptQuery(
+                    session_id=session_id,
+                    offset=offset,
+                    limit=_SESSION_INSPECTION_PAGE_SIZE,
+                )
+            )
+            if offset == 0 and page.total_records > _SESSION_INSPECTION_MAX_RECORDS:
+                raise ValueError(
+                    "Session inspection exceeds the "
+                    f"{_SESSION_INSPECTION_MAX_RECORDS}-message safety limit."
+                )
+            for record in page.records:
+                message_bytes = compact_json_utf8_size(record.message.model_dump(mode="json"))
+                transcript_count += 1
+                transcript_total_bytes += message_bytes
+                transcript_largest_bytes = max(transcript_largest_bytes, message_bytes)
+            offset += _SESSION_INSPECTION_PAGE_SIZE
+            if offset >= page.total_records:
+                break
+
+        pending = await self.query_pending_actions(
+            PendingActionQuery(session_id=session_id, limit=200)
+        )
+        usage = session_usage_summary(session_id, usage_events)
+        model_calls_with_usage = count_model_steps_with_usage(usage_events)
+        budget = session_budget_inspection(budget_events)
+        return SessionInspectionSummary(
+            session=identity,
+            transcript=SerializedRecordSummary(
+                record_count=transcript_count,
+                total_bytes=transcript_total_bytes,
+                largest_record_bytes=transcript_largest_bytes,
+            ),
+            events=SerializedRecordSummary(
+                record_count=event_count,
+                total_bytes=event_total_bytes,
+                largest_record_bytes=event_largest_bytes,
+            ),
+            usage=usage,
+            model_calls=usage.model_steps,
+            model_calls_with_usage=model_calls_with_usage,
+            tool_calls=usage.tool_calls,
+            pending_action_count=len(pending.actions),
+            pending_action_kinds=tuple(
+                sorted({action.kind for action in pending.actions}, key=str)
+            ),
+            pending_action_issue_count=len(pending.issues),
+            queued_message_count=queued_message_count,
+            delivered_message_count=delivered_message_count,
+            outstanding_message_count=max(
+                queued_message_count - delivered_message_count,
+                0,
+            ),
+            operation_event_count=operation_event_count,
+            terminal_failure_state=(
+                "failed"
+                if identity.status is SessionStatus.FAILED
+                else "interrupted"
+                if identity.status is SessionStatus.INTERRUPTED
+                else "none"
+            ),
+            budget=budget,
+        )
 
     @abstractmethod
     async def list_sessions(self, query: SessionQuery | None = None) -> SessionListResult:
@@ -2601,6 +2841,35 @@ class InMemorySessionStore(SessionStore):
                 status=session.status,
                 updated_at=session.updated_at,
                 last_activity_at=session.last_activity_at,
+            )
+
+    async def inspect_identity(self, session_id: str) -> SessionInspectionIdentity:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(session_id)
+            labels, label_count, labels_truncated = _bounded_session_inspection_labels(
+                session.labels
+            )
+            return SessionInspectionIdentity(
+                id=session.id,
+                agent_name=session.agent_name,
+                provider_name=session.provider_name,
+                model=session.model,
+                parent_session_id=session.parent_session_id,
+                causal_budget_id=session.causal_budget_id,
+                runtime_name=session.runtime_name,
+                runtime_version=session.runtime_version,
+                environment_name=session.environment_name,
+                status=session.status,
+                created_at=session.created_at,
+                updated_at=session.updated_at,
+                last_activity_at=session.last_activity_at,
+                run_epoch=session.run_epoch,
+                labels=labels,
+                label_count=label_count,
+                labels_truncated=labels_truncated,
             )
 
     async def update_status(self, session_id: str, status: SessionStatus) -> Session:
@@ -5179,9 +5448,17 @@ def _sort_sessions(sessions: list[Session], order_by: SessionOrder) -> list[Sess
         )
     if order_by == SessionOrder.UPDATED_AT_ASC:
         return sorted(sessions, key=lambda session: (session.updated_at, session.id))
+    if order_by == SessionOrder.UPDATED_AT_DESC:
+        return sorted(
+            sorted(sessions, key=lambda session: session.id),
+            key=lambda session: session.updated_at,
+            reverse=True,
+        )
+    if order_by == SessionOrder.LAST_ACTIVITY_AT_ASC:
+        return sorted(sessions, key=lambda session: (session.last_activity_at, session.id))
     return sorted(
         sorted(sessions, key=lambda session: session.id),
-        key=lambda session: session.updated_at,
+        key=lambda session: session.last_activity_at,
         reverse=True,
     )
 
@@ -5286,8 +5563,17 @@ def _active_unexpired_session_operation_id(
     return active_operation_id if expiry.astimezone(UTC) > now.astimezone(UTC) else None
 
 
-_DESCENDING_SESSION_ORDERS = frozenset({SessionOrder.CREATED_AT_DESC, SessionOrder.UPDATED_AT_DESC})
+_DESCENDING_SESSION_ORDERS = frozenset(
+    {
+        SessionOrder.CREATED_AT_DESC,
+        SessionOrder.UPDATED_AT_DESC,
+        SessionOrder.LAST_ACTIVITY_AT_DESC,
+    }
+)
 _CREATED_AT_ORDERS = frozenset({SessionOrder.CREATED_AT_ASC, SessionOrder.CREATED_AT_DESC})
+_LAST_ACTIVITY_AT_ORDERS = frozenset(
+    {SessionOrder.LAST_ACTIVITY_AT_ASC, SessionOrder.LAST_ACTIVITY_AT_DESC}
+)
 
 
 def session_order_is_descending(order_by: SessionOrder) -> bool:
@@ -5296,14 +5582,22 @@ def session_order_is_descending(order_by: SessionOrder) -> bool:
 
 def session_sort_column(order_by: SessionOrder) -> str:
     """The session column an order sorts by — the keyset cursor's primary key."""
-    return "created_at" if order_by in _CREATED_AT_ORDERS else "updated_at"
+    if order_by in _CREATED_AT_ORDERS:
+        return "created_at"
+    if order_by in _LAST_ACTIVITY_AT_ORDERS:
+        return "last_activity_at"
+    return "updated_at"
 
 
 def _session_sort_value(
     session: Session | PendingActionSession,
     order_by: SessionOrder,
 ) -> datetime:
-    return session.created_at if order_by in _CREATED_AT_ORDERS else session.updated_at
+    if order_by in _CREATED_AT_ORDERS:
+        return session.created_at
+    if order_by in _LAST_ACTIVITY_AT_ORDERS:
+        return session.last_activity_at if isinstance(session, Session) else session.updated_at
+    return session.updated_at
 
 
 def encode_session_cursor(

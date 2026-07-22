@@ -5,7 +5,8 @@ import json
 import logging
 import math
 import re
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -72,6 +73,7 @@ from cayu.runtime.sessions import (
     DELETE_BLOCKED_SESSION_STATUSES,
     MAX_PENDING_ACTION_RESULT_BYTES,
     MAX_PENDING_ACTION_TOOL_CALLS,
+    SESSION_INSPECTION_LABEL_LIMIT,
     SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
     CheckpointTransform,
     EnqueueSessionMessageRequest,
@@ -92,6 +94,7 @@ from cayu.runtime.sessions import (
     Session,
     SessionAggregateFilter,
     SessionIdentity,
+    SessionInspectionIdentity,
     SessionListResult,
     SessionMessageDeliveryBatch,
     SessionMessageQueueStatus,
@@ -1088,7 +1091,16 @@ async def _disable_prepared_statements(conn: Any) -> None:
     conn.prepare_threshold = None
 
 
-async def _acquire_schema_transaction_lock(conn: Any, cur: Any) -> None:
+async def _configure_store_connection(conn: Any) -> None:
+    await _disable_prepared_statements(conn)
+
+
+async def _acquire_schema_transaction_lock(
+    conn: Any,
+    cur: Any,
+    *,
+    read_only: bool = False,
+) -> None:
     """Acquire the schema lock without leaving a waiting transaction open.
 
     Concurrent index DDL holds the same key as a session advisory lock. A
@@ -1105,6 +1117,8 @@ async def _acquire_schema_transaction_lock(conn: Any, cur: Any) -> None:
         if row is not None and row[0] is True:
             return
         await conn.rollback()
+        if read_only:
+            await conn.execute("SET TRANSACTION READ ONLY")
         await asyncio.sleep(_SCHEMA_ADVISORY_LOCK_POLL_SECONDS)
 
 
@@ -1118,6 +1132,7 @@ class _PostgresStoreBase:
     """
 
     _min_required_revision = _POSTGRES_MIN_REQUIRED_REVISION
+    _supports_read_only = False
 
     def __init__(
         self,
@@ -1127,11 +1142,21 @@ class _PostgresStoreBase:
         min_size: int = 1,
         max_size: int = 8,
         schema_mode: schema.SchemaMode = schema.SchemaMode.VALIDATE,
+        read_only: bool = False,
     ) -> None:
         if not isinstance(schema_mode, schema.SchemaMode):
             raise TypeError("schema_mode must be a SchemaMode.")
+        if type(read_only) is not bool:
+            raise TypeError("read_only must be a bool.")
+        if read_only and not self._supports_read_only:
+            raise ValueError("read_only is only supported by PostgresSessionStore.")
+        if read_only and schema_mode is not schema.SchemaMode.VALIDATE:
+            raise ValueError("Read-only Postgres stores require schema_mode=VALIDATE.")
         self._schema_mode = schema_mode
+        self._read_only = read_only
         if pool is not None:
+            if read_only:
+                raise ValueError("read_only requires a store-owned Postgres connection pool.")
             if not isinstance(pool, AsyncConnectionPool):
                 raise TypeError("pool must be an AsyncConnectionPool.")
             self._pool = pool
@@ -1149,12 +1174,21 @@ class _PostgresStoreBase:
                 # Disable server-side prepared statements so the store works behind
                 # a transaction-pooling pgbouncer (e.g. Fly Managed Postgres), where
                 # prepared statements raise "prepared statement already exists".
-                configure=_disable_prepared_statements,
+                configure=_configure_store_connection,
             )
             self._owns_pool = True
         self._open_lock = asyncio.Lock()
         self._opened = False
         self._schema_ready = False
+
+    @asynccontextmanager
+    async def _connection(self) -> AsyncIterator[Any]:
+        async with self._pool.connection() as conn:
+            if self._read_only:
+                # Keep the guard in the same transaction as the store operation.
+                # Session defaults are not stable behind transaction-pooled PgBouncer.
+                await conn.execute("SET TRANSACTION READ ONLY")
+            yield conn
 
     async def ensure_schema(self) -> None:
         """Open the pool and reconcile the schema now (per ``schema_mode``).
@@ -1195,9 +1229,13 @@ class _PostgresStoreBase:
             await self._migrate_schema()
             return
 
-        async with self._pool.connection() as conn:
+        async with self._connection() as conn:
             async with conn.cursor() as cur:
-                await _acquire_schema_transaction_lock(conn, cur)
+                await _acquire_schema_transaction_lock(
+                    conn,
+                    cur,
+                    read_only=self._read_only,
+                )
                 if self._schema_mode is not schema.SchemaMode.VALIDATE:
                     await cur.execute(pg_support.MIGRATIONS_TABLE_DDL)
                 state = await self._read_schema_state(cur)
@@ -4064,6 +4102,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     """Postgres-backed session store for durable multi-tenant runtime state."""
 
     _min_required_revision = _POSTGRES_SESSION_MIN_REQUIRED_REVISION
+    _supports_read_only = True
 
     async def create(
         self,
@@ -4095,7 +4134,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         )
         if session.parent_session_id == session.id:
             raise ValueError("Session cannot be its own parent.")
-        async with self._pool.connection() as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     await cur.execute(
@@ -4146,7 +4185,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         )
 
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     source_session = _validate_session_fork_source(
@@ -4246,13 +4285,13 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     async def load(self, session_id: str) -> Session | None:
         session_id = require_clean_nonblank(session_id, "session_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             return await self._load(cur, session_id)
 
     async def load_state(self, session_id: str) -> SessionStateSnapshot | None:
         session_id = require_clean_nonblank(session_id, "session_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             await cur.execute(
                 """
                 SELECT id, status, updated_at, last_activity_at
@@ -4271,6 +4310,58 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 last_activity_at=pg_support.to_utc(row[3]),
             )
 
+    async def inspect_identity(self, session_id: str) -> SessionInspectionIdentity:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT id, agent_name, provider_name, model, parent_session_id,
+                       causal_budget_id, runtime_name, runtime_version, environment_name,
+                       status, created_at, updated_at, last_activity_at, run_epoch
+                FROM cayu_sessions
+                WHERE id = %s
+                """,
+                (session_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                raise KeyError(session_id)
+            await cur.execute(
+                """
+                SELECT key, value,
+                       (SELECT COUNT(*)
+                        FROM cayu_session_labels
+                        WHERE session_id = %s) AS label_count
+                FROM cayu_session_labels
+                WHERE session_id = %s
+                ORDER BY key COLLATE "C" ASC
+                LIMIT %s
+                """,
+                (session_id, session_id, SESSION_INSPECTION_LABEL_LIMIT),
+            )
+            label_rows = await cur.fetchall()
+            label_count = 0 if not label_rows else label_rows[0][2]
+            return SessionInspectionIdentity(
+                id=row[0],
+                agent_name=row[1],
+                provider_name=row[2],
+                model=row[3],
+                parent_session_id=row[4],
+                causal_budget_id=row[5],
+                runtime_name=row[6],
+                runtime_version=row[7],
+                environment_name=row[8],
+                status=SessionStatus(row[9]),
+                created_at=pg_support.to_utc(row[10]),
+                updated_at=pg_support.to_utc(row[11]),
+                last_activity_at=pg_support.to_utc(row[12]),
+                run_epoch=row[13],
+                labels={label_row[0]: label_row[1] for label_row in label_rows},
+                label_count=label_count,
+                labels_truncated=label_count > len(label_rows),
+            )
+
     async def update_status(self, session_id: str, status: SessionStatus) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
         if not isinstance(status, SessionStatus):
@@ -4287,7 +4378,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         await self._ensure_ready()
         updated_at = datetime.now(UTC)
         expected_run_epoch = _current_session_run_epoch(session_id)
-        async with self._pool.connection() as conn:
+        async with self._connection() as conn:
             async with conn.cursor() as cur:
                 if expected_run_epoch is None:
                     await cur.execute(
@@ -4320,7 +4411,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     async def delete_session(self, session_id: str) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     session = await self._load_for_update(cur, session_id)
@@ -4369,7 +4460,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         await self._ensure_ready()
         updated_at = datetime.now(UTC)
         expected_run_epoch = _current_session_run_epoch(session_id)
-        async with self._pool.connection() as conn:
+        async with self._connection() as conn:
             async with conn.cursor() as cur:
                 if expected_run_epoch is None:
                     await cur.execute(
@@ -4408,7 +4499,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         user_metadata = copy_session_user_metadata(metadata)
         await self._ensure_ready()
         updated_at = datetime.now(UTC)
-        async with self._pool.connection() as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     await cur.execute(
@@ -4447,7 +4538,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         await self._ensure_ready()
         updated_at = datetime.now(UTC)
         expected_run_epoch = _current_session_run_epoch(session_id)
-        async with self._pool.connection() as conn:
+        async with self._connection() as conn:
             async with conn.cursor() as cur:
                 params: list[object] = [
                     str(to_status),
@@ -4506,7 +4597,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             raise TypeError("checkpoint_transform is required.")
         await self._ensure_ready()
         updated_at = datetime.now(UTC)
-        async with self._pool.connection() as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     loaded = await self._load_for_update(cur, session_id)
@@ -4574,7 +4665,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             raise ValueError("to_status must be a SessionStatus.")
         await self._ensure_ready()
         updated_at = datetime.now(UTC)
-        async with self._pool.connection() as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     loaded = await self._load_for_update(cur, session_id)
@@ -4634,7 +4725,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             raise ValueError("inactive_before must be timezone-aware.")
         await self._ensure_ready()
         now = datetime.now(UTC)
-        async with self._pool.connection() as conn:
+        async with self._connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     """
@@ -4677,7 +4768,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             raise TypeError("checkpoint_transform is required.")
         await self._ensure_ready()
         updated_at = datetime.now(UTC)
-        async with self._pool.connection() as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     loaded = await self._load_for_update(cur, session_id)
@@ -4720,7 +4811,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             return
         await self._ensure_ready()
         try:
-            async with self._pool.connection() as conn:
+            async with self._connection() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(
                         "UPDATE cayu_sessions SET run_epoch = run_epoch + 1 "
@@ -4741,7 +4832,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
 
         await self._ensure_ready()
         expected_run_epoch = _current_session_run_epoch(session_id)
-        async with self._pool.connection() as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     # Reserve a contiguous block of per-session order values by
@@ -4887,7 +4978,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             raise ValueError("lease_seconds must be greater than 0.")
         claim_id = str(uuid4())
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     exact_filter = ""
@@ -4971,7 +5062,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         session_id = require_clean_nonblank(session_id, "session_id")
         event_id = require_clean_nonblank(event_id, "event_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             await cur.execute(
                 """
                 SELECT session_id, event_id, event_sequence, status, attempts,
@@ -5036,7 +5127,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         retry_delay_seconds: float | None,
     ) -> PersistedEventSideEffectDelivery:
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     await cur.execute(
@@ -5109,7 +5200,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         if selected_statuses == []:
             return []
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             clauses: list[str] = []
             params: list[Any] = []
             if after_sequence is not None:
@@ -5152,7 +5243,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
 
         request = copy_enqueue_session_message_request(request)
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     loaded = await self._load_for_update(cur, request.session_id)
@@ -5322,7 +5413,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         if type(limit) is not int or not 1 <= limit <= SESSION_MESSAGE_DELIVERY_BATCH_LIMIT:
             raise ValueError(f"limit must be between 1 and {SESSION_MESSAGE_DELIVERY_BATCH_LIMIT}.")
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     loaded = await self._load_for_update(cur, session_id)
@@ -5538,7 +5629,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         session_id = require_clean_nonblank(session_id, "session_id")
         idempotency_key = require_clean_nonblank(idempotency_key, "idempotency_key")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             await cur.execute(
                 "SELECT record FROM cayu_session_operations "
                 "WHERE session_id = %s AND idempotency_key = %s",
@@ -5603,7 +5694,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         )
         updated_at = datetime.now(UTC)
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     loaded = await self._load_for_update(cur, session_id)
@@ -5768,7 +5859,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     async def load_events(self, session_id: str) -> list[Event]:
         session_id = require_clean_nonblank(session_id, "session_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             await cur.execute(
                 "SELECT 1 FROM cayu_sessions WHERE id = %s",
                 (session_id,),
@@ -5792,7 +5883,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         if len(query.session_ids) > _EVENT_QUERY_SESSION_IDS_BATCH_SIZE:
             return await self._query_events_by_session_id_batches(query)
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             return await self._query_events(cur, query, safe_insert_xid=None)
 
     async def _query_events(
@@ -5850,7 +5941,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     async def _query_events_by_session_id_batches(self, query: EventQuery) -> list[EventRecord]:
         records: list[EventRecord] = []
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             safe_insert_xid = None
             needs_snapshot_cutoff = query.after_sequence is not None
             if needs_snapshot_cutoff:
@@ -5877,7 +5968,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     async def summarize_events(self, session_id: str) -> EventSummary:
         session_id = require_clean_nonblank(session_id, "session_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             await cur.execute("SELECT 1 FROM cayu_sessions WHERE id = %s", (session_id,))
             if await cur.fetchone() is None:
                 raise KeyError(f"Session not found: {session_id}")
@@ -5923,7 +6014,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     async def summarize_outcome(self, session_id: str) -> SessionOutcome:
         session_id = require_clean_nonblank(session_id, "session_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             session = await self._load(cur, session_id)
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
@@ -5994,7 +6085,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             dialect=_SQL_DIALECT,
         )
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
@@ -6037,7 +6128,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             dialect=_SQL_DIALECT,
         )
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
@@ -6339,7 +6430,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         """
 
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             # Candidate selection, byte accounting, projection reads, and labels all
             # observe one immutable snapshot. The look-ahead row is selected only
             # as bounded session metadata and never enters JSON projection work.
@@ -6591,7 +6682,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         plan = session_store_sql.build_session_query_sql(query, dialect=_SQL_DIALECT)
 
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             # Interpolations are trusted: SESSION_COLUMNS is a constant, order_sql is
             # an enum-derived literal, the clauses are hard-coded; values bind via %s.
             total_count: int | None = None
@@ -6645,7 +6736,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         session_id = require_clean_nonblank(session_id, "session_id")
         copied_messages = copy_transcript_messages(messages)
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with self._connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("SELECT 1 FROM cayu_sessions WHERE id = %s", (session_id,))
                 if await cur.fetchone() is None:
@@ -6676,7 +6767,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             raise TypeError("checkpoint_transform is required.")
         updated_at = datetime.now(UTC)
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     session = await self._load_for_update(cur, session_id)
@@ -6711,7 +6802,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     async def load_transcript(self, session_id: str) -> list[Message]:
         session_id = require_clean_nonblank(session_id, "session_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             await cur.execute("SELECT 1 FROM cayu_sessions WHERE id = %s", (session_id,))
             if await cur.fetchone() is None:
                 raise KeyError(f"Session not found: {session_id}")
@@ -6737,7 +6828,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         role_params: list[object] = [str(query.role)] if query.role is not None else []
 
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             await cur.execute("SELECT 1 FROM cayu_sessions WHERE id = %s", (query.session_id,))
             if await cur.fetchone() is None:
                 raise KeyError(f"Session not found: {query.session_id}")
@@ -6794,7 +6885,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         copied = copy_json_value(state, "checkpoint")
         updated_at = datetime.now(UTC)
         await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with self._connection() as conn:
             async with conn.cursor() as cur:
                 if await self._load_for_update(cur, session_id) is None:
                     raise KeyError(f"Session not found: {session_id}")
@@ -6812,7 +6903,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             raise TypeError("checkpoint_transform is required.")
         await self._ensure_ready()
         updated_at = datetime.now(UTC)
-        async with self._pool.connection() as conn:
+        async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     session = await self._load_for_update(cur, session_id)
@@ -6835,7 +6926,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     async def load_checkpoint(self, session_id: str) -> dict[str, Any] | None:
         session_id = require_clean_nonblank(session_id, "session_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             return await self._load_checkpoint(cur, session_id)
 
     async def load_interruption_cascade_marker(
@@ -6844,7 +6935,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     ) -> dict[str, Any] | None:
         session_id = require_clean_nonblank(session_id, "session_id")
         await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             await cur.execute(
                 """
                 WITH marker AS (
@@ -7006,7 +7097,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         session_id: str,
         event_ids: list[str],
     ) -> str | None:
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with self._connection() as conn, conn.cursor() as cur:
             for event_id in event_ids:
                 await cur.execute(
                     "SELECT 1 FROM cayu_events WHERE session_id = %s AND event_id = %s",

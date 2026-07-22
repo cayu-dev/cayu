@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
@@ -297,6 +298,19 @@ USAGE_BEARING_EVENT_TYPES: tuple[EventType, ...] = (
 )
 
 
+def project_usage_inspection_event(event: Event) -> Event:
+    """Retain only the bounded fields consumed by session usage inspection."""
+    payload: dict[str, Any] = {}
+    if event.type == EventType.MODEL_COMPLETED:
+        try:
+            metrics = usage_metrics_from_event_payload(event.payload)
+        except (TypeError, ValueError):
+            metrics = None
+        if metrics is not None:
+            payload["usage_metrics"] = metrics.model_dump(mode="json")
+    return event.model_copy(update={"payload": payload})
+
+
 def session_usage_summary(session_id: str, events: list[Event]) -> SessionUsageSummary:
     provider_names: list[str] = []
     models: list[str] = []
@@ -311,7 +325,10 @@ def session_usage_summary(session_id: str, events: list[Event]) -> SessionUsageS
         if event.type != EventType.MODEL_COMPLETED:
             continue
         model_steps += 1
-        metrics = usage_metrics_from_event_payload(event.payload)
+        try:
+            metrics = usage_metrics_from_event_payload(event.payload)
+        except (TypeError, ValueError):
+            metrics = None
         if metrics is None:
             continue
         usage = _add_usage(usage, metrics)
@@ -328,6 +345,21 @@ def session_usage_summary(session_id: str, events: list[Event]) -> SessionUsageS
         models=models,
         usage=usage,
     )
+
+
+def count_model_steps_with_usage(events: Iterable[Event]) -> int:
+    """Count durable model completions carrying valid normalized usage."""
+    count = 0
+    for event in events:
+        if event.type != EventType.MODEL_COMPLETED:
+            continue
+        try:
+            metrics = usage_metrics_from_event_payload(event.payload)
+        except (TypeError, ValueError):
+            continue
+        if metrics is not None:
+            count += 1
+    return count
 
 
 def causal_budget_usage_summary(

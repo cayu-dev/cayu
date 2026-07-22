@@ -27,6 +27,7 @@ from cayu.runtime.sessions import (
     DELETE_BLOCKED_SESSION_STATUSES,
     MAX_PENDING_ACTION_RESULT_BYTES,
     MAX_PENDING_ACTION_TOOL_CALLS,
+    SESSION_INSPECTION_LABEL_LIMIT,
     SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
     CheckpointTransform,
     EnqueueSessionMessageRequest,
@@ -47,6 +48,7 @@ from cayu.runtime.sessions import (
     Session,
     SessionAggregateFilter,
     SessionIdentity,
+    SessionInspectionIdentity,
     SessionListResult,
     SessionMessageDeliveryBatch,
     SessionMessageQueueStatus,
@@ -588,6 +590,7 @@ class SQLiteSessionStore(SessionStore):
         path: str | Path,
         *,
         schema_mode: schema.SchemaMode = schema.SchemaMode.CREATE,
+        read_only: bool = False,
     ) -> None:
         if isinstance(path, Path):
             db_path = path
@@ -597,18 +600,23 @@ class SQLiteSessionStore(SessionStore):
             raise TypeError("SQLiteSessionStore path must be a string or Path.")
         if not isinstance(schema_mode, schema.SchemaMode):
             raise TypeError("schema_mode must be a SchemaMode.")
+        if not isinstance(read_only, bool):
+            raise TypeError("read_only must be a bool.")
+        if read_only and schema_mode is not schema.SchemaMode.VALIDATE:
+            raise ValueError("read_only SQLite stores require schema_mode=validate.")
 
         self.path = db_path
         self._schema_mode = schema_mode
+        self._read_only = read_only
         self._lock = asyncio.Lock()
-        self._connection = self._connect(db_path)
+        self._connection = self._connect_read_only(db_path) if read_only else self._connect(db_path)
         self._initialize_schema()
         # Hot-path queries run on a dedicated read-only connection in worker
         # threads so the event loop never blocks on SQLite I/O and reads never
         # queue behind the writer connection's transactions. In-memory
         # databases are private to their connection, so they fall back to the
         # writer connection (and its lock).
-        if str(db_path) == ":memory:":
+        if read_only or str(db_path) == ":memory:":
             self._read_connection = self._connection
             self._read_lock = self._lock
         else:
@@ -871,6 +879,58 @@ class SQLiteSessionStore(SessionStore):
                 status=SessionStatus(row["status"]),
                 updated_at=sqlite_support.parse_datetime(row["updated_at"]),
                 last_activity_at=sqlite_support.parse_datetime(row["last_activity_at"]),
+            )
+
+        return await self._run_read(query)
+
+    async def inspect_identity(self, session_id: str) -> SessionInspectionIdentity:
+        session_id = require_clean_nonblank(session_id, "session_id")
+
+        def query(connection: sqlite3.Connection) -> SessionInspectionIdentity:
+            row = connection.execute(
+                """
+                SELECT id, agent_name, provider_name, model, parent_session_id,
+                       causal_budget_id, runtime_name, runtime_version, environment_name,
+                       status, created_at, updated_at, last_activity_at, run_epoch
+                FROM cayu_sessions
+                WHERE id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(session_id)
+            label_rows = connection.execute(
+                """
+                SELECT key, value,
+                       (SELECT COUNT(*)
+                        FROM cayu_session_labels
+                        WHERE session_id = ?) AS label_count
+                FROM cayu_session_labels
+                WHERE session_id = ?
+                ORDER BY key ASC
+                LIMIT ?
+                """,
+                (session_id, session_id, SESSION_INSPECTION_LABEL_LIMIT),
+            ).fetchall()
+            label_count = 0 if not label_rows else label_rows[0]["label_count"]
+            return SessionInspectionIdentity(
+                id=row["id"],
+                agent_name=row["agent_name"],
+                provider_name=row["provider_name"],
+                model=row["model"],
+                parent_session_id=row["parent_session_id"],
+                causal_budget_id=row["causal_budget_id"],
+                runtime_name=row["runtime_name"],
+                runtime_version=row["runtime_version"],
+                environment_name=row["environment_name"],
+                status=SessionStatus(row["status"]),
+                created_at=sqlite_support.parse_datetime(row["created_at"]),
+                updated_at=sqlite_support.parse_datetime(row["updated_at"]),
+                last_activity_at=sqlite_support.parse_datetime(row["last_activity_at"]),
+                run_epoch=row["run_epoch"],
+                labels={label_row["key"]: label_row["value"] for label_row in label_rows},
+                label_count=label_count,
+                labels_truncated=label_count > len(label_rows),
             )
 
         return await self._run_read(query)

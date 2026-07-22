@@ -31,7 +31,7 @@ def connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
     if str(path) == ":memory:":
         if read_only:
             raise ValueError("Read-only connections require a file-backed SQLite database.")
-    else:
+    elif not read_only:
         path.parent.mkdir(parents=True, exist_ok=True)
     if read_only:
         # A dedicated read-only connection lets queries run in worker threads
