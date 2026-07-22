@@ -226,6 +226,19 @@ async def _reopen_store(case, store: SessionStore) -> SessionStore:
     return _new_postgres_store(postgres_dsn)
 
 
+def test_session_store_conformance_declares_usage_aggregate_support(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            assert store.supports_usage_aggregates is True
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
 def test_session_store_conformance_preserves_only_safe_bedrock_aggregate_evidence(
     session_store_case,
 ) -> None:

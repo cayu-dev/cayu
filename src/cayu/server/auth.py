@@ -18,6 +18,8 @@ from cayu._validation import (
     require_unicode_scalar_text,
 )
 
+AUTH_IDENTITY_MAX_CHARS = 512
+
 
 class AuthContext(BaseModel):
     """Authenticated caller identity and operator-action provenance.
@@ -30,9 +32,13 @@ class AuthContext(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    subject: str = Field(description="Verified identity of the authenticated caller.")
+    subject: str = Field(
+        max_length=AUTH_IDENTITY_MAX_CHARS,
+        description="Verified identity of the authenticated caller.",
+    )
     tenant: str | None = Field(
         default=None,
+        max_length=AUTH_IDENTITY_MAX_CHARS,
         description=(
             "Optional verified tenant identity for actor provenance only. It is not a "
             "storage partition, authorization rule, row-level filter, or tenant-isolation "
@@ -47,14 +53,16 @@ class AuthContext(BaseModel):
     @field_validator("subject")
     @classmethod
     def validate_subject(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        value = require_clean_nonblank(value, info.field_name)
+        return require_unicode_scalar_text(value, info.field_name)
 
     @field_validator("tenant")
     @classmethod
     def validate_tenant(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
-        return require_clean_nonblank(value, info.field_name)
+        value = require_clean_nonblank(value, info.field_name)
+        return require_unicode_scalar_text(value, info.field_name)
 
     @field_validator("claims", mode="before")
     @classmethod
@@ -169,7 +177,12 @@ class BasicAuth:
 
 def _require_basic_auth_text(value: str, field_name: str) -> str:
     value = require_clean_nonblank(value, field_name)
-    return require_unicode_scalar_text(value, field_name)
+    value = require_unicode_scalar_text(value, field_name)
+    if field_name in {"username", "subject", "tenant"} and len(value) > AUTH_IDENTITY_MAX_CHARS:
+        raise ValueError(
+            f"`{field_name}` must contain at most {AUTH_IDENTITY_MAX_CHARS} characters."
+        )
+    return value
 
 
 def _require_basic_auth_username(value: str) -> str:

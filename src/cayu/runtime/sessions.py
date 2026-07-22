@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 from uuid import uuid4
 from weakref import ReferenceType, ref
 
@@ -2136,6 +2136,14 @@ class SessionStore(ABC):
     clearing task-local ownership so inherited child contexts cannot write late.
     """
 
+    supports_usage_aggregates: ClassVar[bool] = False
+    """Whether ``aggregate_usage`` is implemented for control-plane reads.
+
+    Custom stores that implement the optional aggregate contract must opt in
+    explicitly. The conservative default keeps capability discovery truthful
+    for existing stores whose inherited method raises ``NotImplementedError``.
+    """
+
     @abstractmethod
     async def create(
         self,
@@ -2682,6 +2690,8 @@ class SessionStore(ABC):
 
 class InMemorySessionStore(SessionStore):
     """In-process session store for tests, local development, and examples."""
+
+    supports_usage_aggregates: ClassVar[bool] = True
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()

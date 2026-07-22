@@ -1314,6 +1314,22 @@ export type CacheUsageMetrics = {
 };
 
 /**
+ * CapabilityOperation
+ *
+ * Availability of one control-plane read or mutation operation.
+ */
+export type CapabilityOperation = {
+    /**
+     * Enabled
+     */
+    enabled: boolean;
+    /**
+     * Unavailable Reason
+     */
+    unavailable_reason?: 'not_configured' | 'unsupported' | null;
+};
+
+/**
  * CausalBudgetCostSummary
  *
  * Estimated cost for all sessions sharing one causal budget id.
@@ -1486,6 +1502,52 @@ export type ContextualPricingRequirement = {
      * Requires Cache Write Ttls
      */
     requires_cache_write_ttls?: boolean;
+};
+
+/**
+ * ControlPlaneCapabilities
+ *
+ * Server-authoritative discovery metadata for the Cayu control plane.
+ *
+ * This projection is presentation metadata rather than an authorization
+ * token. Every underlying route continues to enforce its configured access
+ * dependency and runtime preconditions.
+ */
+export type ControlPlaneCapabilities = {
+    actor: ServerContractActor | null;
+    /**
+     * Cayu Version
+     */
+    cayu_version: string | null;
+    /**
+     * Configured Store Roles
+     */
+    configured_store_roles: Array<'session' | 'task' | 'knowledge' | 'artifact'>;
+    mutations: ControlPlaneMutationCapabilities;
+    surfaces: ControlPlaneSurfaceCapabilities;
+};
+
+/**
+ * ControlPlaneMutationCapabilities
+ */
+export type ControlPlaneMutationCapabilities = {
+    knowledge_review: CapabilityOperation;
+    pending_action_resolution: CapabilityOperation;
+    session_annotations: CapabilityOperation;
+    session_execution: CapabilityOperation;
+    session_interruption: CapabilityOperation;
+    task_lifecycle: CapabilityOperation;
+};
+
+/**
+ * ControlPlaneSurfaceCapabilities
+ */
+export type ControlPlaneSurfaceCapabilities = {
+    artifacts: OptionalSurfaceCapability;
+    dashboard: OptionalSurfaceCapability;
+    pricing: OptionalSurfaceCapability;
+    reviewed_knowledge: OptionalSurfaceCapability;
+    tasks: OptionalSurfaceCapability;
 };
 
 /**
@@ -1825,6 +1887,20 @@ export type OperationalSnapshotResponse = {
      */
     task_snapshot_status: 'available' | 'not_requested' | 'not_configured' | 'unsupported';
     tasks: TaskOperationalSnapshot | null;
+};
+
+/**
+ * OptionalSurfaceCapability
+ *
+ * Configuration and operation availability for one optional surface.
+ */
+export type OptionalSurfaceCapability = {
+    /**
+     * Configured
+     */
+    configured: boolean;
+    mutate: CapabilityOperation;
+    read: CapabilityOperation;
 };
 
 /**
@@ -2350,6 +2426,22 @@ export type RunLimits = {
 };
 
 /**
+ * ServerContractActor
+ *
+ * Bounded actor projection that deliberately excludes arbitrary claims.
+ */
+export type ServerContractActor = {
+    /**
+     * Subject
+     */
+    subject: string;
+    /**
+     * Tenant
+     */
+    tenant?: string | null;
+};
+
+/**
  * ServerContractResponse
  */
 export type ServerContractResponse = {
@@ -2357,6 +2449,7 @@ export type ServerContractResponse = {
      * Api Prefix
      */
     api_prefix?: string;
+    capabilities: ControlPlaneCapabilities;
     client_generation?: ClientGenerationContract;
     /**
      * Contract Version

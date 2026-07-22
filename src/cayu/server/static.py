@@ -85,6 +85,12 @@ class DashboardStaticFiles(StaticFiles):
             field_name="dashboard_config",
         )
 
+    @property
+    def dashboard_pricing_configured(self) -> bool:
+        """Whether the resolved browser configuration carries a default price book."""
+
+        return self._dashboard_config.get("priceBook") is not None
+
     async def get_response(self, path: str, scope: Scope):
         if _is_excluded_path(path, self._excluded_api_path):
             raise HTTPException(status_code=404)

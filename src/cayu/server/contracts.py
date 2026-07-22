@@ -439,6 +439,78 @@ class ClientGenerationContract(ApiBaseModel):
     source_of_truth: Literal["openapi"] = "openapi"
 
 
+CapabilityUnavailableReason = Literal["not_configured", "unsupported"]
+ConfiguredStoreRole = Literal["session", "task", "knowledge", "artifact"]
+
+
+class CapabilityOperation(ApiBaseModel):
+    """Availability of one control-plane read or mutation operation."""
+
+    enabled: StrictBool
+    unavailable_reason: CapabilityUnavailableReason | None = None
+
+    @model_validator(mode="after")
+    def validate_reason(self) -> CapabilityOperation:
+        if self.enabled and self.unavailable_reason is not None:
+            raise ValueError("Enabled capability operations cannot have an unavailable reason.")
+        if not self.enabled and self.unavailable_reason is None:
+            raise ValueError("Disabled capability operations require an unavailable reason.")
+        return self
+
+
+class OptionalSurfaceCapability(ApiBaseModel):
+    """Configuration and operation availability for one optional surface."""
+
+    configured: StrictBool
+    read: CapabilityOperation
+    mutate: CapabilityOperation
+
+    @model_validator(mode="after")
+    def validate_configuration(self) -> OptionalSurfaceCapability:
+        if not self.configured and (self.read.enabled or self.mutate.enabled):
+            raise ValueError("Unconfigured surfaces cannot expose enabled operations.")
+        return self
+
+
+class ControlPlaneSurfaceCapabilities(ApiBaseModel):
+    dashboard: OptionalSurfaceCapability
+    tasks: OptionalSurfaceCapability
+    reviewed_knowledge: OptionalSurfaceCapability
+    artifacts: OptionalSurfaceCapability
+    pricing: OptionalSurfaceCapability
+
+
+class ControlPlaneMutationCapabilities(ApiBaseModel):
+    session_execution: CapabilityOperation
+    session_interruption: CapabilityOperation
+    pending_action_resolution: CapabilityOperation
+    session_annotations: CapabilityOperation
+    task_lifecycle: CapabilityOperation
+    knowledge_review: CapabilityOperation
+
+
+class ServerContractActor(ApiBaseModel):
+    """Bounded actor projection that deliberately excludes arbitrary claims."""
+
+    subject: str = Field(max_length=512)
+    tenant: str | None = Field(default=None, max_length=512)
+
+
+class ControlPlaneCapabilities(ApiBaseModel):
+    """Server-authoritative discovery metadata for the Cayu control plane.
+
+    This projection is presentation metadata rather than an authorization
+    token. Every underlying route continues to enforce its configured access
+    dependency and runtime preconditions.
+    """
+
+    cayu_version: str | None = Field(max_length=128)
+    configured_store_roles: tuple[ConfiguredStoreRole, ...] = Field(max_length=4)
+    actor: ServerContractActor | None
+    surfaces: ControlPlaneSurfaceCapabilities
+    mutations: ControlPlaneMutationCapabilities
+
+
 class VersioningContract(ApiBaseModel):
     contract_version: str = SERVER_CONTRACT_VERSION
     compatibility: Literal["additive-with-explicit-breaking-review"] = (
@@ -456,6 +528,7 @@ class ServerContractResponse(ApiBaseModel):
     versioning: VersioningContract = Field(default_factory=VersioningContract)
     sse: SseContract = Field(default_factory=SseContract)
     client_generation: ClientGenerationContract = Field(default_factory=ClientGenerationContract)
+    capabilities: ControlPlaneCapabilities
 
 
 class ApiEventRecord(ApiBaseModel):

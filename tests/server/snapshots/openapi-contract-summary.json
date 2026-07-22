@@ -2461,6 +2461,36 @@
       "title": "CacheUsageMetrics",
       "type": "object"
     },
+    "CapabilityOperation": {
+      "additionalProperties": false,
+      "description": "Availability of one control-plane read or mutation operation.",
+      "properties": {
+        "enabled": {
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "not_configured",
+                "unsupported"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Unavailable Reason"
+        }
+      },
+      "required": [
+        "enabled"
+      ],
+      "title": "CapabilityOperation",
+      "type": "object"
+    },
     "CausalBudgetCostSummary": {
       "additionalProperties": false,
       "description": "Estimated cost for all sessions sharing one causal budget id.",
@@ -2760,6 +2790,125 @@
         "dimensions"
       ],
       "title": "ContextualPricingRequirement",
+      "type": "object"
+    },
+    "ControlPlaneCapabilities": {
+      "additionalProperties": false,
+      "description": "Server-authoritative discovery metadata for the Cayu control plane.\n\nThis projection is presentation metadata rather than an authorization\ntoken. Every underlying route continues to enforce its configured access\ndependency and runtime preconditions.",
+      "properties": {
+        "actor": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/ServerContractActor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cayu_version": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Cayu Version"
+        },
+        "configured_store_roles": {
+          "items": {
+            "enum": [
+              "session",
+              "task",
+              "knowledge",
+              "artifact"
+            ],
+            "type": "string"
+          },
+          "maxItems": 4,
+          "title": "Configured Store Roles",
+          "type": "array"
+        },
+        "mutations": {
+          "$ref": "#/components/schemas/ControlPlaneMutationCapabilities"
+        },
+        "surfaces": {
+          "$ref": "#/components/schemas/ControlPlaneSurfaceCapabilities"
+        }
+      },
+      "required": [
+        "cayu_version",
+        "configured_store_roles",
+        "actor",
+        "surfaces",
+        "mutations"
+      ],
+      "title": "ControlPlaneCapabilities",
+      "type": "object"
+    },
+    "ControlPlaneMutationCapabilities": {
+      "additionalProperties": false,
+      "properties": {
+        "knowledge_review": {
+          "$ref": "#/components/schemas/CapabilityOperation"
+        },
+        "pending_action_resolution": {
+          "$ref": "#/components/schemas/CapabilityOperation"
+        },
+        "session_annotations": {
+          "$ref": "#/components/schemas/CapabilityOperation"
+        },
+        "session_execution": {
+          "$ref": "#/components/schemas/CapabilityOperation"
+        },
+        "session_interruption": {
+          "$ref": "#/components/schemas/CapabilityOperation"
+        },
+        "task_lifecycle": {
+          "$ref": "#/components/schemas/CapabilityOperation"
+        }
+      },
+      "required": [
+        "session_execution",
+        "session_interruption",
+        "pending_action_resolution",
+        "session_annotations",
+        "task_lifecycle",
+        "knowledge_review"
+      ],
+      "title": "ControlPlaneMutationCapabilities",
+      "type": "object"
+    },
+    "ControlPlaneSurfaceCapabilities": {
+      "additionalProperties": false,
+      "properties": {
+        "artifacts": {
+          "$ref": "#/components/schemas/OptionalSurfaceCapability"
+        },
+        "dashboard": {
+          "$ref": "#/components/schemas/OptionalSurfaceCapability"
+        },
+        "pricing": {
+          "$ref": "#/components/schemas/OptionalSurfaceCapability"
+        },
+        "reviewed_knowledge": {
+          "$ref": "#/components/schemas/OptionalSurfaceCapability"
+        },
+        "tasks": {
+          "$ref": "#/components/schemas/OptionalSurfaceCapability"
+        }
+      },
+      "required": [
+        "dashboard",
+        "tasks",
+        "reviewed_knowledge",
+        "artifacts",
+        "pricing"
+      ],
+      "title": "ControlPlaneSurfaceCapabilities",
       "type": "object"
     },
     "CostLineItem": {
@@ -3433,6 +3582,29 @@
         "tasks"
       ],
       "title": "OperationalSnapshotResponse",
+      "type": "object"
+    },
+    "OptionalSurfaceCapability": {
+      "additionalProperties": false,
+      "description": "Configuration and operation availability for one optional surface.",
+      "properties": {
+        "configured": {
+          "title": "Configured",
+          "type": "boolean"
+        },
+        "mutate": {
+          "$ref": "#/components/schemas/CapabilityOperation"
+        },
+        "read": {
+          "$ref": "#/components/schemas/CapabilityOperation"
+        }
+      },
+      "required": [
+        "configured",
+        "read",
+        "mutate"
+      ],
+      "title": "OptionalSurfaceCapability",
       "type": "object"
     },
     "PendingActionKind": {
@@ -4400,6 +4572,34 @@
       "title": "RunLimits",
       "type": "object"
     },
+    "ServerContractActor": {
+      "additionalProperties": false,
+      "description": "Bounded actor projection that deliberately excludes arbitrary claims.",
+      "properties": {
+        "subject": {
+          "maxLength": 512,
+          "title": "Subject",
+          "type": "string"
+        },
+        "tenant": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tenant"
+        }
+      },
+      "required": [
+        "subject"
+      ],
+      "title": "ServerContractActor",
+      "type": "object"
+    },
     "ServerContractResponse": {
       "additionalProperties": false,
       "properties": {
@@ -4407,6 +4607,9 @@
           "default": "/api",
           "title": "Api Prefix",
           "type": "string"
+        },
+        "capabilities": {
+          "$ref": "#/components/schemas/ControlPlaneCapabilities"
         },
         "client_generation": {
           "$ref": "#/components/schemas/ClientGenerationContract"
@@ -4423,6 +4626,9 @@
           "$ref": "#/components/schemas/VersioningContract"
         }
       },
+      "required": [
+        "capabilities"
+      ],
       "title": "ServerContractResponse",
       "type": "object"
     },

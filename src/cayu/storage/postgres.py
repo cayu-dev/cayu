@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
-from typing import Any, LiteralString, cast
+from typing import Any, ClassVar, LiteralString, cast
 from uuid import uuid4
 
 try:
@@ -4101,6 +4101,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
 class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     """Postgres-backed session store for durable multi-tenant runtime state."""
 
+    supports_usage_aggregates: ClassVar[bool] = True
     _min_required_revision = _POSTGRES_SESSION_MIN_REQUIRED_REVISION
     _supports_read_only = True
 

@@ -8,7 +8,7 @@ import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import Any, ClassVar, TypeVar, cast
 from uuid import uuid4
 
 from cayu._validation import (
@@ -584,6 +584,8 @@ def _queued_session_message_from_row(row: sqlite3.Row) -> SessionQueuedMessage:
 
 class SQLiteSessionStore(SessionStore):
     """SQLite-backed session store for durable local runtime state."""
+
+    supports_usage_aggregates: ClassVar[bool] = True
 
     def __init__(
         self,

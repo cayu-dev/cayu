@@ -1224,7 +1224,9 @@ def test_server_control_plane_inventory_redacts_configured_secrets(tmp_path) -> 
     )
 
 
-def test_server_artifact_inventory_rejects_duplicate_store_ids(tmp_path) -> None:
+def test_server_artifact_inventory_remains_usable_after_duplicate_store_rejection(
+    tmp_path,
+) -> None:
     app = CayuApp()
     first_store = LocalArtifactStore(tmp_path / "first", store_id="duplicate-store")
     second_store = LocalArtifactStore(tmp_path / "second", store_id="duplicate-store")
@@ -1232,9 +1234,11 @@ def test_server_artifact_inventory_rejects_duplicate_store_ids(tmp_path) -> None
         Environment(EnvironmentSpec(name="first"), artifact_store=first_store),
         default=True,
     )
-    app.register_environment(
-        Environment(EnvironmentSpec(name="second"), artifact_store=second_store),
-    )
+    with pytest.raises(ValueError, match="different registered store: duplicate-store"):
+        app.register_environment(
+            Environment(EnvironmentSpec(name="second"), artifact_store=second_store),
+            default=True,
+        )
     asyncio.run(
         first_store.put_bytes(
             b"first",
@@ -1244,20 +1248,16 @@ def test_server_artifact_inventory_rejects_duplicate_store_ids(tmp_path) -> None
             environment_name="first",
         )
     )
-    asyncio.run(
-        second_store.put_bytes(
-            b"second",
-            filename="second.txt",
-            content_type="text/plain",
-            scope=ArtifactScope.ENVIRONMENT,
-            environment_name="second",
-        )
-    )
 
-    response = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG)).get("/api/artifacts")
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+    capabilities = client.get("/api/contract").json()["capabilities"]
+    response = client.get("/api/artifacts")
 
-    assert response.status_code == 409
-    assert "duplicate-store" in response.json()["detail"]
+    assert app.list_environments() == ("first",)
+    assert app.get_environment().spec.name == "first"
+    assert capabilities["surfaces"]["artifacts"]["read"]["enabled"] is True
+    assert response.status_code == 200
+    assert [artifact["filename"] for artifact in response.json()["artifacts"]] == ["first.txt"]
 
 
 def test_server_artifact_inventory_paginates_across_registered_stores(tmp_path) -> None:
@@ -2634,6 +2634,8 @@ def test_server_rejects_price_books_and_resolution_work_above_rollup_bounds() ->
 
 def test_server_aggregate_routes_reject_invalid_windows_and_unsupported_stores() -> None:
     class UnsupportedAggregateStore(InMemorySessionStore):
+        supports_usage_aggregates = False
+
         async def aggregate_operational_snapshot(self, filters=None):
             raise NotImplementedError
 
@@ -2642,10 +2644,18 @@ def test_server_aggregate_routes_reject_invalid_windows_and_unsupported_stores()
 
     client = TestClient(
         create_server(
-            CayuApp(session_store=UnsupportedAggregateStore()), config=_LOCAL_SERVER_CONFIG
+            CayuApp(session_store=UnsupportedAggregateStore()),
+            config=ServerConfig.local_development(
+                dashboard=DashboardConfig(runtime_config={"priceBook": _price_book_payload()})
+            ),
         )
     )
     assert client.post("/api/operations/snapshot", json={}).status_code == 501
+    assert client.get("/api/contract").json()["capabilities"]["surfaces"]["pricing"] == {
+        "configured": True,
+        "read": {"enabled": False, "unavailable_reason": "unsupported"},
+        "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
+    }
     unsupported_usage = client.post(
         "/api/usage/rollup",
         json={

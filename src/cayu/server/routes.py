@@ -113,6 +113,7 @@ from cayu.runtime.usage import (
     usage_metrics_from_event_payload,
 )
 from cayu.runtime.user_input import UserInputRecoveryRequest, UserInputResponse
+from cayu.server._capabilities import inspect_control_plane_capabilities
 from cayu.server.auth import AuthContext, AuthDependency, server_auth_dependency
 from cayu.server.config import normalize_api_path
 from cayu.server.contracts import (
@@ -1847,6 +1848,8 @@ def create_router(
     api_path: str = SERVER_API_PREFIX,
     openapi_url: str | None = "/openapi.json",
     replay_idle_timeout_s: float = 300.0,
+    dashboard_configured: bool = False,
+    dashboard_pricing_configured: bool = False,
 ) -> APIRouter:
     """Create an APIRouter with standard cayu endpoints.
 
@@ -1866,6 +1869,12 @@ def create_router(
             client generation. Pass ``None`` when generated OpenAPI is disabled.
         replay_idle_timeout_s: Maximum time an active replay stream may wait
             without seeing a new persisted event before emitting an error and closing.
+        dashboard_pricing_configured: Whether resolved dashboard configuration
+            supplies a default price book for cost estimation. This is discovery
+            metadata only; the usage endpoint still validates every submitted
+            price book.
+        dashboard_configured: Whether the bundled dashboard is mounted. Its own
+            configured access dependency remains authoritative.
     """
 
     if (
@@ -1880,6 +1889,13 @@ def create_router(
     api_prefix = normalize_api_path(api_path, field_name="api_path")
     router = APIRouter(prefix=api_prefix)
     auth_context_openapi_schema = AuthContext.model_json_schema()
+    capability_snapshot = inspect_control_plane_capabilities(
+        dashboard_configured=dashboard_configured,
+        tasks_configured=task_store is not None,
+        knowledge_configured=knowledge_store is not None,
+        dashboard_pricing_configured=dashboard_pricing_configured,
+        session_usage_aggregates_supported=session_store.supports_usage_aggregates,
+    )
 
     # Shared dependency list for control-plane routes. FastAPI treats an empty
     # sequence like no dependencies, so `auth=None` keeps explicit open access.
@@ -1948,18 +1964,26 @@ def create_router(
     @router.get(
         "/contract",
         response_model=ServerContractResponse,
-        dependencies=protected,
         description=(
             "Return the versioned Cayu server contract. Authentication controls access "
             "to protected routes, but AuthContext.tenant is actor provenance only and "
-            "does not filter or isolate Cayu data."
+            "does not filter or isolate Cayu data. Capability metadata supports "
+            "presentation and discovery only; route enforcement remains authoritative."
         ),
         openapi_extra={"x-cayu-auth-context": auth_context_openapi_schema},
     )
-    async def get_contract():
+    async def get_contract(
+        response: Response,
+        auth_context: AuthContext | None = optional_auth_context,
+    ):
+        response.headers["Cache-Control"] = "private, no-store"
         return ServerContractResponse(
             api_prefix=api_prefix,
             client_generation=ClientGenerationContract(openapi_url=openapi_url),
+            capabilities=capability_snapshot.project(
+                auth_context,
+                artifacts_configured=cayu_app.has_registered_artifact_store(),
+            ),
         )
 
     @router.post(

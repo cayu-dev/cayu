@@ -418,6 +418,12 @@ Streaming consumers should buffer assistant text deltas when structured output i
 
 Creates sessions, stores events, stores provider-neutral transcripts, and checkpoints runtime state.
 
+Usage aggregation is an optional store capability. The base
+`SessionStore.aggregate_usage(...)` raises `NotImplementedError`, and
+`supports_usage_aggregates` defaults to `False` so servers do not advertise an
+unusable usage surface. Custom stores that fully implement the bounded usage
+aggregate contract must explicitly set `supports_usage_aggregates = True`.
+
 Checkpoint field updates that can race with runtime finalization use `transform_checkpoint(...)`; transcript repair uses `append_transcript_messages_and_transform_checkpoint(...)` when it must update both atomically. Built-in stores execute those transforms while holding their session/checkpoint write boundary (a process-local lock for the in-memory store, an immediate write transaction for SQLite, and a row lock for PostgreSQL). Interruption-aware checkpoint replacements explicitly take the current `pending_session_interrupt` and `pending_interruption_cascade` values—including their absence—from that transactional snapshot, so an older runtime snapshot can neither erase active interruption state nor resurrect cleared state.
 
 ### Durable session steering
@@ -1589,6 +1595,48 @@ control-plane routes against a server reporting a different contract version.
 The exported aggregate models parse that canonical JSON representation back to
 Python integers, while direct Python construction remains strict and does not
 accept string counters.
+
+The protected `GET /api/contract` response also carries the server-authoritative
+control-plane capability projection. It reports whether Tasks, reviewed
+Knowledge, registered artifact storage, and dashboard pricing are configured,
+with separate read and mutation availability and stable `not_configured` or
+`unsupported` reasons. Dashboard mounting is reported independently from its
+access policy. Framework mutation families—including session execution,
+interruption, annotations, pending-action resolution, task lifecycle, and
+knowledge review—are reported separately so the dashboard can suppress controls
+that cannot work. The fixed
+`configured_store_roles` list names only Cayu roles (`session`, `task`,
+`knowledge`, and `artifact`); it never exposes implementation classes, module
+names, object representations, paths, or connection details. Under authenticated
+access, `actor` contains only the verified subject and optional tenant. Arbitrary
+authentication claims are deliberately excluded.
+Because the response may contain caller identity, it is returned with
+`Cache-Control: private, no-store`.
+
+Authentication identity has the same explicit bound before it reaches this
+projection or durable operator provenance: `AuthContext.subject` and
+`AuthContext.tenant`, plus the `BasicAuth` `username`, `subject`, and `tenant`
+identity fields, accept at most 512 Unicode characters. Prerelease migration:
+custom authentication dependencies that currently return longer values must
+switch to stable bounded identifiers before upgrading. Do not truncate values
+in a way that can create identity collisions; keep additional authorization
+context in validated claims or application-owned state.
+
+Capabilities are discovery and presentation metadata, not authorization. Every
+route continues to run its configured authentication dependency and enforce its
+own runtime preconditions. Custom request-aware authentication may still reject
+an operation even when the operation is structurally enabled. The `pricing`
+surface is configured when the bundled dashboard received a default price book;
+its read operation is enabled only when the configured `SessionStore` also
+declares `supports_usage_aggregates = True`. Custom stores inherit a conservative
+`False` default and must opt in after implementing the bounded aggregate
+contract. Callers of the usage endpoint may still submit a validated bounded
+price book directly when that read operation is supported; the configured flag
+specifically describes the dashboard's catalog. Dashboard configuration
+validates a non-null `priceBook` against those same usage-request bounds before
+mounting, so the capability cannot advertise a catalog that the dashboard's
+aggregate request would reject.
+
 Aggregate session filters accept at most 50 exact labels, 25 label-selector
 clauses, and 100 values across those selectors, preventing a request body from
 expanding into an unbounded database predicate.
@@ -2794,6 +2842,11 @@ external sandbox boundary.
 Uploaded/generated file reference boundary. Artifacts are not the active project filesystem. They are durable file blobs with metadata, content type, size, creation time, and explicit scope.
 
 `LocalArtifactStore` is available for local filesystem-backed artifact storage. It stores each artifact as content plus JSON metadata under one root. Local artifact ids use the exact generated form `art_` followed by 32 lowercase hexadecimal characters; malformed ids are rejected before filesystem access. The store pins the initialized root directory identity and anchors operations to a validated root directory descriptor where the platform supports directory-relative access. Replacing the configured root path, including with a symlink or Windows reparse point, makes the store unavailable rather than redirecting artifact I/O. Stored artifact directories, metadata, and content must be regular filesystem entries rather than symbolic links. Session-scoped artifacts require `session_id`; environment-scoped artifacts require `environment_name`. `read_file(artifact_id=...)` enforces that the artifact belongs to the current session or current environment before exposing content to the model.
+
+An `ArtifactStore.id` is a stable identity for the lifetime of the store. Within
+one `CayuApp`, distinct store instances must use distinct ids; registration
+rejects a conflicting environment before changing application state. Multiple
+environments may intentionally share the same store instance and id.
 
 Configure an artifact store on the environment when the agent should inspect uploaded/generated artifacts or workspace PDFs/images:
 

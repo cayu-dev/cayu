@@ -45908,6 +45908,72 @@ def test_cayu_app_rejects_duplicate_environment_and_factory_names(tmp_path):
         app.register_environment(Environment(EnvironmentSpec(name="dynamic")))
 
 
+@pytest.mark.parametrize("first_kind", ["concrete", "factory"])
+@pytest.mark.parametrize("conflicting_kind", ["concrete", "factory"])
+def test_cayu_app_rejects_conflicting_artifact_store_ids_atomically(
+    first_kind: str,
+    conflicting_kind: str,
+    tmp_path,
+):
+    app = CayuApp()
+    first_store = LocalArtifactStore(tmp_path / "first", store_id="shared-id")
+    conflicting_store = LocalArtifactStore(tmp_path / "second", store_id="shared-id")
+
+    def register(kind: str, name: str, store: LocalArtifactStore, *, default: bool):
+        if kind == "concrete":
+            app.register_environment(
+                Environment(EnvironmentSpec(name=name), artifact_store=store),
+                default=default,
+            )
+            return None
+        factory = RecordingEnvironmentFactory(
+            Environment(EnvironmentSpec(name=name), artifact_store=store)
+        )
+        app.register_environment_factory(
+            EnvironmentSpec(name=name),
+            factory,
+            artifact_store=store,
+            default=default,
+        )
+        return factory
+
+    first_factory = register(first_kind, "first", first_store, default=True)
+
+    with pytest.raises(ValueError, match="different registered store: shared-id"):
+        register(conflicting_kind, "conflicting", conflicting_store, default=True)
+
+    assert app.list_environments() == ("first",)
+    assert app.has_registered_artifact_store() is True
+    if first_kind == "concrete":
+        assert app.get_environment().spec.name == "first"
+    else:
+        assert app.get_environment_factory() is first_factory
+
+    register("concrete", "shared", first_store, default=False)
+    assert app.list_environments() == ("first", "shared")
+
+
+def test_cayu_app_allows_one_artifact_store_instance_in_multiple_environments(tmp_path):
+    app = CayuApp()
+    shared_store = LocalArtifactStore(tmp_path / "shared", store_id="shared-id")
+    app.register_environment(
+        Environment(EnvironmentSpec(name="concrete"), artifact_store=shared_store),
+        default=True,
+    )
+    factory = RecordingEnvironmentFactory(
+        Environment(EnvironmentSpec(name="factory"), artifact_store=shared_store)
+    )
+
+    app.register_environment_factory(
+        EnvironmentSpec(name="factory"),
+        factory,
+        artifact_store=shared_store,
+    )
+
+    assert app.list_environments() == ("concrete", "factory")
+    assert app.has_registered_artifact_store() is True
+
+
 def test_cayu_app_rejects_environment_factory_lookup_for_static_environment():
     app = CayuApp()
     app.register_environment(Environment(EnvironmentSpec(name="local")), default=True)

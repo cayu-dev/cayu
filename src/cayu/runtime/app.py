@@ -18,6 +18,7 @@ from cayu._validation import (
     copy_label_map,
     require_clean_nonblank,
     require_nonblank,
+    require_unicode_scalar_text,
 )
 from cayu.artifacts import (
     DEFAULT_MAX_FILE_ATTACHMENT_BYTES,
@@ -514,6 +515,7 @@ class CayuApp:
         self._agents: dict[str, runtime_records.RegisteredAgentState] = {}
         self._providers: dict[str, runtime_records.RegisteredProvider] = {}
         self._environments: dict[str, runtime_records.RegisteredEnvironment] = {}
+        self._artifact_stores_by_id: dict[str, ArtifactStore] = {}
         self._default_provider_name: str | None = None
         self._default_environment_name: str | None = None
         self._session_control = SessionControl[SessionUsageTracker](
@@ -789,6 +791,8 @@ class CayuApp:
         stored_spec = _validate_environment_spec(stored_environment.spec)
         if stored_spec.name in self._environments:
             raise ValueError(f"Environment already registered: {stored_spec.name}")
+        artifact_store = stored_environment.artifact_store
+        artifact_store_id = self._validate_artifact_store_registration(artifact_store)
 
         registration_source, registration_symbol = _registration_site()
         self._environments[stored_spec.name] = runtime_records.RegisteredEnvironment(
@@ -797,6 +801,8 @@ class CayuApp:
             registration_source=registration_source,
             registration_symbol=registration_symbol,
         )
+        if artifact_store_id is not None and artifact_store is not None:
+            self._artifact_stores_by_id[artifact_store_id] = artifact_store
         self._select_default_environment_if_requested(stored_spec.name, default=default)
         return environment
 
@@ -817,17 +823,40 @@ class CayuApp:
         stored_spec = _validate_environment_spec(spec)
         if stored_spec.name in self._environments:
             raise ValueError(f"Environment already registered: {stored_spec.name}")
+        stored_environment = Environment(stored_spec, artifact_store=artifact_store)
+        artifact_store_id = self._validate_artifact_store_registration(artifact_store)
 
         registration_source, registration_symbol = _registration_site()
         self._environments[stored_spec.name] = runtime_records.RegisteredEnvironment(
             spec=stored_spec,
-            environment=Environment(stored_spec, artifact_store=artifact_store),
+            environment=stored_environment,
             factory=factory,
             registration_source=registration_source,
             registration_symbol=registration_symbol,
         )
+        if artifact_store_id is not None and artifact_store is not None:
+            self._artifact_stores_by_id[artifact_store_id] = artifact_store
         self._select_default_environment_if_requested(stored_spec.name, default=default)
         return factory
+
+    def _validate_artifact_store_registration(
+        self,
+        artifact_store: ArtifactStore | None,
+    ) -> str | None:
+        if artifact_store is None:
+            return None
+        artifact_store_id = require_clean_nonblank(artifact_store.id, "artifact_store.id")
+        artifact_store_id = require_unicode_scalar_text(
+            artifact_store_id,
+            "artifact_store.id",
+        )
+        registered_store = self._artifact_stores_by_id.get(artifact_store_id)
+        if registered_store is not None and registered_store is not artifact_store:
+            raise ValueError(
+                "Artifact store id already belongs to a different registered store: "
+                f"{artifact_store_id}"
+            )
+        return artifact_store_id
 
     def _select_default_environment_if_requested(
         self,
@@ -859,6 +888,15 @@ class CayuApp:
     def list_environments(self) -> tuple[str, ...]:
         """Return the names of all registered environments (concrete or factory), sorted."""
         return tuple(sorted(self._environments))
+
+    def has_registered_artifact_store(self) -> bool:
+        """Return whether any registered environment exposes artifact storage.
+
+        The registration paths maintain this value, so the check is constant-time
+        and does not copy registration metadata or materialize environment factories.
+        """
+
+        return bool(self._artifact_stores_by_id)
 
     def list_environment_registrations(self) -> tuple[runtime_records.RegisteredEnvironment, ...]:
         """Return registered environment metadata without materializing factories."""

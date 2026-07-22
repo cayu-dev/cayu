@@ -11,7 +11,7 @@ pytest.importorskip("sse_starlette")
 from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 
-from cayu import CayuApp
+from cayu import CayuApp, default_price_book
 from cayu.runtime.sessions import SessionStatus
 from cayu.server import (
     AuthenticatedAccess,
@@ -754,8 +754,16 @@ def test_mount_cayu_accepts_explicit_open_or_authenticated_access() -> None:
     from fastapi import FastAPI
 
     open_server = FastAPI()
-    mount_cayu(open_server, CayuApp(), path="/control", access=OpenAccess())
+    mount_cayu(
+        open_server,
+        CayuApp(),
+        path="/control",
+        access=OpenAccess(),
+        dashboard_config={"priceBook": default_price_book()},
+    )
     assert TestClient(open_server).get("/control/api/health").status_code == 200
+    open_contract = TestClient(open_server).get("/control/api/contract").json()
+    assert open_contract["capabilities"]["surfaces"]["pricing"]["configured"] is True
 
     protected_server = FastAPI()
     mount_cayu(

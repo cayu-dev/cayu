@@ -124,6 +124,12 @@ _ALLOWED_FASTAPI_OPTIONS = frozenset(
 )
 
 
+def _dashboard_pricing_configured(runtime_config: Mapping[str, Any]) -> bool:
+    """Return whether the resolved dashboard has a default pricing catalog."""
+
+    return runtime_config.get("priceBook") is not None
+
+
 def create_server(
     app: CayuApp,
     *,
@@ -251,6 +257,11 @@ def create_server(
             api_path=control_plane_path,
             openapi_url=server.openapi_url,
             replay_idle_timeout_s=lifecycle.replay_idle_timeout_s,
+            dashboard_configured=resolved_config.dashboard.enabled,
+            dashboard_pricing_configured=(
+                resolved_config.dashboard.enabled
+                and _dashboard_pricing_configured(resolved_config.dashboard.runtime_config)
+            ),
         )
         server.include_router(router)
 
@@ -384,6 +395,10 @@ def mount_cayu(
         api_path=api_path,
         openapi_url=getattr(server, "openapi_url", None),
         replay_idle_timeout_s=replay_idle_timeout_s,
+        dashboard_configured=dashboard,
+        dashboard_pricing_configured=(
+            prepared_dashboard is not None and prepared_dashboard[1].dashboard_pricing_configured
+        ),
     )
 
     # All caller-controlled values and route construction are validated before

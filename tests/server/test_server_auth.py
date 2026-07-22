@@ -436,6 +436,35 @@ def test_basic_auth_rejects_username_delimiter_and_non_scalar_claims() -> None:
         )
 
 
+@pytest.mark.parametrize("field_name", ["subject", "tenant"])
+def test_auth_context_bounds_identity_used_by_contract_and_audit_events(field_name: str) -> None:
+    values = {"subject": "operator"}
+    values[field_name] = "a" * 513
+
+    with pytest.raises(ValueError, match="at most 512 characters"):
+        AuthContext(**values)
+
+
+@pytest.mark.parametrize("field_name", ["subject", "tenant"])
+def test_auth_context_rejects_non_scalar_actor_identity(field_name: str) -> None:
+    values = {"subject": "operator"}
+    values[field_name] = f"bad{chr(0xD800)}identity"
+
+    with pytest.raises(ValueError):
+        AuthContext(**values)
+
+
+@pytest.mark.parametrize("field_name", ["username", "subject", "tenant"])
+def test_basic_auth_rejects_oversized_actor_identity_at_configuration_time(
+    field_name: str,
+) -> None:
+    values = {"username": "operator", "password": "secret-password"}
+    values[field_name] = "a" * 513
+
+    with pytest.raises(ValueError, match="at most 512 characters"):
+        BasicAuth(**values)
+
+
 def test_basic_auth_dependency_authenticates_dashboard_shell() -> None:
     app = CayuApp(task_store=InMemoryTaskStore())
     app.register_provider(OneShotProvider(), default=True)

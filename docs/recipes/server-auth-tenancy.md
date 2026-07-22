@@ -13,6 +13,12 @@ dependency may return:
 AuthContext(subject="user-123", tenant="org-456", claims={"role": "member"})
 ```
 
+`subject` and `tenant` are stable identity fields and each accepts at most 512
+Unicode characters. Custom authentication dependencies upgrading from an
+earlier prerelease must map longer external identities to collision-resistant
+bounded identifiers rather than silently truncating them. `BasicAuth` applies
+the same limit to `username`, explicit `subject`, and `tenant`.
+
 The `tenant` value is useful operator provenance. Cayu stamps verified identity
 into durable evidence for approvals, interruptions, recovery, user-input
 resolution, session compaction, and message enqueue. It does **not** scope

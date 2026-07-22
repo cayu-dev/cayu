@@ -11,10 +11,28 @@ pytest.importorskip("sse_starlette")
 
 from fastapi.testclient import TestClient
 
-from cayu import CayuApp
+from cayu import (
+    CayuApp,
+    Environment,
+    EnvironmentFactory,
+    EnvironmentFactoryRequest,
+    EnvironmentFactoryResult,
+    EnvironmentSpec,
+    InMemoryKnowledgeStore,
+    InMemoryTaskStore,
+    LocalArtifactStore,
+    default_price_book,
+)
 from cayu.core.events import EVENT_ID_MAX_CHARS, Event, EventType
-from cayu.server import AuthContext, ServerApiConfig, ServerConfig, create_server
-from cayu.server.contracts import SSE_LAST_EVENT_ID_FORMAT
+from cayu.runtime import InMemorySessionStore
+from cayu.server import (
+    AuthContext,
+    DashboardConfig,
+    ServerApiConfig,
+    ServerConfig,
+    create_server,
+)
+from cayu.server.contracts import SSE_LAST_EVENT_ID_FORMAT, CapabilityOperation
 from cayu.server.sse import (
     SSE_ERROR_SESSION_ID_MAX_BYTES,
     SSE_ERROR_TEXT_MAX_BYTES,
@@ -41,6 +59,12 @@ _STREAMING_ROUTES = {
     "/api/user-input/resolve",
     "/api/user-input/recover",
 }
+
+
+class _UncalledEnvironmentFactory(EnvironmentFactory):
+    async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
+        del request
+        raise AssertionError("Capability discovery must not materialize environment factories.")
 
 
 def _client() -> TestClient:
@@ -150,6 +174,254 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
         "supported_targets": ["typescript", "python"],
         "source_of_truth": "openapi",
     }
+    assert body["capabilities"]["configured_store_roles"] == ["session"]
+    assert body["capabilities"]["actor"] is None
+    assert body["capabilities"]["surfaces"] == {
+        "dashboard": {
+            "configured": True,
+            "read": {"enabled": True, "unavailable_reason": None},
+            "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
+        },
+        "tasks": {
+            "configured": False,
+            "read": {"enabled": False, "unavailable_reason": "not_configured"},
+            "mutate": {"enabled": False, "unavailable_reason": "not_configured"},
+        },
+        "reviewed_knowledge": {
+            "configured": False,
+            "read": {"enabled": False, "unavailable_reason": "not_configured"},
+            "mutate": {"enabled": False, "unavailable_reason": "not_configured"},
+        },
+        "artifacts": {
+            "configured": False,
+            "read": {"enabled": False, "unavailable_reason": "not_configured"},
+            "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
+        },
+        "pricing": {
+            "configured": False,
+            "read": {"enabled": False, "unavailable_reason": "not_configured"},
+            "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
+        },
+    }
+    assert body["capabilities"]["mutations"] == {
+        "session_execution": {"enabled": True, "unavailable_reason": None},
+        "session_interruption": {"enabled": True, "unavailable_reason": None},
+        "pending_action_resolution": {"enabled": True, "unavailable_reason": None},
+        "session_annotations": {"enabled": True, "unavailable_reason": None},
+        "task_lifecycle": {"enabled": False, "unavailable_reason": "not_configured"},
+        "knowledge_review": {"enabled": False, "unavailable_reason": "not_configured"},
+    }
+
+
+def test_contract_reports_configured_optional_capabilities_and_redacted_actor(tmp_path) -> None:
+    artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="contract-artifacts")
+    app = CayuApp(
+        task_store=InMemoryTaskStore(),
+        knowledge_store=InMemoryKnowledgeStore(),
+    )
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="contract-environment"),
+            artifact_store=artifact_store,
+        )
+    )
+
+    auth_calls = 0
+
+    def authenticate(_request) -> AuthContext:
+        nonlocal auth_calls
+        auth_calls += 1
+        return AuthContext(
+            subject="operator-a",
+            tenant="tenant-a",
+            claims={"credential": "must-not-appear"},
+        )
+
+    client = TestClient(
+        create_server(
+            app,
+            config=ServerConfig.protected(
+                authenticate,
+                dashboard=DashboardConfig(
+                    runtime_config={
+                        "priceBook": default_price_book(),
+                        "privateToken": "dashboard-secret-must-not-appear",
+                    }
+                ),
+            ),
+        )
+    )
+
+    response = client.get("/api/contract")
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "private, no-store"
+    assert auth_calls == 1
+    capabilities = response.json()["capabilities"]
+    assert capabilities["configured_store_roles"] == [
+        "session",
+        "task",
+        "knowledge",
+        "artifact",
+    ]
+    assert capabilities["actor"] == {"subject": "operator-a", "tenant": "tenant-a"}
+    assert "must-not-appear" not in response.text
+    for surface in capabilities["surfaces"].values():
+        assert surface["configured"] is True
+        assert surface["read"] == {"enabled": True, "unavailable_reason": None}
+    assert capabilities["surfaces"]["artifacts"]["mutate"] == {
+        "enabled": False,
+        "unavailable_reason": "unsupported",
+    }
+    assert capabilities["surfaces"]["pricing"]["mutate"] == {
+        "enabled": False,
+        "unavailable_reason": "unsupported",
+    }
+    assert capabilities["mutations"]["task_lifecycle"]["enabled"] is True
+    assert capabilities["mutations"]["knowledge_review"]["enabled"] is True
+
+
+@pytest.mark.parametrize("registration_kind", ["concrete", "factory"])
+def test_contract_reflects_artifact_store_registered_after_server_construction(
+    registration_kind: str,
+    tmp_path,
+) -> None:
+    app = CayuApp()
+    client = TestClient(create_server(app, config=ServerConfig.local_development()))
+    artifact_store = LocalArtifactStore(
+        tmp_path / registration_kind,
+        store_id=f"late-{registration_kind}-artifacts",
+    )
+
+    before = client.get("/api/contract").json()["capabilities"]
+    assert before["surfaces"]["artifacts"]["configured"] is False
+    assert before["configured_store_roles"] == ["session"]
+
+    if registration_kind == "concrete":
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="late-concrete-environment"),
+                artifact_store=artifact_store,
+            )
+        )
+    else:
+        app.register_environment_factory(
+            EnvironmentSpec(name="late-factory-environment"),
+            _UncalledEnvironmentFactory(),
+            artifact_store=artifact_store,
+        )
+
+    after = client.get("/api/contract").json()["capabilities"]
+    assert after["surfaces"]["artifacts"] == {
+        "configured": True,
+        "read": {"enabled": True, "unavailable_reason": None},
+        "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
+    }
+    assert after["configured_store_roles"] == ["session", "artifact"]
+
+
+@pytest.mark.parametrize(
+    "configured_feature", ["tasks", "reviewed_knowledge", "artifacts", "pricing"]
+)
+def test_contract_keeps_optional_capability_combinations_independent(
+    configured_feature: str,
+    tmp_path,
+) -> None:
+    app = CayuApp(
+        task_store=InMemoryTaskStore() if configured_feature == "tasks" else None,
+        knowledge_store=(
+            InMemoryKnowledgeStore() if configured_feature == "reviewed_knowledge" else None
+        ),
+    )
+    if configured_feature == "artifacts":
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="artifact-environment"),
+                artifact_store=LocalArtifactStore(
+                    tmp_path / "artifacts",
+                    store_id="independent-artifacts",
+                ),
+            )
+        )
+    dashboard = DashboardConfig(
+        runtime_config=(
+            {"priceBook": default_price_book()} if configured_feature == "pricing" else {}
+        )
+    )
+
+    capabilities = (
+        TestClient(
+            create_server(
+                app,
+                config=ServerConfig.local_development(dashboard=dashboard),
+            )
+        )
+        .get("/api/contract")
+        .json()["capabilities"]
+    )
+
+    optional_surface_names = {"tasks", "reviewed_knowledge", "artifacts", "pricing"}
+    configured_surfaces = {
+        name
+        for name, capability in capabilities["surfaces"].items()
+        if name in optional_surface_names and capability["configured"]
+    }
+    assert configured_surfaces == {configured_feature}
+    expected_roles = {
+        "tasks": ["session", "task"],
+        "reviewed_knowledge": ["session", "knowledge"],
+        "artifacts": ["session", "artifact"],
+        "pricing": ["session"],
+    }
+    assert capabilities["configured_store_roles"] == expected_roles[configured_feature]
+    assert capabilities["mutations"]["task_lifecycle"]["enabled"] is (configured_feature == "tasks")
+    assert capabilities["mutations"]["knowledge_review"]["enabled"] is (
+        configured_feature == "reviewed_knowledge"
+    )
+
+
+def test_contract_reports_disabled_dashboard_without_inventing_pricing_availability() -> None:
+    client = TestClient(
+        create_server(
+            CayuApp(),
+            config=ServerConfig.local_development(
+                dashboard=DashboardConfig(
+                    enabled=False,
+                    runtime_config={"priceBook": default_price_book()},
+                )
+            ),
+        )
+    )
+
+    surfaces = client.get("/api/contract").json()["capabilities"]["surfaces"]
+
+    assert surfaces["dashboard"] == {
+        "configured": False,
+        "read": {"enabled": False, "unavailable_reason": "not_configured"},
+        "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
+    }
+    assert surfaces["pricing"]["configured"] is False
+
+
+def test_contract_rejects_an_invalid_session_store_capability_declaration() -> None:
+    class InvalidCapabilityStore(InMemorySessionStore):
+        supports_usage_aggregates = "yes"  # type: ignore[assignment]
+
+    with pytest.raises(
+        TypeError,
+        match="session_usage_aggregates_supported must be a bool",
+    ):
+        create_server(
+            CayuApp(session_store=InvalidCapabilityStore()),
+            config=ServerConfig.local_development(),
+        )
+
+
+def test_capability_operation_rejects_inconsistent_availability() -> None:
+    with pytest.raises(ValueError, match="cannot have an unavailable reason"):
+        CapabilityOperation(enabled=True, unavailable_reason="unsupported")
+    with pytest.raises(ValueError, match="require an unavailable reason"):
+        CapabilityOperation(enabled=False)
 
 
 def test_openapi_declares_auth_tenant_as_provenance_only() -> None:
