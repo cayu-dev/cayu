@@ -43,6 +43,42 @@ export type AggregateAccuracy = {
 export type AggregateAccuracyKind = 'exact' | 'sampled' | 'truncated';
 
 /**
+ * AggregateCacheUsageMetrics
+ *
+ * Lossless JSON projection of identity-free aggregate cache counters.
+ */
+export type AggregateCacheUsageMetrics = {
+    /**
+     * Cached Input Tokens
+     */
+    cached_input_tokens: string;
+    /**
+     * Read Tokens
+     */
+    read_tokens: string;
+    /**
+     * Uncached Input Tokens
+     */
+    uncached_input_tokens: string;
+    /**
+     * Write 1H Tokens
+     */
+    write_1h_tokens: string;
+    /**
+     * Write 5M Tokens
+     */
+    write_5m_tokens: string;
+    /**
+     * Write Tokens
+     */
+    write_tokens: string;
+    /**
+     * Write Unknown Ttl Tokens
+     */
+    write_unknown_ttl_tokens: string;
+};
+
+/**
  * AggregateCostSummary
  */
 export type AggregateCostSummary = {
@@ -82,6 +118,31 @@ export type AggregateCostSummary = {
      * Unpriced Model Steps
      */
     unpriced_model_steps: number;
+};
+
+/**
+ * AggregateUsageMetrics
+ *
+ * Lossless JSON projection of identity-free aggregate token counters.
+ */
+export type AggregateUsageMetrics = {
+    cache: AggregateCacheUsageMetrics;
+    /**
+     * Input Tokens
+     */
+    input_tokens: string;
+    /**
+     * Output Tokens
+     */
+    output_tokens: string;
+    /**
+     * Reasoning Output Tokens
+     */
+    reasoning_output_tokens: string;
+    /**
+     * Total Tokens
+     */
+    total_tokens: string;
 };
 
 /**
@@ -2419,7 +2480,7 @@ export type SessionOperationalSnapshot = {
     /**
      * Total Count
      */
-    total_count: number;
+    total_count: string;
 };
 
 /**
@@ -2467,27 +2528,27 @@ export type SessionStatusCounts = {
     /**
      * Completed
      */
-    completed: number;
+    completed: string;
     /**
      * Failed
      */
-    failed: number;
+    failed: string;
     /**
      * Interrupted
      */
-    interrupted: number;
+    interrupted: string;
     /**
      * Interrupting
      */
-    interrupting: number;
+    interrupting: string;
     /**
      * Pending
      */
-    pending: number;
+    pending: string;
     /**
      * Running
      */
-    running: number;
+    running: string;
 };
 
 /**
@@ -2843,7 +2904,7 @@ export type TaskOperationalSnapshot = {
     /**
      * Total Count
      */
-    total_count: number;
+    total_count: string;
 };
 
 /**
@@ -2865,39 +2926,39 @@ export type TaskStatusCounts = {
     /**
      * Blocked
      */
-    blocked: number;
+    blocked: string;
     /**
      * Cancelled
      */
-    cancelled: number;
+    cancelled: string;
     /**
      * Claimed
      */
-    claimed: number;
+    claimed: string;
     /**
      * Completed
      */
-    completed: number;
+    completed: string;
     /**
      * Failed
      */
-    failed: number;
+    failed: string;
     /**
      * Needs Attention
      */
-    needs_attention: number;
+    needs_attention: string;
     /**
      * Paused
      */
-    paused: number;
+    paused: string;
     /**
      * Pending
      */
-    pending: number;
+    pending: string;
     /**
      * Running
      */
-    running: number;
+    running: string;
 };
 
 /**
@@ -3235,7 +3296,7 @@ export type UsageAggregateRemainder = {
     /**
      * Group Count
      */
-    group_count: number;
+    group_count: string;
     totals: UsageAggregateTotals;
 };
 
@@ -3248,20 +3309,127 @@ export type UsageAggregateTotals = {
     /**
      * Model Steps
      */
-    model_steps: number;
+    model_steps: string;
     /**
      * Model Steps With Usage
      */
-    model_steps_with_usage: number;
+    model_steps_with_usage: string;
     /**
      * Session Count
      */
-    session_count: number;
+    session_count: string;
     /**
      * Tool Calls
      */
-    tool_calls: number;
-    usage: UsageMetrics;
+    tool_calls: string;
+    usage: AggregateUsageMetrics;
+};
+
+/**
+ * UsageBillingCostBreakdown
+ *
+ * Bounded identity detail for evaluated cost inputs, with an exact remainder.
+ */
+export type UsageBillingCostBreakdown = {
+    accuracy: AggregateAccuracy;
+    /**
+     * Groups
+     */
+    groups: Array<UsageBillingCostGroup>;
+    /**
+     * Identified Model Steps
+     */
+    identified_model_steps: string;
+    remainder: UsageBillingCostRemainder | null;
+};
+
+/**
+ * UsageBillingCostGroup
+ *
+ * One bounded, identity-bearing group of equivalent pricing outcomes.
+ */
+export type UsageBillingCostGroup = {
+    billing_identity: UsageBillingIdentity;
+    /**
+     * Currency
+     */
+    currency?: string | null;
+    /**
+     * Missing Pricing Reason
+     */
+    missing_pricing_reason?: string | null;
+    /**
+     * Model Steps
+     */
+    model_steps: string;
+    /**
+     * Priced
+     */
+    priced: boolean;
+    /**
+     * Pricing Model
+     */
+    pricing_model?: string | null;
+    /**
+     * Pricing Provider Name
+     */
+    pricing_provider_name?: string | null;
+    /**
+     * Total Cost
+     */
+    total_cost: string;
+};
+
+/**
+ * UsageBillingCostRemainder
+ *
+ * Exact counts for identity-bearing pricing groups omitted from bounded detail.
+ */
+export type UsageBillingCostRemainder = {
+    /**
+     * Group Count
+     */
+    group_count: string;
+    /**
+     * Model Steps
+     */
+    model_steps: string;
+    /**
+     * Priced Model Steps
+     */
+    priced_model_steps: string;
+    /**
+     * Unpriced Model Steps
+     */
+    unpriced_model_steps: string;
+};
+
+/**
+ * UsageBillingIdentity
+ *
+ * Bounded commercial identity safe to return in an aggregate response.
+ */
+export type UsageBillingIdentity = {
+    /**
+     * Completion Evidence
+     */
+    completion_evidence?: {
+        [key: string]: string;
+    };
+    /**
+     * Provider Name
+     */
+    provider_name: string;
+    /**
+     * Request Evidence
+     */
+    request_evidence?: {
+        [key: string]: string;
+    };
+    /**
+     * Resource Id
+     */
+    resource_id: string;
 };
 
 /**
@@ -3294,6 +3462,7 @@ export type UsageBreakdownItem = {
  */
 export type UsageCostRollup = {
     accuracy: AggregateAccuracy;
+    billing_breakdown: UsageBillingCostBreakdown;
     /**
      * Currencies
      */
@@ -3301,7 +3470,7 @@ export type UsageCostRollup = {
     /**
      * Evaluated Model Steps
      */
-    evaluated_model_steps: number;
+    evaluated_model_steps: string;
     /**
      * Price Book Generated At
      */
@@ -3313,15 +3482,15 @@ export type UsageCostRollup = {
     /**
      * Priced Model Steps
      */
-    priced_model_steps: number;
+    priced_model_steps: string;
     /**
      * Unevaluated Model Steps
      */
-    unevaluated_model_steps: number;
+    unevaluated_model_steps: string;
     /**
      * Unpriced Model Steps
      */
-    unpriced_model_steps: number;
+    unpriced_model_steps: string;
     /**
      * Unpriced Reasons
      */
@@ -3341,7 +3510,7 @@ export type UsageCurrencyCost = {
     /**
      * Model Steps
      */
-    model_steps: number;
+    model_steps: string;
     /**
      * Total Cost
      */
@@ -3396,6 +3565,8 @@ export type UsageRollupRequest = {
     end_at: string;
     /**
      * Group Limit
+     *
+     * Maximum returned groups, applied independently to provider, model, and billing identity breakdowns. Omitted groups are represented by an explicit remainder.
      */
     group_limit?: number;
     /**
@@ -3421,7 +3592,7 @@ export type UsageRollupResponse = {
     /**
      * Active Session Count
      */
-    active_session_count: number;
+    active_session_count: string;
     /**
      * As Of
      */
@@ -3438,7 +3609,7 @@ export type UsageRollupResponse = {
     /**
      * Matching Session Count
      */
-    matching_session_count: number;
+    matching_session_count: string;
     model_breakdown: UsageAggregateBreakdown;
     provider_breakdown: UsageAggregateBreakdown;
     /**
@@ -3469,7 +3640,7 @@ export type UsageUnpricedReason = {
     /**
      * Model Steps
      */
-    model_steps: number;
+    model_steps: string;
     /**
      * Reason
      */

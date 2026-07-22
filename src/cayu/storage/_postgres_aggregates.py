@@ -4,6 +4,8 @@ from datetime import UTC, datetime
 from typing import Any, LiteralString, cast
 
 from cayu.runtime.aggregates import (
+    _BEDROCK_AGGREGATE_COMPLETION_EVIDENCE,
+    _BEDROCK_AGGREGATE_REQUEST_EVIDENCE,
     AGGREGATE_IDENTITY_TRIM_CHARACTERS,
     EXACT_AGGREGATE,
     MAX_AGGREGATE_USAGE_COUNTER,
@@ -292,8 +294,8 @@ FROM model_remainder
 
 _PRICING_INPUT_SQL = """
 WITH
-scope(max_input_bytes) AS (
-    SELECT %s::bigint
+scope(max_input_bytes, identity_trim) AS (
+    SELECT %s::bigint, %s::text
 ),
 matched_sessions AS MATERIALIZED (
     SELECT id
@@ -303,27 +305,8 @@ matched_sessions AS MATERIALIZED (
 pricing_candidates AS (
     SELECT
         (event.timestamp AT TIME ZONE 'UTC')::date AS effective_on,
-        CASE
-            WHEN jsonb_typeof(event.payload -> 'usage_metrics') = 'object'
-            THEN CASE
-                WHEN jsonb_typeof(
-                    event.payload #> '{{usage_metrics,billing_identity}}'
-                ) = 'object'
-                THEN jsonb_set(
-                    event.payload -> 'usage_metrics',
-                    '{{billing_identity}}',
-                    (event.payload #> '{{usage_metrics,billing_identity}}')
-                        - 'request_evidence' - 'completion_evidence',
-                    false
-                )
-                ELSE event.payload -> 'usage_metrics'
-            END
-        END AS usage_metrics,
-        CASE
-            WHEN jsonb_typeof(event.payload -> 'billing_identity') = 'object'
-            THEN (event.payload -> 'billing_identity')
-                 - 'request_evidence' - 'completion_evidence'
-        END AS billing_identity
+        {usage_metrics_projection} AS usage_metrics,
+        {billing_identity_projection} AS billing_identity
     FROM cayu_events AS event
     JOIN matched_sessions AS session ON session.id = event.session_id
     WHERE event.timestamp >= %s::timestamptz
@@ -481,15 +464,109 @@ def pricing_input_statement(
     if type(max_input_bytes) is not int or max_input_bytes < 1:
         raise ValueError("max_input_bytes must be a positive integer.")
     return (
-        _PRICING_INPUT_SQL.format(session_where_sql=session_plan.filter_where_sql),
+        _PRICING_INPUT_SQL.format(
+            session_where_sql=session_plan.filter_where_sql,
+            usage_metrics_projection=_postgres_usage_metrics_projection(),
+            billing_identity_projection=_postgres_billing_identity_projection(
+                ("billing_identity",)
+            ),
+        ),
         (
             max_input_bytes,
+            AGGREGATE_IDENTITY_TRIM_CHARACTERS,
             *session_plan.filter_params,
             query.start_at,
             query.end_at,
             MAX_USAGE_PRICING_RAW_CANDIDATES,
         ),
     )
+
+
+def _postgres_usage_metrics_projection() -> str:
+    metrics_path = ("usage_metrics",)
+    identity_path = (*metrics_path, "billing_identity")
+    metrics = f"event.payload #> {_postgres_json_path(metrics_path)}"
+    identity = _postgres_billing_identity_projection(identity_path)
+    return f"""
+        CASE
+            WHEN jsonb_typeof({metrics}) = 'object'
+            THEN CASE
+                WHEN jsonb_typeof(
+                    event.payload #> {_postgres_json_path(identity_path)}
+                ) = 'object'
+                THEN jsonb_set(
+                    {metrics},
+                    '{{billing_identity}}',
+                    {identity},
+                    false
+                )
+                ELSE {metrics}
+            END
+        END
+    """.strip()
+
+
+def _postgres_billing_identity_projection(identity_path: tuple[str, ...]) -> str:
+    identity = f"(event.payload #> {_postgres_json_path(identity_path)})"
+    request_evidence = _postgres_text_evidence_projection(
+        (*identity_path, "request_evidence"),
+        _BEDROCK_AGGREGATE_REQUEST_EVIDENCE,
+    )
+    completion_evidence = _postgres_text_evidence_projection(
+        (*identity_path, "completion_evidence"),
+        _BEDROCK_AGGREGATE_COMPLETION_EVIDENCE,
+    )
+    provider_path = _postgres_json_path((*identity_path, "provider_name"))
+    return f"""
+        CASE
+            WHEN jsonb_typeof({identity}) = 'object'
+            THEN CASE
+                WHEN event.payload #>> {provider_path} = 'bedrock'
+                THEN ({identity} - 'request_evidence' - 'completion_evidence')
+                     || jsonb_strip_nulls(
+                         jsonb_build_object(
+                             'request_evidence', NULLIF(
+                                 {request_evidence},
+                                 '{{}}'::jsonb
+                             ),
+                             'completion_evidence', NULLIF(
+                                 {completion_evidence},
+                                 '{{}}'::jsonb
+                             )
+                         )
+                     )
+                ELSE {identity} - 'request_evidence' - 'completion_evidence'
+            END
+        END
+    """.strip()
+
+
+def _postgres_text_evidence_projection(
+    evidence_path: tuple[str, ...],
+    fields: tuple[str, ...],
+) -> str:
+    entries: list[str] = []
+    for field in fields:
+        path = _postgres_json_path((*evidence_path, field))
+        value = f"event.payload #>> {path}"
+        entries.append(
+            f"""
+                '{field}', CASE
+                    WHEN jsonb_typeof(event.payload #> {path}) = 'string'
+                     AND {value} <> ''
+                     AND btrim(
+                         {value},
+                         (SELECT identity_trim FROM scope)
+                     ) = {value}
+                    THEN event.payload #> {path}
+                END
+            """.strip()
+        )
+    return f"jsonb_strip_nulls(jsonb_build_object({', '.join(entries)}))"
+
+
+def _postgres_json_path(parts: tuple[str, ...]) -> str:
+    return "'{" + ",".join(parts) + "}'"
 
 
 def _nonnegative_json_integer(path: str) -> str:

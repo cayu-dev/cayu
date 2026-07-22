@@ -889,8 +889,15 @@ class ModelStepCostEstimate(BaseModel):
     currency: str | None = None
     total_cost: Decimal = Field(ge=0)
     missing_pricing_reason: str | None = None
+    pricing_provider_name: str | None = None
+    pricing_model: str | None = None
 
-    @field_validator("currency", "missing_pricing_reason")
+    @field_validator(
+        "currency",
+        "missing_pricing_reason",
+        "pricing_provider_name",
+        "pricing_model",
+    )
     @classmethod
     def validate_optional_text(cls, value: str | None, info) -> str | None:
         if value is None:
@@ -902,11 +909,20 @@ class ModelStepCostEstimate(BaseModel):
         if self.priced:
             if self.currency is None or self.missing_pricing_reason is not None:
                 raise ValueError("Priced model steps require currency and no missing reason.")
+            if (self.pricing_provider_name is None) != (self.pricing_model is None):
+                raise ValueError(
+                    "Priced model steps require both pricing identity fields or neither field."
+                )
         elif (
-            self.currency is not None or self.total_cost != 0 or self.missing_pricing_reason is None
+            self.currency is not None
+            or self.total_cost != 0
+            or self.missing_pricing_reason is None
+            or self.pricing_provider_name is not None
+            or self.pricing_model is not None
         ):
             raise ValueError(
-                "Unpriced model steps require a missing reason and zero currency-local cost."
+                "Unpriced model steps require a missing reason, no pricing identity, and zero "
+                "currency-local cost."
             )
         return self
 
@@ -1217,6 +1233,8 @@ def estimate_model_step_cost(
         priced=True,
         currency=currency,
         total_cost=line_item.total_cost,
+        pricing_provider_name=line_item.pricing_provider_name,
+        pricing_model=line_item.pricing_model,
     )
 
 

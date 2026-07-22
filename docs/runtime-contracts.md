@@ -1490,6 +1490,16 @@ Per-event usage counters are normalized only when they are nonnegative signed
 64-bit integers. Larger or malformed counters contribute zero in every store and
 make that event's pricing metrics unavailable, while sums of valid counters
 remain exact beyond signed 64-bit range.
+Server contract version 2 serializes aggregate counters as nonnegative decimal
+strings, rather than JSON numbers, so totals beyond JavaScript's safe-integer
+range remain exact. It also makes the bounded `cost.billing_breakdown` projection
+part of the usage-rollup response. Clients generated against contract version 1
+must regenerate from the current OpenAPI document and treat these aggregate
+counter fields as strings; independently hosted dashboards must not render
+control-plane routes against a server reporting a different contract version.
+The exported aggregate models parse that canonical JSON representation back to
+Python integers, while direct Python construction remains strict and does not
+accept string counters.
 Aggregate session filters accept at most 50 exact labels, 25 label-selector
 clauses, and 100 values across those selectors, preventing a request body from
 expanding into an unbounded database predicate.
@@ -1509,6 +1519,15 @@ with the other built-in control-plane
 reads, these endpoints cover the complete configured store. Authentication does
 not turn `AuthContext.tenant` into a row filter; tenant-facing applications must
 enforce their own complete storage or route boundary.
+
+When pricing inputs carry a `BillingIdentity`, `cost.billing_breakdown` groups
+the evaluated steps by commercial identity and pricing outcome. Its detail is
+bounded independently by `group_limit`; omitted identity groups remain visible
+as an exact count/step remainder and are still included in currency totals.
+Provider name and resource id are always available. Arbitrary provider evidence
+never enters this response. Cayu retains only its bounded, adapter-owned Bedrock
+region, resource/profile scope, requested tier, and effective tier fields so the
+control plane can diagnose context-aware pricing without exposing customer data.
 
 ```bash
 curl -X POST \

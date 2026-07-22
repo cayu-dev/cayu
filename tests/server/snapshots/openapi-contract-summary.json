@@ -70,6 +70,58 @@
       "title": "AggregateAccuracyKind",
       "type": "string"
     },
+    "AggregateCacheUsageMetrics": {
+      "additionalProperties": false,
+      "description": "Lossless JSON projection of identity-free aggregate cache counters.",
+      "properties": {
+        "cached_input_tokens": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Cached Input Tokens",
+          "type": "string"
+        },
+        "read_tokens": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Read Tokens",
+          "type": "string"
+        },
+        "uncached_input_tokens": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Uncached Input Tokens",
+          "type": "string"
+        },
+        "write_1h_tokens": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Write 1H Tokens",
+          "type": "string"
+        },
+        "write_5m_tokens": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Write 5M Tokens",
+          "type": "string"
+        },
+        "write_tokens": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Write Tokens",
+          "type": "string"
+        },
+        "write_unknown_ttl_tokens": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Write Unknown Ttl Tokens",
+          "type": "string"
+        }
+      },
+      "required": [
+        "read_tokens",
+        "write_tokens",
+        "write_5m_tokens",
+        "write_1h_tokens",
+        "write_unknown_ttl_tokens",
+        "cached_input_tokens",
+        "uncached_input_tokens"
+      ],
+      "title": "AggregateCacheUsageMetrics",
+      "type": "object"
+    },
     "AggregateCostSummary": {
       "additionalProperties": false,
       "properties": {
@@ -136,6 +188,44 @@
         "session_costs"
       ],
       "title": "AggregateCostSummary",
+      "type": "object"
+    },
+    "AggregateUsageMetrics": {
+      "additionalProperties": false,
+      "description": "Lossless JSON projection of identity-free aggregate token counters.",
+      "properties": {
+        "cache": {
+          "$ref": "#/components/schemas/AggregateCacheUsageMetrics"
+        },
+        "input_tokens": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Input Tokens",
+          "type": "string"
+        },
+        "output_tokens": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Output Tokens",
+          "type": "string"
+        },
+        "reasoning_output_tokens": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Reasoning Output Tokens",
+          "type": "string"
+        },
+        "total_tokens": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Total Tokens",
+          "type": "string"
+        }
+      },
+      "required": [
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "reasoning_output_tokens",
+        "cache"
+      ],
+      "title": "AggregateUsageMetrics",
       "type": "object"
     },
     "AggregateUsageSummary": {
@@ -4322,7 +4412,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "1",
+          "default": "2",
           "title": "Contract Version",
           "type": "string"
         },
@@ -4529,9 +4619,9 @@
           "$ref": "#/components/schemas/SessionStatusCounts"
         },
         "total_count": {
-          "minimum": 0.0,
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Total Count",
-          "type": "integer"
+          "type": "string"
         }
       },
       "required": [
@@ -4619,34 +4709,34 @@
       "description": "Complete current-session counts for every lifecycle status.",
       "properties": {
         "completed": {
-          "minimum": 0.0,
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Completed",
-          "type": "integer"
+          "type": "string"
         },
         "failed": {
-          "minimum": 0.0,
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Failed",
-          "type": "integer"
+          "type": "string"
         },
         "interrupted": {
-          "minimum": 0.0,
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Interrupted",
-          "type": "integer"
+          "type": "string"
         },
         "interrupting": {
-          "minimum": 0.0,
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Interrupting",
-          "type": "integer"
+          "type": "string"
         },
         "pending": {
-          "minimum": 0.0,
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Pending",
-          "type": "integer"
+          "type": "string"
         },
         "running": {
-          "minimum": 0.0,
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Running",
-          "type": "integer"
+          "type": "string"
         }
       },
       "required": [
@@ -5281,9 +5371,9 @@
           "$ref": "#/components/schemas/TaskStatusCounts"
         },
         "total_count": {
-          "minimum": 0.0,
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Total Count",
-          "type": "integer"
+          "type": "string"
         }
       },
       "required": [
@@ -5325,49 +5415,49 @@
       "description": "Complete current-task counts for every lifecycle status.",
       "properties": {
         "blocked": {
-          "minimum": 0.0,
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Blocked",
-          "type": "integer"
+          "type": "string"
         },
         "cancelled": {
-          "minimum": 0.0,
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Cancelled",
-          "type": "integer"
+          "type": "string"
         },
         "claimed": {
-          "minimum": 0.0,
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Claimed",
-          "type": "integer"
+          "type": "string"
         },
         "completed": {
-          "minimum": 0.0,
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Completed",
-          "type": "integer"
+          "type": "string"
         },
         "failed": {
-          "minimum": 0.0,
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Failed",
-          "type": "integer"
+          "type": "string"
         },
         "needs_attention": {
-          "minimum": 0.0,
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Needs Attention",
-          "type": "integer"
+          "type": "string"
         },
         "paused": {
-          "minimum": 0.0,
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Paused",
-          "type": "integer"
+          "type": "string"
         },
         "pending": {
-          "minimum": 0.0,
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Pending",
-          "type": "integer"
+          "type": "string"
         },
         "running": {
-          "minimum": 0.0,
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Running",
-          "type": "integer"
+          "type": "string"
         }
       },
       "required": [
@@ -6057,9 +6147,9 @@
       "description": "Exact totals represented by groups omitted from a bounded breakdown.",
       "properties": {
         "group_count": {
-          "minimum": 1.0,
+          "pattern": "^[1-9]\\d*$",
           "title": "Group Count",
-          "type": "integer"
+          "type": "string"
         },
         "totals": {
           "$ref": "#/components/schemas/UsageAggregateTotals"
@@ -6077,27 +6167,27 @@
       "description": "Identity-free activity and token totals for one aggregate scope.",
       "properties": {
         "model_steps": {
-          "minimum": 0.0,
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Model Steps",
-          "type": "integer"
+          "type": "string"
         },
         "model_steps_with_usage": {
-          "minimum": 0.0,
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Model Steps With Usage",
-          "type": "integer"
+          "type": "string"
         },
         "session_count": {
-          "minimum": 0.0,
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Session Count",
-          "type": "integer"
+          "type": "string"
         },
         "tool_calls": {
-          "minimum": 0.0,
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Tool Calls",
-          "type": "integer"
+          "type": "string"
         },
         "usage": {
-          "$ref": "#/components/schemas/UsageMetrics"
+          "$ref": "#/components/schemas/AggregateUsageMetrics"
         }
       },
       "required": [
@@ -6108,6 +6198,191 @@
         "usage"
       ],
       "title": "UsageAggregateTotals",
+      "type": "object"
+    },
+    "UsageBillingCostBreakdown": {
+      "additionalProperties": false,
+      "description": "Bounded identity detail for evaluated cost inputs, with an exact remainder.",
+      "properties": {
+        "accuracy": {
+          "$ref": "#/components/schemas/AggregateAccuracy"
+        },
+        "groups": {
+          "items": {
+            "$ref": "#/components/schemas/UsageBillingCostGroup"
+          },
+          "maxItems": 100,
+          "title": "Groups",
+          "type": "array"
+        },
+        "identified_model_steps": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Identified Model Steps",
+          "type": "string"
+        },
+        "remainder": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/UsageBillingCostRemainder"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "identified_model_steps",
+        "groups",
+        "remainder",
+        "accuracy"
+      ],
+      "title": "UsageBillingCostBreakdown",
+      "type": "object"
+    },
+    "UsageBillingCostGroup": {
+      "additionalProperties": false,
+      "description": "One bounded, identity-bearing group of equivalent pricing outcomes.",
+      "properties": {
+        "billing_identity": {
+          "$ref": "#/components/schemas/UsageBillingIdentity"
+        },
+        "currency": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Currency"
+        },
+        "missing_pricing_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Missing Pricing Reason"
+        },
+        "model_steps": {
+          "pattern": "^[1-9]\\d*$",
+          "title": "Model Steps",
+          "type": "string"
+        },
+        "priced": {
+          "title": "Priced",
+          "type": "boolean"
+        },
+        "pricing_model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Pricing Model"
+        },
+        "pricing_provider_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Pricing Provider Name"
+        },
+        "total_cost": {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "title": "Total Cost",
+          "type": "string"
+        }
+      },
+      "required": [
+        "billing_identity",
+        "priced",
+        "model_steps",
+        "total_cost"
+      ],
+      "title": "UsageBillingCostGroup",
+      "type": "object"
+    },
+    "UsageBillingCostRemainder": {
+      "additionalProperties": false,
+      "description": "Exact counts for identity-bearing pricing groups omitted from bounded detail.",
+      "properties": {
+        "group_count": {
+          "pattern": "^[1-9]\\d*$",
+          "title": "Group Count",
+          "type": "string"
+        },
+        "model_steps": {
+          "pattern": "^[1-9]\\d*$",
+          "title": "Model Steps",
+          "type": "string"
+        },
+        "priced_model_steps": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Priced Model Steps",
+          "type": "string"
+        },
+        "unpriced_model_steps": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Unpriced Model Steps",
+          "type": "string"
+        }
+      },
+      "required": [
+        "group_count",
+        "model_steps",
+        "priced_model_steps",
+        "unpriced_model_steps"
+      ],
+      "title": "UsageBillingCostRemainder",
+      "type": "object"
+    },
+    "UsageBillingIdentity": {
+      "additionalProperties": false,
+      "description": "Bounded commercial identity safe to return in an aggregate response.",
+      "properties": {
+        "completion_evidence": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "maxProperties": 1,
+          "title": "Completion Evidence",
+          "type": "object"
+        },
+        "provider_name": {
+          "title": "Provider Name",
+          "type": "string"
+        },
+        "request_evidence": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "maxProperties": 4,
+          "title": "Request Evidence",
+          "type": "object"
+        },
+        "resource_id": {
+          "title": "Resource Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider_name",
+        "resource_id"
+      ],
+      "title": "UsageBillingIdentity",
       "type": "object"
     },
     "UsageBreakdownItem": {
@@ -6166,6 +6441,9 @@
         "accuracy": {
           "$ref": "#/components/schemas/AggregateAccuracy"
         },
+        "billing_breakdown": {
+          "$ref": "#/components/schemas/UsageBillingCostBreakdown"
+        },
         "currencies": {
           "items": {
             "$ref": "#/components/schemas/UsageCurrencyCost"
@@ -6175,9 +6453,9 @@
           "type": "array"
         },
         "evaluated_model_steps": {
-          "minimum": 0.0,
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Evaluated Model Steps",
-          "type": "integer"
+          "type": "string"
         },
         "price_book_generated_at": {
           "title": "Price Book Generated At",
@@ -6188,19 +6466,19 @@
           "type": "string"
         },
         "priced_model_steps": {
-          "minimum": 0.0,
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Priced Model Steps",
-          "type": "integer"
+          "type": "string"
         },
         "unevaluated_model_steps": {
-          "minimum": 0.0,
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Unevaluated Model Steps",
-          "type": "integer"
+          "type": "string"
         },
         "unpriced_model_steps": {
-          "minimum": 0.0,
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Unpriced Model Steps",
-          "type": "integer"
+          "type": "string"
         },
         "unpriced_reasons": {
           "items": {
@@ -6220,7 +6498,8 @@
         "unpriced_model_steps",
         "unevaluated_model_steps",
         "currencies",
-        "unpriced_reasons"
+        "unpriced_reasons",
+        "billing_breakdown"
       ],
       "title": "UsageCostRollup",
       "type": "object"
@@ -6234,9 +6513,9 @@
           "type": "string"
         },
         "model_steps": {
-          "minimum": 1.0,
+          "pattern": "^[1-9]\\d*$",
           "title": "Model Steps",
-          "type": "integer"
+          "type": "string"
         },
         "total_cost": {
           "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
@@ -6340,6 +6619,7 @@
         },
         "group_limit": {
           "default": 20,
+          "description": "Maximum returned groups, applied independently to provider, model, and billing identity breakdowns. Omitted groups are represented by an explicit remainder.",
           "maximum": 100.0,
           "minimum": 1.0,
           "title": "Group Limit",
@@ -6386,9 +6666,9 @@
           "$ref": "#/components/schemas/AggregateAccuracy"
         },
         "active_session_count": {
-          "minimum": 0.0,
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Active Session Count",
-          "type": "integer"
+          "type": "string"
         },
         "as_of": {
           "format": "date-time",
@@ -6415,9 +6695,9 @@
           "type": "boolean"
         },
         "matching_session_count": {
-          "minimum": 0.0,
+          "pattern": "^(0|[1-9]\\d*)$",
           "title": "Matching Session Count",
-          "type": "integer"
+          "type": "string"
         },
         "model_breakdown": {
           "$ref": "#/components/schemas/UsageAggregateBreakdown"
@@ -6473,9 +6753,9 @@
       "description": "Model-step count that could not be priced for one explicit reason.",
       "properties": {
         "model_steps": {
-          "minimum": 1.0,
+          "pattern": "^[1-9]\\d*$",
           "title": "Model Steps",
-          "type": "integer"
+          "type": "string"
         },
         "reason": {
           "title": "Reason",
@@ -6842,7 +7122,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "1",
+          "default": "2",
           "title": "Contract Version",
           "type": "string"
         }

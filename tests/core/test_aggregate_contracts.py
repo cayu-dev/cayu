@@ -1,23 +1,28 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from cayu.core import Event, EventType, Message
 from cayu.core.billing import BillingIdentity, PricingContext
+from cayu.providers import bedrock_billing_identity, completed_bedrock_billing_identity
 from cayu.runtime.aggregates import (
     MAX_AGGREGATE_USAGE_COUNTER,
     AggregateAccuracy,
     AggregateAccuracyKind,
     BoundedUsagePricingInputAccumulator,
     UsageAggregateBreakdown,
+    UsageAggregateRemainder,
+    UsageAggregateTotals,
+    UsageCurrencyCost,
     UsagePricingInput,
     UsageRollupStoreResult,
     coalesce_usage_pricing_inputs,
@@ -29,11 +34,13 @@ from cayu.runtime.sessions import (
     RunRequest,
     SessionAggregateFilter,
     SessionIdentity,
+    SessionOperationalSnapshot,
     SessionStatus,
+    SessionStatusCounts,
     UsageRollupQuery,
 )
 from cayu.runtime.tasks import InMemoryTaskStore, TaskAggregateFilter, TaskCreate
-from cayu.runtime.usage import UsageMetrics
+from cayu.runtime.usage import CacheUsageMetrics, UsageMetrics
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 
 
@@ -101,6 +108,33 @@ def _billing_model_event(*, event_id: str, session_id: str, timestamp: datetime)
             "usage_metrics": metrics.model_dump(mode="json"),
             "billing_identity": identity.model_dump(mode="json"),
         },
+    )
+
+
+def _unclean_bedrock_evidence_event(
+    *,
+    event_id: str,
+    session_id: str,
+    timestamp: datetime,
+) -> Event:
+    identity = BillingIdentity(
+        provider_name="bedrock",
+        resource_id="bedrock-model",
+        request_evidence={"source_region": f" {'x' * 2048} "},
+    )
+    metrics = UsageMetrics(
+        provider_name="bedrock",
+        model="bedrock-model",
+        billing_identity=identity,
+        input_tokens=1,
+        total_tokens=1,
+    )
+    return Event(
+        id=event_id,
+        type=EventType.MODEL_COMPLETED,
+        session_id=session_id,
+        timestamp=timestamp,
+        payload={"usage_metrics": metrics.model_dump(mode="json")},
     )
 
 
@@ -383,6 +417,175 @@ def test_usage_rollup_pricing_projection_redacts_billing_evidence() -> None:
     asyncio.run(run())
 
 
+def test_usage_rollup_billing_breakdown_preserves_only_safe_bedrock_context() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        start = datetime(2026, 7, 1, tzinfo=UTC)
+        invoked_model = "global.anthropic.claude-sonnet-4-6"
+        regions = ("us-east-1", "us-west-2")
+        for index, region in enumerate(regions):
+            session_id = f"bedrock-billing-{index}"
+            await store.create(_request(session_id), identity=_identity())
+            requested = bedrock_billing_identity(
+                invoked_model=invoked_model,
+                source_region=region,
+                resource_type="inference_profile",
+                profile_scope="global",
+                requested_service_tier="default",
+            )
+            completed = completed_bedrock_billing_identity(
+                requested,
+                effective_service_tier="default",
+            )
+            identity = BillingIdentity(
+                provider_name=completed.provider_name,
+                resource_id=completed.resource_id,
+                request_evidence={
+                    **completed.request_evidence,
+                    "customer_secret": "must-not-enter-the-rollup",
+                },
+                completion_evidence={
+                    **completed.completion_evidence,
+                    "provider_trace": "must-also-remain-redacted",
+                },
+                pricing_contexts=completed.pricing_contexts,
+            )
+            metrics = UsageMetrics(
+                provider_name="bedrock",
+                model=invoked_model,
+                billing_identity=identity,
+                input_tokens=1_000_000,
+                total_tokens=1_000_000,
+            )
+            await store.append_event(
+                session_id,
+                Event(
+                    id=f"bedrock-billing-event-{index}",
+                    type=EventType.MODEL_COMPLETED,
+                    session_id=session_id,
+                    timestamp=start + timedelta(minutes=index),
+                    payload={
+                        "usage_metrics": metrics.model_dump(mode="json"),
+                        "billing_identity": identity.model_dump(mode="json"),
+                    },
+                ),
+            )
+
+        result = await store.aggregate_usage(
+            UsageRollupQuery(
+                start_at=start,
+                end_at=start + timedelta(days=1),
+                include_pricing_inputs=True,
+            )
+        )
+        pricing = PriceBook(
+            prices=tuple(
+                ModelPrice.fixed(
+                    provider_name="bedrock",
+                    model=invoked_model,
+                    match="exact",
+                    pricing_context={
+                        "source_region": (region,),
+                        "service_tier": ("default",),
+                    },
+                    input_per_million=Decimal("1"),
+                    output_per_million=Decimal("1"),
+                )
+                for region in regions
+            )
+        )
+        cost = estimate_usage_rollup_cost(result, pricing, billing_group_limit=1)
+
+        assert cost.priced_model_steps == 2
+        assert cost.currencies[0].total_cost == Decimal("2")
+        breakdown = cost.billing_breakdown
+        assert breakdown.identified_model_steps == 2
+        assert len(breakdown.groups) == 1
+        assert breakdown.remainder is not None
+        assert breakdown.remainder.group_count == 1
+        assert breakdown.remainder.model_steps == 1
+        assert breakdown.accuracy.kind == "truncated"
+        identity = breakdown.groups[0].billing_identity
+        assert identity.request_evidence["source_region"] in regions
+        assert identity.request_evidence["resource_type"] == "inference_profile"
+        assert identity.request_evidence["profile_scope"] == "global"
+        assert identity.request_evidence["requested_service_tier"] == "default"
+        assert identity.completion_evidence == {"effective_service_tier": "default"}
+        assert "pricing_contexts" not in identity.model_dump(mode="json")
+        assert "customer_secret" not in identity.request_evidence
+        assert "provider_trace" not in identity.completion_evidence
+
+    asyncio.run(run())
+
+
+def test_usage_rollup_ignores_blank_bedrock_display_evidence() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        start = datetime(2026, 7, 1, tzinfo=UTC)
+        session_id = "bedrock-blank-display-evidence"
+        invoked_model = "anthropic.claude-sonnet-4-6-v1:0"
+        await store.create(_request(session_id), identity=_identity())
+        identity = BillingIdentity(
+            provider_name="bedrock",
+            resource_id=invoked_model,
+            request_evidence={
+                "source_region": " ",
+                "resource_type": "",
+                "requested_service_tier": "\t",
+            },
+            completion_evidence={"effective_service_tier": "\n"},
+        )
+        metrics = UsageMetrics(
+            provider_name="bedrock",
+            model=invoked_model,
+            billing_identity=identity,
+            input_tokens=1,
+            total_tokens=1,
+        )
+        await store.append_event(
+            session_id,
+            Event(
+                id="bedrock-blank-display-evidence-event",
+                type=EventType.MODEL_COMPLETED,
+                session_id=session_id,
+                timestamp=start,
+                payload={"usage_metrics": metrics.model_dump(mode="json")},
+            ),
+        )
+
+        result = await store.aggregate_usage(
+            UsageRollupQuery(
+                start_at=start,
+                end_at=start + timedelta(days=1),
+                include_pricing_inputs=True,
+            )
+        )
+        cost = estimate_usage_rollup_cost(
+            result,
+            PriceBook(
+                prices=(
+                    ModelPrice.fixed(
+                        provider_name="bedrock",
+                        model=invoked_model,
+                        match="exact",
+                        pricing_context={
+                            "source_region": ("us-east-1",),
+                            "service_tier": ("default",),
+                        },
+                        input_per_million=Decimal("1"),
+                        output_per_million=Decimal("1"),
+                    ),
+                )
+            ),
+        )
+
+        assert cost.unpriced_model_steps == 1
+        assert cost.billing_breakdown.groups[0].billing_identity.request_evidence == {}
+        assert cost.billing_breakdown.groups[0].billing_identity.completion_evidence == {}
+
+    asyncio.run(run())
+
+
 def test_usage_rollup_treats_naive_event_timestamps_as_utc(tmp_path) -> None:
     async def run() -> None:
         stores = (
@@ -562,6 +765,9 @@ def test_sqlite_usage_rollup_sums_past_signed_64_bit_without_overflow(tmp_path) 
             assert result.provider_breakdown.groups[0].totals.usage.input_tokens == (2 * maximum)
             assert result.provider_breakdown.remainder is not None
             assert result.provider_breakdown.remainder.totals.usage.input_tokens == 2 * maximum
+            serialized = result.totals.model_dump(mode="json")
+            assert serialized["model_steps"] == "4"
+            assert serialized["usage"]["input_tokens"] == str(4 * maximum)
         await stores[1].close()
 
     asyncio.run(run())
@@ -669,7 +875,7 @@ def test_sampled_rollup_requires_truthful_breakdown_accuracy() -> None:
             UsageRollupQuery(start_at=start, end_at=start + timedelta(days=1))
         )
 
-    payload = asyncio.run(build_exact_result()).model_dump(mode="json")
+    payload = asyncio.run(build_exact_result()).model_dump()
     sampled_accuracy = {
         "kind": "sampled",
         "reason": "The store returned a representative sample.",
@@ -821,6 +1027,111 @@ def test_session_aggregate_filters_reject_oversized_label_predicates() -> None:
                     "values": [f"project-{index}" for index in range(101)],
                 },
             )
+        )
+
+
+@pytest.mark.parametrize(
+    ("model", "field_name", "mode"),
+    [
+        (model, field_name, mode)
+        for model, field_name in (
+            (UsageAggregateRemainder, "group_count"),
+            (UsageCurrencyCost, "model_steps"),
+        )
+        for mode in ("validation", "serialization")
+    ],
+)
+def test_positive_aggregate_counts_remain_positive_decimal_strings_in_json_schema(
+    model: type[BaseModel],
+    field_name: str,
+    mode: Literal["validation", "serialization"],
+) -> None:
+    field_schema = model.model_json_schema(mode=mode)["properties"][field_name]
+
+    assert field_schema["type"] == "string"
+    assert field_schema["pattern"] == r"^[1-9]\d*$"
+
+
+@pytest.mark.parametrize("mode", ["validation", "serialization"])
+def test_nested_aggregate_usage_counters_are_decimal_strings_in_json_schema(
+    mode: Literal["validation", "serialization"],
+) -> None:
+    schema = UsageAggregateTotals.model_json_schema(mode=mode)
+    input_tokens = schema["$defs"]["AggregateUsageMetrics"]["properties"]["input_tokens"]
+
+    assert input_tokens["type"] == "string"
+    assert input_tokens["pattern"] == r"^(0|[1-9]\d*)$"
+
+
+def test_public_aggregate_models_round_trip_their_exact_json_counters() -> None:
+    exact_count = 2**53 + 1
+    totals = UsageAggregateTotals(
+        session_count=exact_count,
+        model_steps=exact_count,
+        model_steps_with_usage=exact_count,
+        tool_calls=exact_count,
+        usage=UsageMetrics(
+            input_tokens=exact_count,
+            output_tokens=exact_count,
+            total_tokens=exact_count * 2,
+            reasoning_output_tokens=exact_count,
+            cache=CacheUsageMetrics(
+                read_tokens=exact_count,
+                write_tokens=exact_count,
+                write_5m_tokens=exact_count,
+                write_1h_tokens=exact_count,
+                write_unknown_ttl_tokens=exact_count,
+                cached_input_tokens=exact_count,
+                uncached_input_tokens=exact_count,
+            ),
+        ),
+    )
+    snapshot = SessionOperationalSnapshot(
+        as_of=datetime(2026, 7, 21, tzinfo=UTC),
+        total_count=exact_count,
+        counts_by_status=SessionStatusCounts(
+            pending=0,
+            running=exact_count,
+            interrupting=0,
+            completed=0,
+            failed=0,
+            interrupted=0,
+        ),
+        accuracy=AggregateAccuracy(kind=AggregateAccuracyKind.EXACT),
+    )
+    currency = UsageCurrencyCost(
+        currency="USD",
+        model_steps=exact_count,
+        total_cost=Decimal("1.25"),
+    )
+
+    for value in (totals, snapshot, currency):
+        payload = value.model_dump_json(round_trip=True)
+
+        restored = type(value).model_validate_json(payload)
+
+        assert restored == value
+        assert f'"{exact_count}"' in payload
+
+
+@pytest.mark.parametrize(
+    "encoded_count",
+    ["1", "true", '"01"', '"-1"', '"+1"', '"1.0"', '"\\u0661"'],
+)
+def test_aggregate_count_json_rejects_noncanonical_wire_values(encoded_count: str) -> None:
+    with pytest.raises(
+        ValidationError,
+        match="canonical nonnegative decimal strings",
+    ):
+        UsageCurrencyCost.model_validate_json(
+            f'{{"currency":"USD","model_steps":{encoded_count},"total_cost":"1.25"}}'
+        )
+
+
+def test_aggregate_count_python_validation_remains_strict() -> None:
+    with pytest.raises(ValidationError, match="valid integer"):
+        UsageCurrencyCost.model_validate(
+            {"currency": "USD", "model_steps": "1", "total_cost": Decimal("1.25")}
         )
 
 
@@ -1298,6 +1609,62 @@ def test_sqlite_pricing_projection_rejects_oversized_rows_before_transfer(tmp_pa
     assert accumulator.result()[0] == ()
 
 
+def test_sqlite_pricing_projection_discards_unclean_bedrock_evidence_before_bounds(
+    tmp_path,
+) -> None:
+    from cayu.storage import _session_store_sql, _sqlite_aggregates, _sqlite_support
+    from cayu.storage.sqlite import _SQL_DIALECT
+
+    database_path = tmp_path / "aggregate-clean-evidence.sqlite"
+    store = SQLiteSessionStore(database_path)
+    start = datetime(2026, 7, 1, tzinfo=UTC)
+    session_id = "clean-bounded-evidence"
+
+    async def seed() -> None:
+        await store.create(_request(session_id), identity=_identity())
+        await store.append_event(
+            session_id,
+            _unclean_bedrock_evidence_event(
+                event_id="clean-bounded-evidence-event",
+                session_id=session_id,
+                timestamp=start,
+            ),
+        )
+
+    asyncio.run(seed())
+    plan = _session_store_sql.build_session_query_sql(None, dialect=_SQL_DIALECT)
+    query = UsageRollupQuery(start_at=start, end_at=start + timedelta(days=1))
+    sql, params = _sqlite_aggregates.pricing_input_statement(
+        session_plan=plan,
+        query=query,
+        max_input_bytes=512,
+    )
+    connection = _sqlite_support.connect(database_path, read_only=True)
+    try:
+        rows = connection.execute(sql, params).fetchall()
+    finally:
+        connection.close()
+        asyncio.run(store.close())
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["input_oversized"] == 0
+    assert row["usage_metrics_json"] is not None
+    projected_metrics = json.loads(row["usage_metrics_json"])
+    projected_identity = projected_metrics["billing_identity"]
+    assert "request_evidence" not in projected_identity
+    assert "completion_evidence" not in projected_identity
+    accumulator = BoundedUsagePricingInputAccumulator(limit=10, max_bytes=512)
+    _sqlite_aggregates._add_pricing_input_from_row(accumulator, row)
+    inputs, group_count, accuracy = accumulator.result()
+    assert accuracy.kind is AggregateAccuracyKind.EXACT
+    assert group_count == 1
+    assert len(inputs) == 1
+    assert inputs[0].metrics is not None
+    assert inputs[0].metrics.billing_identity is not None
+    assert inputs[0].metrics.billing_identity.request_evidence == {}
+
+
 def test_postgres_aggregates_match_in_memory_reference(postgres_dsn: str) -> None:
     from cayu.storage.migrations import SchemaMode
     from cayu.storage.postgres import PostgresSessionStore, PostgresTaskStore
@@ -1470,6 +1837,11 @@ def test_postgres_aggregates_match_in_memory_reference(postgres_dsn: str) -> Non
                         input_tokens=MAX_AGGREGATE_USAGE_COUNTER + 1,
                         output_tokens=0,
                     ),
+                    _unclean_bedrock_evidence_event(
+                        event_id="unclean-bounded-evidence",
+                        session_id=session_id,
+                        timestamp=start + timedelta(hours=16),
+                    ),
                 ],
             )
         edge_filter = SessionAggregateFilter(labels={"test-scope": edge_label})
@@ -1491,7 +1863,18 @@ def test_postgres_aggregates_match_in_memory_reference(postgres_dsn: str) -> Non
             sessions=edge_filter,
             include_pricing_inputs=True,
         )
-        for edge_query in (canonical_query, identity_query, oversized_counter_query):
+        unclean_evidence_query = UsageRollupQuery(
+            start_at=start + timedelta(hours=16),
+            end_at=start + timedelta(hours=17),
+            sessions=edge_filter,
+            include_pricing_inputs=True,
+        )
+        for edge_query in (
+            canonical_query,
+            identity_query,
+            oversized_counter_query,
+            unclean_evidence_query,
+        ):
             memory_edge = await memory_sessions.aggregate_usage(edge_query)
             postgres_edge = await postgres_sessions.aggregate_usage(edge_query)
             assert postgres_edge.model_dump(exclude={"as_of"}) == memory_edge.model_dump(
@@ -1506,6 +1889,11 @@ def test_postgres_aggregates_match_in_memory_reference(postgres_dsn: str) -> Non
         oversized_counter_edge = await postgres_sessions.aggregate_usage(oversized_counter_query)
         assert oversized_counter_edge.totals.usage.input_tokens == 0
         assert oversized_counter_edge.pricing_inputs[0].metrics is None
+        unclean_evidence_edge = await postgres_sessions.aggregate_usage(unclean_evidence_query)
+        unclean_metrics = unclean_evidence_edge.pricing_inputs[0].metrics
+        assert unclean_metrics is not None
+        assert unclean_metrics.billing_identity is not None
+        assert unclean_metrics.billing_identity.request_evidence == {}
 
         from psycopg import AsyncConnection
 
@@ -1531,6 +1919,11 @@ def test_postgres_aggregates_match_in_memory_reference(postgres_dsn: str) -> Non
             query=canonical_query,
             max_input_bytes=1,
         )
+        clean_evidence_sql, clean_evidence_params = _postgres_aggregates.pricing_input_statement(
+            session_plan=edge_plan,
+            query=unclean_evidence_query,
+            max_input_bytes=512,
+        )
         connection = await AsyncConnection.connect(postgres_dsn)
         try:
             async with connection.cursor() as cursor:
@@ -1544,6 +1937,8 @@ def test_postgres_aggregates_match_in_memory_reference(postgres_dsn: str) -> Non
                 pricing_explain_rows = await cursor.fetchall()
                 await cursor.execute(bounded_pricing_sql, bounded_pricing_params)
                 bounded_pricing_row = await cursor.fetchone()
+                await cursor.execute(clean_evidence_sql, clean_evidence_params)
+                clean_evidence_row = await cursor.fetchone()
         finally:
             await connection.close()
         explanation = "\n".join(str(row[0]) for row in explain_rows)
@@ -1558,6 +1953,11 @@ def test_postgres_aggregates_match_in_memory_reference(postgres_dsn: str) -> Non
         assert '"timestamp" <' in pricing_explanation
         assert bounded_pricing_row is not None
         assert bounded_pricing_row[1:4] == (None, None, True)
+        assert clean_evidence_row is not None
+        assert clean_evidence_row[1] is not None
+        assert clean_evidence_row[3] is False
+        assert "request_evidence" not in clean_evidence_row[1]["billing_identity"]
+        assert "completion_evidence" not in clean_evidence_row[1]["billing_identity"]
 
         memory_tasks = InMemoryTaskStore()
         postgres_tasks = PostgresTaskStore(

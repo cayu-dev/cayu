@@ -2032,7 +2032,15 @@ def create_router(
                 status_code=501,
                 detail="The configured session store does not support usage aggregates.",
             ) from exc
-        cost = None if body.pricing is None else estimate_usage_rollup_cost(result, body.pricing)
+        cost = (
+            None
+            if body.pricing is None
+            else estimate_usage_rollup_cost(
+                result,
+                body.pricing,
+                billing_group_limit=body.group_limit,
+            )
+        )
         return UsageRollupResponse(
             scope="configured_session_store",
             time_basis="event.timestamp",

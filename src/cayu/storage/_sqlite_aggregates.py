@@ -6,6 +6,8 @@ from datetime import UTC, datetime
 from typing import Any
 
 from cayu.runtime.aggregates import (
+    _BEDROCK_AGGREGATE_COMPLETION_EVIDENCE,
+    _BEDROCK_AGGREGATE_REQUEST_EVIDENCE,
     AGGREGATE_IDENTITY_TRIM_CHARACTERS,
     EXACT_AGGREGATE,
     MAX_AGGREGATE_USAGE_COUNTER,
@@ -263,8 +265,8 @@ FROM model_remainder
 
 _PRICING_INPUT_SQL = """
 WITH
-scope(max_input_bytes) AS (
-    SELECT ?
+scope(max_input_bytes, identity_trim) AS (
+    SELECT ?, ?
 ),
 matched_sessions AS MATERIALIZED (
     SELECT id
@@ -274,25 +276,8 @@ matched_sessions AS MATERIALIZED (
 pricing_candidates AS (
     SELECT
         substr(event.timestamp, 1, 10) AS effective_on,
-        CASE
-            WHEN json_type(event.payload_json, '$.usage_metrics') = 'object'
-            THEN json_remove(
-                json_extract(event.payload_json, '$.usage_metrics'),
-                '$.billing_identity.request_evidence',
-                '$.billing_identity.completion_evidence'
-            )
-        END AS usage_metrics_json,
-        CASE
-            WHEN json_type(event.payload_json, '$.billing_identity') = 'object'
-            THEN json_extract(
-                json_remove(
-                    event.payload_json,
-                    '$.billing_identity.request_evidence',
-                    '$.billing_identity.completion_evidence'
-                ),
-                '$.billing_identity'
-            )
-        END AS billing_identity_json
+        {usage_metrics_projection} AS usage_metrics_json,
+        {billing_identity_projection} AS billing_identity_json
     FROM cayu_events AS event
     JOIN matched_sessions AS session ON session.id = event.session_id
     WHERE event.timestamp >= ?
@@ -442,15 +427,101 @@ def pricing_input_statement(
     if type(max_input_bytes) is not int or max_input_bytes < 1:
         raise ValueError("max_input_bytes must be a positive integer.")
     return (
-        _PRICING_INPUT_SQL.format(session_where_sql=session_plan.filter_where_sql),
+        _PRICING_INPUT_SQL.format(
+            session_where_sql=session_plan.filter_where_sql,
+            usage_metrics_projection=_sqlite_usage_metrics_projection(),
+            billing_identity_projection=_sqlite_billing_identity_projection("$.billing_identity"),
+        ),
         (
             max_input_bytes,
+            AGGREGATE_IDENTITY_TRIM_CHARACTERS,
             *session_plan.filter_params,
             query.start_at.isoformat(),
             query.end_at.isoformat(),
             MAX_USAGE_PRICING_RAW_CANDIDATES,
         ),
     )
+
+
+def _sqlite_usage_metrics_projection() -> str:
+    metrics_path = "$.usage_metrics"
+    identity_path = f"{metrics_path}.billing_identity"
+    metrics = f"json_extract(event.payload_json, '{metrics_path}')"
+    identity = _sqlite_billing_identity_projection(identity_path)
+    return f"""
+        CASE
+            WHEN json_type(event.payload_json, '{metrics_path}') = 'object'
+            THEN CASE
+                WHEN json_type(event.payload_json, '{identity_path}') = 'object'
+                THEN json_set(
+                    {metrics},
+                    '$.billing_identity',
+                    json({identity})
+                )
+                ELSE {metrics}
+            END
+        END
+    """.strip()
+
+
+def _sqlite_billing_identity_projection(identity_path: str) -> str:
+    identity = f"json_extract(event.payload_json, '{identity_path}')"
+    request_evidence = _sqlite_text_evidence_projection(
+        f"{identity_path}.request_evidence",
+        _BEDROCK_AGGREGATE_REQUEST_EVIDENCE,
+    )
+    completion_evidence = _sqlite_text_evidence_projection(
+        f"{identity_path}.completion_evidence",
+        _BEDROCK_AGGREGATE_COMPLETION_EVIDENCE,
+    )
+    return f"""
+        CASE
+            WHEN json_type(event.payload_json, '{identity_path}') = 'object'
+            THEN CASE
+                WHEN json_extract(
+                    event.payload_json,
+                    '{identity_path}.provider_name'
+                ) = 'bedrock'
+                THEN json_patch(
+                    json_remove({identity}, '$.request_evidence', '$.completion_evidence'),
+                    json_object(
+                        'request_evidence', CASE
+                            WHEN json({request_evidence}) <> json('{{}}')
+                            THEN json({request_evidence})
+                        END,
+                        'completion_evidence', CASE
+                            WHEN json({completion_evidence}) <> json('{{}}')
+                            THEN json({completion_evidence})
+                        END
+                    )
+                )
+                ELSE json_remove({identity}, '$.request_evidence', '$.completion_evidence')
+            END
+        END
+    """.strip()
+
+
+def _sqlite_text_evidence_projection(evidence_path: str, fields: tuple[str, ...]) -> str:
+    projected = "'{}'"
+    for field in fields:
+        path = f"{evidence_path}.{field}"
+        value = f"json_extract(event.payload_json, '{path}')"
+        projected = f"""
+            json_patch(
+                {projected},
+                CASE
+                    WHEN json_type(event.payload_json, '{path}') = 'text'
+                     AND {value} <> ''
+                     AND trim(
+                         {value},
+                         (SELECT identity_trim FROM scope)
+                     ) = {value}
+                    THEN json_object('{field}', {value})
+                    ELSE '{{}}'
+                END
+            )
+        """.strip()
+    return projected
 
 
 def _nonnegative_json_integer(path: str) -> str:

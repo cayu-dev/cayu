@@ -128,7 +128,7 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
     assert response.status_code == 200
     body = response.json()
     assert body["api_prefix"] == "/api"
-    assert body["contract_version"] == "1"
+    assert body["contract_version"] == "2"
     assert body["versioning"]["breaking_change_requires"] == [
         "openapi_snapshot_update",
         "client_regeneration",

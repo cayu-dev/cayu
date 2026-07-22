@@ -1,10 +1,20 @@
 import { useQuery } from "@tanstack/react-query"
-import { Link } from "@tanstack/react-router"
-import { AlertTriangle, Coins, Database, Hash, Search, Workflow } from "lucide-react"
-import { useEffect, useMemo, useState } from "react"
+import { Link, useNavigate, useSearch } from "@tanstack/react-router"
+import {
+  Activity,
+  AlertTriangle,
+  CalendarRange,
+  Coins,
+  Database,
+  Hash,
+  RefreshCw,
+  SlidersHorizontal,
+  Workflow,
+} from "lucide-react"
+import { useMemo, useRef, useState } from "react"
 import { DataCard, Page, PageHeader, StateMessage } from "../components/dashboard/layout"
 import { Badge } from "../components/ui/badge"
-import { Button } from "../components/ui/button"
+import { Button, buttonVariants } from "../components/ui/button"
 import { Input } from "../components/ui/input"
 import {
   Table,
@@ -14,211 +24,341 @@ import {
   TableHeader,
   TableRow,
 } from "../components/ui/table"
-import { fetchSessionsSummary, type SessionsSummary, type SessionsSummaryQuery } from "../lib/api"
-import { bedrockBillingRows } from "../lib/bedrock-billing"
+import { Textarea } from "../components/ui/textarea"
+import { retryAggregateRequest } from "../lib/aggregate-query"
+import { fetchUsageRollup, type UsageRollup } from "../lib/api"
+import { billingCostRows, billingIdentityCoverage } from "../lib/billing-breakdown"
 import { dashboardConfig } from "../lib/config"
-import { addDecimalStrings } from "../lib/decimal"
-import { formatCount, formatDateTime, formatDecimal, numericValue } from "../lib/format"
+import { formatCount, formatDateTime, formatDecimal } from "../lib/format"
+import type {
+  AggregateAccuracy,
+  UsageAggregateBreakdown,
+  UsageCostRollup,
+} from "../lib/generated/server-api"
 import {
-  describeUsageRollupScope,
-  USAGE_ROLLUP_MAX_PAGES,
-  USAGE_ROLLUP_PAGE_LIMIT,
-  USAGE_ROLLUP_SESSION_LIMIT,
-} from "../lib/usage-rollup-scope"
+  multilineUsageFilters,
+  usageRollupFilterCount,
+  usageRollupRequestState,
+  usageRollupSearchWithoutFilters,
+  usageRollupSessionSearch,
+  usageTimestampFromUtcInput,
+  usageTimestampInputValue,
+} from "../lib/usage-rollup"
+import {
+  type UsageRange,
+  type UsageRollupSearch,
+  usageRollupRange,
+  validateUsageRollupSearch,
+} from "../lib/usage-rollup-search"
 import { cn } from "../lib/utils"
 
-type SessionStatusFilter = "all" | Exclude<SessionsSummaryQuery["status"], null | undefined>
-type UsageBreakdown = NonNullable<SessionsSummary["provider_breakdown"]>[number]
-type UsageSession = SessionsSummary["usage"]["session_summaries"][number]
-type UsageSessionCost = NonNullable<SessionsSummary["cost"]>["session_costs"][number]
-type UsageCostLineItem = NonNullable<SessionsSummary["cost"]>["line_items"][number]
+const RENDERED_DETAIL_LIMIT = 20
 
-type UsageRollup = {
-  sessions: SessionsSummary["sessions"]
-  sessionSummaries: UsageSession[]
-  totalCount: number | null
-  loadedCount: number
-  nextCursor: string | null
-  usage: SessionsSummary["usage"]["usage"]
-  modelSteps: number
-  toolCalls: number
-  providerBreakdown: UsageBreakdown[]
-  modelBreakdown: UsageBreakdown[]
-  cost: SessionsSummary["cost"]
+const RANGE_LABELS: Record<UsageRange, string> = {
+  "24h": "Last 24 hours",
+  "7d": "Last 7 days",
+  "30d": "Last 30 days",
+  "90d": "Last 90 days",
+  "365d": "Last 365 days",
+  custom: "Custom window",
 }
-
-const SESSION_STATUSES: SessionStatusFilter[] = [
-  "pending",
-  "running",
-  "interrupting",
-  "completed",
-  "failed",
-  "interrupted",
-]
 
 const selectClassName =
-  "h-8 min-w-32 rounded-lg border border-input bg-background px-2.5 py-1 text-sm outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+  "h-8 min-w-36 rounded-lg border border-input bg-background px-2.5 py-1 text-sm outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
 
-function useDebouncedValue<T>(value: T, delayMs: number): T {
-  const [debounced, setDebounced] = useState(value)
-  useEffect(() => {
-    const handle = window.setTimeout(() => setDebounced(value), delayMs)
-    return () => window.clearTimeout(handle)
-  }, [delayMs, value])
-  return debounced
+type UsageFilterDraft = {
+  range: UsageRange
+  startAt: string
+  endAt: string
+  agentName: string
+  providerName: string
+  model: string
+  environmentName: string
+  parentSessionId: string
+  causalBudgetId: string
+  labels: string
+  labelSelectors: string
 }
 
-function optionalFilter(value: string) {
+type UsageScalarFilterField = keyof Pick<
+  UsageFilterDraft,
+  "agentName" | "providerName" | "model" | "environmentName" | "parentSessionId" | "causalBudgetId"
+>
+
+const USAGE_SCALAR_FILTERS: Array<{
+  id: string
+  label: string
+  field: UsageScalarFilterField
+  placeholder: string
+}> = [
+  { id: "usage-agent-filter", label: "Agent", field: "agentName", placeholder: "agent name" },
+  {
+    id: "usage-provider-filter",
+    label: "Provider",
+    field: "providerName",
+    placeholder: "provider name",
+  },
+  { id: "usage-model-filter", label: "Model", field: "model", placeholder: "model" },
+  {
+    id: "usage-environment-filter",
+    label: "Environment",
+    field: "environmentName",
+    placeholder: "environment",
+  },
+  {
+    id: "usage-parent-filter",
+    label: "Parent session",
+    field: "parentSessionId",
+    placeholder: "parent session ID",
+  },
+  {
+    id: "usage-budget-filter",
+    label: "Causal budget",
+    field: "causalBudgetId",
+    placeholder: "causal budget ID",
+  },
+]
+
+function optionalFilter(value: string): string | undefined {
   const trimmed = value.trim()
   return trimmed === "" ? undefined : trimmed
 }
 
-function formatCost(value: string | null | undefined, currency: string | null | undefined) {
-  if (!value || !currency) return "-"
-  return `${formatDecimal(value)} ${currency}`
-}
-
-function addUsage(left: UsageBreakdown["usage"], right: UsageBreakdown["usage"]) {
+function filterDraft(search: UsageRollupSearch): UsageFilterDraft {
   return {
-    provider_name: left.provider_name ?? right.provider_name ?? null,
-    requested_model: left.requested_model ?? right.requested_model ?? null,
-    model: left.model ?? right.model ?? null,
-    input_tokens: numericValue(left.input_tokens) + numericValue(right.input_tokens),
-    output_tokens: numericValue(left.output_tokens) + numericValue(right.output_tokens),
-    total_tokens: numericValue(left.total_tokens) + numericValue(right.total_tokens),
-    reasoning_output_tokens:
-      numericValue(left.reasoning_output_tokens) + numericValue(right.reasoning_output_tokens),
-    cache: {
-      read_tokens: numericValue(left.cache?.read_tokens) + numericValue(right.cache?.read_tokens),
-      write_tokens:
-        numericValue(left.cache?.write_tokens) + numericValue(right.cache?.write_tokens),
-      write_5m_tokens:
-        numericValue(left.cache?.write_5m_tokens) + numericValue(right.cache?.write_5m_tokens),
-      write_1h_tokens:
-        numericValue(left.cache?.write_1h_tokens) + numericValue(right.cache?.write_1h_tokens),
-      write_unknown_ttl_tokens:
-        numericValue(left.cache?.write_unknown_ttl_tokens) +
-        numericValue(right.cache?.write_unknown_ttl_tokens),
-      cached_input_tokens:
-        numericValue(left.cache?.cached_input_tokens) +
-        numericValue(right.cache?.cached_input_tokens),
-      uncached_input_tokens:
-        numericValue(left.cache?.uncached_input_tokens) +
-        numericValue(right.cache?.uncached_input_tokens),
-    },
+    range: usageRollupRange(search),
+    startAt: usageTimestampInputValue(search.start_at),
+    endAt: usageTimestampInputValue(search.end_at),
+    agentName: search.agent_name ?? "",
+    providerName: search.provider_name ?? "",
+    model: search.model ?? "",
+    environmentName: search.environment_name ?? "",
+    parentSessionId: search.parent_session_id ?? "",
+    causalBudgetId: search.causal_budget_id ?? "",
+    labels: search.label?.join("\n") ?? "",
+    labelSelectors: search.label_selector?.join("\n") ?? "",
   }
 }
 
-function mergeCost(left: SessionsSummary["cost"], right: SessionsSummary["cost"]) {
-  if (!left) return right
-  if (!right) return left
-  if (left.currency !== right.currency) {
-    throw new Error(
-      `Cannot merge usage costs with different currencies: ${left.currency}, ${right.currency}`,
-    )
-  }
-  return {
-    currency: left.currency,
-    session_ids: [...left.session_ids, ...right.session_ids],
-    session_count: left.session_count + right.session_count,
-    model_steps: left.model_steps + right.model_steps,
-    priced_model_steps: left.priced_model_steps + right.priced_model_steps,
-    unpriced_model_steps: left.unpriced_model_steps + right.unpriced_model_steps,
-    total_cost: addDecimalStrings(left.total_cost, right.total_cost),
-    line_items: [...left.line_items, ...right.line_items],
-    session_costs: [...left.session_costs, ...right.session_costs],
-  }
+function draftKey(draft: UsageFilterDraft): string {
+  return JSON.stringify(Object.values(draft).map((value) => value.trim()))
 }
 
-function mergeBreakdown(
-  left: UsageBreakdown[],
-  right: UsageBreakdown[],
-  keyOf: (item: UsageBreakdown) => string,
-) {
-  const buckets = new Map<string, UsageBreakdown>()
-  for (const item of [...left, ...right]) {
-    const key = keyOf(item)
-    const existing = buckets.get(key)
-    if (!existing) {
-      buckets.set(key, { ...item, usage: { ...item.usage, cache: { ...item.usage.cache } } })
-      continue
-    }
-    buckets.set(key, {
-      provider_name: existing.provider_name,
-      model: existing.model,
-      session_count: existing.session_count + item.session_count,
-      model_steps: existing.model_steps + item.model_steps,
-      usage: addUsage(existing.usage, item.usage),
+function UsageControls({
+  search,
+  resolvedWindow,
+  onApply,
+  onClearFilters,
+}: {
+  search: UsageRollupSearch
+  resolvedWindow: { startAt: string; endAt: string } | null
+  onApply: (search: UsageRollupSearch) => void
+  onClearFilters: () => void
+}) {
+  const confirmed = filterDraft(search)
+  const [draft, setDraft] = useState(confirmed)
+  const [error, setError] = useState<string | null>(null)
+  const [filtersOpen, setFiltersOpen] = useState(() => usageRollupFilterCount(search) > 0)
+  const dirty = draftKey(draft) !== draftKey(confirmed)
+  const filterCount = usageRollupFilterCount(search)
+
+  function setField<Key extends keyof UsageFilterDraft>(field: Key, value: UsageFilterDraft[Key]) {
+    setDraft((current) => ({ ...current, [field]: value }))
+    setError(null)
+  }
+
+  function selectRange(range: UsageRange) {
+    setDraft((current) => {
+      if (range !== "custom" || current.startAt || current.endAt || !resolvedWindow) {
+        return { ...current, range }
+      }
+      return {
+        ...current,
+        range,
+        startAt: usageTimestampInputValue(resolvedWindow.startAt),
+        endAt: usageTimestampInputValue(resolvedWindow.endAt),
+      }
     })
+    setError(null)
   }
-  return [...buckets.values()].sort((a, b) => {
-    const tokenDelta = numericValue(b.usage.total_tokens) - numericValue(a.usage.total_tokens)
-    if (tokenDelta !== 0) return tokenDelta
-    return `${a.provider_name ?? ""}/${a.model ?? ""}`.localeCompare(
-      `${b.provider_name ?? ""}/${b.model ?? ""}`,
-    )
-  })
+
+  function submit() {
+    try {
+      const next = validateUsageRollupSearch({
+        range: draft.range,
+        start_at:
+          draft.range === "custom"
+            ? usageTimestampFromUtcInput(draft.startAt, "Custom start", {
+                originalValue: search.start_at,
+                originalInputValue: confirmed.startAt,
+              })
+            : undefined,
+        end_at:
+          draft.range === "custom"
+            ? usageTimestampFromUtcInput(draft.endAt, "Custom end", {
+                originalValue: search.end_at,
+                originalInputValue: confirmed.endAt,
+              })
+            : undefined,
+        agent_name: optionalFilter(draft.agentName),
+        provider_name: optionalFilter(draft.providerName),
+        model: optionalFilter(draft.model),
+        environment_name: optionalFilter(draft.environmentName),
+        parent_session_id: optionalFilter(draft.parentSessionId),
+        causal_budget_id: optionalFilter(draft.causalBudgetId),
+        label: multilineUsageFilters(draft.labels),
+        label_selector: multilineUsageFilters(draft.labelSelectors),
+      })
+      const validation = usageRollupRequestState(next)
+      if (!validation.ok) throw new Error(validation.error)
+      onApply(next)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "The usage filters are invalid.")
+    }
+  }
+
+  return (
+    <DataCard>
+      <form
+        className="space-y-4 p-4"
+        onSubmit={(event) => {
+          event.preventDefault()
+          submit()
+        }}
+      >
+        <div className="flex min-w-0 flex-wrap items-end gap-3">
+          <label htmlFor="usage-range" className="text-sm text-muted-foreground">
+            Time range
+            <select
+              id="usage-range"
+              value={draft.range}
+              onChange={(event) => selectRange(event.target.value as UsageRange)}
+              className={cn(selectClassName, "mt-1.5 block")}
+            >
+              {Object.entries(RANGE_LABELS).map(([value, label]) => (
+                <option key={value} value={value}>
+                  {label}
+                </option>
+              ))}
+            </select>
+          </label>
+          {draft.range === "custom" && (
+            <>
+              <label htmlFor="usage-start-at" className="text-sm text-muted-foreground">
+                Start (UTC)
+                <Input
+                  id="usage-start-at"
+                  type="datetime-local"
+                  step="0.001"
+                  value={draft.startAt}
+                  onChange={(event) => setField("startAt", event.target.value)}
+                  className="mt-1.5"
+                />
+              </label>
+              <label htmlFor="usage-end-at" className="text-sm text-muted-foreground">
+                End (UTC)
+                <Input
+                  id="usage-end-at"
+                  type="datetime-local"
+                  step="0.001"
+                  value={draft.endAt}
+                  onChange={(event) => setField("endAt", event.target.value)}
+                  className="mt-1.5"
+                />
+              </label>
+            </>
+          )}
+          <Button type="submit" size="sm" disabled={!dirty}>
+            Apply
+          </Button>
+          {dirty && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                setDraft(confirmed)
+                setError(null)
+              }}
+            >
+              Discard changes
+            </Button>
+          )}
+          {filterCount > 0 && (
+            <Button type="button" variant="outline" size="sm" onClick={onClearFilters}>
+              Clear filters
+            </Button>
+          )}
+        </div>
+
+        <details
+          className="border-t border-border pt-3"
+          open={filtersOpen}
+          onToggle={(event) => setFiltersOpen(event.currentTarget.open)}
+        >
+          <summary className="flex cursor-pointer list-none items-center gap-2 text-sm font-medium">
+            <SlidersHorizontal className="h-4 w-4" />
+            Session filters
+            {filterCount > 0 && <Badge variant="secondary">{filterCount}</Badge>}
+          </summary>
+          <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {USAGE_SCALAR_FILTERS.map(({ id, label, field, placeholder }) => (
+              <label key={id} htmlFor={id} className="text-sm text-muted-foreground">
+                {label}
+                <Input
+                  id={id}
+                  value={draft[field]}
+                  onChange={(event) => setField(field, event.target.value)}
+                  placeholder={placeholder}
+                  className="mt-1.5"
+                />
+              </label>
+            ))}
+            <label htmlFor="usage-label-filter" className="text-sm text-muted-foreground">
+              Exact labels
+              <Textarea
+                id="usage-label-filter"
+                value={draft.labels}
+                onChange={(event) => setField("labels", event.target.value)}
+                placeholder={"tenant=acme\ntier=critical"}
+                className="mt-1.5"
+                rows={3}
+              />
+              <span className="mt-1 block text-xs">One key=value filter per line.</span>
+            </label>
+            <label htmlFor="usage-selector-filter" className="text-sm text-muted-foreground">
+              Label selectors
+              <Textarea
+                id="usage-selector-filter"
+                value={draft.labelSelectors}
+                onChange={(event) => setField("labelSelectors", event.target.value)}
+                placeholder={"region in (us,eu)\n!archived"}
+                className="mt-1.5"
+                rows={3}
+              />
+              <span className="mt-1 block text-xs">One selector expression per line.</span>
+            </label>
+          </div>
+        </details>
+        {error && (
+          <div className="text-sm text-destructive" role="alert">
+            {error}
+          </div>
+        )}
+      </form>
+    </DataCard>
+  )
 }
 
-async function fetchUsageRollup(query: SessionsSummaryQuery): Promise<UsageRollup> {
-  let cursor: string | null | undefined
-  let pages = 0
-  const sessions: UsageRollup["sessions"] = []
-  const sessionSummaries: UsageSession[] = []
-  let totalCount: number | null = null
-  let usage: UsageRollup["usage"] = {}
-  let modelSteps = 0
-  let toolCalls = 0
-  let providerBreakdown: UsageBreakdown[] = []
-  let modelBreakdown: UsageBreakdown[] = []
-  let cost: SessionsSummary["cost"] = null
+function AccuracyBadge({ accuracy }: { accuracy: AggregateAccuracy }) {
+  return (
+    <Badge variant={accuracy.kind === "exact" ? "secondary" : "outline"}>{accuracy.kind}</Badge>
+  )
+}
 
-  do {
-    const page = await fetchSessionsSummary(
-      {
-        ...query,
-        limit: USAGE_ROLLUP_PAGE_LIMIT,
-        cursor,
-        offset: undefined,
-      },
-      {
-        pricing: dashboardConfig.priceBook,
-      },
-    )
-    pages += 1
-    sessions.push(...page.sessions)
-    sessionSummaries.push(...page.usage.session_summaries)
-    totalCount = page.total_count
-    usage = addUsage(usage, page.usage.usage)
-    modelSteps += page.usage.model_steps
-    toolCalls += page.usage.tool_calls
-    providerBreakdown = mergeBreakdown(
-      providerBreakdown,
-      page.provider_breakdown ?? [],
-      (item) => item.provider_name ?? "unknown-provider",
-    )
-    modelBreakdown = mergeBreakdown(
-      modelBreakdown,
-      page.model_breakdown ?? [],
-      (item) => `${item.provider_name ?? "unknown-provider"}\u0000${item.model ?? "unknown-model"}`,
-    )
-    cost = mergeCost(cost, page.cost)
-    cursor = page.next_cursor
-  } while (cursor && pages < USAGE_ROLLUP_MAX_PAGES)
-
-  return {
-    sessions,
-    sessionSummaries,
-    totalCount,
-    loadedCount: sessions.length,
-    nextCursor: cursor ?? null,
-    usage,
-    modelSteps,
-    toolCalls,
-    providerBreakdown,
-    modelBreakdown,
-    cost,
-  }
+function accuracyExplanation(accuracy: AggregateAccuracy, fallback: string): string {
+  const reason = accuracy.reason ?? fallback
+  return accuracy.limit ? `${reason} Limit: ${formatCount(accuracy.limit)}.` : reason
 }
 
 function MetricCard({
@@ -260,16 +400,29 @@ function MetricCard({
 function BreakdownTable({
   title,
   description,
-  rows,
-  includeModel,
+  breakdown,
+  includeModel = false,
 }: {
   title: string
   description: string
-  rows: UsageBreakdown[]
+  breakdown: UsageAggregateBreakdown
   includeModel?: boolean
 }) {
+  const remainder = breakdown.remainder
   return (
-    <DataCard title={title} description={description}>
+    <DataCard
+      title={title}
+      description={description}
+      actions={<AccuracyBadge accuracy={breakdown.accuracy} />}
+    >
+      {breakdown.accuracy.kind !== "exact" && (
+        <div className="border-b border-border bg-chart-1/5 px-4 py-3 text-sm text-chart-1">
+          {accuracyExplanation(
+            breakdown.accuracy,
+            "This breakdown does not cover the complete scope.",
+          )}
+        </div>
+      )}
       <Table>
         <TableHeader>
           <TableRow>
@@ -283,28 +436,57 @@ function BreakdownTable({
           </TableRow>
         </TableHeader>
         <TableBody>
-          {rows.length ? (
-            rows.map((row) => (
-              <TableRow key={`${row.provider_name ?? "unknown"}:${row.model ?? "all"}`}>
-                <TableCell>{row.provider_name ?? "unknown"}</TableCell>
-                {includeModel && (
-                  <TableCell className="max-w-56 truncate font-mono text-xs">
-                    {row.model ?? "unknown"}
-                  </TableCell>
-                )}
-                <TableCell className="text-right">{formatCount(row.model_steps)}</TableCell>
-                <TableCell className="text-right">{formatCount(row.session_count)}</TableCell>
-                <TableCell className="text-right">{formatCount(row.usage.input_tokens)}</TableCell>
-                <TableCell className="text-right">{formatCount(row.usage.output_tokens)}</TableCell>
-                <TableCell className="text-right font-medium">
-                  {formatCount(row.usage.total_tokens)}
+          {breakdown.groups.map((group) => (
+            <TableRow key={JSON.stringify([group.provider_name, group.model])}>
+              <TableCell>{group.provider_name ?? "unknown"}</TableCell>
+              {includeModel && (
+                <TableCell className="max-w-56 truncate font-mono text-xs">
+                  {group.model ?? "unknown"}
                 </TableCell>
-              </TableRow>
-            ))
-          ) : (
+              )}
+              <TableCell className="text-right">{formatCount(group.totals.model_steps)}</TableCell>
+              <TableCell className="text-right">
+                {formatCount(group.totals.session_count)}
+              </TableCell>
+              <TableCell className="text-right">
+                {formatCount(group.totals.usage.input_tokens)}
+              </TableCell>
+              <TableCell className="text-right">
+                {formatCount(group.totals.usage.output_tokens)}
+              </TableCell>
+              <TableCell className="text-right font-medium">
+                {formatCount(group.totals.usage.total_tokens)}
+              </TableCell>
+            </TableRow>
+          ))}
+          {remainder && (
+            <TableRow className="bg-muted/40">
+              <TableCell>
+                Other {formatCount(remainder.group_count)} {includeModel ? "model" : "provider"}
+                {remainder.group_count === "1" ? " group" : " groups"}
+              </TableCell>
+              {includeModel && <TableCell className="text-muted-foreground">combined</TableCell>}
+              <TableCell className="text-right">
+                {formatCount(remainder.totals.model_steps)}
+              </TableCell>
+              <TableCell className="text-right">
+                {formatCount(remainder.totals.session_count)}
+              </TableCell>
+              <TableCell className="text-right">
+                {formatCount(remainder.totals.usage.input_tokens)}
+              </TableCell>
+              <TableCell className="text-right">
+                {formatCount(remainder.totals.usage.output_tokens)}
+              </TableCell>
+              <TableCell className="text-right font-medium">
+                {formatCount(remainder.totals.usage.total_tokens)}
+              </TableCell>
+            </TableRow>
+          )}
+          {!breakdown.groups.length && !remainder && (
             <TableRow>
               <TableCell colSpan={includeModel ? 7 : 6}>
-                <StateMessage>No model usage in the current filters.</StateMessage>
+                <StateMessage>No model usage in this window and filter scope.</StateMessage>
               </TableCell>
             </TableRow>
           )}
@@ -314,337 +496,510 @@ function BreakdownTable({
   )
 }
 
-function BedrockBillingBreakdown({
-  lineItems,
-  currency,
-  scopeDescription,
-}: {
-  lineItems: UsageCostLineItem[]
-  currency: string
-  scopeDescription: string
-}) {
-  const rows = useMemo(() => bedrockBillingRows(lineItems), [lineItems])
+function CostSummary({ cost }: { cost: UsageCostRollup | null }) {
+  if (!cost) {
+    return (
+      <DataCard title="Estimated Cost" description="No dashboard price book is configured.">
+        <StateMessage>
+          Usage remains available, but cost is unavailable rather than displayed as zero.
+        </StateMessage>
+      </DataCard>
+    )
+  }
 
-  if (!rows.length) return null
+  const currencies = cost.currencies.slice(0, RENDERED_DETAIL_LIMIT)
+  const reasons = cost.unpriced_reasons.slice(0, RENDERED_DETAIL_LIMIT)
+  const hasCoverageGap = cost.unpriced_model_steps !== "0" || cost.unevaluated_model_steps !== "0"
   return (
     <DataCard
-      title="Bedrock Billing Breakdown"
-      description={`Exact invocation identity within ${scopeDescription}; regions, profiles, and tiers are never combined.`}
+      title="Estimated Cost"
+      description={`Price book ${cost.price_book_version}, generated ${cost.price_book_generated_at}; currencies are never combined.`}
+      actions={<AccuracyBadge accuracy={cost.accuracy} />}
     >
+      <div className="grid gap-3 border-b border-border p-4 sm:grid-cols-3">
+        <div>
+          <div className="text-xs uppercase text-muted-foreground">Priced steps</div>
+          <div className="mt-1 text-xl font-semibold">{formatCount(cost.priced_model_steps)}</div>
+        </div>
+        <div>
+          <div className="text-xs uppercase text-muted-foreground">Unpriced steps</div>
+          <div className="mt-1 text-xl font-semibold">{formatCount(cost.unpriced_model_steps)}</div>
+        </div>
+        <div>
+          <div className="text-xs uppercase text-muted-foreground">Unevaluated steps</div>
+          <div className="mt-1 text-xl font-semibold">
+            {formatCount(cost.unevaluated_model_steps)}
+          </div>
+        </div>
+      </div>
+      {(hasCoverageGap || cost.accuracy.kind !== "exact") && (
+        <div className="border-b border-border bg-chart-1/5 px-4 py-3 text-sm text-chart-1">
+          {accuracyExplanation(
+            cost.accuracy,
+            "Some model steps could not be priced; displayed currency totals cover priced steps only.",
+          )}
+        </div>
+      )}
       <Table>
         <TableHeader>
           <TableRow>
-            <TableHead>Invoked resource</TableHead>
-            <TableHead>Source region</TableHead>
-            <TableHead>Scope</TableHead>
-            <TableHead>Requested / effective tier</TableHead>
-            <TableHead>Pricing target</TableHead>
-            <TableHead className="text-right">Priced / unpriced</TableHead>
-            <TableHead className="text-right">Cost</TableHead>
+            <TableHead>Currency</TableHead>
+            <TableHead className="text-right">Priced steps</TableHead>
+            <TableHead className="text-right">Estimated cost</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
-          {rows.map((row) => (
-            <TableRow
-              key={JSON.stringify([
-                row.identity.invoked_model,
-                row.identity.source_region,
-                row.identity.resource_type,
-                row.identity.profile_scope,
-                row.identity.requested_service_tier,
-                row.identity.effective_service_tier,
-              ])}
-            >
-              <TableCell className="max-w-80 truncate font-mono text-xs">
-                {row.identity.invoked_model}
+          {currencies.map((currency) => (
+            <TableRow key={currency.currency}>
+              <TableCell>{currency.currency}</TableCell>
+              <TableCell className="text-right">{formatCount(currency.model_steps)}</TableCell>
+              <TableCell className="text-right font-medium">
+                {formatDecimal(currency.total_cost)}
               </TableCell>
-              <TableCell>{row.identity.source_region ?? "unresolved"}</TableCell>
-              <TableCell>{row.identity.profile_scope ?? row.identity.resource_type}</TableCell>
-              <TableCell>
-                {row.identity.requested_service_tier ?? "default"} /{" "}
-                {row.identity.effective_service_tier ?? "not reported"}
-              </TableCell>
-              <TableCell className="max-w-64 truncate font-mono text-xs">
-                {row.pricingModel ?? row.missingReason ?? "unpriced"}
-              </TableCell>
-              <TableCell className="text-right">
-                {formatCount(row.priced)} / {formatCount(row.unpriced)}
-              </TableCell>
-              <TableCell className="text-right">{formatCost(row.totalCost, currency)}</TableCell>
             </TableRow>
           ))}
+          {!currencies.length && (
+            <TableRow>
+              <TableCell colSpan={3}>
+                <StateMessage>No model steps were priced in this scope.</StateMessage>
+              </TableCell>
+            </TableRow>
+          )}
         </TableBody>
       </Table>
+      {cost.currencies.length > currencies.length && (
+        <div className="border-t border-border px-4 py-3 text-sm text-muted-foreground">
+          {formatCount(cost.currencies.length - currencies.length)} additional currency rows are
+          omitted from rendering.
+        </div>
+      )}
+      {reasons.length > 0 && (
+        <div className="border-t border-border p-4">
+          <div className="text-sm font-medium">Unpriced reasons</div>
+          <ul className="mt-2 space-y-1 text-sm text-muted-foreground">
+            {reasons.map((reason) => (
+              <li key={reason.reason} className="flex justify-between gap-3">
+                <span>{reason.reason}</span>
+                <span className="shrink-0">{formatCount(reason.model_steps)} steps</span>
+              </li>
+            ))}
+          </ul>
+          {cost.unpriced_reasons.length > reasons.length && (
+            <div className="mt-2 text-xs text-muted-foreground">
+              {formatCount(cost.unpriced_reasons.length - reasons.length)} additional reasons are
+              omitted from rendering.
+            </div>
+          )}
+        </div>
+      )}
     </DataCard>
   )
 }
 
-export function UsagePage() {
-  const [search, setSearch] = useState("")
-  const [status, setStatus] = useState<SessionStatusFilter>("all")
-  const debouncedSearch = useDebouncedValue(search, 300)
-  const query = useMemo<SessionsSummaryQuery>(
-    () => ({
-      q: optionalFilter(debouncedSearch),
-      status: status === "all" ? undefined : status,
-      order_by: "updated_at_desc",
-    }),
-    [debouncedSearch, status],
+function BillingIdentityBreakdown({ cost }: { cost: UsageCostRollup | null }) {
+  if (!cost) return null
+  const breakdown = cost.billing_breakdown
+  const rows = billingCostRows(breakdown.groups)
+  const coverage = billingIdentityCoverage(cost)
+  const hasIdentityDetail = rows.length > 0 || breakdown.remainder !== null
+  return (
+    <div data-testid="usage-billing-breakdown">
+      <DataCard
+        title="Billing Identity Breakdown"
+        description="Bounded commercial identity for identified pricing inputs. Coverage is reported separately; Bedrock regions, profiles, and tiers remain distinct while other provider evidence stays excluded."
+        actions={<AccuracyBadge accuracy={breakdown.accuracy} />}
+      >
+        <div
+          className="grid gap-3 border-b border-border p-4 sm:grid-cols-3"
+          data-testid="usage-billing-identity-coverage"
+        >
+          <div>
+            <div className="text-xs uppercase text-muted-foreground">Identified steps</div>
+            <div className="mt-1 text-xl font-semibold">
+              {formatCount(coverage?.identified ?? breakdown.identified_model_steps)}
+            </div>
+          </div>
+          <div>
+            <div className="text-xs uppercase text-muted-foreground">Evaluated steps</div>
+            <div className="mt-1 text-xl font-semibold">
+              {formatCount(coverage?.evaluated ?? cost.evaluated_model_steps)}
+            </div>
+          </div>
+          <div>
+            <div className="text-xs uppercase text-muted-foreground">Without identity</div>
+            <div className="mt-1 text-xl font-semibold">
+              {coverage ? formatCount(coverage.missing) : "—"}
+            </div>
+          </div>
+        </div>
+        {coverage && coverage.missing !== "0" && (
+          <div
+            className="border-b border-border bg-chart-1/5 px-4 py-3 text-sm text-chart-1"
+            data-testid="usage-billing-identity-gap"
+          >
+            Billing identity is missing for {formatCount(coverage.missing)} of{" "}
+            {formatCount(coverage.evaluated)} evaluated model steps. Missing steps are not
+            represented in this table, but remain in the aggregate usage and cost accounting above.
+          </div>
+        )}
+        {!coverage && (
+          <div className="border-b border-border bg-destructive/5 px-4 py-3 text-sm text-destructive">
+            Billing identity coverage is unavailable because the returned counters are inconsistent.
+          </div>
+        )}
+        {breakdown.accuracy.kind !== "exact" && (
+          <div className="border-b border-border bg-chart-1/5 px-4 py-3 text-sm text-chart-1">
+            {accuracyExplanation(
+              breakdown.accuracy,
+              "This billing-identity breakdown does not include every identified group.",
+            )}
+          </div>
+        )}
+        {hasIdentityDetail ? (
+          <>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Provider</TableHead>
+                  <TableHead>Invoked resource</TableHead>
+                  <TableHead>Source region</TableHead>
+                  <TableHead>Scope</TableHead>
+                  <TableHead>Requested / effective tier</TableHead>
+                  <TableHead>Pricing target</TableHead>
+                  <TableHead className="text-right">Priced / unpriced</TableHead>
+                  <TableHead className="text-right">Cost</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {rows.map((row) => (
+                  <TableRow
+                    key={JSON.stringify([
+                      row.identity.invoked_model,
+                      row.identity.provider_name,
+                      row.identity.source_region,
+                      row.identity.resource_type,
+                      row.identity.profile_scope,
+                      row.identity.requested_service_tier,
+                      row.identity.effective_service_tier,
+                      row.pricingProvider,
+                      row.pricingModel,
+                      row.currency,
+                      row.missingReason,
+                    ])}
+                  >
+                    <TableCell>{row.identity.provider_name}</TableCell>
+                    <TableCell className="max-w-80 truncate font-mono text-xs">
+                      {row.identity.invoked_model}
+                    </TableCell>
+                    <TableCell>
+                      {row.identity.source_region ??
+                        (row.identity.provider_name === "bedrock" ? "unresolved" : "not reported")}
+                    </TableCell>
+                    <TableCell>
+                      {row.identity.profile_scope ??
+                        row.identity.resource_type ??
+                        (row.identity.provider_name === "bedrock" ? "unresolved" : "not reported")}
+                    </TableCell>
+                    <TableCell>
+                      {row.identity.provider_name === "bedrock"
+                        ? `${row.identity.requested_service_tier ?? "unresolved"} / ${
+                            row.identity.effective_service_tier ?? "not reported"
+                          }`
+                        : "not reported"}
+                    </TableCell>
+                    <TableCell className="max-w-64 truncate font-mono text-xs">
+                      {row.pricingModel
+                        ? `${row.pricingProvider ?? "unknown"}/${row.pricingModel}`
+                        : (row.missingReason ?? "unpriced")}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      {formatCount(row.priced)} / {formatCount(row.unpriced)}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      {row.currency ? `${formatDecimal(row.totalCost)} ${row.currency}` : "—"}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+            {breakdown.remainder && (
+              <div className="border-t border-border px-4 py-3 text-sm text-muted-foreground">
+                {formatCount(breakdown.remainder.group_count)} additional billing identity groups
+                across providers ({formatCount(breakdown.remainder.model_steps)} model steps) are
+                included in aggregate cost totals but omitted from this bounded table. Narrow the
+                provider filter to inspect a crowded provider.
+              </div>
+            )}
+          </>
+        ) : (
+          <StateMessage>
+            {coverage?.evaluated === "0"
+              ? "No model steps were evaluated for pricing in this scope."
+              : `No billing identity was reported. Evaluated model-step count: ${formatCount(
+                  coverage?.evaluated ?? cost.evaluated_model_steps,
+                )}.`}
+          </StateMessage>
+        )}
+      </DataCard>
+    </div>
   )
+}
 
+function UsageScope({ data }: { data: UsageRollup }) {
+  const exact = data.accuracy.kind === "exact"
+  return (
+    <div
+      className={cn(
+        "flex items-start gap-3 rounded-md border px-4 py-3 text-sm",
+        exact
+          ? "border-border bg-muted/40 text-foreground"
+          : "border-chart-1/30 bg-chart-1/5 text-chart-1",
+      )}
+      data-testid="usage-aggregate-scope"
+      role={exact ? "status" : "alert"}
+    >
+      {exact ? (
+        <Database className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+      ) : (
+        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+      )}
+      <div className="space-y-1">
+        <div className="flex flex-wrap items-center gap-2 font-medium">
+          <span>{exact ? "Authoritative store rollup" : `${data.accuracy.kind} store rollup`}</span>
+          <AccuracyBadge accuracy={data.accuracy} />
+        </div>
+        <div className={exact ? "text-muted-foreground" : undefined}>
+          Events from {formatDateTime(data.start_at)} inclusive to {formatDateTime(data.end_at)}{" "}
+          exclusive, as of {formatDateTime(data.as_of)}. Filters use current session attributes;
+          event time is the usage basis. Times are shown in this browser&apos;s local zone.
+        </div>
+        {!exact && (
+          <div>
+            {accuracyExplanation(data.accuracy, "This rollup does not cover the complete scope.")}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function UsagePageForSearch({ search }: { search: UsageRollupSearch }) {
+  const navigate = useNavigate({ from: "/usage" })
+  const queryAnchor = useRef(new Date())
+  const searchKey = JSON.stringify(search)
+  const requestState = useMemo(
+    () =>
+      usageRollupRequestState(search, {
+        now: queryAnchor.current,
+        pricing: dashboardConfig.priceBook,
+      }),
+    [search],
+  )
+  const request = requestState.ok ? requestState.request : null
   const usage = useQuery({
-    queryKey: ["usage-rollup", query],
-    queryFn: () => fetchUsageRollup(query),
+    queryKey: ["usage-rollup", searchKey],
+    queryFn: ({ signal }) => {
+      const currentRequest = usageRollupRequestState(search, {
+        now: queryAnchor.current,
+        pricing: dashboardConfig.priceBook,
+      })
+      if (!currentRequest.ok) throw new Error(currentRequest.error)
+      return fetchUsageRollup(currentRequest.request, signal)
+    },
+    enabled: request !== null,
+    gcTime: 0,
+    refetchOnWindowFocus: false,
+    retry: retryAggregateRequest,
   })
   const data = usage.data
-  const scope = describeUsageRollupScope({
-    hasMore: Boolean(data?.nextCursor),
-    loadedCount: data?.loadedCount ?? 0,
-    totalCount: data?.totalCount ?? null,
-  })
-  const ScopeIcon = scope.kind === "partial" ? AlertTriangle : Database
-  const hasFilters = search.trim() !== "" || status !== "all"
-  const costBySessionId = useMemo(() => {
-    const bySessionId = new Map<string, UsageSessionCost>()
-    for (const item of data?.cost?.session_costs ?? []) {
-      bySessionId.set(item.session_id, item)
-    }
-    return bySessionId
-  }, [data?.cost?.session_costs])
-  const topSessions = useMemo(() => {
-    if (!data) return []
-    const sessionsById = new Map(data.sessions.map((item) => [item.session.id, item.session]))
-    return [...data.sessionSummaries]
-      .sort((a, b) => {
-        if (data.cost) {
-          const costDelta =
-            numericValue(costBySessionId.get(b.session_id)?.total_cost) -
-            numericValue(costBySessionId.get(a.session_id)?.total_cost)
-          if (costDelta !== 0) return costDelta
-        }
-        return numericValue(b.usage?.total_tokens) - numericValue(a.usage?.total_tokens)
-      })
-      .slice(0, 20)
-      .map((summary) => ({
-        summary,
-        session: sessionsById.get(summary.session_id),
-        cost: costBySessionId.get(summary.session_id),
-      }))
-  }, [costBySessionId, data])
+  const filterCount = usageRollupFilterCount(search)
+
+  function applySearch(next: UsageRollupSearch) {
+    void navigate({ search: next, resetScroll: false })
+  }
 
   function clearFilters() {
-    setSearch("")
-    setStatus("all")
+    void navigate({
+      search: (current) => usageRollupSearchWithoutFilters(current),
+      resetScroll: false,
+    })
+  }
+
+  function refreshUsage() {
+    queryAnchor.current = new Date()
+    void usage.refetch()
   }
 
   return (
     <Page>
       <PageHeader
         title="Usage"
-        description={`Client-side usage rollup over at most ${formatCount(USAGE_ROLLUP_SESSION_LIMIT)} most recently updated matching sessions. The current loaded scope is shown below.`}
+        description="Store-native activity, token, and cost totals over an explicit event-time window."
+        actions={
+          <div className="flex flex-wrap gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={refreshUsage}
+              disabled={usage.isFetching}
+            >
+              <RefreshCw className={cn("h-4 w-4", usage.isFetching && "animate-spin")} />
+              Refresh window
+            </Button>
+            <Link
+              to="/sessions"
+              search={usageRollupSessionSearch(search)}
+              className={buttonVariants({ variant: "outline" })}
+            >
+              Browse matching sessions
+            </Link>
+          </div>
+        }
       />
 
-      <DataCard>
-        <div className="flex min-w-0 flex-wrap items-center gap-2 border-b border-border p-4">
-          <div className="relative min-w-56 flex-[2_1_18rem]">
-            <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              value={search}
-              onChange={(event) => setSearch(event.target.value)}
-              placeholder="Search sessions, agents, providers, models..."
-              className="pl-8"
-            />
-          </div>
-          <select
-            value={status}
-            onChange={(event) => setStatus(event.target.value as SessionStatusFilter)}
-            className={selectClassName}
-            aria-label="Filter by status"
-          >
-            <option value="all">All statuses</option>
-            {SESSION_STATUSES.map((item) => (
-              <option key={item} value={item}>
-                {item}
-              </option>
-            ))}
-          </select>
-          {hasFilters && (
-            <Button variant="outline" size="sm" onClick={clearFilters}>
-              Clear
-            </Button>
-          )}
-        </div>
-      </DataCard>
+      <UsageControls
+        search={search}
+        resolvedWindow={
+          data
+            ? { startAt: data.start_at, endAt: data.end_at }
+            : request
+              ? { startAt: request.start_at, endAt: request.end_at }
+              : null
+        }
+        onApply={applySearch}
+        onClearFilters={clearFilters}
+      />
 
-      {usage.isError ? (
+      {!requestState.ok ? (
         <StateMessage tone="danger">
-          {usage.error instanceof Error ? usage.error.message : "Failed to load usage."}
+          <div role="alert">
+            <div className="font-medium">The usage query is invalid.</div>
+            <div className="mt-1">{requestState.error}</div>
+          </div>
+        </StateMessage>
+      ) : usage.isError && !data ? (
+        <StateMessage tone="danger">
+          <div className="space-y-2" role="alert">
+            <div>
+              {usage.error instanceof Error ? usage.error.message : "Failed to load usage."}
+            </div>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={usage.isFetching}
+              onClick={() => void usage.refetch()}
+            >
+              {usage.isFetching ? "Retrying..." : "Retry"}
+            </Button>
+          </div>
         </StateMessage>
       ) : usage.isLoading || !data ? (
-        <StateMessage>Loading usage...</StateMessage>
+        <StateMessage>Loading the bounded usage rollup...</StateMessage>
       ) : (
         <>
-          <div
-            className={cn(
-              "flex items-start gap-3 rounded-md border px-4 py-3 text-sm",
-              scope.kind === "complete"
-                ? "border-border bg-muted/40 text-foreground"
-                : "border-chart-1/30 bg-chart-1/5 text-chart-1",
-            )}
-            data-testid="usage-loaded-scope"
-            role={scope.kind === "partial" ? "alert" : "status"}
-          >
-            <ScopeIcon className="mt-0.5 h-4 w-4 flex-shrink-0" />
-            <div className="space-y-1">
-              <div className="font-medium">{scope.label}</div>
-              <div>{scope.description}</div>
-            </div>
-          </div>
+          {usage.isError && (
+            <StateMessage tone="danger">
+              <div data-testid="usage-retained-error">
+                The last confirmed rollup remains visible, but its refresh failed.{" "}
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={usage.isFetching}
+                  onClick={() => void usage.refetch()}
+                >
+                  Retry
+                </Button>
+              </div>
+            </StateMessage>
+          )}
+          <UsageScope data={data} />
 
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-5">
             <MetricCard
               icon={Database}
-              label="Loaded Sessions"
-              value={formatCount(data.loadedCount)}
-              detail={scope.metricQualifier}
+              label="Matching Sessions"
+              value={formatCount(data.matching_session_count)}
+              detail={`${formatCount(data.active_session_count)} active; ${
+                filterCount
+                  ? `${filterCount} current-attribute filter${filterCount === 1 ? "" : "s"}`
+                  : "all current sessions"
+              }; not time-bounded`}
+            />
+            <MetricCard
+              icon={Activity}
+              label="Sessions with Activity"
+              value={formatCount(data.totals.session_count)}
+              detail={
+                data.includes_active_sessions
+                  ? "model or tool activity in-window; active sessions included"
+                  : "model or tool activity in-window; active sessions excluded"
+              }
             />
             <MetricCard
               icon={Hash}
               label="Tokens"
-              value={formatCount(data.usage.total_tokens)}
-              detail={`${formatCount(data.usage.input_tokens)} in / ${formatCount(data.usage.output_tokens)} out across ${scope.metricQualifier}`}
+              value={formatCount(data.totals.usage.total_tokens)}
+              detail={`${formatCount(data.totals.usage.input_tokens)} in / ${formatCount(data.totals.usage.output_tokens)} out`}
+              tone={data.accuracy.kind === "exact" ? "default" : "warning"}
             />
             <MetricCard
               icon={Workflow}
               label="Model Steps"
-              value={formatCount(data.modelSteps)}
-              detail={`${formatCount(data.toolCalls)} tool calls across ${scope.metricQualifier}`}
+              value={formatCount(data.totals.model_steps)}
+              detail={`${formatCount(data.totals.model_steps_with_usage)} reported normalized usage`}
+              tone={data.accuracy.kind === "exact" ? "default" : "warning"}
             />
             <MetricCard
-              icon={Coins}
-              label="Estimated Cost"
-              value={data.cost ? formatDecimal(data.cost.total_cost) : "—"}
-              detail={
-                data.cost
-                  ? `${data.cost.currency} across ${scope.metricQualifier}`
-                  : `Pricing not supplied; ${scope.metricQualifier}`
-              }
-              tone={data.cost?.unpriced_model_steps ? "warning" : "default"}
-            />
-            <MetricCard
-              icon={AlertTriangle}
-              label="Unpriced Steps"
-              value={data.cost ? formatCount(data.cost.unpriced_model_steps) : "—"}
-              detail={
-                data.cost
-                  ? `From the price book across ${scope.metricQualifier}`
-                  : `Cost not estimated; ${scope.metricQualifier}`
-              }
-              tone={data.cost?.unpriced_model_steps ? "warning" : "default"}
+              icon={CalendarRange}
+              label="Tool Calls"
+              value={formatCount(data.totals.tool_calls)}
+              detail="tool.call.started events in the window"
+              tone={data.accuracy.kind === "exact" ? "default" : "warning"}
             />
           </div>
 
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
             <BreakdownTable
               title="Provider Breakdown"
-              description={`Provider-level token totals from model.completed events across ${scope.metricQualifier}.`}
-              rows={data.providerBreakdown}
+              description="Top provider groups by normalized total tokens; omitted groups are combined explicitly."
+              breakdown={data.provider_breakdown}
             />
             <BreakdownTable
               title="Model Breakdown"
-              description={`Provider/model token totals from model.completed events across ${scope.metricQualifier}.`}
-              rows={data.modelBreakdown}
+              description="Top provider/model groups by normalized total tokens; omitted groups are combined explicitly."
+              breakdown={data.model_breakdown}
               includeModel
             />
           </div>
 
-          {data.cost && (
-            <BedrockBillingBreakdown
-              lineItems={data.cost.line_items}
-              currency={data.cost.currency}
-              scopeDescription={scope.metricQualifier}
-            />
-          )}
+          <CostSummary cost={data.cost} />
+          <BillingIdentityBreakdown cost={data.cost} />
 
-          <DataCard
-            title={data.cost ? "Highest Cost Sessions" : "Highest Token Sessions"}
-            description={
-              data.cost
-                ? `Up to 20 sessions by estimated cost within ${scope.metricQualifier}.`
-                : `Up to 20 sessions by total tokens within ${scope.metricQualifier}.`
-            }
-          >
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Session</TableHead>
-                  <TableHead>Status</TableHead>
-                  <TableHead>Provider</TableHead>
-                  <TableHead>Model</TableHead>
-                  <TableHead className="text-right">Input</TableHead>
-                  <TableHead className="text-right">Output</TableHead>
-                  <TableHead className="text-right">Total</TableHead>
-                  {data.cost && <TableHead className="text-right">Cost</TableHead>}
-                  <TableHead>Updated</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {topSessions.length ? (
-                  topSessions.map(({ cost, session, summary }) => (
-                    <TableRow key={summary.session_id}>
-                      <TableCell>
-                        <Link
-                          to="/sessions/$sessionId"
-                          params={{ sessionId: summary.session_id }}
-                          className="font-mono text-sm text-primary hover:underline"
-                        >
-                          {summary.session_id}
-                        </Link>
-                      </TableCell>
-                      <TableCell>
-                        {session ? <Badge variant="outline">{session.status}</Badge> : "-"}
-                      </TableCell>
-                      <TableCell>
-                        {session?.provider_name ?? summary.provider_names?.[0] ?? "-"}
-                      </TableCell>
-                      <TableCell className="max-w-56 truncate font-mono text-xs">
-                        {session?.model ?? summary.models?.[0] ?? "-"}
-                      </TableCell>
-                      <TableCell className="text-right">
-                        {formatCount(summary.usage?.input_tokens)}
-                      </TableCell>
-                      <TableCell className="text-right">
-                        {formatCount(summary.usage?.output_tokens)}
-                      </TableCell>
-                      <TableCell className="text-right font-medium">
-                        {formatCount(summary.usage?.total_tokens)}
-                      </TableCell>
-                      {data.cost && (
-                        <TableCell className="text-right font-medium">
-                          {formatCost(cost?.total_cost, cost?.currency)}
-                        </TableCell>
-                      )}
-                      <TableCell className="text-muted-foreground">
-                        {formatDateTime(session?.updated_at)}
-                      </TableCell>
-                    </TableRow>
-                  ))
-                ) : (
-                  <TableRow>
-                    <TableCell colSpan={data.cost ? 9 : 8}>
-                      <StateMessage>
-                        {hasFilters
-                          ? "No sessions with usage match the current filters."
-                          : "No session usage yet."}
-                      </StateMessage>
-                    </TableCell>
-                  </TableRow>
-                )}
-              </TableBody>
-            </Table>
-          </DataCard>
+          <div className="flex items-start gap-3 rounded-md border border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground">
+            <Coins className="mt-0.5 h-4 w-4 shrink-0" />
+            <div>
+              Aggregate responses intentionally omit session histories and per-session cost rows.
+              Use{" "}
+              <Link
+                to="/sessions"
+                search={usageRollupSessionSearch(search)}
+                className="text-primary underline"
+              >
+                matching sessions
+              </Link>{" "}
+              for bounded drill-down; the time window applies only to this aggregate view.
+            </div>
+          </div>
         </>
       )}
     </Page>
   )
+}
+
+export function UsagePage() {
+  const search = useSearch({ from: "/usage" })
+  const searchKey = JSON.stringify(search)
+  return <UsagePageForSearch key={searchKey} search={search} />
 }

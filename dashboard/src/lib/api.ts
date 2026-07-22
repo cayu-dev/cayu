@@ -21,6 +21,7 @@ import type {
   GetArtifactApiArtifactsArtifactIdGetData,
   GetArtifactContentApiArtifactsArtifactIdContentGetData,
   GetContractApiContractGetResponse,
+  GetOperationalSnapshotApiOperationsSnapshotPostResponse,
   GetSessionApiSessionsSessionIdGetResponse,
   GetSessionStateApiSessionsSessionIdStateGetResponse,
   GetSessionSummaryApiSessionsSessionIdSummaryGetResponse,
@@ -29,6 +30,7 @@ import type {
   GetSessionTranscriptApiSessionsSessionIdTranscriptGetData,
   GetSessionTranscriptApiSessionsSessionIdTranscriptGetResponse,
   GetTaskApiTasksTaskIdGetResponse,
+  GetUsageRollupApiUsageRollupPostResponse,
   InterruptSessionBody,
   ListArtifactsApiArtifactsGetData,
   ListPendingActionsApiPendingActionsGetData,
@@ -39,6 +41,7 @@ import type {
   ListSessionsApiSessionsGetData,
   ListSessionsApiSessionsGetResponse,
   ListTasksApiTasksGetData,
+  OperationalSnapshotRequest,
   PendingKnowledgeDetailResponse,
   PendingKnowledgeListResponse,
   RejectKnowledgeApiKnowledgeEntryIdRejectPostResponse,
@@ -54,10 +57,11 @@ import type {
   UpdateSessionLabelsBody,
   UpdateSessionMetadataApiSessionsSessionIdMetadataPatchResponse,
   UpdateSessionMetadataBody,
+  UsageRollupRequest,
   UserInputRecoveryBody,
 } from "./generated/server-api"
 
-export const SUPPORTED_SERVER_CONTRACT_VERSION = "1"
+export const SUPPORTED_SERVER_CONTRACT_VERSION = "2"
 
 export class ApiClientError extends Error {
   readonly status: number
@@ -111,6 +115,10 @@ export type SessionsSummaryQuery = NonNullable<
   GetSessionsSummaryApiSessionsSummaryPostData["query"]
 >
 export type SessionsPage = ListSessionsApiSessionsGetResponse
+export type OperationalSnapshot = GetOperationalSnapshotApiOperationsSnapshotPostResponse
+export type OperationalSnapshotBody = OperationalSnapshotRequest
+export type UsageRollup = GetUsageRollupApiUsageRollupPostResponse
+export type UsageRollupBody = UsageRollupRequest
 export type Task = ApiTaskListItem
 export type TaskDetail = ApiTaskDetail
 export type TaskHold = TaskHoldBody
@@ -282,6 +290,28 @@ export async function fetchSessionsSummary(
   signal?: AbortSignal,
 ): Promise<SessionsSummary> {
   return requestJson<SessionsSummary>(`/sessions/summary${queryString(query)}`, {
+    method: "POST",
+    body: JSON.stringify(body),
+    signal,
+  })
+}
+
+export async function fetchOperationalSnapshot(
+  body: OperationalSnapshotBody = {},
+  signal?: AbortSignal,
+): Promise<OperationalSnapshot> {
+  return requestJson<OperationalSnapshot>("/operations/snapshot", {
+    method: "POST",
+    body: JSON.stringify(body),
+    signal,
+  })
+}
+
+export async function fetchUsageRollup(
+  body: UsageRollupBody,
+  signal?: AbortSignal,
+): Promise<UsageRollup> {
+  return requestJson<UsageRollup>("/usage/rollup", {
     method: "POST",
     body: JSON.stringify(body),
     signal,

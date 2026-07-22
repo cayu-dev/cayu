@@ -9,12 +9,13 @@ import re
 import socket
 import tempfile
 from collections.abc import AsyncIterator
+from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import uvicorn
-from playwright.async_api import (  # ty: ignore[unresolved-import]
+from playwright.async_api import (
     BrowserContext,
     Page,
     Request,
@@ -30,6 +31,8 @@ from cayu import (
     EventType,
     Message,
     MessageRole,
+    ModelPrice,
+    PriceBook,
     RunRequest,
     TextPart,
     ThinkingPart,
@@ -39,7 +42,13 @@ from cayu import (
     ToolResult,
     ToolSpec,
 )
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.providers import (
+    ModelProvider,
+    ModelRequest,
+    ModelStreamEvent,
+    bedrock_billing_identity,
+    completed_bedrock_billing_identity,
+)
 from cayu.runtime import EventQuery, InMemorySessionStore, SessionIdentity, SessionStatus
 from cayu.server import create_server
 
@@ -53,12 +62,14 @@ INTERRUPT_SESSION_ID = "dashboard-contract-interrupt"
 INTERRUPT_FAILURE_SESSION_ID = "dashboard-contract-interrupt-failure"
 RESUME_INTERRUPT_SESSION_ID = "dashboard-contract-resume-interrupt"
 REOBSERVE_SESSION_ID = "dashboard-contract-reobserve"
+BEDROCK_SESSION_ID = "dashboard-contract-bedrock-billing"
 FILTERED_SESSION_ID = "dashboard-contract-filtered-session"
 PAGINATED_SESSION_PREFIX = "dashboard-contract-page"
 PAGINATED_SESSION_COUNT = 101
 DISCOVERY_ENVIRONMENT = "dashboard-contract-production"
 DISCOVERY_BUDGET_ID = "dashboard-contract-budget"
 SLOW_SESSION_QUERY = "dashboard-contract-slow-query"
+SLOW_USAGE_AGENT = "dashboard-contract-slow-usage-agent"
 AGENT_NAME = "dashboard-contract-agent"
 PROVIDER_NAME = "contract-provider"
 MODEL_NAME = "contract-model"
@@ -240,7 +251,15 @@ async def main() -> None:
         "dashboard contract tool must remain mutation-free",
     )
     app, provider, store = await _seed_app()
-    server_app = MutationDisconnectFaults(create_server(app, dev=True), provider)
+    price_book = _dashboard_price_book()
+    server_app = MutationDisconnectFaults(
+        create_server(
+            app,
+            dev=True,
+            dashboard_config={"priceBook": price_book.model_dump(mode="json")},
+        ),
+        provider,
+    )
     listener = _loopback_listener()
     port = listener.getsockname()[1]
     base_url = f"http://127.0.0.1:{port}"
@@ -419,6 +438,56 @@ async def _seed_app() -> tuple[CayuApp, DashboardContractProvider, InMemorySessi
     )
     await store.update_status(SESSION_ID, SessionStatus.COMPLETED)
 
+    bedrock_identity = completed_bedrock_billing_identity(
+        bedrock_billing_identity(
+            invoked_model="global.anthropic.claude-sonnet-4-6",
+            source_region="us-east-1",
+            resource_type="inference_profile",
+            profile_scope="global",
+            requested_service_tier="default",
+        ),
+        effective_service_tier="default",
+    )
+    await store.create(
+        RunRequest(
+            agent_name=AGENT_NAME,
+            session_id=BEDROCK_SESSION_ID,
+            labels={"billing": "bedrock"},
+            messages=[Message.text("user", "Verify the Bedrock billing breakdown.")],
+        ),
+        identity=SessionIdentity(provider_name="bedrock", model=bedrock_identity.resource_id),
+    )
+    await store.append_events(
+        BEDROCK_SESSION_ID,
+        [
+            Event(
+                id="dashboard-bedrock-model-completed",
+                type=EventType.MODEL_COMPLETED,
+                session_id=BEDROCK_SESSION_ID,
+                agent_name=AGENT_NAME,
+                payload={
+                    "usage_metrics": {
+                        "provider_name": "bedrock",
+                        "requested_model": bedrock_identity.resource_id,
+                        "model": bedrock_identity.resource_id,
+                        "billing_identity": bedrock_identity.model_dump(mode="json"),
+                        "input_tokens": 1_000_000,
+                        "output_tokens": 0,
+                        "total_tokens": 1_000_000,
+                    },
+                    "billing_identity": bedrock_identity.model_dump(mode="json"),
+                },
+            ),
+            Event(
+                id="dashboard-bedrock-session-completed",
+                type=EventType.SESSION_COMPLETED,
+                session_id=BEDROCK_SESSION_ID,
+                agent_name=AGENT_NAME,
+            ),
+        ],
+    )
+    await store.update_status(BEDROCK_SESSION_ID, SessionStatus.COMPLETED)
+
     async def seed_completed_session(
         session_id: str,
         prompt: str,
@@ -557,6 +626,33 @@ async def _seed_app() -> tuple[CayuApp, DashboardContractProvider, InMemorySessi
     return app, provider, store
 
 
+def _dashboard_price_book() -> PriceBook:
+    return PriceBook(
+        price_book_version="dashboard-browser-contract",
+        generated_at="2026-07-21",
+        prices=(
+            ModelPrice.fixed(
+                provider_name=PROVIDER_NAME,
+                model=MODEL_NAME,
+                match="exact",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("1"),
+            ),
+            ModelPrice.fixed(
+                provider_name="bedrock",
+                model="global.anthropic.claude-sonnet-4-6",
+                match="exact",
+                pricing_context={
+                    "source_region": ("us-east-1",),
+                    "service_tier": ("default",),
+                },
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("1"),
+            ),
+        ),
+    )
+
+
 async def _run_browser_contract(
     base_url: str,
     provider: DashboardContractProvider,
@@ -572,6 +668,8 @@ async def _run_browser_contract(
     expected_query_aborts: list[str] = []
     expected_edit_rejections: list[str] = []
     expected_edit_console_errors: list[str] = []
+    expected_usage_rejections: list[str] = []
+    expected_usage_console_errors: list[str] = []
     expected_observer_abort_paths = {
         "/api/run",
         "/api/resume",
@@ -600,8 +698,11 @@ async def _run_browser_contract(
             expected_query_aborts,
             expected_edit_rejections,
             expected_edit_console_errors,
+            expected_usage_rejections,
+            expected_usage_console_errors,
         )
         try:
+            await _exercise_contract_version_gate(page, base_url)
             await _exercise_dashboard(page, base_url, provider, faults)
             _require_no_browser_failures(browser_failures)
             run_observer_aborts = [
@@ -617,8 +718,8 @@ async def _run_browser_contract(
             )
             require_equal(
                 len(expected_query_aborts),
-                1,
-                "the superseded session query must abort exactly one browser request",
+                2,
+                "the superseded session and usage queries must each abort one browser request",
             )
             require_equal(
                 len(expected_edit_rejections),
@@ -629,6 +730,16 @@ async def _run_browser_contract(
                 len(expected_edit_console_errors),
                 len(expected_edit_rejections),
                 "each expected edit rejection must produce one classified Chromium resource error",
+            )
+            require_equal(
+                len(expected_usage_rejections),
+                1,
+                "the injected usage refresh failure must remain an expected API response",
+            )
+            require_equal(
+                len(expected_usage_console_errors),
+                len(expected_usage_rejections),
+                "each expected usage rejection must produce one classified Chromium resource error",
             )
         except BaseException:
             await _capture_diagnostics(context, page, diagnostics_dir, browser_failures)
@@ -644,6 +755,7 @@ async def _run_browser_contract(
         "session_id": SESSION_ID,
         "interactions": [
             "mutation_pre_frame_recovery",
+            "contract_version_gate",
             "mutation_post_frame_recovery",
             "session_resume",
             "approval_resolution",
@@ -663,14 +775,16 @@ async def _run_browser_contract(
             "session_cursor_pagination",
             "session_filter_url_state",
             "session_query_cancellation",
-            "overview_truthful_scope",
-            "usage_loaded_scope",
+            "overview_operational_snapshot",
+            "usage_aggregate_scope",
+            "usage_filter_url_state",
         ],
         "console_errors": 0,
         "page_errors": 0,
         "mutation_observer_aborts": len(expected_observer_aborts),
-        "session_query_aborts": len(expected_query_aborts),
+        "query_aborts": len(expected_query_aborts),
         "session_edit_rejections": len(expected_edit_rejections),
+        "usage_refresh_rejections": len(expected_usage_rejections),
         "request_failures": 0,
         "api_errors": 0,
     }
@@ -755,47 +869,94 @@ async def _exercise_dashboard(
     await _exercise_existing_session_mutations(page, base_url, provider)
 
 
-async def _exercise_operational_scope(page: Page, base_url: str) -> None:
-    summary_path = "**/api/sessions/summary*"
-    summary_started = asyncio.Event()
-    release_summary = asyncio.Event()
-    summary_continued = asyncio.Event()
+async def _exercise_contract_version_gate(page: Page, base_url: str) -> None:
+    api_requests_beyond_contract: list[str] = []
 
-    async def delay_overview_summary(route) -> None:
-        summary_started.set()
-        await release_summary.wait()
+    async def serve_incompatible_contract(route, request) -> None:
+        path = urlsplit(request.url).path
+        if path == "/api/contract":
+            await route.fulfill(
+                status=200,
+                headers={"content-type": "application/json"},
+                body=json.dumps({"api_prefix": "/api", "contract_version": "1"}),
+            )
+            return
+        api_requests_beyond_contract.append(f"{request.method} {path}")
+        await route.fulfill(
+            status=500,
+            headers={"content-type": "application/json"},
+            body=json.dumps({"detail": "API route rendered before contract compatibility."}),
+        )
+
+    await page.route("**/api/**", serve_incompatible_contract)
+    try:
+        await page.goto(f"{base_url}/cayu/usage", wait_until="networkidle")
+        await expect(page.get_by_test_id("dashboard-contract-gate")).to_contain_text(
+            "Dashboard expects CAYU server contract v2, but the server reports v1."
+        )
+        await expect(page.get_by_role("heading", name="Usage", exact=True)).to_have_count(0)
+        require_equal(
+            api_requests_beyond_contract,
+            [],
+            "an incompatible dashboard must not start route-specific API requests",
+        )
+    finally:
+        await page.unroute("**/api/**", serve_incompatible_contract)
+
+
+async def _exercise_operational_scope(page: Page, base_url: str) -> None:
+    snapshot_path = "**/api/operations/snapshot"
+    snapshot_started = asyncio.Event()
+    release_snapshot = asyncio.Event()
+    snapshot_continued = asyncio.Event()
+
+    async def delay_operational_snapshot(route) -> None:
+        snapshot_started.set()
+        await release_snapshot.wait()
         try:
             await route.continue_()
         finally:
-            summary_continued.set()
+            snapshot_continued.set()
 
-    await page.route(summary_path, delay_overview_summary)
+    await page.route(snapshot_path, delay_operational_snapshot)
     try:
         await page.goto(f"{base_url}/cayu/", wait_until="domcontentloaded")
-        await asyncio.wait_for(summary_started.wait(), timeout=5)
-        token_metric = page.get_by_text("Session Tokens", exact=True).locator("..").locator("..")
-        await expect(token_metric.get_by_text("—", exact=True)).to_be_visible()
+        await asyncio.wait_for(snapshot_started.wait(), timeout=5)
+        active_metric = page.get_by_text("Active Sessions", exact=True).locator("..").locator("..")
+        await expect(active_metric.get_by_text("—", exact=True)).to_be_visible()
         await expect(
-            token_metric.get_by_text("Loading up to 25 most recently updated sessions.", exact=True)
+            active_metric.get_by_text(re.compile(r"Loading the operational session snapshot\."))
         ).to_be_visible()
-        await expect(token_metric.get_by_text(re.compile(r"0 in / 0 out"))).to_have_count(0)
-        await expect(page.get_by_text("Loading recent sessions...", exact=True)).to_be_visible()
-        await expect(page.get_by_text("No sessions yet.", exact=True)).to_have_count(0)
+        await expect(
+            page.get_by_text("Loading configured-store metrics...", exact=True)
+        ).to_be_visible()
     finally:
-        release_summary.set()
-        if summary_started.is_set():
-            await asyncio.wait_for(summary_continued.wait(), timeout=5)
-        await page.unroute(summary_path, delay_overview_summary)
+        release_snapshot.set()
+        if snapshot_started.is_set():
+            await asyncio.wait_for(snapshot_continued.wait(), timeout=5)
+        await page.unroute(snapshot_path, delay_operational_snapshot)
 
     await page.wait_for_load_state("networkidle")
     await expect(page.get_by_role("heading", name="Dashboard", exact=True)).to_be_visible()
-    overview_scope = page.get_by_test_id("overview-sample-scope")
-    await expect(overview_scope).to_be_visible()
+    operational_scope = page.get_by_test_id("overview-operational-scope")
+    await expect(operational_scope).to_be_visible()
     await expect(
-        overview_scope.get_by_text("Recent sample — not deployment totals", exact=True)
+        operational_scope.get_by_text("Configured-store operational snapshot", exact=True)
     ).to_be_visible()
     await expect(
-        overview_scope.get_by_text(
+        operational_scope.get_by_text(
+            re.compile(
+                r"Exact session counts as of .* independent, not one cross-store atomic read\."
+            )
+        )
+    ).to_be_visible()
+    recent_scope = page.get_by_test_id("overview-sample-scope")
+    await expect(recent_scope).to_be_visible()
+    await expect(
+        recent_scope.get_by_text("Recent lists — bounded drill-down", exact=True)
+    ).to_be_visible()
+    await expect(
+        recent_scope.get_by_text(
             re.compile(r"latest 25 of \d+ sessions by updated time \(25-session limit\)")
         )
     ).to_be_visible()
@@ -803,9 +964,10 @@ async def _exercise_operational_scope(page: Page, base_url: str) -> None:
         "Active Sessions",
         "Completed Sessions",
         "Failed Sessions",
-        "Session Tokens",
+        "Tasks Needing Attention",
     ):
         await expect(page.get_by_text(label, exact=True)).to_be_visible()
+    await expect(page.get_by_text("Session Tokens", exact=True)).to_have_count(0)
     await expect(page.get_by_text("Active Work", exact=True)).to_have_count(0)
     await expect(page.get_by_text("Recent Needs Attention", exact=True)).to_be_visible()
 
@@ -813,34 +975,207 @@ async def _exercise_operational_scope(page: Page, base_url: str) -> None:
     await expect(page.get_by_role("heading", name="Usage", exact=True)).to_be_visible()
     await expect(
         page.get_by_text(
-            "Client-side usage rollup over at most 10,000 most recently updated matching "
-            "sessions. The current loaded scope is shown below.",
+            "Store-native activity, token, and cost totals over an explicit event-time window.",
             exact=True,
         )
     ).to_be_visible()
-    usage_scope = page.get_by_test_id("usage-loaded-scope")
+    usage_scope = page.get_by_test_id("usage-aggregate-scope")
     await expect(usage_scope).to_be_visible()
-    await expect(usage_scope.get_by_text("Complete loaded scope", exact=True)).to_be_visible()
+    await expect(usage_scope.get_by_text("Authoritative store rollup", exact=True)).to_be_visible()
     await expect(
         usage_scope.get_by_text(
             re.compile(
-                r"All \d+ matching sessions reported by this paginated request are included "
-                r"in the client-side rollup\."
+                r"Events from .* inclusive to .* exclusive, as of .* event time is the usage basis\."
             )
         )
     ).to_be_visible()
     for label in (
-        "Loaded Sessions",
+        "Matching Sessions",
+        "Sessions with Activity",
         "Tokens",
         "Model Steps",
+        "Tool Calls",
         "Estimated Cost",
-        "Unpriced Steps",
     ):
         await expect(page.get_by_text(label, exact=True)).to_be_visible()
-    unpriced_metric = page.get_by_text("Unpriced Steps", exact=True).locator("..").locator("..")
-    await expect(unpriced_metric.get_by_text("—", exact=True)).to_be_visible()
-    await expect(unpriced_metric.get_by_text("0", exact=True)).to_have_count(0)
-    await expect(unpriced_metric.get_by_text(re.compile(r"Cost not estimated;"))).to_be_visible()
+    await expect(
+        page.get_by_text(
+            "Price book dashboard-browser-contract, generated 2026-07-21; "
+            "currencies are never combined.",
+            exact=True,
+        )
+    ).to_be_visible()
+    bedrock_breakdown = page.get_by_test_id("usage-billing-breakdown")
+    await expect(
+        bedrock_breakdown.get_by_text("Billing Identity Breakdown", exact=True)
+    ).to_be_visible()
+    coverage = bedrock_breakdown.get_by_test_id("usage-billing-identity-coverage")
+    await expect(coverage.get_by_text("Identified steps", exact=True)).to_be_visible()
+    await expect(coverage.get_by_text("Evaluated steps", exact=True)).to_be_visible()
+    await expect(coverage.get_by_text("Without identity", exact=True)).to_be_visible()
+    await expect(bedrock_breakdown.get_by_test_id("usage-billing-identity-gap")).to_contain_text(
+        "Billing identity is missing for 1 of 2 evaluated model steps"
+    )
+    bedrock_row = bedrock_breakdown.get_by_role("row").filter(
+        has_text="global.anthropic.claude-sonnet-4-6"
+    )
+    await expect(bedrock_row).to_contain_text("us-east-1")
+    await expect(bedrock_row).to_contain_text("global")
+    await expect(bedrock_row).to_contain_text("default / default")
+    await expect(bedrock_row).to_contain_text("bedrock/global.anthropic.claude-sonnet-4-6")
+
+    no_identity_query = urlencode({"provider_name": PROVIDER_NAME})
+    await page.goto(f"{base_url}/cayu/usage?{no_identity_query}", wait_until="networkidle")
+    no_identity_breakdown = page.get_by_test_id("usage-billing-breakdown")
+    await expect(no_identity_breakdown).to_contain_text(
+        "No billing identity was reported. Evaluated model-step count: 1."
+    )
+    await expect(
+        no_identity_breakdown.get_by_test_id("usage-billing-identity-gap")
+    ).to_contain_text("Billing identity is missing for 1 of 1 evaluated model steps")
+
+    await page.goto(f"{base_url}/cayu/usage", wait_until="networkidle")
+
+    await page.get_by_text("Session filters", exact=True).click()
+    await page.get_by_label("Agent", exact=True).fill(AGENT_NAME)
+    await page.locator("#usage-label-filter").fill("stage=initial")
+    await page.get_by_role("button", name="Apply", exact=True).click()
+    await expect(page).to_have_url(re.compile(r"[?&]agent_name=dashboard-contract-agent(?:&|$)"))
+    filtered_query = parse_qs(urlsplit(page.url).query)
+    require_equal(
+        filtered_query.get("label"),
+        ["stage=initial"],
+        "usage URL state must preserve repeated exact label parameters",
+    )
+    await expect(page.get_by_test_id("usage-aggregate-scope")).to_be_visible()
+    matching_metric = page.get_by_text("Matching Sessions", exact=True).locator("..").locator("..")
+    await expect(matching_metric.get_by_text("1", exact=True)).to_be_visible()
+    await page.reload(wait_until="networkidle")
+    await expect(page.get_by_label("Agent", exact=True)).to_have_value(AGENT_NAME)
+    await expect(page.locator("#usage-label-filter")).to_have_value("stage=initial")
+
+    await page.get_by_role("button", name="Clear filters", exact=True).click()
+    await expect(page).not_to_have_url(re.compile(r"[?&](?:agent_name|label)="))
+    await page.locator("#usage-range").select_option("7d")
+    await page.get_by_role("button", name="Apply", exact=True).click()
+    await expect(page).to_have_url(re.compile(r"[?&]range=7d(?:&|$)"))
+    await expect(page.get_by_test_id("usage-aggregate-scope")).to_be_visible()
+
+    precise_start = "2026-07-01T00:00:59.999123Z"
+    offset_end = "2026-07-02T08:30:00.123456+06:00"
+    custom_query = urlencode(
+        {
+            "range": "custom",
+            "start_at": precise_start,
+            "end_at": offset_end,
+        }
+    )
+    await page.goto(f"{base_url}/cayu/usage?{custom_query}", wait_until="networkidle")
+    await expect(page.get_by_label("Start (UTC)", exact=True)).to_have_value(
+        "2026-07-01T00:00:59.999"
+    )
+    await expect(page.get_by_label("End (UTC)", exact=True)).to_have_value(
+        "2026-07-02T02:30:00.123"
+    )
+    await page.get_by_text("Session filters", exact=True).click()
+    await page.get_by_label("Agent", exact=True).fill(AGENT_NAME)
+    async with page.expect_request(
+        lambda request: (
+            request.method == "POST" and urlsplit(request.url).path == "/api/usage/rollup"
+        )
+    ) as custom_request_info:
+        await page.get_by_role("button", name="Apply", exact=True).click()
+    custom_request = await custom_request_info.value
+    custom_request_body = custom_request.post_data_json
+    if not isinstance(custom_request_body, dict):
+        raise AssertionError("usage rollup POST body must be an object")
+    require_equal(
+        custom_request_body.get("start_at"),
+        precise_start,
+        "the usage POST must preserve the exact custom start boundary",
+    )
+    require_equal(
+        custom_request_body.get("end_at"),
+        offset_end,
+        "the usage POST must preserve the exact custom end boundary",
+    )
+    custom_filtered_query = parse_qs(urlsplit(page.url).query)
+    require_equal(
+        custom_filtered_query.get("start_at"),
+        [precise_start],
+        "an unrelated usage filter must preserve the exact custom start boundary",
+    )
+    require_equal(
+        custom_filtered_query.get("end_at"),
+        [offset_end],
+        "an unrelated usage filter must preserve the exact custom end boundary",
+    )
+    await expect(page.get_by_test_id("usage-aggregate-scope")).to_be_visible()
+
+    await page.goto(f"{base_url}/cayu/usage", wait_until="networkidle")
+    await expect(page.get_by_role("heading", name="Usage", exact=True)).to_be_visible()
+
+    usage_path = "**/api/usage/rollup"
+    slow_usage_started = asyncio.Event()
+    release_slow_usage = asyncio.Event()
+    slow_usage_continued = asyncio.Event()
+
+    async def delay_superseded_usage(route, request) -> None:
+        body = request.post_data_json
+        agent_name = body.get("session_filter", {}).get("agent_name") if body else None
+        if agent_name != SLOW_USAGE_AGENT:
+            await route.continue_()
+            return
+        slow_usage_started.set()
+        await release_slow_usage.wait()
+        try:
+            await route.continue_()
+        except Exception:
+            # The AbortSignal deliberately owns the superseded request. Chromium may
+            # dispose its intercepted route before this test releases the server path.
+            pass
+        finally:
+            slow_usage_continued.set()
+
+    await page.route(usage_path, delay_superseded_usage)
+    try:
+        await page.get_by_text("Session filters", exact=True).click()
+        await page.get_by_label("Agent", exact=True).fill(SLOW_USAGE_AGENT)
+        await page.get_by_role("button", name="Apply", exact=True).click()
+        await asyncio.wait_for(slow_usage_started.wait(), timeout=5)
+        await page.get_by_label("Agent", exact=True).fill(AGENT_NAME)
+        await page.get_by_role("button", name="Apply", exact=True).click()
+        await expect(page).to_have_url(
+            re.compile(r"[?&]agent_name=dashboard-contract-agent(?:&|$)")
+        )
+        await expect(page.get_by_test_id("usage-aggregate-scope")).to_be_visible()
+        await expect(
+            page.get_by_text("Loading the bounded usage rollup...", exact=True)
+        ).to_have_count(0)
+    finally:
+        release_slow_usage.set()
+        if slow_usage_started.is_set():
+            await asyncio.wait_for(slow_usage_continued.wait(), timeout=5)
+        await page.unroute(usage_path, delay_superseded_usage)
+
+    async def reject_usage_refresh(route) -> None:
+        await route.fulfill(
+            status=501,
+            headers={"content-type": "application/json"},
+            body=json.dumps({"detail": "Injected aggregate refresh failure."}),
+        )
+
+    await page.route(usage_path, reject_usage_refresh)
+    try:
+        await page.get_by_role("button", name="Refresh window", exact=True).click()
+        await expect(page.get_by_test_id("usage-retained-error")).to_be_visible()
+        await expect(page.get_by_test_id("usage-aggregate-scope")).to_be_visible()
+    finally:
+        await page.unroute(usage_path, reject_usage_refresh)
+
+    await page.get_by_role("button", name="Retry", exact=True).click()
+    await expect(page.get_by_test_id("usage-retained-error")).to_have_count(0)
+    await expect(page.get_by_test_id("usage-aggregate-scope")).to_be_visible()
 
 
 async def _exercise_session_annotations(page: Page) -> None:
@@ -1384,6 +1719,8 @@ def _record_browser_failures(
     expected_query_aborts: list[str],
     expected_edit_rejections: list[str],
     expected_edit_console_errors: list[str],
+    expected_usage_rejections: list[str],
+    expected_usage_console_errors: list[str],
 ) -> None:
     def record_request_failure(request: Request) -> None:
         path = urlsplit(request.url).path
@@ -1413,6 +1750,12 @@ def _record_browser_failures(
         ):
             expected_query_aborts.append(detail)
             return
+        if request.method == "POST" and path == "/api/usage/rollup":
+            body = request.post_data_json
+            agent_name = body.get("session_filter", {}).get("agent_name") if body else None
+            if agent_name == SLOW_USAGE_AGENT and request.failure == "net::ERR_ABORTED":
+                expected_query_aborts.append(detail)
+                return
         failures["request_failures"].append(detail)
 
     def record_response(response) -> None:
@@ -1426,6 +1769,9 @@ def _record_browser_failures(
         ):
             expected_edit_rejections.append(detail)
             return
+        if response.status == 501 and request.method == "POST" and path == "/api/usage/rollup":
+            expected_usage_rejections.append(detail)
+            return
         if "/api/" in response.url and response.status >= 400:
             failures["api_errors"].append(detail)
 
@@ -1437,6 +1783,12 @@ def _record_browser_failures(
             == "Failed to load resource: the server responded with a status of 422 (Unprocessable Entity)"
         ):
             expected_edit_console_errors.append(message.text)
+            return
+        if (
+            message.text
+            == "Failed to load resource: the server responded with a status of 501 (Not Implemented)"
+        ):
+            expected_usage_console_errors.append(message.text)
             return
         failures["console_errors"].append(message.text)
 

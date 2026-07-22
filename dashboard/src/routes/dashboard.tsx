@@ -3,19 +3,25 @@ import { Link } from "@tanstack/react-router"
 import { Activity, AlertTriangle, CheckCircle, Database, ListTodo, XCircle } from "lucide-react"
 import { DataCard, Page, PageHeader, StateMessage } from "../components/dashboard/layout"
 import { Badge } from "../components/ui/badge"
-import { buttonVariants } from "../components/ui/button"
+import { Button, buttonVariants } from "../components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card"
 import {
+  aggregateRequestFailureIsPermanent,
+  aggregateSnapshotNeedsWarning,
+  retryAggregateRequest,
+} from "../lib/aggregate-query"
+import {
+  fetchOperationalSnapshot,
   fetchPendingActions,
   fetchSessionsSummary,
   fetchTasks,
   isApiPayloadTooLarge,
+  type OperationalSnapshot,
   type PendingAction,
-  type Session,
   type SessionsSummary,
   type Task,
 } from "../lib/api"
-import { formatCount, formatDateTime, numericValue } from "../lib/format"
+import { formatCount, formatDateTime, sumCounts } from "../lib/format"
 import { summarizeSessionDebugState } from "../lib/session-debug"
 
 const OVERVIEW_SOURCE_LIMIT = 25
@@ -55,10 +61,6 @@ function StatusBadge({ status }: { status: string }) {
           ? "destructive"
           : "outline"
   return <Badge variant={variant}>{status}</Badge>
-}
-
-function isActiveSession(session: Session) {
-  return ["pending", "running", "interrupting"].includes(session.status)
 }
 
 function needsAttentionTask(task: Task) {
@@ -105,17 +107,50 @@ function pendingActionLabel(action: PendingAction) {
   return "Manual recovery required"
 }
 
+function snapshotAccuracyDetail(
+  snapshot: OperationalSnapshot["sessions"] | NonNullable<OperationalSnapshot["tasks"]>,
+): string {
+  if (snapshot.accuracy.kind === "exact") return "Exact"
+  const reason = snapshot.accuracy.reason ? `: ${snapshot.accuracy.reason}` : ""
+  const limit = snapshot.accuracy.limit ? ` (limit ${formatCount(snapshot.accuracy.limit)})` : ""
+  return `${snapshot.accuracy.kind}${reason}${limit}`
+}
+
+function taskSnapshotStatus(snapshot: OperationalSnapshot): string {
+  if (snapshot.tasks) {
+    return `${snapshotAccuracyDetail(snapshot.tasks)} task counts as of ${formatDateTime(snapshot.tasks.as_of)}`
+  }
+  if (snapshot.task_snapshot_status === "not_configured") {
+    return "Task metrics unavailable: no task store is configured"
+  }
+  if (snapshot.task_snapshot_status === "unsupported") {
+    return "Task metrics unavailable: the configured task store does not support snapshots"
+  }
+  return "Task metrics were not requested"
+}
+
 export function DashboardPage() {
+  const operations = useQuery({
+    queryKey: ["operational-snapshot", "dashboard"],
+    queryFn: ({ signal }) => fetchOperationalSnapshot({}, signal),
+    retry: retryAggregateRequest,
+    refetchInterval: (query) =>
+      aggregateRequestFailureIsPermanent(query.state.error) ? false : 5000,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: (query) => !aggregateRequestFailureIsPermanent(query.state.error),
+  })
   const summary = useQuery({
     queryKey: ["sessions-summary", "dashboard"],
     queryFn: () =>
       fetchSessionsSummary({ limit: OVERVIEW_SOURCE_LIMIT, order_by: "updated_at_desc" }),
     refetchInterval: 5000,
+    refetchIntervalInBackground: false,
   })
   const tasks = useQuery({
     queryKey: ["tasks", "dashboard"],
     queryFn: () => fetchTasks({ limit: OVERVIEW_SOURCE_LIMIT }),
     refetchInterval: 5000,
+    refetchIntervalInBackground: false,
   })
   const pendingActions = useQuery({
     queryKey: ["pending-actions", "dashboard"],
@@ -133,14 +168,9 @@ export function DashboardPage() {
   const pendingActionIssues = pendingActions.data?.issues || []
   const sessionsError = summary.error instanceof Error ? summary.error.message : null
   const tasksError = tasks.error instanceof Error ? tasks.error.message : null
-  const activeSessions = list.filter(isActiveSession)
-  const completed = list.filter((s) => s.status === "completed").length
-  const failed = list.filter((s) => s.status === "failed").length
   const attentionTasks = taskList.filter(needsAttentionTask)
   const attentionSessionItems = sessionItems.filter(needsAttentionSessionItem)
   const attentionSessions = attentionSessionItems.map((item) => item.session)
-  const usage = summary.data?.usage.usage
-  const totalTokens = numericValue(usage?.total_tokens)
   const sessionScope = summary.data
     ? describeOverviewSessionScope(
         list.length,
@@ -148,20 +178,35 @@ export function DashboardPage() {
         Boolean(summary.data.next_cursor),
       )
     : `up to ${OVERVIEW_SOURCE_LIMIT} most recently updated sessions`
-  const sessionMetricAvailable = summary.data !== undefined
   const sessionSampleLoading = summary.isLoading && summary.data === undefined
   const taskSampleLoading = tasks.isLoading && tasks.data === undefined
   const attentionSampleLoading =
     sessionSampleLoading ||
     taskSampleLoading ||
     (pendingActions.isLoading && pendingActions.data === undefined)
-  const sessionMetricDetail = sessionMetricAvailable
-    ? summary.isError
-      ? `Last loaded values across ${sessionScope}; refresh failed.`
-      : `Across ${sessionScope}.`
-    : summary.isError
-      ? "Session sample unavailable."
-      : `Loading ${sessionScope}.`
+  const operationalSnapshot = operations.data
+  const sessionCounts = operationalSnapshot?.sessions.counts_by_status
+  const activeSessionCount = sessionCounts
+    ? sumCounts(sessionCounts.pending, sessionCounts.running, sessionCounts.interrupting)
+    : null
+  const taskCounts = operationalSnapshot?.tasks?.counts_by_status
+  const attentionTaskCount = taskCounts
+    ? sumCounts(taskCounts.blocked, taskCounts.needs_attention, taskCounts.failed)
+    : null
+  const sessionMetricDetail = operationalSnapshot
+    ? `${snapshotAccuracyDetail(operationalSnapshot.sessions)} as of ${formatDateTime(operationalSnapshot.sessions.as_of)}${operations.isError ? "; refresh failed" : ""}.`
+    : operations.isError
+      ? "Operational session snapshot unavailable."
+      : "Loading the operational session snapshot."
+  const taskMetricDetail = operationalSnapshot
+    ? `${taskSnapshotStatus(operationalSnapshot)}${operations.isError ? "; refresh failed" : ""}.`
+    : operations.isError
+      ? "Operational task snapshot unavailable."
+      : "Loading the operational task snapshot."
+  const operationalSnapshotIsWarning = aggregateSnapshotNeedsWarning(
+    operationalSnapshot,
+    operations.isError,
+  )
 
   return (
     <Page>
@@ -174,48 +219,86 @@ export function DashboardPage() {
         }
       />
 
-      <div
-        className="flex items-start gap-3 rounded-md border border-border bg-muted/40 px-4 py-3 text-sm"
-        data-testid="overview-sample-scope"
-      >
-        <Database className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
-        <div className="space-y-1">
-          <div className="font-medium">Recent sample — not deployment totals</div>
-          <div className="text-muted-foreground">
-            Session cards cover {sessionScope}. Recent attention entries independently load up to{" "}
-            {OVERVIEW_SOURCE_LIMIT} tasks and {OVERVIEW_SOURCE_LIMIT} pending actions; categories
-            can overlap.
+      {operations.isError && !operationalSnapshot ? (
+        <StateMessage tone="danger">
+          <div data-testid="overview-operational-scope" role="alert">
+            <div className="font-medium">Operational snapshot unavailable</div>
+            <div className="mt-1">
+              {operations.error instanceof Error
+                ? operations.error.message
+                : "Failed to load configured-store metrics."}{" "}
+              Recent drill-down lists remain available below.
+            </div>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="mt-3"
+              disabled={operations.isFetching}
+              onClick={() => void operations.refetch()}
+            >
+              {operations.isFetching ? "Retrying..." : "Retry metrics"}
+            </Button>
+          </div>
+        </StateMessage>
+      ) : operationalSnapshot ? (
+        <div
+          className={`flex items-start gap-3 rounded-md border px-4 py-3 text-sm ${
+            operationalSnapshotIsWarning
+              ? "border-chart-1/30 bg-chart-1/5 text-chart-1"
+              : "border-border bg-muted/40"
+          }`}
+          data-testid="overview-operational-scope"
+          role={operationalSnapshotIsWarning ? "alert" : "status"}
+        >
+          {operationalSnapshotIsWarning ? (
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          ) : (
+            <Database className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+          )}
+          <div className="space-y-1">
+            <div className="font-medium">Configured-store operational snapshot</div>
+            <div className="text-muted-foreground">
+              {snapshotAccuracyDetail(operationalSnapshot.sessions)} session counts as of{" "}
+              {formatDateTime(operationalSnapshot.sessions.as_of)}.{" "}
+              {taskSnapshotStatus(operationalSnapshot)}. Scope is the server&apos;s configured
+              stores; session and task snapshots are independent, not one cross-store atomic read.
+              {operations.isError &&
+                " The latest refresh failed; last confirmed values remain visible."}
+            </div>
           </div>
         </div>
-      </div>
+      ) : (
+        <StateMessage>
+          <div data-testid="overview-operational-scope">Loading configured-store metrics...</div>
+        </StateMessage>
+      )}
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
         {[
           {
             icon: Activity,
             label: "Active Sessions",
-            value: sessionMetricAvailable ? activeSessions.length : "—",
-            detail: sessionMetricDetail,
+            value: activeSessionCount === null ? "—" : formatCount(activeSessionCount),
+            detail: `${sessionMetricDetail} Pending, running, and interrupting sessions are active.`,
           },
           {
             icon: CheckCircle,
             label: "Completed Sessions",
-            value: sessionMetricAvailable ? completed : "—",
+            value: sessionCounts ? formatCount(sessionCounts.completed) : "—",
             detail: sessionMetricDetail,
           },
           {
             icon: XCircle,
             label: "Failed Sessions",
-            value: sessionMetricAvailable ? failed : "—",
+            value: sessionCounts ? formatCount(sessionCounts.failed) : "—",
             detail: sessionMetricDetail,
           },
           {
-            icon: Database,
-            label: "Session Tokens",
-            value: sessionMetricAvailable ? formatCount(totalTokens) : "—",
-            detail: sessionMetricAvailable
-              ? `${formatCount(usage?.input_tokens)} in / ${formatCount(usage?.output_tokens)} out across ${sessionScope}${summary.isError ? "; refresh failed" : ""}.`
-              : sessionMetricDetail,
+            icon: ListTodo,
+            label: "Tasks Needing Attention",
+            value: attentionTaskCount === null ? "—" : formatCount(attentionTaskCount),
+            detail: `${taskMetricDetail} Blocked, needs attention, and failed tasks are included.`,
           },
         ].map(({ icon: Icon, label, value, detail }) => (
           <Card key={label}>
@@ -229,6 +312,21 @@ export function DashboardPage() {
             </CardContent>
           </Card>
         ))}
+      </div>
+
+      <div
+        className="flex items-start gap-3 rounded-md border border-border bg-muted/40 px-4 py-3 text-sm"
+        data-testid="overview-sample-scope"
+      >
+        <Database className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+        <div className="space-y-1">
+          <div className="font-medium">Recent lists — bounded drill-down</div>
+          <div className="text-muted-foreground">
+            Recent sessions cover {sessionScope}. Attention and task lists independently load up to{" "}
+            {OVERVIEW_SOURCE_LIMIT} tasks and {OVERVIEW_SOURCE_LIMIT} pending actions; categories
+            can overlap and are not deployment totals.
+          </div>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">

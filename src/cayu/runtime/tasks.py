@@ -11,7 +11,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from cayu._validation import copy_json_object, require_clean_nonblank, require_nonblank
-from cayu.runtime.aggregates import EXACT_AGGREGATE, AggregateAccuracy
+from cayu.runtime.aggregates import EXACT_AGGREGATE, AggregateAccuracy, AggregateCount
 
 
 class TaskStatus(StrEnum):
@@ -203,15 +203,15 @@ class TaskStatusCounts(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    pending: StrictInt = Field(ge=0)
-    claimed: StrictInt = Field(ge=0)
-    running: StrictInt = Field(ge=0)
-    paused: StrictInt = Field(ge=0)
-    blocked: StrictInt = Field(ge=0)
-    needs_attention: StrictInt = Field(ge=0)
-    completed: StrictInt = Field(ge=0)
-    failed: StrictInt = Field(ge=0)
-    cancelled: StrictInt = Field(ge=0)
+    pending: AggregateCount = Field(ge=0)
+    claimed: AggregateCount = Field(ge=0)
+    running: AggregateCount = Field(ge=0)
+    paused: AggregateCount = Field(ge=0)
+    blocked: AggregateCount = Field(ge=0)
+    needs_attention: AggregateCount = Field(ge=0)
+    completed: AggregateCount = Field(ge=0)
+    failed: AggregateCount = Field(ge=0)
+    cancelled: AggregateCount = Field(ge=0)
 
 
 class TaskOperationalSnapshot(BaseModel):
@@ -220,7 +220,7 @@ class TaskOperationalSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     as_of: datetime
-    total_count: StrictInt = Field(ge=0)
+    total_count: AggregateCount = Field(ge=0)
     counts_by_status: TaskStatusCounts
     accuracy: AggregateAccuracy
 

@@ -8,6 +8,8 @@ import pytest
 
 from cayu import SQLiteSessionStore
 from cayu.core import AgentSpec, Event, EventType, Message
+from cayu.core.billing import BillingIdentity
+from cayu.providers import bedrock_billing_identity, completed_bedrock_billing_identity
 from cayu.runtime import (
     CayuApp,
     CheckpointCompactionContextPolicy,
@@ -32,7 +34,9 @@ from cayu.runtime import (
     SessionStatus,
     SessionStatusConflict,
     SessionStore,
+    UsageRollupQuery,
 )
+from cayu.runtime.usage import UsageMetrics
 
 _POSTGRES_TABLES = (
     "cayu_knowledge_labels",
@@ -144,6 +148,122 @@ async def _reopen_store(case, store: SessionStore) -> SessionStore:
     if store_kind == "sqlite":
         return SQLiteSessionStore(tmp_path / "sessions.sqlite")
     return _new_postgres_store(postgres_dsn)
+
+
+def test_session_store_conformance_preserves_only_safe_bedrock_aggregate_evidence(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session_id = "sess_bedrock_aggregate_evidence"
+            start = datetime(2026, 7, 1, tzinfo=UTC)
+            invoked_model = "global.anthropic.claude-sonnet-4-6"
+            await store.create(
+                RunRequest(
+                    session_id=session_id,
+                    agent_name="assistant",
+                    messages=[Message.text("user", "price this run")],
+                ),
+                identity=_identity(),
+            )
+
+            def identity_for_region(region: str) -> BillingIdentity:
+                completed = completed_bedrock_billing_identity(
+                    bedrock_billing_identity(
+                        invoked_model=invoked_model,
+                        source_region=region,
+                        resource_type="inference_profile",
+                        profile_scope="global",
+                        requested_service_tier="default",
+                    ),
+                    effective_service_tier="default",
+                )
+                return BillingIdentity(
+                    provider_name=completed.provider_name,
+                    resource_id=completed.resource_id,
+                    request_evidence={
+                        **completed.request_evidence,
+                        "customer_secret": "must-not-cross-the-aggregate-boundary",
+                    },
+                    completion_evidence={
+                        **completed.completion_evidence,
+                        "provider_trace": "must-also-remain-redacted",
+                    },
+                    pricing_contexts=completed.pricing_contexts,
+                )
+
+            nested_identity = identity_for_region("us-east-1")
+            root_identity = identity_for_region("us-west-2")
+            nested_metrics = UsageMetrics(
+                provider_name="bedrock",
+                model=invoked_model,
+                billing_identity=nested_identity,
+                input_tokens=1,
+                total_tokens=1,
+            )
+            root_metrics = UsageMetrics(
+                provider_name="bedrock",
+                model=invoked_model,
+                input_tokens=1,
+                total_tokens=1,
+            )
+            await store.append_events(
+                session_id,
+                [
+                    Event(
+                        id="bedrock-nested-aggregate-evidence",
+                        type=EventType.MODEL_COMPLETED,
+                        session_id=session_id,
+                        timestamp=start,
+                        payload={"usage_metrics": nested_metrics.model_dump(mode="json")},
+                    ),
+                    Event(
+                        id="bedrock-root-aggregate-evidence",
+                        type=EventType.MODEL_COMPLETED,
+                        session_id=session_id,
+                        timestamp=start + timedelta(minutes=1),
+                        payload={
+                            "usage_metrics": root_metrics.model_dump(mode="json"),
+                            "billing_identity": root_identity.model_dump(mode="json"),
+                        },
+                    ),
+                ],
+            )
+
+            result = await store.aggregate_usage(
+                UsageRollupQuery(
+                    start_at=start,
+                    end_at=start + timedelta(days=1),
+                    include_pricing_inputs=True,
+                )
+            )
+
+            assert result.pricing_inputs_accuracy.kind == "exact"
+            assert len(result.pricing_inputs) == 2
+            projected_by_region: dict[str, BillingIdentity] = {}
+            for item in result.pricing_inputs:
+                assert item.metrics is not None
+                projected = item.metrics.billing_identity
+                assert projected is not None
+                region = projected.request_evidence.get("source_region")
+                assert region is not None
+                projected_by_region[region] = projected
+            assert set(projected_by_region) == {"us-east-1", "us-west-2"}
+            for region, projected in projected_by_region.items():
+                assert projected.request_evidence == {
+                    "source_region": region,
+                    "resource_type": "inference_profile",
+                    "profile_scope": "global",
+                    "requested_service_tier": "default",
+                }
+                assert projected.completion_evidence == {"effective_service_tier": "default"}
+                assert "customer_secret" not in projected.request_evidence
+                assert "provider_trace" not in projected.completion_evidence
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
 
 
 def test_session_store_conformance_explicit_compaction_operation(session_store_case) -> None:

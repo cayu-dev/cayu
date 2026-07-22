@@ -1,25 +1,30 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import cast
+from typing import Annotated, cast
 
 from pydantic import (
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
+    PlainSerializer,
     StrictBool,
     StrictInt,
+    ValidationInfo,
+    field_serializer,
     field_validator,
     model_validator,
 )
 
 from cayu._validation import json_utf8_size_within_limit, require_clean_nonblank
+from cayu.core.billing import BillingIdentity
 from cayu.runtime.usage import CacheUsageMetrics, UsageMetrics
 
 
@@ -62,6 +67,56 @@ MAX_AGGREGATE_USAGE_COUNTER = 2**63 - 1
 MAX_USAGE_PRICING_INPUT_BYTES = 8 * 1024 * 1024
 MAX_USAGE_PRICING_RAW_CANDIDATES = 5000
 
+
+def _serialize_aggregate_count(value: int) -> str:
+    """Serialize exact aggregate counters without crossing JSON's safe-integer boundary."""
+
+    return str(value)
+
+
+def _aggregate_count_from_json(value: object) -> int:
+    if (
+        type(value) is not str
+        or not value
+        or (value != "0" and (value[0] == "0" or not value.isascii() or not value.isdigit()))
+    ):
+        raise ValueError(
+            "Aggregate counters in JSON must be canonical nonnegative decimal strings."
+        )
+    return int(value)
+
+
+def _deserialize_aggregate_count(value: object, info: ValidationInfo) -> object:
+    """Parse the v2 wire representation without weakening strict Python construction."""
+
+    if info.mode != "json":
+        return value
+    return _aggregate_count_from_json(value)
+
+
+AggregateCountString = Annotated[str, Field(pattern=r"^(0|[1-9]\d*)$")]
+AggregateCount = Annotated[
+    StrictInt,
+    BeforeValidator(
+        _deserialize_aggregate_count,
+        json_schema_input_type=AggregateCountString,
+    ),
+    PlainSerializer(_serialize_aggregate_count, return_type=AggregateCountString, when_used="json"),
+]
+PositiveAggregateCountString = Annotated[str, Field(pattern=r"^[1-9]\d*$")]
+PositiveAggregateCount = Annotated[
+    StrictInt,
+    BeforeValidator(
+        _deserialize_aggregate_count,
+        json_schema_input_type=PositiveAggregateCountString,
+    ),
+    PlainSerializer(
+        _serialize_aggregate_count,
+        return_type=PositiveAggregateCountString,
+        when_used="json",
+    ),
+]
+
 # Python's ``str.strip`` set, written explicitly so SQLite and PostgreSQL can
 # apply the same identity contract instead of relying on database-specific
 # ASCII whitespace defaults.
@@ -74,16 +129,97 @@ AGGREGATE_IDENTITY_TRIM_CHARACTERS = (
 )
 
 
+class AggregateCacheUsageMetrics(BaseModel):
+    """Lossless JSON projection of identity-free aggregate cache counters."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    read_tokens: AggregateCount = Field(ge=0)
+    write_tokens: AggregateCount = Field(ge=0)
+    write_5m_tokens: AggregateCount = Field(ge=0)
+    write_1h_tokens: AggregateCount = Field(ge=0)
+    write_unknown_ttl_tokens: AggregateCount = Field(ge=0)
+    cached_input_tokens: AggregateCount = Field(ge=0)
+    uncached_input_tokens: AggregateCount = Field(ge=0)
+
+
+class AggregateUsageMetrics(BaseModel):
+    """Lossless JSON projection of identity-free aggregate token counters."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    input_tokens: AggregateCount = Field(ge=0)
+    output_tokens: AggregateCount = Field(ge=0)
+    total_tokens: AggregateCount = Field(ge=0)
+    reasoning_output_tokens: AggregateCount = Field(ge=0)
+    cache: AggregateCacheUsageMetrics
+
+
 class UsageAggregateTotals(BaseModel):
     """Identity-free activity and token totals for one aggregate scope."""
 
     model_config = ConfigDict(extra="forbid")
 
-    session_count: StrictInt = Field(ge=0)
-    model_steps: StrictInt = Field(ge=0)
-    model_steps_with_usage: StrictInt = Field(ge=0)
-    tool_calls: StrictInt = Field(ge=0)
+    session_count: AggregateCount = Field(ge=0)
+    model_steps: AggregateCount = Field(ge=0)
+    model_steps_with_usage: AggregateCount = Field(ge=0)
+    tool_calls: AggregateCount = Field(ge=0)
     usage: UsageMetrics
+
+    @field_serializer("usage", when_used="json")
+    def serialize_usage(self, value: UsageMetrics) -> AggregateUsageMetrics:
+        return AggregateUsageMetrics(
+            input_tokens=value.input_tokens,
+            output_tokens=value.output_tokens,
+            total_tokens=value.total_tokens,
+            reasoning_output_tokens=value.reasoning_output_tokens,
+            cache=AggregateCacheUsageMetrics(
+                read_tokens=value.cache.read_tokens,
+                write_tokens=value.cache.write_tokens,
+                write_5m_tokens=value.cache.write_5m_tokens,
+                write_1h_tokens=value.cache.write_1h_tokens,
+                write_unknown_ttl_tokens=value.cache.write_unknown_ttl_tokens,
+                cached_input_tokens=value.cache.cached_input_tokens,
+                uncached_input_tokens=value.cache.uncached_input_tokens,
+            ),
+        )
+
+    @field_validator(
+        "usage",
+        mode="before",
+        json_schema_input_type=AggregateUsageMetrics,
+    )
+    @classmethod
+    def deserialize_usage(cls, value: object, info: ValidationInfo) -> object:
+        """Parse the aggregate-only JSON projection back into runtime usage metrics."""
+
+        if info.mode != "json" or type(value) is not dict:
+            return value
+        usage = dict(value)
+        for field_name in (
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "reasoning_output_tokens",
+        ):
+            if field_name in usage:
+                usage[field_name] = _aggregate_count_from_json(usage[field_name])
+        raw_cache = usage.get("cache")
+        if type(raw_cache) is dict:
+            cache = dict(raw_cache)
+            for field_name in (
+                "read_tokens",
+                "write_tokens",
+                "write_5m_tokens",
+                "write_1h_tokens",
+                "write_unknown_ttl_tokens",
+                "cached_input_tokens",
+                "uncached_input_tokens",
+            ):
+                if field_name in cache:
+                    cache[field_name] = _aggregate_count_from_json(cache[field_name])
+            usage["cache"] = cache
+        return usage
 
     @field_validator("usage")
     @classmethod
@@ -180,23 +316,23 @@ def pricing_usage_metrics_from_event_payload(
         return None
     raw_metrics = cast("dict[str, object]", raw_metrics)
     event_identity = payload.get("billing_identity")
-    bounded_payload_view: dict[str, object] = {"usage_metrics": _PricingMetricsMapping(raw_metrics)}
+    bounded_metrics = dict(raw_metrics)
+    nested_identity = bounded_metrics.get("billing_identity")
+    if type(nested_identity) is dict:
+        bounded_metrics["billing_identity"] = _billing_identity_for_aggregate(
+            cast("dict[str, object]", nested_identity)
+        )
+    bounded_payload_view: dict[str, object] = {"usage_metrics": bounded_metrics}
     if type(event_identity) is dict:
-        bounded_payload_view["billing_identity"] = _EvidenceFreeMapping(
+        bounded_payload_view["billing_identity"] = _billing_identity_for_aggregate(
             cast("dict[str, object]", event_identity)
         )
     if not json_utf8_size_within_limit(bounded_payload_view, max_bytes):
         raise _UsagePricingInputTooLarge
 
-    bounded_metrics = dict(raw_metrics)
-    nested_identity = bounded_metrics.get("billing_identity")
-    if type(nested_identity) is dict:
-        bounded_metrics["billing_identity"] = _billing_identity_without_evidence(
-            cast("dict[str, object]", nested_identity)
-        )
     bounded_payload: dict[str, object] = {"usage_metrics": bounded_metrics}
     if type(event_identity) is dict:
-        bounded_payload["billing_identity"] = _billing_identity_without_evidence(
+        bounded_payload["billing_identity"] = _billing_identity_for_aggregate(
             cast("dict[str, object]", event_identity)
         )
     try:
@@ -210,45 +346,6 @@ def pricing_usage_metrics_from_event_payload(
 
 class _UsagePricingInputTooLarge(ValueError):
     """A price-relevant event projection exceeds its application-memory bound."""
-
-
-class _EvidenceFreeMapping(Mapping[str, object]):
-    """Read-only identity view that skips unbounded evidence without copying it."""
-
-    _EXCLUDED = frozenset({"request_evidence", "completion_evidence"})
-
-    def __init__(self, value: dict[str, object]) -> None:
-        self._value = value
-
-    def __getitem__(self, key: str) -> object:
-        if key in self._EXCLUDED:
-            raise KeyError(key)
-        return self._value[key]
-
-    def __iter__(self) -> Iterator[str]:
-        return (key for key in self._value if key not in self._EXCLUDED)
-
-    def __len__(self) -> int:
-        return len(self._value) - sum(key in self._value for key in self._EXCLUDED)
-
-
-class _PricingMetricsMapping(Mapping[str, object]):
-    """Read-only usage view that substitutes the evidence-free nested identity."""
-
-    def __init__(self, value: dict[str, object]) -> None:
-        self._value = value
-
-    def __getitem__(self, key: str) -> object:
-        item = self._value[key]
-        if key == "billing_identity" and type(item) is dict:
-            return _EvidenceFreeMapping(cast("dict[str, object]", item))
-        return item
-
-    def __iter__(self) -> Iterator[str]:
-        return iter(self._value)
-
-    def __len__(self) -> int:
-        return len(self._value)
 
 
 def _usage_metrics_within_aggregate_counter_limit(metrics: UsageMetrics) -> bool:
@@ -270,12 +367,63 @@ def _usage_metrics_within_aggregate_counter_limit(metrics: UsageMetrics) -> bool
     )
 
 
-def _billing_identity_without_evidence(identity: dict[str, object]) -> dict[str, object]:
-    return {
+_BEDROCK_AGGREGATE_REQUEST_EVIDENCE = (
+    "source_region",
+    "resource_type",
+    "profile_scope",
+    "requested_service_tier",
+)
+_BEDROCK_AGGREGATE_COMPLETION_EVIDENCE = ("effective_service_tier",)
+
+
+def _billing_identity_for_aggregate(identity: dict[str, object]) -> dict[str, object]:
+    """Retain only bounded, Cayu-owned commercial display fields.
+
+    Provider evidence is arbitrary durable JSON and must not enter an aggregate
+    response by default. Bedrock's adapter owns a small string-only schema used by
+    its pricing diagnostics, so those exact fields are safe to project while all
+    unknown evidence (including customer data) remains excluded.
+    """
+
+    projected = {
         key: value
         for key, value in identity.items()
         if key not in {"request_evidence", "completion_evidence"}
     }
+    if identity.get("provider_name") != "bedrock":
+        return projected
+    for field_name, allowed_fields in (
+        ("request_evidence", _BEDROCK_AGGREGATE_REQUEST_EVIDENCE),
+        ("completion_evidence", _BEDROCK_AGGREGATE_COMPLETION_EVIDENCE),
+    ):
+        raw_evidence = identity.get(field_name)
+        if type(raw_evidence) is not dict:
+            continue
+        evidence = cast("dict[str, object]", raw_evidence)
+        selected = {
+            key: value
+            for key in allowed_fields
+            if type(value := evidence.get(key)) is str and value and value == value.strip()
+        }
+        if selected:
+            projected[field_name] = selected
+    return projected
+
+
+def _billing_identity_for_breakdown(identity: BillingIdentity) -> UsageBillingIdentity:
+    """Return the safe display projection used by aggregate response groups."""
+
+    projected = _billing_identity_for_aggregate(identity.model_dump(mode="json"))
+    request_evidence = projected.get("request_evidence", {})
+    completion_evidence = projected.get("completion_evidence", {})
+    assert type(request_evidence) is dict
+    assert type(completion_evidence) is dict
+    return UsageBillingIdentity(
+        provider_name=identity.provider_name,
+        resource_id=identity.resource_id,
+        request_evidence=cast("dict[str, str]", request_evidence),
+        completion_evidence=cast("dict[str, str]", completion_evidence),
+    )
 
 
 def _aggregate_counter(value: object) -> int:
@@ -333,7 +481,7 @@ class UsageAggregateRemainder(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    group_count: StrictInt = Field(ge=1)
+    group_count: PositiveAggregateCount = Field(ge=1)
     totals: UsageAggregateTotals
 
 
@@ -629,7 +777,7 @@ class UsageCurrencyCost(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     currency: str
-    model_steps: StrictInt = Field(ge=1)
+    model_steps: PositiveAggregateCount = Field(ge=1)
     total_cost: Decimal = Field(ge=0)
 
     @field_validator("currency")
@@ -644,12 +792,147 @@ class UsageUnpricedReason(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reason: str
-    model_steps: StrictInt = Field(ge=1)
+    model_steps: PositiveAggregateCount = Field(ge=1)
 
     @field_validator("reason")
     @classmethod
     def validate_reason(cls, value: str) -> str:
         return require_clean_nonblank(value, "reason")
+
+
+class UsageBillingIdentity(BaseModel):
+    """Bounded commercial identity safe to return in an aggregate response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider_name: str
+    resource_id: str
+    request_evidence: dict[str, str] = Field(default_factory=dict, max_length=4)
+    completion_evidence: dict[str, str] = Field(default_factory=dict, max_length=1)
+
+    @field_validator("provider_name", "resource_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("request_evidence", "completion_evidence")
+    @classmethod
+    def copy_evidence(cls, value: dict[str, str], info) -> dict[str, str]:
+        copied: dict[str, str] = {}
+        for key, item in value.items():
+            clean_key = require_clean_nonblank(key, f"{info.field_name} key")
+            copied[clean_key] = require_clean_nonblank(item, f"{info.field_name}.{clean_key}")
+        return copied
+
+    @model_validator(mode="after")
+    def validate_display_contract(self) -> UsageBillingIdentity:
+        request_fields = set(self.request_evidence)
+        completion_fields = set(self.completion_evidence)
+        if self.provider_name == "bedrock":
+            if not request_fields.issubset(_BEDROCK_AGGREGATE_REQUEST_EVIDENCE) or not (
+                completion_fields.issubset(_BEDROCK_AGGREGATE_COMPLETION_EVIDENCE)
+            ):
+                raise ValueError("Bedrock aggregate identity contains unsupported display fields.")
+        elif request_fields or completion_fields:
+            raise ValueError("Provider evidence is not part of the generic aggregate contract.")
+        return self
+
+
+class UsageBillingCostGroup(BaseModel):
+    """One bounded, identity-bearing group of equivalent pricing outcomes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    billing_identity: UsageBillingIdentity
+    pricing_provider_name: str | None = None
+    pricing_model: str | None = None
+    priced: StrictBool
+    model_steps: PositiveAggregateCount = Field(ge=1)
+    currency: str | None = None
+    total_cost: Decimal = Field(ge=0)
+    missing_pricing_reason: str | None = None
+
+    @field_validator(
+        "pricing_provider_name",
+        "pricing_model",
+        "currency",
+        "missing_pricing_reason",
+    )
+    @classmethod
+    def validate_optional_text(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        value = require_clean_nonblank(value, info.field_name)
+        return value.upper() if info.field_name == "currency" else value
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> UsageBillingCostGroup:
+        if self.priced:
+            if (
+                self.currency is None
+                or self.pricing_provider_name is None
+                or self.pricing_model is None
+                or self.missing_pricing_reason is not None
+            ):
+                raise ValueError(
+                    "Priced billing groups require currency, pricing identity, and no missing "
+                    "reason."
+                )
+        elif (
+            self.currency is not None
+            or self.total_cost != 0
+            or self.pricing_provider_name is not None
+            or self.pricing_model is not None
+            or self.missing_pricing_reason is None
+        ):
+            raise ValueError(
+                "Unpriced billing groups require a missing reason, no pricing identity, and zero "
+                "currency-local cost."
+            )
+        return self
+
+
+class UsageBillingCostRemainder(BaseModel):
+    """Exact counts for identity-bearing pricing groups omitted from bounded detail."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    group_count: PositiveAggregateCount = Field(ge=1)
+    model_steps: PositiveAggregateCount = Field(ge=1)
+    priced_model_steps: AggregateCount = Field(ge=0)
+    unpriced_model_steps: AggregateCount = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_step_accounting(self) -> UsageBillingCostRemainder:
+        if self.priced_model_steps + self.unpriced_model_steps != self.model_steps:
+            raise ValueError("Remainder priced and unpriced steps must sum to model_steps.")
+        return self
+
+
+class UsageBillingCostBreakdown(BaseModel):
+    """Bounded identity detail for evaluated cost inputs, with an exact remainder."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    identified_model_steps: AggregateCount = Field(ge=0)
+    groups: tuple[UsageBillingCostGroup, ...] = Field(max_length=100)
+    remainder: UsageBillingCostRemainder | None
+    accuracy: AggregateAccuracy
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> UsageBillingCostBreakdown:
+        represented_steps = sum(group.model_steps for group in self.groups)
+        if self.remainder is not None:
+            represented_steps += self.remainder.model_steps
+            if self.accuracy.kind is not AggregateAccuracyKind.TRUNCATED:
+                raise ValueError("A bounded billing remainder must report truncation.")
+        if represented_steps != self.identified_model_steps:
+            raise ValueError(
+                "Billing groups and their remainder must sum to identified_model_steps."
+            )
+        if self.accuracy.kind is AggregateAccuracyKind.EXACT and self.remainder is not None:
+            raise ValueError("An exact billing breakdown cannot include a remainder.")
+        return self
 
 
 class UsageCostRollup(BaseModel):
@@ -660,12 +943,13 @@ class UsageCostRollup(BaseModel):
     price_book_version: str
     price_book_generated_at: str
     accuracy: AggregateAccuracy
-    evaluated_model_steps: StrictInt = Field(ge=0)
-    priced_model_steps: StrictInt = Field(ge=0)
-    unpriced_model_steps: StrictInt = Field(ge=0)
-    unevaluated_model_steps: StrictInt = Field(ge=0)
+    evaluated_model_steps: AggregateCount = Field(ge=0)
+    priced_model_steps: AggregateCount = Field(ge=0)
+    unpriced_model_steps: AggregateCount = Field(ge=0)
+    unevaluated_model_steps: AggregateCount = Field(ge=0)
     currencies: tuple[UsageCurrencyCost, ...] = Field(max_length=5000)
     unpriced_reasons: tuple[UsageUnpricedReason, ...] = Field(max_length=5000)
+    billing_breakdown: UsageBillingCostBreakdown
 
     @field_validator("price_book_version", "price_book_generated_at")
     @classmethod
@@ -684,12 +968,38 @@ class UsageCostRollup(BaseModel):
             raise ValueError("Exact cost rollups cannot contain unevaluated model steps.")
         if self.accuracy.kind is AggregateAccuracyKind.TRUNCATED and self.evaluated_model_steps:
             raise ValueError("Truncated cost rollups cannot report partial evaluated totals.")
+        if self.billing_breakdown.identified_model_steps > self.evaluated_model_steps:
+            raise ValueError("Billing-identified model steps cannot exceed evaluated_model_steps.")
+        if (
+            self.accuracy.kind is AggregateAccuracyKind.SAMPLED
+            and self.billing_breakdown.accuracy.kind is AggregateAccuracyKind.EXACT
+        ):
+            raise ValueError("Sampled cost rollups cannot contain an exact billing breakdown.")
+        if (
+            self.accuracy.kind is AggregateAccuracyKind.TRUNCATED
+            and self.billing_breakdown.accuracy.kind is not AggregateAccuracyKind.TRUNCATED
+        ):
+            raise ValueError("Truncated cost rollups require a truncated billing breakdown.")
         return self
+
+
+@dataclass
+class _UsageBillingCostAccumulator:
+    billing_identity: UsageBillingIdentity
+    pricing_provider_name: str | None
+    pricing_model: str | None
+    priced: bool
+    currency: str | None
+    missing_pricing_reason: str | None
+    model_steps: int = 0
+    total_cost: Decimal = Decimal(0)
 
 
 def estimate_usage_rollup_cost(
     result: UsageRollupStoreResult,
     pricing,
+    *,
+    billing_group_limit: int = 20,
 ) -> UsageCostRollup:
     """Price an exact bounded input projection without reporting partial totals."""
 
@@ -699,6 +1009,8 @@ def estimate_usage_rollup_cost(
         raise TypeError("result must be a UsageRollupStoreResult.")
     if type(pricing) is not PriceBook:
         raise TypeError("pricing must be a PriceBook.")
+    if type(billing_group_limit) is not int or not 1 <= billing_group_limit <= 100:
+        raise ValueError("billing_group_limit must be between 1 and 100.")
     if not result.pricing_inputs_included:
         raise ValueError("Usage rollup did not request pricing inputs.")
     cost_accuracy = _combined_aggregate_accuracy(
@@ -719,11 +1031,18 @@ def estimate_usage_rollup_cost(
             unevaluated_model_steps=result.totals.model_steps,
             currencies=(),
             unpriced_reasons=(),
+            billing_breakdown=UsageBillingCostBreakdown(
+                identified_model_steps=0,
+                groups=(),
+                remainder=None,
+                accuracy=cost_accuracy,
+            ),
         )
 
     currency_costs: dict[str, Decimal] = {}
     currency_steps: dict[str, int] = {}
     unpriced_reasons: dict[str, int] = {}
+    billing_groups: dict[str, _UsageBillingCostAccumulator] = {}
     priced_model_steps = 0
     unpriced_model_steps = 0
     for item in result.pricing_inputs:
@@ -737,6 +1056,35 @@ def estimate_usage_rollup_cost(
             pricing=pricing,
             effective_on=item.effective_on,
         )
+        pricing_identity = item.metrics.billing_identity
+        if pricing_identity is not None:
+            billing_identity = _billing_identity_for_breakdown(pricing_identity)
+            group_key = json.dumps(
+                {
+                    "billing_identity": billing_identity.model_dump(mode="json"),
+                    "pricing_provider_name": estimate.pricing_provider_name,
+                    "pricing_model": estimate.pricing_model,
+                    "priced": estimate.priced,
+                    "currency": estimate.currency,
+                    "missing_pricing_reason": estimate.missing_pricing_reason,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            group = billing_groups.get(group_key)
+            if group is None:
+                group = _UsageBillingCostAccumulator(
+                    billing_identity=billing_identity.model_copy(deep=True),
+                    pricing_provider_name=estimate.pricing_provider_name,
+                    pricing_model=estimate.pricing_model,
+                    priced=estimate.priced,
+                    currency=estimate.currency,
+                    missing_pricing_reason=estimate.missing_pricing_reason,
+                )
+                billing_groups[group_key] = group
+            group.model_steps += item.occurrences
+            group.total_cost += estimate.total_cost * item.occurrences
         if not estimate.priced:
             reason = estimate.missing_pricing_reason or "no matching model pricing"
             unpriced_reasons[reason] = unpriced_reasons.get(reason, 0) + item.occurrences
@@ -749,6 +1097,63 @@ def estimate_usage_rollup_cost(
         )
         currency_steps[currency] = currency_steps.get(currency, 0) + item.occurrences
         priced_model_steps += item.occurrences
+
+    ordered_billing_groups = sorted(
+        (
+            UsageBillingCostGroup(
+                billing_identity=group.billing_identity,
+                pricing_provider_name=group.pricing_provider_name,
+                pricing_model=group.pricing_model,
+                priced=group.priced,
+                model_steps=group.model_steps,
+                currency=group.currency,
+                total_cost=group.total_cost,
+                missing_pricing_reason=group.missing_pricing_reason,
+            )
+            for group in billing_groups.values()
+        ),
+        key=lambda group: (
+            -group.model_steps,
+            group.billing_identity.provider_name,
+            group.billing_identity.resource_id,
+            json.dumps(
+                group.billing_identity.model_dump(mode="json"),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            "" if group.pricing_provider_name is None else group.pricing_provider_name,
+            "" if group.pricing_model is None else group.pricing_model,
+            "" if group.currency is None else group.currency,
+            "" if group.missing_pricing_reason is None else group.missing_pricing_reason,
+        ),
+    )
+    retained_billing_groups = tuple(ordered_billing_groups[:billing_group_limit])
+    omitted_billing_groups = ordered_billing_groups[billing_group_limit:]
+    billing_remainder = (
+        None
+        if not omitted_billing_groups
+        else UsageBillingCostRemainder(
+            group_count=len(omitted_billing_groups),
+            model_steps=sum(group.model_steps for group in omitted_billing_groups),
+            priced_model_steps=sum(
+                group.model_steps for group in omitted_billing_groups if group.priced
+            ),
+            unpriced_model_steps=sum(
+                group.model_steps for group in omitted_billing_groups if not group.priced
+            ),
+        )
+    )
+    billing_accuracy = cost_accuracy
+    if billing_remainder is not None:
+        billing_accuracy = _combined_aggregate_accuracy(
+            cost_accuracy,
+            AggregateAccuracy(
+                kind=AggregateAccuracyKind.TRUNCATED,
+                reason="Billing identity groups exceed group_limit.",
+                limit=billing_group_limit,
+            ),
+        )
 
     return UsageCostRollup(
         price_book_version=pricing.price_book_version,
@@ -772,6 +1177,12 @@ def estimate_usage_rollup_cost(
                 unpriced_reasons.items(),
                 key=lambda item: (-item[1], item[0]),
             )
+        ),
+        billing_breakdown=UsageBillingCostBreakdown(
+            identified_model_steps=sum(group.model_steps for group in ordered_billing_groups),
+            groups=retained_billing_groups,
+            remainder=billing_remainder,
+            accuracy=billing_accuracy,
         ),
     )
 

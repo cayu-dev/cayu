@@ -48,6 +48,7 @@ from cayu.runtime.aggregates import (
     EXACT_AGGREGATE,
     AggregateAccuracy,
     AggregateAccuracyKind,
+    AggregateCount,
     BoundedUsagePricingInputAccumulator,
     UsageAggregateBreakdown,
     UsageAggregateGroup,
@@ -1205,12 +1206,12 @@ class SessionStatusCounts(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    pending: StrictInt = Field(ge=0)
-    running: StrictInt = Field(ge=0)
-    interrupting: StrictInt = Field(ge=0)
-    completed: StrictInt = Field(ge=0)
-    failed: StrictInt = Field(ge=0)
-    interrupted: StrictInt = Field(ge=0)
+    pending: AggregateCount = Field(ge=0)
+    running: AggregateCount = Field(ge=0)
+    interrupting: AggregateCount = Field(ge=0)
+    completed: AggregateCount = Field(ge=0)
+    failed: AggregateCount = Field(ge=0)
+    interrupted: AggregateCount = Field(ge=0)
 
 
 class SessionOperationalSnapshot(BaseModel):
@@ -1219,7 +1220,7 @@ class SessionOperationalSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     as_of: datetime
-    total_count: StrictInt = Field(ge=0)
+    total_count: AggregateCount = Field(ge=0)
     counts_by_status: SessionStatusCounts
     accuracy: AggregateAccuracy
 

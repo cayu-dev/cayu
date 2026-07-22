@@ -2388,15 +2388,15 @@ def test_server_exposes_separate_store_local_operational_snapshots() -> None:
     body = response.json()
     assert body["scope"] == "configured_stores"
     assert body["cross_store_atomic"] is False
-    assert body["sessions"]["total_count"] == 1
-    assert body["sessions"]["counts_by_status"]["running"] == 1
+    assert body["sessions"]["total_count"] == "1"
+    assert body["sessions"]["counts_by_status"]["running"] == "1"
     assert body["sessions"]["accuracy"] == {
         "kind": "exact",
         "reason": None,
         "limit": None,
     }
     assert body["task_snapshot_status"] == "available"
-    assert body["tasks"]["counts_by_status"]["pending"] == 1
+    assert body["tasks"]["counts_by_status"]["pending"] == "1"
 
     without_tasks = client.post(
         "/api/operations/snapshot",
@@ -2484,14 +2484,77 @@ def test_server_exposes_bounded_event_time_usage_rollup_and_cost() -> None:
     assert body["scope"] == "configured_session_store"
     assert body["time_basis"] == "event.timestamp"
     assert body["session_filter_basis"] == "current_session_attributes"
-    assert body["matching_session_count"] == 1
-    assert body["active_session_count"] == 1
-    assert body["totals"]["model_steps"] == 1
-    assert body["totals"]["tool_calls"] == 1
+    assert body["matching_session_count"] == "1"
+    assert body["active_session_count"] == "1"
+    assert body["totals"]["model_steps"] == "1"
+    assert body["totals"]["tool_calls"] == "1"
     assert body["provider_breakdown"]["groups"][0]["provider_name"] == "fake"
     assert body["cost"]["accuracy"]["kind"] == "exact"
-    assert body["cost"]["currencies"] == [{"currency": "USD", "model_steps": 1, "total_cost": "1"}]
+    assert body["cost"]["currencies"] == [
+        {"currency": "USD", "model_steps": "1", "total_cost": "1"}
+    ]
+    assert body["cost"]["billing_breakdown"] == {
+        "identified_model_steps": "0",
+        "groups": [],
+        "remainder": None,
+        "accuracy": {"kind": "exact", "limit": None, "reason": None},
+    }
     assert "pricing_inputs" not in body
+
+
+def test_server_serializes_aggregate_counters_without_javascript_rounding() -> None:
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store)
+    start = datetime(2026, 7, 1, tzinfo=UTC)
+    maximum = 2**63 - 1
+
+    async def seed() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="aggregate-large-json-counter",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.append_events(
+            "aggregate-large-json-counter",
+            [
+                Event(
+                    id=f"aggregate-large-json-counter-{index}",
+                    type=EventType.MODEL_COMPLETED,
+                    session_id="aggregate-large-json-counter",
+                    timestamp=start + timedelta(minutes=index),
+                    payload={
+                        "usage_metrics": {
+                            "provider_name": "fake",
+                            "model": "fake-model",
+                            "input_tokens": maximum,
+                            "output_tokens": 0,
+                            "total_tokens": maximum,
+                        }
+                    },
+                )
+                for index in range(2)
+            ],
+        )
+
+    asyncio.run(seed())
+    response = TestClient(create_server(app, dev=True)).post(
+        "/api/usage/rollup",
+        json={
+            "start_at": start.isoformat(),
+            "end_at": (start + timedelta(days=1)).isoformat(),
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["totals"]["model_steps"] == "2"
+    assert body["totals"]["usage"]["input_tokens"] == str(2 * maximum)
+    assert body["provider_breakdown"]["groups"][0]["totals"]["usage"]["input_tokens"] == str(
+        2 * maximum
+    )
 
 
 def test_server_rejects_price_books_and_resolution_work_above_rollup_bounds() -> None:

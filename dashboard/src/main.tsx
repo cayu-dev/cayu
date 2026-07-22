@@ -14,6 +14,7 @@ import { dashboardConfig } from "./lib/config"
 import { parseDashboardSearch, stringifyDashboardSearch } from "./lib/search-params"
 import { validateSessionHistorySearch } from "./lib/session-history-search"
 import { validateSessionIndexSearch } from "./lib/session-index-search"
+import { validateUsageRollupSearch } from "./lib/usage-rollup-search"
 
 const AgentsPage = lazyRouteComponent(() => import("./routes/agents"), "AgentsPage")
 const ArtifactsPage = lazyRouteComponent(() => import("./routes/artifacts"), "ArtifactsPage")
@@ -66,6 +67,7 @@ const sessionsRoute = createRoute({
 const usageRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/usage",
+  validateSearch: validateUsageRollupSearch,
   component: UsagePage,
 })
 

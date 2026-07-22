@@ -13,6 +13,7 @@ import {
   ListTodo,
   Play,
 } from "lucide-react"
+import { Button } from "./components/ui/button"
 import {
   fetchServerContract,
   isSupportedServerContract,
@@ -108,22 +109,37 @@ export function Layout() {
       </nav>
       <main className="min-w-0 flex-1 overflow-auto">
         <div className="p-4 sm:p-6 xl:p-8">
-          {(contractError || incompatibleContract) && (
-            <div className="mb-6 flex items-start gap-3 rounded-md border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
+          {contract.isLoading ? (
+            <div className="flex items-center gap-3 rounded-md border border-border bg-muted/40 px-4 py-3 text-sm text-muted-foreground">
+              Checking API contract before loading control-plane data...
+            </div>
+          ) : contractError || incompatibleContract ? (
+            <div
+              className="mb-6 flex items-start gap-3 rounded-md border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive"
+              data-testid="dashboard-contract-gate"
+              role="alert"
+            >
               <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
-              <div>
-                {incompatibleContract ? (
-                  <>
-                    Dashboard expects CAYU server contract v{SUPPORTED_SERVER_CONTRACT_VERSION}, but
-                    the server reports v{contract.data.contract_version}.
-                  </>
-                ) : (
-                  <>Could not load the CAYU server contract: {contractError}</>
-                )}
+              <div className="space-y-2">
+                {incompatibleContract
+                  ? `Dashboard expects CAYU server contract v${SUPPORTED_SERVER_CONTRACT_VERSION}, but the server reports v${contract.data.contract_version}.`
+                  : `Could not load the CAYU server contract: ${contractError}`}
+                <div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={contract.isFetching}
+                    onClick={() => void contract.refetch()}
+                  >
+                    {contract.isFetching ? "Checking..." : "Retry contract check"}
+                  </Button>
+                </div>
               </div>
             </div>
+          ) : (
+            <Outlet />
           )}
-          <Outlet />
         </div>
       </main>
     </div>

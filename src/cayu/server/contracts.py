@@ -21,6 +21,7 @@ from cayu._validation import json_utf8_size_within_limit
 from cayu.core.events import EVENT_ID_MAX_CHARS
 from cayu.runtime.aggregates import (
     AggregateAccuracy,
+    AggregateCount,
     UsageAggregateBreakdown,
     UsageAggregateTotals,
     UsageCostRollup,
@@ -47,7 +48,7 @@ from cayu.server.sse import (
 )
 
 SERVER_API_PREFIX = "/api"
-SERVER_CONTRACT_VERSION = "1"
+SERVER_CONTRACT_VERSION = "2"
 SSE_CONTENT_TYPE = "text/event-stream"
 SSE_LAST_EVENT_ID_FORMAT = "session_id:event_id"
 
@@ -100,7 +101,15 @@ class UsageRollupRequest(ApiBaseModel):
     start_at: datetime
     end_at: datetime
     session_filter: SessionAggregateFilter = Field(default_factory=SessionAggregateFilter)
-    group_limit: StrictInt = Field(default=20, ge=1, le=100)
+    group_limit: StrictInt = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description=(
+            "Maximum returned groups, applied independently to provider, model, and billing "
+            "identity breakdowns. Omitted groups are represented by an explicit remainder."
+        ),
+    )
     pricing_input_limit: StrictInt = Field(default=1000, ge=1, le=5000)
     pricing: PriceBook | None = Field(
         default=None,
@@ -306,8 +315,8 @@ class UsageRollupResponse(ApiBaseModel):
     start_at: datetime
     end_at: datetime
     accuracy: AggregateAccuracy
-    matching_session_count: StrictInt = Field(ge=0)
-    active_session_count: StrictInt = Field(ge=0)
+    matching_session_count: AggregateCount = Field(ge=0)
+    active_session_count: AggregateCount = Field(ge=0)
     includes_active_sessions: StrictBool
     totals: UsageAggregateTotals
     provider_breakdown: UsageAggregateBreakdown
