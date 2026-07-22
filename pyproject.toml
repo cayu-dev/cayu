@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cayu"
-version = "0.1.0rc1"
+version = "0.1.0rc2"
 description = "A Python runtime for production AI agents with durable sessions, controlled tool execution, context management, reviewed knowledge, recovery, evals, and replay."
 readme = "README.md"
 requires-python = ">=3.11"
