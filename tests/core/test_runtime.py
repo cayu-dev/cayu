@@ -23294,7 +23294,15 @@ def test_operator_interrupt_wins_race_with_manual_tool_round_recovery_claim(
         assert interrupted_checkpoint is not None
         assert interrupted_checkpoint["pending_tool_round"]["round_id"] == request.round_id
         assert "incomplete_session_recovery_claim" not in interrupted_checkpoint
+        # Both application instances observe the same terminal interruption and
+        # may race to claim its durable cascade. Draining only the operator's
+        # coordinator is insufficient when the recovery worker won that claim.
         assert await operator_app.drain_background_interruptions(timeout_s=1) is True
+        if app is not operator_app:
+            assert await app.drain_background_interruptions(timeout_s=1) is True
+        drained_checkpoint = await store.load_checkpoint(session_id)
+        assert drained_checkpoint is not None
+        assert "pending_interruption_cascade" not in drained_checkpoint
         persisted = await store.load_events(session_id)
         terminal_interruptions = [
             event for event in persisted if event.type == EventType.SESSION_INTERRUPTED
