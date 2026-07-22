@@ -26,7 +26,7 @@ from cayu import (
 from cayu.server import create_server
 
 WORKSPACE = Path(__file__).parent / ".examples-workspaces" / "dashboard-knowledge-review"
-DB_DIR = WORKSPACE / ".cayu"
+DATA_DIR = WORKSPACE / "data"
 
 
 async def seed_knowledge(store: SQLiteKnowledgeStore) -> None:
@@ -133,11 +133,12 @@ async def seed_knowledge(store: SQLiteKnowledgeStore) -> None:
 
 def main() -> None:
     WORKSPACE.mkdir(parents=True, exist_ok=True)
-    DB_DIR.mkdir(exist_ok=True)
+    DATA_DIR.mkdir(exist_ok=True)
 
-    session_store = SQLiteSessionStore(DB_DIR / "sessions.db")
-    task_store = SQLiteTaskStore(DB_DIR / "tasks.db")
-    knowledge_store = SQLiteKnowledgeStore(DB_DIR / "knowledge.db")
+    database = DATA_DIR / "cayu.db"
+    session_store = SQLiteSessionStore(database)
+    task_store = SQLiteTaskStore(database)
+    knowledge_store = SQLiteKnowledgeStore(database)
     asyncio.run(seed_knowledge(knowledge_store))
 
     app = CayuApp(

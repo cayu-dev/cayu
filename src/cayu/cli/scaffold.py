@@ -90,8 +90,8 @@ def build_app(
     """
 
     app = CayuApp(
-        session_store=session_store or SQLiteSessionStore("data/sessions.sqlite"),
-        task_store=task_store or SQLiteTaskStore("data/tasks.sqlite"),
+        session_store=session_store or SQLiteSessionStore("data/cayu.db"),
+        task_store=task_store or SQLiteTaskStore("data/cayu.db"),
     )
     selected_provider = provider
     if selected_provider is None:
@@ -225,6 +225,10 @@ dev = ["pytest"]
 [tool.cayu]
 factory = "app:build_app"
 eval_target = "evals.agent:build_eval"
+
+[tool.cayu.session_store]
+backend = "sqlite"
+path = "data/cayu.db"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

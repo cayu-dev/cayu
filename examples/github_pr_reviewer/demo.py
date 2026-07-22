@@ -33,7 +33,10 @@ async def review_pr(owner: str, repo: str, pr_number: int) -> None:
         ).json()
     scratch = Path(tempfile.mkdtemp(prefix="cayu_pr_reviewer_"))
     app, task_store = build_app(
-        scratch / "tasks.sqlite", scratch / "workspaces", provider=provider, model=model
+        scratch / "data" / "cayu.db",
+        scratch / "workspaces",
+        provider=provider,
+        model=model,
     )
     task = await enqueue_pr_review(
         task_store,
@@ -133,7 +136,7 @@ async def demo() -> None:
     )
     os.environ.pop("GITHUB_TOKEN", None)
     app, task_store = build_app(
-        scratch / "tasks.sqlite",
+        scratch / "data" / "cayu.db",
         scratch / "workspaces",
         provider=provider,
         model="scripted-model",

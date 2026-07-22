@@ -91,7 +91,7 @@ def _file_payload(index: int | str = 0, patch: str = "+ok\n") -> dict:
 
 def test_build_app_composes_the_reviewer(tmp_path: Path) -> None:
     app, _task_store = mod.build_app(
-        tmp_path / "tasks.sqlite",
+        tmp_path / "data" / "cayu.db",
         tmp_path / "workspaces",
         provider=ScriptedModelProvider([]),
         model="scripted-model",

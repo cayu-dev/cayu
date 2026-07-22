@@ -12,6 +12,8 @@ from urllib.parse import unquote, urlsplit
 
 from cayu.cli.project import ProjectError, discover_cayu_project_configuration
 
+CANONICAL_SQLITE_PATH = Path("data/cayu.db")
+
 
 class SessionStoreBackend(StrEnum):
     SQLITE = "sqlite"
@@ -47,7 +49,7 @@ def resolve_session_store_target(
     environ: Mapping[str, str] | None = None,
     start: Path | None = None,
 ) -> SessionStoreTarget:
-    """Resolve explicit, environment, then project-configured targets."""
+    """Resolve explicit, environment, project-configured, then canonical targets."""
 
     if sqlite is not None and postgres is not None:
         raise SessionStoreTargetError("--sqlite and --postgres are mutually exclusive.")
@@ -100,6 +102,14 @@ def resolve_session_store_target(
             environ=environment,
         )
 
+    canonical = project.root / CANONICAL_SQLITE_PATH
+    if canonical.is_file():
+        return SessionStoreTarget(
+            backend=SessionStoreBackend.SQLITE,
+            sqlite_path=canonical,
+            source="canonical-discovery",
+            config_path=project.pyproject,
+        )
     raise _missing_target_error(project.pyproject)
 
 

@@ -7,7 +7,8 @@ this precedence:
 1. explicit `--sqlite PATH` or `--postgres DSN` options;
 2. `CAYU_DATABASE_URL`;
 3. `[tool.cayu.session_store]` in the nearest applicable `pyproject.toml`;
-4. an actionable missing-configuration error.
+4. the exact `data/cayu.db` file under that project root, when it exists;
+5. an actionable missing-configuration error.
 
 `--sqlite` and `--postgres` are mutually exclusive. An explicit option always
 wins over the environment and project configuration, which keeps scripts and
@@ -25,6 +26,10 @@ path = "data/cayu.db"
 
 Relative paths resolve from the directory containing `pyproject.toml`, not the
 caller's current working directory.
+
+Without a `session_store` table, Cayu recognizes only the exact
+`<project>/data/cayu.db` convention. It does not search for alternate filenames
+or create the file during resolution.
 
 Configure Postgres by naming an environment variable:
 

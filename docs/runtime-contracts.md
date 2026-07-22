@@ -518,7 +518,7 @@ conversation state.
 
 Hook helper side effects are persisted and sent to event sinks; the parent run stream yields the hook telemetry events. Hook-emitted custom events must use the `custom.` namespace. `CayuApp(runtime_hooks=[...])` registers app-level hooks for global middleware, while `register_agent(..., runtime_hooks=[...])` registers hooks that run only for that agent. App-level hooks run before agent-level hooks. Hooks that fork and dispatch follow-up sessions should still guard on session metadata, task type, or another app-owned marker when they can process their own follow-up sessions. This lets apps implement follow-up work such as “fork this completed builder session and dispatch a knowledge-extraction task” without making fork, task, or dispatch mean the same thing.
 
-`SQLiteSessionStore` is the durable local implementation. It stores sessions, append-only events, provider-neutral transcript messages, and the latest checkpoint in SQLite, while keeping session identity and event identity fields queryable as columns. Session identity includes agent, provider, active model, runtime, environment, and parent session. Event identity includes event type, agent, environment, workflow, and tool. `InMemorySessionStore` remains for tests and small examples. Hosted use can later provide a different `SessionStore`, such as Postgres, without changing runtime behavior.
+`SQLiteSessionStore` is the durable local implementation. New projects conventionally place session, task, and knowledge tables in one `data/cayu.db`; applications may select a different path explicitly. It stores sessions, append-only events, provider-neutral transcript messages, and the latest checkpoint in SQLite, while keeping session identity and event identity fields queryable as columns. Session identity includes agent, provider, active model, runtime, environment, and parent session. Event identity includes event type, agent, environment, workflow, and tool. `InMemorySessionStore` remains for tests and small examples. Hosted use can later provide a different `SessionStore`, such as Postgres, without changing runtime behavior.
 
 JSONL can be added later as an export/debug format. It should not be the primary Cayu session store because dashboards, replay, task orchestration, retries, and hosted runtimes need indexed structured queries and transactional state updates.
 
@@ -3089,7 +3089,7 @@ Apps can expose explicit agent recall by attaching a knowledge store to the
 environment and registering the built-in tools:
 
 ```python
-store = SQLiteKnowledgeStore("knowledge.sqlite")
+store = SQLiteKnowledgeStore("data/cayu.db")
 environment = Environment(
     EnvironmentSpec(name="local"),
     knowledge_store=store,

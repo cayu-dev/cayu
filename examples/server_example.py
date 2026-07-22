@@ -44,7 +44,7 @@ from cayu import (
 from cayu.server import BasicAuth, create_server
 
 WORKSPACE = Path(__file__).parent / ".examples-workspaces" / "server"
-DB_DIR = WORKSPACE / ".cayu"
+DATA_DIR = WORKSPACE / "data"
 
 
 class RecentContextPolicy(ContextPolicy):
@@ -54,10 +54,11 @@ class RecentContextPolicy(ContextPolicy):
 
 def main() -> None:
     WORKSPACE.mkdir(parents=True, exist_ok=True)
-    DB_DIR.mkdir(exist_ok=True)
+    DATA_DIR.mkdir(exist_ok=True)
 
-    session_store = SQLiteSessionStore(DB_DIR / "sessions.db")
-    task_store = SQLiteTaskStore(DB_DIR / "tasks.db")
+    database = DATA_DIR / "cayu.db"
+    session_store = SQLiteSessionStore(database)
+    task_store = SQLiteTaskStore(database)
 
     app = CayuApp(session_store=session_store, task_store=task_store)
     model = _register_provider(app)

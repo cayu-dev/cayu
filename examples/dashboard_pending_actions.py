@@ -52,7 +52,7 @@ from cayu.server import create_server
 from cayu.tools import UserInputTool
 
 WORKSPACE = Path(__file__).parent / ".examples-workspaces" / "dashboard-pending-actions"
-DB_DIR = WORKSPACE / ".cayu"
+DATA_DIR = WORKSPACE / "data"
 
 DEMO_PRICING = PriceBook(
     prices=(
@@ -673,16 +673,16 @@ async def seed_artifacts(app: CayuApp) -> None:
 
 def build_app() -> CayuApp:
     WORKSPACE.mkdir(parents=True, exist_ok=True)
-    DB_DIR.mkdir(exist_ok=True)
-    for name in ("sessions.db", "tasks.db", "knowledge.db"):
-        for path in DB_DIR.glob(f"{name}*"):
-            path.unlink(missing_ok=True)
-    shutil.rmtree(DB_DIR / "artifacts", ignore_errors=True)
+    DATA_DIR.mkdir(exist_ok=True)
+    for path in DATA_DIR.glob("cayu.db*"):
+        path.unlink(missing_ok=True)
+    shutil.rmtree(DATA_DIR / "artifacts", ignore_errors=True)
 
-    knowledge_store = SQLiteKnowledgeStore(DB_DIR / "knowledge.db")
+    database = DATA_DIR / "cayu.db"
+    knowledge_store = SQLiteKnowledgeStore(database)
     app = CayuApp(
-        session_store=ManualRecoveryDemoSessionStore(DB_DIR / "sessions.db"),
-        task_store=SQLiteTaskStore(DB_DIR / "tasks.db"),
+        session_store=ManualRecoveryDemoSessionStore(database),
+        task_store=SQLiteTaskStore(database),
         knowledge_store=knowledge_store,
         enable_logging=False,
     )
@@ -692,7 +692,7 @@ def build_app() -> CayuApp:
                 name="demo-local",
                 metadata={"tier": "demo", "region": "local"},
             ),
-            artifact_store=LocalArtifactStore(DB_DIR / "artifacts", store_id="demo-artifacts"),
+            artifact_store=LocalArtifactStore(DATA_DIR / "artifacts", store_id="demo-artifacts"),
             knowledge_store=knowledge_store,
             workspace_instructions="Use the dashboard demo workspace for local control-plane checks.",
         ),

@@ -113,10 +113,8 @@ def main() -> None:
                 f"exitstatus={child.exitstatus} signalstatus={child.signalstatus}"
             )
 
-        if not (project / "data" / "sessions.sqlite").is_file():
-            raise RuntimeError("scaffold factory did not create its project-root session store")
-        if not (project / "data" / "tasks.sqlite").is_file():
-            raise RuntimeError("scaffold factory did not create its project-root task store")
+        if not (project / "data" / "cayu.db").is_file():
+            raise RuntimeError("scaffold factory did not create its project-root Cayu store")
         if (nested / "data").exists():
             raise RuntimeError("scaffold factory resolved relative state from the nested directory")
 

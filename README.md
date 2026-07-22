@@ -122,8 +122,8 @@ asyncio.run(main())
 ```
 
 `CayuApp()` uses in-memory stores by default, which is appropriate for this
-one-shot example and for tests. The generated project configures SQLite so its
-sessions survive process restarts. Multi-process production deployments should
+one-shot example and for tests. The generated project configures all local Cayu
+stores in `data/cayu.db` so sessions survive process restarts. Multi-process production deployments should
 select a conforming shared store such as PostgreSQL.
 
 `CayuApp.run(...)` is the lower-level event-stream API. Runtime failures are

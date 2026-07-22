@@ -2,6 +2,15 @@
 
 ## v0.1.0 (unreleased)
 
+### One local SQLite convention
+
+New scaffolds and examples place Cayu's SQLite-backed runtime state in
+`data/cayu.db`. The product-level name reflects that the database can hold
+sessions, tasks, knowledge, budgets, and other Cayu runtime state. This is a
+prerelease convention change: Cayu does not discover
+or migrate alternate filenames. Applications that intentionally use another
+path must configure or pass that path explicitly.
+
 ### Virtual egress supports GitHub-style CLI tokens
 
 `VirtualCredentialSpec(credential_kind="opaque_token")` now brokers opaque

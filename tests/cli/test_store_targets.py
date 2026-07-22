@@ -354,6 +354,27 @@ def test_structurally_invalid_database_url_error_redacts_credentials(tmp_path: P
     assert "malformed database URL" in str(excinfo.value)
 
 
+def test_unconfigured_project_resolves_only_the_canonical_database(tmp_path: Path) -> None:
+    _write_project(tmp_path, '[tool.cayu]\nfactory = "app:build_app"\n')
+    canonical = tmp_path / "data" / "cayu.db"
+    canonical.parent.mkdir()
+    canonical.touch()
+
+    target = resolve_session_store_target(environ={}, start=tmp_path)
+
+    assert target.backend is SessionStoreBackend.SQLITE
+    assert target.sqlite_path == canonical
+    assert target.source == "canonical-discovery"
+
+
+def test_unconfigured_project_does_not_discover_other_database_names(tmp_path: Path) -> None:
+    _write_project(tmp_path, '[tool.cayu]\nfactory = "app:build_app"\n')
+    (tmp_path / "sessions.db").touch()
+
+    with pytest.raises(SessionStoreTargetError, match="No Cayu session store is configured"):
+        resolve_session_store_target(environ={}, start=tmp_path)
+
+
 def test_missing_store_target_has_zero_flag_and_override_guidance(tmp_path: Path) -> None:
     with pytest.raises(SessionStoreTargetError) as excinfo:
         resolve_session_store_target(environ={}, start=tmp_path)
