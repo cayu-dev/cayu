@@ -124,6 +124,15 @@ def test_dashboard_runtime_config_resolves_pydantic_models_before_freezing() -> 
         DashboardConfig(runtime_config={"value": object()})
 
 
+def test_dashboard_runtime_config_rejects_invalid_price_book_without_exposing_input() -> None:
+    secret = "pricing-secret-must-not-appear"
+
+    with pytest.raises(ValidationError, match="valid Cayu PriceBook") as exc_info:
+        DashboardConfig(runtime_config={"priceBook": {"credential": secret}})
+
+    assert secret not in str(exc_info.value)
+
+
 def test_dashboard_runtime_config_rejects_cyclic_values() -> None:
     runtime_config = {}
     runtime_config["self"] = runtime_config
@@ -659,7 +668,7 @@ def test_mount_cayu_validation_failure_does_not_modify_host_application(
 
 
 @pytest.mark.parametrize("adapter", ["mount_cayu", "mount_dashboard"])
-@pytest.mark.parametrize("invalid_config_kind", ["cyclic", "non_object"])
+@pytest.mark.parametrize("invalid_config_kind", ["cyclic", "non_object", "invalid_price_book"])
 def test_dashboard_mounts_reject_invalid_runtime_config_before_modifying_host(
     adapter: str,
     invalid_config_kind: str,
@@ -669,13 +678,15 @@ def test_dashboard_mounts_reject_invalid_runtime_config_before_modifying_host(
     if invalid_config_kind == "cyclic":
         runtime_config = {}
         runtime_config["self"] = runtime_config
+    elif invalid_config_kind == "invalid_price_book":
+        runtime_config = {"priceBook": {"credential": "pricing-secret-must-not-appear"}}
     else:
         runtime_config = object()
     server = FastAPI()
     routes_before = list(server.routes)
     lifespan_before = server.router.lifespan_context
 
-    with pytest.raises(ValueError, match="dashboard_config"):
+    with pytest.raises(ValueError, match="dashboard_config") as exc_info:
         if adapter == "mount_cayu":
             mount_cayu(
                 server,
@@ -686,6 +697,7 @@ def test_dashboard_mounts_reject_invalid_runtime_config_before_modifying_host(
         else:
             mount_dashboard(server, dashboard_config=runtime_config)
 
+    assert "pricing-secret-must-not-appear" not in str(exc_info.value)
     assert server.routes == routes_before
     assert server.router.lifespan_context is lifespan_before
 

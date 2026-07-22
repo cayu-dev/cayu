@@ -294,6 +294,21 @@ class UsageRollupRequest(ApiBaseModel):
         return self
 
 
+def validate_usage_rollup_price_book(value: object) -> PriceBook:
+    """Validate a default catalog against the usage endpoint's exact bounds."""
+
+    validation_request = UsageRollupRequest.model_validate(
+        {
+            "start_at": datetime(2000, 1, 1, tzinfo=UTC),
+            "end_at": datetime(2000, 1, 2, tzinfo=UTC),
+            "pricing": value,
+        }
+    )
+    if validation_request.pricing is None:
+        raise ValueError("A default usage price book cannot be null.")
+    return validation_request.pricing
+
+
 def _bounded_raw_sequence(
     value: object,
     *,

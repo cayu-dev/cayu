@@ -31,7 +31,7 @@ from cayu._validation import (
     thaw_json_value,
 )
 from cayu.runtime.sessions import IncompleteSessionsRecoveryRequest, SessionStatus
-from cayu.server.contracts import SERVER_API_PREFIX
+from cayu.server.contracts import SERVER_API_PREFIX, validate_usage_rollup_price_book
 
 DEFAULT_SERVER_DEPLOYMENT_NAME = "development"
 DEFAULT_SERVER_TITLE = "Cayu"
@@ -588,6 +588,13 @@ def normalize_dashboard_runtime_config(
     if type(copied) is not dict:
         raise ValueError(f"{field_name} must be an object.")
     require_durable_json_text(copied, field_name)
+    configured_price_book = copied.get("priceBook")
+    if configured_price_book is not None:
+        try:
+            price_book = validate_usage_rollup_price_book(configured_price_book)
+        except ValidationError:
+            raise ValueError(f"{field_name}.priceBook must be a valid Cayu PriceBook.") from None
+        copied["priceBook"] = price_book.model_dump(mode="json")
     return copied
 
 
