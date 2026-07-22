@@ -1113,6 +1113,26 @@ def test_sqlite_session_store_validate_mode_fails_fast_on_uninitialized(tmp_path
         SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
 
+def test_sqlite_session_store_revision_twenty_seven_requires_deferred_input_migration(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "sessions.sqlite"
+    store = SQLiteSessionStore(db_path)
+    asyncio.run(_close(store))
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 28")
+        connection.execute("DROP TABLE cayu_deferred_interaction_inputs")
+        connection.execute("PRAGMA user_version = 27")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 28"):
+        SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
+
+
 def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
     db_path = tmp_path / "sessions.sqlite"
     store = SQLiteSessionStore(db_path)
@@ -1131,7 +1151,7 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 24"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 28"):
         SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
     task_store = SQLiteTaskStore(
@@ -1229,7 +1249,7 @@ def test_sqlite_session_store_revision_thirteen_requires_run_fencing_migration(t
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 24"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 28"):
         SQLiteSessionStore(db_path)
 
     reopened = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
@@ -1268,7 +1288,7 @@ def test_sqlite_session_store_revision_fourteen_requires_cascade_index_migration
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 24"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 28"):
         SQLiteSessionStore(db_path)
 
     reopened = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
@@ -1366,7 +1386,7 @@ def test_sqlite_session_store_revision_sixteen_requires_pending_action_index(tmp
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 24"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 28"):
         SQLiteSessionStore(db_path)
 
     reopened = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
@@ -1586,7 +1606,7 @@ def test_sqlite_revision_seventeen_requires_session_operation_migration(tmp_path
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 24"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 28"):
         SQLiteSessionStore(db_path)
 
     migrated = SQLiteSessionStore(
@@ -2274,6 +2294,9 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (23, 23),
         (24, 23),
         (25, 25),
+        (26, 25),
+        (27, 25),
+        (28, 28),
     ]
     assert version == schema_migrations.LATEST_REVISION
 
@@ -3142,9 +3165,17 @@ def test_sqlite_prune_events_bounds_growth(tmp_path):
             ),
             identity=_identity(),
         )
-        old = _make_event(session.id, seq=1, timestamp=datetime(2026, 1, 1, tzinfo=UTC))
+        old = Event(
+            id="evt_pruned_interaction",
+            type=EventType.INTERACTION_STARTED,
+            session_id=session.id,
+            interaction_id="interaction-pruned",
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+        )
         new = _make_event(session.id, seq=2, timestamp=datetime(2026, 3, 1, tzinfo=UTC))
         await store.append_events(session.id, [old, new])
+        latest = await store.query_latest_interaction_events(session.id, limit=10)
+        assert [record.event.id for record in latest] == [old.id]
 
         # Retention cannot erase an event whose required side effects are still
         # pending, failed, leased, or dead-lettered.
@@ -3164,6 +3195,7 @@ def test_sqlite_prune_events_bounds_growth(tmp_path):
         assert deleted == 1
         remaining = await store.load_events(session.id)
         assert [event.payload for event in remaining] == [{"n": 2}]
+        assert await store.query_latest_interaction_events(session.id, limit=10) == []
 
         # Unknown session is rejected; wrong-type cutoff is rejected.
         with pytest.raises(KeyError):

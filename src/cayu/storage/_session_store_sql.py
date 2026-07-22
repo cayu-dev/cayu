@@ -85,6 +85,9 @@ def build_event_query_sql(
     if query.event_id is not None:
         clauses.append(f"cayu_events.event_id = {dialect.placeholder}")
         params.append(query.event_id)
+    if query.interaction_id is not None:
+        clauses.append(f"cayu_events.interaction_id = {dialect.placeholder}")
+        params.append(query.interaction_id)
     if query.session_id is not None:
         clauses.append(f"cayu_events.session_id = {dialect.placeholder}")
         params.append(query.session_id)

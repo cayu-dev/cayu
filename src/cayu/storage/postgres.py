@@ -101,6 +101,7 @@ from cayu.runtime.sessions import (
     _TOOL_ROUND_LIFECYCLE_EVENT_TYPES,
     DELETE_BLOCKED_SESSION_STATUSES,
     FORK_TRANSCRIPT_VALIDATION_ERROR,
+    INHERIT_INTERACTION,
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
     MAX_PENDING_ACTION_RESULT_BYTES,
     MAX_PENDING_ACTION_TOOL_CALLS,
@@ -110,6 +111,7 @@ from cayu.runtime.sessions import (
     SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
     BudgetReservationIdentityConflict,
     CheckpointTransform,
+    DeferredInteractionInput,
     EnqueueSessionMessageRequest,
     EnqueueSessionMessageResult,
     EventQuery,
@@ -117,6 +119,7 @@ from cayu.runtime.sessions import (
     EventRecord,
     EventSummary,
     ForkTranscriptValidator,
+    InteractionAttribution,
     McpManifestBaseline,
     McpManifestBaselineLoadResult,
     McpManifestPublicationResult,
@@ -173,9 +176,14 @@ from cayu.runtime.sessions import (
     _assert_session_run_epoch,
     _assert_session_run_epoch_value,
     _build_runtime_publication_receipt,
+    _copy_interaction_admission,
     _copy_mcp_manifest_publication,
+    _copy_optional_interaction_admission,
+    _copy_queued_interaction_started_event,
     _copy_session_event_batch,
+    _copy_transition_interaction_admission,
     _current_session_run_epoch,
+    _deactivate_session_interaction,
     _deactivate_session_run_fence,
     _model_completion_stage_abandonment_record,
     _model_completion_stage_preparation_record,
@@ -209,6 +217,7 @@ from cayu.runtime.sessions import (
     _stored_mcp_manifest_baseline,
     _tool_round_publication_identity,
     _validate_equivalent_queued_session_message,
+    _validate_interaction_page,
     _validate_mcp_manifest_history_keys,
     _validate_mcp_manifest_publication_state,
     _validate_model_completion_active_marker_for_preparation,
@@ -247,6 +256,7 @@ from cayu.runtime.sessions import (
     filter_transcript_records,
     fork_transcript_is_accepted,
     replace_session_user_metadata,
+    resolve_interaction_attribution,
     session_next_cursor,
     session_outcome,
     session_query_from_aggregate_filter,
@@ -322,7 +332,7 @@ from cayu.storage.memory import (
 _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 _SCHEMA_ADVISORY_LOCK_POLL_SECONDS = 0.25
 _POSTGRES_MIN_REQUIRED_REVISION = 18
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 24
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 28
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL = """
     event_type IN (
@@ -465,6 +475,7 @@ def _event_query_with_session_ids(
     return EventQuery(
         session_ids=session_ids,
         event_id=query.event_id,
+        interaction_id=query.interaction_id,
         causal_budget_id=query.causal_budget_id,
         event_type=query.event_type,
         event_types=query.event_types,
@@ -782,6 +793,75 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
             generation BIGINT NOT NULL CHECK (generation >= 1),
             baseline JSONB NOT NULL,
             updated_at TIMESTAMPTZ NOT NULL
+        )
+        """,
+    ),
+    26: (
+        "ALTER TABLE cayu_events ADD COLUMN IF NOT EXISTS interaction_id TEXT",
+        "ALTER TABLE cayu_transcript_messages ADD COLUMN IF NOT EXISTS interaction_id TEXT",
+    ),
+    27: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_interaction_latest_events (
+            session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+            interaction_id TEXT NOT NULL,
+            latest_event_sequence BIGINT NOT NULL
+                REFERENCES cayu_events(sequence) ON DELETE CASCADE,
+            PRIMARY KEY (session_id, interaction_id)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_cayu_interaction_latest_events_page "
+        "ON cayu_interaction_latest_events(session_id, latest_event_sequence DESC)",
+        """
+        CREATE OR REPLACE FUNCTION cayu_track_interaction_latest_event()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            IF NEW.interaction_id IS NOT NULL AND NEW.event_type = ANY(ARRAY[
+                'interaction.started', 'interaction.resumed', 'interaction.paused',
+                'interaction.completed', 'interaction.failed', 'interaction.interrupted'
+            ]) THEN
+                INSERT INTO cayu_interaction_latest_events (
+                    session_id, interaction_id, latest_event_sequence
+                ) VALUES (NEW.session_id, NEW.interaction_id, NEW.sequence)
+                ON CONFLICT (session_id, interaction_id) DO UPDATE SET
+                    latest_event_sequence = EXCLUDED.latest_event_sequence
+                WHERE EXCLUDED.latest_event_sequence
+                    > cayu_interaction_latest_events.latest_event_sequence;
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+        """,
+        "DROP TRIGGER IF EXISTS cayu_track_interaction_latest_event ON cayu_events",
+        """
+        CREATE TRIGGER cayu_track_interaction_latest_event
+        AFTER INSERT ON cayu_events
+        FOR EACH ROW EXECUTE FUNCTION cayu_track_interaction_latest_event()
+        """,
+        """
+        INSERT INTO cayu_interaction_latest_events (
+            session_id, interaction_id, latest_event_sequence
+        )
+        SELECT session_id, interaction_id, MAX(sequence)
+        FROM cayu_events
+        WHERE interaction_id IS NOT NULL
+          AND event_type = ANY(ARRAY[
+              'interaction.started', 'interaction.resumed', 'interaction.paused',
+              'interaction.completed', 'interaction.failed', 'interaction.interrupted'
+          ])
+        GROUP BY session_id, interaction_id
+        ON CONFLICT (session_id, interaction_id) DO UPDATE SET
+            latest_event_sequence = EXCLUDED.latest_event_sequence
+        WHERE EXCLUDED.latest_event_sequence
+            > cayu_interaction_latest_events.latest_event_sequence
+        """,
+    ),
+    28: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_deferred_interaction_inputs (
+            session_id TEXT PRIMARY KEY REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+            interaction_id TEXT NOT NULL,
+            source_messages JSONB NOT NULL
         )
         """,
     ),
@@ -1175,6 +1255,7 @@ def _revision_17_event_backfill_sql(*, source_predicate: str, batch_limit: int) 
             ELSE jsonb_build_object(
                 'type', measured.projection -> 'type',
                 'session_id', 'cayu_oversized_pending_action_projection',
+                'interaction_id', measured.projection -> 'interaction_id',
                 'id', 'cayu_oversized_pending_action_projection',
                 'timestamp', measured.projection -> 'timestamp',
                 'agent_name', NULL,
@@ -1392,6 +1473,37 @@ _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] =
             """,
             drop_statement=(
                 "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_events_pending_action_lookup"
+            ),
+        ),
+    ),
+    26: (
+        _ConcurrentIndexMigration(
+            index_name="idx_cayu_events_session_interaction_sequence",
+            table_name="cayu_events",
+            key_definitions=("session_id", "interaction_id", "sequence"),
+            predicate_definition=None,
+            create_statement=(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+                "idx_cayu_events_session_interaction_sequence "
+                "ON cayu_events(session_id, interaction_id, sequence)"
+            ),
+            drop_statement=(
+                "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_events_session_interaction_sequence"
+            ),
+        ),
+        _ConcurrentIndexMigration(
+            index_name="idx_cayu_transcript_messages_session_interaction_sequence",
+            table_name="cayu_transcript_messages",
+            key_definitions=("session_id", "interaction_id", "sequence"),
+            predicate_definition=None,
+            create_statement=(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+                "idx_cayu_transcript_messages_session_interaction_sequence "
+                "ON cayu_transcript_messages(session_id, interaction_id, sequence)"
+            ),
+            drop_statement=(
+                "DROP INDEX CONCURRENTLY IF EXISTS "
+                "idx_cayu_transcript_messages_session_interaction_sequence"
             ),
         ),
     ),
@@ -5153,7 +5265,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         request: RunRequest,
         *,
         identity: SessionIdentity,
+        interaction_started_event: Event | None = None,
+        interaction_source_messages: list[Message] | None = None,
     ) -> Session:
+        from cayu.runtime.pending_actions import pending_action_event_storage_values
+
         request = copy_run_request(request)
         identity = copy_session_identity(identity)
         await self._ensure_ready()
@@ -5176,6 +5292,14 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             metadata=copy_durable_json_object(request.metadata, "metadata"),
             labels=request.labels,
         )
+        admission = _copy_optional_interaction_admission(
+            session.id,
+            interaction_started_event,
+            interaction_source_messages,
+            defer_transcript=True,
+        )
+        if admission is not None:
+            session = session.model_copy(update={"status": SessionStatus.RUNNING, "run_epoch": 1})
         if session.parent_session_id == session.id:
             raise ValueError("Session cannot be its own parent.")
         async with self._connection() as conn:
@@ -5196,6 +5320,66 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             """,
                             pg_support.session_label_insert_values(session),
                         )
+                    if admission is not None:
+                        started_event, source_messages = admission
+                        interaction_id = started_event.interaction_id
+                        if interaction_id is None:
+                            raise AssertionError("Interaction admission lost its identity.")
+                        lookup_key, projection, projection_bytes = (
+                            pending_action_event_storage_values(started_event)
+                        )
+                        await cur.execute(
+                            "UPDATE cayu_sessions SET event_seq = 1 WHERE id = %s",
+                            (session.id,),
+                        )
+                        await cur.execute(
+                            """
+                            INSERT INTO cayu_events (
+                                session_id, session_order, event_id, interaction_id,
+                                event_type, timestamp, agent_name, environment_name,
+                                workflow_name, tool_name, payload, event,
+                                pending_action_lookup_key, pending_action_projection,
+                                pending_action_projection_bytes
+                            ) VALUES (
+                                %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s, %s, %s
+                            )
+                            """,
+                            (
+                                session.id,
+                                1,
+                                started_event.id,
+                                interaction_id,
+                                str(started_event.type),
+                                pg_support.to_utc(started_event.timestamp),
+                                started_event.agent_name,
+                                started_event.environment_name,
+                                started_event.workflow_name,
+                                started_event.tool_name,
+                                _dumps(started_event.payload),
+                                _dumps(started_event.model_dump(mode="json")),
+                                lookup_key,
+                                projection,
+                                projection_bytes,
+                            ),
+                        )
+                        await self._enqueue_persisted_event_side_effects(
+                            cur,
+                            session.id,
+                            [started_event.id],
+                        )
+                        await cur.execute(
+                            "INSERT INTO cayu_deferred_interaction_inputs "
+                            "(session_id, interaction_id, source_messages) "
+                            "VALUES (%s, %s, %s)",
+                            (
+                                session.id,
+                                interaction_id,
+                                _dumps(
+                                    [message.model_dump(mode="json") for message in source_messages]
+                                ),
+                            ),
+                        )
                 await conn.commit()
             except UniqueViolation as exc:
                 await conn.rollback()
@@ -5207,6 +5391,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         f"Parent session not found: {session.parent_session_id}"
                     ) from exc
                 raise
+        if admission is not None:
+            _activate_session_run_fence(session)
         return session.model_copy(deep=True)
 
     async def create_fork(
@@ -5297,7 +5483,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
 
                     await cur.execute(
                         """
-                        SELECT message
+                        SELECT message, interaction_id
                         FROM cayu_transcript_messages
                         WHERE session_id = %s
                         ORDER BY sequence ASC
@@ -5312,6 +5498,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         copied_messages = [
                             Message(**_json_obj(row[0])) for row in selected_transcript_rows
                         ]
+                        copied_interaction_ids = [row[1] for row in selected_transcript_rows]
                     else:
                         if transcript_cursor > transcript_row_count:
                             transcript_rows.clear()
@@ -5323,6 +5510,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         copied_messages = [
                             Message(**_json_obj(row[0])) for row in selected_transcript_rows
                         ]
+                        copied_interaction_ids = [row[1] for row in selected_transcript_rows]
                     selected_transcript_rows.clear()
                     if not fork_transcript_is_accepted(copied_messages, transcript_validator):
                         copied_messages.clear()
@@ -5365,12 +5553,17 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     if copied_messages:
                         await cur.executemany(
                             """
-                            INSERT INTO cayu_transcript_messages (session_id, message)
-                            VALUES (%s, %s)
+                            INSERT INTO cayu_transcript_messages
+                                (session_id, interaction_id, message)
+                            VALUES (%s, %s, %s)
                             """,
                             [
-                                (fork.id, _dumps(message.model_dump(mode="json")))
-                                for message in copied_messages
+                                (
+                                    fork.id,
+                                    copied_interaction_ids[index],
+                                    _dumps(message.model_dump(mode="json")),
+                                )
+                                for index, message in enumerate(copied_messages)
                             ],
                         )
                     if copied_checkpoint is not None:
@@ -5751,13 +5944,28 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         from_statuses: set[SessionStatus],
         to_status: SessionStatus,
         checkpoint_transform: CheckpointTransform,
+        interaction_started_event: Event | None = None,
+        interaction_source_messages: list[Message] | None = None,
+        continued_interaction_id: str | None = None,
+        defer_interaction_source: bool = False,
     ) -> Session:
+        from cayu.runtime.pending_actions import pending_action_event_storage_values
+
         session_id = require_clean_nonblank(session_id, "session_id")
         allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
         if not isinstance(to_status, SessionStatus):
             raise ValueError("to_status must be a SessionStatus.")
         if checkpoint_transform is None:
             raise TypeError("checkpoint_transform is required.")
+        admission = _copy_transition_interaction_admission(
+            session_id,
+            interaction_started_event,
+            interaction_source_messages,
+            continued_interaction_id=continued_interaction_id,
+            defer_interaction_source=defer_interaction_source,
+        )
+        if admission is not None and to_status is not SessionStatus.RUNNING:
+            raise ValueError("Interaction admission requires a transition to running.")
         await self._ensure_ready()
         updated_at = datetime.now(UTC)
         async with self._connection() as conn:
@@ -5784,21 +5992,112 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         """
                         UPDATE cayu_sessions
                         SET status = %s, updated_at = %s, last_activity_at = %s,
-                            run_epoch = run_epoch + %s
+                            run_epoch = run_epoch + %s,
+                            event_seq = event_seq + %s
                         WHERE id = %s
+                        RETURNING event_seq
                         """,
                         (
                             str(to_status),
                             updated_at,
                             updated_at,
                             1 if to_status == SessionStatus.RUNNING else 0,
+                            1 if admission is not None and admission[0] is not None else 0,
                             session_id,
                         ),
                     )
+                    order_row = await cur.fetchone()
+                    if order_row is None:
+                        raise KeyError(f"Session not found: {session_id}")
                     if transformed_checkpoint is not None:
                         await self._upsert_checkpoint(
                             cur, session_id, transformed_checkpoint, updated_at
                         )
+                    if admission is not None:
+                        started_event, interaction_id, source_messages, defer_source = admission
+                        await cur.execute(
+                            "SELECT interaction_id FROM cayu_deferred_interaction_inputs "
+                            "WHERE session_id = %s FOR UPDATE",
+                            (session_id,),
+                        )
+                        existing_deferred = await cur.fetchone()
+                        if existing_deferred is not None and (
+                            not defer_source or existing_deferred[0] != interaction_id
+                        ):
+                            raise RuntimeError("Session already has deferred interaction input.")
+                        if started_event is not None:
+                            lookup_key, projection, projection_bytes = (
+                                pending_action_event_storage_values(started_event)
+                            )
+                            await cur.execute(
+                                """
+                                INSERT INTO cayu_events (
+                                    session_id, session_order, event_id, interaction_id,
+                                    event_type, timestamp, agent_name, environment_name,
+                                    workflow_name, tool_name, payload, event,
+                                    pending_action_lookup_key, pending_action_projection,
+                                    pending_action_projection_bytes
+                                ) VALUES (
+                                    %s, %s, %s, %s, %s, %s, %s, %s,
+                                    %s, %s, %s, %s, %s, %s, %s
+                                )
+                                """,
+                                (
+                                    session_id,
+                                    order_row[0],
+                                    started_event.id,
+                                    interaction_id,
+                                    str(started_event.type),
+                                    pg_support.to_utc(started_event.timestamp),
+                                    started_event.agent_name,
+                                    started_event.environment_name,
+                                    started_event.workflow_name,
+                                    started_event.tool_name,
+                                    _dumps(started_event.payload),
+                                    _dumps(started_event.model_dump(mode="json")),
+                                    lookup_key,
+                                    projection,
+                                    projection_bytes,
+                                ),
+                            )
+                            await self._enqueue_persisted_event_side_effects(
+                                cur,
+                                session_id,
+                                [started_event.id],
+                            )
+                        if defer_source:
+                            await cur.execute(
+                                "INSERT INTO cayu_deferred_interaction_inputs "
+                                "(session_id, interaction_id, source_messages) "
+                                "VALUES (%s, %s, %s) "
+                                "ON CONFLICT(session_id) DO UPDATE SET "
+                                "interaction_id = EXCLUDED.interaction_id, "
+                                "source_messages = EXCLUDED.source_messages",
+                                (
+                                    session_id,
+                                    interaction_id,
+                                    _dumps(
+                                        [
+                                            message.model_dump(mode="json")
+                                            for message in source_messages
+                                        ]
+                                    ),
+                                ),
+                            )
+                        else:
+                            await cur.executemany(
+                                "INSERT INTO cayu_transcript_messages "
+                                "(session_id, interaction_id, message) "
+                                "VALUES (%s, %s, %s)",
+                                [
+                                    (
+                                        session_id,
+                                        interaction_id,
+                                        _dumps(message.model_dump(mode="json")),
+                                    )
+                                    for message in source_messages
+                                ],
+                            )
                 await conn.commit()
             except Exception:
                 await conn.rollback()
@@ -5971,6 +6270,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         session_id = require_clean_nonblank(session_id, "session_id")
         expected_run_epoch = _current_session_run_epoch(session_id)
         if expected_run_epoch is None:
+            _deactivate_session_interaction(session_id)
             return
         await self._ensure_ready()
         try:
@@ -5984,6 +6284,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 await conn.commit()
         finally:
             _deactivate_session_run_fence(session_id)
+            _deactivate_session_interaction(session_id)
 
     async def append_event(self, session_id: str, event: Event) -> None:
         await self.append_events(session_id, [event])
@@ -6188,6 +6489,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 session_id,
                                 next_order,
                                 event.id,
+                                event.interaction_id,
                                 str(event.type),
                                 pg_support.to_utc(event.timestamp),
                                 event.agent_name,
@@ -6204,14 +6506,15 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     await cur.executemany(
                         """
                         INSERT INTO cayu_events (
-                            session_id, session_order, event_id, event_type, timestamp,
+                            session_id, session_order, event_id, interaction_id,
+                            event_type, timestamp,
                             agent_name, environment_name, workflow_name, tool_name,
                             payload, event, pending_action_lookup_key,
                             pending_action_projection, pending_action_projection_bytes
                         )
                         VALUES (
                             %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s, %s
+                            %s, %s, %s, %s, %s, %s, %s
                         )
                         """,
                         rows,
@@ -6369,6 +6672,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 session_id,
                                 next_order,
                                 event.id,
+                                event.interaction_id,
                                 str(event.type),
                                 pg_support.to_utc(event.timestamp),
                                 event.agent_name,
@@ -6385,14 +6689,15 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     await cur.executemany(
                         """
                         INSERT INTO cayu_events (
-                            session_id, session_order, event_id, event_type, timestamp,
+                            session_id, session_order, event_id, interaction_id,
+                            event_type, timestamp,
                             agent_name, environment_name, workflow_name, tool_name,
                             payload, event, pending_action_lookup_key,
                             pending_action_projection, pending_action_projection_bytes
                         )
                         VALUES (
                             %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s, %s
+                            %s, %s, %s, %s, %s, %s, %s
                         )
                         """,
                         event_rows,
@@ -6432,6 +6737,137 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 existing = await self._first_existing_event_id(
                     session_id,
                     [event.id for event in copied_events],
+                )
+                if existing is not None:
+                    raise ValueError(
+                        f"Event already exists for session {session_id}: {existing}"
+                    ) from exc
+                raise
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def admit_interaction(
+        self,
+        session_id: str,
+        *,
+        started_event: Event,
+        source_messages: list[Message],
+        defer_transcript: bool = False,
+    ) -> None:
+        from cayu.runtime.pending_actions import pending_action_event_storage_values
+
+        copied_event, copied_messages = _copy_interaction_admission(
+            session_id,
+            started_event,
+            source_messages,
+            defer_transcript=defer_transcript,
+        )
+        interaction_id = copied_event.interaction_id
+        if interaction_id is None:  # validated by _copy_interaction_admission
+            raise AssertionError("Interaction admission lost its identity.")
+        lookup_key, projection, projection_bytes = pending_action_event_storage_values(copied_event)
+        expected_run_epoch = _current_session_run_epoch(session_id)
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    if expected_run_epoch is None:
+                        await cur.execute(
+                            "UPDATE cayu_sessions SET event_seq = event_seq + 1, "
+                            "last_activity_at = %s WHERE id = %s RETURNING event_seq",
+                            (datetime.now(UTC), session_id),
+                        )
+                    else:
+                        await cur.execute(
+                            "UPDATE cayu_sessions SET event_seq = event_seq + 1, "
+                            "last_activity_at = %s WHERE id = %s AND run_epoch = %s "
+                            "RETURNING event_seq",
+                            (datetime.now(UTC), session_id, expected_run_epoch),
+                        )
+                    order_row = await cur.fetchone()
+                    if order_row is None:
+                        if expected_run_epoch is not None:
+                            await _raise_session_write_conflict(
+                                cur,
+                                session_id,
+                                expected_run_epoch,
+                            )
+                        raise KeyError(f"Session not found: {session_id}")
+                    await cur.execute(
+                        "SELECT 1 FROM cayu_deferred_interaction_inputs WHERE session_id = %s",
+                        (session_id,),
+                    )
+                    if await cur.fetchone() is not None:
+                        raise RuntimeError("Session already has deferred interaction input.")
+                    await cur.execute(
+                        """
+                        INSERT INTO cayu_events (
+                            session_id, session_order, event_id, interaction_id,
+                            event_type, timestamp, agent_name, environment_name,
+                            workflow_name, tool_name, payload, event,
+                            pending_action_lookup_key, pending_action_projection,
+                            pending_action_projection_bytes
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s, %s, %s
+                        )
+                        """,
+                        (
+                            session_id,
+                            order_row[0],
+                            copied_event.id,
+                            interaction_id,
+                            str(copied_event.type),
+                            pg_support.to_utc(copied_event.timestamp),
+                            copied_event.agent_name,
+                            copied_event.environment_name,
+                            copied_event.workflow_name,
+                            copied_event.tool_name,
+                            _dumps(copied_event.payload),
+                            _dumps(copied_event.model_dump(mode="json")),
+                            lookup_key,
+                            projection,
+                            projection_bytes,
+                        ),
+                    )
+                    await self._enqueue_persisted_event_side_effects(
+                        cur,
+                        session_id,
+                        [copied_event.id],
+                    )
+                    if defer_transcript:
+                        await cur.execute(
+                            "INSERT INTO cayu_deferred_interaction_inputs "
+                            "(session_id, interaction_id, source_messages) "
+                            "VALUES (%s, %s, %s)",
+                            (
+                                session_id,
+                                interaction_id,
+                                _dumps(
+                                    [message.model_dump(mode="json") for message in copied_messages]
+                                ),
+                            ),
+                        )
+                    else:
+                        await cur.executemany(
+                            "INSERT INTO cayu_transcript_messages "
+                            "(session_id, interaction_id, message) VALUES (%s, %s, %s)",
+                            [
+                                (
+                                    session_id,
+                                    interaction_id,
+                                    _dumps(message.model_dump(mode="json")),
+                                )
+                                for message in copied_messages
+                            ],
+                        )
+                await conn.commit()
+            except UniqueViolation as exc:
+                await conn.rollback()
+                existing = await self._first_existing_event_id(
+                    session_id,
+                    [copied_event.id],
                 )
                 if existing is not None:
                     raise ValueError(
@@ -6851,17 +7287,19 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     await cur.execute(
                         """
                         INSERT INTO cayu_events (
-                            session_id, session_order, event_id, event_type, timestamp,
+                            session_id, session_order, event_id, interaction_id,
+                            event_type, timestamp,
                             agent_name, environment_name, workflow_name, tool_name,
                             payload, event, pending_action_lookup_key,
                             pending_action_projection, pending_action_projection_bytes
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         (
                             request.session_id,
                             event_order_row[0],
                             accepted_event.id,
+                            accepted_event.interaction_id,
                             str(accepted_event.type),
                             accepted_event.timestamp,
                             accepted_event.agent_name,
@@ -6904,10 +7342,19 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         include_on_idle: bool,
         eligible_through: int | None = None,
         limit: int = SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
+        interaction_id: str | None = None,
+        interaction_started_event: Event | None = None,
     ) -> SessionMessageDeliveryBatch:
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
         session_id = require_clean_nonblank(session_id, "session_id")
+        if interaction_id is not None:
+            interaction_id = require_clean_nonblank(interaction_id, "interaction_id")
+        interaction_started_event = _copy_queued_interaction_started_event(
+            session_id,
+            interaction_id,
+            interaction_started_event,
+        )
         if type(include_on_idle) is not bool:
             raise TypeError("include_on_idle must be a bool.")
         if eligible_through is not None and eligible_through < 0:
@@ -6977,6 +7424,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         delivery_event = Event(
                             type=EventType.SESSION_MESSAGE_DELIVERED,
                             session_id=session_id,
+                            interaction_id=interaction_id,
                             agent_name=loaded.agent_name,
                             environment_name=loaded.environment_name,
                             timestamp=delivered_at,
@@ -7012,10 +7460,14 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             Message.text(MessageRole.USER, queued_message.content)
                         )
                     await cur.executemany(
-                        "INSERT INTO cayu_transcript_messages (session_id, message) "
-                        "VALUES (%s, %s)",
+                        "INSERT INTO cayu_transcript_messages "
+                        "(session_id, interaction_id, message) VALUES (%s, %s, %s)",
                         [
-                            (session_id, _dumps(message.model_dump(mode="json")))
+                            (
+                                session_id,
+                                interaction_id,
+                                _dumps(message.model_dump(mode="json")),
+                            )
                             for message in transcript_messages
                         ],
                     )
@@ -7033,17 +7485,25 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 updated.queue_id,
                             ),
                         )
+                    persisted_events = [
+                        *(
+                            [interaction_started_event]
+                            if interaction_started_event is not None
+                            else []
+                        ),
+                        *delivery_events,
+                    ]
                     await cur.execute(
                         "UPDATE cayu_sessions SET event_seq = event_seq + %s, "
                         "last_activity_at = %s WHERE id = %s RETURNING event_seq",
-                        (len(delivery_events), delivered_at, session_id),
+                        (len(persisted_events), delivered_at, session_id),
                     )
                     event_order_row = await cur.fetchone()
                     if event_order_row is None:
                         raise KeyError(f"Session not found: {session_id}")
-                    next_order = event_order_row[0] - len(delivery_events)
+                    next_order = event_order_row[0] - len(persisted_events)
                     event_rows = []
-                    for event in delivery_events:
+                    for event in persisted_events:
                         next_order += 1
                         lookup_key, projection, projection_bytes = (
                             pending_action_event_storage_values(event)
@@ -7053,6 +7513,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 session_id,
                                 next_order,
                                 event.id,
+                                event.interaction_id,
                                 str(event.type),
                                 event.timestamp,
                                 event.agent_name,
@@ -7068,16 +7529,17 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         )
                     await cur.executemany(
                         "INSERT INTO cayu_events (session_id, session_order, event_id, "
-                        "event_type, timestamp, agent_name, environment_name, workflow_name, "
+                        "interaction_id, event_type, timestamp, agent_name, "
+                        "environment_name, workflow_name, "
                         "tool_name, payload, event, pending_action_lookup_key, "
                         "pending_action_projection, pending_action_projection_bytes) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                         event_rows,
                     )
                     await self._enqueue_persisted_event_side_effects(
                         cur,
                         session_id,
-                        [event.id for event in delivery_events],
+                        [event.id for event in persisted_events],
                     )
                     mode_clause = (
                         "delivery_mode IN ('next_turn', 'on_idle')"
@@ -7094,7 +7556,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 await conn.commit()
                 return SessionMessageDeliveryBatch(
                     messages=tuple(updated_messages),
-                    events=tuple(delivery_events),
+                    events=tuple(persisted_events),
+                    interaction_id=interaction_id,
                     eligible_through=boundary,
                     has_more=remaining is not None,
                 )
@@ -8150,7 +8613,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     )
 
                     transcript_rows = [
-                        (session_id, _dumps(message_payload))
+                        (session_id, request.interaction_id, _dumps(message_payload))
                         for message_payload in prepared.transcript_payloads
                     ]
                     prepared_event_rows = []
@@ -8166,6 +8629,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             (
                                 session_id,
                                 event.id,
+                                event.interaction_id,
                                 str(event.type),
                                 pg_support.to_utc(event.timestamp),
                                 event.agent_name,
@@ -8217,8 +8681,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     if transcript_rows:
                         await cur.executemany(
                             """
-                            INSERT INTO cayu_transcript_messages (session_id, message)
-                            VALUES (%s, %s)
+                            INSERT INTO cayu_transcript_messages (
+                                session_id, interaction_id, message
+                            )
+                            VALUES (%s, %s, %s)
                             """,
                             transcript_rows,
                         )
@@ -8253,14 +8719,15 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         await cur.executemany(
                             """
                             INSERT INTO cayu_events (
-                                session_id, session_order, event_id, event_type, timestamp,
+                                session_id, session_order, event_id, interaction_id,
+                                event_type, timestamp,
                                 agent_name, environment_name, workflow_name, tool_name,
                                 payload, event, pending_action_lookup_key,
                                 pending_action_projection, pending_action_projection_bytes
                             )
                             VALUES (
                                 %s, %s, %s, %s, %s, %s, %s, %s,
-                                %s, %s, %s, %s, %s, %s
+                                %s, %s, %s, %s, %s, %s, %s
                             )
                             """,
                             event_rows,
@@ -8548,6 +9015,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 session_id,
                                 next_order,
                                 event.id,
+                                event.interaction_id,
                                 str(event.type),
                                 pg_support.to_utc(event.timestamp),
                                 event.agent_name,
@@ -8565,14 +9033,15 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         await cur.executemany(
                             """
                             INSERT INTO cayu_events (
-                                session_id, session_order, event_id, event_type, timestamp,
+                                session_id, session_order, event_id, interaction_id,
+                                event_type, timestamp,
                                 agent_name, environment_name, workflow_name, tool_name,
                                 payload, event, pending_action_lookup_key,
                                 pending_action_projection, pending_action_projection_bytes
                             )
                             VALUES (
                                 %s, %s, %s, %s, %s, %s, %s, %s,
-                                %s, %s, %s, %s, %s, %s
+                                %s, %s, %s, %s, %s, %s, %s
                             )
                             """,
                             rows,
@@ -8790,6 +9259,40 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 safe_insert_xid=safe_insert_xid,
                 force_snapshot_cutoff=needs_snapshot_cutoff,
             )
+
+    async def query_latest_interaction_events(
+        self,
+        session_id: str,
+        *,
+        before_sequence: int | None = None,
+        limit: int = 100,
+    ) -> list[EventRecord]:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        before_sequence, limit = _validate_interaction_page(before_sequence, limit)
+        cursor_clause = "" if before_sequence is None else "AND latest.latest_event_sequence < %s"
+        params: list[object] = [session_id]
+        if before_sequence is not None:
+            params.append(before_sequence)
+        params.append(limit)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute("SELECT 1 FROM cayu_sessions WHERE id = %s", (session_id,))
+            if await cur.fetchone() is None:
+                raise KeyError(f"Session not found: {session_id}")
+            await cur.execute(
+                f"""
+                    SELECT event.sequence, event.event
+                    FROM cayu_interaction_latest_events AS latest
+                    JOIN cayu_events AS event
+                      ON event.sequence = latest.latest_event_sequence
+                    WHERE latest.session_id = %s {cursor_clause}
+                    ORDER BY latest.latest_event_sequence DESC
+                    LIMIT %s
+                    """,
+                params,
+            )
+            rows = await cur.fetchall()
+            return [EventRecord(sequence=row[0], event=Event(**_json_obj(row[1]))) for row in rows]
 
     async def _query_events(
         self,
@@ -10013,8 +10516,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         self,
         session_id: str,
         messages: list[Message],
+        *,
+        interaction_id: InteractionAttribution = INHERIT_INTERACTION,
     ) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
+        interaction_id = resolve_interaction_attribution(session_id, interaction_id)
         copied_messages = copy_transcript_messages(messages)
         await self._ensure_ready()
         async with self._connection() as conn:
@@ -10026,23 +10532,179 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     await _touch_session_activity(cur, session_id, datetime.now(UTC))
                     await cur.executemany(
                         """
-                        INSERT INTO cayu_transcript_messages (session_id, message)
-                        VALUES (%s, %s)
+                        INSERT INTO cayu_transcript_messages
+                            (session_id, interaction_id, message)
+                        VALUES (%s, %s, %s)
                         """,
                         [
-                            (session_id, _dumps(message.model_dump(mode="json")))
+                            (
+                                session_id,
+                                interaction_id,
+                                _dumps(message.model_dump(mode="json")),
+                            )
                             for message in copied_messages
                         ],
                     )
             await conn.commit()
+
+    async def replace_initial_transcript_messages(
+        self,
+        session_id: str,
+        expected_messages: list[Message],
+        replacement_messages: list[Message],
+        *,
+        interaction_id: InteractionAttribution = INHERIT_INTERACTION,
+    ) -> None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        interaction_id = resolve_interaction_attribution(session_id, interaction_id)
+        expected = copy_transcript_messages(expected_messages)
+        replacement = copy_transcript_messages(replacement_messages)
+        updated_at = datetime.now(UTC)
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    session = await self._load_for_update(cur, session_id)
+                    if session is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    _assert_session_run_epoch(session_id, session)
+                    await cur.execute(
+                        "SELECT interaction_id, source_messages "
+                        "FROM cayu_deferred_interaction_inputs "
+                        "WHERE session_id = %s FOR UPDATE",
+                        (session_id,),
+                    )
+                    row = await cur.fetchone()
+                    if row is None or row[0] != interaction_id:
+                        raise RuntimeError(
+                            "Deferred interaction input changed before finalization."
+                        )
+                    stored = [Message(**item) for item in _json_list(row[1])]
+                    if stored != expected:
+                        raise RuntimeError(
+                            "Deferred interaction input changed before finalization."
+                        )
+                    await cur.execute(
+                        "SELECT 1 FROM cayu_transcript_messages WHERE session_id = %s LIMIT 1",
+                        (session_id,),
+                    )
+                    if await cur.fetchone() is not None:
+                        raise RuntimeError("Initial transcript changed before finalization.")
+                    if len(replacement) < len(expected) or (
+                        expected and replacement[-len(expected) :] != expected
+                    ):
+                        raise RuntimeError(
+                            "Initial transcript must preserve the admitted source suffix."
+                        )
+                    prefix_count = len(replacement) - len(expected)
+                    await cur.executemany(
+                        "INSERT INTO cayu_transcript_messages "
+                        "(session_id, interaction_id, message) VALUES (%s, %s, %s)",
+                        [
+                            (
+                                session_id,
+                                None if index < prefix_count else interaction_id,
+                                _dumps(message.model_dump(mode="json")),
+                            )
+                            for index, message in enumerate(replacement)
+                        ],
+                    )
+                    await cur.execute(
+                        "DELETE FROM cayu_deferred_interaction_inputs WHERE session_id = %s",
+                        (session_id,),
+                    )
+                    await _touch_session_activity(cur, session_id, updated_at)
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def materialize_deferred_interaction_input(
+        self,
+        session_id: str,
+        *,
+        interaction_id: InteractionAttribution = INHERIT_INTERACTION,
+    ) -> bool:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        interaction_id = resolve_interaction_attribution(session_id, interaction_id)
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    session = await self._load_for_update(cur, session_id)
+                    if session is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    _assert_session_run_epoch(session_id, session)
+                    await cur.execute(
+                        "SELECT interaction_id, source_messages "
+                        "FROM cayu_deferred_interaction_inputs "
+                        "WHERE session_id = %s FOR UPDATE",
+                        (session_id,),
+                    )
+                    row = await cur.fetchone()
+                    if row is None:
+                        await conn.commit()
+                        return False
+                    if row[0] != interaction_id:
+                        raise RuntimeError(
+                            "Deferred interaction input belongs to another interaction."
+                        )
+                    messages = [Message(**item) for item in _json_list(row[1])]
+                    await cur.executemany(
+                        "INSERT INTO cayu_transcript_messages "
+                        "(session_id, interaction_id, message) VALUES (%s, %s, %s)",
+                        [
+                            (
+                                session_id,
+                                interaction_id,
+                                _dumps(message.model_dump(mode="json")),
+                            )
+                            for message in messages
+                        ],
+                    )
+                    await cur.execute(
+                        "DELETE FROM cayu_deferred_interaction_inputs WHERE session_id = %s",
+                        (session_id,),
+                    )
+                    await _touch_session_activity(cur, session_id, datetime.now(UTC))
+                await conn.commit()
+                return True
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def load_deferred_interaction_input(
+        self,
+        session_id: str,
+    ) -> DeferredInteractionInput | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            if await self._load(cur, session_id) is None:
+                raise KeyError(f"Session not found: {session_id}")
+            await cur.execute(
+                "SELECT interaction_id, source_messages "
+                "FROM cayu_deferred_interaction_inputs WHERE session_id = %s",
+                (session_id,),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return DeferredInteractionInput(
+            interaction_id=row[0],
+            source_messages=[Message(**item) for item in _json_list(row[1])],
+        )
 
     async def append_transcript_messages_and_transform_checkpoint(
         self,
         session_id: str,
         messages: list[Message],
         checkpoint_transform: CheckpointTransform,
+        *,
+        interaction_id: InteractionAttribution = INHERIT_INTERACTION,
     ) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
+        interaction_id = resolve_interaction_attribution(session_id, interaction_id)
         copied_messages = copy_transcript_messages(messages)
         if checkpoint_transform is None:
             raise TypeError("checkpoint_transform is required.")
@@ -10066,11 +10728,16 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     if copied_messages:
                         await cur.executemany(
                             """
-                            INSERT INTO cayu_transcript_messages (session_id, message)
-                            VALUES (%s, %s)
+                            INSERT INTO cayu_transcript_messages
+                                (session_id, interaction_id, message)
+                            VALUES (%s, %s, %s)
                             """,
                             [
-                                (session_id, _dumps(message.model_dump(mode="json")))
+                                (
+                                    session_id,
+                                    interaction_id,
+                                    _dumps(message.model_dump(mode="json")),
+                                )
                                 for message in copied_messages
                             ],
                         )
@@ -10105,8 +10772,15 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         # with ``message ->> 'role'`` rather than a dedicated column. This keeps the
         # existing transcript schema unchanged (no destructive NOT NULL migration) while
         # matching the SQLite store's role-filtering and stable, gap-free index semantics.
-        role_clause = "WHERE role = %s" if query.role is not None else ""
-        role_params: list[object] = [str(query.role)] if query.role is not None else []
+        filters: list[str] = []
+        filter_params: list[object] = []
+        if query.role is not None:
+            filters.append("role = %s")
+            filter_params.append(str(query.role))
+        if query.interaction_id is not None:
+            filters.append("interaction_id = %s")
+            filter_params.append(query.interaction_id)
+        filter_clause = "WHERE " + " AND ".join(filters) if filters else ""
 
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
@@ -10119,15 +10793,16 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 WITH ordered AS (
                     SELECT
                         message ->> 'role' AS role,
+                        interaction_id,
                         ROW_NUMBER() OVER (ORDER BY sequence ASC) - 1 AS transcript_index
                     FROM cayu_transcript_messages
                     WHERE session_id = %s
                 )
                 SELECT COUNT(*)
                 FROM ordered
-                {role_clause}
+                {filter_clause}
                 """,
-                [query.session_id, *role_params],
+                [query.session_id, *filter_params],
             )
             total_row = await cur.fetchone()
             total_records = int(total_row[0]) if total_row is not None else 0
@@ -10137,22 +10812,28 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 WITH ordered AS (
                     SELECT
                         message ->> 'role' AS role,
+                        interaction_id,
                         message,
                         ROW_NUMBER() OVER (ORDER BY sequence ASC) - 1 AS transcript_index
                     FROM cayu_transcript_messages
                     WHERE session_id = %s
                 )
-                SELECT transcript_index, message
+                SELECT transcript_index, interaction_id, message
                 FROM ordered
-                {role_clause}
+                {filter_clause}
                 ORDER BY transcript_index ASC
                 LIMIT %s OFFSET %s
                 """,
-                [query.session_id, *role_params, query.limit, query.offset],
+                [query.session_id, *filter_params, query.limit, query.offset],
             )
             rows = await cur.fetchall()
             records = [
-                TranscriptRecord(index=row[0], message=Message(**_json_obj(row[1]))) for row in rows
+                TranscriptRecord(
+                    index=row[0],
+                    interaction_id=row[1],
+                    message=Message(**_json_obj(row[2])),
+                )
+                for row in rows
             ]
             return TranscriptPage(
                 records=filter_transcript_records(records, include_thinking=query.include_thinking),
@@ -11228,6 +11909,14 @@ def _checkpoint_row_values(
 def _json_obj(value: Any) -> dict[str, Any]:
     if isinstance(value, str):
         return json.loads(value)
+    return value
+
+
+def _json_list(value: Any) -> list[Any]:
+    if isinstance(value, str):
+        value = json.loads(value)
+    if type(value) is not list:
+        raise TypeError("Expected a JSON array.")
     return value
 
 

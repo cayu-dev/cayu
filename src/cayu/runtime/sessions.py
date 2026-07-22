@@ -6,6 +6,7 @@ import hashlib
 import heapq
 import json
 import math
+import time
 from abc import ABC, abstractmethod
 from bisect import bisect_left, bisect_right
 from collections import deque
@@ -209,6 +210,144 @@ _SESSION_RUN_FENCES: ContextVar[dict[str, int] | None] = ContextVar(
     "cayu_session_run_fence",
     default=None,
 )
+_SESSION_INTERACTION_IDS: ContextVar[dict[str, str] | None] = ContextVar(
+    "cayu_session_interaction_ids",
+    default=None,
+)
+_SESSION_INTERACTION_STARTED_AT: ContextVar[dict[str, float] | None] = ContextVar(
+    "cayu_session_interaction_started_at",
+    default=None,
+)
+_SESSION_INTERACTION_RECOVERED_ACTIVE_THROUGH: ContextVar[dict[str, datetime] | None] = ContextVar(
+    "cayu_session_interaction_recovered_active_through",
+    default=None,
+)
+_SESSION_INVOCATION_INTERACTION_IDS: ContextVar[dict[str, tuple[str, ...]] | None] = ContextVar(
+    "cayu_session_invocation_interaction_ids",
+    default=None,
+)
+
+
+class _InheritInteractionAttribution:
+    __slots__ = ()
+
+
+INHERIT_INTERACTION = _InheritInteractionAttribution()
+InteractionAttribution = str | None | _InheritInteractionAttribution
+UNASSOCIATED_RUNTIME_EVENT_TYPES: frozenset[EventType] = frozenset({EventType.TURN_COMPLETED})
+
+
+def _current_session_interaction_id(session_id: str) -> str | None:
+    interactions = _SESSION_INTERACTION_IDS.get()
+    return None if interactions is None else interactions.get(session_id)
+
+
+def _current_session_interaction_started_at(session_id: str) -> float | None:
+    started = _SESSION_INTERACTION_STARTED_AT.get()
+    return None if started is None else started.get(session_id)
+
+
+def _current_session_interaction_recovered_active_through(
+    session_id: str,
+) -> datetime | None:
+    recovered = _SESSION_INTERACTION_RECOVERED_ACTIVE_THROUGH.get()
+    return None if recovered is None else recovered.get(session_id)
+
+
+def _set_session_interaction_recovered_active_through(
+    session_id: str,
+    active_through: datetime,
+) -> None:
+    session_id = require_clean_nonblank(session_id, "session_id")
+    if active_through.tzinfo is None or active_through.utcoffset() is None:
+        raise ValueError("active_through must be timezone-aware.")
+    recovered = dict(_SESSION_INTERACTION_RECOVERED_ACTIVE_THROUGH.get() or {})
+    recovered[session_id] = active_through.astimezone(UTC)
+    _SESSION_INTERACTION_RECOVERED_ACTIVE_THROUGH.set(recovered)
+
+
+def _clear_session_interaction_recovered_active_through(session_id: str) -> None:
+    recovered = _SESSION_INTERACTION_RECOVERED_ACTIVE_THROUGH.get()
+    if recovered is None or session_id not in recovered:
+        return
+    remaining = dict(recovered)
+    remaining.pop(session_id)
+    _SESSION_INTERACTION_RECOVERED_ACTIVE_THROUGH.set(remaining or None)
+
+
+def _current_session_invocation_interaction_ids(session_id: str) -> tuple[str, ...]:
+    interactions = _SESSION_INVOCATION_INTERACTION_IDS.get()
+    return () if interactions is None else interactions.get(session_id, ())
+
+
+def resolve_interaction_attribution(
+    session_id: str,
+    interaction_id: InteractionAttribution,
+) -> str | None:
+    """Resolve omitted transcript attribution while preserving explicit null."""
+
+    if interaction_id is INHERIT_INTERACTION:
+        interaction_id = _current_session_interaction_id(session_id)
+    if interaction_id is None:
+        return None
+    if type(interaction_id) is not str:
+        raise TypeError("interaction_id must be a string, None, or INHERIT_INTERACTION.")
+    return require_clean_nonblank(interaction_id, "interaction_id")
+
+
+def attribute_event_to_current_interaction(event: Event) -> Event:
+    """Copy an event and explicitly apply the active runtime interaction identity."""
+
+    copied = copy_event(event)
+    if copied.interaction_id is None and copied.type not in UNASSOCIATED_RUNTIME_EVENT_TYPES:
+        interaction_id = _current_session_interaction_id(copied.session_id)
+        if interaction_id is not None:
+            copied = copied.model_copy(update={"interaction_id": interaction_id})
+    return copied
+
+
+def attribute_events_to_current_interaction(events: list[Event]) -> list[Event]:
+    if type(events) is not list:
+        raise TypeError("Runtime events must be a list.")
+    return [attribute_event_to_current_interaction(event) for event in events]
+
+
+def _activate_session_interaction(session_id: str, interaction_id: str) -> None:
+    session_id = require_clean_nonblank(session_id, "session_id")
+    interaction_id = require_clean_nonblank(interaction_id, "interaction_id")
+    interactions = dict(_SESSION_INTERACTION_IDS.get() or {})
+    previous_interaction_id = interactions.get(session_id)
+    interactions[session_id] = interaction_id
+    _SESSION_INTERACTION_IDS.set(interactions)
+    started = dict(_SESSION_INTERACTION_STARTED_AT.get() or {})
+    if previous_interaction_id != interaction_id or session_id not in started:
+        started[session_id] = time.monotonic()
+        _SESSION_INTERACTION_STARTED_AT.set(started)
+    invocation_interactions = dict(_SESSION_INVOCATION_INTERACTION_IDS.get() or {})
+    seen = invocation_interactions.get(session_id, ())
+    if interaction_id not in seen:
+        invocation_interactions[session_id] = (*seen, interaction_id)
+        _SESSION_INVOCATION_INTERACTION_IDS.set(invocation_interactions)
+
+
+def _deactivate_session_interaction(session_id: str) -> None:
+    interactions = _SESSION_INTERACTION_IDS.get()
+    if interactions is None or session_id not in interactions:
+        return
+    remaining = dict(interactions)
+    remaining.pop(session_id)
+    _SESSION_INTERACTION_IDS.set(remaining or None)
+    started = _SESSION_INTERACTION_STARTED_AT.get()
+    if started is not None and session_id in started:
+        remaining_started = dict(started)
+        remaining_started.pop(session_id)
+        _SESSION_INTERACTION_STARTED_AT.set(remaining_started or None)
+    _clear_session_interaction_recovered_active_through(session_id)
+    invocation_interactions = _SESSION_INVOCATION_INTERACTION_IDS.get()
+    if invocation_interactions is not None and session_id in invocation_interactions:
+        remaining_invocations = dict(invocation_interactions)
+        remaining_invocations.pop(session_id)
+        _SESSION_INVOCATION_INTERACTION_IDS.set(remaining_invocations or None)
 
 
 class _SessionRunFenceContext:
@@ -706,6 +845,7 @@ class SessionMessageDeliveryBatch(BaseModel):
 
     messages: tuple[SessionQueuedMessage, ...] = Field(default_factory=tuple)
     events: tuple[Event, ...] = Field(default_factory=tuple)
+    interaction_id: str | None = None
     eligible_through: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     has_more: StrictBool = False
 
@@ -718,6 +858,13 @@ class SessionMessageDeliveryBatch(BaseModel):
     @classmethod
     def copy_events(cls, value) -> tuple[Event, ...]:
         return tuple(copy_event(event) for event in value)
+
+    @field_validator("interaction_id")
+    @classmethod
+    def validate_interaction_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, "interaction_id")
 
 
 class InterruptSessionRequest(BaseModel):
@@ -1285,6 +1432,7 @@ class RuntimePublicationRequest(BaseModel):
 
     publication_id: str = Field(max_length=256)
     kind: RuntimePublicationKind
+    interaction_id: str | None = Field(default=None, max_length=256)
     intent: dict[str, Any]
     mutation: RuntimePublicationMutation
     transcript_messages: tuple[Message, ...]
@@ -1295,6 +1443,11 @@ class RuntimePublicationRequest(BaseModel):
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("interaction_id")
+    @classmethod
+    def validate_optional_interaction_id(cls, value: str | None) -> str | None:
+        return None if value is None else require_clean_nonblank(value, "interaction_id")
 
     @field_validator("intent", mode="before")
     @classmethod
@@ -3204,6 +3357,7 @@ class EventQuery(BaseModel):
     session_id: str | None = None
     session_ids: tuple[str, ...] = Field(default_factory=tuple)
     event_id: str | None = None
+    interaction_id: str | None = None
     causal_budget_id: str | None = None
     event_type: EventType | str | None = None
     event_types: tuple[EventType | str, ...] = Field(default_factory=tuple)
@@ -3222,6 +3376,7 @@ class EventQuery(BaseModel):
     @field_validator(
         "session_id",
         "event_id",
+        "interaction_id",
         "causal_budget_id",
         "agent_name",
         "environment_name",
@@ -3325,12 +3480,39 @@ class TranscriptRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     index: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    interaction_id: str | None = None
     message: Message
+
+    @field_validator("interaction_id")
+    @classmethod
+    def validate_interaction_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, "interaction_id")
 
     @field_validator("message")
     @classmethod
     def copy_message(cls, value: Message) -> Message:
         return copy_message(value)
+
+
+class DeferredInteractionInput(BaseModel):
+    """Source messages durably admitted but not yet visible in the transcript."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    interaction_id: str
+    source_messages: list[Message]
+
+    @field_validator("interaction_id")
+    @classmethod
+    def validate_interaction_id(cls, value: str) -> str:
+        return require_clean_nonblank(value, "interaction_id")
+
+    @field_validator("source_messages")
+    @classmethod
+    def copy_source_messages(cls, value: list[Message]) -> list[Message]:
+        return [copy_message(message) for message in value]
 
 
 class TranscriptPage(BaseModel):
@@ -3680,6 +3862,7 @@ class TranscriptQuery(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     session_id: str
+    interaction_id: str | None = None
     role: MessageRole | str | None = None
     offset: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
     limit: StrictInt = Field(default=100, ge=1, le=5000)
@@ -3693,6 +3876,13 @@ class TranscriptQuery(BaseModel):
     @classmethod
     def validate_session_id(cls, value: str) -> str:
         return require_clean_nonblank(value, "session_id")
+
+    @field_validator("interaction_id")
+    @classmethod
+    def validate_interaction_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, "interaction_id")
 
     @field_validator("role")
     @classmethod
@@ -3726,7 +3916,13 @@ def filter_transcript_records(
     for record in records:
         message = _without_thinking_parts(record.message)
         if message is not None:
-            filtered.append(TranscriptRecord(index=record.index, message=message))
+            filtered.append(
+                TranscriptRecord(
+                    index=record.index,
+                    interaction_id=record.interaction_id,
+                    message=message,
+                )
+            )
     return filtered
 
 
@@ -3752,8 +3948,15 @@ class SessionStore(ABC):
         request: RunRequest,
         *,
         identity: SessionIdentity,
+        interaction_started_event: Event | None = None,
+        interaction_source_messages: list[Message] | None = None,
     ) -> Session:
-        """Create a session for a run request."""
+        """Create a session, optionally admitting its first interaction atomically.
+
+        With admission, create the session directly in ``RUNNING``, claim its
+        first run epoch, and persist the start event plus deferred source batch
+        in the same transaction. Both optional arguments are supplied together.
+        """
 
     @abstractmethod
     async def create_fork(
@@ -3828,8 +4031,12 @@ class SessionStore(ABC):
         from_statuses: set[SessionStatus],
         to_status: SessionStatus,
         checkpoint_transform: CheckpointTransform,
+        interaction_started_event: Event | None = None,
+        interaction_source_messages: list[Message] | None = None,
+        continued_interaction_id: str | None = None,
+        defer_interaction_source: bool = False,
     ) -> Session:
-        """Atomically persist a transition/checkpoint and claim RUNNING when requested."""
+        """Atomically persist a transition/checkpoint and optional interaction admission."""
 
     @abstractmethod
     async def transition_status_if_no_queued_messages(
@@ -3936,6 +4143,25 @@ class SessionStore(ABC):
         )
 
     @abstractmethod
+    async def admit_interaction(
+        self,
+        session_id: str,
+        *,
+        started_event: Event,
+        source_messages: list[Message],
+        defer_transcript: bool = False,
+    ) -> None:
+        """Atomically persist an interaction start and its exact source input.
+
+        ``defer_transcript`` is reserved for a new session whose bootstrap/system
+        prefix is not known until environment setup completes.  Stores must keep
+        that source input durable but invisible to transcript reads until
+        :meth:`replace_initial_transcript_messages` materializes the final ordered
+        transcript.  Non-deferred admissions append the source messages directly,
+        attributed to ``started_event.interaction_id``.
+        """
+
+    @abstractmethod
     async def claim_persisted_event_side_effect(
         self,
         *,
@@ -4001,6 +4227,8 @@ class SessionStore(ABC):
         include_on_idle: bool,
         eligible_through: int | None = None,
         limit: int = SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
+        interaction_id: str | None = None,
+        interaction_started_event: Event | None = None,
     ) -> SessionMessageDeliveryBatch:
         """Atomically append and mark one bounded queue batch delivered."""
 
@@ -4437,6 +4665,24 @@ class SessionStore(ABC):
             f"{type(self).__name__} does not implement byte-bounded event queries."
         )
 
+    async def query_latest_interaction_events(
+        self,
+        session_id: str,
+        *,
+        before_sequence: int | None = None,
+        limit: int = 100,
+    ) -> list[EventRecord]:
+        """Return each interaction's latest lifecycle event in descending order.
+
+        Built-in stores implement this as a native keyset query. The explicit
+        capability error prevents endpoints from silently degrading to an
+        unbounded event-log scan for out-of-tree stores.
+        """
+
+        raise NotImplementedError(
+            "This SessionStore does not support native interaction pagination."
+        )
+
     @abstractmethod
     async def summarize_events(self, session_id: str) -> EventSummary:
         """Summarize stored events for one session without loading every event."""
@@ -4694,6 +4940,8 @@ class SessionStore(ABC):
         self,
         session_id: str,
         messages: list[Message],
+        *,
+        interaction_id: InteractionAttribution = INHERIT_INTERACTION,
     ) -> None:
         """Append provider-neutral transcript messages to a session.
 
@@ -4704,11 +4952,51 @@ class SessionStore(ABC):
         """
 
     @abstractmethod
+    async def replace_initial_transcript_messages(
+        self,
+        session_id: str,
+        expected_messages: list[Message],
+        replacement_messages: list[Message],
+        *,
+        interaction_id: InteractionAttribution = INHERIT_INTERACTION,
+    ) -> None:
+        """Atomically materialize deferred input as the ordered initial transcript.
+
+        The replacement must end with ``expected_messages``.  Any leading
+        bootstrap/system messages are stored with null interaction attribution;
+        the source suffix is attributed to ``interaction_id``.  No partial or
+        externally visible pre-finalization transcript is permitted.
+        """
+
+    @abstractmethod
+    async def load_deferred_interaction_input(
+        self,
+        session_id: str,
+    ) -> DeferredInteractionInput | None:
+        """Load the private admitted source batch, if one still exists."""
+
+    @abstractmethod
+    async def materialize_deferred_interaction_input(
+        self,
+        session_id: str,
+        *,
+        interaction_id: InteractionAttribution = INHERIT_INTERACTION,
+    ) -> bool:
+        """Materialize deferred source input without a bootstrap prefix.
+
+        Returns ``True`` when a pending admission was materialized and ``False``
+        when no matching deferred input exists.  Recovery and setup-failure paths
+        use this before making the owning interaction or session terminal.
+        """
+
+    @abstractmethod
     async def append_transcript_messages_and_transform_checkpoint(
         self,
         session_id: str,
         messages: list[Message],
         checkpoint_transform: CheckpointTransform,
+        *,
+        interaction_id: InteractionAttribution = INHERIT_INTERACTION,
     ) -> None:
         """Append transcript messages and atomically transform the current checkpoint.
 
@@ -4805,6 +5093,11 @@ class InMemorySessionStore(SessionStore):
         # queries — including the per-step budget read path — stop scanning the global
         # event list. Keyed by session id and by ``str(event.type)`` respectively.
         self._session_event_records: dict[str, list[EventRecord]] = {}
+        self._latest_interaction_event_records: dict[str, dict[str, EventRecord]] = {}
+        self._latest_interaction_event_records_by_sequence: dict[
+            str,
+            list[EventRecord],
+        ] = {}
         self._pending_action_event_records: dict[
             str,
             dict[str, dict[str, EventRecord]],
@@ -4837,6 +5130,8 @@ class InMemorySessionStore(SessionStore):
         ] = {}
         self._next_event_sequence = 1
         self._transcripts: dict[str, list[Message]] = {}
+        self._transcript_interaction_ids: dict[str, list[str | None]] = {}
+        self._deferred_interaction_inputs: dict[str, tuple[str, list[Message]]] = {}
         self._checkpoints: dict[str, dict[str, Any]] = {}
         self._session_operation_records: dict[str, dict[str, dict[str, Any]]] = {}
         self._mcp_manifest_baselines: dict[str, McpManifestBaseline] = {}
@@ -5026,6 +5321,8 @@ class InMemorySessionStore(SessionStore):
         request: RunRequest,
         *,
         identity: SessionIdentity,
+        interaction_started_event: Event | None = None,
+        interaction_source_messages: list[Message] | None = None,
     ) -> Session:
         if type(request) is not RunRequest:
             raise TypeError("Session creation requires a RunRequest.")
@@ -5033,6 +5330,12 @@ class InMemorySessionStore(SessionStore):
         identity = copy_session_identity(identity)
         async with self._lock:
             session_id = request.session_id or str(uuid4())
+            admission = _copy_optional_interaction_admission(
+                session_id,
+                interaction_started_event,
+                interaction_source_messages,
+                defer_transcript=True,
+            )
             if session_id in self._sessions:
                 raise ValueError(f"Session already exists: {session_id}")
             if request.parent_session_id == session_id:
@@ -5054,21 +5357,40 @@ class InMemorySessionStore(SessionStore):
                 runtime_name=identity.runtime_name,
                 runtime_version=identity.runtime_version,
                 environment_name=request.environment_name,
-                status=SessionStatus.PENDING,
+                status=(SessionStatus.RUNNING if admission is not None else SessionStatus.PENDING),
                 created_at=now,
                 updated_at=now,
                 last_activity_at=now,
                 labels=request.labels,
                 metadata=deepcopy(request.metadata),
+                run_epoch=1 if admission is not None else 0,
             )
             self._sessions[session.id] = session
             self._index_session_parent_unlocked(session)
             self._events[session.id] = []
             self._event_ids[session.id] = set()
             self._session_event_records[session.id] = []
+            self._latest_interaction_event_records[session.id] = {}
+            self._latest_interaction_event_records_by_sequence[session.id] = []
             self._pending_action_event_records[session.id] = {}
             self._session_operation_records[session.id] = {}
             self._transcripts[session.id] = []
+            self._transcript_interaction_ids[session.id] = []
+            if admission is not None:
+                started_event, source_messages = admission
+                interaction_id = started_event.interaction_id
+                if interaction_id is None:
+                    raise AssertionError("Interaction admission lost its identity.")
+                self._sessions[session.id] = self._append_events_unlocked(
+                    session,
+                    [started_event],
+                )
+                self._deferred_interaction_inputs[session.id] = (
+                    interaction_id,
+                    source_messages,
+                )
+                session = self._sessions[session.id]
+                _activate_session_run_fence(session)
             return session.model_copy(deep=True)
 
     async def create_fork(
@@ -5194,9 +5516,16 @@ class InMemorySessionStore(SessionStore):
             self._events[fork.id] = []
             self._event_ids[fork.id] = set()
             self._session_event_records[fork.id] = []
+            self._latest_interaction_event_records[fork.id] = {}
+            self._latest_interaction_event_records_by_sequence[fork.id] = []
             self._pending_action_event_records[fork.id] = {}
             self._session_operation_records[fork.id] = {}
             self._transcripts[fork.id] = copied_transcript
+            source_interaction_ids = self._transcript_interaction_ids.get(source_session_id, [])
+            copied_count = len(copied_transcript)
+            # Historical attribution remains tied to the source session's
+            # interactions; new child work receives new child interaction IDs.
+            self._transcript_interaction_ids[fork.id] = list(source_interaction_ids[:copied_count])
             if copied_checkpoint is not None:
                 self._store_checkpoint_unlocked(fork.id, copied_checkpoint)
             return fork.model_copy(deep=True)
@@ -5362,10 +5691,14 @@ class InMemorySessionStore(SessionStore):
                 if key[0] != session_id
             }
             self._session_event_records.pop(session_id, None)
+            self._latest_interaction_event_records.pop(session_id, None)
+            self._latest_interaction_event_records_by_sequence.pop(session_id, None)
             self._pending_action_event_records.pop(session_id, None)
             self._pending_action_index_scopes.pop(session_id, None)
             self._pending_action_latest_barrier_records.pop(session_id, None)
             self._transcripts.pop(session_id, None)
+            self._transcript_interaction_ids.pop(session_id, None)
+            self._deferred_interaction_inputs.pop(session_id, None)
             self._checkpoints.pop(session_id, None)
             self._session_operation_records.pop(session_id, None)
             self._pending_action_session_ids.discard(session_id)
@@ -5466,6 +5799,10 @@ class InMemorySessionStore(SessionStore):
         from_statuses: set[SessionStatus],
         to_status: SessionStatus,
         checkpoint_transform: CheckpointTransform,
+        interaction_started_event: Event | None = None,
+        interaction_source_messages: list[Message] | None = None,
+        continued_interaction_id: str | None = None,
+        defer_interaction_source: bool = False,
     ) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
         allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
@@ -5473,6 +5810,15 @@ class InMemorySessionStore(SessionStore):
             raise ValueError("to_status must be a SessionStatus.")
         if checkpoint_transform is None:
             raise TypeError("checkpoint_transform is required.")
+        admission = _copy_transition_interaction_admission(
+            session_id,
+            interaction_started_event,
+            interaction_source_messages,
+            continued_interaction_id=continued_interaction_id,
+            defer_interaction_source=defer_interaction_source,
+        )
+        if admission is not None and to_status is not SessionStatus.RUNNING:
+            raise ValueError("Interaction admission requires a transition to running.")
         async with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
@@ -5494,6 +5840,14 @@ class InMemorySessionStore(SessionStore):
                     "checkpoint",
                 )
 
+            if admission is not None:
+                _, interaction_id, _, defer_source = admission
+                existing_deferred = self._deferred_interaction_inputs.get(session_id)
+                if existing_deferred is not None and (
+                    not defer_source or existing_deferred[0] != interaction_id
+                ):
+                    raise RuntimeError("Session already has deferred interaction input.")
+
             now = datetime.now(UTC)
             updated = session.model_copy(
                 update={
@@ -5506,6 +5860,24 @@ class InMemorySessionStore(SessionStore):
             self._sessions[session_id] = updated
             if transformed_checkpoint is not None:
                 self._store_checkpoint_unlocked(session_id, transformed_checkpoint)
+            if admission is not None:
+                started_event, interaction_id, source_messages, defer_source = admission
+                if started_event is not None:
+                    self._sessions[session_id] = self._append_events_unlocked(
+                        updated,
+                        [started_event],
+                    )
+                if defer_source:
+                    self._deferred_interaction_inputs[session_id] = (
+                        interaction_id,
+                        source_messages,
+                    )
+                else:
+                    self._transcripts[session_id].extend(source_messages)
+                    self._transcript_interaction_ids[session_id].extend(
+                        [interaction_id] * len(source_messages)
+                    )
+                updated = self._sessions[session_id]
             result = updated.model_copy(deep=True)
             if to_status == SessionStatus.RUNNING:
                 _activate_session_run_fence(result)
@@ -5622,6 +5994,7 @@ class InMemorySessionStore(SessionStore):
         session_id = require_clean_nonblank(session_id, "session_id")
         expected_run_epoch = _current_session_run_epoch(session_id)
         if expected_run_epoch is None:
+            _deactivate_session_interaction(session_id)
             return
         try:
             async with self._lock:
@@ -5632,6 +6005,7 @@ class InMemorySessionStore(SessionStore):
                     )
         finally:
             _deactivate_session_run_fence(session_id)
+            _deactivate_session_interaction(session_id)
 
     async def append_event(self, session_id: str, event: Event) -> None:
         await self.append_events(session_id, [event])
@@ -5810,6 +6184,9 @@ class InMemorySessionStore(SessionStore):
         session_id = session.id
         existing_ids = self._event_ids[session_id]
         session_records = self._session_event_records.setdefault(session_id, [])
+        from cayu.runtime.interactions import INTERACTION_LIFECYCLE_EVENT_TYPES
+
+        lifecycle_types = {str(event_type) for event_type in INTERACTION_LIFECYCLE_EVENT_TYPES}
         for prepared_event in prepared.events:
             record = prepared_event.record
             event_type = prepared_event.event_type
@@ -5821,6 +6198,29 @@ class InMemorySessionStore(SessionStore):
             self._event_records.append(record)
             self._event_records_by_id[(session_id, stored_event.id)] = record
             session_records.append(record)
+            interaction_id = stored_event.interaction_id
+            if interaction_id is not None and event_type in lifecycle_types:
+                latest_by_id = self._latest_interaction_event_records.setdefault(session_id, {})
+                latest_by_sequence = self._latest_interaction_event_records_by_sequence.setdefault(
+                    session_id, []
+                )
+                previous = latest_by_id.get(interaction_id)
+                if previous is not None:
+                    previous_index = bisect_left(
+                        latest_by_sequence,
+                        previous.sequence,
+                        key=lambda candidate: candidate.sequence,
+                    )
+                    if (
+                        previous_index >= len(latest_by_sequence)
+                        or latest_by_sequence[previous_index].sequence != previous.sequence
+                    ):
+                        raise RuntimeError(
+                            "In-memory interaction latest-event indexes are inconsistent."
+                        )
+                    latest_by_sequence.pop(previous_index)
+                latest_by_id[interaction_id] = record
+                latest_by_sequence.append(record)
             if projected_record is not None:
                 if event_type in PENDING_ACTION_BARRIER_EVENT_TYPE_VALUES:
                     self._pending_action_latest_barrier_records[session_id] = projected_record
@@ -5905,6 +6305,7 @@ class InMemorySessionStore(SessionStore):
             baseline_updates=baseline_updates,
             events=events,
         )
+
         async with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
@@ -5942,6 +6343,45 @@ class InMemorySessionStore(SessionStore):
                     for key in expected
                     if key in self._mcp_manifest_baselines
                 },
+            )
+
+    async def admit_interaction(
+        self,
+        session_id: str,
+        *,
+        started_event: Event,
+        source_messages: list[Message],
+        defer_transcript: bool = False,
+    ) -> None:
+        copied_event, copied_messages = _copy_interaction_admission(
+            session_id,
+            started_event,
+            source_messages,
+            defer_transcript=defer_transcript,
+        )
+        interaction_id = copied_event.interaction_id
+        if interaction_id is None:  # validated by _copy_interaction_admission
+            raise AssertionError("Interaction admission lost its identity.")
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            _assert_session_run_epoch(session_id, session)
+            if session_id in self._deferred_interaction_inputs:
+                raise RuntimeError("Session already has deferred interaction input.")
+            updated = self._append_events_unlocked(session, [copied_event])
+            if defer_transcript:
+                self._deferred_interaction_inputs[session_id] = (
+                    interaction_id,
+                    copied_messages,
+                )
+            else:
+                self._transcripts[session_id].extend(copied_messages)
+                self._transcript_interaction_ids[session_id].extend(
+                    [interaction_id] * len(copied_messages)
+                )
+            self._sessions[session_id] = updated.model_copy(
+                update={"last_activity_at": datetime.now(UTC)}
             )
 
     async def claim_persisted_event_side_effect(
@@ -6254,10 +6694,19 @@ class InMemorySessionStore(SessionStore):
         include_on_idle: bool,
         eligible_through: int | None = None,
         limit: int = SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
+        interaction_id: str | None = None,
+        interaction_started_event: Event | None = None,
     ) -> SessionMessageDeliveryBatch:
         session_id = require_clean_nonblank(session_id, "session_id")
         if type(include_on_idle) is not bool:
             raise TypeError("include_on_idle must be a bool.")
+        if interaction_id is not None:
+            interaction_id = require_clean_nonblank(interaction_id, "interaction_id")
+        interaction_started_event = _copy_queued_interaction_started_event(
+            session_id,
+            interaction_id,
+            interaction_started_event,
+        )
         if eligible_through is not None and eligible_through < 0:
             raise ValueError("eligible_through must be greater than or equal to zero.")
         if type(limit) is not int or not 1 <= limit <= SESSION_MESSAGE_DELIVERY_BATCH_LIMIT:
@@ -6313,6 +6762,7 @@ class InMemorySessionStore(SessionStore):
                 delivery_event = Event(
                     type=EventType.SESSION_MESSAGE_DELIVERED,
                     session_id=session.id,
+                    interaction_id=interaction_id,
                     agent_name=session.agent_name,
                     environment_name=session.environment_name,
                     timestamp=delivered_at,
@@ -6346,8 +6796,15 @@ class InMemorySessionStore(SessionStore):
                     detach_message(Message.text(MessageRole.USER, queued_message.content))
                 )
 
-            updated_session = self._append_events_unlocked(session, delivery_events)
+            persisted_events = [
+                *([interaction_started_event] if interaction_started_event is not None else []),
+                *delivery_events,
+            ]
+            updated_session = self._append_events_unlocked(session, persisted_events)
             self._transcripts.setdefault(session_id, []).extend(transcript_messages)
+            self._transcript_interaction_ids.setdefault(session_id, []).extend(
+                [interaction_id] * len(transcript_messages)
+            )
             selected_queue = self._pending_session_messages[selected_key]
             for _ in selected:
                 selected_queue.popleft()
@@ -6367,7 +6824,8 @@ class InMemorySessionStore(SessionStore):
             )
             return SessionMessageDeliveryBatch(
                 messages=tuple(updated_messages),
-                events=tuple(delivery_events),
+                events=tuple(persisted_events),
+                interaction_id=interaction_id,
                 eligible_through=boundary,
                 has_more=has_more,
             )
@@ -7162,6 +7620,9 @@ class InMemorySessionStore(SessionStore):
             }
         )
         self._transcripts[session_id].extend(request.transcript_messages)
+        self._transcript_interaction_ids[session_id].extend(
+            [request.interaction_id] * len(request.transcript_messages)
+        )
         if prepared_checkpoint is not None:
             self._apply_checkpoint_store_unlocked(session_id, prepared_checkpoint)
         operation_records[prepared.storage_key] = receipt_record
@@ -7314,6 +7775,31 @@ class InMemorySessionStore(SessionStore):
             if len(records) == query.limit:
                 break
         return records
+
+    async def query_latest_interaction_events(
+        self,
+        session_id: str,
+        *,
+        before_sequence: int | None = None,
+        limit: int = 100,
+    ) -> list[EventRecord]:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        before_sequence, limit = _validate_interaction_page(before_sequence, limit)
+        async with self._lock:
+            if session_id not in self._sessions:
+                raise KeyError(f"Session not found: {session_id}")
+            records = self._latest_interaction_event_records_by_sequence.get(session_id, [])
+            stop = (
+                bisect_left(
+                    records,
+                    before_sequence,
+                    key=lambda record: record.sequence,
+                )
+                if before_sequence is not None
+                else len(records)
+            )
+            start = max(0, stop - limit)
+            return [record.model_copy(deep=True) for record in reversed(records[start:stop])]
 
     def _query_candidate_records(
         self,
@@ -7754,8 +8240,11 @@ class InMemorySessionStore(SessionStore):
         self,
         session_id: str,
         messages: list[Message],
+        *,
+        interaction_id: InteractionAttribution = INHERIT_INTERACTION,
     ) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
+        interaction_id = resolve_interaction_attribution(session_id, interaction_id)
         copied_messages = _detach_transcript_messages(messages)
         async with self._lock:
             session = self._sessions.get(session_id)
@@ -7765,8 +8254,91 @@ class InMemorySessionStore(SessionStore):
             if not copied_messages:
                 return
             self._transcripts[session_id].extend(copied_messages)
+            self._transcript_interaction_ids[session_id].extend(
+                [interaction_id] * len(copied_messages)
+            )
             self._sessions[session_id] = session.model_copy(
                 update={"last_activity_at": datetime.now(UTC)}
+            )
+
+    async def replace_initial_transcript_messages(
+        self,
+        session_id: str,
+        expected_messages: list[Message],
+        replacement_messages: list[Message],
+        *,
+        interaction_id: InteractionAttribution = INHERIT_INTERACTION,
+    ) -> None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        interaction_id = resolve_interaction_attribution(session_id, interaction_id)
+        expected = _detach_transcript_messages(expected_messages)
+        replacement = _detach_transcript_messages(replacement_messages)
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            _assert_session_run_epoch(session_id, session)
+            deferred = self._deferred_interaction_inputs.get(session_id)
+            if deferred != (interaction_id, expected):
+                raise RuntimeError("Deferred interaction input changed before finalization.")
+            if self._transcripts.get(session_id):
+                raise RuntimeError("Initial transcript changed before finalization.")
+            if len(replacement) < len(expected) or (
+                expected and replacement[-len(expected) :] != expected
+            ):
+                raise RuntimeError("Initial transcript must preserve the admitted source suffix.")
+            prefix_count = len(replacement) - len(expected)
+            self._transcripts[session_id] = replacement
+            self._transcript_interaction_ids[session_id] = [None] * prefix_count + [
+                interaction_id
+            ] * len(expected)
+            self._deferred_interaction_inputs.pop(session_id, None)
+            self._sessions[session_id] = session.model_copy(
+                update={"last_activity_at": datetime.now(UTC)}
+            )
+
+    async def materialize_deferred_interaction_input(
+        self,
+        session_id: str,
+        *,
+        interaction_id: InteractionAttribution = INHERIT_INTERACTION,
+    ) -> bool:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        interaction_id = resolve_interaction_attribution(session_id, interaction_id)
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            _assert_session_run_epoch(session_id, session)
+            deferred = self._deferred_interaction_inputs.get(session_id)
+            if deferred is None:
+                return False
+            deferred_interaction_id, messages = deferred
+            if deferred_interaction_id != interaction_id:
+                raise RuntimeError("Deferred interaction input belongs to another interaction.")
+            self._transcripts[session_id].extend(messages)
+            self._transcript_interaction_ids[session_id].extend([interaction_id] * len(messages))
+            self._deferred_interaction_inputs.pop(session_id, None)
+            self._sessions[session_id] = session.model_copy(
+                update={"last_activity_at": datetime.now(UTC)}
+            )
+            return True
+
+    async def load_deferred_interaction_input(
+        self,
+        session_id: str,
+    ) -> DeferredInteractionInput | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._lock:
+            if session_id not in self._sessions:
+                raise KeyError(f"Session not found: {session_id}")
+            deferred = self._deferred_interaction_inputs.get(session_id)
+            if deferred is None:
+                return None
+            interaction_id, messages = deferred
+            return DeferredInteractionInput(
+                interaction_id=interaction_id,
+                source_messages=messages,
             )
 
     async def append_transcript_messages_and_transform_checkpoint(
@@ -7774,8 +8346,11 @@ class InMemorySessionStore(SessionStore):
         session_id: str,
         messages: list[Message],
         checkpoint_transform: CheckpointTransform,
+        *,
+        interaction_id: InteractionAttribution = INHERIT_INTERACTION,
     ) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
+        interaction_id = resolve_interaction_attribution(session_id, interaction_id)
         copied_messages = _detach_transcript_messages(messages)
         if checkpoint_transform is None:
             raise TypeError("checkpoint_transform is required.")
@@ -7794,6 +8369,9 @@ class InMemorySessionStore(SessionStore):
             copied_checkpoint = copy_durable_json_object(transformed, "checkpoint")
             if copied_messages:
                 self._transcripts[session_id].extend(copied_messages)
+                self._transcript_interaction_ids[session_id].extend(
+                    [interaction_id] * len(copied_messages)
+                )
             self._store_checkpoint_unlocked(session_id, copied_checkpoint)
             self._sessions[session_id] = session.model_copy(
                 update={"last_activity_at": datetime.now(UTC)}
@@ -7812,12 +8390,22 @@ class InMemorySessionStore(SessionStore):
             if query.session_id not in self._sessions:
                 raise KeyError(f"Session not found: {query.session_id}")
 
-            indexed_messages = list(enumerate(self._transcripts.get(query.session_id, [])))
+            interaction_ids = self._transcript_interaction_ids.get(query.session_id, [])
+            indexed_messages = [
+                (index, message, interaction_ids[index])
+                for index, message in enumerate(self._transcripts.get(query.session_id, []))
+            ]
             if query.role is not None:
                 indexed_messages = [
-                    (index, message)
-                    for index, message in indexed_messages
+                    (index, message, interaction_id)
+                    for index, message, interaction_id in indexed_messages
                     if message.role == query.role
+                ]
+            if query.interaction_id is not None:
+                indexed_messages = [
+                    (index, message, interaction_id)
+                    for index, message, interaction_id in indexed_messages
+                    if interaction_id == query.interaction_id
                 ]
 
             page = indexed_messages[query.offset : query.offset + query.limit]
@@ -7826,9 +8414,10 @@ class InMemorySessionStore(SessionStore):
             records = [
                 TranscriptRecord(
                     index=index,
+                    interaction_id=interaction_id,
                     message=detach_message(message) if query.include_thinking else message,
                 )
-                for index, message in page
+                for index, message, interaction_id in page
             ]
             return TranscriptPage(
                 records=filter_transcript_records(records, include_thinking=query.include_thinking),
@@ -9465,6 +10054,7 @@ def _prepare_model_completion_stage_terminal(
         copied_publication = RuntimePublicationRequest(
             publication_id=publication.publication_id,
             kind=publication.kind,
+            interaction_id=publication.interaction_id,
             intent=publication.intent,
             mutation=publication.mutation,
             transcript_messages=publication.transcript_messages,
@@ -10238,7 +10828,12 @@ def _reconstruct_model_completion_stage_terminal(
         _require_raw_sha256_digest(record["publication_material_digest"])
         _require_raw_sha256_digest(record["record_digest"])
         publication_record = record["publication"]
-        if set(publication_record) != set(RuntimePublicationRequest.model_fields):
+        required_publication_fields = set(RuntimePublicationRequest.model_fields) - {
+            "interaction_id"
+        }
+        if not required_publication_fields.issubset(publication_record) or (
+            set(publication_record) - set(RuntimePublicationRequest.model_fields)
+        ):
             raise ValueError
         raw_transcript = publication_record["transcript_messages"]
         raw_events = publication_record["events"]
@@ -10247,6 +10842,7 @@ def _reconstruct_model_completion_stage_terminal(
         publication = RuntimePublicationRequest(
             publication_id=publication_record["publication_id"],
             kind=publication_record["kind"],
+            interaction_id=publication_record.get("interaction_id"),
             intent=publication_record["intent"],
             mutation=publication_record["mutation"],
             transcript_messages=tuple(
@@ -10838,6 +11434,7 @@ def _prepare_runtime_publication(
         copied_request = RuntimePublicationRequest(
             publication_id=request.publication_id,
             kind=request.kind,
+            interaction_id=request.interaction_id,
             intent=request.intent,
             mutation=request.mutation,
             transcript_messages=request.transcript_messages,
@@ -11354,6 +11951,122 @@ def _validate_mcp_manifest_publication_state(
                 )
 
 
+def _copy_queued_interaction_started_event(
+    session_id: str,
+    interaction_id: str | None,
+    event: Event | None,
+) -> Event | None:
+    if event is None:
+        return None
+    if interaction_id is None:
+        raise ValueError("interaction_id is required with interaction_started_event.")
+    copied = copy_event(event)
+    if copied.session_id != session_id:
+        raise ValueError("interaction_started_event belongs to a different session.")
+    if copied.interaction_id != interaction_id:
+        raise ValueError("interaction_started_event belongs to a different interaction.")
+    if copied.type != EventType.INTERACTION_STARTED:
+        raise ValueError("interaction_started_event must be interaction.started.")
+    return copied
+
+
+def _copy_interaction_admission(
+    session_id: str,
+    started_event: Event,
+    source_messages: list[Message],
+    *,
+    defer_transcript: bool,
+) -> tuple[Event, list[Message]]:
+    session_id = require_clean_nonblank(session_id, "session_id")
+    if type(defer_transcript) is not bool:
+        raise TypeError("defer_transcript must be a bool.")
+    if type(started_event) is not Event:
+        raise TypeError("started_event must be an Event.")
+    copied_event = copy_event(started_event)
+    if copied_event.session_id != session_id:
+        raise ValueError("started_event belongs to a different session.")
+    if copied_event.type is not EventType.INTERACTION_STARTED:
+        raise ValueError("started_event must be interaction.started.")
+    if copied_event.interaction_id is None:
+        raise ValueError("started_event must have an interaction_id.")
+    copied_messages = _detach_transcript_messages(source_messages)
+    return copied_event, copied_messages
+
+
+def _copy_optional_interaction_admission(
+    session_id: str,
+    started_event: Event | None,
+    source_messages: list[Message] | None,
+    *,
+    defer_transcript: bool,
+) -> tuple[Event, list[Message]] | None:
+    if (started_event is None) != (source_messages is None):
+        raise ValueError(
+            "interaction_started_event and interaction_source_messages must be supplied together."
+        )
+    if started_event is None or source_messages is None:
+        return None
+    return _copy_interaction_admission(
+        session_id,
+        started_event,
+        source_messages,
+        defer_transcript=defer_transcript,
+    )
+
+
+def _copy_transition_interaction_admission(
+    session_id: str,
+    started_event: Event | None,
+    source_messages: list[Message] | None,
+    *,
+    continued_interaction_id: str | None,
+    defer_interaction_source: bool,
+) -> tuple[Event | None, str, list[Message], bool] | None:
+    if type(defer_interaction_source) is not bool:
+        raise TypeError("defer_interaction_source must be a bool.")
+    if started_event is not None and continued_interaction_id is not None:
+        raise ValueError(
+            "interaction_started_event and continued_interaction_id are mutually exclusive."
+        )
+    if started_event is None and continued_interaction_id is None:
+        if source_messages is not None or defer_interaction_source:
+            raise ValueError("Interaction source messages require an interaction identity.")
+        return None
+    if source_messages is None:
+        raise ValueError("interaction_source_messages are required for interaction admission.")
+    if started_event is not None:
+        event, messages = _copy_interaction_admission(
+            session_id,
+            started_event,
+            source_messages,
+            defer_transcript=defer_interaction_source,
+        )
+        interaction_id = event.interaction_id
+        if interaction_id is None:
+            raise AssertionError("Interaction admission lost its identity.")
+        return event, interaction_id, messages, defer_interaction_source
+    if continued_interaction_id is None:
+        raise AssertionError("Continued interaction admission lost its identity.")
+    interaction_id = require_clean_nonblank(continued_interaction_id, "continued_interaction_id")
+    return (
+        None,
+        interaction_id,
+        _detach_transcript_messages(source_messages),
+        defer_interaction_source,
+    )
+
+
+def _validate_interaction_page(
+    before_sequence: int | None,
+    limit: int,
+) -> tuple[int | None, int]:
+    if before_sequence is not None and (type(before_sequence) is not int or before_sequence < 1):
+        raise ValueError("before_sequence must be a positive integer.")
+    if type(limit) is not int or limit < 1 or limit > 5000:
+        raise ValueError("limit must be between 1 and 5000.")
+    return before_sequence, limit
+
+
 def copy_session_query(query: SessionQuery | None) -> SessionQuery:
     if query is None:
         return SessionQuery()
@@ -11419,6 +12132,7 @@ def copy_event_query(query: EventQuery | None) -> EventQuery:
         session_id=query.session_id,
         session_ids=query.session_ids,
         event_id=query.event_id,
+        interaction_id=query.interaction_id,
         causal_budget_id=query.causal_budget_id,
         event_type=query.event_type,
         event_types=query.event_types,
@@ -11441,6 +12155,7 @@ def copy_transcript_query(query: TranscriptQuery) -> TranscriptQuery:
         raise TypeError("Transcript queries must be TranscriptQuery instances.")
     return TranscriptQuery(
         session_id=query.session_id,
+        interaction_id=query.interaction_id,
         role=query.role,
         offset=query.offset,
         limit=query.limit,
@@ -12330,6 +13045,8 @@ def _event_record_matches(
     if query.session_ids and event.session_id not in query.session_ids:
         return False
     if query.event_id is not None and event.id != query.event_id:
+        return False
+    if query.interaction_id is not None and event.interaction_id != query.interaction_id:
         return False
     event_timestamp = event.timestamp.astimezone(UTC)
     if query.since is not None and event_timestamp < query.since:

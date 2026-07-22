@@ -293,6 +293,48 @@ def aggregate_usage_metrics_from_json_payload(value: object) -> AggregateUsageMe
     return AggregateUsageMetrics.model_validate(copied)
 
 
+def aggregate_usage_metrics_from_durable_payload(value: object) -> AggregateUsageMetrics:
+    """Parse aggregate counters from a decoded durable JSON payload.
+
+    Aggregate counters are emitted as JSON strings by Pydantic so values above
+    JavaScript's safe-integer range remain exact. Existing durable payload
+    builders retain integers while they are in range, so readers must accept
+    either representation without weakening Python-side model construction.
+    """
+
+    copied = copy_durable_json_object(value, "aggregate usage")
+
+    def durable_count(item: object) -> object:
+        if type(item) is int and item >= 0:
+            return item
+        return _aggregate_count_from_json(item)
+
+    raw_cache = copied.get("cache")
+    if type(raw_cache) is dict:
+        projected_cache = dict(raw_cache)
+        for key in (
+            "read_tokens",
+            "write_tokens",
+            "write_5m_tokens",
+            "write_1h_tokens",
+            "write_unknown_ttl_tokens",
+            "cached_input_tokens",
+            "uncached_input_tokens",
+        ):
+            if key in projected_cache:
+                projected_cache[key] = durable_count(projected_cache[key])
+        copied["cache"] = projected_cache
+    for key in (
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "reasoning_output_tokens",
+    ):
+        if key in copied:
+            copied[key] = durable_count(copied[key])
+    return AggregateUsageMetrics.model_validate(copied)
+
+
 class SessionUsageSummary(BaseModel):
     """Usage totals derived from durable session events."""
 
@@ -791,6 +833,37 @@ def session_usage_summary(session_id: str, events: list[Event]) -> SessionUsageS
         if metrics.model is not None and metrics.model not in models:
             models.append(metrics.model)
 
+    return SessionUsageSummary(
+        session_id=session_id,
+        model_steps=model_steps,
+        tool_calls=tool_calls,
+        provider_names=provider_names,
+        models=models,
+        usage=usage,
+    )
+
+
+def combine_session_usage_summaries(
+    session_id: str,
+    summaries: Iterable[SessionUsageSummary],
+) -> SessionUsageSummary:
+    """Combine bounded usage projections without retaining every source event."""
+
+    provider_names: list[str] = []
+    models: list[str] = []
+    usage = build_aggregate_usage_metrics()
+    model_steps = 0
+    tool_calls = 0
+    for summary in summaries:
+        model_steps += summary.model_steps
+        tool_calls += summary.tool_calls
+        usage = add_aggregate_usage(usage, summary.usage)
+        for provider_name in summary.provider_names:
+            if provider_name not in provider_names:
+                provider_names.append(provider_name)
+        for model in summary.models:
+            if model not in models:
+                models.append(model)
     return SessionUsageSummary(
         session_id=session_id,
         model_steps=model_steps,

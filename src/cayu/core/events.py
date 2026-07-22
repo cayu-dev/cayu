@@ -37,6 +37,13 @@ class EventType(StrEnum):
     SESSION_RUN_FENCED = "session.run_fenced"
     TURN_COMPLETED = "turn.completed"
 
+    INTERACTION_STARTED = "interaction.started"
+    INTERACTION_RESUMED = "interaction.resumed"
+    INTERACTION_PAUSED = "interaction.paused"
+    INTERACTION_COMPLETED = "interaction.completed"
+    INTERACTION_FAILED = "interaction.failed"
+    INTERACTION_INTERRUPTED = "interaction.interrupted"
+
     BUDGET_CHECKED = "budget.checked"
     BUDGET_LIMIT_REACHED = "budget.limit_reached"
     BUDGET_RESERVED = "budget.reserved"
@@ -141,6 +148,7 @@ class Event(BaseModel):
     # (`| str` also admits `custom.*` types, which stay plain strings.)
     type: EventType | str
     session_id: str
+    interaction_id: str | None = None
     id: str = Field(default_factory=lambda: str(uuid4()), max_length=EVENT_ID_MAX_CHARS)
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     agent_name: str | None = None
@@ -159,7 +167,13 @@ class Event(BaseModel):
     def validate_nonblank_ids(cls, value: str, info) -> str:
         return require_durable_clean_nonblank(value, info.field_name)
 
-    @field_validator("agent_name", "environment_name", "workflow_name", "tool_name")
+    @field_validator(
+        "interaction_id",
+        "agent_name",
+        "environment_name",
+        "workflow_name",
+        "tool_name",
+    )
     @classmethod
     def validate_optional_nonblank_names(
         cls,
@@ -195,6 +209,7 @@ def copy_event(event: Event) -> Event:
     return Event(
         type=event.type,
         session_id=event.session_id,
+        interaction_id=event.interaction_id,
         id=event.id,
         timestamp=event.timestamp,
         agent_name=event.agent_name,

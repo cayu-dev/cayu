@@ -199,6 +199,7 @@ from cayu.runtime.hooks import (
     RuntimeHookPhase,
     ToolCallHookContext,
 )
+from cayu.runtime.interactions import InteractionStatus, InteractionSummaryEvidence
 from cayu.runtime.loop_policies import (
     BeforeStopAction,
     BeforeStopContext,
@@ -242,6 +243,7 @@ from cayu.runtime.sessions import (
     ActiveModelCompletionStage,
     CheckpointTransform,
     CompactSessionRequest,
+    DeferredInteractionInput,
     EnqueueSessionMessageRequest,
     EnqueueSessionMessageResult,
     EventOrder,
@@ -488,6 +490,7 @@ __all__ = [
     "ContextualPricingRequirement",
     "CostLineItem",
     "DefaultContextPolicy",
+    "DeferredInteractionInput",
     "DenyPatternRule",
     "DiagnosticSeverity",
     "DispatchHandle",
@@ -526,6 +529,8 @@ __all__ = [
     "IncompleteSessionRecoveryResult",
     "IncompleteSessionsRecoveryRequest",
     "InlineDispatcher",
+    "InteractionStatus",
+    "InteractionSummaryEvidence",
     "InterruptSessionRequest",
     "KnowledgeInjectionPolicy",
     "LabelSelectorOperator",

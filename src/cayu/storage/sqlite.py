@@ -29,6 +29,7 @@ from cayu.runtime.sessions import (
     _TOOL_ROUND_LIFECYCLE_EVENT_TYPES,
     DELETE_BLOCKED_SESSION_STATUSES,
     FORK_TRANSCRIPT_VALIDATION_ERROR,
+    INHERIT_INTERACTION,
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
     MAX_PENDING_ACTION_TOOL_CALLS,
     MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
@@ -38,6 +39,7 @@ from cayu.runtime.sessions import (
     SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
     BudgetReservationIdentityConflict,
     CheckpointTransform,
+    DeferredInteractionInput,
     EnqueueSessionMessageRequest,
     EnqueueSessionMessageResult,
     EventQuery,
@@ -45,6 +47,7 @@ from cayu.runtime.sessions import (
     EventRecord,
     EventSummary,
     ForkTranscriptValidator,
+    InteractionAttribution,
     McpManifestBaseline,
     McpManifestBaselineLoadResult,
     McpManifestPublicationResult,
@@ -102,9 +105,14 @@ from cayu.runtime.sessions import (
     _assert_session_run_epoch,
     _assert_session_run_epoch_value,
     _build_runtime_publication_receipt,
+    _copy_interaction_admission,
     _copy_mcp_manifest_publication,
+    _copy_optional_interaction_admission,
+    _copy_queued_interaction_started_event,
     _copy_session_event_batch,
+    _copy_transition_interaction_admission,
     _current_session_run_epoch,
+    _deactivate_session_interaction,
     _deactivate_session_run_fence,
     _model_completion_stage_abandonment_record,
     _model_completion_stage_preparation_record,
@@ -138,6 +146,7 @@ from cayu.runtime.sessions import (
     _stored_mcp_manifest_baseline_json,
     _tool_round_publication_identity,
     _validate_equivalent_queued_session_message,
+    _validate_interaction_page,
     _validate_mcp_manifest_history_keys,
     _validate_mcp_manifest_publication_state,
     _validate_model_completion_active_marker_for_preparation,
@@ -176,6 +185,7 @@ from cayu.runtime.sessions import (
     filter_transcript_records,
     fork_transcript_is_accepted,
     replace_session_user_metadata,
+    resolve_interaction_attribution,
     session_next_cursor,
     session_outcome,
     session_query_from_aggregate_filter,
@@ -214,7 +224,7 @@ from cayu.storage import migrations as schema
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = 24
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = 28
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
     contains_style="sqlite_nocase_like",
@@ -684,6 +694,7 @@ def _event_query_with_session_ids(
     return EventQuery(
         session_ids=session_ids,
         event_id=query.event_id,
+        interaction_id=query.interaction_id,
         causal_budget_id=query.causal_budget_id,
         event_type=query.event_type,
         event_types=query.event_types,
@@ -707,6 +718,7 @@ def _event_query_with_session_ids(
 _EVENT_COLUMN_NAMES: tuple[str, ...] = (
     "session_id",
     "event_id",
+    "interaction_id",
     "event_type",
     "timestamp",
     "agent_name",
@@ -739,6 +751,7 @@ def _event_from_row(row: sqlite3.Row) -> Event:
     return Event(
         type=row["event_type"],
         session_id=row["session_id"],
+        interaction_id=row["interaction_id"],
         id=row["event_id"],
         timestamp=row["timestamp"],
         agent_name=row["agent_name"],
@@ -901,11 +914,25 @@ class SQLiteSessionStore(SessionStore):
         request: RunRequest,
         *,
         identity: SessionIdentity,
+        interaction_started_event: Event | None = None,
+        interaction_source_messages: list[Message] | None = None,
     ) -> Session:
+        from cayu.runtime.pending_actions import pending_action_event_storage_values
+
         request = copy_run_request(request)
         identity = copy_session_identity(identity)
         async with self._lock:
             session = sqlite_support.session_from_request(request, identity=identity)
+            admission = _copy_optional_interaction_admission(
+                session.id,
+                interaction_started_event,
+                interaction_source_messages,
+                defer_transcript=True,
+            )
+            if admission is not None:
+                session = session.model_copy(
+                    update={"status": SessionStatus.RUNNING, "run_epoch": 1}
+                )
             if session.parent_session_id == session.id:
                 raise ValueError("Session cannot be its own parent.")
             try:
@@ -957,6 +984,57 @@ class SQLiteSessionStore(SessionStore):
                             """,
                             sqlite_support.session_label_row_values(session),
                         )
+                    if admission is not None:
+                        started_event, source_messages = admission
+                        interaction_id = started_event.interaction_id
+                        if interaction_id is None:
+                            raise AssertionError("Interaction admission lost its identity.")
+                        lookup_key, projection, projection_bytes = (
+                            pending_action_event_storage_values(started_event)
+                        )
+                        self._connection.execute(
+                            """
+                            INSERT INTO cayu_events (
+                                session_id, event_id, interaction_id, event_type,
+                                timestamp, agent_name, environment_name, workflow_name,
+                                tool_name, payload_json, pending_action_lookup_key,
+                                pending_action_projection_json,
+                                pending_action_projection_bytes
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                session.id,
+                                started_event.id,
+                                interaction_id,
+                                str(started_event.type),
+                                sqlite_support.format_datetime(started_event.timestamp),
+                                started_event.agent_name,
+                                started_event.environment_name,
+                                started_event.workflow_name,
+                                started_event.tool_name,
+                                sqlite_support.json_dumps(started_event.payload),
+                                lookup_key,
+                                projection,
+                                projection_bytes,
+                            ),
+                        )
+                        _enqueue_persisted_event_side_effects(
+                            self._connection,
+                            session.id,
+                            [started_event.id],
+                        )
+                        self._connection.execute(
+                            "INSERT INTO cayu_deferred_interaction_inputs "
+                            "(session_id, interaction_id, source_messages_json) "
+                            "VALUES (?, ?, ?)",
+                            (
+                                session.id,
+                                interaction_id,
+                                sqlite_support.json_dumps(
+                                    [message.model_dump(mode="json") for message in source_messages]
+                                ),
+                            ),
+                        )
             except sqlite3.IntegrityError as exc:
                 if self._session_exists_unlocked(session.id):
                     raise ValueError(f"Session already exists: {session.id}") from exc
@@ -967,6 +1045,8 @@ class SQLiteSessionStore(SessionStore):
                         f"Parent session not found: {session.parent_session_id}"
                     ) from exc
                 raise
+            if admission is not None:
+                _activate_session_run_fence(session)
             return session.model_copy(deep=True)
 
     async def create_fork(
@@ -1055,7 +1135,7 @@ class SQLiteSessionStore(SessionStore):
                     )
                 transcript_rows = self._connection.execute(
                     """
-                    SELECT message_json
+                    SELECT message_json, interaction_id
                     FROM cayu_transcript_messages
                     WHERE session_id = ?
                     ORDER BY sequence ASC
@@ -1070,6 +1150,9 @@ class SQLiteSessionStore(SessionStore):
                         Message(**json.loads(row["message_json"]))
                         for row in selected_transcript_rows
                     ]
+                    copied_interaction_ids = [
+                        row["interaction_id"] for row in selected_transcript_rows
+                    ]
                 else:
                     if transcript_cursor > transcript_row_count:
                         transcript_rows.clear()
@@ -1081,6 +1164,9 @@ class SQLiteSessionStore(SessionStore):
                     copied_messages = [
                         Message(**json.loads(row["message_json"]))
                         for row in selected_transcript_rows
+                    ]
+                    copied_interaction_ids = [
+                        row["interaction_id"] for row in selected_transcript_rows
                     ]
                 selected_transcript_rows.clear()
                 if not fork_transcript_is_accepted(copied_messages, transcript_validator):
@@ -1139,17 +1225,19 @@ class SQLiteSessionStore(SessionStore):
                         INSERT INTO cayu_transcript_messages (
                             session_id,
                             role,
+                            interaction_id,
                             message_json
                         )
-                        VALUES (?, ?, ?)
+                        VALUES (?, ?, ?, ?)
                         """,
                         [
                             (
                                 fork.id,
                                 str(message.role),
+                                copied_interaction_ids[index],
                                 sqlite_support.json_dumps(message.model_dump(mode="json")),
                             )
-                            for message in copied_messages
+                            for index, message in enumerate(copied_messages)
                         ],
                     )
                 if copied_checkpoint is not None:
@@ -1539,13 +1627,28 @@ class SQLiteSessionStore(SessionStore):
         from_statuses: set[SessionStatus],
         to_status: SessionStatus,
         checkpoint_transform: CheckpointTransform,
+        interaction_started_event: Event | None = None,
+        interaction_source_messages: list[Message] | None = None,
+        continued_interaction_id: str | None = None,
+        defer_interaction_source: bool = False,
     ) -> Session:
+        from cayu.runtime.pending_actions import pending_action_event_storage_values
+
         session_id = require_clean_nonblank(session_id, "session_id")
         allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
         if not isinstance(to_status, SessionStatus):
             raise ValueError("to_status must be a SessionStatus.")
         if checkpoint_transform is None:
             raise TypeError("checkpoint_transform is required.")
+        admission = _copy_transition_interaction_admission(
+            session_id,
+            interaction_started_event,
+            interaction_source_messages,
+            continued_interaction_id=continued_interaction_id,
+            defer_interaction_source=defer_interaction_source,
+        )
+        if admission is not None and to_status is not SessionStatus.RUNNING:
+            raise ValueError("Interaction admission requires a transition to running.")
 
         updated_at = datetime.now(UTC)
         async with self._lock:
@@ -1616,6 +1719,83 @@ class SQLiteSessionStore(SessionStore):
                             session_id, transformed_checkpoint, updated_at
                         ),
                     )
+                if admission is not None:
+                    started_event, interaction_id, source_messages, defer_source = admission
+                    existing_deferred = self._connection.execute(
+                        "SELECT interaction_id FROM cayu_deferred_interaction_inputs "
+                        "WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchone()
+                    if existing_deferred is not None and (
+                        not defer_source or existing_deferred["interaction_id"] != interaction_id
+                    ):
+                        raise RuntimeError("Session already has deferred interaction input.")
+                    if started_event is not None:
+                        lookup_key, projection, projection_bytes = (
+                            pending_action_event_storage_values(started_event)
+                        )
+                        self._connection.execute(
+                            """
+                            INSERT INTO cayu_events (
+                                session_id, event_id, interaction_id, event_type,
+                                timestamp, agent_name, environment_name, workflow_name,
+                                tool_name, payload_json, pending_action_lookup_key,
+                                pending_action_projection_json,
+                                pending_action_projection_bytes
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                session_id,
+                                started_event.id,
+                                interaction_id,
+                                str(started_event.type),
+                                sqlite_support.format_datetime(started_event.timestamp),
+                                started_event.agent_name,
+                                started_event.environment_name,
+                                started_event.workflow_name,
+                                started_event.tool_name,
+                                sqlite_support.json_dumps(started_event.payload),
+                                lookup_key,
+                                projection,
+                                projection_bytes,
+                            ),
+                        )
+                        _enqueue_persisted_event_side_effects(
+                            self._connection,
+                            session_id,
+                            [started_event.id],
+                        )
+                    if defer_source:
+                        self._connection.execute(
+                            "INSERT INTO cayu_deferred_interaction_inputs "
+                            "(session_id, interaction_id, source_messages_json) "
+                            "VALUES (?, ?, ?) "
+                            "ON CONFLICT(session_id) DO UPDATE SET "
+                            "interaction_id = excluded.interaction_id, "
+                            "source_messages_json = excluded.source_messages_json",
+                            (
+                                session_id,
+                                interaction_id,
+                                sqlite_support.json_dumps(
+                                    [message.model_dump(mode="json") for message in source_messages]
+                                ),
+                            ),
+                        )
+                    else:
+                        self._connection.executemany(
+                            "INSERT INTO cayu_transcript_messages "
+                            "(session_id, role, interaction_id, message_json) "
+                            "VALUES (?, ?, ?, ?)",
+                            [
+                                (
+                                    session_id,
+                                    str(message.role),
+                                    interaction_id,
+                                    sqlite_support.json_dumps(message.model_dump(mode="json")),
+                                )
+                                for message in source_messages
+                            ],
+                        )
                 self._connection.commit()
                 transitioned = loaded.model_copy(
                     update={
@@ -1805,6 +1985,7 @@ class SQLiteSessionStore(SessionStore):
         session_id = require_clean_nonblank(session_id, "session_id")
         expected_run_epoch = _current_session_run_epoch(session_id)
         if expected_run_epoch is None:
+            _deactivate_session_interaction(session_id)
             return
         try:
             async with self._lock:
@@ -1816,6 +1997,7 @@ class SQLiteSessionStore(SessionStore):
                     )
         finally:
             _deactivate_session_run_fence(session_id)
+            _deactivate_session_interaction(session_id)
 
     async def append_event(self, session_id: str, event: Event) -> None:
         await self.append_events(session_id, [event])
@@ -1892,6 +2074,7 @@ class SQLiteSessionStore(SessionStore):
                             (
                                 session_id,
                                 event.id,
+                                event.interaction_id,
                                 str(event.type),
                                 sqlite_support.format_datetime(event.timestamp),
                                 event.agent_name,
@@ -1909,6 +2092,7 @@ class SQLiteSessionStore(SessionStore):
                         INSERT INTO cayu_events (
                             session_id,
                             event_id,
+                            interaction_id,
                             event_type,
                             timestamp,
                             agent_name,
@@ -1920,7 +2104,7 @@ class SQLiteSessionStore(SessionStore):
                             pending_action_projection_json,
                             pending_action_projection_bytes
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         rows,
                     )
@@ -2036,6 +2220,7 @@ class SQLiteSessionStore(SessionStore):
                         (
                             session_id,
                             event.id,
+                            event.interaction_id,
                             str(event.type),
                             sqlite_support.format_datetime(event.timestamp),
                             event.agent_name,
@@ -2051,12 +2236,12 @@ class SQLiteSessionStore(SessionStore):
                 connection.executemany(
                     """
                     INSERT INTO cayu_events (
-                        session_id, event_id, event_type, timestamp, agent_name,
+                        session_id, event_id, interaction_id, event_type, timestamp, agent_name,
                         environment_name, workflow_name, tool_name, payload_json,
                         pending_action_lookup_key, pending_action_projection_json,
                         pending_action_projection_bytes
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     event_rows,
                 )
@@ -2108,6 +2293,115 @@ class SQLiteSessionStore(SessionStore):
                 raise
 
         return await self._run_write(statement)
+
+    async def admit_interaction(
+        self,
+        session_id: str,
+        *,
+        started_event: Event,
+        source_messages: list[Message],
+        defer_transcript: bool = False,
+    ) -> None:
+        from cayu.runtime.pending_actions import pending_action_event_storage_values
+
+        copied_event, copied_messages = _copy_interaction_admission(
+            session_id,
+            started_event,
+            source_messages,
+            defer_transcript=defer_transcript,
+        )
+        interaction_id = copied_event.interaction_id
+        if interaction_id is None:  # validated by _copy_interaction_admission
+            raise AssertionError("Interaction admission lost its identity.")
+        serialized_messages = sqlite_support.json_dumps(
+            [message.model_dump(mode="json") for message in copied_messages]
+        )
+
+        def statement(connection: sqlite3.Connection) -> None:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                session = self._load_unlocked(session_id)
+                if session is None:
+                    raise KeyError(f"Session not found: {session_id}")
+                _assert_session_run_epoch(session_id, session)
+                pending = connection.execute(
+                    "SELECT 1 FROM cayu_deferred_interaction_inputs WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if pending is not None:
+                    raise RuntimeError("Session already has deferred interaction input.")
+                lookup_key, projection, projection_bytes = pending_action_event_storage_values(
+                    copied_event
+                )
+                connection.execute(
+                    """
+                    INSERT INTO cayu_events (
+                        session_id, event_id, interaction_id, event_type, timestamp,
+                        agent_name, environment_name, workflow_name, tool_name,
+                        payload_json, pending_action_lookup_key,
+                        pending_action_projection_json, pending_action_projection_bytes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        session_id,
+                        copied_event.id,
+                        interaction_id,
+                        str(copied_event.type),
+                        sqlite_support.format_datetime(copied_event.timestamp),
+                        copied_event.agent_name,
+                        copied_event.environment_name,
+                        copied_event.workflow_name,
+                        copied_event.tool_name,
+                        sqlite_support.json_dumps(copied_event.payload),
+                        lookup_key,
+                        projection,
+                        projection_bytes,
+                    ),
+                )
+                _enqueue_persisted_event_side_effects(
+                    connection,
+                    session_id,
+                    [copied_event.id],
+                )
+                if defer_transcript:
+                    connection.execute(
+                        "INSERT INTO cayu_deferred_interaction_inputs "
+                        "(session_id, interaction_id, source_messages_json) VALUES (?, ?, ?)",
+                        (session_id, interaction_id, serialized_messages),
+                    )
+                else:
+                    connection.executemany(
+                        "INSERT INTO cayu_transcript_messages "
+                        "(session_id, role, interaction_id, message_json) VALUES (?, ?, ?, ?)",
+                        [
+                            (
+                                session_id,
+                                str(message.role),
+                                interaction_id,
+                                sqlite_support.json_dumps(message.model_dump(mode="json")),
+                            )
+                            for message in copied_messages
+                        ],
+                    )
+                _touch_session_activity(connection, session_id, datetime.now(UTC))
+                connection.commit()
+            except sqlite3.IntegrityError as exc:
+                connection.rollback()
+                existing_event_id = _first_existing_event_id(
+                    connection,
+                    session_id,
+                    [copied_event.id],
+                )
+                if existing_event_id is not None:
+                    raise ValueError(
+                        f"Event already exists for session {session_id}: {existing_event_id}"
+                    ) from exc
+                raise
+            except Exception:
+                connection.rollback()
+                raise
+
+        await self._run_write(statement)
 
     async def claim_persisted_event_side_effect(
         self,
@@ -2471,16 +2765,17 @@ class SQLiteSessionStore(SessionStore):
                 connection.execute(
                     """
                     INSERT INTO cayu_events (
-                        session_id, event_id, event_type, timestamp, agent_name,
+                        session_id, event_id, interaction_id, event_type, timestamp, agent_name,
                         environment_name, workflow_name, tool_name, payload_json,
                         pending_action_lookup_key, pending_action_projection_json,
                         pending_action_projection_bytes
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         request.session_id,
                         accepted_event.id,
+                        accepted_event.interaction_id,
                         str(accepted_event.type),
                         sqlite_support.format_datetime(accepted_event.timestamp),
                         accepted_event.agent_name,
@@ -2523,8 +2818,17 @@ class SQLiteSessionStore(SessionStore):
         include_on_idle: bool,
         eligible_through: int | None = None,
         limit: int = SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
+        interaction_id: str | None = None,
+        interaction_started_event: Event | None = None,
     ) -> SessionMessageDeliveryBatch:
         session_id = require_clean_nonblank(session_id, "session_id")
+        if interaction_id is not None:
+            interaction_id = require_clean_nonblank(interaction_id, "interaction_id")
+        interaction_started_event = _copy_queued_interaction_started_event(
+            session_id,
+            interaction_id,
+            interaction_started_event,
+        )
         if type(include_on_idle) is not bool:
             raise TypeError("include_on_idle must be a bool.")
         if eligible_through is not None and eligible_through < 0:
@@ -2593,6 +2897,7 @@ class SQLiteSessionStore(SessionStore):
                     delivery_event = Event(
                         type=EventType.SESSION_MESSAGE_DELIVERED,
                         session_id=session_id,
+                        interaction_id=interaction_id,
                         agent_name=loaded.agent_name,
                         environment_name=loaded.environment_name,
                         timestamp=delivered_at,
@@ -2627,12 +2932,14 @@ class SQLiteSessionStore(SessionStore):
                         Message.text(MessageRole.USER, queued_message.content)
                     )
                 connection.executemany(
-                    "INSERT INTO cayu_transcript_messages (session_id, role, message_json) "
-                    "VALUES (?, ?, ?)",
+                    "INSERT INTO cayu_transcript_messages "
+                    "(session_id, role, interaction_id, message_json) "
+                    "VALUES (?, ?, ?, ?)",
                     [
                         (
                             session_id,
                             str(message.role),
+                            interaction_id,
                             sqlite_support.json_dumps(message.model_dump(mode="json")),
                         )
                         for message in transcript_messages
@@ -2652,8 +2959,12 @@ class SQLiteSessionStore(SessionStore):
                             updated.queue_id,
                         ),
                     )
+                persisted_events = [
+                    *([interaction_started_event] if interaction_started_event is not None else []),
+                    *delivery_events,
+                ]
                 event_rows = []
-                for event in delivery_events:
+                for event in persisted_events:
                     lookup_key, projection, projection_bytes = pending_action_event_storage_values(
                         event
                     )
@@ -2661,6 +2972,7 @@ class SQLiteSessionStore(SessionStore):
                         (
                             session_id,
                             event.id,
+                            event.interaction_id,
                             str(event.type),
                             sqlite_support.format_datetime(event.timestamp),
                             event.agent_name,
@@ -2674,16 +2986,18 @@ class SQLiteSessionStore(SessionStore):
                         )
                     )
                 connection.executemany(
-                    "INSERT INTO cayu_events (session_id, event_id, event_type, timestamp, "
+                    "INSERT INTO cayu_events (session_id, event_id, interaction_id, "
+                    "event_type, timestamp, "
                     "agent_name, environment_name, workflow_name, tool_name, payload_json, "
                     "pending_action_lookup_key, pending_action_projection_json, "
-                    "pending_action_projection_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "pending_action_projection_bytes) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     event_rows,
                 )
                 _enqueue_persisted_event_side_effects(
                     connection,
                     session_id,
-                    [event.id for event in delivery_events],
+                    [event.id for event in persisted_events],
                 )
                 _touch_session_activity(connection, session_id, delivered_at)
                 remaining_mode_sql = (
@@ -2700,7 +3014,8 @@ class SQLiteSessionStore(SessionStore):
                 connection.commit()
                 return SessionMessageDeliveryBatch(
                     messages=tuple(updated_messages),
-                    events=tuple(delivery_events),
+                    events=tuple(persisted_events),
+                    interaction_id=interaction_id,
                     eligible_through=boundary,
                     has_more=remaining is not None,
                 )
@@ -3730,6 +4045,7 @@ class SQLiteSessionStore(SessionStore):
                     (
                         session_id,
                         str(message.role),
+                        request.interaction_id,
                         sqlite_support.json_dumps(message_payload),
                     )
                     for message, message_payload in zip(
@@ -3751,6 +4067,7 @@ class SQLiteSessionStore(SessionStore):
                         (
                             session_id,
                             event.id,
+                            event.interaction_id,
                             str(event.type),
                             sqlite_support.format_datetime(event.timestamp),
                             event.agent_name,
@@ -3790,9 +4107,9 @@ class SQLiteSessionStore(SessionStore):
                     connection.executemany(
                         """
                         INSERT INTO cayu_transcript_messages (
-                            session_id, role, message_json
+                            session_id, role, interaction_id, message_json
                         )
-                        VALUES (?, ?, ?)
+                        VALUES (?, ?, ?, ?)
                         """,
                         transcript_rows,
                     )
@@ -3821,12 +4138,12 @@ class SQLiteSessionStore(SessionStore):
                     connection.executemany(
                         """
                         INSERT INTO cayu_events (
-                            session_id, event_id, event_type, timestamp,
+                            session_id, event_id, interaction_id, event_type, timestamp,
                             agent_name, environment_name, workflow_name, tool_name,
                             payload_json, pending_action_lookup_key,
                             pending_action_projection_json, pending_action_projection_bytes
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         event_rows,
                     )
@@ -4078,6 +4395,7 @@ class SQLiteSessionStore(SessionStore):
                         (
                             session_id,
                             event.id,
+                            event.interaction_id,
                             str(event.type),
                             sqlite_support.format_datetime(event.timestamp),
                             event.agent_name,
@@ -4137,12 +4455,12 @@ class SQLiteSessionStore(SessionStore):
                     connection.executemany(
                         """
                         INSERT INTO cayu_events (
-                            session_id, event_id, event_type, timestamp,
+                            session_id, event_id, interaction_id, event_type, timestamp,
                             agent_name, environment_name, workflow_name, tool_name,
                             payload_json, pending_action_lookup_key,
                             pending_action_projection_json, pending_action_projection_bytes
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         event_rows,
                     )
@@ -4377,6 +4695,43 @@ class SQLiteSessionStore(SessionStore):
                 ]
             finally:
                 connection.rollback()
+
+        return await self._run_read(run_query)
+
+    async def query_latest_interaction_events(
+        self,
+        session_id: str,
+        *,
+        before_sequence: int | None = None,
+        limit: int = 100,
+    ) -> list[EventRecord]:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        before_sequence, limit = _validate_interaction_page(before_sequence, limit)
+        cursor_clause = "" if before_sequence is None else "AND latest.latest_event_sequence < ?"
+        params: list[object] = [session_id]
+        if before_sequence is not None:
+            params.append(before_sequence)
+        params.append(limit)
+
+        def run_query(connection: sqlite3.Connection) -> list[EventRecord]:
+            if not _session_exists(connection, session_id):
+                raise KeyError(f"Session not found: {session_id}")
+            event_columns = ", ".join(f"event.{name}" for name in _EVENT_COLUMN_NAMES)
+            rows = connection.execute(
+                f"""
+                SELECT event.sequence, {event_columns}
+                FROM cayu_interaction_latest_events AS latest
+                JOIN cayu_events AS event
+                  ON event.sequence = latest.latest_event_sequence
+                WHERE latest.session_id = ? {cursor_clause}
+                ORDER BY latest.latest_event_sequence DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+            return [
+                EventRecord(sequence=row["sequence"], event=_event_from_row(row)) for row in rows
+            ]
 
         return await self._run_read(run_query)
 
@@ -5816,8 +6171,11 @@ class SQLiteSessionStore(SessionStore):
         self,
         session_id: str,
         messages: list[Message],
+        *,
+        interaction_id: InteractionAttribution = INHERIT_INTERACTION,
     ) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
+        interaction_id = resolve_interaction_attribution(session_id, interaction_id)
         copied_messages = copy_transcript_messages(messages)
 
         def statement(connection: sqlite3.Connection) -> None:
@@ -5832,14 +6190,16 @@ class SQLiteSessionStore(SessionStore):
                     INSERT INTO cayu_transcript_messages (
                         session_id,
                         role,
+                        interaction_id,
                         message_json
                     )
-                    VALUES (?, ?, ?)
+                    VALUES (?, ?, ?, ?)
                     """,
                     [
                         (
                             session_id,
                             str(message.role),
+                            interaction_id,
                             sqlite_support.json_dumps(message.model_dump(mode="json")),
                         )
                         for message in copied_messages
@@ -5848,13 +6208,169 @@ class SQLiteSessionStore(SessionStore):
 
         await self._run_write(statement)
 
+    async def replace_initial_transcript_messages(
+        self,
+        session_id: str,
+        expected_messages: list[Message],
+        replacement_messages: list[Message],
+        *,
+        interaction_id: InteractionAttribution = INHERIT_INTERACTION,
+    ) -> None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        interaction_id = resolve_interaction_attribution(session_id, interaction_id)
+        expected = copy_transcript_messages(expected_messages)
+        replacement = copy_transcript_messages(replacement_messages)
+        updated_at = datetime.now(UTC)
+
+        def statement(connection: sqlite3.Connection) -> None:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                session = self._load_unlocked(session_id)
+                if session is None:
+                    raise KeyError(f"Session not found: {session_id}")
+                _assert_session_run_epoch(session_id, session)
+                row = connection.execute(
+                    "SELECT interaction_id, source_messages_json "
+                    "FROM cayu_deferred_interaction_inputs WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if row is None or row["interaction_id"] != interaction_id:
+                    raise RuntimeError("Deferred interaction input changed before finalization.")
+                stored = [Message(**item) for item in json.loads(row["source_messages_json"])]
+                if stored != expected:
+                    raise RuntimeError("Deferred interaction input changed before finalization.")
+                existing = connection.execute(
+                    "SELECT 1 FROM cayu_transcript_messages WHERE session_id = ? LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+                if existing is not None:
+                    raise RuntimeError("Initial transcript changed before finalization.")
+                if len(replacement) < len(expected) or (
+                    expected and replacement[-len(expected) :] != expected
+                ):
+                    raise RuntimeError(
+                        "Initial transcript must preserve the admitted source suffix."
+                    )
+                prefix_count = len(replacement) - len(expected)
+                connection.executemany(
+                    "INSERT INTO cayu_transcript_messages "
+                    "(session_id, role, interaction_id, message_json) VALUES (?, ?, ?, ?)",
+                    [
+                        (
+                            session_id,
+                            str(message.role),
+                            None if index < prefix_count else interaction_id,
+                            sqlite_support.json_dumps(message.model_dump(mode="json")),
+                        )
+                        for index, message in enumerate(replacement)
+                    ],
+                )
+                connection.execute(
+                    "DELETE FROM cayu_deferred_interaction_inputs WHERE session_id = ?",
+                    (session_id,),
+                )
+                _touch_session_activity(connection, session_id, updated_at)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+
+        await self._run_write(statement)
+
+    async def materialize_deferred_interaction_input(
+        self,
+        session_id: str,
+        *,
+        interaction_id: InteractionAttribution = INHERIT_INTERACTION,
+    ) -> bool:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        interaction_id = resolve_interaction_attribution(session_id, interaction_id)
+
+        def statement(connection: sqlite3.Connection) -> bool:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                session = self._load_unlocked(session_id)
+                if session is None:
+                    raise KeyError(f"Session not found: {session_id}")
+                _assert_session_run_epoch(session_id, session)
+                row = connection.execute(
+                    "SELECT interaction_id, source_messages_json "
+                    "FROM cayu_deferred_interaction_inputs WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if row is None:
+                    connection.commit()
+                    return False
+                if row["interaction_id"] != interaction_id:
+                    raise RuntimeError("Deferred interaction input belongs to another interaction.")
+                messages = [Message(**item) for item in json.loads(row["source_messages_json"])]
+                connection.executemany(
+                    "INSERT INTO cayu_transcript_messages "
+                    "(session_id, role, interaction_id, message_json) VALUES (?, ?, ?, ?)",
+                    [
+                        (
+                            session_id,
+                            str(message.role),
+                            interaction_id,
+                            sqlite_support.json_dumps(message.model_dump(mode="json")),
+                        )
+                        for message in messages
+                    ],
+                )
+                connection.execute(
+                    "DELETE FROM cayu_deferred_interaction_inputs WHERE session_id = ?",
+                    (session_id,),
+                )
+                _touch_session_activity(connection, session_id, datetime.now(UTC))
+                connection.commit()
+                return True
+            except Exception:
+                connection.rollback()
+                raise
+
+        return await self._run_write(statement)
+
+    async def load_deferred_interaction_input(
+        self,
+        session_id: str,
+    ) -> DeferredInteractionInput | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+
+        def query(connection: sqlite3.Connection) -> DeferredInteractionInput | None:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM cayu_sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                is None
+            ):
+                raise KeyError(f"Session not found: {session_id}")
+            row = connection.execute(
+                "SELECT interaction_id, source_messages_json "
+                "FROM cayu_deferred_interaction_inputs WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return DeferredInteractionInput(
+                interaction_id=row["interaction_id"],
+                source_messages=[
+                    Message(**item) for item in json.loads(row["source_messages_json"])
+                ],
+            )
+
+        return await self._run_read(query)
+
     async def append_transcript_messages_and_transform_checkpoint(
         self,
         session_id: str,
         messages: list[Message],
         checkpoint_transform: CheckpointTransform,
+        *,
+        interaction_id: InteractionAttribution = INHERIT_INTERACTION,
     ) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
+        interaction_id = resolve_interaction_attribution(session_id, interaction_id)
         copied_messages = copy_transcript_messages(messages)
         if checkpoint_transform is None:
             raise TypeError("checkpoint_transform is required.")
@@ -5881,14 +6397,16 @@ class SQLiteSessionStore(SessionStore):
                         INSERT INTO cayu_transcript_messages (
                             session_id,
                             role,
+                            interaction_id,
                             message_json
                         )
-                        VALUES (?, ?, ?)
+                        VALUES (?, ?, ?, ?)
                         """,
                         [
                             (
                                 session_id,
                                 str(message.role),
+                                interaction_id,
                                 sqlite_support.json_dumps(message.model_dump(mode="json")),
                             )
                             for message in copied_messages
@@ -5942,26 +6460,34 @@ class SQLiteSessionStore(SessionStore):
 
     async def query_transcript(self, query: TranscriptQuery) -> TranscriptPage:
         query = copy_transcript_query(query)
-        role_clause = "WHERE role = ?" if query.role is not None else ""
-        role_params: list[object] = [str(query.role)] if query.role is not None else []
+        filters: list[str] = []
+        filter_params: list[object] = []
+        if query.role is not None:
+            filters.append("role = ?")
+            filter_params.append(str(query.role))
+        if query.interaction_id is not None:
+            filters.append("interaction_id = ?")
+            filter_params.append(query.interaction_id)
+        filter_clause = "WHERE " + " AND ".join(filters) if filters else ""
 
         async with self._lock:
             if not self._session_exists_unlocked(query.session_id):
                 raise KeyError(f"Session not found: {query.session_id}")
 
-            count_params: list[object] = [query.session_id, *role_params]
+            count_params: list[object] = [query.session_id, *filter_params]
             total_row = self._connection.execute(
                 f"""
                 WITH ordered AS (
                     SELECT
                         role,
+                        interaction_id,
                         ROW_NUMBER() OVER (ORDER BY sequence ASC) - 1 AS transcript_index
                     FROM cayu_transcript_messages
                     WHERE session_id = ?
                 )
                 SELECT COUNT(*) AS total_records
                 FROM ordered
-                {role_clause}
+                {filter_clause}
                 """,
                 count_params,
             ).fetchone()
@@ -5969,7 +6495,7 @@ class SQLiteSessionStore(SessionStore):
 
             page_params: list[object] = [
                 query.session_id,
-                *role_params,
+                *filter_params,
                 query.limit,
                 query.offset,
             ]
@@ -5978,14 +6504,15 @@ class SQLiteSessionStore(SessionStore):
                 WITH ordered AS (
                     SELECT
                         role,
+                        interaction_id,
                         message_json,
                         ROW_NUMBER() OVER (ORDER BY sequence ASC) - 1 AS transcript_index
                     FROM cayu_transcript_messages
                     WHERE session_id = ?
                 )
-                SELECT transcript_index, message_json
+                SELECT transcript_index, interaction_id, message_json
                 FROM ordered
-                {role_clause}
+                {filter_clause}
                 ORDER BY transcript_index ASC
                 LIMIT ? OFFSET ?
                 """,
@@ -5994,6 +6521,7 @@ class SQLiteSessionStore(SessionStore):
             records = [
                 TranscriptRecord(
                     index=row["transcript_index"],
+                    interaction_id=row["interaction_id"],
                     message=Message(**json.loads(row["message_json"])),
                 )
                 for row in rows

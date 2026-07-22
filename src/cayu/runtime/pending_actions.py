@@ -366,6 +366,7 @@ def pending_action_event_storage_values(
     projection_view = {
         "type": str(event.type),
         "session_id": event.session_id,
+        "interaction_id": event.interaction_id,
         "id": event.id,
         "timestamp": event.timestamp,
         "agent_name": event.agent_name,
@@ -482,6 +483,7 @@ def _project_pending_action_event(
     return Event(
         type=event.type,
         session_id=event.session_id,
+        interaction_id=event.interaction_id,
         id=event.id,
         timestamp=event.timestamp,
         agent_name=event.agent_name,
@@ -510,6 +512,7 @@ def project_pending_action_event_record(record: EventRecord) -> EventRecord:
         event = Event(
             type=record.event.type,
             session_id=record.event.session_id,
+            interaction_id=record.event.interaction_id,
             id=record.event.id,
             timestamp=record.event.timestamp,
             agent_name=record.event.agent_name,

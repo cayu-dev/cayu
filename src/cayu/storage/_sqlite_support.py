@@ -157,6 +157,7 @@ _BASELINE_DDL = """
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
         event_id TEXT NOT NULL,
+        interaction_id TEXT,
         event_type TEXT NOT NULL,
         timestamp TEXT NOT NULL,
         agent_name TEXT,
@@ -258,6 +259,7 @@ _BASELINE_DDL = """
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
         role TEXT NOT NULL,
+        interaction_id TEXT,
         message_json TEXT NOT NULL
     );
 
@@ -464,6 +466,10 @@ _BASELINE_DDL = """
         ON cayu_transcript_messages(session_id, sequence);
     CREATE INDEX IF NOT EXISTS idx_cayu_transcript_messages_session_role_sequence
         ON cayu_transcript_messages(session_id, role, sequence);
+    CREATE INDEX IF NOT EXISTS idx_cayu_events_session_interaction_sequence
+        ON cayu_events(session_id, interaction_id, sequence);
+    CREATE INDEX IF NOT EXISTS idx_cayu_transcript_messages_session_interaction_sequence
+        ON cayu_transcript_messages(session_id, interaction_id, sequence);
     CREATE INDEX IF NOT EXISTS idx_cayu_session_message_queue_delivery
         ON cayu_session_message_queue(session_id, status, delivery_mode, ordering_key);
     CREATE INDEX IF NOT EXISTS idx_cayu_tasks_status
@@ -892,6 +898,63 @@ _MIGRATION_STEPS: dict[int, str] = {
                 reservation_id
             );
     """,
+    26: """
+        CREATE INDEX IF NOT EXISTS idx_cayu_events_session_interaction_sequence
+            ON cayu_events(session_id, interaction_id, sequence);
+        CREATE INDEX IF NOT EXISTS idx_cayu_transcript_messages_session_interaction_sequence
+            ON cayu_transcript_messages(session_id, interaction_id, sequence);
+    """,
+    27: """
+        CREATE TABLE IF NOT EXISTS cayu_interaction_latest_events (
+            session_id TEXT NOT NULL,
+            interaction_id TEXT NOT NULL,
+            latest_event_sequence INTEGER NOT NULL,
+            PRIMARY KEY (session_id, interaction_id),
+            FOREIGN KEY (session_id) REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+            FOREIGN KEY (latest_event_sequence)
+                REFERENCES cayu_events(sequence) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_cayu_interaction_latest_events_page
+            ON cayu_interaction_latest_events(session_id, latest_event_sequence DESC);
+        INSERT INTO cayu_interaction_latest_events (
+            session_id, interaction_id, latest_event_sequence
+        )
+        SELECT session_id, interaction_id, MAX(sequence)
+        FROM cayu_events
+        WHERE interaction_id IS NOT NULL
+          AND event_type IN (
+              'interaction.started', 'interaction.resumed', 'interaction.paused',
+              'interaction.completed', 'interaction.failed', 'interaction.interrupted'
+          )
+        GROUP BY session_id, interaction_id
+        ON CONFLICT(session_id, interaction_id) DO UPDATE SET
+            latest_event_sequence = excluded.latest_event_sequence
+        WHERE excluded.latest_event_sequence > latest_event_sequence;
+        CREATE TRIGGER IF NOT EXISTS cayu_track_interaction_latest_event
+        AFTER INSERT ON cayu_events
+        FOR EACH ROW
+        WHEN NEW.interaction_id IS NOT NULL
+         AND NEW.event_type IN (
+              'interaction.started', 'interaction.resumed', 'interaction.paused',
+              'interaction.completed', 'interaction.failed', 'interaction.interrupted'
+         )
+        BEGIN
+            INSERT INTO cayu_interaction_latest_events (
+                session_id, interaction_id, latest_event_sequence
+            ) VALUES (NEW.session_id, NEW.interaction_id, NEW.sequence)
+            ON CONFLICT(session_id, interaction_id) DO UPDATE SET
+                latest_event_sequence = excluded.latest_event_sequence
+            WHERE excluded.latest_event_sequence > latest_event_sequence;
+        END;
+    """,
+    28: """
+        CREATE TABLE IF NOT EXISTS cayu_deferred_interaction_inputs (
+            session_id TEXT PRIMARY KEY
+                REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+            interaction_id TEXT NOT NULL,
+            source_messages_json TEXT NOT NULL
+        );
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -933,6 +996,10 @@ _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
             "pending_action_metrics_ready",
             "INTEGER NOT NULL DEFAULT 0",
         ),
+    ),
+    26: (
+        ("cayu_events", "interaction_id", "TEXT"),
+        ("cayu_transcript_messages", "interaction_id", "TEXT"),
     ),
 }
 

@@ -50,6 +50,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
         session_order BIGINT NOT NULL,
         event_id TEXT NOT NULL,
+        interaction_id TEXT,
         event_type TEXT NOT NULL,
         timestamp TIMESTAMPTZ NOT NULL,
         agent_name TEXT,
@@ -132,6 +133,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     CREATE TABLE IF NOT EXISTS cayu_transcript_messages (
         sequence BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+        interaction_id TEXT,
         message JSONB NOT NULL
     )
     """,
@@ -315,6 +317,10 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_tool_name ON cayu_events(tool_name)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_transcript_messages_session_sequence "
     "ON cayu_transcript_messages(session_id, sequence)",
+    "CREATE INDEX IF NOT EXISTS idx_cayu_events_session_interaction_sequence "
+    "ON cayu_events(session_id, interaction_id, sequence)",
+    "CREATE INDEX IF NOT EXISTS idx_cayu_transcript_messages_session_interaction_sequence "
+    "ON cayu_transcript_messages(session_id, interaction_id, sequence)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_session_message_queue_delivery "
     "ON cayu_session_message_queue(session_id, status, delivery_mode, ordering_key)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_tasks_status ON cayu_tasks(status)",

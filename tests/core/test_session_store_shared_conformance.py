@@ -70,6 +70,7 @@ from cayu.runtime import (
     SessionStatusConflict,
     SessionStore,
     ToolRoundIdentity,
+    TranscriptQuery,
     UsageRollupQuery,
     runtime_publication_checkpoint_mutation,
     runtime_publication_checkpoint_value_digest,
@@ -111,6 +112,8 @@ _POSTGRES_TABLES = (
     "cayu_knowledge_chunks",
     "cayu_knowledge_entries",
     "cayu_event_watcher_state",
+    "cayu_deferred_interaction_inputs",
+    "cayu_interaction_latest_events",
     "cayu_persisted_event_side_effects",
     "cayu_mcp_manifest_baselines",
     "cayu_budget_reservation_identities",
@@ -2524,6 +2527,14 @@ def test_session_store_conformance_explicit_compaction_operation(session_store_c
                 Message.text("assistant", "current answer"),
             ]
             await store.append_transcript_messages(created.id, transcript)
+            await store.append_event(
+                created.id,
+                Event(
+                    type=EventType.INTERACTION_COMPLETED,
+                    session_id=created.id,
+                    interaction_id="interaction-deleted-with-session",
+                ),
+            )
             completed = await store.update_status(created.id, SessionStatus.COMPLETED)
             request = CompactSessionRequest(
                 session_id=created.id,
@@ -7972,6 +7983,8 @@ def test_session_store_conformance_blocks_delete_during_explicit_compaction(
             await store.delete_session(created.id)
             assert await store.load(created.id) is None
             with pytest.raises(KeyError, match="Session not found"):
+                await store.query_latest_interaction_events(created.id, limit=1)
+            with pytest.raises(KeyError, match="Session not found"):
                 await store.load_session_operation(created.id, request.idempotency_key)
         finally:
             await _close_store(store)
@@ -8368,7 +8381,18 @@ def test_session_store_conformance_durable_session_message_queue(session_store_c
                 created.id,
                 include_on_idle=True,
                 limit=1,
+                interaction_id="interaction-queue-first",
+                interaction_started_event=Event(
+                    id="evt_interaction_queue_first",
+                    type=EventType.INTERACTION_STARTED,
+                    session_id=created.id,
+                    interaction_id="interaction-queue-first",
+                ),
             )
+            assert [event.type for event in first.events] == [
+                EventType.INTERACTION_STARTED,
+                EventType.SESSION_MESSAGE_DELIVERED,
+            ]
             assert [message.queue_id for message in first.messages] == [next_one.message.queue_id]
             assert first.has_more is True
             late = await store.enqueue_session_message(
@@ -8384,12 +8408,14 @@ def test_session_store_conformance_durable_session_message_queue(session_store_c
                 include_on_idle=True,
                 eligible_through=first.eligible_through,
                 limit=1,
+                interaction_id="interaction-queue-first",
             )
             third = await store.deliver_queued_session_messages(
                 created.id,
                 include_on_idle=True,
                 eligible_through=first.eligible_through,
                 limit=1,
+                interaction_id="interaction-queue-first",
             )
             assert [message.queue_id for message in second.messages] == [next_two.message.queue_id]
             assert [message.queue_id for message in third.messages] == [idle.message.queue_id]
@@ -8404,6 +8430,13 @@ def test_session_store_conformance_durable_session_message_queue(session_store_c
             late_batch = await store.deliver_queued_session_messages(
                 created.id,
                 include_on_idle=False,
+                interaction_id="interaction-queue-late",
+                interaction_started_event=Event(
+                    id="evt_interaction_queue_late",
+                    type=EventType.INTERACTION_STARTED,
+                    session_id=created.id,
+                    interaction_id="interaction-queue-late",
+                ),
             )
             assert [message.queue_id for message in late_batch.messages] == [late.message.queue_id]
             completed = await store.transition_status_if_no_queued_messages(
@@ -8419,6 +8452,25 @@ def test_session_store_conformance_durable_session_message_queue(session_store_c
                 "idle",
                 "late next boundary",
             ]
+            transcript_page = await store.query_transcript(
+                TranscriptQuery(session_id=created.id, limit=10)
+            )
+            assert [record.interaction_id for record in transcript_page.records] == [
+                "interaction-queue-first",
+                "interaction-queue-first",
+                "interaction-queue-first",
+                "interaction-queue-late",
+            ]
+            lifecycle = await store.query_events(
+                EventQuery(
+                    session_id=created.id,
+                    event_types=(EventType.INTERACTION_STARTED,),
+                )
+            )
+            assert [record.event.id for record in lifecycle] == [
+                "evt_interaction_queue_first",
+                "evt_interaction_queue_late",
+            ]
             queue_events = [
                 event
                 for event in await store.load_events(created.id)
@@ -8429,7 +8481,7 @@ def test_session_store_conformance_durable_session_message_queue(session_store_c
             assert all("content" not in event.payload for event in queue_events)
             deliveries = await store.list_persisted_event_side_effect_deliveries(limit=1000)
             assert {delivery.event_id for delivery in deliveries} == {
-                event.id for event in queue_events
+                event.id for event in [*queue_events, *(record.event for record in lifecycle)]
             }
             assert all(
                 delivery.status is PersistedEventSideEffectStatus.PENDING for delivery in deliveries
@@ -8832,6 +8884,683 @@ def test_session_store_conformance_applies_query_filters(session_store_case) -> 
     asyncio.run(run())
 
 
+def test_session_store_conformance_preserves_interaction_attribution(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_interaction_attribution",
+                    messages=[Message.text("user", "bootstrap")],
+                ),
+                identity=_identity(),
+            )
+            first_id = "interaction-first"
+            second_id = "interaction-second"
+            await store.append_events(
+                session.id,
+                [
+                    Event(
+                        id="evt_interaction_first",
+                        type=EventType.MODEL_STARTED,
+                        session_id=session.id,
+                        interaction_id=first_id,
+                    ),
+                    Event(
+                        id="evt_interaction_legacy",
+                        type="custom.legacy",
+                        session_id=session.id,
+                    ),
+                    Event(
+                        id="evt_interaction_second",
+                        type=EventType.MODEL_COMPLETED,
+                        session_id=session.id,
+                        interaction_id=second_id,
+                    ),
+                ],
+            )
+            await store.append_transcript_messages(
+                session.id,
+                [Message.text("user", "first"), Message.text("assistant", "one")],
+                interaction_id=first_id,
+            )
+            await store.append_transcript_messages(
+                session.id,
+                [Message.text("user", "legacy")],
+            )
+            await store.append_transcript_messages(
+                session.id,
+                [Message.text("user", "second"), Message.text("assistant", "two")],
+                interaction_id=second_id,
+            )
+
+            store = await _reopen_store(session_store_case, store)
+            first_events = await store.query_events(
+                EventQuery(session_id=session.id, interaction_id=first_id)
+            )
+            assert [(record.event.id, record.event.interaction_id) for record in first_events] == [
+                ("evt_interaction_first", first_id)
+            ]
+            all_events = await store.query_events(EventQuery(session_id=session.id))
+            assert [record.event.interaction_id for record in all_events] == [
+                first_id,
+                None,
+                second_id,
+            ]
+
+            first_transcript = await store.query_transcript(
+                TranscriptQuery(session_id=session.id, interaction_id=first_id)
+            )
+            assert [record.index for record in first_transcript.records] == [0, 1]
+            assert [record.interaction_id for record in first_transcript.records] == [
+                first_id,
+                first_id,
+            ]
+            assert first_transcript.total_records == 2
+
+            all_transcript = await store.query_transcript(
+                TranscriptQuery(session_id=session.id, limit=10)
+            )
+            assert [record.index for record in all_transcript.records] == [0, 1, 2, 3, 4]
+            assert [record.interaction_id for record in all_transcript.records] == [
+                first_id,
+                first_id,
+                None,
+                second_id,
+                second_id,
+            ]
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_atomically_admits_and_materializes_interaction_input(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_interaction_admission",
+                    messages=[Message.text("user", "bootstrap")],
+                ),
+                identity=_identity(),
+            )
+            await store.transition_status(
+                session.id,
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.RUNNING,
+            )
+            source = [Message.text("user", "exact source")]
+            started = Event(
+                id="evt_interaction_admitted",
+                type=EventType.INTERACTION_STARTED,
+                session_id=session.id,
+                interaction_id="interaction-admitted",
+            )
+            await store.admit_interaction(
+                session.id,
+                started_event=started,
+                source_messages=source,
+                defer_transcript=True,
+            )
+
+            store = await _reopen_store(session_store_case, store)
+            assert [
+                record.event.id
+                for record in await store.query_events(EventQuery(session_id=session.id))
+            ] == [started.id]
+            assert (
+                await store.query_transcript(TranscriptQuery(session_id=session.id))
+            ).records == []
+
+            with pytest.raises(
+                RuntimeError,
+                match="Deferred interaction input changed before finalization",
+            ):
+                await store.replace_initial_transcript_messages(
+                    session.id,
+                    [Message.text("user", "wrong source")],
+                    [Message.text("user", "wrong source")],
+                    interaction_id="interaction-admitted",
+                )
+            assert (
+                await store.query_transcript(TranscriptQuery(session_id=session.id))
+            ).records == []
+
+            final = [Message.text("system", "resolved system"), *source]
+            await store.replace_initial_transcript_messages(
+                session.id,
+                source,
+                final,
+                interaction_id="interaction-admitted",
+            )
+            page = await store.query_transcript(TranscriptQuery(session_id=session.id, limit=10))
+            assert [record.index for record in page.records] == [0, 1]
+            assert [record.interaction_id for record in page.records] == [
+                None,
+                "interaction-admitted",
+            ]
+
+            with pytest.raises(ValueError, match="Event already exists for session"):
+                await store.admit_interaction(
+                    session.id,
+                    started_event=started,
+                    source_messages=[Message.text("user", "must roll back")],
+                )
+            unchanged = await store.query_transcript(
+                TranscriptQuery(session_id=session.id, limit=10)
+            )
+            assert [record.message for record in unchanged.records] == final
+        finally:
+            await store.release_run_fence("sess_interaction_admission")
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_create_atomically_claims_and_admits_first_interaction(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            source: list[Message] = []
+            started = Event(
+                id="evt_atomic_create_interaction",
+                type=EventType.INTERACTION_STARTED,
+                session_id="sess_atomic_create_interaction",
+                interaction_id="interaction-atomic-create",
+            )
+            session = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_atomic_create_interaction",
+                    messages=source,
+                ),
+                identity=_identity(),
+                interaction_started_event=started,
+                interaction_source_messages=source,
+            )
+
+            assert session.status is SessionStatus.RUNNING
+            assert session.run_epoch == 1
+            store = await _reopen_store(session_store_case, store)
+            assert [
+                record.event.id
+                for record in await store.query_events(EventQuery(session_id=session.id))
+            ] == [started.id]
+            assert (
+                await store.query_transcript(TranscriptQuery(session_id=session.id))
+            ).records == []
+            deferred = await store.load_deferred_interaction_input(session.id)
+            assert deferred is not None
+            assert deferred.interaction_id == "interaction-atomic-create"
+            assert deferred.source_messages == []
+            assert await store.materialize_deferred_interaction_input(
+                session.id,
+                interaction_id="interaction-atomic-create",
+            )
+            assert await store.load_deferred_interaction_input(session.id) is None
+        finally:
+            await store.release_run_fence("sess_atomic_create_interaction")
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_transition_atomically_claims_and_admits_interaction(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_atomic_resume_interaction",
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            source = [Message.text("user", "resume source")]
+            started = Event(
+                id="evt_atomic_resume_interaction",
+                type=EventType.INTERACTION_STARTED,
+                session_id=session.id,
+                interaction_id="interaction-atomic-resume",
+            )
+            transitioned = await store.transition_status_and_checkpoint(
+                session.id,
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.RUNNING,
+                checkpoint_transform=lambda _session, checkpoint: checkpoint,
+                interaction_started_event=started,
+                interaction_source_messages=source,
+            )
+
+            assert transitioned.status is SessionStatus.RUNNING
+            assert transitioned.run_epoch == 1
+            store = await _reopen_store(session_store_case, store)
+            events = await store.query_events(
+                EventQuery(session_id=session.id, interaction_id="interaction-atomic-resume")
+            )
+            assert [record.event.id for record in events] == [started.id]
+            transcript = await store.query_transcript(
+                TranscriptQuery(session_id=session.id, limit=10)
+            )
+            assert [record.message for record in transcript.records] == source
+            assert [record.interaction_id for record in transcript.records] == [
+                "interaction-atomic-resume"
+            ]
+            assert await store.load_deferred_interaction_input(session.id) is None
+        finally:
+            await store.release_run_fence("sess_atomic_resume_interaction")
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_transition_can_defer_continued_interaction_input(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_atomic_continue_interaction",
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            source = [Message.text("user", "continue after recovery")]
+            await store.transition_status_and_checkpoint(
+                session.id,
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.RUNNING,
+                checkpoint_transform=lambda _session, checkpoint: checkpoint,
+                interaction_source_messages=source,
+                continued_interaction_id="interaction-existing",
+                defer_interaction_source=True,
+            )
+
+            store = await _reopen_store(session_store_case, store)
+            assert await store.query_events(EventQuery(session_id=session.id)) == []
+            assert (
+                await store.query_transcript(TranscriptQuery(session_id=session.id))
+            ).records == []
+            deferred = await store.load_deferred_interaction_input(session.id)
+            assert deferred is not None
+            assert deferred.interaction_id == "interaction-existing"
+            assert deferred.source_messages == source
+            assert await store.materialize_deferred_interaction_input(
+                session.id,
+                interaction_id="interaction-existing",
+            )
+            transcript = await store.query_transcript(
+                TranscriptQuery(session_id=session.id, limit=10)
+            )
+            assert [record.interaction_id for record in transcript.records] == [
+                "interaction-existing"
+            ]
+        finally:
+            await store.release_run_fence("sess_atomic_continue_interaction")
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_transition_extends_matching_deferred_interaction_input(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_atomic_extend_deferred_interaction",
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            first_source = [Message.text("user", "continue after recovery")]
+            await store.transition_status_and_checkpoint(
+                session.id,
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.RUNNING,
+                checkpoint_transform=lambda _session, checkpoint: checkpoint,
+                interaction_source_messages=first_source,
+                continued_interaction_id="interaction-existing",
+                defer_interaction_source=True,
+            )
+            await store.update_status(session.id, SessionStatus.FAILED)
+            await store.release_run_fence(session.id)
+            store = await _reopen_store(session_store_case, store)
+
+            combined_source = [
+                *first_source,
+                Message.text("user", "retry recovery"),
+            ]
+            await store.transition_status_and_checkpoint(
+                session.id,
+                from_statuses={SessionStatus.FAILED},
+                to_status=SessionStatus.RUNNING,
+                checkpoint_transform=lambda _session, checkpoint: checkpoint,
+                interaction_source_messages=combined_source,
+                continued_interaction_id="interaction-existing",
+                defer_interaction_source=True,
+            )
+
+            store = await _reopen_store(session_store_case, store)
+            deferred = await store.load_deferred_interaction_input(session.id)
+            assert deferred is not None
+            assert deferred.interaction_id == "interaction-existing"
+            assert deferred.source_messages == combined_source
+            assert (
+                await store.query_transcript(TranscriptQuery(session_id=session.id))
+            ).records == []
+        finally:
+            await store.release_run_fence("sess_atomic_extend_deferred_interaction")
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_admits_resume_input_with_start_event(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_interaction_resume_admission",
+                    messages=[Message.text("user", "bootstrap")],
+                ),
+                identity=_identity(),
+            )
+            await store.append_transcript_messages(
+                session.id,
+                [Message.text("assistant", "previous response")],
+                interaction_id=None,
+            )
+            await store.transition_status(
+                session.id,
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.RUNNING,
+            )
+            started = Event(
+                id="evt_interaction_resume_admitted",
+                type=EventType.INTERACTION_STARTED,
+                session_id=session.id,
+                interaction_id="interaction-resume-admitted",
+            )
+            await store.admit_interaction(
+                session.id,
+                started_event=started,
+                source_messages=[Message.text("user", "resume source")],
+            )
+
+            page = await store.query_transcript(TranscriptQuery(session_id=session.id, limit=10))
+            assert [record.interaction_id for record in page.records] == [
+                None,
+                "interaction-resume-admitted",
+            ]
+            events = await store.query_events(
+                EventQuery(
+                    session_id=session.id,
+                    interaction_id="interaction-resume-admitted",
+                )
+            )
+            assert [record.event.id for record in events] == [started.id]
+        finally:
+            await store.release_run_fence("sess_interaction_resume_admission")
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_materializes_deferred_interaction_input_fallback(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_deferred_interaction_fallback",
+                    messages=[Message.text("user", "bootstrap")],
+                ),
+                identity=_identity(),
+            )
+            await store.append_transcript_messages(
+                session.id,
+                [Message.text("assistant", "previous response")],
+                interaction_id=None,
+            )
+            await store.transition_status(
+                session.id,
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.RUNNING,
+            )
+            await store.admit_interaction(
+                session.id,
+                started_event=Event(
+                    id="evt_deferred_interaction_fallback",
+                    type=EventType.INTERACTION_STARTED,
+                    session_id=session.id,
+                    interaction_id="interaction-deferred-fallback",
+                ),
+                source_messages=[Message.text("user", "deferred source")],
+                defer_transcript=True,
+            )
+            store = await _reopen_store(session_store_case, store)
+
+            with pytest.raises(
+                RuntimeError,
+                match="Deferred interaction input belongs to another interaction",
+            ):
+                await store.materialize_deferred_interaction_input(
+                    session.id,
+                    interaction_id="interaction-wrong",
+                )
+            before = await store.query_transcript(TranscriptQuery(session_id=session.id, limit=10))
+            assert [record.interaction_id for record in before.records] == [None]
+
+            assert await store.materialize_deferred_interaction_input(
+                session.id,
+                interaction_id="interaction-deferred-fallback",
+            )
+            store = await _reopen_store(session_store_case, store)
+            after = await store.query_transcript(TranscriptQuery(session_id=session.id, limit=10))
+            assert [record.interaction_id for record in after.records] == [
+                None,
+                "interaction-deferred-fallback",
+            ]
+            assert [record.message for record in after.records] == [
+                Message.text("assistant", "previous response"),
+                Message.text("user", "deferred source"),
+            ]
+            assert not await store.materialize_deferred_interaction_input(
+                session.id,
+                interaction_id="interaction-deferred-fallback",
+            )
+        finally:
+            await store.release_run_fence("sess_deferred_interaction_fallback")
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_paginates_latest_interaction_states(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_interaction_pagination",
+                    messages=[Message.text("user", "bootstrap")],
+                ),
+                identity=_identity(),
+            )
+            await store.append_events(
+                session.id,
+                [
+                    Event(
+                        id="interaction_1_started",
+                        type=EventType.INTERACTION_STARTED,
+                        session_id=session.id,
+                        interaction_id="interaction-1",
+                    ),
+                    Event(
+                        id="interaction_2_started",
+                        type=EventType.INTERACTION_STARTED,
+                        session_id=session.id,
+                        interaction_id="interaction-2",
+                    ),
+                    Event(
+                        id="interaction_1_paused",
+                        type=EventType.INTERACTION_PAUSED,
+                        session_id=session.id,
+                        interaction_id="interaction-1",
+                    ),
+                    Event(
+                        id="interaction_3_started",
+                        type=EventType.INTERACTION_STARTED,
+                        session_id=session.id,
+                        interaction_id="interaction-3",
+                    ),
+                    Event(
+                        id="interaction_2_completed",
+                        type=EventType.INTERACTION_COMPLETED,
+                        session_id=session.id,
+                        interaction_id="interaction-2",
+                    ),
+                ],
+            )
+
+            first_page = await store.query_latest_interaction_events(session.id, limit=2)
+            assert [record.event.id for record in first_page] == [
+                "interaction_2_completed",
+                "interaction_3_started",
+            ]
+            second_page = await store.query_latest_interaction_events(
+                session.id,
+                before_sequence=first_page[-1].sequence,
+                limit=2,
+            )
+            assert [record.event.id for record in second_page] == ["interaction_1_paused"]
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_pages_hundreds_of_interactions(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_interaction_scale",
+                    messages=[Message.text("user", "bootstrap")],
+                ),
+                identity=_identity(),
+            )
+            interaction_count = 250
+            await store.append_events(
+                session.id,
+                [
+                    Event(
+                        id=f"interaction_{index}_completed",
+                        type=EventType.INTERACTION_COMPLETED,
+                        session_id=session.id,
+                        interaction_id=f"interaction-{index}",
+                    )
+                    for index in range(interaction_count)
+                ],
+            )
+
+            observed: list[str] = []
+            before_sequence = None
+            while True:
+                page = await store.query_latest_interaction_events(
+                    session.id,
+                    before_sequence=before_sequence,
+                    limit=37,
+                )
+                if not page:
+                    break
+                observed.extend(record.event.interaction_id or "" for record in page)
+                before_sequence = page[-1].sequence
+
+            assert observed == [
+                f"interaction-{index}" for index in reversed(range(interaction_count))
+            ]
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_distinguishes_inherited_and_explicit_null_transcript_ids(
+    session_store_case,
+) -> None:
+    from cayu.runtime.sessions import (
+        _activate_session_interaction,
+        _deactivate_session_interaction,
+    )
+
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_transcript_attribution_modes",
+                messages=[Message.text("user", "bootstrap")],
+            ),
+            identity=_identity(),
+        )
+        try:
+            _activate_session_interaction(session.id, "interaction-active")
+            await store.append_transcript_messages(
+                session.id,
+                [Message.text("user", "inherit")],
+            )
+            await store.append_transcript_messages(
+                session.id,
+                [Message.text("assistant", "unassociated")],
+                interaction_id=None,
+            )
+            page = await store.query_transcript(TranscriptQuery(session_id=session.id))
+            assert [record.interaction_id for record in page.records] == [
+                "interaction-active",
+                None,
+            ]
+        finally:
+            _deactivate_session_interaction(session.id)
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
 def test_session_store_conformance_validates_event_batch_preamble(
     session_store_case,
 ) -> None:
@@ -9007,10 +9736,13 @@ def test_session_store_conformance_validates_exact_fork_transcript_atomically(
             )
             await session_store.append_transcript_messages(
                 source.id,
-                [
-                    Message.text("user", "copied-prefix"),
-                    Message.text("user", "excluded-suffix"),
-                ],
+                [Message.text("user", "copied-prefix")],
+                interaction_id="source-interaction-copied",
+            )
+            await session_store.append_transcript_messages(
+                source.id,
+                [Message.text("user", "excluded-suffix")],
+                interaction_id="source-interaction-excluded",
             )
             source = await session_store.update_status(
                 source.id,
@@ -9040,6 +9772,12 @@ def test_session_store_conformance_validates_exact_fork_transcript_atomically(
             assert [
                 message.content[0].text for message in await session_store.load_transcript(fork.id)
             ] == ["copied-prefix"]
+            fork_transcript = await session_store.query_transcript(
+                TranscriptQuery(session_id=fork.id, limit=10)
+            )
+            assert [record.interaction_id for record in fork_transcript.records] == [
+                "source-interaction-copied"
+            ]
 
             mutation_source = await session_store.create(
                 RunRequest(

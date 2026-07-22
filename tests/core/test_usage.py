@@ -67,7 +67,11 @@ from cayu.runtime.stop_policy import (
 )
 from cayu.runtime.usage import (
     ModelCompletionPurpose,
+    SessionUsageSummary,
+    aggregate_usage_metrics_from_durable_payload,
+    build_aggregate_usage_metrics,
     causal_budget_usage_summary,
+    combine_session_usage_summaries,
     count_model_steps_with_usage,
     durable_model_completed_payload,
     is_conversational_model_completion_payload,
@@ -85,6 +89,26 @@ class MutableClock:
 
     def __call__(self) -> datetime:
         return self.value
+
+
+def test_combined_usage_summary_preserves_exact_durable_aggregate_counts() -> None:
+    first = SessionUsageSummary(
+        session_id="session",
+        usage=build_aggregate_usage_metrics(
+            input_tokens=MAX_DURABLE_JSON_INTEGER,
+            total_tokens=MAX_DURABLE_JSON_INTEGER,
+        ),
+    )
+    second = SessionUsageSummary(
+        session_id="session",
+        usage=build_aggregate_usage_metrics(input_tokens=1, total_tokens=1),
+    )
+
+    combined = combine_session_usage_summaries("session", [first, second])
+    durable = combined.usage.model_dump(mode="json")
+
+    assert durable["input_tokens"] == str(MAX_DURABLE_JSON_INTEGER + 1)
+    assert aggregate_usage_metrics_from_durable_payload(durable) == combined.usage
 
 
 async def _reserve(ledger, **kwargs):
@@ -2509,7 +2533,9 @@ def test_sqlite_revision_twenty_five_refuses_ambiguous_active_reservations(
             "ALTER TABLE cayu_budget_reservations DROP COLUMN settlement_fallback_json"
         )
         connection.execute("ALTER TABLE cayu_budget_reservations DROP COLUMN environment_name")
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 25")
+        # Reconstruct the real pre-revision-25 schema. A database cannot retain
+        # the later interaction-contract revision while omitting revision 25.
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 25")
         connection.execute("PRAGMA user_version = 24")
         connection.commit()
     finally:
