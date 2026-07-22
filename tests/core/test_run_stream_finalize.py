@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import suppress
+from datetime import timedelta
 from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
@@ -24,6 +26,7 @@ from cayu.runtime import (
     ResumeRequest,
     RunRequest,
     SessionIdentity,
+    SessionRunFenced,
     SessionStatus,
 )
 
@@ -52,6 +55,28 @@ class RecordingReleaseStore(InMemorySessionStore):
     async def release_run_fence(self, session_id: str) -> None:
         self.release_calls[session_id] = self.release_calls.get(session_id, 0) + 1
         await super().release_run_fence(session_id)
+
+
+class BlockingReleaseStore(RecordingReleaseStore):
+    def __init__(self, *, fail_release: bool = False) -> None:
+        super().__init__()
+        self.fail_release = fail_release
+        self.release_started = asyncio.Event()
+        self.allow_release = asyncio.Event()
+        self.release_finished = asyncio.Event()
+
+    async def release_run_fence(self, session_id: str) -> None:
+        self.release_started.set()
+        await self.allow_release.wait()
+        try:
+            if self.fail_release:
+                try:
+                    raise OSError("run fence database connection lost")
+                except OSError as cause:
+                    raise RuntimeError("run fence release failed") from cause
+            await super().release_run_fence(session_id)
+        finally:
+            self.release_finished.set()
 
 
 class Harness(NamedTuple):
@@ -141,6 +166,284 @@ def test_abandoned_run_stream_finalizes_running_session() -> None:
     assert resumed is not None
     assert resumed.status == SessionStatus.COMPLETED
     assert len(h.provider.requests) == 1
+
+
+def test_injected_run_stream_exception_finalizes_before_return() -> None:
+    h = _build([_batch("unused")])
+
+    async def scenario() -> None:
+        session_id = "sess_injected_run_stream_exception"
+        stream = h.app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            )
+        )
+        first_event = await anext(stream)
+        assert first_event.type == EventType.SESSION_STARTED
+
+        injected = RuntimeError("consumer rejected run event")
+        try:
+            await stream.athrow(injected)
+        except RuntimeError as exc:
+            assert exc is injected
+        else:
+            raise AssertionError("Injected stream exception did not propagate.")
+
+        session = await h.store.load(session_id)
+        assert session is not None and session.status == SessionStatus.INTERRUPTED
+        events = await h.store.load_events(session_id)
+        _assert_turn_completed_before_abandoned_terminal(events)
+        terminal = _abandoned_terminal_event(events)
+        assert terminal.payload["reason"] == "event_stream_closed"
+        assert terminal.payload["abandoned"] is True
+        assert h.store.release_calls[session_id] == 1
+
+    asyncio.run(scenario())
+
+
+def test_cleanup_cancellation_remains_authoritative_and_waits_for_release() -> None:
+    store = BlockingReleaseStore()
+    provider = FakeProvider([_batch("unused")])
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def scenario() -> None:
+        session_id = "sess_cleanup_cancelled_after_stream_failure"
+        stream = app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            )
+        )
+        first_event = await anext(stream)
+        assert first_event.type == EventType.SESSION_STARTED
+
+        injected = RuntimeError("consumer rejected run event")
+        throw_task = asyncio.create_task(stream.athrow(injected))
+        await asyncio.wait_for(store.release_started.wait(), timeout=5)
+        assert throw_task.cancelling() == 0
+
+        throw_task.cancel()
+        await asyncio.sleep(0)
+        assert throw_task.cancelling() == 1
+        assert throw_task.done() is False
+        assert store.release_finished.is_set() is False
+
+        store.allow_release.set()
+        try:
+            await asyncio.wait_for(throw_task, timeout=5)
+        except asyncio.CancelledError as cancellation:
+            assert cancellation.__cause__ is injected
+        else:
+            raise AssertionError("Cleanup cancellation did not remain authoritative.")
+
+        assert throw_task.cancelled() is True
+        assert throw_task.cancelling() == 1
+        assert store.release_finished.is_set() is True
+        session = await store.load(session_id)
+        assert session is not None and session.status == SessionStatus.INTERRUPTED
+        assert store.release_calls[session_id] == 1
+
+    asyncio.run(scenario())
+
+
+def test_cancellation_requested_before_cleanup_starts_remains_authoritative() -> None:
+    store = RecordingReleaseStore()
+    provider = FakeProvider([_batch("unused")])
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def scenario() -> None:
+        session_id = "sess_cancelled_before_stream_cleanup"
+        stream = app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            )
+        )
+        first_event = await anext(stream)
+        assert first_event.type == EventType.SESSION_STARTED
+
+        async def cancel_then_close() -> None:
+            current_task = asyncio.current_task()
+            assert current_task is not None
+            current_task.cancel()
+            assert current_task.cancelling() == 1
+            await stream.aclose()
+
+        close_task = asyncio.create_task(cancel_then_close())
+        try:
+            await close_task
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("Cancellation requested before cleanup was swallowed.")
+
+        assert close_task.cancelled() is True
+        assert close_task.cancelling() == 1
+        session = await store.load(session_id)
+        assert session is not None and session.status == SessionStatus.INTERRUPTED
+        assert store.release_calls[session_id] == 1
+        assert app._session_control.has_active_tasks(session_id) is False
+
+    asyncio.run(scenario())
+
+
+def test_previously_delivered_cancellation_is_not_rediscovered_during_cleanup() -> None:
+    h = _build([_batch("unused")])
+
+    async def scenario() -> None:
+        session_id = "sess_handled_cancellation_before_stream_cleanup"
+        stream = h.app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            )
+        )
+        first_event = await anext(stream)
+        assert first_event.type == EventType.SESSION_STARTED
+
+        async def handle_cancellation_then_close() -> None:
+            current_task = asyncio.current_task()
+            assert current_task is not None
+            current_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await asyncio.sleep(0)
+            assert current_task.cancelling() == 1
+            await stream.aclose()
+
+        close_task = asyncio.create_task(handle_cancellation_then_close())
+        await close_task
+
+        assert close_task.cancelled() is False
+        assert close_task.cancelling() == 1
+        session = await h.store.load(session_id)
+        assert session is not None and session.status == SessionStatus.INTERRUPTED
+        assert h.store.release_calls[session_id] == 1
+        assert h.app._session_control.has_active_tasks(session_id) is False
+
+    asyncio.run(scenario())
+
+
+def test_cleanup_cancellation_preserves_release_failure_without_loop_report() -> None:
+    session_id = "sess_cleanup_cancelled_with_release_failure"
+    store = BlockingReleaseStore(fail_release=True)
+    provider = FakeProvider([_batch("unused")])
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        reported_contexts: list[dict[str, object]] = []
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: reported_contexts.append(context))
+        try:
+            stream = app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "hello")],
+                )
+            )
+            first_event = await anext(stream)
+            assert first_event.type == EventType.SESSION_STARTED
+
+            injected = RuntimeError("consumer rejected run event")
+            throw_task = asyncio.create_task(stream.athrow(injected))
+            await asyncio.wait_for(store.release_started.wait(), timeout=5)
+            throw_task.cancel()
+            await asyncio.sleep(0)
+            assert throw_task.cancelling() == 1
+            assert throw_task.done() is False
+
+            store.allow_release.set()
+            try:
+                await asyncio.wait_for(throw_task, timeout=5)
+            except asyncio.CancelledError as cancellation:
+                assert isinstance(cancellation.__cause__, BaseExceptionGroup)
+                earlier_failure, cleanup_failure = cancellation.__cause__.exceptions
+                assert earlier_failure is injected
+                assert isinstance(cleanup_failure, RuntimeError)
+                assert str(cleanup_failure) == "run fence release failed"
+                assert isinstance(cleanup_failure.__cause__, OSError)
+                assert str(cleanup_failure.__cause__) == ("run fence database connection lost")
+            else:
+                raise AssertionError("Cleanup cancellation did not remain authoritative.")
+
+            await asyncio.sleep(0)
+            assert throw_task.cancelled() is True
+            assert throw_task.cancelling() == 1
+            assert store.release_finished.is_set() is True
+            session = await store.load(session_id)
+            assert session is not None and session.status == SessionStatus.INTERRUPTED
+            assert reported_contexts == []
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+    asyncio.run(scenario())
+
+
+def test_wait_for_stream_resumption_retains_stale_run_fence() -> None:
+    h = _build([_batch("stale answer must not persist")])
+
+    async def scenario() -> None:
+        session_id = "sess_wait_for_stale_run_fence"
+        stream = h.app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            )
+        )
+        first_event = await asyncio.wait_for(anext(stream), timeout=5)
+        assert first_event.type == EventType.SESSION_STARTED
+        stale_owner = await h.store.load(session_id)
+        assert stale_owner is not None
+
+        async def take_over() -> int:
+            replacement = await h.store.fence_stalled_run(
+                session_id,
+                statuses={SessionStatus.RUNNING},
+                inactive_before=stale_owner.last_activity_at + timedelta(seconds=1),
+            )
+            assert replacement is not None
+            return replacement.run_epoch
+
+        replacement_epoch = await asyncio.create_task(take_over())
+        try:
+            try:
+                await asyncio.wait_for(anext(stream), timeout=5)
+            except SessionRunFenced:
+                pass
+            else:
+                raise AssertionError("Stale stream resumed after run-fence takeover.")
+        finally:
+            await stream.aclose()
+
+        after = await h.store.load(session_id)
+        assert after is not None
+        assert after.status == SessionStatus.RUNNING
+        assert after.run_epoch == replacement_epoch
+        assert not [
+            event
+            for event in await h.store.load_events(session_id)
+            if event.type
+            in {
+                EventType.MODEL_STARTED,
+                EventType.MODEL_COMPLETED,
+                EventType.SESSION_COMPLETED,
+            }
+        ]
+
+    asyncio.run(scenario())
 
 
 def test_abandoned_resume_stream_finalizes_running_session() -> None:

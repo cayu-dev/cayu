@@ -2,7 +2,7 @@
 
 The lifecycle owns concrete environment resources and their durable reconnect
 state. Session orchestration, task ownership, hook execution, and terminal
-status decisions remain with :class:`CayuApp`.
+status decisions belong to the session engine behind :class:`CayuApp`.
 """
 
 from __future__ import annotations

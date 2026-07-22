@@ -62,6 +62,38 @@ Runtime inputs are copied at framework boundaries. Framework code should depend 
 
 JSON-like contract fields should remain portable across local, hosted, and remote execution. They should contain JSON-compatible values only, without Python-specific object identity, circular references, or special numeric values such as NaN and Infinity.
 
+### Runtime ownership
+
+`CayuApp` is the stable public façade and composition root. It validates public
+requests, owns registrations and configuration, constructs the runtime
+collaborators, and delegates execution. Deep runtime modules do not import or
+accept the complete application object.
+
+```text
+CayuApp
+  -> RuntimeEventWriter
+  -> SessionControl
+  -> RunLimitController
+  -> EnvironmentLifecycle
+  -> ModelStepExecutor
+  -> ToolRoundExecutor
+  -> RecoveryCoordinator
+  -> SessionEngine
+```
+
+`SessionEngine` owns run, resume, fork, explicit compaction, queued-message
+delivery, task linkage, model/tool loop decisions, interruption terminalization,
+turn completion, and terminal hooks. `RecoveryCoordinator` owns durable paused
+continuations, manual outcome reconciliation, incomplete-session repair, and
+abandoned-run finalization. Model, tool, environment, limit, control, and event
+modules own their complete lower-level behavior slices.
+
+Some collaborators need to call session orchestration but are constructed before
+`SessionEngine`. `CayuApp` supplies those edges as narrow typed callables; the
+internal modules never type against or depend on the complete façade interface.
+This keeps dependency direction explicit while allowing `CayuApp` to remain the
+single composition root.
+
 ## Multi-Agent Shape
 
 Cayu must support systems where multiple agents collaborate through shared state.

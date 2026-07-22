@@ -619,8 +619,20 @@ def test_resolve_user_input_aclose_surfaces_precleanup_fence_release_failure() -
         while (await anext(stream)).type != EventType.MODEL_STARTED:
             pass
         store.fail_next_release = True
-        with pytest.raises(RuntimeError, match="run fence release unavailable before cleanup"):
-            await stream.aclose()
+        loop = asyncio.get_running_loop()
+        reported_contexts: list[dict[str, object]] = []
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: reported_contexts.append(context))
+        try:
+            with pytest.raises(
+                RuntimeError,
+                match="run fence release unavailable before cleanup",
+            ):
+                await stream.aclose()
+            await asyncio.sleep(0)
+            assert reported_contexts == []
+        finally:
+            loop.set_exception_handler(previous_handler)
 
         session = await store.load(session_id)
         assert session is not None

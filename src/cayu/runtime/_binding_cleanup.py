@@ -1,7 +1,7 @@
 """Internal handoff for structured binding lifecycle failures.
 
-Bindings own their rollback, while ``CayuApp`` owns the last-resort runner
-cleanup and the durable failure events.  This small status object carries the
+Bindings own their rollback, while the session engine and environment lifecycle
+own last-resort cleanup and durable failure events. This small status object carries the
 structured failure across that boundary without replacing original exception
 objects. Finalization metadata uses the same controlled handoff for durable
 phase diagnostics.

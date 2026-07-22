@@ -1274,14 +1274,15 @@ class RecoveryCoordinator:
                     release_run_fence_on_exit=False,
                 )
             )
+            forwarded_stream = self._session_control.stream_with_out_of_band_events(
+                session.id,
+                session_stream,
+            )
             try:
-                async for event in self._session_control.stream_with_out_of_band_events(
-                    session.id,
-                    session_stream,
-                ):
+                async for event in forwarded_stream:
                     yield event
             except GeneratorExit:
-                await session_stream.aclose()
+                await forwarded_stream.aclose()
                 raise
         except Exception as exc:
             if not pending_cleared:
@@ -1773,14 +1774,15 @@ class RecoveryCoordinator:
                     release_run_fence_on_exit=False,
                 )
             )
+            forwarded_stream = self._session_control.stream_with_out_of_band_events(
+                session.id,
+                session_stream,
+            )
             try:
-                async for event in self._session_control.stream_with_out_of_band_events(
-                    session.id,
-                    session_stream,
-                ):
+                async for event in forwarded_stream:
                     yield event
             except GeneratorExit:
-                await session_stream.aclose()
+                await forwarded_stream.aclose()
                 raise
         except GeneratorExit:
             await self.finalize_abandoned_session_by_id(session.id)

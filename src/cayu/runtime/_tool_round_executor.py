@@ -3,8 +3,8 @@
 This module is deliberately below :class:`CayuApp`.  It owns one complete
 tool-round lifecycle without importing or accepting the application facade.
 Session-level limit terminalization and interrupted-round recovery remain
-orchestration boundaries supplied as narrow callbacks until their owning
-runtime modules are extracted.
+orchestration boundaries supplied by the session engine and recovery coordinator
+through narrow callbacks.
 """
 
 from __future__ import annotations

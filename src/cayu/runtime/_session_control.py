@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, Generic, TypeVar
 
@@ -322,7 +322,7 @@ class SessionControl(Generic[UsageTrackerT]):
         self,
         session_id: str,
         stream: AsyncIterator[Event],
-    ) -> AsyncIterator[Event]:
+    ) -> AsyncGenerator[Event, None]:
         try:
             async for event in stream:
                 yield event

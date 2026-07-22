@@ -8,7 +8,8 @@ import math
 from abc import ABC, abstractmethod
 from bisect import bisect_left, bisect_right
 from collections import deque
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any, Literal
 from uuid import uuid4
+from weakref import ReferenceType, ref
 
 from pydantic import (
     BaseModel,
@@ -107,6 +109,50 @@ class SessionQueuedMessagesPending(RuntimeError):
 
 _SESSION_RUN_FENCES: ContextVar[dict[str, int] | None] = ContextVar(
     "cayu_session_run_fence",
+    default=None,
+)
+
+
+class _SessionRunFenceContext:
+    """Carry one stream's task-local run fences across task boundaries."""
+
+    def __init__(self) -> None:
+        fences = _SESSION_RUN_FENCES.get()
+        self._fences = None if fences is None else dict(fences)
+
+    @classmethod
+    def current_or_new(cls) -> _SessionRunFenceContext:
+        current = _ACTIVE_SESSION_RUN_FENCE_CONTEXT.get()
+        task = asyncio.current_task()
+        if current is not None and current[1]() is task:
+            return current[0]
+        return cls()
+
+    @contextmanager
+    def activate(self) -> Iterator[None]:
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("Session run-fence context requires a running task.")
+        current = _ACTIVE_SESSION_RUN_FENCE_CONTEXT.get()
+        if current is not None and current[0] is self and current[1]() is task:
+            yield
+            return
+        fences = None if self._fences is None else dict(self._fences)
+        fence_token = _SESSION_RUN_FENCES.set(fences)
+        context_token = _ACTIVE_SESSION_RUN_FENCE_CONTEXT.set((self, ref(task)))
+        try:
+            yield
+        finally:
+            current = _SESSION_RUN_FENCES.get()
+            self._fences = None if current is None else dict(current)
+            _ACTIVE_SESSION_RUN_FENCE_CONTEXT.reset(context_token)
+            _SESSION_RUN_FENCES.reset(fence_token)
+
+
+_ACTIVE_SESSION_RUN_FENCE_CONTEXT: ContextVar[
+    tuple[_SessionRunFenceContext, ReferenceType[asyncio.Task[Any]]] | None
+] = ContextVar(
+    "cayu_active_session_run_fence_context",
     default=None,
 )
 

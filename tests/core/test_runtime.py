@@ -17,7 +17,9 @@ from pydantic import ValidationError
 import cayu.runtime._environment_lifecycle as environment_lifecycle_module
 import cayu.runtime._model_step_executor as model_step_executor_module
 import cayu.runtime._recovery_coordinator as recovery_coordinator_module
+import cayu.runtime._run_limits as run_limits_module
 import cayu.runtime._session_control as session_control_module
+import cayu.runtime._session_engine as session_engine_module
 import cayu.runtime.app as runtime_app_module
 import cayu.runtime.sessions as sessions_module
 from cayu.artifacts import (
@@ -191,7 +193,7 @@ from cayu.runtime._binding_cleanup import (
     binding_cleanup_status,
     record_binding_cleanup_failure,
 )
-from cayu.runtime.app import _require_native_structured_output_support
+from cayu.runtime._session_engine import _require_native_structured_output_support
 from cayu.runtime.context import (
     ContextBuildResult,
     RuntimeManagedContextPolicy,
@@ -529,6 +531,21 @@ class FailingTerminalToolEventStore(InMemorySessionStore):
             self.failed_terminal_once = True
             raise RuntimeError("terminal tool event unavailable")
         await super().append_events(session_id, events)
+
+
+class FailNextRunFenceReleaseStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_next_release = False
+
+    async def release_run_fence(self, session_id: str) -> None:
+        if self.fail_next_release:
+            self.fail_next_release = False
+            try:
+                raise OSError("run fence database connection lost")
+            except OSError as cause:
+                raise RuntimeError("run fence release failed") from cause
+        await super().release_run_fence(session_id)
 
 
 class FailingOrdinaryToolResultCloseStore(InMemorySessionStore):
@@ -4205,7 +4222,7 @@ def test_cayu_app_releases_run_fence_when_initial_message_projection_fails(monke
         raise RuntimeError("initial message projection unavailable")
 
     monkeypatch.setattr(
-        runtime_app_module.transcript_helpers, "initial_messages", fail_initial_messages
+        session_engine_module.transcript_helpers, "initial_messages", fail_initial_messages
     )
 
     async def run() -> Session:
@@ -7754,7 +7771,7 @@ def test_cayu_app_tool_call_limit_allows_existing_result_then_blocks_next_tool()
 
 def test_cayu_app_elapsed_limit_stops_between_tool_calls(monkeypatch):
     clock = {"value": 0.0}
-    monkeypatch.setattr(runtime_app_module.time, "monotonic", lambda: clock["value"])
+    monkeypatch.setattr(session_engine_module.time, "monotonic", lambda: clock["value"])
 
     class ElapsedTool(SideEffectTool):
         async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
@@ -7829,7 +7846,7 @@ def test_cayu_app_elapsed_limit_stops_between_tool_calls(monkeypatch):
 
 def test_cayu_app_elapsed_limit_stops_after_policy_before_approval(monkeypatch):
     clock = {"value": 0.0}
-    monkeypatch.setattr(runtime_app_module.time, "monotonic", lambda: clock["value"])
+    monkeypatch.setattr(session_engine_module.time, "monotonic", lambda: clock["value"])
 
     class AdvancingApprovalPolicy(ToolPolicy):
         async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
@@ -9107,7 +9124,7 @@ def test_cayu_app_preserves_completed_usage_when_heartbeat_fails_in_same_turn(
         return done, pending
 
     monkeypatch.setattr(
-        runtime_app_module.asyncio,
+        run_limits_module.asyncio,
         "wait",
         force_terminal_item_and_heartbeat_into_same_done_set,
     )
@@ -12766,6 +12783,70 @@ def test_cayu_app_dispatches_existing_session_inline():
     assert session.status == SessionStatus.COMPLETED
 
 
+def test_dispatch_inline_cleanup_failure_has_one_forwarding_owner() -> None:
+    async def scenario() -> None:
+        session_id = "sess_dispatch_cleanup_failure"
+        store = FailNextRunFenceReleaseStore()
+        provider = FakeProvider(
+            [
+                [
+                    ModelStreamEvent.text_delta("first answer"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("unused dispatch answer"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "first request")],
+            ),
+        )
+
+        stream = app.dispatch_inline(
+            DispatchRequest(
+                session_id=session_id,
+                dispatch_id="dispatch_cleanup_failure",
+                messages=[Message.text("user", "run dispatched work")],
+            )
+        )
+        first_event = await anext(stream)
+        assert first_event.type == EventType.SESSION_RESUMED
+
+        loop = asyncio.get_running_loop()
+        reported_contexts: list[dict[str, object]] = []
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: reported_contexts.append(context))
+        try:
+            store.fail_next_release = True
+            injected = RuntimeError("dispatch consumer rejected event")
+            with pytest.raises(RuntimeError, match="dispatch consumer rejected event") as raised:
+                await stream.athrow(injected)
+            assert raised.value is injected
+            cleanup_failure = raised.value.__cause__
+            assert isinstance(cleanup_failure, RuntimeError)
+            assert str(cleanup_failure) == "run fence release failed"
+            assert isinstance(cleanup_failure.__cause__, OSError)
+            await asyncio.sleep(0)
+            assert reported_contexts == []
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+        session = await store.load(session_id)
+        assert session is not None and session.status == SessionStatus.INTERRUPTED
+        assert app._session_control.has_active_tasks(session_id) is False
+
+    asyncio.run(scenario())
+
+
 def test_subagent_tool_runs_child_session_with_parent_and_causal_linkage():
     store = InMemorySessionStore()
     provider = FakeProvider(
@@ -14030,7 +14111,7 @@ def test_finalizing_background_child_does_not_fail_parent_cascade(monkeypatch):
             "_interrupt_session",
             finalizing_interrupt_session,
         )
-        await app._interrupt_background_subagent_children(
+        await app._background_interruption_coordinator.run_cascade(
             parent_session_id="sess_parent_with_finalizing_child",
             interrupt_payload={
                 "reason": "operator stop",
@@ -14096,7 +14177,7 @@ def test_background_interruption_reconciles_child_already_interrupting_elsewhere
             )
 
         other_owner = asyncio.create_task(finish_other_owner())
-        await app._interrupt_background_subagent_children(
+        await app._background_interruption_coordinator.run_cascade(
             parent_session_id=parent_id,
             interrupt_payload={
                 "reason": "operator stop",
@@ -14160,7 +14241,7 @@ def test_background_interruption_cascade_isolates_child_completion_race(monkeypa
         monkeypatch.setattr(
             app._background_interruption_coordinator, "_interrupt_session", racing_interrupt_session
         )
-        await app._interrupt_background_subagent_children(
+        await app._background_interruption_coordinator.run_cascade(
             parent_session_id="sess_parent_child_completion_race",
             interrupt_payload={
                 "reason": "operator stop",
@@ -14223,7 +14304,7 @@ def test_background_interruption_cascade_persists_partial_failure(monkeypatch):
             "_interrupt_session",
             partially_failing_interrupt_session,
         )
-        await app._interrupt_background_subagent_children(
+        await app._background_interruption_coordinator.run_cascade(
             parent_session_id=parent_session_id,
             interrupt_payload={
                 "reason": "operator stop",
@@ -14310,12 +14391,12 @@ def test_background_interruption_cascade_success_resolves_prior_failure(monkeypa
             "_interrupt_session",
             retrying_interrupt_session,
         )
-        await app._interrupt_background_subagent_children(
+        await app._background_interruption_coordinator.run_cascade(
             parent_session_id=parent_session_id,
             interrupt_payload=payload,
         )
         failed_checkpoint = await store.load_checkpoint(parent_session_id)
-        await app._interrupt_background_subagent_children(
+        await app._background_interruption_coordinator.run_cascade(
             parent_session_id=parent_session_id,
             interrupt_payload=payload,
         )
@@ -14381,7 +14462,7 @@ def test_background_interruption_cascade_retains_marker_while_child_is_interrupt
             "_interrupt_session",
             still_finalizing_interrupt,
         )
-        await app._interrupt_background_subagent_children(
+        await app._background_interruption_coordinator.run_cascade(
             parent_session_id=parent_id,
             interrupt_payload=payload,
         )
@@ -14389,7 +14470,7 @@ def test_background_interruption_cascade_retains_marker_while_child_is_interrupt
         failed_events = await store.load_events(parent_id)
 
         await store.update_status(child_id, SessionStatus.INTERRUPTED)
-        await app._interrupt_background_subagent_children(
+        await app._background_interruption_coordinator.run_cascade(
             parent_session_id=parent_id,
             interrupt_payload=payload,
         )
@@ -14447,7 +14528,7 @@ def test_background_interruption_shutdown_cancels_shared_workers_and_keeps_marke
         monkeypatch.setattr(
             app._background_interruption_coordinator, "_interrupt_session", blocked_interrupt
         )
-        app._schedule_background_interruption_cascade(
+        app._session_engine._schedule_background_interruption_cascade(
             parent_session_id=parent_id,
             interrupt_payload={
                 "reason": "operator stop",
@@ -14631,7 +14712,7 @@ def test_background_interruption_shutdown_drains_locally_queued_roots(monkeypatc
             app._background_interruption_coordinator, "run_cascade", controlled_cascade
         )
         for index in range(2):
-            app._schedule_background_interruption_cascade(
+            app._session_engine._schedule_background_interruption_cascade(
                 parent_session_id=f"sess_locally_queued_{index}",
                 interrupt_payload=payload,
                 create_if_missing=False,
@@ -14699,7 +14780,7 @@ def test_background_interruption_shutdown_does_not_restart_external_lease_waiter
             "_claim_pending_interruption_cascade",
             blocked_claim,
         )
-        app._schedule_background_interruption_cascade(
+        app._session_engine._schedule_background_interruption_cascade(
             parent_session_id=parent_id,
             interrupt_payload=payload,
             create_if_missing=False,
@@ -14758,7 +14839,7 @@ def test_background_interruption_drain_cancellation_cleans_up_owned_work(monkeyp
         monkeypatch.setattr(
             app._background_interruption_coordinator, "_interrupt_session", blocked_interrupt
         )
-        app._schedule_background_interruption_cascade(
+        app._session_engine._schedule_background_interruption_cascade(
             parent_session_id=parent_id,
             interrupt_payload={
                 "reason": "operator stop",
@@ -14845,7 +14926,7 @@ def test_background_interruption_shutdown_grace_detaches_cancellation_resistant_
             "_interrupt_session",
             cancellation_resistant_interrupt,
         )
-        app._schedule_background_interruption_cascade(
+        app._session_engine._schedule_background_interruption_cascade(
             parent_session_id=parent_id,
             interrupt_payload={
                 "reason": "operator stop",
@@ -14935,7 +15016,7 @@ def test_background_interruption_shutdown_fences_cancellation_resistant_claim(mo
             "_run_claimed_background_interruption_cascade",
             record_claimed_run,
         )
-        task = app._schedule_background_interruption_cascade(
+        task = app._session_engine._schedule_background_interruption_cascade(
             parent_session_id=parent_id,
             interrupt_payload=payload,
             create_if_missing=True,
@@ -15001,7 +15082,7 @@ def test_interruption_cascade_status_prefers_cleared_durable_marker_over_stale_d
                 }
             },
         )
-        app._defer_background_interruption_cascade(
+        app._session_engine._defer_background_interruption_cascade(
             parent_session_id=parent_id,
             interrupt_payload=payload,
             retry_at=datetime.now(UTC) + timedelta(seconds=30),
@@ -15088,7 +15169,7 @@ def test_background_interruption_heartbeat_retries_transient_store_error(monkeyp
             "_renew_pending_interruption_cascade_claim",
             transient_renew,
         )
-        await app._interrupt_background_subagent_children(
+        await app._background_interruption_coordinator.run_cascade(
             parent_session_id=parent_id,
             interrupt_payload={
                 "reason": "operator stop",
@@ -15184,7 +15265,7 @@ def test_background_interruption_concurrency_is_app_wide_across_nested_trees(mon
         }
         await asyncio.gather(
             *(
-                app._interrupt_background_subagent_children(
+                app._background_interruption_coordinator.run_cascade(
                     parent_session_id=parent_id,
                     interrupt_payload=payload,
                 )
@@ -15242,7 +15323,7 @@ def test_background_interruption_traverses_foreground_nodes_to_background_descen
             identity=identity,
         )
 
-        await app._interrupt_background_subagent_children(
+        await app._background_interruption_coordinator.run_cascade(
             parent_session_id=parent_id,
             interrupt_payload={
                 "reason": "operator stop",
@@ -15315,7 +15396,7 @@ def test_background_interruption_cascade_paginates_all_children(monkeypatch):
             "_interrupt_session",
             capture_interrupt_session,
         )
-        await app._interrupt_background_subagent_children(
+        await app._background_interruption_coordinator.run_cascade(
             parent_session_id=parent_session_id,
             interrupt_payload={
                 "reason": "operator stop",
@@ -15372,7 +15453,11 @@ def test_interrupt_waits_for_actual_terminal_event_before_checkpoint_cleanup(mon
         monkeypatch.setattr(
             app._background_interruption_coordinator, "run_cascade", capture_cascade
         )
-        monkeypatch.setattr(app, "_emit_terminal_event_with_hooks", terminal_stream)
+        monkeypatch.setattr(
+            app._session_engine,
+            "_emit_terminal_event_with_hooks",
+            terminal_stream,
+        )
         events = [
             event
             async for event in app.interrupt_session(
@@ -15475,7 +15560,11 @@ def test_interrupt_does_not_start_or_clear_cascade_before_terminal_event(monkeyp
             await release_terminal.wait()
             yield await app._event_writer.emit(kwargs["event"])
 
-        monkeypatch.setattr(app, "_emit_terminal_event_with_hooks", delayed_terminal_stream)
+        monkeypatch.setattr(
+            app._session_engine,
+            "_emit_terminal_event_with_hooks",
+            delayed_terminal_stream,
+        )
         stream = app.interrupt_session(
             InterruptSessionRequest(session_id=session_id, reason="operator stop")
         )
@@ -15635,7 +15724,11 @@ def test_pending_interruption_recovery_discovers_only_indexed_markers(monkeypatc
             scheduled_parent_ids.append(kwargs["parent_session_id"])
             return None
 
-        monkeypatch.setattr(app, "_schedule_background_interruption_cascade", record_schedule)
+        monkeypatch.setattr(
+            app._session_engine,
+            "_schedule_background_interruption_cascade",
+            record_schedule,
+        )
         cutoff = datetime.now(UTC) - timedelta(minutes=5)
         scheduled = await app.resume_pending_interruption_cascades(
             interrupting_inactive_before=cutoff
@@ -15871,7 +15964,7 @@ def test_background_interruption_does_not_cross_fork_lineage():
             identity=identity,
         )
 
-        await app._interrupt_background_subagent_children(
+        await app._background_interruption_coordinator.run_cascade(
             parent_session_id=parent_id,
             interrupt_payload={
                 "reason": "operator stop",
@@ -16057,7 +16150,7 @@ def test_interruption_cascade_completion_publish_failure_keeps_retryable_marker(
             return await original_emit(event)
 
         monkeypatch.setattr(app._event_writer, "emit", fail_completion_event)
-        await app._interrupt_background_subagent_children(
+        await app._background_interruption_coordinator.run_cascade(
             parent_session_id=session_id,
             interrupt_payload=payload,
         )
@@ -16115,7 +16208,7 @@ def test_interruption_cascade_completion_clear_failure_is_durably_reported(monke
             "_complete_pending_interruption_cascade",
             fail_checkpoint_clear,
         )
-        await app._interrupt_background_subagent_children(
+        await app._background_interruption_coordinator.run_cascade(
             parent_session_id=session_id,
             interrupt_payload=payload,
         )
@@ -16198,11 +16291,11 @@ def test_checkpoint_replacement_preserves_current_runtime_state_without_resurrec
         }
         await store.transform_checkpoint(
             session_id,
-            runtime_app_module._replace_checkpoint_preserving_runtime_state(stale_replacement),
+            session_engine_module._replace_checkpoint_preserving_runtime_state(stale_replacement),
         )
         preserved = await store.load_checkpoint(session_id)
-        await app._clear_pending_session_interrupt(session_id)
-        await app._clear_pending_interruption_cascade(session_id)
+        await app._session_engine._clear_pending_session_interrupt(session_id)
+        await app._session_engine._clear_pending_interruption_cascade(session_id)
         await store.transform_checkpoint(
             session_id,
             lambda _session, checkpoint: {
@@ -16213,7 +16306,7 @@ def test_checkpoint_replacement_preserves_current_runtime_state_without_resurrec
         )
         await store.transform_checkpoint(
             session_id,
-            runtime_app_module._replace_checkpoint_preserving_runtime_state(stale_replacement),
+            session_engine_module._replace_checkpoint_preserving_runtime_state(stale_replacement),
         )
         return preserved, await store.load_checkpoint(session_id)
 
@@ -22376,6 +22469,113 @@ def test_cayu_app_recover_tool_round_aclose_reports_cleanup_failure() -> None:
     asyncio.run(scenario())
 
 
+def test_cayu_app_recover_tool_round_athrow_finalizes_before_return() -> None:
+    session_id = "sess_tool_round_manual_athrow_cleanup"
+    app, store, tool, checkpoint = _crashed_tool_round_app(session_id)
+    request = ToolRoundRecoveryRequest(
+        session_id=session_id,
+        round_id=checkpoint["pending_tool_round"]["round_id"],
+        tool_call_id="call_1",
+        outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+        message="side effect completed externally",
+    )
+
+    async def scenario() -> None:
+        releases_before = store.release_calls
+        stream = app.recover_tool_round(request)
+        first_event = await asyncio.wait_for(anext(stream), timeout=5)
+        assert first_event.type == EventType.SESSION_RESUMED
+
+        claimed_checkpoint = await store.load_checkpoint(session_id)
+        assert claimed_checkpoint is not None
+        assert "incomplete_session_recovery_claim" in claimed_checkpoint
+        assert app._session_control.has_active_tasks(session_id) is True
+        # Ownership belongs to the delegated stream, not the consumer task.
+        assert sessions_module._current_session_run_epoch(session_id) is None
+
+        injected = RuntimeError("consumer rejected recovery event")
+        with pytest.raises(RuntimeError, match="consumer rejected recovery event") as exc_info:
+            await stream.athrow(injected)
+        assert exc_info.value is injected
+
+        interrupted = await store.load(session_id)
+        assert interrupted is not None and interrupted.status == SessionStatus.INTERRUPTED
+        checkpoint_after_throw = await store.load_checkpoint(session_id)
+        assert checkpoint_after_throw is not None
+        assert checkpoint_after_throw["pending_tool_round"]["round_id"] == request.round_id
+        assert "incomplete_session_recovery_claim" not in checkpoint_after_throw
+        assert app._session_control.has_active_tasks(session_id) is False
+        assert sessions_module._current_session_run_epoch(session_id) is None
+        assert store.release_calls - releases_before == 1
+        assert tool.calls == [{}]
+
+    asyncio.run(scenario())
+
+
+def test_cayu_app_recover_tool_round_athrow_preserves_cleanup_failure() -> None:
+    class FailingRecoveryReleaseStore(FailingTerminalToolEventStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_release = False
+
+        async def release_run_fence(self, session_id: str) -> None:
+            if self.fail_release:
+                self.fail_release = False
+                try:
+                    raise OSError("recovery database connection lost")
+                except OSError as database_failure:
+                    raise RuntimeError(
+                        "manual recovery run fence release unavailable"
+                    ) from database_failure
+            await super().release_run_fence(session_id)
+
+    session_id = "sess_tool_round_manual_athrow_cleanup_failure"
+    store = FailingRecoveryReleaseStore()
+    app, store, tool, checkpoint = _crashed_tool_round_app(session_id, store=store)
+    request = ToolRoundRecoveryRequest(
+        session_id=session_id,
+        round_id=checkpoint["pending_tool_round"]["round_id"],
+        tool_call_id="call_1",
+        outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+        message="side effect completed externally",
+    )
+
+    async def scenario() -> None:
+        stream = app.recover_tool_round(request)
+        first_event = await asyncio.wait_for(anext(stream), timeout=5)
+        assert first_event.type == EventType.SESSION_RESUMED
+
+        store.fail_release = True
+        injected = RuntimeError("consumer rejected recovery event")
+        original_cause = ValueError("upstream consumer failure")
+        injected.__cause__ = original_cause
+        with pytest.raises(RuntimeError, match="consumer rejected recovery event") as exc_info:
+            await stream.athrow(injected)
+        assert exc_info.value is injected
+        assert isinstance(injected.__cause__, BaseExceptionGroup)
+        cleanup_failure, preserved_consumer_cause = injected.__cause__.exceptions
+        assert isinstance(cleanup_failure, RuntimeError)
+        assert str(cleanup_failure) == "manual recovery run fence release unavailable"
+        assert isinstance(cleanup_failure.__cause__, OSError)
+        assert str(cleanup_failure.__cause__) == "recovery database connection lost"
+        assert preserved_consumer_cause is original_cause
+        assert any(
+            "Delegated runtime stream cleanup failed: RuntimeError" in note
+            for note in getattr(injected, "__notes__", ())
+        )
+
+        interrupted = await store.load(session_id)
+        assert interrupted is not None and interrupted.status == SessionStatus.INTERRUPTED
+        checkpoint_after_throw = await store.load_checkpoint(session_id)
+        assert checkpoint_after_throw is not None
+        assert "incomplete_session_recovery_claim" not in checkpoint_after_throw
+        assert app._session_control.has_active_tasks(session_id) is False
+        assert sessions_module._current_session_run_epoch(session_id) is None
+        assert tool.calls == [{}]
+
+    asyncio.run(scenario())
+
+
 def test_cayu_app_recover_tool_round_cancellation_after_claim_commit_releases_fence():
     class BlockingRecoveryTransitionStore(FailingTerminalToolEventStore):
         def __init__(self) -> None:
@@ -23163,7 +23363,7 @@ def test_manual_tool_round_recovery_finalizes_pending_operator_interrupt_before_
             session_id,
             from_statuses={SessionStatus.RUNNING},
             to_status=SessionStatus.INTERRUPTING,
-            checkpoint_transform=runtime_app_module._checkpoint_with_pending_session_interrupt(
+            checkpoint_transform=session_engine_module._checkpoint_with_pending_session_interrupt(
                 interrupt_payload,
             ),
         )
@@ -25471,6 +25671,58 @@ def test_tool_approval_resolution_closes_continuation_before_aclose_returns():
     assert status == SessionStatus.INTERRUPTED
     assert release_delta == 1
     assert has_active_tasks is False
+
+
+def test_tool_approval_cleanup_failure_has_one_forwarding_owner() -> None:
+    async def scenario() -> None:
+        session_id = "sess_approval_cleanup_failure"
+        store = FailNextRunFenceReleaseStore()
+        app, _provider = _approval_pause_app(
+            store=store,
+            tool=SideEffectTool(),
+            policy=RequireApprovalPolicy(),
+        )
+        interrupted = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+        approval_id = next(
+            event for event in interrupted if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+        ).payload["approval"]["approval_id"]
+
+        stream = app.resolve_tool_approval(
+            ToolApprovalRequest(
+                session_id=session_id,
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+            )
+        )
+        while (await anext(stream)).type != EventType.MODEL_STARTED:
+            pass
+
+        loop = asyncio.get_running_loop()
+        reported_contexts: list[dict[str, object]] = []
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: reported_contexts.append(context))
+        try:
+            store.fail_next_release = True
+            with pytest.raises(RuntimeError, match="run fence release failed") as raised:
+                await stream.aclose()
+            assert isinstance(raised.value.__cause__, OSError)
+            await asyncio.sleep(0)
+            assert reported_contexts == []
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+        session = await store.load(session_id)
+        assert session is not None and session.status == SessionStatus.INTERRUPTED
+        assert app._session_control.has_active_tasks(session_id) is False
+
+    asyncio.run(scenario())
 
 
 def test_tool_approval_resolution_task_cancellation_finalizes_and_preserves_pending_state():

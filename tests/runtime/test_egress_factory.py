@@ -49,7 +49,7 @@ from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runners import LambdaMicroVMRunner
 from cayu.runners.base import ExecCommand, ExecResult, Runner
 from cayu.runtime import CayuApp, InMemorySessionStore, RunRequest
-from cayu.runtime.app import (
+from cayu.runtime._environment_lifecycle import (
     _persist_binding_finalize_failure_event,
     _reconcile_binding_finalize_failure_event,
 )

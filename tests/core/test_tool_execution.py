@@ -558,10 +558,10 @@ def test_limit_stop_mid_round_does_not_strand_later_segment_tool_calls(monkeypat
     # remaining round call (later segments included). Otherwise those assistant tool_calls dangle
     # with no matching tool_result and the session is unresumable. Regression test: the limit-close
     # is scoped to the whole round, not just the tripping segment.
-    import cayu.runtime.app as runtime_app_module
+    import cayu.runtime._session_engine as session_engine_module
 
     clock = {"value": 0.0}
-    monkeypatch.setattr(runtime_app_module.time, "monotonic", lambda: clock["value"])
+    monkeypatch.setattr(session_engine_module.time, "monotonic", lambda: clock["value"])
 
     class _ClockAdvancingTool(Tool):
         spec = ToolSpec(

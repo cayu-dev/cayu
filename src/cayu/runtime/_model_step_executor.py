@@ -4,7 +4,7 @@ This module sits below :class:`CayuApp`: it never imports or accepts the
 application facade.  The complete executor owns provider-facing request
 construction, attachment resolution, context projection and recovery, budget
 reservation settlement, retry isolation, and stream normalization. Session-loop
-decisions and transcript commits stay with the application orchestrator.
+decisions and transcript commits stay with :class:`SessionEngine`.
 """
 
 from __future__ import annotations
