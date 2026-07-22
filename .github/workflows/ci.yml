@@ -81,8 +81,54 @@ jobs:
               tests/core/test_runtime.py::test_cancelled_sqlite_factory_checkpoint_preserves_committed_allocation
           done
 
+  release-artifact-scope:
+    name: Release artifact scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      run: ${{ steps.scope.outputs.run }}
+    steps:
+      - name: Check out pull request history
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Select release artifact verification
+        id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if test "$EVENT_NAME" != "pull_request"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git diff --quiet "$BASE_SHA...$HEAD_SHA" -- \
+            .github/workflows/ci.yml \
+            LICENSE \
+            NOTICE \
+            pyproject.toml \
+            uv.lock \
+            scripts/check_release_artifacts.py \
+            scripts/generate_sidecar_manifest.py \
+            ':(glob)maintenance/model_catalog/**' \
+            ':(glob)src/cayu/data/**' \
+            ':(glob)src/cayu/**/*lambda_microvm*' \
+            ':(glob)src/cayu/**/*manifest*' \
+            ':(glob)examples/aws/**/*lambda_microvm*' \
+            ':(glob)examples/aws/lambda_microvm*/**'; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
   package:
     name: Release artifacts
+    needs: release-artifact-scope
+    if: needs.release-artifact-scope.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
