@@ -25,6 +25,15 @@ class CayuProject:
 
 
 @dataclass(frozen=True)
+class CayuProjectConfiguration:
+    """One discovered ``[tool.cayu]`` table and its filesystem origin."""
+
+    root: Path
+    pyproject: Path
+    config: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class _ConfiguredCayuProject:
     root: Path
     pyproject: Path
@@ -128,16 +137,23 @@ def _configured_target(value: object, *, pyproject: Path, key: str) -> str:
     return value.strip()
 
 
-def _discover_configured_project(
+def discover_cayu_project_configuration(
     *,
-    command: str,
-    configuration_example: str,
-    explicit_target_example: str,
-    discovery_keys: tuple[str, ...] = ("factory",),
-) -> _ConfiguredCayuProject:
-    cwd = Path.cwd().resolve()
-    for directory in (cwd, *cwd.parents):
-        pyproject = directory / "pyproject.toml"
+    discovery_keys: tuple[str, ...],
+    start: Path | None = None,
+) -> CayuProjectConfiguration | None:
+    """Find the nearest applicable ``[tool.cayu]`` configuration.
+
+    ``discovery_keys`` defines applicability without importing project code. The
+    same upward walk is shared by application-target and durable-store discovery.
+    """
+
+    directory = Path.cwd() if start is None else start
+    directory = directory.resolve()
+    if directory.is_file():
+        directory = directory.parent
+    for candidate in (directory, *directory.parents):
+        pyproject = candidate / "pyproject.toml"
         if not pyproject.is_file():
             continue
         try:
@@ -146,22 +162,43 @@ def _discover_configured_project(
             raise ProjectError(f"Could not read {pyproject}: {exc}") from exc
         tool_config = config.get("tool", {})
         cayu_config = tool_config.get("cayu", {}) if isinstance(tool_config, dict) else {}
-        if not isinstance(cayu_config, dict) or not any(
-            key in cayu_config for key in discovery_keys
-        ):
+        if not isinstance(cayu_config, dict):
             continue
-        if "factory" not in cayu_config:
+        if not any(key in cayu_config for key in discovery_keys):
+            continue
+        return CayuProjectConfiguration(
+            root=candidate,
+            pyproject=pyproject,
+            config=cayu_config,
+        )
+    return None
+
+
+def _discover_configured_project(
+    *,
+    command: str,
+    configuration_example: str,
+    explicit_target_example: str,
+    discovery_keys: tuple[str, ...] = ("factory",),
+) -> _ConfiguredCayuProject:
+    discovered = discover_cayu_project_configuration(discovery_keys=discovery_keys)
+    if discovered is not None:
+        if "factory" not in discovered.config:
             raise ProjectError(
-                f"{pyproject}: [tool.cayu].factory is not configured. "
+                f"{discovered.pyproject}: [tool.cayu].factory is not configured. "
                 'Add factory = "module:build_app" under [tool.cayu].'
             )
-        target = cayu_config["factory"]
-        factory_target = _configured_target(target, pyproject=pyproject, key="factory")
+        target = discovered.config["factory"]
+        factory_target = _configured_target(
+            target,
+            pyproject=discovered.pyproject,
+            key="factory",
+        )
         return _ConfiguredCayuProject(
-            root=directory,
-            pyproject=pyproject,
+            root=discovered.root,
+            pyproject=discovered.pyproject,
             factory_target=factory_target,
-            config=cayu_config,
+            config=discovered.config,
         )
 
     raise ProjectError(
