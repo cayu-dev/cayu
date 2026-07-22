@@ -664,19 +664,22 @@ def test_overall_deadline_covers_workspace_seeding(
 
 
 @pytest.mark.parametrize("delayed_capture", [1, 2], ids=["before", "after"])
-def test_overall_deadline_covers_both_workspace_snapshots(
+def test_overall_deadline_is_forwarded_to_both_workspace_snapshots(
     delayed_capture: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     original_capture = testing._capture_workspace
     capture_count = 0
+    observed_deadlines: list[float] = []
     tool = _PureTool()
 
     def delayed_snapshot(*args: Any, **kwargs: Any) -> dict[str, str]:
         nonlocal capture_count
         capture_count += 1
+        deadline = kwargs["deadline"]
+        observed_deadlines.append(deadline)
         if capture_count == delayed_capture:
-            time.sleep(0.03)
+            kwargs["clock"] = lambda: deadline
         return original_capture(*args, **kwargs)
 
     monkeypatch.setattr(testing, "_capture_workspace", delayed_snapshot)
@@ -688,11 +691,12 @@ def test_overall_deadline_covers_both_workspace_snapshots(
                 tool_name="pure",
                 arguments={},
                 workspace_files={"input.txt": b"unchanged"},
-                timeout_seconds=0.01,
+                timeout_seconds=10.0,
             )
         )
 
     assert capture_count == delayed_capture
+    assert observed_deadlines == [observed_deadlines[0]] * delayed_capture
     assert (tool.context is not None) is (delayed_capture == 2)
 
 
