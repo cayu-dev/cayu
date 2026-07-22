@@ -506,7 +506,7 @@ def _installed_cayu_version() -> str:
     try:
         return version("cayu")
     except PackageNotFoundError:
-        return "0.1.0rc2"
+        return "0.1.0rc3"
 
 
 def project_files(name: str, *, provider: str | None = None) -> dict[str, str]:

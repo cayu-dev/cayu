@@ -75,7 +75,7 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert "_SCAFFOLDED_PROVIDER = None" in configuration_source
     assert 'os.environ.get("CAYU_PROVIDER", _SCAFFOLDED_PROVIDER)' in configuration_source
     pyproject = (proj / "pyproject.toml").read_text(encoding="utf-8")
-    assert 'dependencies = ["cayu>=0.1.0rc2"]' in pyproject
+    assert 'dependencies = ["cayu>=0.1.0rc3"]' in pyproject
     assert 'console = ["cayu[console]"]' not in pyproject
     assert 'dev = ["pytest"]' in pyproject
     assert '[tool.cayu]\nfactory = "app:build_app"' in pyproject
