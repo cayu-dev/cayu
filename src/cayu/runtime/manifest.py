@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime.app import CayuApp
 
-APP_MANIFEST_SCHEMA_VERSION = "3"
+APP_MANIFEST_SCHEMA_VERSION = "4"
 _ABSOLUTE_PATH_PLACEHOLDER = "[ABSOLUTE_PATH]"
 _MEMORY_ADDRESS_PLACEHOLDER = "[MEMORY_ADDRESS]"
 _OBJECT_REPRESENTATION_PLACEHOLDER = "[OBJECT_REPRESENTATION]"
@@ -155,6 +155,7 @@ class ToolManifest(_ManifestModel):
 class AgentManifest(_ManifestModel):
     name: str
     model: str
+    has_system_prompt: bool
     configured_provider: str | None
     resolved_provider: str | None
     provider_resolution: Literal["explicit", "model_pattern", "default", "missing", "ambiguous"]
@@ -230,7 +231,7 @@ class RuntimeManifest(_ManifestModel):
 
 
 class AppManifest(_ManifestModel):
-    schema_version: Literal["3"] = APP_MANIFEST_SCHEMA_VERSION
+    schema_version: Literal["4"] = APP_MANIFEST_SCHEMA_VERSION
     fingerprint: str
     agents: tuple[AgentManifest, ...]
     providers: tuple[ProviderManifest, ...]
@@ -371,6 +372,7 @@ def _describe_agent(
     return AgentManifest(
         name=name,
         model=spec.model,
+        has_system_prompt=spec.system_prompt is not None,
         configured_provider=spec.provider_name,
         resolved_provider=resolved,
         provider_resolution=resolution,

@@ -28,33 +28,37 @@ only when the requested behavior requires it.
 
 | When you need it | Cayu concepts | Start here |
 | --- | --- | --- |
-| One model-driven agent | `CayuApp`, `AgentSpec`, `ModelProvider`, `RunRequest` | [`cayu new`](https://github.com/cayu-dev/cayu/blob/main/src/cayu/cli/scaffold.py), [application anatomy](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/application-anatomy.md) |
-| A provider-neutral run result | `run_to_completion`, `RunOutcome`, events | [application anatomy](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/application-anatomy.md) |
-| Model-specific routing or capabilities | provider registration, model catalog, thinking, structured output | [model catalog](https://github.com/cayu-dev/cayu/blob/main/docs/model-catalog.md), [structured output](https://github.com/cayu-dev/cayu/blob/main/examples/structured_output_live.py) |
-| A capability outside the model | `Tool`, `ToolSpec`, `ToolContext` | [echo tool](https://github.com/cayu-dev/cayu/blob/main/examples/echo_tool_runtime.py) |
-| Replay or mutation semantics | `ToolEffect`, idempotency keys | [tool effects](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/tool-effects.md) |
-| Authority or a human decision | `ToolPolicy`, approvals, user-input checkpoints | [business approvals](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/business-approvals.md) |
-| Files or commands during a run | `Environment`, `Workspace`, `Runner` | [local environment](https://github.com/cayu-dev/cayu/blob/main/examples/local_environment_runtime.py), [environment factories](https://github.com/cayu-dev/cayu/blob/main/docs/environment-factories.md) |
-| Durable uploads or generated files | `ArtifactStore`, artifact/workspace bridges | [artifact example](https://github.com/cayu-dev/cayu/blob/main/examples/artifact_workspace_bridge.py) |
-| Secrets or restricted network access | vaults, virtual credentials, egress policies | [virtual egress](https://github.com/cayu-dev/cayu/blob/main/docs/virtual-egress.md) |
-| Tools exposed over MCP | MCP adapters and manifest policy | [stdio MCP](https://github.com/cayu-dev/cayu/blob/main/examples/stdio_mcp_runtime.py) |
-| Conversation history that survives restarts | `SessionStore`, transcripts, checkpoints, resume | [runtime contracts](https://github.com/cayu-dev/cayu/blob/main/docs/runtime-contracts.md) |
-| Context approaching a model limit | token counting, context policies, compaction, overflow recovery | [context counting](https://github.com/cayu-dev/cayu/blob/main/examples/context_counting_live.py) |
-| Reviewed or retrievable knowledge | knowledge stores, review state, recall tools | [local knowledge](https://github.com/cayu-dev/cayu/blob/main/examples/knowledge_remember_local.py) |
-| Durable background work | `TaskStore`, dispatcher, worker, event watcher | [triggering runs](https://github.com/cayu-dev/cayu/blob/main/docs/triggering-runs.md), [task worker](https://github.com/cayu-dev/cayu/blob/main/examples/task_worker_loop.py) |
-| Deterministic orchestration | workflow helpers and runtime hooks | [workflow helpers](https://github.com/cayu-dev/cayu/blob/main/examples/workflow_helpers.py) |
-| Delegated model work | subagent tools and child-session policy | [subagent example](https://github.com/cayu-dev/cayu/blob/main/examples/subagent_live.py) |
-| Behavioral regression proof | `EvalSuite`, runtime assertions, replay | [evals](https://github.com/cayu-dev/cayu/blob/main/docs/evals.md) |
-| Usage limits or cost control | usage events, run limits, budgets, pricing | [cost optimization](https://github.com/cayu-dev/cayu/blob/main/docs/cost-optimization.md), [usage summary](https://github.com/cayu-dev/cayu/blob/main/examples/usage_cost_summary.py) |
-| Developer and operator inspection | `cayu inspect`, `cayu check`, console, dashboard, tracing | [console](https://github.com/cayu-dev/cayu/blob/main/docs/console.md), [OpenTelemetry](https://github.com/cayu-dev/cayu/blob/main/examples/otel_tracing.py) |
-| An HTTP control plane | `cayu[server]`, authenticated FastAPI application | [server example](https://github.com/cayu-dev/cayu/blob/main/examples/server_example.py) |
-| Advanced authority, isolation, caching, or speculation | composed runtime strategies with explicit evidence boundaries | [advanced runtime strategies](https://github.com/cayu-dev/cayu/blob/main/docs/advanced-runtime-examples.md) |
+| One model-driven agent | `CayuApp`, `AgentSpec`, `ModelProvider`, `RunRequest` | `cayu guide anatomy` |
+| A provider-neutral run result | `run_to_completion`, `RunOutcome`, events | `cayu guide anatomy#verify-the-contract` |
+| Model-specific routing or capabilities | provider registration, model catalog, thinking, structured output | `cayu guide providers`, `cayu guide structured-output` |
+| A capability outside the model | `Tool`, `ToolSpec`, `ToolContext` | `cayu guide references#domain-tool` |
+| Replay or mutation semantics | `ToolEffect`, idempotency keys | `cayu guide tool-effects` |
+| Authority or a human decision | `ToolPolicy`, approvals, user-input checkpoints | `cayu guide references#approvals` |
+| Files or commands during a run | `Environment`, `Workspace`, `Runner` | `cayu guide references#environments` |
+| Durable uploads or generated files | `ArtifactStore`, artifact/workspace bridges | `cayu guide references#artifacts` |
+| Secrets or restricted network access | vaults, virtual credentials, egress policies | `cayu guide references#secrets-egress` |
+| Tools exposed over MCP | MCP adapters and manifest policy | `cayu guide references#mcp` |
+| Conversation history that survives restarts | `SessionStore`, transcripts, checkpoints, resume | `cayu guide references#sessions` |
+| Context approaching a model limit | token counting, context policies, compaction, overflow recovery | `cayu guide references#context` |
+| Reviewed or retrievable knowledge | knowledge stores, review state, recall tools | `cayu guide references#knowledge` |
+| Durable background work | `TaskStore`, dispatcher, worker, event watcher | `cayu guide references#background-work` |
+| Deterministic orchestration | workflow helpers and runtime hooks | `cayu guide references#workflows-hooks` |
+| Delegated model work | subagent tools and child-session policy | `cayu guide references#subagents` |
+| Behavioral regression proof | `EvalSuite`, runtime assertions, replay | `cayu guide references#evals` |
+| Usage limits or cost control | usage events, run limits, budgets, pricing | `cayu guide references#cost-control` |
+| Developer and operator inspection | `cayu inspect`, `cayu check`, console, dashboard, tracing | `cayu guide references#observability` |
+| An HTTP control plane | `cayu[server]`, authenticated FastAPI application | `cayu guide references#server` |
+| Advanced authority, isolation, caching, or speculation | composed runtime strategies with explicit evidence boundaries | `cayu guide references#advanced-runtime` |
 
 This map is a menu, not a checklist. A conversational, classification,
 generation, or research agent does not automatically need a tool, workflow,
 task queue, environment, approval step, knowledge store, server, or multi-agent
-topology. Use the [examples index](https://github.com/cayu-dev/cayu/blob/main/examples/README.md)
-to find the smallest runnable reference for an optional capability.
+topology. The package-shipped `cayu guide references` topic is the offline
+index for optional capabilities.
+
+Online, the repository's
+[examples index](https://github.com/cayu-dev/cayu/blob/main/examples/README.md)
+is a secondary catalog of runnable source examples.
 
 A tool-backed slice is optional. Add one only when the agent needs a real
 capability outside the model. Prefer a narrow domain tool; when command
@@ -96,7 +100,13 @@ cayu check --json
 redacted application manifest. It describes configuration and static
 resolution; it does not invoke a provider, tool, environment factory, worker,
 watcher, session, or recovery path. Capability fields distinguish declared and
-resolved configuration from process availability and live verification.
+resolved configuration from process availability and live verification. Agent
+entries expose `has_system_prompt` so prompt presence is inspectable, but the
+manifest deliberately omits prompt content and implementation bodies. The
+application fingerprint is structural: prompt absence versus presence changes
+it, while editing one non-empty prompt into another does not. Prove prompt
+behavior through runtime tests and evals rather than treating the fingerprint
+as a content digest.
 Read-only describes Cayu's inspection phase, not arbitrary code inside the
 project-owned factory: `inspect` must call that factory, so keep factory boot
 effects limited to constructing the application graph.
@@ -110,8 +120,16 @@ verification command.
 
 ## 4. Add a tool-backed slice only when needed
 
-Do not use the generator for the first model-only agent. When the application
-actually needs an additional tool-backed slice, plan before applying:
+Do not generate a tool for the first model-only agent unless the requested job
+actually needs a capability outside the model. When it does, attach the first
+tool tracer bullet to the existing starter:
+
+```bash
+cayu generate tool assess_submission --agent reviewer --effect none --dry-run --json
+cayu generate tool assess_submission --agent reviewer --effect none
+```
+
+For an additional agent with its own tool-backed slice, plan before applying:
 
 ```bash
 cayu generate slice reviewer --tool assess_submission --effect none --dry-run --json
@@ -126,12 +144,16 @@ without partial writes. Repeating a successful invocation is a no-op.
 
 Generated code is a tracer bullet, not finished domain behavior. A generated
 slice carries an explicit `AgentAuthoringState.UNFINISHED_GENERATED_TRACER_BULLET`
-marker, so `cayu check --fail-on warning --json` rejects it as a completed
+marker, while the scaffold's first-tool flow sets `_AUTHORING_STATE` to
+`"unfinished_generated_tracer_bullet"`. In either case,
+`cayu check --fail-on warning --json` rejects the agent as a completed
 submission while its structural inspection, runtime test, and eval remain
 runnable.
 
 Replace the domain system prompt, tool schema and body, runtime test inputs and
-assertions, and trajectory eval behavior and assertions. Only then remove the
+assertions, and trajectory eval behavior and assertions. Only then clear the
+marker. For `cayu generate tool`, change `_AUTHORING_STATE` to `None` in the
+generated agent-config region. For `cayu generate slice`, remove the
 `authoring_state` argument and unused `AgentAuthoringState` import from the
 generated agent module. Cayu deliberately trusts that explicit state instead
 of parsing arbitrary Python, prompts, or test source; clearing it is an author

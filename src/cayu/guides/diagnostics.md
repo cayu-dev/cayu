@@ -10,13 +10,15 @@ Register an `AgentSpec` with `CayuApp.register_agent()`.
 
 ## agent-generated-tracer-bullet-unfinished
 
-`AGENT_GENERATED_TRACER_BULLET_UNFINISHED` means `cayu generate slice` left
-the agent's explicit `authoring_state` marker in place. The generated prompt,
-echo/sample tool behavior, runtime test, and scripted trajectory are a runnable
-wiring proof, not evidence that the requested domain behavior is complete.
+`AGENT_GENERATED_TRACER_BULLET_UNFINISHED` means a generator left the agent's
+explicit authoring-state marker in place. The generated prompt, placeholder
+tool behavior, runtime test, and scripted trajectory are a runnable wiring
+proof, not evidence that the requested domain behavior is complete.
 
 Replace the domain system prompt, tool schema and implementation, runtime test
-inputs and assertions, and trajectory eval behavior and assertions. Then remove
+inputs and assertions, and trajectory eval behavior and assertions. For a
+scaffold updated by `cayu generate tool`, change `_AUTHORING_STATE` to `None`
+inside the generated agent-config region. For `cayu generate slice`, remove
 `authoring_state=AgentAuthoringState.UNFINISHED_GENERATED_TRACER_BULLET` and
 the unused import from the generated agent module. Verify with
 `cayu inspect --json && cayu check --fail-on warning --json`.
@@ -62,6 +64,22 @@ This remains an error rather than an acknowledgment-based bypass: use a
 statically describable enforcing policy until Cayu provides a trusted custom
 coverage contract.
 
+## tool-input-schema-unconstrained
+
+`TOOL_INPUT_SCHEMA_UNCONSTRAINED` means a registered tool exposes `{}` as its
+input schema. That is valid JSON Schema, but it accepts every JSON value and
+does not teach the model which arguments to send. Declare the expected object
+properties, required fields, and `additionalProperties` behavior in
+`ToolSpec.input_schema`. If a tool derives its schema dynamically, override the
+public `Tool.schema` property; Cayu treats that property as authoritative when
+the tool is registered.
+
+Tool implementations must also declare `run` with `async def`. Cayu validates
+that contract during agent registration so a synchronous implementation fails
+before a session starts.
+
 Inspection and checks are structural. Clearing all diagnostics does not prove a
 provider credential, remote service, sandbox, network path, or deployment is
-live.
+live. The manifest reports `has_system_prompt` but never prompt text; its
+fingerprint records prompt presence, not prompt contents. A prompt edit between
+two non-empty values therefore needs a runtime test or eval for verification.

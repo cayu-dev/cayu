@@ -149,7 +149,7 @@ def test_describe_returns_a_deterministic_public_application_manifest() -> None:
     manifest = _described_app().describe()
     reversed_manifest = _described_app(reverse=True).describe()
 
-    assert manifest.schema_version == "3"
+    assert manifest.schema_version == "4"
     assert manifest.defaults.provider == "primary"
     assert manifest.defaults.environment == "local"
     assert [agent.name for agent in manifest.agents] == ["reviewer", "writer"]
@@ -188,6 +188,33 @@ def test_agent_authoring_state_is_typed_copied_and_fingerprinted() -> None:
 
     with pytest.raises(ValidationError, match="authoring_state"):
         AgentSpec(name="bad", model="model", authoring_state="complete")
+
+
+def test_manifest_reports_prompt_presence_without_exposing_prompt_content() -> None:
+    without_prompt = CayuApp(enable_logging=False)
+    without_prompt.register_agent(AgentSpec(name="writer", model="model"))
+    with_prompt = CayuApp(enable_logging=False)
+    with_prompt.register_agent(
+        AgentSpec(
+            name="writer",
+            model="model",
+            system_prompt="private low entropy prompt text",
+        )
+    )
+
+    absent = without_prompt.describe()
+    present = with_prompt.describe()
+
+    assert absent.agents[0].has_system_prompt is False
+    assert present.agents[0].has_system_prompt is True
+    assert "private low entropy prompt text" not in present.model_dump_json()
+    assert absent.fingerprint != present.fingerprint
+
+    changed_prompt = CayuApp(enable_logging=False)
+    changed_prompt.register_agent(
+        AgentSpec(name="writer", model="model", system_prompt="different private prompt")
+    )
+    assert changed_prompt.describe().fingerprint == present.fingerprint
 
 
 def test_agent_execution_requirements_are_typed_and_fingerprinted() -> None:
@@ -289,7 +316,7 @@ def test_manifest_is_public_versioned_redacted_and_deeply_read_only(tmp_path: Pa
     payload = manifest.model_dump_json()
     schema = AppManifest.model_json_schema(mode="serialization")
 
-    assert schema["properties"]["schema_version"]["const"] == "3"
+    assert schema["properties"]["schema_version"]["const"] == "4"
     assert "manifest-secret" not in payload
     assert str(tmp_path) not in payload
     assert factory.called is False
@@ -398,7 +425,7 @@ def test_manifest_rejects_non_json_schema_payloads() -> None:
     with pytest.raises(ValidationError, match="JSON-compatible"):
         AppManifest.model_validate(
             {
-                "schema_version": "3",
+                "schema_version": "4",
                 "fingerprint": "0" * 64,
                 "agents": [
                     {

@@ -114,6 +114,13 @@ class _ToolSpecInput(BaseModel):
 
 
 class ToolSpec(BaseModel):
+    """Immutable public declaration for a framework-native tool.
+
+    ``input_schema`` is the default JSON Schema exposed through ``Tool.schema``.
+    Tool subclasses may override that property when the runtime schema is derived;
+    registration treats the public property as authoritative.
+    """
+
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     name: str
@@ -122,8 +129,26 @@ class ToolSpec(BaseModel):
     effect: ToolEffect = ToolEffect.EXTERNAL
     _input_schema: Any = PrivateAttr(default_factory=dict)
 
-    def __init__(self, **data: Any) -> None:
-        parsed = _ToolSpecInput.model_validate(data)
+    def __init__(
+        self,
+        *,
+        name: str,
+        description: str = "",
+        input_schema: dict[str, Any] | None = None,
+        parallel_safe: bool = True,
+        effect: ToolEffect = ToolEffect.EXTERNAL,
+        **data: Any,
+    ) -> None:
+        parsed = _ToolSpecInput.model_validate(
+            {
+                "name": name,
+                "description": description,
+                "input_schema": {} if input_schema is None else input_schema,
+                "parallel_safe": parallel_safe,
+                "effect": effect,
+                **data,
+            }
+        )
         super().__init__(
             name=parsed.name,
             description=parsed.description,
@@ -442,7 +467,11 @@ class ToolContext(BaseModel):
 
 
 class Tool(ABC):
-    """Base class for framework-native tools."""
+    """Base class for framework-native tools.
+
+    Subclasses declare a ``ToolSpec`` and implement ``run`` with ``async def``.
+    Registration validates both contracts before a session can execute the tool.
+    """
 
     spec: ToolSpec
 
@@ -483,4 +512,4 @@ class Tool(ABC):
 
     @abstractmethod
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
-        """Execute a tool call."""
+        """Execute a tool call asynchronously and return a ``ToolResult``."""

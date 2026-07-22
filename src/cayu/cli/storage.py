@@ -1,4 +1,4 @@
-"""`cayu storage` subcommands: schema status / migrate, and JSONL export.
+"""`cayu storage` subcommands: schema status / migrate, and JSON/JSONL export.
 
 Realizes ADR 0001 Phase 2 (explicit migrate + status) and Phase 3 (JSONL
 export). Migrations are an explicit, operator-run step — never silent on import
@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import json
 import re
 import sys
 from collections.abc import Iterator
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import Any, TextIO
 from urllib.parse import unquote, urlsplit, urlunsplit
 
+from cayu.cli._output import add_output_options
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import jsonl_export
 from cayu.storage import migrations as schema
@@ -24,16 +26,27 @@ from cayu.storage import migrations as schema
 _SUBCOMMANDS = (
     ("status", "Show the database schema revision and any pending migrations."),
     ("migrate", "Apply pending forward migrations under the backend lock."),
-    ("export", "Export sessions (or tasks) as JSONL for backup/replay."),
+    ("export", "Export sessions (or tasks) as JSON or JSONL for backup/replay."),
 )
 
 
 def add_storage_parser(subparsers: Any) -> None:
     """Register the ``storage`` command group on an argparse subparsers object."""
-    storage = subparsers.add_parser("storage", help="Inspect, migrate, and export Cayu storage.")
+    storage = subparsers.add_parser(
+        "storage",
+        help="Inspect, migrate, and export Cayu storage.",
+        description=(
+            "Inspect, migrate, and export Cayu storage. Schema changes are explicit; "
+            "start with `cayu storage status`."
+        ),
+    )
     inner = storage.add_subparsers(dest="storage_command", required=True)
     for name, help_text in _SUBCOMMANDS:
-        sub = inner.add_parser(name, help=help_text)
+        sub = inner.add_parser(
+            name,
+            help=help_text,
+            description=f"{help_text} Use `--output FILE` to write data to a destination.",
+        )
         target = sub.add_mutually_exclusive_group(required=True)
         target.add_argument("--sqlite", metavar="PATH", help="Path to a SQLite database file.")
         target.add_argument("--postgres", metavar="DSN", help="Postgres connection string.")
@@ -41,9 +54,9 @@ def add_storage_parser(subparsers: Any) -> None:
             sub.add_argument(
                 "--tasks", action="store_true", help="Export tasks instead of sessions."
             )
-            sub.add_argument(
-                "--output", metavar="FILE", help="Write JSONL to FILE (default: stdout)."
-            )
+            add_output_options(sub, formats=("json", "jsonl"))
+        else:
+            add_output_options(sub)
 
 
 def run_storage(args: argparse.Namespace) -> int:
@@ -55,8 +68,8 @@ def run_storage(args: argparse.Namespace) -> int:
             return _migrate(args)
         if args.storage_command == "export":
             return _export(args)
-    except schema.SchemaError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    except (schema.SchemaError, OSError) as exc:
+        _render_error(args, str(exc))
         return 1
     return 1
 
@@ -168,24 +181,70 @@ def _sanitize(message: str, dsn: str) -> str:
     return out
 
 
-def _print_status(backend: str, target: str, state: schema.SchemaState) -> None:
+def _status_payload(backend: str, target: str, state: schema.SchemaState) -> dict[str, Any]:
+    pending = schema.pending(state.revision)
+    return {
+        "schema_version": "1",
+        "backend": backend,
+        "target": target,
+        "database": {
+            "revision": state.revision,
+            "compatible_from": state.compatible_from,
+            "initialized": state.revision != schema.UNINITIALIZED,
+        },
+        "application": {
+            "latest_revision": schema.LATEST_REVISION,
+            "min_supported_revision": schema.MIN_SUPPORTED_REVISION,
+        },
+        "pending_migrations": [item.revision for item in pending],
+        "up_to_date": not pending,
+    }
+
+
+def _render_status(
+    backend: str,
+    target: str,
+    state: schema.SchemaState,
+    *,
+    output_format: str,
+    output: str | None,
+) -> None:
+    with _output_stream(output) as stream:
+        if output_format == "json":
+            print(json.dumps(_status_payload(backend, target, state), sort_keys=True), file=stream)
+            return
+        _print_status(backend, target, state, stream=stream)
+
+
+def _print_status(
+    backend: str,
+    target: str,
+    state: schema.SchemaState,
+    *,
+    stream: TextIO,
+) -> None:
     if state.revision == schema.UNINITIALIZED:
-        print(f"{backend} ({target}): uninitialized — no Cayu schema yet")
+        print(f"{backend} ({target}): uninitialized — no Cayu schema yet", file=stream)
     else:
         print(
             f"{backend} ({target}): revision {state.revision} "
-            f"(compatible_from {state.compatible_from})"
+            f"(compatible_from {state.compatible_from})",
+            file=stream,
         )
     print(
         f"  app: latest revision {schema.LATEST_REVISION}, "
-        f"min supported {schema.MIN_SUPPORTED_REVISION}"
+        f"min supported {schema.MIN_SUPPORTED_REVISION}",
+        file=stream,
     )
     pending = schema.pending(state.revision)
     if pending:
         revs = ", ".join(str(rev.revision) for rev in pending)
-        print(f"  pending migrations: {revs} (run `cayu storage migrate`)")
+        print(
+            f"  pending migrations: {revs} (run `cayu storage migrate`)",
+            file=stream,
+        )
     else:
-        print("  pending migrations: none (up to date)")
+        print("  pending migrations: none (up to date)", file=stream)
 
 
 def _status(args: argparse.Namespace) -> int:
@@ -195,7 +254,13 @@ def _status(args: argparse.Namespace) -> int:
             state = sqlite_support.read_schema_state(connection)
         finally:
             connection.close()
-        _print_status("sqlite", args.sqlite, state)
+        _render_status(
+            "sqlite",
+            args.sqlite,
+            state,
+            output_format=args.output_format,
+            output=args.output,
+        )
         return 0
 
     async def run() -> schema.SchemaState:
@@ -209,14 +274,20 @@ def _status(args: argparse.Namespace) -> int:
         ):
             return await postgres.read_schema_state(cur)
 
-    state = _run_postgres(run, args.postgres)
+    state = _run_postgres(run, args)
     if state is None:
         return 1
-    _print_status("postgres", _redact_dsn(args.postgres), state)
+    _render_status(
+        "postgres",
+        _redact_dsn(args.postgres),
+        state,
+        output_format=args.output_format,
+        output=args.output,
+    )
     return 0
 
 
-def _run_postgres(run: Any, dsn: str) -> schema.SchemaState | None:
+def _run_postgres(run: Any, args: argparse.Namespace) -> schema.SchemaState | None:
     """Run a postgres coroutine, converting connection errors to a clean,
     DSN-redacted stderr message (``None`` signals failure). Schema-compatibility
     errors propagate to the top-level handler unchanged."""
@@ -225,7 +296,7 @@ def _run_postgres(run: Any, dsn: str) -> schema.SchemaState | None:
     except schema.SchemaError:
         raise
     except Exception as exc:
-        print(f"error: {_sanitize(str(exc), dsn)}", file=sys.stderr)
+        _render_error(args, _sanitize(str(exc), args.postgres))
         return None
 
 
@@ -246,7 +317,13 @@ def _migrate(args: argparse.Namespace) -> int:
             state = sqlite_support.read_schema_state(connection)
         finally:
             connection.close()
-        _print_status("sqlite", args.sqlite, state)
+        _render_status(
+            "sqlite",
+            args.sqlite,
+            state,
+            output_format=args.output_format,
+            output=args.output,
+        )
         return 0
 
     async def run() -> schema.SchemaState:
@@ -267,10 +344,16 @@ def _migrate(args: argparse.Namespace) -> int:
         ):
             return await postgres.read_schema_state(cur)
 
-    state = _run_postgres(run, args.postgres)
+    state = _run_postgres(run, args)
     if state is None:
         return 1
-    _print_status("postgres", _redact_dsn(args.postgres), state)
+    _render_status(
+        "postgres",
+        _redact_dsn(args.postgres),
+        state,
+        output_format=args.output_format,
+        output=args.output,
+    )
     return 0
 
 
@@ -287,6 +370,36 @@ def _output_stream(path: str | None) -> Iterator[TextIO]:
         handle.close()
 
 
+class _JsonArrayStream:
+    """Adapt the JSONL exporter to a streaming JSON array without buffering records."""
+
+    def __init__(self, stream: TextIO) -> None:
+        self._stream = stream
+        self._buffer = ""
+        self._first = True
+        self._stream.write("[")
+
+    def write(self, data: str, /) -> int:
+        self._buffer += data
+        while "\n" in self._buffer:
+            record, self._buffer = self._buffer.split("\n", 1)
+            self._write_record(record)
+        return len(data)
+
+    def finish(self) -> None:
+        self._write_record(self._buffer)
+        self._buffer = ""
+        self._stream.write("]\n")
+
+    def _write_record(self, record: str) -> None:
+        if not record.strip():
+            return
+        if not self._first:
+            self._stream.write(",")
+        self._stream.write(record)
+        self._first = False
+
+
 def _export(args: argparse.Namespace) -> int:
     async def run() -> int:
         if args.tasks:
@@ -294,7 +407,9 @@ def _export(args: argparse.Namespace) -> int:
             try:
                 await _ensure_store_ready_for_export(store)
                 with _output_stream(args.output) as stream:
-                    count = await jsonl_export.export_tasks(store, stream=stream)
+                    count = await _export_tasks(
+                        store, stream=stream, output_format=args.output_format
+                    )
             finally:
                 await store.close()
             noun = "task(s)"
@@ -303,7 +418,11 @@ def _export(args: argparse.Namespace) -> int:
             try:
                 await _ensure_store_ready_for_export(store)
                 with _output_stream(args.output) as stream:
-                    count = await jsonl_export.export_sessions(store, stream=stream)
+                    count = await _export_sessions(
+                        store,
+                        stream=stream,
+                        output_format=args.output_format,
+                    )
             finally:
                 await store.close()
             noun = "session(s)"
@@ -321,8 +440,41 @@ def _export(args: argparse.Namespace) -> int:
     except schema.SchemaError:
         raise
     except Exception as exc:
-        print(f"error: {_sanitize(str(exc), args.postgres)}", file=sys.stderr)
+        _render_error(args, _sanitize(str(exc), args.postgres))
         return 1
+
+
+async def _export_sessions(store: Any, *, stream: TextIO, output_format: str) -> int:
+    if output_format == "jsonl":
+        return await jsonl_export.export_sessions(store, stream=stream)
+    adapter = _JsonArrayStream(stream)
+    count = await jsonl_export.export_sessions(store, stream=adapter)
+    adapter.finish()
+    return count
+
+
+async def _export_tasks(store: Any, *, stream: TextIO, output_format: str) -> int:
+    if output_format == "jsonl":
+        return await jsonl_export.export_tasks(store, stream=stream)
+    adapter = _JsonArrayStream(stream)
+    count = await jsonl_export.export_tasks(store, stream=adapter)
+    adapter.finish()
+    return count
+
+
+def _render_error(args: argparse.Namespace, message: str) -> None:
+    if getattr(args, "output_format", None) in {"json", "jsonl"}:
+        print(
+            json.dumps(
+                {
+                    "schema_version": "1",
+                    "error": {"code": "STORAGE_COMMAND_FAILED", "message": message},
+                },
+                sort_keys=True,
+            )
+        )
+        return
+    print(f"error: {message}", file=sys.stderr)
 
 
 async def _ensure_store_ready_for_export(store: Any) -> None:

@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Any, cast
 
 from cayu._validation import compact_json_utf8_size
+from cayu.cli._output import add_output_options, output_destination
 from cayu.cli.storage import _sanitize
 from cayu.cli.store_targets import (
     SessionStoreBackend,
@@ -37,7 +38,7 @@ from cayu.runtime.usage import count_model_steps_with_usage
 from cayu.storage import SQLiteSessionStore
 from cayu.storage import migrations as schema
 
-OUTPUT_CHOICES = ("table", "json", "jsonl")
+FORMAT_CHOICES = ("json", "table", "jsonl")
 CLI_SCHEMA_VERSION = "1"
 _MAX_COLLECTED_EVENT_BYTES = 64 * 1024 * 1024
 _MAX_COLLECTED_EVENT_RECORDS = 100_000
@@ -52,9 +53,20 @@ def add_session_parser(subparsers: Any) -> None:
     session = subparsers.add_parser(
         "session",
         help="Inspect durable Cayu sessions without mutating storage.",
+        description=(
+            "Inspect durable Cayu sessions without mutating storage. "
+            "Start with `cayu session list`; JSON is the default output."
+        ),
     )
     commands = session.add_subparsers(dest="session_command", required=True)
-    list_parser = commands.add_parser("list", help="List sessions by newest activity.")
+    list_parser = commands.add_parser(
+        "list",
+        help="List sessions by newest activity.",
+        description=(
+            "List sessions by newest activity. Use a returned session id with "
+            "`cayu session show SESSION_ID`."
+        ),
+    )
     _add_target_options(list_parser)
     list_parser.add_argument("--status", choices=tuple(item.value for item in SessionStatus))
     list_parser.add_argument("--agent", help="Filter by exact agent name.")
@@ -70,32 +82,60 @@ def add_session_parser(subparsers: Any) -> None:
     paging = list_parser.add_mutually_exclusive_group()
     paging.add_argument("--offset", type=_nonnegative_int, default=0)
     paging.add_argument("--cursor")
-    list_parser.add_argument("--output", choices=OUTPUT_CHOICES, default="table")
+    add_output_options(list_parser, formats=FORMAT_CHOICES)
 
-    show_parser = commands.add_parser("show", help="Show a compact session overview.")
+    show_parser = commands.add_parser(
+        "show",
+        help="Show a compact session overview.",
+        description=(
+            "Show a compact session overview. Use usage, tools, events, or transcript "
+            "for bounded detail."
+        ),
+    )
     show_parser.add_argument("session_id")
     _add_target_options(show_parser)
-    show_parser.add_argument("--output", choices=OUTPUT_CHOICES, default="table")
+    add_output_options(show_parser, formats=FORMAT_CHOICES)
 
-    usage_parser = commands.add_parser("usage", help="Show per-model-call token usage.")
+    usage_parser = commands.add_parser(
+        "usage",
+        help="Show per-model-call token usage.",
+        description=(
+            "Show bounded per-model-call token usage and pricing state. "
+            "Use `--limit` and `--offset` to page results."
+        ),
+    )
     usage_parser.add_argument("session_id")
     _add_target_options(usage_parser)
     usage_parser.add_argument("--offset", type=_nonnegative_int, default=0)
     usage_parser.add_argument("--limit", type=_positive_limit, default=100)
     usage_parser.add_argument("--after-sequence", type=_nonnegative_int)
     usage_parser.add_argument("--before-sequence", type=_positive_int)
-    usage_parser.add_argument("--output", choices=OUTPUT_CHOICES, default="table")
+    add_output_options(usage_parser, formats=FORMAT_CHOICES)
 
-    tools_parser = commands.add_parser("tools", help="Show paired durable tool calls.")
+    tools_parser = commands.add_parser(
+        "tools",
+        help="Show paired durable tool calls.",
+        description=(
+            "Show paired durable tool calls without result bodies. "
+            "Use event inspection for bounded payload metadata."
+        ),
+    )
     tools_parser.add_argument("session_id")
     _add_target_options(tools_parser)
     tools_parser.add_argument("--offset", type=_nonnegative_int, default=0)
     tools_parser.add_argument("--limit", type=_positive_limit, default=100)
     tools_parser.add_argument("--after-sequence", type=_nonnegative_int)
     tools_parser.add_argument("--before-sequence", type=_positive_int)
-    tools_parser.add_argument("--output", choices=OUTPUT_CHOICES, default="table")
+    add_output_options(tools_parser, formats=FORMAT_CHOICES)
 
-    events_parser = commands.add_parser("events", help="Page durable session events.")
+    events_parser = commands.add_parser(
+        "events",
+        help="Page durable session events.",
+        description=(
+            "Page durable session events with optional filters. "
+            "Use `--include-payload` only for bounded payload previews."
+        ),
+    )
     events_parser.add_argument("session_id")
     _add_target_options(events_parser)
     events_parser.add_argument("--type", action="append", dest="event_types", default=[])
@@ -114,11 +154,15 @@ def add_session_parser(subparsers: Any) -> None:
         type=_payload_limit,
         metavar="BYTES",
     )
-    events_parser.add_argument("--output", choices=OUTPUT_CHOICES, default="table")
+    add_output_options(events_parser, formats=FORMAT_CHOICES)
 
     transcript_parser = commands.add_parser(
         "transcript",
         help="Page bounded transcript metadata and previews.",
+        description=(
+            "Page bounded transcript metadata with redacted content by default. "
+            "Use `--include-content` only for bounded, redacted previews."
+        ),
     )
     transcript_parser.add_argument("session_id")
     _add_target_options(transcript_parser)
@@ -137,11 +181,22 @@ def add_session_parser(subparsers: Any) -> None:
         metavar="BYTES",
         help="Include redacted serialized content, bounded per message.",
     )
-    transcript_parser.add_argument("--output", choices=OUTPUT_CHOICES, default="table")
+    add_output_options(transcript_parser, formats=FORMAT_CHOICES)
 
 
 def run_session(args: argparse.Namespace) -> int:
     """Resolve a read-only target and dispatch one session-inspection command."""
+
+    try:
+        with output_destination(args.output):
+            return _run_session(args)
+    except OSError as exc:
+        print(f"error: could not write output: {exc}", file=sys.stderr)
+        return 1
+
+
+def _run_session(args: argparse.Namespace) -> int:
+    """Run after the optional output destination owns stdout."""
 
     dsn: str | None = None
     try:
@@ -152,13 +207,29 @@ def run_session(args: argparse.Namespace) -> int:
         dsn = target.postgres_dsn
         return asyncio.run(_run_session_command(args, target))
     except (SessionStoreTargetError, ValueError, OSError, RuntimeError) as exc:
-        print(f"error: {_safe_error(str(exc), dsn)}", file=sys.stderr)
+        _render_session_error(_safe_error(str(exc), dsn), args.output_format)
         return 1
     except Exception as exc:
         # Driver and SQLite failures have backend-specific exception types. Keep
         # the CLI concise while preserving the existing DSN scrubbing contract.
-        print(f"error: {_safe_error(str(exc), dsn)}", file=sys.stderr)
+        _render_session_error(_safe_error(str(exc), dsn), args.output_format)
         return 1
+
+
+def _render_session_error(message: str, output_format: str) -> None:
+    if output_format in {"json", "jsonl"}:
+        print(
+            json.dumps(
+                {
+                    "schema_version": CLI_SCHEMA_VERSION,
+                    "error": {"code": "SESSION_INSPECTION_FAILED", "message": message},
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return
+    print(f"error: {message}", file=sys.stderr)
 
 
 async def _run_session_command(
@@ -244,7 +315,7 @@ async def _list_sessions(args: argparse.Namespace, store: SessionStore) -> int:
         "total_count": result.total_count,
     }
     _render_collection(
-        args.output,
+        args.output_format,
         payload,
         sessions,
         headers=(
@@ -333,7 +404,7 @@ async def _show_session(args: argparse.Namespace, store: SessionStore) -> int:
         "terminal_failure": {"state": summary.terminal_failure_state},
         "budget": summary.budget.model_dump(mode="json"),
     }
-    _render_detail(args.output, payload)
+    _render_detail(args.output_format, payload)
     return 0
 
 
@@ -402,7 +473,7 @@ async def _session_usage(args: argparse.Namespace, store: SessionStore) -> int:
         },
     }
     _render_usage(
-        args.output,
+        args.output_format,
         payload,
         page,
         ledger_page,
@@ -622,7 +693,7 @@ async def _session_tools(args: argparse.Namespace, store: SessionStore) -> int:
         },
     }
     _render_collection(
-        args.output,
+        args.output_format,
         payload,
         page,
         headers=(
@@ -998,7 +1069,7 @@ async def _session_events(args: argparse.Namespace, store: SessionStore) -> int:
     if args.include_payload is not None:
         headers += ("payload_preview", "payload_truncated")
     _render_collection(
-        args.output,
+        args.output_format,
         payload,
         rows,
         headers=headers,
@@ -1089,7 +1160,7 @@ async def _session_transcript(args: argparse.Namespace, store: SessionStore) -> 
     )
     if args.include_content is not None:
         headers += ("content_json", "content_truncated")
-    _render_collection(args.output, payload, rows, headers=headers)
+    _render_collection(args.output_format, payload, rows, headers=headers)
     return 0
 
 

@@ -25,6 +25,10 @@ def add_console_parser(subparsers: Any) -> None:
     parser = subparsers.add_parser(
         "console",
         help="Open an IPython console with a booted Cayu application.",
+        description=(
+            "Open an IPython console with a live, writable Cayu application. "
+            "Use `cayu inspect` first for read-only structural inspection."
+        ),
     )
     parser.add_argument(
         "target",

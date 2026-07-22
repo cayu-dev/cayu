@@ -43,6 +43,10 @@ class AgentSpec(BaseModel):
     def _reject_registration_kwargs(cls, data: Any) -> Any:
         # tools/tool_policy belong to CayuApp.register_agent, not AgentSpec.
         if isinstance(data, dict):
+            if "instructions" in data:
+                raise ValueError(
+                    "AgentSpec does not accept `instructions`; did you mean `system_prompt`?"
+                )
             misplaced = sorted({"tools", "tool_policy"} & set(data))
             if misplaced:
                 names = ", ".join(misplaced)

@@ -80,6 +80,10 @@ def add_lambda_microvm_parser(subparsers: Any) -> None:
     lambda_microvm = subparsers.add_parser(
         "lambda-microvm",
         help="Manage AWS Lambda MicroVM support artifacts.",
+        description=(
+            "Manage AWS Lambda MicroVM support artifacts. "
+            "Use the sidecar export command to materialize a build context."
+        ),
     )
     lambda_commands = lambda_microvm.add_subparsers(
         dest="lambda_microvm_command",
@@ -88,11 +92,19 @@ def add_lambda_microvm_parser(subparsers: Any) -> None:
     sidecar = lambda_commands.add_parser(
         "sidecar",
         help="Manage the first-party Lambda MicroVM command sidecar.",
+        description=(
+            "Manage the first-party Lambda MicroVM command sidecar. "
+            "Use `cayu lambda-microvm sidecar export DESTINATION` next."
+        ),
     )
     sidecar_commands = sidecar.add_subparsers(dest="sidecar_command", required=True)
     export = sidecar_commands.add_parser(
         "export",
         help="Export the versioned sidecar image build context.",
+        description=(
+            "Export the versioned sidecar image build context. "
+            "Build the emitted context with the container tooling documented inside it."
+        ),
     )
     export.add_argument("destination", type=Path, metavar="DESTINATION")
     export.add_argument(

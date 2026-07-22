@@ -1,13 +1,37 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterable
+from typing import Any
 
+from cayu._validation import copy_json_value
 from cayu.providers import (
     ModelProvider,
     ModelRequest,
     ModelStreamEvent,
     ModelStreamEventType,
 )
+from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
+
+
+def scripted_structured_output(
+    output: Any,
+    *,
+    id: str | None = None,
+) -> tuple[ModelStreamEvent, ModelStreamEvent]:
+    """Build one complete provider script that submits structured JSON output.
+
+    This is the public test/eval seam for Cayu's provider-neutral structured-output
+    tool protocol. Callers supply only the JSON value; Cayu owns the reserved tool
+    name and argument envelope.
+    """
+    return (
+        ModelStreamEvent.tool_call(
+            id=id,
+            name=STRUCTURED_OUTPUT_TOOL_NAME,
+            arguments={"output": copy_json_value(output, "output")},
+        ),
+        ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+    )
 
 
 class ScriptedModelProvider(ModelProvider):

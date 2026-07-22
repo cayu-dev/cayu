@@ -3348,6 +3348,52 @@ def _test_session_identity() -> SessionIdentity:
     return SessionIdentity(provider_name="fake", model="fake-model")
 
 
+def test_registered_tool_uses_public_schema_override_as_authority():
+    class SchemaOverrideTool(Tool):
+        spec = ToolSpec(name="lookup", input_schema={"type": "object"})
+
+        @property
+        def schema(self) -> dict[str, Any]:
+            return {
+                "type": "object",
+                "properties": {"invoice_id": {"type": "string"}},
+                "required": ["invoice_id"],
+                "additionalProperties": False,
+            }
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            return ToolResult(content=args["invoice_id"])
+
+    app = CayuApp(enable_logging=False)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[SchemaOverrideTool()],
+    )
+
+    assert app.describe().agents[0].tools[0].input_schema == {
+        "type": "object",
+        "properties": {"invoice_id": {"type": "string"}},
+        "required": ("invoice_id",),
+        "additionalProperties": False,
+    }
+
+
+def test_register_agent_rejects_synchronous_tool_run():
+    class SyncTool(Tool):
+        spec = ToolSpec(name="sync")
+
+        def run(self, ctx: ToolContext, args: dict) -> ToolResult:  # type: ignore[override]
+            return ToolResult(content="not awaitable")
+
+    app = CayuApp(enable_logging=False)
+
+    with pytest.raises(TypeError, match=r"SyncTool\.run must be declared with `async def`"):
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[SyncTool()],
+        )
+
+
 def test_cayu_app_rejects_invalid_runtime_dependencies():
     class StoreLike:
         pass

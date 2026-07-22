@@ -49,6 +49,13 @@ class _ConfiguredTool(Tool):
         return ToolResult(content=self._content)
 
 
+class _UnconstrainedTool(Tool):
+    spec = ToolSpec(name="lookup", effect=ToolEffect.NONE)
+
+    async def run(self, ctx, args):
+        return ToolResult(content="found")
+
+
 class _PermissiveApprovalPolicy(AlwaysRequireApprovalToolPolicy):
     async def authorize(self, request):
         return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
@@ -63,6 +70,7 @@ def test_builtin_diagnostic_codes_are_unique_and_compatibility_pinned() -> None:
         "APP_NO_AGENTS",
         "EXTERNAL_TOOL_COVERAGE_UNKNOWN",
         "EXTERNAL_TOOL_UNGUARDED",
+        "TOOL_INPUT_SCHEMA_UNCONSTRAINED",
     )
     assert len(BUILTIN_DIAGNOSTIC_CODES) == len(set(BUILTIN_DIAGNOSTIC_CODES))
 
@@ -208,6 +216,28 @@ def test_check_tags_and_deploy_selection_are_orthogonal() -> None:
     assert deploy.diagnostics == ()
 
 
+def test_unconstrained_tool_schema_is_an_actionable_authoring_warning() -> None:
+    app = CayuApp(enable_logging=False)
+    app.register_provider(ScriptedModelProvider([], name="scripted"), default=True)
+    app.register_agent(
+        AgentSpec(name="researcher", model="test-model"),
+        tools=[_UnconstrainedTool()],
+    )
+
+    report = check_manifest(app.describe())
+
+    assert [item.code for item in report.diagnostics] == ["TOOL_INPUT_SCHEMA_UNCONSTRAINED"]
+    finding = report.diagnostics[0]
+    assert finding.severity == "warning"
+    assert finding.path == "agents.researcher.tools.lookup.input_schema"
+    assert finding.tags == ("authoring", "deploy")
+    assert finding.parameters == {"agent": "researcher", "tool": "lookup"}
+    assert "valid JSON Schema" in finding.message
+    assert finding.documentation_anchor == (
+        "cayu guide diagnostics#tool-input-schema-unconstrained"
+    )
+
+
 def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
     empty_codes = {
         item.code for item in check_manifest(CayuApp(enable_logging=False).describe()).diagnostics
@@ -258,6 +288,15 @@ def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
     )
     unfinished_codes = {item.code for item in check_manifest(unfinished.describe()).diagnostics}
 
+    unconstrained = CayuApp(enable_logging=False)
+    unconstrained.register_agent(
+        AgentSpec(name="unconstrained", model="model"),
+        tools=[_UnconstrainedTool()],
+    )
+    unconstrained_codes = {
+        item.code for item in check_manifest(unconstrained.describe()).diagnostics
+    }
+
     assert (
         empty_codes
         | missing_codes
@@ -266,6 +305,7 @@ def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
         | unknown_codes
         | misaligned_codes
         | unfinished_codes
+        | unconstrained_codes
         == set(BUILTIN_DIAGNOSTIC_CODES)
     )
 

@@ -9,7 +9,8 @@ from pathlib import Path
 import pytest
 
 from cayu.cli import main
-from cayu.cli.generate import GeneratorApplyError, apply_slice_plan, plan_slice
+from cayu.cli.generate import GeneratorApplyError, apply_slice_plan, plan_slice, plan_tool
+from cayu.runtime import APP_MANIFEST_SCHEMA_VERSION
 
 
 def _files(root: Path) -> dict[str, bytes]:
@@ -41,6 +42,138 @@ def test_generate_slice_effect_help_routes_to_canonical_guide(capsys) -> None:
     assert "cayu guide tool-effects" in output
 
 
+def test_generate_tool_attaches_first_tracer_bullet_to_scaffold_starter(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    assert main(["new", "invoice-analyst", "--dir", str(tmp_path), "--provider", "openai"]) == 0
+    capsys.readouterr()
+    project = tmp_path / "invoice-analyst"
+    monkeypatch.chdir(project)
+    command = [
+        "generate",
+        "tool",
+        "calculate_total",
+        "--agent",
+        "invoice-analyst",
+        "--effect",
+        "none",
+    ]
+
+    assert main(command) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "ready"
+    after_apply = _files(project)
+    assert "agents/invoice-analyst.py" not in after_apply
+    assert after_apply["tools/__init__.py"] == b""
+    assert "ToolSpec(" in after_apply["tools/calculate_total.py"].decode()
+    assert '"required": ["input"]' in after_apply["tools/calculate_total.py"].decode()
+    assert "starter_tools.append(CalculateTotalTool())" in after_apply["app.py"].decode()
+    assert (
+        "_WORKFLOW_TOOL_NAMES.append(CALCULATE_TOTAL_TOOL_NAME)"
+        in after_apply["agents/agent.py"].decode()
+    )
+
+    for module_name in ("app", "agents.agent", "agents", "tools.calculate_total", "tools"):
+        sys.modules.pop(module_name, None)
+    assert main(["inspect", "--json"]) == 0
+    agent = json.loads(capsys.readouterr().out)["agents"][0]
+    assert agent["name"] == "invoice-analyst"
+    assert agent["workflow_tool_names"] == ["calculate_total"]
+    assert agent["authoring_state"] == "unfinished_generated_tracer_bullet"
+    assert agent["tools"][0]["input_schema"]["required"] == ["input"]
+    assert main(["check", "--json"]) == 0
+    assert [item["code"] for item in json.loads(capsys.readouterr().out)["diagnostics"]] == [
+        "AGENT_GENERATED_TRACER_BULLET_UNFINISHED"
+    ]
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "pytest", "tests/test_calculate_total.py", "-q"],
+        cwd=project,
+        env={
+            **os.environ,
+            "PYTHONPATH": str(Path(__file__).parents[2] / "src"),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    eval_output = project / "calculate-total-eval.json"
+    assert (
+        main(
+            [
+                "eval",
+                "run",
+                "evals.calculate_total:build_eval",
+                "--output",
+                str(eval_output),
+            ]
+        )
+        == 0
+    )
+    assert json.loads(eval_output.read_text(encoding="utf-8"))["status"] == "passed"
+
+    before_repeat = _stable_files(project)
+    assert main([*command, "--json"]) == 0
+    repeated = json.loads(capsys.readouterr().out)
+    assert repeated["status"] == "already_present"
+    assert repeated["edits"] == []
+    assert _stable_files(project) == before_repeat
+
+    agent_path = project / "agents" / "agent.py"
+    completed_source = agent_path.read_text(encoding="utf-8").replace(
+        '_AUTHORING_STATE = "unfinished_generated_tracer_bullet"',
+        "_AUTHORING_STATE = None",
+    )
+    agent_path.write_text(completed_source, encoding="utf-8")
+    for module_name in ("app", "agents.agent", "agents", "tools.calculate_total", "tools"):
+        sys.modules.pop(module_name, None)
+    assert main(["check", "--fail-on", "warning", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["diagnostics"] == []
+
+
+def test_generate_tool_requires_intact_starter_markers_without_writes(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    app_path = project / "app.py"
+    app_path.write_text(
+        app_path.read_text(encoding="utf-8").replace(
+            "    # <cayu:generated-starter-tools>\n    # </cayu:generated-starter-tools>\n",
+            "",
+        ),
+        encoding="utf-8",
+    )
+    before = _files(project)
+    monkeypatch.chdir(project)
+
+    plan = plan_tool(tool_name="lookup", agent_name="project", effect="none")
+
+    assert plan.status == "manual_action_required"
+    assert "intact machine-owned starter markers" in plan.conflicts[0]["reason"]
+    assert (
+        main(
+            [
+                "generate",
+                "tool",
+                "lookup",
+                "--agent",
+                "project",
+                "--effect",
+                "none",
+            ]
+        )
+        == 1
+    )
+    assert "manual_action_required" in capsys.readouterr().out
+    assert _files(project) == before
+
+
 def test_generate_slice_dry_run_is_deterministic_and_write_free(
     tmp_path: Path,
     monkeypatch,
@@ -69,7 +202,7 @@ def test_generate_slice_dry_run_is_deterministic_and_write_free(
     second = json.loads(capsys.readouterr().out)
 
     assert first == second
-    assert first["schema_version"] == "3"
+    assert first["schema_version"] == APP_MANIFEST_SCHEMA_VERSION
     assert first["status"] == "ready"
     assert first["authoring_state"] == "unfinished_generated_tracer_bullet"
     assert [item["path"] for item in first["preconditions"]] == ["agents/agent.py"]
@@ -82,15 +215,15 @@ def test_generate_slice_dry_run_is_deterministic_and_write_free(
         "tools/analyze_document.py",
     ]
     assert first["verification_commands"] == [
-        "cayu inspect --json",
-        "cayu check --json",
-        "pytest tests/test_analyst.py",
-        "cayu eval run evals.analyst:build_eval",
+        "uv run cayu inspect --json",
+        "uv run cayu check --json",
+        "uv run pytest tests/test_analyst.py",
+        "uv run cayu eval run evals.analyst:build_eval",
     ]
     assert _files(project) == before
 
 
-def test_generate_slice_json_is_a_write_free_plan_without_dry_run(
+def test_generate_slice_json_selects_format_while_dry_run_controls_writes(
     tmp_path: Path,
     monkeypatch,
     capsys,
@@ -98,7 +231,6 @@ def test_generate_slice_json_is_a_write_free_plan_without_dry_run(
     assert main(["new", "project", "--dir", str(tmp_path)]) == 0
     capsys.readouterr()
     project = tmp_path / "project"
-    before = _files(project)
     monkeypatch.chdir(project)
 
     assert (
@@ -118,7 +250,8 @@ def test_generate_slice_json_is_a_write_free_plan_without_dry_run(
     )
 
     assert json.loads(capsys.readouterr().out)["status"] == "ready"
-    assert _files(project) == before
+    assert (project / "agents" / "analyst.py").is_file()
+    assert (project / "tools" / "analyze_document.py").is_file()
 
 
 def test_generate_slice_applies_once_and_passes_public_verification(
@@ -126,7 +259,7 @@ def test_generate_slice_applies_once_and_passes_public_verification(
     monkeypatch,
     capsys,
 ) -> None:
-    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    assert main(["new", "project", "--dir", str(tmp_path), "--provider", "anthropic"]) == 0
     capsys.readouterr()
     project = tmp_path / "project"
     monkeypatch.chdir(project)
@@ -141,7 +274,7 @@ def test_generate_slice_applies_once_and_passes_public_verification(
     ]
 
     assert main(command) == 0
-    assert capsys.readouterr().out.startswith("Applied analyst: ready")
+    assert json.loads(capsys.readouterr().out)["status"] == "ready"
     after_apply = _files(project)
     app_source = after_apply["app.py"].decode()
     assert "AlwaysRequireApprovalToolPolicy" in app_source
@@ -288,8 +421,9 @@ def test_generate_slice_detects_keyword_registration_and_constant_agent_name(
     app_path = project / "app.py"
     app_path.write_text(
         app_path.read_text(encoding="utf-8").replace(
-            "app.register_agent(AGENT)",
-            "app.register_agent(spec=AGENT)",
+            "        AGENT,\n",
+            "        spec=AGENT,\n",
+            1,
         ),
         encoding="utf-8",
     )
@@ -350,8 +484,17 @@ def test_generate_slice_does_not_exempt_a_customized_same_symbol_registration(
     app_path = project / "app.py"
     app_path.write_text(
         app_path.read_text(encoding="utf-8").replace(
-            "app.register_agent(ANALYST_AGENT, tools=[AnalyzeDocumentTool()])",
-            "app.register_agent(ANALYST_AGENT)",
+            (
+                "app.register_agent(\n"
+                "        _agent_for_provider_override(ANALYST_AGENT, provider),\n"
+                "        tools=[AnalyzeDocumentTool()],\n"
+                "    )"
+            ),
+            (
+                "app.register_agent(\n"
+                "        _agent_for_provider_override(ANALYST_AGENT, provider),\n"
+                "    )"
+            ),
         ),
         encoding="utf-8",
     )
@@ -377,12 +520,13 @@ def test_generate_slice_detects_a_bound_registration_alias_without_writes(
     app_path = project / "app.py"
     app_path.write_text(
         app_path.read_text(encoding="utf-8").replace(
-            "    app.register_agent(AGENT)\n",
-            "    register_agent = app.register_agent\n    register_agent(AGENT)\n",
+            "    app.register_agent(\n",
+            "    register_agent = app.register_agent\n    register_agent(\n",
+            1,
         ),
         encoding="utf-8",
     )
-    assert "    register_agent(AGENT)\n" in app_path.read_text(encoding="utf-8")
+    assert "    register_agent(\n" in app_path.read_text(encoding="utf-8")
     before = _files(project)
     monkeypatch.chdir(project)
 
@@ -417,11 +561,12 @@ def test_generate_slice_fails_closed_for_a_function_local_agent_shadow(
     )
     app_path.write_text(
         app_source.replace(
-            "    app.register_agent(AGENT)\n",
+            "    app.register_agent(\n",
             (
                 '    AGENT = AgentSpec(name="reviewer", model="gpt-5.6-luna")\n'
-                "    app.register_agent(AGENT)\n"
+                "    app.register_agent(\n"
             ),
+            1,
         ),
         encoding="utf-8",
     )
@@ -458,12 +603,13 @@ def test_generate_slice_fails_closed_for_a_pattern_bound_agent_shadow(
     )
     app_path.write_text(
         app_source.replace(
-            "    app.register_agent(AGENT)\n",
+            "    app.register_agent(\n",
             (
                 '    match AgentSpec(name="reviewer", model="gpt-5.6-luna"):\n'
                 "        case AGENT:\n"
-                "            app.register_agent(AGENT)\n"
+                "            app.register_agent(\n"
             ),
+            1,
         ),
         encoding="utf-8",
     )
@@ -488,7 +634,7 @@ def test_generate_slice_fails_closed_for_a_pattern_bound_agent_shadow(
         )
         == 1
     )
-    assert "Planned reviewer: manual_action_required" in capsys.readouterr().out
+    assert json.loads(capsys.readouterr().out)["status"] == "manual_action_required"
     assert _files(project) == before
     assert main(["inspect", "--json"]) == 0
     assert [agent["name"] for agent in json.loads(capsys.readouterr().out)["agents"]] == [
@@ -517,7 +663,11 @@ def test_generate_slice_preserves_formatted_multiline_registrations(
     assert main(analyst_command) == 0
     capsys.readouterr()
     app_path = project / "app.py"
-    assert "    app.register_agent(\n        ANALYST_AGENT," in app_path.read_text(encoding="utf-8")
+    assert (
+        "    app.register_agent(\n"
+        "        _agent_for_provider_override(ANALYST_AGENT, provider),"
+        in app_path.read_text(encoding="utf-8")
+    )
     formatted = app_path.read_bytes()
 
     repeated = plan_slice(name="analyst", tool_name="analyze_document", effect="external")

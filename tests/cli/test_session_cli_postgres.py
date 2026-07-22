@@ -268,8 +268,7 @@ def test_session_commands_have_sqlite_postgres_semantic_parity(
                         *command,
                         "--sqlite",
                         str(sqlite_path),
-                        "--output",
-                        "json",
+                        "--json",
                     ]
                 )
                 == 0
@@ -282,8 +281,7 @@ def test_session_commands_have_sqlite_postgres_semantic_parity(
                         *command,
                         "--postgres",
                         postgres_dsn,
-                        "--output",
-                        "json",
+                        "--json",
                     ]
                 )
                 == 0

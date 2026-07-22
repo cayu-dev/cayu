@@ -2075,10 +2075,17 @@ def _validate_registered_tool(tool: Tool) -> runtime_records.RegisteredTool:
     name = require_clean_nonblank(spec.name, "name")
     if name == STRUCTURED_OUTPUT_TOOL_NAME:
         raise ValueError(f"Tool name is reserved for structured output: {name}")
+    if not inspect.iscoroutinefunction(tool.run):
+        raise TypeError(
+            f"{type(tool).__name__}.run must be declared with `async def` and return a ToolResult."
+        )
+    schema = copy_json_value(tool.schema, "schema")
+    if type(schema) is not dict:
+        raise TypeError(f"{type(tool).__name__}.schema must return a JSON Schema object.")
     validated_spec = ToolSpec(
         name=name,
         description=spec.description,
-        input_schema=copy_json_value(spec.input_schema, "input_schema"),
+        input_schema=schema,
         parallel_safe=spec.parallel_safe,
         effect=spec.effect,
     )

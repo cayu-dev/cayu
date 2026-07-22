@@ -39,9 +39,20 @@ def add_auth_parser(subparsers: argparse._SubParsersAction) -> None:
     openai = providers.add_parser(
         "openai",
         help="Manage the experimental OpenAI subscription sign-in.",
+        description=(
+            "Manage the experimental OpenAI subscription sign-in. "
+            "Use `cayu auth openai status` to inspect local state."
+        ),
     )
     actions = openai.add_subparsers(dest="auth_action")
-    login = actions.add_parser("login", help="Sign in with a ChatGPT Plus/Pro subscription.")
+    login = actions.add_parser(
+        "login",
+        help="Sign in with a ChatGPT Plus/Pro subscription.",
+        description=(
+            "Sign in with a ChatGPT Plus/Pro subscription. "
+            "Run `cayu auth openai status` afterward to verify local state."
+        ),
+    )
     login.add_argument(
         "--headless",
         action="store_true",
@@ -52,8 +63,22 @@ def add_auth_parser(subparsers: argparse._SubParsersAction) -> None:
         action="store_true",
         help="Print the authorization URL without opening a browser.",
     )
-    actions.add_parser("status", help="Show subscription sign-in status.")
-    actions.add_parser("logout", help="Delete Cayu's local subscription credentials.")
+    actions.add_parser(
+        "status",
+        help="Show subscription sign-in status.",
+        description=(
+            "Show subscription sign-in status. Use `cayu auth openai login` when no "
+            "active credentials are available."
+        ),
+    )
+    actions.add_parser(
+        "logout",
+        help="Delete Cayu's local subscription credentials.",
+        description=(
+            "Delete Cayu's local subscription credentials. "
+            "Run `cayu auth openai status` to confirm removal."
+        ),
+    )
 
 
 def run_auth(args: argparse.Namespace) -> int:

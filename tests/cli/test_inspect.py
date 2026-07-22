@@ -63,10 +63,10 @@ def build_app():
     monkeypatch.chdir(nested)
     sys.modules.pop("inspect_project", None)
 
-    assert main(["inspect", "--json"]) == 0
+    assert main(["inspect"]) == 0
 
     output = json.loads(capsys.readouterr().out)
-    assert output["schema_version"] == "3"
+    assert output["schema_version"] == "4"
     assert output["agents"][0]["name"] == "reviewer"
     assert output["agents"][0]["resolved_provider"] == "scripted"
     assert output["defaults"]["environment"] is None
@@ -79,6 +79,10 @@ def build_app():
     )
     assert (project / "build-count.txt").read_text(encoding="utf-8") == "1"
     assert "inspect_project" not in sys.modules
+
+    destination = project / "manifest.json"
+    assert main(["inspect", "--output", str(destination)]) == 0
+    assert json.loads(destination.read_text(encoding="utf-8"))["agents"][0]["name"] == ("reviewer")
 
 
 def test_inspect_subject_filter_and_missing_subject_use_structured_contract(
@@ -113,7 +117,7 @@ def build_app():
 
     assert main(["inspect", "--environment", "missing", "--json"]) == 1
     error = json.loads(capsys.readouterr().out)
-    assert error["schema_version"] == "3"
+    assert error["schema_version"] == "4"
     assert error["error"] == {
         "code": "SUBJECT_NOT_FOUND",
         "message": "Environment not found: missing.",
@@ -141,7 +145,7 @@ def test_inspect_factory_failure_uses_current_manifest_schema_version(
 
     output = json.loads(capsys.readouterr().out)
     assert output == {
-        "schema_version": "3",
+        "schema_version": "4",
         "error": {
             "code": "PROJECT_BOOT_FAILED",
             "message": "Application factory failed (RuntimeError): boot exploded",

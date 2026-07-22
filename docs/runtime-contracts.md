@@ -25,6 +25,12 @@ that application-owned behavior. The canonical
 these boundaries and the console, script, server-integration,
 worker-integration, and test process roles.
 
+`CayuApp.describe()` emits a structural, redacted manifest. Agent entries expose
+`has_system_prompt`, but prompt text and implementation bodies never enter the
+manifest. The application fingerprint therefore changes when prompt presence
+changes, but not when one non-empty prompt is edited into another; runtime tests
+and evals are the behavioral proof for prompt content.
+
 ## ContextPolicy
 
 Builds the model-facing message list immediately before each provider request.
@@ -1172,6 +1178,14 @@ The initial `CayuApp` runtime registers agent specs, model providers, and tools,
 
 The tool calls in one model step run concurrently by default, bounded by a semaphore of size `CayuApp(max_parallel_tool_calls=…)` (default 4); set it to `1` to force fully sequential execution. Concurrency cuts wall-clock time when a step emits several independent, I/O-bound calls. A tool whose `ToolSpec.parallel_safe` is `False` (the default is `True`) is an ordering **barrier** — it runs alone in its model-order position, after everything before it and before everything after it — the opt-out for tools with side effects or single-threaded backends. `parallel_safe` controls ordering only; it is intentionally separate from `ToolSpec.effect`, which describes retry/idempotency semantics. Execution preserves the model's tool-call order: a round is split into ordered segments where each contiguous run of `parallel_safe` calls executes concurrently and each `parallel_safe=False` call runs by itself, so `[safe A, safe B, unsafe C, safe D]` runs as concurrent `A/B`, then `C`, then `D` (never `A/B/D` before `C`, which would read-after-write). The built-in mutating tools (`exec_command`, `write_file`, `remember_knowledge`, and the spawning subagent tool) ship with `parallel_safe=False`; pure readers keep the default ordering. `read_file` is effect-conservative even though it is read-oriented, because workspace image/PDF reads can create artifact snapshots. Approval and `ask_user` are unaffected: policy is evaluated before execution and a round that requires approval or asks the user pauses before any tool runs, so a concurrent segment only ever contains already-authorized calls. The persisted `tool_result` message keeps the model's tool-call order regardless of completion order. A round is projected against `max_tool_calls`, token, and cost limits once before execution begins; because a concurrent batch cannot be stopped part-way, a batch of cost-incurring tools can overshoot a token/cost budget that a cap of `1` would have caught between calls. If a session is interrupted mid-batch, calls that already finished are recorded as completed (not re-run on resume); only unfinished calls are marked interrupted.
 
+Registered tools declare their provider-facing JSON Schema through
+`ToolSpec.input_schema`; the default `Tool.schema` property exposes that value,
+and an override of the public property is authoritative at registration.
+Registration copies and validates that schema and rejects a `Tool.run` method
+that is not declared with `async def`. An empty schema object remains valid and
+unconstrained, so `cayu check` reports it as an authoring warning rather than a
+registration error.
+
 `CayuApp.run()` and `CayuApp.resume()` are event-stream APIs. Runtime failures
 are represented as terminal `session.failed` events rather than re-raised
 exceptions from the iterator. `run_to_completion(app, request)` consumes the
@@ -1181,7 +1195,12 @@ incrementally. Because it retains every event, including streaming deltas, use i
 only for bounded runs; long-lived or high-volume consumers should process
 `CayuApp.run()` incrementally. `RunOutcome.status` is a `SessionStatus` and is
 `COMPLETED`, `FAILED`, or `INTERRUPTED`; `RunOutcome.ok` is true only for
-`COMPLETED`.
+`COMPLETED`. For structured-output runs, `RunOutcome.structured_output` exposes
+the last validated value and its attempt metadata; its wrapper distinguishes a
+validated JSON `null` from no validated output. Tests can use
+`scripted_structured_output(value)` with `ScriptedModelProvider` to exercise the
+tool strategy without importing or reproducing Cayu's reserved submission-tool
+wire protocol.
 
 When a caller already has a loaded transcript, `final_output_text(transcript)`
 returns the concatenated text from the most recent assistant message that

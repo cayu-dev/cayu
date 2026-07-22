@@ -5,9 +5,13 @@ from __future__ import annotations
 import asyncio
 import importlib
 import importlib.util
+import json
+import os
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 from cayu import (
     CayuApp,
@@ -28,7 +32,13 @@ from cayu.cli.project import project_context
 def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> None:
     assert main(["new", "myproj", "--dir", str(tmp_path)]) == 0
     proj = tmp_path / "myproj"
-    for filename in ("app.py", "pyproject.toml", "README.md", ".gitignore"):
+    for filename in (
+        "app.py",
+        "configuration.py",
+        "pyproject.toml",
+        "README.md",
+        ".gitignore",
+    ):
         assert (proj / filename).exists()
     for dirname in ("agents", "evals", "tests"):
         assert (proj / dirname).is_dir()
@@ -58,11 +68,15 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert first_app is not second_app
 
     app_source = (proj / "app.py").read_text(encoding="utf-8")
+    configuration_source = (proj / "configuration.py").read_text(encoding="utf-8")
+    assert "AnthropicProvider" in app_source
     assert "OpenAISubscriptionProvider" in app_source
-    assert 'CAYU_OPENAI_SUBSCRIPTION") == "1"' in app_source
+    assert "CAYU_OPENAI_SUBSCRIPTION" not in app_source
+    assert "_SCAFFOLDED_PROVIDER = None" in configuration_source
+    assert 'os.environ.get("CAYU_PROVIDER", _SCAFFOLDED_PROVIDER)' in configuration_source
     pyproject = (proj / "pyproject.toml").read_text(encoding="utf-8")
-    assert 'dependencies = ["cayu"]' in pyproject
-    assert '[project.optional-dependencies]\nconsole = ["cayu[console]"]' in pyproject
+    assert 'dependencies = ["cayu>=0.1.0rc1"]' in pyproject
+    assert 'console = ["cayu[console]"]' not in pyproject
     assert 'dev = ["pytest"]' in pyproject
     assert '[tool.cayu]\nfactory = "app:build_app"' in pyproject
     assert 'eval_target = "evals.agent:build_eval"' in pyproject
@@ -71,32 +85,50 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert 'SQLiteTaskStore("data/cayu.db")' in app_source
     assert "sessions.sqlite" not in app_source
     readme = (proj / "README.md").read_text(encoding="utf-8")
-    assert "cayu inspect --json" in readme
-    assert "cayu guide anatomy" in readme
+    assert "uv run cayu inspect --json" in readme
+    assert "uv run cayu guide anatomy" in readme
     assert readme.index("## Application structure") < readme.index("## Setup and prove the project")
-    assert "pip install -e '.[console,dev]'" in readme
-    assert "uv sync --extra console --extra dev" in readme
-    assert "cayu eval run" in readme
-    assert "cayu session list" in readme
-    assert "cayu auth openai login" in readme
-    assert "CAYU_OPENAI_SUBSCRIPTION=1" in readme
+    assert "pip install -e" not in readme
+    assert "uv sync --extra dev" in readme
+    assert "uv run cayu eval run" in readme
+    assert "uv run cayu session list" in readme
+    assert "uv run cayu auth openai login" in readme
+    assert "CAYU_PROVIDER=openai-subscription" in readme
+    assert "CAYU_PROVIDER=anthropic" in readme
+    assert "ANTHROPIC_API_KEY" in readme
     assert "subscription holder's own local" in readme
     assert "development and evaluation" in readme
     assert "not intended for production" in readme
     assert "bypassing plan limits" in readme
     assert "cayu eval run evals.agent:build_eval" not in readme
-    assert "src/cayu/guides/authoring.md#cayu-map" in readme
-    assert 'python run.py --message "YOUR REQUEST"' in readme
+    assert "uv run cayu guide authoring#cayu-map" in readme
+    assert "github.com" not in readme
+    assert 'uv run python run.py --message "YOUR REQUEST"' in readme
     assert "model-only" in readme
     assert "cayu generate slice" not in readme
-    assert "cayu check --json" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "uv sync --extra dev" in output
+    assert "uv run cayu check --json" in output
+    assert "none selected" in output
 
 
 def test_scaffold_subscription_mode_selects_a_compatible_model(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    assert main(["new", "myproj", "--dir", str(tmp_path)]) == 0
+    assert (
+        main(
+            [
+                "new",
+                "myproj",
+                "--dir",
+                str(tmp_path),
+                "--provider",
+                "openai-subscription",
+            ]
+        )
+        == 0
+    )
     project = tmp_path / "myproj"
     provider = ScriptedModelProvider(
         [
@@ -105,7 +137,6 @@ def test_scaffold_subscription_mode_selects_a_compatible_model(
         ],
         name="openai_subscription",
     )
-    monkeypatch.setenv("CAYU_OPENAI_SUBSCRIPTION", "1")
     monkeypatch.setattr("cayu.OpenAISubscriptionProvider", lambda: provider)
 
     spec = importlib.util.spec_from_file_location("subscription_scaffold_app", project / "app.py")
@@ -129,6 +160,119 @@ def test_scaffold_subscription_mode_selects_a_compatible_model(
 
     assert outcome.ok
     assert provider.requests[0].model == "gpt-5.4"
+
+
+def test_scaffold_does_not_infer_provider_from_credentials(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    assert main(["new", "myproj", "--dir", str(tmp_path)]) == 0
+    project = tmp_path / "myproj"
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-key")
+
+    spec = importlib.util.spec_from_file_location("neutral_scaffold_app", project / "app.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    with project_context(project):
+        spec.loader.exec_module(module)
+        provider = module.configured_provider()
+        app = module.build_app(
+            provider=provider,
+            session_store=InMemorySessionStore(),
+            task_store=InMemoryTaskStore(),
+        )
+
+    assert isinstance(provider, ScriptedModelProvider)
+    assert provider.name == "unconfigured"
+    assert app.describe().agents[0].model == "provider-model-unconfigured"
+    with pytest.raises(RuntimeError, match="no provider is selected"):
+        module.validate_run_configuration(app, "myproj")
+
+
+def test_scaffold_provider_env_explicitly_overrides_scaffold_default(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    assert main(["new", "myproj", "--dir", str(tmp_path), "--provider", "openai"]) == 0
+    project = tmp_path / "myproj"
+    provider = ScriptedModelProvider([], name="anthropic")
+    monkeypatch.setenv("CAYU_PROVIDER", "anthropic")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-key")
+    monkeypatch.setattr("cayu.AnthropicProvider", lambda *, api_key: provider)
+    monkeypatch.setattr(
+        "cayu.OpenAIProvider",
+        lambda **kwargs: pytest.fail("credential presence must not override CAYU_PROVIDER"),
+    )
+
+    spec = importlib.util.spec_from_file_location("anthropic_scaffold_app", project / "app.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    with project_context(project):
+        spec.loader.exec_module(module)
+        selected = module.configured_provider()
+        app = module.build_app(
+            provider=selected,
+            session_store=InMemorySessionStore(),
+            task_store=InMemoryTaskStore(),
+        )
+
+    assert selected is provider
+    agent = app.describe().agents[0]
+    assert agent.configured_provider == "anthropic"
+    assert agent.model == "claude-sonnet-4-6"
+
+
+@pytest.mark.parametrize(
+    ("scaffold_provider", "environment_provider"),
+    [
+        pytest.param(None, None, id="neutral"),
+        pytest.param("openai", None, id="openai"),
+        pytest.param("anthropic", None, id="anthropic"),
+        pytest.param("openai-subscription", None, id="openai-subscription"),
+        pytest.param(None, "openai", id="neutral-env-openai"),
+        pytest.param(None, "anthropic", id="neutral-env-anthropic"),
+        pytest.param(None, "openai-subscription", id="neutral-env-openai-subscription"),
+    ],
+)
+def test_scaffolded_credential_free_proof_ignores_live_provider_selection(
+    tmp_path: Path,
+    scaffold_provider: str | None,
+    environment_provider: str | None,
+) -> None:
+    command = ["new", "myproj", "--dir", str(tmp_path)]
+    if scaffold_provider is not None:
+        command.extend(("--provider", scaffold_provider))
+    assert main(command) == 0
+    project = tmp_path / "myproj"
+    environment = os.environ.copy()
+    for name in ("CAYU_PROVIDER", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+        environment.pop(name, None)
+    if environment_provider is not None:
+        environment["CAYU_PROVIDER"] = environment_provider
+    environment["PYTHONPATH"] = str(Path(__file__).parents[2] / "src")
+
+    test_result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q"],
+        cwd=project,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert test_result.returncode == 0, test_result.stdout + test_result.stderr
+
+    eval_result = subprocess.run(
+        [sys.executable, "-m", "cayu", "eval", "run"],
+        cwd=project,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert eval_result.returncode == 0, eval_result.stdout + eval_result.stderr
+    assert json.loads(eval_result.stdout)["status"] == "passed"
 
 
 def test_python_m_cayu_routes_to_the_cli() -> None:
@@ -259,24 +403,27 @@ def test_cayu_new_emits_safe_agent_instructions_and_credential_free_proof(
     agent_source = (project / "agents" / "agent.py").read_text(encoding="utf-8")
     eval_source = (project / "evals" / "agent.py").read_text(encoding="utf-8")
     assert 'name="myproj"' in agent_source
-    assert "system_prompt" not in agent_source
-    assert "workflow_tool_names" not in agent_source
+    assert "_SYSTEM_PROMPT_PARTS: list[str] = []" in agent_source
+    assert "system_prompt=" in agent_source
+    assert "workflow_tool_names=" in agent_source
     assert "ToolCalled" not in eval_source
 
     instructions = (project / "AGENTS.md").read_text(encoding="utf-8")
-    assert "cayu guide anatomy" in instructions
-    assert "cayu inspect --json" in instructions
-    assert "cayu check --json" in instructions
-    assert "pytest" in instructions
-    assert "cayu eval run" in instructions
+    assert "uv run cayu guide anatomy" in instructions
+    assert "uv run cayu inspect --json" in instructions
+    assert "uv run cayu check --json" in instructions
+    assert "uv run pytest" in instructions
+    assert "uv run cayu eval run" in instructions
     assert "cayu eval run evals.agent:build_eval" not in instructions
     assert "Edit the existing agent, test, and eval" in instructions
     assert "Tools are optional" in instructions
-    assert "src/cayu/guides/authoring.md#cayu-map" in instructions
-    assert "examples/README.md" in instructions
+    assert "uv run cayu guide authoring#cayu-map" in instructions
+    assert "uv run cayu guide references" in instructions
+    assert "github.com" not in instructions
     assert "Deployment is a separate task" in instructions
     assert "Clarify users, jobs, triggers" not in instructions
     assert "cayu generate slice" not in instructions
+    assert "uv run cayu generate tool TOOL_NAME --agent myproj --effect EFFECT" in instructions
 
 
 def test_cayu_new_uses_supported_hyphenated_project_name_for_the_agent(

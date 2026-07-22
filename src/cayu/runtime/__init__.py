@@ -206,7 +206,7 @@ from cayu.runtime.mcp_manifest_policy import (
     McpManifestPolicyError,
     copy_mcp_manifest_policy,
 )
-from cayu.runtime.outcomes import RunOutcome, run_to_completion
+from cayu.runtime.outcomes import RunOutcome, StructuredOutputResult, run_to_completion
 from cayu.runtime.retry_policy import (
     RetryDecision,
     RetryPolicy,
@@ -562,6 +562,7 @@ __all__ = [
     "StopLimit",
     "StoreManifest",
     "StructuredOutputError",
+    "StructuredOutputResult",
     "StructuredOutputSpec",
     "StructuredOutputStrategy",
     "StructuredOutputValidation",

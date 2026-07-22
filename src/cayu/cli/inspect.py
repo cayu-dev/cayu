@@ -5,6 +5,7 @@ import json
 import sys
 from typing import Any
 
+from cayu.cli._output import add_output_options, output_destination
 from cayu.cli.project import ProjectError, build_project_app, project_context, resolve_project
 from cayu.runtime.manifest import APP_MANIFEST_SCHEMA_VERSION, AppManifest
 
@@ -13,13 +14,17 @@ def add_inspect_parser(subparsers: Any) -> None:
     parser = subparsers.add_parser(
         "inspect",
         help="Describe a booted Cayu project without running it.",
+        description=(
+            "Describe a booted Cayu project without running it. This proves the "
+            "structural manifest only; use `cayu check` for diagnostics."
+        ),
     )
     parser.add_argument(
         "target",
         nargs="?",
         help="Override project discovery with a module:factory target.",
     )
-    parser.add_argument("--json", action="store_true", help="Emit the stable JSON manifest.")
+    add_output_options(parser)
     subjects = parser.add_mutually_exclusive_group()
     subjects.add_argument("--agent", help="Return one agent from the manifest.")
     subjects.add_argument("--tool", help="Return agents registering this tool.")
@@ -28,12 +33,21 @@ def add_inspect_parser(subparsers: Any) -> None:
 
 def run_inspect(args: argparse.Namespace) -> int:
     try:
+        with output_destination(args.output):
+            return _run_inspect(args)
+    except OSError as exc:
+        print(f"error: could not write output: {exc}", file=sys.stderr)
+        return 2
+
+
+def _run_inspect(args: argparse.Namespace) -> int:
+    try:
         project = resolve_project(args.target, command="cayu inspect")
         with project_context(project.root):
             app = build_project_app(project.target, command="Inspect")
             manifest = app.describe(project_root=project.root)
     except Exception as exc:
-        if args.json:
+        if args.output_format == "json":
             print(
                 json.dumps(
                     {
@@ -52,7 +66,7 @@ def run_inspect(args: argparse.Namespace) -> int:
 
     filtered, error = _filter_manifest(manifest, args)
     if error is not None:
-        if args.json:
+        if args.output_format == "json":
             print(
                 json.dumps(
                     {"schema_version": APP_MANIFEST_SCHEMA_VERSION, "error": error},
@@ -63,7 +77,7 @@ def run_inspect(args: argparse.Namespace) -> int:
             print(f"error: {error['message']}", file=sys.stderr)
         return 1
 
-    if args.json:
+    if args.output_format == "json":
         print(filtered.model_dump_json(indent=2))
     else:
         print(_render_human(filtered))

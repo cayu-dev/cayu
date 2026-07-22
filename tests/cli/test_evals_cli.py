@@ -25,6 +25,15 @@ from cayu.cli.evals import add_eval_parser
 from cayu.providers import ModelProvider, ModelStreamEvent
 
 
+def _captured_eval_error(capsys: pytest.CaptureFixture[str]) -> str:
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    payload = json.loads(captured.out)
+    assert payload["schema_version"] == "1"
+    assert payload["error"]["code"] == "EVAL_COMMAND_FAILED"
+    return payload["error"]["message"]
+
+
 def _write_cayu_project_config(
     root: Path,
     *,
@@ -83,12 +92,20 @@ def test_eval_run_parses_optional_case_timeout_as_float() -> None:
     add_eval_parser(subparsers)
 
     configured = parser.parse_args(
-        ["eval", "run", "example:build", "--case-timeout-seconds", "0.05"]
+        [
+            "eval",
+            "run",
+            "example:build",
+            "--case-timeout-seconds",
+            "0.05",
+            "--json",
+        ]
     )
     timeout_omitted = parser.parse_args(["eval", "run", "example:build"])
     target_omitted = parser.parse_args(["eval", "run"])
 
     assert configured.case_timeout_seconds == 0.05
+    assert configured.output_format == "json"
     assert timeout_omitted.case_timeout_seconds is None
     assert target_omitted.target is None
 
@@ -231,7 +248,7 @@ def test_eval_run_does_not_climb_past_nearest_project_missing_default(
 
     assert main(["eval", "run"]) == 1
 
-    error = capsys.readouterr().err
+    error = _captured_eval_error(capsys)
     assert str(project_pyproject) in error
     assert "[tool.cayu].eval_target is not configured" in error
     assert not parent_marker.exists()
@@ -266,7 +283,7 @@ def test_eval_run_does_not_climb_past_eval_target_only_project(
 
     assert main(["eval", "run"]) == 1
 
-    error = capsys.readouterr().err
+    error = _captured_eval_error(capsys)
     assert str(project_pyproject) in error
     assert "[tool.cayu].factory is not configured" in error
     assert 'factory = "module:build_app"' in error
@@ -284,7 +301,7 @@ def test_eval_run_reports_non_utf8_pyproject_path(
 
     assert main(["eval", "run"]) == 1
 
-    error = capsys.readouterr().err
+    error = _captured_eval_error(capsys)
     assert f"Could not read {pyproject}" in error
     assert "utf-8" in error
 
@@ -298,7 +315,7 @@ def test_eval_run_reports_missing_or_malformed_configured_target(
     monkeypatch.chdir(tmp_path)
 
     assert main(["eval", "run"]) == 1
-    missing_project_error = capsys.readouterr().err
+    missing_project_error = _captured_eval_error(capsys)
     assert "No Cayu project found" in missing_project_error
     assert '[tool.cayu] factory = "module:build_app"' in missing_project_error
     assert 'eval_target = "module:build_eval"' in missing_project_error
@@ -311,7 +328,7 @@ def test_eval_run_reports_missing_or_malformed_configured_target(
         )
 
         assert main(["eval", "run"]) == 1
-        error = capsys.readouterr().err
+        error = _captured_eval_error(capsys)
         assert str(pyproject) in error
         assert "[tool.cayu].eval_target must be a non-empty string" in error
 
@@ -369,7 +386,7 @@ def build():
     sys.modules.pop(module_name, None)
 
     assert main(["eval", "run", f"{module_name}:build"]) == 1
-    assert "Eval target must return EvalPlan" in capsys.readouterr().err
+    assert "Eval target must return EvalPlan" in _captured_eval_error(capsys)
     assert (first_project / "build-count.txt").read_text(encoding="utf-8") == "1"
     assert module_name not in sys.modules
     assert sys.path == original_path
@@ -377,7 +394,7 @@ def build():
     sys.modules.pop(module_name, None)
     monkeypatch.chdir(second_project)
     assert main(["eval", "run", f"{module_name}:build"]) == 1
-    error = capsys.readouterr().err
+    error = _captured_eval_error(capsys)
     assert "Command-line eval target could not be loaded" in error
     assert f"No module named '{module_name}'" in error
     assert sys.path == original_path
@@ -427,7 +444,7 @@ def build():
     sys.modules.pop(module_name, None)
 
     assert main(["eval", "run", f"{module_name}:build"]) == 1
-    assert "Eval target must return EvalPlan" in capsys.readouterr().err
+    assert "Eval target must return EvalPlan" in _captured_eval_error(capsys)
     loaded = json.loads((project / "import-state.json").read_text(encoding="utf-8"))
     assert loaded["source"] == "local"
     assert loaded["import_path"][0] == cwd
@@ -447,16 +464,16 @@ def test_eval_run_reports_clear_target_resolution_errors(
     sys.modules.pop(module_name, None)
 
     assert main(["eval", "run", "not-a-target"]) == 1
-    syntax_error = capsys.readouterr().err
+    syntax_error = _captured_eval_error(capsys)
     assert "Command-line eval target must use module:attribute syntax" in syntax_error
 
     assert main(["eval", "run", "missing_repo_local_eval:build"]) == 1
-    missing_error = capsys.readouterr().err
+    missing_error = _captured_eval_error(capsys)
     assert "Command-line eval target could not be loaded" in missing_error
     assert "No module named 'missing_repo_local_eval'" in missing_error
 
     assert main(["eval", "run", f"{module_name}:missing"]) == 1
-    attribute_error = capsys.readouterr().err
+    attribute_error = _captured_eval_error(capsys)
     assert "Command-line eval target could not be loaded" in attribute_error
     assert "has no attribute 'missing'" in attribute_error
 
@@ -474,7 +491,7 @@ def test_eval_run_configured_target_errors_identify_pyproject_source(
 
     assert main(["eval", "run"]) == 1
 
-    syntax_error = capsys.readouterr().err
+    syntax_error = _captured_eval_error(capsys)
     assert f"Configured eval target from {pyproject}" in syntax_error
     assert "must use module:attribute syntax" in syntax_error
 
@@ -484,7 +501,7 @@ def test_eval_run_configured_target_errors_identify_pyproject_source(
     )
     assert main(["eval", "run"]) == 1
 
-    error = capsys.readouterr().err
+    error = _captured_eval_error(capsys)
     assert f"Configured eval target from {pyproject}" in error
     assert "No module named 'missing_configured_eval'" in error
 
@@ -500,7 +517,7 @@ def test_eval_run_configured_target_errors_identify_pyproject_source(
 
     assert main(["eval", "run"]) == 1
 
-    invalid_error = capsys.readouterr().err
+    invalid_error = _captured_eval_error(capsys)
     assert f"Configured eval target from {pyproject}" in invalid_error
     assert "returned an invalid eval plan" in invalid_error
     assert "Eval target must return EvalPlan" in invalid_error

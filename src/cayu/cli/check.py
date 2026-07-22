@@ -5,6 +5,7 @@ import json
 import sys
 from typing import Any
 
+from cayu.cli._output import add_output_options, output_destination
 from cayu.cli.project import ProjectError, build_project_app, project_context, resolve_project
 from cayu.runtime.checks import (
     AVAILABLE_CHECK_TAGS,
@@ -19,13 +20,17 @@ def add_check_parser(subparsers: Any) -> None:
     parser = subparsers.add_parser(
         "check",
         help="Validate a booted Cayu project with actionable diagnostics.",
+        description=(
+            "Validate a booted Cayu project with actionable diagnostics. "
+            "Run `cayu guide diagnostics` to interpret stable finding codes."
+        ),
     )
     parser.add_argument(
         "target",
         nargs="?",
         help="Override project discovery with a module:factory target.",
     )
-    parser.add_argument("--json", action="store_true", help="Emit the stable JSON report.")
+    add_output_options(parser)
     parser.add_argument(
         "--tag",
         action="append",
@@ -46,11 +51,20 @@ def add_check_parser(subparsers: Any) -> None:
 
 
 def run_check(args: argparse.Namespace) -> int:
+    try:
+        with output_destination(args.output):
+            return _run_check(args)
+    except OSError as exc:
+        print(f"error: could not write output: {exc}", file=sys.stderr)
+        return 2
+
+
+def _run_check(args: argparse.Namespace) -> int:
     requested_tags = frozenset(args.tag)
     unknown = requested_tags - AVAILABLE_CHECK_TAGS
     if unknown:
         message = f"Unknown check tags: {', '.join(sorted(unknown))}."
-        _render_invocation_error(message, as_json=args.json)
+        _render_invocation_error(message, as_json=args.output_format == "json")
         return 2
     try:
         project = resolve_project(args.target, command="cayu check")
@@ -68,10 +82,10 @@ def run_check(args: argparse.Namespace) -> int:
             if isinstance(exc, ProjectError)
             else f"Application factory failed ({type(exc).__name__}): {exc}"
         )
-        _render_invocation_error(message, as_json=args.json)
+        _render_invocation_error(message, as_json=args.output_format == "json")
         return 2
 
-    if args.json:
+    if args.output_format == "json":
         print(report.model_dump_json(indent=2))
     else:
         print(_render_human(report))

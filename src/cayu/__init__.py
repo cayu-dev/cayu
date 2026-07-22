@@ -1,5 +1,6 @@
 """Cayu public API."""
 
+from cayu._version import __version__
 from cayu.artifacts import (
     DEFAULT_ARTIFACT_WORKSPACE_COPY_LIMIT_BYTES,
     DEFAULT_MAX_FILE_ATTACHMENT_BYTES,
@@ -163,6 +164,7 @@ from cayu.evals import (
     run_eval_case,
     run_eval_plan,
     run_eval_suite,
+    scripted_structured_output,
     trajectory_to_json,
     write_eval_run_json,
     write_html_report,
@@ -461,6 +463,7 @@ from cayu.runtime import (
     StopDecision,
     StopLimit,
     StructuredOutputError,
+    StructuredOutputResult,
     StructuredOutputSpec,
     StructuredOutputStrategy,
     StructuredOutputValidation,
@@ -1153,6 +1156,7 @@ __all__ = [
     "StopDecision",
     "StopLimit",
     "StructuredOutputError",
+    "StructuredOutputResult",
     "StructuredOutputSpec",
     "StructuredOutputStrategy",
     "StructuredOutputValidation",
@@ -1263,6 +1267,7 @@ __all__ = [
     "WorkspaceSnapshot",
     "WorkspaceToArtifactResult",
     "WriteFileTool",
+    "__version__",
     "business_approval_audit",
     "business_approval_routing",
     "business_approval_routing_metadata",
@@ -1335,6 +1340,7 @@ __all__ = [
     "run_project_entrypoint",
     "run_task_worker",
     "run_to_completion",
+    "scripted_structured_output",
     "secret_env_refs",
     "session_usage_summary",
     "step",

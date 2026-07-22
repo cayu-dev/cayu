@@ -3,16 +3,25 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 _NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*")
 
 GENERATED_IMPORTS_START = "# <cayu:generated-imports>"
 GENERATED_IMPORTS_END = "# </cayu:generated-imports>"
+GENERATED_STARTER_TOOLS_START = "# <cayu:generated-starter-tools>"
+GENERATED_STARTER_TOOLS_END = "# </cayu:generated-starter-tools>"
 GENERATED_REGISTRATIONS_START = "# <cayu:generated-registrations>"
 GENERATED_REGISTRATIONS_END = "# </cayu:generated-registrations>"
+GENERATED_AGENT_IMPORTS_START = "# <cayu:generated-agent-imports>"
+GENERATED_AGENT_IMPORTS_END = "# </cayu:generated-agent-imports>"
+GENERATED_AGENT_CONFIG_START = "# <cayu:generated-agent-config>"
+GENERATED_AGENT_CONFIG_END = "# </cayu:generated-agent-config>"
+PROVIDER_OVERRIDE_AGENT_HELPER = "_agent_for_provider_override"
 
 _APP_PY = '''"""Application factory for __PROJECT_NAME__.
 
@@ -23,6 +32,9 @@ stores, not this Python object, coordinate state between processes.
 import os
 
 from cayu import (
+    AgentSpec,
+    AlwaysRequireApprovalToolPolicy,
+    AnthropicProvider,
     CayuApp,
     ModelProvider,
     OpenAIProvider,
@@ -35,28 +47,43 @@ from cayu import (
 )
 
 from agents.agent import AGENT
+from configuration import configured_provider_choice
 
 # Generated tool-backed slices add their imports and registrations here.
 # <cayu:generated-imports>
 # </cayu:generated-imports>
 
-_UNCONFIGURED_PROVIDER_NAME = "openai-unconfigured"
+
+class _ScaffoldPlaceholderProvider(ScriptedModelProvider):
+    """Credential-free placeholder rejected only by live ``run.py`` validation."""
 
 
 def configured_provider() -> ModelProvider:
-    """Resolve the live provider only when its credential is available.
+    """Construct only the explicitly selected provider.
 
-    The no-key placeholder is intentionally non-runnable; it lets public
-    inspection and checking describe the project without claiming a live check.
-    Tests and evals inject their own ScriptedModelProvider explicitly.
+    Credential variables authenticate the selected provider; they never choose
+    one. A same-name scripted placeholder keeps inspection and hermetic proof
+    credential-free while ``run.py`` rejects it before live execution.
     """
 
-    if os.environ.get("CAYU_OPENAI_SUBSCRIPTION") == "1":
+    choice = configured_provider_choice()
+    if choice is None:
+        return _ScaffoldPlaceholderProvider([], name="unconfigured")
+    if choice == "openai-subscription":
         return OpenAISubscriptionProvider()
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if api_key:
-        return OpenAIProvider(api_key=api_key)
-    return ScriptedModelProvider([], name=_UNCONFIGURED_PROVIDER_NAME)
+    if choice == "openai":
+        api_key = os.environ.get("OPENAI_API_KEY")
+        return (
+            OpenAIProvider(api_key=api_key)
+            if api_key
+            else _ScaffoldPlaceholderProvider([], name="openai")
+        )
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    return (
+        AnthropicProvider(api_key=api_key)
+        if api_key
+        else _ScaffoldPlaceholderProvider([], name="anthropic")
+    )
 
 
 def validate_run_configuration(app: CayuApp, agent_name: str) -> None:
@@ -70,11 +97,26 @@ def validate_run_configuration(app: CayuApp, agent_name: str) -> None:
             f"agent {agent_name!r} does not resolve to exactly one model provider"
         )
     provider = app.get_provider(manifest_agent.resolved_provider)
-    if provider.name == _UNCONFIGURED_PROVIDER_NAME:
+    if not isinstance(provider, _ScaffoldPlaceholderProvider):
+        return
+    choice = configured_provider_choice()
+    if choice is None:
         raise RuntimeError(
-            "no live OpenAI provider is configured; set OPENAI_API_KEY, or run "
-            "`cayu auth openai login` and set CAYU_OPENAI_SUBSCRIPTION=1."
+            "no provider is selected; set CAYU_PROVIDER to openai, anthropic, or "
+            "openai-subscription (credentials do not select a provider)"
         )
+    credential = "OPENAI_API_KEY" if choice == "openai" else "ANTHROPIC_API_KEY"
+    raise RuntimeError(f"provider {choice!r} is selected but {credential} is not set")
+
+
+def _agent_for_provider_override(
+    agent: AgentSpec, provider: ModelProvider | None
+) -> AgentSpec:
+    """Route an agent through an explicitly injected test/eval provider."""
+
+    if provider is None:
+        return agent
+    return agent.model_copy(update={"provider_name": provider.name})
 
 
 def build_app(
@@ -97,25 +139,91 @@ def build_app(
     if selected_provider is None:
         selected_provider = configured_provider()
     app.register_provider(selected_provider, default=True)
-    app.register_agent(AGENT)
+    starter_tools = []
+    starter_external_tool_names = []
+    # <cayu:generated-starter-tools>
+    # </cayu:generated-starter-tools>
+    app.register_agent(
+        _agent_for_provider_override(AGENT, provider),
+        tools=starter_tools,
+        tool_policy=(
+            AlwaysRequireApprovalToolPolicy(tools=starter_external_tool_names)
+            if starter_external_tool_names
+            else None
+        ),
+    )
     # <cayu:generated-registrations>
     # </cayu:generated-registrations>
     return app
 '''
 
-_AGENT_PY = """import os
+_CONFIGURATION_PY = '''"""Explicit provider and compatible model selection for this application."""
 
-from cayu import AgentSpec
+import os
 
+_SCAFFOLDED_PROVIDER = __PROVIDER_LITERAL__
+_SUPPORTED_PROVIDERS = {"openai", "anthropic", "openai-subscription"}
+_PROVIDER_NAMES = {
+    "openai": "openai",
+    "anthropic": "anthropic",
+    "openai-subscription": "openai_subscription",
+}
+_DEFAULT_MODELS = {
+    "openai": "gpt-5.6-luna",
+    "anthropic": "claude-sonnet-4-6",
+    "openai-subscription": "gpt-5.4",
+}
+
+
+def configured_provider_choice() -> str | None:
+    """Return explicit project/env selection without inspecting credentials."""
+
+    selected = os.environ.get("CAYU_PROVIDER", _SCAFFOLDED_PROVIDER)
+    if selected is None:
+        return None
+    if selected not in _SUPPORTED_PROVIDERS:
+        choices = ", ".join(sorted(_SUPPORTED_PROVIDERS))
+        raise RuntimeError(f"CAYU_PROVIDER must be one of: {choices}")
+    return selected
+
+
+def configured_provider_name() -> str | None:
+    selected = configured_provider_choice()
+    return None if selected is None else _PROVIDER_NAMES[selected]
+
+
+def configured_model() -> str:
+    override = os.environ.get("CAYU_MODEL")
+    if override:
+        return override
+    selected = configured_provider_choice()
+    return (
+        "provider-model-unconfigured" if selected is None else _DEFAULT_MODELS[selected]
+    )
+'''
+
+_AGENT_PY = """from cayu import AgentSpec
+
+from configuration import configured_model, configured_provider_name
+
+# Generated first-tool imports and agent contract additions live in these regions.
+# <cayu:generated-agent-imports>
+# </cayu:generated-agent-imports>
+
+_SYSTEM_PROMPT_PARTS: list[str] = []
+_WORKFLOW_TOOL_NAMES: list[str] = []
+_AUTHORING_STATE: str | None = None
+
+# <cayu:generated-agent-config>
+# </cayu:generated-agent-config>
 
 AGENT = AgentSpec(
     name="__PROJECT_NAME__",
-    model=os.environ.get(
-        "CAYU_MODEL",
-        "gpt-5.4"
-        if os.environ.get("CAYU_OPENAI_SUBSCRIPTION") == "1"
-        else "gpt-5.6-luna",
-    ),
+    model=configured_model(),
+    provider_name=configured_provider_name(),
+    system_prompt="\\n".join(_SYSTEM_PROMPT_PARTS) or None,
+    workflow_tool_names=tuple(_WORKFLOW_TOOL_NAMES),
+    authoring_state=_AUTHORING_STATE,
 )
 """
 
@@ -216,10 +324,9 @@ _PYPROJECT = """[project]
 name = "__PROJECT_NAME__"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["cayu"]
+dependencies = ["cayu>=__CAYU_VERSION__"]
 
 [project.optional-dependencies]
-console = ["cayu[console]"]
 dev = ["pytest"]
 
 [tool.cayu]
@@ -245,21 +352,20 @@ Describe the requested job in `agents/agent.py`; update `tests/test_agent.py`
 and `evals/agent.py` to prove that behavior. The project factory is `build_app()`
 in `app.py`. Run `cayu guide anatomy` for its lifecycle contract.
 
-Use the [Cayu Map](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/authoring.md#cayu-map)
-to select another concept only when the requested behavior requires it. The
-[examples index](https://github.com/cayu-dev/cayu/blob/main/examples/README.md)
-links the smallest runnable references.
+Run `uv run cayu guide authoring#cayu-map` to select another concept only when
+the requested behavior requires it. `uv run cayu guide references` contains the
+package-shipped offline references.
 
 ## Setup and prove the project
 
 ```bash
-pip install -e '.[console,dev]' # or: uv sync --extra console --extra dev
-cayu guide anatomy
-cayu inspect --json
-cayu check --json
-pytest
-cayu eval run
-cayu session list
+uv sync --extra dev
+uv run cayu guide anatomy
+uv run cayu inspect --json
+uv run cayu check --json
+uv run pytest
+uv run cayu eval run
+uv run cayu session list
 ```
 
 These commands require no model API key. They prove project construction,
@@ -267,11 +373,32 @@ static wiring, a deterministic model response, and its eval.
 
 ## Run with a live provider
 
-Use your own ChatGPT subscription for local testing:
+Provider intent is explicit. This scaffold defaults to `__PROVIDER_DISPLAY__`;
+override it with `CAYU_PROVIDER=openai`, `anthropic`, or
+`openai-subscription`. API-key variables authenticate that choice and never
+select it automatically.
+
+OpenAI Platform API:
 
 ```bash
-cayu auth openai login
-CAYU_OPENAI_SUBSCRIPTION=1 python run.py --message "YOUR REQUEST"
+export CAYU_PROVIDER=openai
+export OPENAI_API_KEY=sk-...
+uv run python run.py --message "YOUR REQUEST"
+```
+
+Anthropic API:
+
+```bash
+export CAYU_PROVIDER=anthropic
+export ANTHROPIC_API_KEY=sk-ant-...
+uv run python run.py --message "YOUR REQUEST"
+```
+
+Your own ChatGPT subscription for local testing:
+
+```bash
+uv run cayu auth openai login
+CAYU_PROVIDER=openai-subscription uv run python run.py --message "YOUR REQUEST"
 ```
 
 Subscription mode selects `gpt-5.4` by default. Set `CAYU_MODEL` if your plan
@@ -281,15 +408,8 @@ This experimental path is intended for the subscription holder's own local
 development and evaluation. It is not intended for production, customer-facing
 or multi-user services, credential sharing, resale, or bypassing plan limits.
 For production, use the OpenAI Platform API or another officially supported
-provider. Read the full
-[support boundary](https://github.com/cayu-dev/cayu/blob/main/docs/openai-subscription.md).
-To use the documented OpenAI Platform API instead:
-
-```bash
-export OPENAI_API_KEY=sk-...
-python run.py --message "YOUR REQUEST"
-```
-
+provider. Run `uv run cayu guide providers#openai-subscription` for the local
+support boundary.
 `--agent` is optional while this is the only registered agent. The checked-in
 `AGENTS.md` is the local instruction surface for coding agents.
 """
@@ -321,22 +441,21 @@ one only for a real capability outside the model, such as reading a repository
 or calling an API. Do not create echo, pass-through, or placeholder tools.
 
 Use the Cayu Map to choose only the concepts the job needs:
-https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/authoring.md#cayu-map
+`uv run cayu guide authoring#cayu-map`.
 
-If another capability is required, use the smallest matching reference from:
-https://github.com/cayu-dev/cayu/blob/main/examples/README.md
+If another capability is required, use the smallest package-shipped reference
+from `uv run cayu guide references`.
 
 This scaffold is for local development. Deployment is a separate task.
 
 ## Project commands
 
-- Setup: `pip install -e '.[console,dev]'` or
-  `uv sync --extra console --extra dev`.
-- Application contract: `cayu guide anatomy`.
-- Authoring details: `cayu guide authoring`.
-- Inspect/check: `cayu inspect --json` and `cayu check --json`.
-- Hermetic proof: `pytest` and `cayu eval run`.
-- Live execution: `python run.py --message "USER REQUEST"` after configuring a
+- Setup: `uv sync --extra dev`.
+- Application contract: `uv run cayu guide anatomy`.
+- Authoring details: `uv run cayu guide authoring`.
+- Inspect/check: `uv run cayu inspect --json` and `uv run cayu check --json`.
+- Hermetic proof: `uv run pytest` and `uv run cayu eval run`.
+- Live execution: `uv run python run.py --message "USER REQUEST"` after configuring a
   provider in `app.configured_provider()`.
 
 Use public `cayu` imports and public CLI JSON only. Do not depend on Cayu source,
@@ -346,13 +465,26 @@ If the job truly needs a tool, read `cayu guide tool-effects`; every tool must
 declare `ToolEffect`, and effect metadata does not authorize execution. A
 `ScriptedModelProvider` proves handling of predetermined calls, not prompt
 comprehension or live model behavior.
+
+For the starter's first real tool, run
+`uv run cayu generate tool TOOL_NAME --agent __PROJECT_NAME__ --effect EFFECT`.
+Then replace the generated sample schema, implementation, test, and eval with
+domain behavior; `cayu check` keeps the tracer-bullet warning active until the
+explicit authoring marker is removed.
 """
 
 _GITIGNORE = "data/\n__pycache__/\n*.pyc\n.pytest_cache/\n.venv/\n"
 
 
 def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser("new", help="Scaffold a new Cayu agent project.")
+    parser = subparsers.add_parser(
+        "new",
+        help="Scaffold a new Cayu agent project.",
+        description=(
+            "Scaffold a new Cayu application project. Follow the printed `uv sync` "
+            "and credential-free verification commands next."
+        ),
+    )
     parser.add_argument("name", help="Project name (also the directory name).")
     parser.add_argument(
         "--dir",
@@ -360,14 +492,37 @@ def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
         default=".",
         help="Parent directory to create the project in (default: current directory).",
     )
+    parser.add_argument(
+        "--provider",
+        choices=("openai", "anthropic", "openai-subscription"),
+        help=(
+            "Explicit live-provider default. Omit for a provider-neutral scaffold; "
+            "CAYU_PROVIDER can select or override it later."
+        ),
+    )
 
 
-def project_files(name: str) -> dict[str, str]:
+def _installed_cayu_version() -> str:
+    try:
+        return version("cayu")
+    except PackageNotFoundError:
+        return "0.1.0rc1"
+
+
+def project_files(name: str, *, provider: str | None = None) -> dict[str, str]:
     def render(template: str) -> str:
-        return template.replace("__PROJECT_NAME__", name)
+        provider_display = provider or "no live provider"
+        provider_literal = "None" if provider is None else json.dumps(provider)
+        return (
+            template.replace("__PROJECT_NAME__", name)
+            .replace("__CAYU_VERSION__", _installed_cayu_version())
+            .replace("__PROVIDER_DISPLAY__", provider_display)
+            .replace("__PROVIDER_LITERAL__", provider_literal)
+        )
 
     return {
         "app.py": render(_APP_PY),
+        "configuration.py": render(_CONFIGURATION_PY),
         "run.py": _RUN_PY,
         "agents/__init__.py": "",
         "agents/agent.py": render(_AGENT_PY),
@@ -376,7 +531,7 @@ def project_files(name: str) -> dict[str, str]:
         "evals/agent.py": render(_EVAL_PY),
         "pyproject.toml": render(_PYPROJECT),
         "README.md": render(_README),
-        "AGENTS.md": _AGENTS_MD,
+        "AGENTS.md": render(_AGENTS_MD),
         ".gitignore": _GITIGNORE,
     }
 
@@ -399,16 +554,20 @@ def run_new(args: argparse.Namespace) -> int:
         print(f"error: {target} already exists and is not empty.", file=sys.stderr)
         return 1
 
-    for rel, content in project_files(name).items():
+    for rel, content in project_files(name, provider=args.provider).items():
         path = target / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
 
     print(f"Scaffolded {target}/ — credential-free proof:")
     print(f"  cd {target}")
-    print("  pip install -e '.[console,dev]'  # or: uv sync --extra console --extra dev")
-    print("  cayu inspect --json")
-    print("  cayu check --json")
-    print("  pytest")
-    print("  cayu eval run")
+    print("  uv sync --extra dev")
+    print("  uv run cayu inspect --json")
+    print("  uv run cayu check --json")
+    print("  uv run pytest")
+    print("  uv run cayu eval run")
+    if args.provider is None:
+        print("  Live provider: none selected; set CAYU_PROVIDER explicitly before `run.py`.")
+    else:
+        print(f"  Live provider: {args.provider} (credentials authenticate this choice).")
     return 0

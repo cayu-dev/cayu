@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import importlib
 import os
 import subprocess
@@ -11,8 +12,25 @@ from typing import Any, cast
 import pytest
 
 from cayu import ModelStreamEvent, ScriptedModelProvider, run_project_entrypoint
+from cayu.cli import _build_parser
 from cayu.cli import main as cayu_main
 from cayu.cli.project import project_context
+
+
+def test_every_cli_command_help_has_a_purpose_and_next_step() -> None:
+    pending = [_build_parser()]
+    descriptions: dict[str, str | None] = {}
+    while pending:
+        parser = pending.pop()
+        for action in parser._actions:
+            if not isinstance(action, argparse._SubParsersAction):
+                continue
+            for _name, child in action.choices.items():
+                descriptions[child.prog] = child.description
+                pending.append(child)
+
+    assert descriptions
+    assert not {command: value for command, value in descriptions.items() if not value}
 
 
 def _completed_provider(text: str) -> ScriptedModelProvider:
@@ -129,8 +147,8 @@ def test_generated_command_explains_how_to_configure_a_live_provider(
     assert completed.returncode == 2
     assert completed.stdout == ""
     assert completed.stderr == (
-        "setup error: no live OpenAI provider is configured; set OPENAI_API_KEY, or run "
-        "`cayu auth openai login` and set CAYU_OPENAI_SUBSCRIPTION=1.\n"
+        "setup error: no provider is selected; set CAYU_PROVIDER to openai, anthropic, "
+        "or openai-subscription (credentials do not select a provider)\n"
     )
 
 
@@ -207,7 +225,7 @@ def test_generated_command_selects_a_generated_agent(
     assert len(provider.requests) == 1
 
 
-def test_generated_provider_validation_follows_model_pattern_routing(
+def test_generated_provider_validation_does_not_infer_intent_from_model_patterns(
     tmp_path: Path,
     monkeypatch,
     capsys,
@@ -225,9 +243,9 @@ def test_generated_provider_validation_follows_model_pattern_routing(
         command_module.build_app = lambda: app
         result = command_module.main(["--message", "Route this."])
 
-    assert result == 0
-    assert capsys.readouterr().out == "Routed result.\n"
-    assert len(routed_provider.requests) == 1
+    assert result == 2
+    assert "no provider is selected" in capsys.readouterr().err
+    assert routed_provider.requests == []
 
 
 def test_entrypoint_lists_agents_before_calling_provider(

@@ -18,6 +18,7 @@ BUILTIN_DIAGNOSTIC_CODES = (
     "APP_NO_AGENTS",
     "EXTERNAL_TOOL_COVERAGE_UNKNOWN",
     "EXTERNAL_TOOL_UNGUARDED",
+    "TOOL_INPUT_SCHEMA_UNCONSTRAINED",
 )
 
 
@@ -92,7 +93,7 @@ def check_manifest(
                     path=f"agents.{agent.name}.authoring_state",
                     message=(
                         f"Agent '{agent.name}' is still marked as an unfinished generated "
-                        "tracer bullet; generated echo/sample behavior is not domain completion."
+                        "tracer bullet; generated placeholder behavior is not domain completion."
                     ),
                     hint=(
                         "Replace the domain system prompt, tool schema and body, runtime test "
@@ -191,6 +192,32 @@ def check_manifest(
             )
 
         for tool in agent.tools:
+            if not tool.input_schema:
+                diagnostics.append(
+                    ProjectDiagnostic(
+                        code="TOOL_INPUT_SCHEMA_UNCONSTRAINED",
+                        severity=DiagnosticSeverity.WARNING,
+                        subject=f"tool:{agent.name}/{tool.name}",
+                        path=f"agents.{agent.name}.tools.{tool.name}.input_schema",
+                        message=(
+                            f"Tool '{tool.name}' uses an empty object, which is valid JSON "
+                            "Schema but accepts every JSON value."
+                        ),
+                        hint=(
+                            "Declare the tool's expected object properties, required fields, "
+                            "and additionalProperties behavior in ToolSpec.input_schema or "
+                            "the Tool.schema property."
+                        ),
+                        tags=("authoring", "deploy"),
+                        parameters={"agent": agent.name, "tool": tool.name},
+                        documentation_anchor=(
+                            "cayu guide diagnostics#tool-input-schema-unconstrained"
+                        ),
+                        verification_command=(
+                            "cayu inspect --json && cayu check --fail-on warning --json"
+                        ),
+                    )
+                )
             if tool.effect != "external" or tool.policy_coverage in {
                 "conditional",
                 "denied",

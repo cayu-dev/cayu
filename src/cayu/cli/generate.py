@@ -17,17 +17,26 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
+from cayu.cli._output import add_output_options, output_destination
 from cayu.cli.project import ProjectError, resolve_project
 from cayu.cli.scaffold import (
+    GENERATED_AGENT_CONFIG_END,
+    GENERATED_AGENT_CONFIG_START,
+    GENERATED_AGENT_IMPORTS_END,
+    GENERATED_AGENT_IMPORTS_START,
     GENERATED_IMPORTS_END,
     GENERATED_IMPORTS_START,
     GENERATED_REGISTRATIONS_END,
     GENERATED_REGISTRATIONS_START,
+    GENERATED_STARTER_TOOLS_END,
+    GENERATED_STARTER_TOOLS_START,
+    PROVIDER_OVERRIDE_AGENT_HELPER,
 )
 from cayu.core.agents import AgentAuthoringState
+from cayu.runtime.manifest import APP_MANIFEST_SCHEMA_VERSION
 
 _IDENTIFIER_RE = re.compile(r"[a-z][a-z0-9_]*")
-GENERATOR_PLAN_SCHEMA_VERSION = "3"
+GENERATOR_PLAN_SCHEMA_VERSION = APP_MANIFEST_SCHEMA_VERSION
 
 
 class GeneratorEdit(BaseModel):
@@ -51,7 +60,7 @@ class GeneratorPrecondition(BaseModel):
 class GeneratorPlan(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal["3"] = GENERATOR_PLAN_SCHEMA_VERSION
+    schema_version: Literal["4"] = GENERATOR_PLAN_SCHEMA_VERSION
     status: Literal["ready", "conflict", "manual_action_required", "already_present"]
     slice_name: str
     tool_name: str
@@ -94,11 +103,19 @@ def add_generate_parser(subparsers: Any) -> None:
     parser = subparsers.add_parser(
         "generate",
         help="Plan or add reviewable generated Cayu application slices.",
+        description=(
+            "Plan or add reviewable generated Cayu application slices. "
+            "Use `--dry-run` to inspect the plan without writing files."
+        ),
     )
     generators = parser.add_subparsers(dest="generate_command", required=True)
     slice_parser = generators.add_parser(
         "slice",
         help="Add one agent, typed tool, runtime test, and trajectory eval.",
+        description=(
+            "Add one agent, typed tool, runtime test, and trajectory eval. "
+            "Finish the generated tracer bullet, then run its verification commands."
+        ),
     )
     slice_parser.add_argument("name", help="snake_case agent/slice name.")
     slice_parser.add_argument("--tool", required=True, help="snake_case tool name.")
@@ -109,24 +126,58 @@ def add_generate_parser(subparsers: Any) -> None:
         help="Declared ToolEffect. See `cayu guide tool-effects` for the decision table.",
     )
     slice_parser.add_argument("--dry-run", action="store_true", help="Plan without writes.")
-    slice_parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit the versioned plan without writing files.",
+    add_output_options(slice_parser)
+    tool_parser = generators.add_parser(
+        "tool",
+        help="Attach the first generated tool tracer bullet to the starter agent.",
+        description=(
+            "Attach the first generated tool tracer bullet to the starter agent. "
+            "Finish its domain behavior, then run `cayu check`."
+        ),
     )
+    tool_parser.add_argument("name", help="snake_case tool name.")
+    tool_parser.add_argument(
+        "--agent",
+        required=True,
+        help="Existing scaffolded starter agent name.",
+    )
+    tool_parser.add_argument(
+        "--effect",
+        choices=("none", "idempotent", "external"),
+        required=True,
+        help="Declared ToolEffect. See `cayu guide tool-effects` for the decision table.",
+    )
+    tool_parser.add_argument("--dry-run", action="store_true", help="Plan without writes.")
+    add_output_options(tool_parser)
 
 
 def run_generate(args: argparse.Namespace) -> int:
-    if args.generate_command != "slice":
+    try:
+        with output_destination(args.output):
+            return _run_generate(args)
+    except OSError as exc:
+        print(f"error: could not write output: {exc}", file=sys.stderr)
+        return 2
+
+
+def _run_generate(args: argparse.Namespace) -> int:
+    if args.generate_command not in {"slice", "tool"}:
         return 2
     try:
-        plan = plan_slice(
-            name=args.name,
-            tool_name=args.tool,
-            effect=args.effect,
-        )
+        if args.generate_command == "slice":
+            plan = plan_slice(
+                name=args.name,
+                tool_name=args.tool,
+                effect=args.effect,
+            )
+        else:
+            plan = plan_tool(
+                tool_name=args.name,
+                agent_name=args.agent,
+                effect=args.effect,
+            )
     except (ProjectError, ValueError, OSError) as exc:
-        if args.json:
+        if args.output_format == "json":
             print(
                 json.dumps(
                     {
@@ -140,18 +191,251 @@ def run_generate(args: argparse.Namespace) -> int:
             print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    should_apply = not args.dry_run and not args.json and plan.status == "ready"
+    should_apply = not args.dry_run and plan.status == "ready"
     if should_apply:
         try:
             apply_slice_plan(plan)
         except (GeneratorApplyError, ProjectError, OSError) as exc:
-            print(f"error: {exc}", file=sys.stderr)
+            if args.output_format == "json":
+                print(
+                    json.dumps(
+                        {
+                            "schema_version": GENERATOR_PLAN_SCHEMA_VERSION,
+                            "error": {"code": "GENERATOR_APPLY_FAILED", "message": str(exc)},
+                        },
+                        sort_keys=True,
+                    )
+                )
+            else:
+                print(f"error: {exc}", file=sys.stderr)
             return 2
-    if args.json:
+    if args.output_format == "json":
         print(plan.model_dump_json(indent=2))
     else:
         print(_render_plan(plan, applied=should_apply))
     return 0 if plan.status in {"ready", "already_present"} else 1
+
+
+def plan_tool(*, tool_name: str, agent_name: str, effect: str) -> GeneratorPlan:
+    """Plan the first tool tracer bullet for the updated scaffold starter."""
+
+    tool_name = _identifier(tool_name, "tool name")
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", agent_name):
+        raise ValueError("agent name must match a scaffolded Cayu agent name.")
+    if effect not in {"none", "idempotent", "external"}:
+        raise ValueError("effect must be none, idempotent, or external.")
+    project = resolve_project(command="cayu generate")
+    root = project.root
+    app_path = _generated_path(root, "app.py")
+    agent_path = _generated_path(root, "agents/agent.py")
+    if not app_path.is_file() or not agent_path.is_file():
+        raise ValueError(
+            "First-tool generation requires app.py and agents/agent.py from `cayu new`."
+        )
+    app_source = app_path.read_text(encoding="utf-8")
+    agent_source = agent_path.read_text(encoding="utf-8")
+    conflicts: list[dict[str, str]] = []
+    edits: list[GeneratorEdit] = []
+    preconditions: dict[str, GeneratorPrecondition] = {}
+    marker_contracts = (
+        ("app.py", app_source, GENERATED_IMPORTS_START, GENERATED_IMPORTS_END),
+        (
+            "app.py",
+            app_source,
+            GENERATED_STARTER_TOOLS_START,
+            GENERATED_STARTER_TOOLS_END,
+        ),
+        (
+            "agents/agent.py",
+            agent_source,
+            GENERATED_AGENT_IMPORTS_START,
+            GENERATED_AGENT_IMPORTS_END,
+        ),
+        (
+            "agents/agent.py",
+            agent_source,
+            GENERATED_AGENT_CONFIG_START,
+            GENERATED_AGENT_CONFIG_END,
+        ),
+    )
+    missing_markers = [
+        f"{path}: {start}; {end}"
+        for path, source, start, end in marker_contracts
+        if source.count(start) != 1 or source.count(end) != 1
+    ]
+    if missing_markers:
+        return GeneratorPlan(
+            status="manual_action_required",
+            slice_name=agent_name,
+            tool_name=tool_name,
+            effect=effect,
+            edits=(),
+            conflicts=(
+                {
+                    "path": "app.py / agents/agent.py",
+                    "operation": "update_region",
+                    "reason": (
+                        "first-tool generation requires intact machine-owned starter markers; "
+                        f"missing or duplicated: {', '.join(missing_markers)}"
+                    ),
+                },
+            ),
+            verification_commands=_tool_verification_commands(tool_name),
+        )
+
+    inspection = _inspect_registered_agents(root, app_source)
+    origins = inspection.origins_by_name.get(agent_name, ())
+    expected_origin = ("agents.agent", "AGENT")
+    if origins != (expected_origin,):
+        rendered = ", ".join(_render_agent_origin(origin) for origin in origins) or "none"
+        conflicts.append(
+            {
+                "path": "app.py",
+                "operation": "update_region",
+                "reason": (
+                    f"agent {agent_name!r} is not the scaffold starter registered from "
+                    f"agents.agent.AGENT (found: {rendered})"
+                ),
+            }
+        )
+    if inspection.unresolved_origins:
+        conflicts.append(
+            {
+                "path": "app.py",
+                "operation": "update_region",
+                "reason": (
+                    "cannot safely attach a first tool while an agent registration has a "
+                    "dynamic identity"
+                ),
+            }
+        )
+
+    tool_class = f"{_class_name(tool_name)}Tool"
+    tool_constant = f"{_constant_name(tool_name)}_TOOL_NAME"
+    app_imports = [f"from tools.{tool_name} import {tool_class}"]
+    app_tool_statements = [f"starter_tools.append({tool_class}())"]
+    if effect == "external":
+        app_imports = [f"from tools.{tool_name} import {tool_class}, {tool_constant}"]
+        app_tool_statements.append(f"starter_external_tool_names.append({tool_constant})")
+    agent_imports = [f"from tools.{tool_name} import {tool_constant}"]
+    agent_config = [
+        f'_SYSTEM_PROMPT_PARTS.append(f"Use {{{tool_constant}}} when it directly answers '
+        "the user's request.\")",
+        f"_WORKFLOW_TOOL_NAMES.append({tool_constant})",
+        '_AUTHORING_STATE = "unfinished_generated_tracer_bullet"',
+    ]
+    generated_regions = (
+        (
+            "app.py",
+            app_source,
+            GENERATED_STARTER_TOOLS_START,
+            GENERATED_STARTER_TOOLS_END,
+            app_tool_statements,
+        ),
+        (
+            "agents/agent.py",
+            agent_source,
+            GENERATED_AGENT_IMPORTS_START,
+            GENERATED_AGENT_IMPORTS_END,
+            agent_imports,
+        ),
+        (
+            "agents/agent.py",
+            agent_source,
+            GENERATED_AGENT_CONFIG_START,
+            GENERATED_AGENT_CONFIG_END,
+            agent_config,
+        ),
+    )
+    for path, source, start, end, additions in generated_regions:
+        if not _region_contains_only(source, start=start, end=end, statements=additions):
+            conflicts.append(
+                {
+                    "path": path,
+                    "operation": "update_region",
+                    "reason": (
+                        "the starter already has generated or customized tool wiring; "
+                        "this command attaches only its first tool"
+                    ),
+                }
+            )
+
+    _plan_tool_files(
+        root,
+        _first_tool_files(agent_name=agent_name, tool_name=tool_name, effect=effect),
+        edits=edits,
+        conflicts=conflicts,
+        preconditions=preconditions,
+    )
+    if not conflicts:
+        updated_app = _update_region(
+            app_source,
+            start=GENERATED_IMPORTS_START,
+            end=GENERATED_IMPORTS_END,
+            additions=app_imports,
+        )
+        updated_app = _update_region(
+            updated_app,
+            start=GENERATED_STARTER_TOOLS_START,
+            end=GENERATED_STARTER_TOOLS_END,
+            additions=app_tool_statements,
+        )
+        if updated_app != app_source:
+            edits.append(
+                _edit(
+                    "app.py",
+                    "update_region",
+                    updated_app,
+                    anchor=(f"{GENERATED_IMPORTS_START}; {GENERATED_STARTER_TOOLS_START}"),
+                    preimage=app_source,
+                )
+            )
+        else:
+            _record_precondition(preconditions, _file_precondition(root, "app.py"))
+
+        updated_agent = _update_region(
+            agent_source,
+            start=GENERATED_AGENT_IMPORTS_START,
+            end=GENERATED_AGENT_IMPORTS_END,
+            additions=agent_imports,
+        )
+        updated_agent = _update_region(
+            updated_agent,
+            start=GENERATED_AGENT_CONFIG_START,
+            end=GENERATED_AGENT_CONFIG_END,
+            additions=agent_config,
+        )
+        if updated_agent != agent_source:
+            edits.append(
+                _edit(
+                    "agents/agent.py",
+                    "update_region",
+                    updated_agent,
+                    anchor=(f"{GENERATED_AGENT_IMPORTS_START}; {GENERATED_AGENT_CONFIG_START}"),
+                    preimage=agent_source,
+                )
+            )
+        else:
+            _record_precondition(preconditions, _file_precondition(root, "agents/agent.py"))
+
+    if conflicts:
+        status: Literal["ready", "conflict", "manual_action_required", "already_present"] = (
+            "conflict"
+        )
+    elif edits:
+        status = "ready"
+    else:
+        status = "already_present"
+    return GeneratorPlan(
+        status=status,
+        slice_name=agent_name,
+        tool_name=tool_name,
+        effect=effect,
+        edits=tuple(sorted(edits, key=lambda item: item.path)),
+        preconditions=tuple(preconditions[path] for path in sorted(preconditions)),
+        conflicts=tuple(conflicts),
+        verification_commands=_tool_verification_commands(tool_name),
+    )
 
 
 def plan_slice(*, name: str, tool_name: str, effect: str) -> GeneratorPlan:
@@ -172,10 +456,10 @@ def plan_slice(*, name: str, tool_name: str, effect: str) -> GeneratorPlan:
         content_sha256=_sha256(app_content),
     )
     verification = (
-        "cayu inspect --json",
-        "cayu check --json",
-        f"pytest tests/test_{name}.py",
-        f"cayu eval run evals.{name}:build_eval",
+        "uv run cayu inspect --json",
+        "uv run cayu check --json",
+        f"uv run pytest tests/test_{name}.py",
+        f"uv run cayu eval run evals.{name}:build_eval",
     )
     independent = _slice_files(name=name, tool_name=tool_name, effect=effect)
     tool_imports = [_class_name(tool_name) + "Tool"]
@@ -185,21 +469,19 @@ def plan_slice(*, name: str, tool_name: str, effect: str) -> GeneratorPlan:
         f"from agents.{name} import {_constant_name(name)}_AGENT",
         f"from tools.{tool_name} import {', '.join(tool_imports)}",
     ]
-    if effect == "external":
-        import_lines.append("from cayu import AlwaysRequireApprovalToolPolicy")
     agent_constant = f"{_constant_name(name)}_AGENT"
     tool_instance = f"{_class_name(tool_name)}Tool()"
+    registration_lines = [
+        "app.register_agent(",
+        f"    {PROVIDER_OVERRIDE_AGENT_HELPER}({agent_constant}, provider),",
+        f"    tools=[{tool_instance}],",
+    ]
     if effect == "external":
-        registration = (
-            "app.register_agent(\n"
-            f"    {agent_constant},\n"
-            f"    tools=[{tool_instance}],\n"
-            "    tool_policy=AlwaysRequireApprovalToolPolicy("
-            f"tools=[{tool_name_constant}]),\n"
-            ")"
+        registration_lines.append(
+            f"    tool_policy=AlwaysRequireApprovalToolPolicy(tools=[{tool_name_constant}]),"
         )
-    else:
-        registration = f"app.register_agent({agent_constant}, tools=[{tool_instance}])"
+    registration_lines.append(")")
+    registration = "\n".join(registration_lines)
 
     conflicts: list[dict[str, str]] = []
     edits: list[GeneratorEdit] = []
@@ -435,6 +717,7 @@ def _inspect_registered_agents(
         if registered is None:
             unresolved.add(("app.py", "register_agent"))
             continue
+        registered = _unwrap_provider_override_agent(registered)
         if isinstance(registered, ast.Call):
             origin = ("app.py", "inline AgentSpec")
             agent_name = _literal_agent_spec_name(registered, app_literals)
@@ -560,6 +843,18 @@ def _registered_agent_argument(node: ast.Call) -> ast.expr | None:
     if node.args:
         return node.args[0]
     return next((item.value for item in node.keywords if item.arg == "spec"), None)
+
+
+def _unwrap_provider_override_agent(node: ast.expr) -> ast.expr:
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == PROVIDER_OVERRIDE_AGENT_HELPER
+        and len(node.args) == 2
+        and not node.keywords
+    ):
+        return node.args[0]
+    return node
 
 
 def _literal_agent_name(
@@ -764,6 +1059,27 @@ def _region_contains_statement(
     return _statement_key(statement) in {item.key for item in existing}
 
 
+def _region_contains_only(
+    source: str,
+    *,
+    start: str,
+    end: str,
+    statements: list[str],
+) -> bool:
+    """Allow an untouched region or the exact idempotent first-tool expansion."""
+
+    bounds = _region_bounds(source, start=start, end=end)
+    if bounds is None:
+        return False
+    body_start, body_end, _ = bounds
+    existing, trailing = _parse_region_statements(source[body_start:body_end])
+    if trailing.strip():
+        return False
+    existing_keys = {item.key for item in existing}
+    planned_keys = {_statement_key(statement) for statement in statements}
+    return existing_keys <= planned_keys
+
+
 def apply_slice_plan(plan: GeneratorPlan) -> None:
     """Apply a ready slice plan as an all-or-nothing filesystem transaction."""
 
@@ -960,12 +1276,15 @@ def _slice_files(*, name: str, tool_name: str, effect: str) -> dict[str, str]:
     )
     agent = f'''from cayu import AgentAuthoringState, AgentSpec
 
+from configuration import configured_model, configured_provider_name
+
 from tools.{tool_name} import {tool_name_constant}
 
 
 {agent_constant} = AgentSpec(
     name="{name}",
-    model="gpt-5.6-luna",
+    model=configured_model(),
+    provider_name=configured_provider_name(),
     system_prompt=f"Use {{{tool_name_constant}}} when it directly answers the user's request.",
     workflow_tool_names=({tool_name_constant},),
     authoring_state=AgentAuthoringState.UNFINISHED_GENERATED_TRACER_BULLET,
@@ -1091,6 +1410,229 @@ def build_eval() -> EvalPlan:
         f"tests/test_{name}.py": test,
         f"evals/{name}.py": eval_source,
     }
+
+
+def _first_tool_files(*, agent_name: str, tool_name: str, effect: str) -> dict[str, str]:
+    """Render a tool and its public runtime/eval tracer bullet for an existing agent."""
+
+    tool_name_constant = f"{_constant_name(tool_name)}_TOOL_NAME"
+    tool_class = f"{_class_name(tool_name)}Tool"
+    effect_constant = effect.upper()
+    if effect == "external":
+        test_assertions = """    assert outcome.status is SessionStatus.INTERRUPTED
+    assert any(
+        event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED for event in outcome.events
+    )"""
+        eval_assertions = """                        SessionInterrupted(),
+                        EventOccurred(EventType.TOOL_CALL_APPROVAL_REQUESTED),"""
+        test_effect_imports = {"EventType", "SessionStatus"}
+        eval_effect_imports = {"EventOccurred", "EventType", "SessionInterrupted"}
+    else:
+        test_assertions = f'''    assert outcome.ok
+    assert outcome.final_text == "{agent_name} completed sample."'''
+        eval_assertions = f"""                        SessionCompleted(),
+                        ToolCalled({tool_name_constant}),
+                        FinalOutputContains("sample"),"""
+        test_effect_imports = set()
+        eval_effect_imports = {"FinalOutputContains", "SessionCompleted", "ToolCalled"}
+    test_imports = "\n".join(
+        f"    {import_name},"
+        for import_name in sorted(
+            {
+                "InMemorySessionStore",
+                "InMemoryTaskStore",
+                "Message",
+                "ModelStreamEvent",
+                "RunRequest",
+                "ScriptedModelProvider",
+                "run_to_completion",
+                *test_effect_imports,
+            }
+        )
+    )
+    eval_imports = "\n".join(
+        f"    {import_name},"
+        for import_name in sorted(
+            {
+                "EvalCase",
+                "EvalPlan",
+                "EvalSuite",
+                "InMemorySessionStore",
+                "InMemoryTaskStore",
+                "Message",
+                "ModelStreamEvent",
+                "RunRequest",
+                "ScriptedModelProvider",
+                *eval_effect_imports,
+            }
+        )
+    )
+    tool = f'''from cayu import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+
+
+{tool_name_constant} = "{tool_name}"
+
+
+class {tool_class}(Tool):
+    spec = ToolSpec(
+        name={tool_name_constant},
+        effect=ToolEffect.{effect_constant},
+        description="Process one explicit input for the {agent_name} agent.",
+        input_schema={{
+            "type": "object",
+            "properties": {{"input": {{"type": "string"}}}},
+            "required": ["input"],
+            "additionalProperties": False,
+        }},
+    )
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        return ToolResult(content=f"{tool_name}: {{args['input']}}")
+'''
+    test = f'''from __future__ import annotations
+
+import asyncio
+
+from cayu import (
+{test_imports}
+)
+
+from app import build_app
+from tools.{tool_name} import {tool_name_constant}
+
+
+def test_{tool_name}_runs_through_public_runtime_seams() -> None:
+    provider = ScriptedModelProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    name={tool_name_constant}, arguments={{"input": "sample"}}
+                ),
+                ModelStreamEvent.completed({{"finish_reason": "tool_calls"}}),
+            ],
+            [
+                ModelStreamEvent.text_delta("{agent_name} completed sample."),
+                ModelStreamEvent.completed({{"finish_reason": "stop"}}),
+            ],
+        ]
+    )
+    app = build_app(
+        provider=provider,
+        session_store=InMemorySessionStore(),
+        task_store=InMemoryTaskStore(),
+    )
+    outcome = asyncio.run(
+        run_to_completion(
+            app,
+            RunRequest(
+                agent_name="{agent_name}",
+                messages=[Message.text("user", "Process sample")],
+                max_steps=2,
+            ),
+        )
+    )
+{test_assertions}
+'''
+    eval_source = f'''from cayu import (
+{eval_imports}
+)
+
+from app import build_app
+from tools.{tool_name} import {tool_name_constant}
+
+
+def build_eval() -> EvalPlan:
+    provider = ScriptedModelProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    name={tool_name_constant}, arguments={{"input": "sample"}}
+                ),
+                ModelStreamEvent.completed({{"finish_reason": "tool_calls"}}),
+            ],
+            [
+                ModelStreamEvent.text_delta("{agent_name} completed sample."),
+                ModelStreamEvent.completed({{"finish_reason": "stop"}}),
+            ],
+        ]
+    )
+    app = build_app(
+        provider=provider,
+        session_store=InMemorySessionStore(),
+        task_store=InMemoryTaskStore(),
+    )
+    return EvalPlan(
+        app=app,
+        suite=EvalSuite(
+            id="{tool_name}-trajectory",
+            cases=[
+                EvalCase(
+                    id="{agent_name}-uses-{tool_name}",
+                    request=RunRequest(
+                        agent_name="{agent_name}",
+                        messages=[Message.text("user", "Process sample")],
+                        max_steps=2,
+                    ),
+                    assertions=[
+{eval_assertions}
+                    ],
+                )
+            ],
+        ),
+    )
+'''
+    return {
+        f"tools/{tool_name}.py": tool,
+        f"tests/test_{tool_name}.py": test,
+        f"evals/{tool_name}.py": eval_source,
+    }
+
+
+def _plan_tool_files(
+    root: Path,
+    files: dict[str, str],
+    *,
+    edits: list[GeneratorEdit],
+    conflicts: list[dict[str, str]],
+    preconditions: dict[str, GeneratorPrecondition],
+) -> None:
+    package_init = "tools/__init__.py"
+    package_path = _generated_path(root, package_init)
+    if not package_path.exists():
+        edits.append(_edit(package_init, "create", ""))
+    elif not package_path.is_file():
+        conflicts.append(
+            {
+                "path": package_init,
+                "operation": "create",
+                "reason": "path exists and is not a regular file",
+            }
+        )
+    else:
+        _record_precondition(preconditions, _file_precondition(root, package_init))
+    for relative, content in sorted(files.items()):
+        path = _generated_path(root, relative)
+        if not path.exists():
+            edits.append(_edit(relative, "create", content))
+        elif not path.is_file() or path.read_text(encoding="utf-8") != content:
+            conflicts.append(
+                {
+                    "path": relative,
+                    "operation": "create",
+                    "reason": "path exists with user-authored or different content",
+                }
+            )
+        else:
+            _record_precondition(preconditions, _file_precondition(root, relative))
+
+
+def _tool_verification_commands(tool_name: str) -> tuple[str, ...]:
+    return (
+        "uv run cayu inspect --json",
+        "uv run cayu check --json",
+        f"uv run pytest tests/test_{tool_name}.py",
+        f"uv run cayu eval run evals.{tool_name}:build_eval",
+    )
 
 
 def _edit(

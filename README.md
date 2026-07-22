@@ -133,9 +133,9 @@ when an application only needs the result. It retains the complete event stream
 in `RunOutcome.events`; use it for bounded runs. Consume `CayuApp.run(...)`
 incrementally for long-lived or high-volume runs.
 
-For a runnable example with no API key, use
-[`examples/echo_tool_runtime.py`](https://github.com/cayu-dev/cayu/blob/main/examples/echo_tool_runtime.py). To add
-workspace tools and command execution, see
+For a credential-free domain-tool tracer bullet, run `cayu guide
+references#domain-tool`, then use `cayu generate tool`. To add workspace tools
+and command execution, see
 [`examples/local_environment_runtime.py`](https://github.com/cayu-dev/cayu/blob/main/examples/local_environment_runtime.py).
 
 ### Build with a coding agent
@@ -151,8 +151,10 @@ cayu inspect --json
 cayu check --fail-on warning --json
 ```
 
-The [authoring guide and Cayu Map](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/authoring.md#cayu-map)
-route each optional capability to the smallest relevant guide. The
+The package-shipped `cayu guide authoring#cayu-map` routes each optional
+capability to the smallest version-matched local reference. Its online
+[source mirror](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/authoring.md#cayu-map)
+is secondary. The
 [examples index](https://github.com/cayu-dev/cayu/blob/main/examples/README.md)
 provides runnable references without making them required project structure.
 
@@ -174,7 +176,7 @@ for one execution:
 
 ```text
 AgentSpec
-  identity, model, instructions, defaults, runtime policies
+  identity, model, system prompt, defaults, runtime policies
 
 Environment
   workspace, runner, artifacts, vault, proxy, knowledge, MCP
@@ -353,9 +355,9 @@ Start with the document that matches the job:
 
 | Goal | Guide |
 | --- | --- |
-| Choose Cayu concepts and build an application, by hand or with an AI coding agent | [Authoring guide and Cayu Map](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/authoring.md#cayu-map) |
-| Classify and verify tool mutation and replay behavior | [Tool effects](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/tool-effects.md) |
-| Understand factories, process roles, and lifecycle | [Application anatomy](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/application-anatomy.md) |
+| Choose Cayu concepts and build an application, by hand or with an AI coding agent | `cayu guide authoring#cayu-map` |
+| Classify and verify tool mutation and replay behavior | `cayu guide tool-effects` |
+| Understand factories, process roles, and lifecycle | `cayu guide anatomy` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/application-anatomy.md)) |
 | Choose how work starts | [Triggering runs](https://github.com/cayu-dev/cayu/blob/main/docs/triggering-runs.md) |
 | Create per-session workspaces and runners | [Environment factories](https://github.com/cayu-dev/cayu/blob/main/docs/environment-factories.md) |
 | Implement a runner for your platform | [Build a runner](https://github.com/cayu-dev/cayu/blob/main/docs/build-a-runner.md) |
@@ -380,7 +382,7 @@ and the [Glossary](https://github.com/cayu-dev/cayu/blob/main/docs/glossary.md).
 ## Examples
 
 - [Examples index](https://github.com/cayu-dev/cayu/blob/main/examples/README.md) — find the smallest reference for a capability.
-- [Echo tool runtime](https://github.com/cayu-dev/cayu/blob/main/examples/echo_tool_runtime.py) — credential-free model/tool loop.
+- `cayu guide references#domain-tool` — credential-free domain-tool authoring and generator path.
 - [Local environment runtime](https://github.com/cayu-dev/cayu/blob/main/examples/local_environment_runtime.py) — files and commands.
 - [Server example](https://github.com/cayu-dev/cayu/blob/main/examples/server_example.py) — protected API and control plane.
 - [Cloud PR reviewer](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/pr-reviewer.md) — durable task, isolated workspace,

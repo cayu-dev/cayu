@@ -16,11 +16,14 @@ from cayu import (
     RunRequest,
     ScriptedModelProvider,
     SessionStatus,
+    StructuredOutputResult,
+    StructuredOutputSpec,
     Tool,
     ToolContext,
     ToolResult,
     ToolSpec,
     run_to_completion,
+    scripted_structured_output,
 )
 from cayu.providers import ModelProvider, ModelRequest
 
@@ -56,6 +59,68 @@ def test_run_to_completion_returns_final_text_and_ok() -> None:
     assert outcome.final_text == "Hello world"
     assert outcome.error is None
     assert outcome.session_id == "s1"
+
+
+def test_run_to_completion_exposes_repaired_structured_output() -> None:
+    app = CayuApp()
+    app.register_provider(
+        ScriptedModelProvider(
+            [
+                scripted_structured_output({"wrong": "value"}),
+                scripted_structured_output({"answer": "fixed"}),
+            ]
+        ),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="assistant", model="scripted-model"))
+    request = RunRequest(
+        agent_name="assistant",
+        session_id="s1",
+        messages=[Message.text("user", "answer")],
+        max_steps=2,
+        structured_output=StructuredOutputSpec(
+            name="answer",
+            json_schema={
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+                "additionalProperties": False,
+            },
+            max_retries=1,
+        ),
+    )
+
+    outcome = asyncio.run(run_to_completion(app, request))
+
+    assert outcome.ok
+    assert outcome.final_text == ""
+    assert outcome.structured_output == StructuredOutputResult(
+        output={"answer": "fixed"},
+        name="answer",
+        attempt=2,
+        max_retries=1,
+    )
+
+
+def test_run_to_completion_distinguishes_valid_json_null_from_no_structured_output() -> None:
+    app = CayuApp()
+    app.register_provider(
+        ScriptedModelProvider([scripted_structured_output(None)]),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="assistant", model="scripted-model"))
+    request = RunRequest(
+        agent_name="assistant",
+        session_id="s1",
+        messages=[Message.text("user", "answer")],
+        structured_output=StructuredOutputSpec(json_schema={"type": "null"}),
+    )
+
+    outcome = asyncio.run(run_to_completion(app, request))
+
+    assert outcome.ok
+    assert outcome.structured_output is not None
+    assert outcome.structured_output.output is None
 
 
 class _NoopTool(Tool):

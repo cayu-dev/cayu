@@ -88,8 +88,6 @@ def test_session_list_uses_project_target_and_emits_stable_json(
                 "completed",
                 "--label",
                 "team=docs",
-                "--output",
-                "json",
             ]
         )
         == 0
@@ -134,8 +132,7 @@ def test_session_list_empty_result_is_successful_json(
                 str(database),
                 "--agent",
                 "missing",
-                "--output",
-                "json",
+                "--json",
             ]
         )
         == 0
@@ -145,6 +142,32 @@ def test_session_list_empty_result_is_successful_json(
     assert payload["sessions"] == []
     assert payload["total_count"] == 0
     assert payload["has_more"] is False
+
+
+def test_session_output_names_a_destination_and_format_is_independent(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    database = _write_project(tmp_path)
+    _seed_sessions(database)
+    destination = tmp_path / "sessions.json"
+
+    assert (
+        main(
+            [
+                "session",
+                "list",
+                "--sqlite",
+                str(database),
+                "--output",
+                str(destination),
+            ]
+        )
+        == 0
+    )
+
+    assert capsys.readouterr().out == ""
+    assert json.loads(destination.read_text(encoding="utf-8"))["sessions"]
 
 
 def test_session_list_defaults_to_last_activity_order_and_pages_by_cursor(
@@ -163,8 +186,7 @@ def test_session_list_defaults_to_last_activity_order_and_pages_by_cursor(
                 str(database),
                 "--limit",
                 "1",
-                "--output",
-                "json",
+                "--json",
             ]
         )
         == 0
@@ -185,8 +207,7 @@ def test_session_list_defaults_to_last_activity_order_and_pages_by_cursor(
                 "1",
                 "--cursor",
                 first["next_cursor"],
-                "--output",
-                "json",
+                "--json",
             ]
         )
         == 0
@@ -235,8 +256,7 @@ def test_session_list_filters_completed_failed_and_running_states(
                     str(database),
                     "--status",
                     status,
-                    "--output",
-                    "json",
+                    "--json",
                 ]
             )
             == 0
@@ -245,7 +265,7 @@ def test_session_list_filters_completed_failed_and_running_states(
         assert [session["id"] for session in payload["sessions"]] == [f"sess_{status}"]
 
 
-def test_session_commands_render_successful_default_tables(
+def test_session_commands_render_successful_explicit_tables(
     tmp_path: Path,
     capsys,
 ) -> None:
@@ -308,7 +328,7 @@ def test_session_commands_render_successful_default_tables(
         (["transcript", "sess_table"], "content_kinds"),
     )
     for command, header in commands:
-        assert main(["session", *command, "--sqlite", str(database)]) == 0
+        assert main(["session", *command, "--sqlite", str(database), "--table"]) == 0
         first_line = capsys.readouterr().out.splitlines()[0]
         assert header in first_line
 
@@ -409,8 +429,7 @@ def test_session_show_summarizes_oversized_state_without_printing_content(
                 "sess_large",
                 "--sqlite",
                 str(database),
-                "--output",
-                "json",
+                "--json",
             ]
         )
         == 0
@@ -654,8 +673,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                     session_id,
                     "--sqlite",
                     str(database),
-                    "--output",
-                    "json",
+                    "--json",
                 ]
             )
             == 0
@@ -776,8 +794,7 @@ def test_session_show_reports_approval_and_user_input_pending_actions(
                     session_id,
                     "--sqlite",
                     str(database),
-                    "--output",
-                    "json",
+                    "--json",
                 ]
             )
             == 0
@@ -802,9 +819,12 @@ def test_session_detail_commands_report_missing_session_concisely(
         assert main(["session", command, "missing", "--sqlite", str(database)]) == 1
 
         captured = capsys.readouterr()
-        assert captured.out == ""
-        assert "error: Session not found: missing" in captured.err
-        assert "Traceback" not in captured.err
+        payload = json.loads(captured.out)
+        assert payload["error"] == {
+            "code": "SESSION_INSPECTION_FAILED",
+            "message": "Session not found: missing",
+        }
+        assert captured.err == ""
 
 
 def test_session_show_missing_sqlite_target_does_not_create_it(
@@ -815,7 +835,9 @@ def test_session_show_missing_sqlite_target_does_not_create_it(
 
     assert main(["session", "show", "missing", "--sqlite", str(missing)]) == 1
 
-    assert "error:" in capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["error"]["code"] == "SESSION_INSPECTION_FAILED"
+    assert captured.err == ""
     assert not missing.exists()
     assert not missing.parent.exists()
 
@@ -836,9 +858,10 @@ def test_session_cli_redacts_postgres_dsn_from_connection_errors(
 
     assert main(["session", "list", "--postgres", dsn]) == 1
     captured = capsys.readouterr()
-    assert captured.out == ""
-    assert secret not in captured.err
-    assert "postgresql://db.example/cayu" in captured.err
+    error = json.loads(captured.out)["error"]
+    assert secret not in error["message"]
+    assert "postgresql://db.example/cayu" in error["message"]
+    assert captured.err == ""
 
 
 def test_session_usage_reports_per_call_cache_and_honest_pricing_state(
@@ -962,8 +985,7 @@ def test_session_usage_reports_per_call_cache_and_honest_pricing_state(
                 str(database),
                 "--limit",
                 "1",
-                "--output",
-                "json",
+                "--json",
             ]
         )
         == 0
@@ -1017,8 +1039,7 @@ def test_session_usage_reports_per_call_cache_and_honest_pricing_state(
                 str(database),
                 "--offset",
                 "1",
-                "--output",
-                "json",
+                "--json",
             ]
         )
         == 0
@@ -1028,7 +1049,19 @@ def test_session_usage_reports_per_call_cache_and_honest_pricing_state(
     assert second["pricing_state"] == "unknown"
     assert second["ledger"] == []
 
-    assert main(["session", "usage", "sess_usage", "--sqlite", str(database)]) == 0
+    assert (
+        main(
+            [
+                "session",
+                "usage",
+                "sess_usage",
+                "--sqlite",
+                str(database),
+                "--table",
+            ]
+        )
+        == 0
+    )
     table_output = capsys.readouterr().out
     assert "unmatched ledger" in table_output.casefold()
     assert "aggregate usage" in table_output.casefold()
@@ -1051,8 +1084,7 @@ def test_session_usage_reports_per_call_cache_and_honest_pricing_state(
                 "sess_usage",
                 "--sqlite",
                 str(database),
-                "--output",
-                "jsonl",
+                "--jsonl",
             ]
         )
         == 0
@@ -1110,8 +1142,7 @@ def test_session_aggregate_commands_bound_retained_projections_not_raw_payloads(
                 "sess_bounded",
                 "--sqlite",
                 str(database),
-                "--output",
-                "json",
+                "--json",
             ]
         )
         == 0
@@ -1127,8 +1158,7 @@ def test_session_aggregate_commands_bound_retained_projections_not_raw_payloads(
                 "sess_bounded",
                 "--sqlite",
                 str(database),
-                "--output",
-                "json",
+                "--json",
             ]
         )
         == 0
@@ -1144,13 +1174,12 @@ def test_session_aggregate_commands_bound_retained_projections_not_raw_payloads(
                 "sess_bounded",
                 "--sqlite",
                 str(database),
-                "--output",
-                "json",
+                "--json",
             ]
         )
         == 1
     )
-    assert "retained-event safety limit" in capsys.readouterr().err
+    assert "retained-event safety limit" in json.loads(capsys.readouterr().out)["error"]["message"]
 
     monkeypatch.setattr(session_cli, "_MAX_COLLECTED_EVENT_RECORDS", 0)
     assert (
@@ -1161,13 +1190,12 @@ def test_session_aggregate_commands_bound_retained_projections_not_raw_payloads(
                 "sess_bounded",
                 "--sqlite",
                 str(database),
-                "--output",
-                "json",
+                "--json",
             ]
         )
         == 1
     )
-    assert "0-event safety limit" in capsys.readouterr().err
+    assert "0-event safety limit" in json.loads(capsys.readouterr().out)["error"]["message"]
 
     monkeypatch.setattr(session_runtime, "_SESSION_INSPECTION_MAX_RECORDS", 0)
     assert (
@@ -1178,13 +1206,12 @@ def test_session_aggregate_commands_bound_retained_projections_not_raw_payloads(
                 "sess_bounded",
                 "--sqlite",
                 str(database),
-                "--output",
-                "json",
+                "--json",
             ]
         )
         == 1
     )
-    assert "0-event safety limit" in capsys.readouterr().err
+    assert "0-event safety limit" in json.loads(capsys.readouterr().out)["error"]["message"]
 
 
 def test_session_tools_pairs_parallel_calls_and_omits_results(
@@ -1463,8 +1490,7 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
                 "sess_tools",
                 "--sqlite",
                 str(database),
-                "--output",
-                "json",
+                "--json",
             ]
         )
         == 0
@@ -1513,7 +1539,19 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
     assert by_id["call-9"]["parallel_round_width"] == 2
     assert by_id["call-10"]["status"] == "awaiting_input"
 
-    assert main(["session", "tools", "sess_tools", "--sqlite", str(database)]) == 0
+    assert (
+        main(
+            [
+                "session",
+                "tools",
+                "sess_tools",
+                "--sqlite",
+                str(database),
+                "--table",
+            ]
+        )
+        == 0
+    )
     table_header = capsys.readouterr().out.splitlines()[0]
     for field in (
         "argument_summary",
@@ -1598,8 +1636,7 @@ def test_session_events_filters_paginates_and_bounds_explicit_payloads(
                 "search",
                 "--include-payload",
                 "64",
-                "--output",
-                "jsonl",
+                "--jsonl",
             ]
         )
         == 0
@@ -1626,6 +1663,7 @@ def test_session_events_filters_paginates_and_bounds_explicit_payloads(
                 "tool.call.completed",
                 "--include-payload",
                 "64",
+                "--table",
             ]
         )
         == 0
@@ -1647,8 +1685,7 @@ def test_session_events_filters_paginates_and_bounds_explicit_payloads(
                 str(database),
                 "--limit",
                 "1",
-                "--output",
-                "json",
+                "--json",
             ]
         )
         == 0
@@ -1717,8 +1754,7 @@ def test_session_transcript_sizes_find_large_records_without_dumping_content(
                 "--limit",
                 "2",
                 "--sizes",
-                "--output",
-                "json",
+                "--json",
             ]
         )
         == 0
@@ -1752,8 +1788,7 @@ def test_session_transcript_sizes_find_large_records_without_dumping_content(
                 "1",
                 "--include-content",
                 "64",
-                "--output",
-                "jsonl",
+                "--jsonl",
             ]
         )
         == 0
@@ -1777,6 +1812,7 @@ def test_session_transcript_sizes_find_large_records_without_dumping_content(
                 "1",
                 "--include-content",
                 "64",
+                "--table",
             ]
         )
         == 0
@@ -1831,8 +1867,7 @@ def test_session_transcript_enforces_total_included_content_limit(
                 "3",
                 "--include-content",
                 "64",
-                "--output",
-                "json",
+                "--json",
             ]
         )
         == 0
@@ -1887,8 +1922,7 @@ def test_session_transcript_bounds_nested_part_metadata(
                 "--sqlite",
                 str(database),
                 "--sizes",
-                "--output",
-                "json",
+                "--json",
             ]
         )
         == 0
@@ -1992,8 +2026,7 @@ def test_session_content_views_strip_opaque_provider_state(
                 str(database),
                 "--include-content",
                 "4096",
-                "--output",
-                "json",
+                "--json",
             ]
         )
         == 0
@@ -2016,8 +2049,7 @@ def test_session_content_views_strip_opaque_provider_state(
                 "custom.provider_state",
                 "--include-payload",
                 "4096",
-                "--output",
-                "json",
+                "--json",
             ]
         )
         == 0
@@ -2105,8 +2137,7 @@ def test_session_default_views_redact_common_credential_field_names(
                     "sess_common_credentials",
                     "--sqlite",
                     str(database),
-                    "--output",
-                    "json",
+                    "--json",
                 ]
             )
             == 0
@@ -2126,8 +2157,8 @@ def test_session_cli_rejects_malformed_filters_and_unsupported_schema(
 
     assert main(["session", "list", "--sqlite", ""]) == 1
     captured = capsys.readouterr()
-    assert captured.out == ""
-    assert "--sqlite must be a non-empty path" in captured.err
+    assert "--sqlite must be a non-empty path" in json.loads(captured.out)["error"]["message"]
+    assert captured.err == ""
 
     assert (
         main(
@@ -2143,9 +2174,8 @@ def test_session_cli_rejects_malformed_filters_and_unsupported_schema(
         == 1
     )
     captured = capsys.readouterr()
-    assert captured.out == ""
-    assert "KEY=VALUE" in captured.err
-    assert "Traceback" not in captured.err
+    assert "KEY=VALUE" in json.loads(captured.out)["error"]["message"]
+    assert captured.err == ""
 
     incompatible = tmp_path / "future.db"
     with sqlite3.connect(incompatible) as connection:
@@ -2161,9 +2191,11 @@ def test_session_cli_rejects_malformed_filters_and_unsupported_schema(
 
     assert main(["session", "list", "--sqlite", str(incompatible)]) == 1
     captured = capsys.readouterr()
-    assert captured.out == ""
-    assert "requires an app that understands revision >= 999" in captured.err
-    assert "Traceback" not in captured.err
+    assert (
+        "requires an app that understands revision >= 999"
+        in json.loads(captured.out)["error"]["message"]
+    )
+    assert captured.err == ""
     with sqlite3.connect(incompatible) as connection:
         tables = {
             row[0]
@@ -2221,8 +2253,7 @@ def test_session_event_and_transcript_pagination_stays_stable_at_scale(
                 "1999",
                 "--limit",
                 "2",
-                "--output",
-                "json",
+                "--json",
             ]
         )
         == 0
@@ -2243,8 +2274,7 @@ def test_session_event_and_transcript_pagination_stays_stable_at_scale(
                 "1999",
                 "--limit",
                 "2",
-                "--output",
-                "json",
+                "--json",
             ]
         )
         == 0

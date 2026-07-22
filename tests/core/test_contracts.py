@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import inspect
 import pickle
 import sys
 import time
@@ -1282,6 +1283,13 @@ def test_agent_spec_uses_explicit_system_prompt_field():
     with pytest.raises(ValidationError):
         AgentSpec(name="assistant", model="fake-model", prompt="too vague")  # type: ignore[call-arg]
 
+    with pytest.raises(ValidationError, match="did you mean `system_prompt`"):
+        AgentSpec(
+            name="assistant",
+            model="fake-model",
+            instructions="Answer carefully.",  # type: ignore[call-arg]
+        )
+
 
 def test_agent_spec_declares_machine_checkable_workflow_tool_names() -> None:
     names = ["read_source", "edit_file"]
@@ -2332,6 +2340,13 @@ def test_tool_spec_json_schema_documents_input_schema():
 
     assert schema["properties"]["input_schema"]["type"] == "object"
     assert "input_schema" not in schema.get("required", [])
+
+
+def test_tool_spec_constructor_signature_includes_input_schema():
+    signature = inspect.signature(ToolSpec)
+
+    assert "input_schema" in signature.parameters
+    assert signature.parameters["input_schema"].default is None
 
 
 def test_exec_command_separates_process_and_shell_execution():

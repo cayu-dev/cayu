@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import inspect
+import json
 import sys
 from pathlib import Path
 from typing import Any
 
+from cayu.cli._output import add_output_options
 from cayu.cli._targets import TargetResolutionError, load_target
 from cayu.cli.project import project_context, resolve_eval_project
 from cayu.evals import (
@@ -28,12 +30,20 @@ def add_eval_parser(subparsers: Any) -> None:
     eval_parser = subparsers.add_parser(
         "eval",
         help="Run and report Cayu runtime-native evals.",
+        description=(
+            "Run and report Cayu runtime-native evals. Start with `cayu eval run` "
+            "for the project-configured hermetic proof."
+        ),
     )
     inner = eval_parser.add_subparsers(dest="eval_command", required=True)
 
     run = inner.add_parser(
         "run",
         help="Run a configured or explicit eval plan.",
+        description=(
+            "Run a configured or explicit eval plan and emit a stable JSON result. "
+            "Use `--output FILE` to save it."
+        ),
     )
     run.add_argument(
         "target",
@@ -43,7 +53,7 @@ def add_eval_parser(subparsers: Any) -> None:
             "with app and suite attributes. Defaults to [tool.cayu].eval_target."
         ),
     )
-    run.add_argument("--output", "-o", metavar="FILE", help="Write JSON results to FILE.")
+    add_output_options(run, formats=("json",))
     run.add_argument("--html-output", metavar="FILE", help="Also write an HTML report to FILE.")
     run.add_argument(
         "--case-timeout-seconds",
@@ -53,26 +63,28 @@ def add_eval_parser(subparsers: Any) -> None:
         help="Limit each eval case to SECONDS (default: no timeout).",
     )
 
-    report = inner.add_parser("report", help="Render a JSON or HTML report from eval results.")
-    report.add_argument("input", metavar="RESULTS_JSON", help="Eval JSON results file.")
-    report.add_argument(
-        "--format",
-        choices=("html", "json"),
-        default="html",
-        help="Report format (default: html).",
+    report = inner.add_parser(
+        "report",
+        help="Render a JSON or HTML report from eval results.",
+        description=(
+            "Render saved eval results as HTML by default or JSON explicitly. "
+            "Use `--output FILE` to save the report."
+        ),
     )
-    report.add_argument("--output", "-o", metavar="FILE", help="Write report to FILE.")
+    report.add_argument("input", metavar="RESULTS_JSON", help="Eval JSON results file.")
+    add_output_options(report, formats=("html", "json"), default="html")
 
-    compare = inner.add_parser("compare", help="Compare baseline and current eval results.")
+    compare = inner.add_parser(
+        "compare",
+        help="Compare baseline and current eval results.",
+        description=(
+            "Compare baseline and current eval results. JSON is the default; "
+            "a nonzero exit reports regressions."
+        ),
+    )
     compare.add_argument("baseline", metavar="BASELINE_JSON")
     compare.add_argument("current", metavar="CURRENT_JSON")
-    compare.add_argument(
-        "--format",
-        choices=("html", "json"),
-        default="json",
-        help="Comparison format (default: json).",
-    )
-    compare.add_argument("--output", "-o", metavar="FILE", help="Write comparison to FILE.")
+    add_output_options(compare, formats=("html", "json"))
     compare.add_argument(
         "--score-tolerance",
         type=float,
@@ -91,7 +103,18 @@ def run_eval_command(args: argparse.Namespace) -> int:
         if args.eval_command == "compare":
             return _compare(args)
     except Exception as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        if getattr(args, "output_format", None) == "json":
+            print(
+                json.dumps(
+                    {
+                        "schema_version": "1",
+                        "error": {"code": "EVAL_COMMAND_FAILED", "message": str(exc)},
+                    },
+                    sort_keys=True,
+                )
+            )
+        else:
+            print(f"error: {exc}", file=sys.stderr)
         return 1
     return 1
 
@@ -141,7 +164,7 @@ async def _load_eval_plan(target: str, *, label: str) -> EvalPlan:
 
 def _report(args: argparse.Namespace) -> int:
     run = load_eval_run(args.input)
-    output = eval_run_to_json(run) if args.format == "json" else render_html_report(run)
+    output = eval_run_to_json(run) if args.output_format == "json" else render_html_report(run)
     _write_or_print(output, args.output)
     return 0
 
@@ -150,7 +173,7 @@ def _compare(args: argparse.Namespace) -> int:
     baseline = load_eval_run(args.baseline)
     current = load_eval_run(args.current)
     comparison = compare_eval_runs(baseline, current, score_tolerance=args.score_tolerance)
-    if args.format == "json":
+    if args.output_format == "json":
         output = comparison_to_json(comparison)
     else:
         output = render_comparison_html(comparison)

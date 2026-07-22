@@ -65,7 +65,7 @@ from cayu.evals.runner import (
     run_eval_plan,
     run_eval_suite,
 )
-from cayu.evals.testing import ScriptedModelProvider
+from cayu.evals.testing import ScriptedModelProvider, scripted_structured_output
 
 __all__ = [
     "EVAL_SCHEMA_VERSION",
@@ -122,6 +122,7 @@ __all__ = [
     "run_eval_case",
     "run_eval_plan",
     "run_eval_suite",
+    "scripted_structured_output",
     "trajectory_to_json",
     "write_eval_run_json",
     "write_html_report",

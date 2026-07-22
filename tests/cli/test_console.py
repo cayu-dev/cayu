@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+import cayu
 from cayu import CayuApp
 from cayu.cli import _version, main
 
@@ -318,4 +319,14 @@ def test_other_cli_commands_work_without_ipython(monkeypatch, capsys) -> None:
 
     assert main(["version"]) == 0
 
+    assert capsys.readouterr().out == f"cayu {_version()}\n"
+
+
+def test_package_version_attribute_and_root_version_flag(capsys) -> None:
+    assert cayu.__version__ == _version()
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--version"])
+
+    assert excinfo.value.code == 0
     assert capsys.readouterr().out == f"cayu {_version()}\n"

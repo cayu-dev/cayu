@@ -44,7 +44,7 @@ def build_app():
     monkeypatch.chdir(tmp_path)
     sys.modules.pop("broken_project", None)
 
-    assert main(["check", "--json"]) == 1
+    assert main(["check"]) == 1
 
     report = json.loads(capsys.readouterr().out)
     assert report["schema_version"] == "1"
@@ -58,6 +58,10 @@ def build_app():
     assert provider_finding["parameters"] == {"agent": "sender", "provider": "missing"}
     assert provider_finding["hint"] == "Register provider 'missing' or change sender.provider_name."
     assert provider_finding["documentation_anchor"].endswith("#agent-provider-not-found")
+
+    destination = tmp_path / "check.json"
+    assert main(["check", "--output", str(destination)]) == 1
+    assert json.loads(destination.read_text(encoding="utf-8"))["diagnostics"]
 
 
 def test_check_json_distinguishes_factory_failure_from_findings(
