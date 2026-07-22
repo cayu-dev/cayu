@@ -528,7 +528,9 @@ class CayuApp:
             max_file_attachment_bytes=self._max_file_attachment_bytes,
             max_total_file_attachment_bytes=self._max_total_file_attachment_bytes,
             max_file_attachments_per_request=self._max_file_attachments_per_request,
-            checkpoint_session=self._environment_lifecycle.checkpoint_preserving_runtime_state,
+            checkpoint_transform=(
+                self._environment_lifecycle.checkpoint_transform_preserving_runtime_state
+            ),
             apply_budget_evaluation=self._apply_model_step_budget_evaluation,
             apply_limit_evaluation=self._apply_model_step_limit_evaluation,
             stop_for_budget_reservation_failure=(

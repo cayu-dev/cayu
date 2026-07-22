@@ -212,10 +212,15 @@ async def _await_bounded_cleanup_task(
     *,
     timeout_s: float,
     timeout_message: str,
+    cancellation: asyncio.CancelledError | None = None,
 ) -> bool:
     """Finish one cleanup task despite cancellation, or report a bounded timeout."""
 
-    outcome = await await_shielded_task_outcome(task, timeout_s=timeout_s)
+    outcome = await await_shielded_task_outcome(
+        task,
+        cancellation=cancellation,
+        timeout_s=timeout_s,
+    )
 
     def timeout_failure(
         cancellation: asyncio.CancelledError | None,

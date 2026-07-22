@@ -89,6 +89,124 @@ def test_context_usage_state_uses_one_latest_completed_event_query() -> None:
     assert store.event_queries[0].order_by == EventOrder.SEQUENCE_DESC
 
 
+def test_context_usage_state_pages_past_compaction_completions() -> None:
+    class TrackingStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.event_queries: list[EventQuery] = []
+
+        async def query_events(self, query: EventQuery | None = None):
+            if query is not None:
+                self.event_queries.append(query)
+            return await super().query_events(query)
+
+    store = TrackingStore()
+    session_id = "usage_context_policy_skips_compaction"
+
+    async def run():
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.append_events(
+            session_id,
+            [
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id=session_id,
+                    payload={
+                        # Main completions retain their runtime-owned cursor even if
+                        # provider metadata collides with the auxiliary purpose key.
+                        "purpose": "context_compaction",
+                        "model": "fake-model",
+                        "transcript_cursor": 2,
+                        "usage": {
+                            "input_tokens": 8,
+                            "output_tokens": 2,
+                            "total_tokens": 10,
+                        },
+                    },
+                ),
+                *[
+                    Event(
+                        type=EventType.MODEL_COMPLETED,
+                        session_id=session_id,
+                        payload={
+                            "purpose": "context_compaction",
+                            "model": "summary-model",
+                            "usage": {
+                                "input_tokens": index,
+                                "output_tokens": 1,
+                                "total_tokens": index + 1,
+                            },
+                        },
+                    )
+                    for index in range(1, 102)
+                ],
+            ],
+        )
+        return await model_step_executor_module._context_usage_state_for_session(
+            session_store=store,
+            session_id=session_id,
+        )
+
+    usage = asyncio.run(run())
+
+    assert usage.last_input_tokens == 8
+    assert usage.last_output_tokens == 2
+    assert usage.last_total_tokens == 10
+    assert usage.last_transcript_cursor == 2
+    assert usage.last_model == "fake-model"
+    assert [query.limit for query in store.event_queries] == [1, 100, 100]
+    assert store.event_queries[0].before_sequence is None
+    assert all(query.order_by == EventOrder.SEQUENCE_DESC for query in store.event_queries)
+
+
+def test_context_usage_state_is_empty_with_only_compaction_completions() -> None:
+    store = InMemorySessionStore()
+    session_id = "usage_context_policy_only_compaction"
+
+    async def run():
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.append_events(
+            session_id,
+            [
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id=session_id,
+                    payload={
+                        "purpose": "context_compaction",
+                        "model": "summary-model",
+                        "usage": {
+                            "input_tokens": 20,
+                            "output_tokens": 5,
+                            "total_tokens": 25,
+                        },
+                    },
+                )
+            ],
+        )
+        return await model_step_executor_module._context_usage_state_for_session(
+            session_store=store,
+            session_id=session_id,
+        )
+
+    usage = asyncio.run(run())
+
+    assert usage == model_step_executor_module.ContextUsageState()
+
+
 def test_model_step_executor_builds_defensive_structured_output_request() -> None:
     app = CayuApp(enable_logging=False)
     app.register_agent(

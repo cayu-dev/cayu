@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Generic, TypeVar
 
-from cayu._validation import require_clean_nonblank
+from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.core.billing import (
     UNRESOLVED_BILLING_IDENTITY,
     BillingIdentity,
@@ -66,6 +66,20 @@ _OperationResultT = TypeVar("_OperationResultT")
 _StreamResultT = TypeVar("_StreamResultT")
 
 
+def _merge_events_by_id(*groups: list[Event]) -> list[Event]:
+    """Merge durable and in-flight views without double-counting one event."""
+
+    merged: list[Event] = []
+    seen: set[str] = set()
+    for group in groups:
+        for event in group:
+            if event.id in seen:
+                continue
+            seen.add(event.id)
+            merged.append(event)
+    return merged
+
+
 class BudgetReservationLeaseLost(RuntimeError):
     """Raised when a live model step can no longer prove its budget reservation."""
 
@@ -102,6 +116,26 @@ def budget_heartbeat_task_failure(task: asyncio.Task[None]) -> BaseException:
     if failure is None:
         return BudgetReservationLeaseLost("Budget reservation heartbeat stopped unexpectedly.")
     return failure
+
+
+def _preserve_completed_metadata(
+    source: BaseException,
+    target: BaseException,
+) -> None:
+    """Copy trustworthy completion evidence without replacing the primary signal."""
+
+    completed_metadata = getattr(source, "completed_metadata", None)
+    if type(completed_metadata) is not dict:
+        return
+    try:
+        copied_metadata = copy_json_value(completed_metadata, "completed_metadata")
+    except Exception as exc:
+        target.add_note(
+            "Budgeted operation completion evidence could not be preserved: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return
+    target.__dict__["completed_metadata"] = copied_metadata
 
 
 async def _next_model_step_item(
@@ -313,12 +347,12 @@ class RunLimitController:
 
         if not has_run_limits(limits):
             return None
-        usage_events = list(operation_events)
+        usage_events = _merge_events_by_id(operation_events)
         if limits.scope == "session":
-            usage_events = [
-                *await self.session_usage_events(session.id),
-                *usage_events,
-            ]
+            usage_events = _merge_events_by_id(
+                await self.session_usage_events(session.id),
+                usage_events,
+            )
             created_at = session.created_at
             if created_at.tzinfo is None:
                 created_at = created_at.replace(tzinfo=UTC)
@@ -361,7 +395,7 @@ class RunLimitController:
             else:
                 raise ValueError(f"Unsupported request budget scope: {limit.scope}")
             events = events_for_budget_window(
-                [*existing_events, *operation_events],
+                _merge_events_by_id(existing_events, operation_events),
                 limit.window,
                 now=self._clock(),
             )
@@ -407,6 +441,8 @@ class RunLimitController:
         usage_tracker: SessionUsageTracker | None = None,
         billing_identity_state: BillingIdentityState = UNRESOLVED_BILLING_IDENTITY,
         pricing_provider_name: str | None = None,
+        model: str | None = None,
+        additional_usage_events: list[Event] | None = None,
     ) -> LimitEvaluation:
         budget_limits = request_budget_limits_for_session(
             limits=budget_limits,
@@ -424,6 +460,10 @@ class RunLimitController:
             if usage_tracker is not None
             else await self.session_usage_events(session.id)
         )
+        additional_events = [
+            event.model_copy(deep=True) for event in (additional_usage_events or [])
+        ]
+        events = _merge_events_by_id(events, additional_events)
         usage_summary = session_usage_summary(session.id, events)
         usage_for_limits = usage_summary
         if limits.scope == "run" and run_baseline is not None:
@@ -472,6 +512,10 @@ class RunLimitController:
                     key=budget_limit.key,
                     window=budget_limit.window,
                 )
+                budget_events = _merge_events_by_id(
+                    budget_events,
+                    additional_events,
+                )
             elif budget_limit.scope == "run":
                 budget_events = events_for_budget_window(
                     events,
@@ -511,6 +555,7 @@ class RunLimitController:
                 effective_at=budget_window_now,
                 billing_identity_state=billing_identity_state,
                 pricing_provider_name=pricing_provider_name,
+                model=model,
             )
             if budget_outcome is None:
                 continue
@@ -551,6 +596,8 @@ class RunLimitController:
         budget_policy: BudgetPolicy | None,
         billing_identity_state: BillingIdentityState = UNRESOLVED_BILLING_IDENTITY,
         pricing_provider_name: str | None = None,
+        model: str | None = None,
+        additional_usage_events: list[Event] | None = None,
     ) -> BudgetEvaluation:
         limits = budget_limits_for_session(
             policy=budget_policy,
@@ -561,17 +608,22 @@ class RunLimitController:
             return BudgetEvaluation(check=None)
         emitted_events: list[Event] = []
         effective_provider_name = pricing_provider_name or session.provider_name
+        effective_model = model or session.model
+        additional_events = [
+            event.model_copy(deep=True) for event in (additional_usage_events or [])
+        ]
         for limit in limits:
             events = await self._budget_store.load_events_for_budget(
                 scope=limit.scope,
                 key=limit.key,
                 window=limit.window,
             )
+            events = _merge_events_by_id(events, additional_events)
             check = budget_check_from_events(
                 limit=limit,
                 events=events,
                 provider_name=effective_provider_name,
-                model=session.model,
+                model=effective_model,
                 billing_identity_state=billing_identity_state,
                 effective_at=self._clock(),
             )
@@ -581,7 +633,7 @@ class RunLimitController:
                 and has_deferred_contextual_price(
                     limit.pricing,
                     provider_name=effective_provider_name,
-                    model=session.model,
+                    model=effective_model,
                 )
             )
             if not deferred_contextual_check:
@@ -1128,6 +1180,9 @@ class RunLimitController:
         lease_lost_before_dispatch_message: str,
         authoritative_failure_note: str,
         concurrent_failure_note: str,
+        completed_metadata_from_result: (
+            Callable[[_OperationResultT], dict[str, object] | None] | None
+        ) = None,
     ) -> tuple[_OperationResultT, BaseException | None]:
         if not reservations:
             return await operation(), None
@@ -1166,6 +1221,7 @@ class RunLimitController:
                         if isinstance(operation_failure, authoritative_failure_types):
                             operation_failure.add_note(f"{authoritative_failure_note}: {failure}")
                             raise operation_failure from failure
+                        _preserve_completed_metadata(operation_failure, failure)
                         failure.add_note(
                             f"{concurrent_failure_note}: "
                             f"{type(operation_failure).__name__}: {operation_failure}"
@@ -1174,12 +1230,13 @@ class RunLimitController:
                 operation_task.cancel()
                 try:
                     return await operation_task, failure
-                except asyncio.CancelledError:
-                    pass
+                except asyncio.CancelledError as operation_cancellation:
+                    _preserve_completed_metadata(operation_cancellation, failure)
                 except BaseException as operation_failure:
                     if isinstance(operation_failure, authoritative_failure_types):
                         operation_failure.add_note(f"{authoritative_failure_note}: {failure}")
                         raise operation_failure from failure
+                    _preserve_completed_metadata(operation_failure, failure)
                     failure.add_note(
                         f"{concurrent_failure_note}: "
                         f"{type(operation_failure).__name__}: {operation_failure}"
@@ -1194,6 +1251,42 @@ class RunLimitController:
             except BudgetReservationLeaseLost as exc:
                 return result, exc
             return result, None
+        except asyncio.CancelledError as exc:
+            if not operation_task.done():
+                operation_task.cancel()
+            try:
+                completed_result = await operation_task
+            except asyncio.CancelledError as operation_cancellation:
+                _preserve_completed_metadata(operation_cancellation, exc)
+            except BaseException as operation_failure:
+                _preserve_completed_metadata(operation_failure, exc)
+                exc.add_note(
+                    "Budgeted operation also failed while caller cancellation was handled: "
+                    f"{type(operation_failure).__name__}: {operation_failure}"
+                )
+            else:
+                try:
+                    completed_metadata = (
+                        None
+                        if completed_metadata_from_result is None
+                        else completed_metadata_from_result(completed_result)
+                    )
+                    if completed_metadata is not None:
+                        if type(completed_metadata) is not dict:
+                            raise TypeError(
+                                "completed_metadata_from_result must return a dictionary or None."
+                            )
+                        exc.__dict__["completed_metadata"] = copy_json_value(
+                            completed_metadata,
+                            "completed_metadata",
+                        )
+                except BaseException as evidence_failure:
+                    exc.add_note(
+                        "Completed operation evidence could not be preserved during "
+                        f"caller cancellation: {type(evidence_failure).__name__}: "
+                        f"{evidence_failure}"
+                    )
+            raise
         finally:
             if not operation_task.done():
                 operation_task.cancel()
@@ -1209,6 +1302,7 @@ class RunLimitController:
         operation: Callable[[], Awaitable[_OperationResultT]],
         *,
         completed_events: Callable[[], list[Event]],
+        prior_completion_events: list[Event] | None = None,
         budget_limits: tuple[BudgetLimit, ...],
         session: Session,
         agent_name: str,
@@ -1226,23 +1320,20 @@ class RunLimitController:
         """Run one observable compactor dispatch under strict budget accounting."""
 
         lifecycle = _BudgetedOperationLifecycle()
-        effective_pricing_provider_name = pricing_provider_name or provider_name
-        contextual_preflight_limits = tuple(
-            limit
-            for limit in budget_limits
-            if limit.action == "interrupt"
-            and not limit.allow_unpriced
-            and has_deferred_contextual_price(
-                limit.pricing,
-                provider_name=effective_pricing_provider_name,
-                model=model,
-            )
+        prior_completion_events = (
+            []
+            if prior_completion_events is None
+            else [event.model_copy(deep=True) for event in prior_completion_events]
         )
-        if contextual_preflight_limits:
+        effective_pricing_provider_name = pricing_provider_name or provider_name
+        dispatch_preflight_limits = tuple(
+            limit for limit in budget_limits if limit.action == "interrupt"
+        )
+        if dispatch_preflight_limits:
             resolved_checks = await self.evaluate_operation_budgets(
                 session=session,
-                budget_limits=contextual_preflight_limits,
-                operation_events=[],
+                budget_limits=dispatch_preflight_limits,
+                operation_events=prior_completion_events,
                 provider_name=effective_pricing_provider_name,
                 model=model,
                 billing_identity_state=resolved_billing_identity(billing_identity),
@@ -1860,13 +1951,17 @@ class RunLimitGate:
         *,
         pending_tool_calls: int = 0,
         billing_identity_state: BillingIdentityState = UNRESOLVED_BILLING_IDENTITY,
+        pricing_provider_name: str | None = None,
+        model: str | None = None,
+        additional_usage_events: list[Event] | None = None,
+        budget_limits: tuple[BudgetLimit, ...] | None = None,
     ) -> LimitEvaluation:
         return await self._controller.evaluate_request_limits(
             session=self._session,
             agent_name=self._agent_name,
             environment_name=self._environment_name,
             limits=self._limits,
-            budget_limits=self._budget_limits,
+            budget_limits=self._budget_limits if budget_limits is None else budget_limits,
             run_started_at=self._run_started_at,
             run_baseline=self._run_baseline,
             budget_baseline_events=self._budget_baseline_events,
@@ -1874,7 +1969,9 @@ class RunLimitGate:
             budget_notify_events=self._budget_notify_events,
             usage_tracker=self._usage_tracker,
             billing_identity_state=billing_identity_state,
-            pricing_provider_name=self._pricing_provider_name,
+            pricing_provider_name=pricing_provider_name or self._pricing_provider_name,
+            model=model,
+            additional_usage_events=additional_usage_events,
         )
 
     async def evaluate_budget(
@@ -1882,6 +1979,9 @@ class RunLimitGate:
         budget_policy: BudgetPolicy | None,
         *,
         billing_identity_state: BillingIdentityState = UNRESOLVED_BILLING_IDENTITY,
+        pricing_provider_name: str | None = None,
+        model: str | None = None,
+        additional_usage_events: list[Event] | None = None,
     ) -> BudgetEvaluation:
         return await self._controller.evaluate_policy_budgets(
             session=self._session,
@@ -1889,8 +1989,15 @@ class RunLimitGate:
             environment_name=self._environment_name,
             budget_policy=budget_policy,
             billing_identity_state=billing_identity_state,
-            pricing_provider_name=self._pricing_provider_name,
+            pricing_provider_name=pricing_provider_name or self._pricing_provider_name,
+            model=model,
+            additional_usage_events=additional_usage_events,
         )
+
+    def has_run_limits(self) -> bool:
+        """Return whether provider dispatches need per-call run-limit admission."""
+
+        return has_run_limits(self._limits)
 
 
 def _latest_model_event_identity(events: list[Event]) -> tuple[str | None, str | None]:
@@ -1973,6 +2080,7 @@ def _first_budget_limit_outcome(
     effective_at: datetime,
     billing_identity_state: BillingIdentityState = UNRESOLVED_BILLING_IDENTITY,
     pricing_provider_name: str | None = None,
+    model: str | None = None,
 ) -> _BudgetLimitOutcome | None:
     if type(session) is not Session:
         raise TypeError("session must be a Session instance.")
@@ -2020,6 +2128,7 @@ def _first_budget_limit_outcome(
         effective_at=effective_at,
         billing_identity_state=billing_identity_state,
         pricing_provider_name=pricing_provider_name,
+        model=model,
     )
     if preflight_error is not None:
         decision = StopDecision(
@@ -2093,15 +2202,17 @@ def _budget_limit_preflight_error(
     effective_at: datetime,
     billing_identity_state: BillingIdentityState = UNRESOLVED_BILLING_IDENTITY,
     pricing_provider_name: str | None = None,
+    model: str | None = None,
 ) -> str | None:
     effective_provider_name = pricing_provider_name or session.provider_name
+    effective_model = require_clean_nonblank(model or session.model, "model")
     if not isinstance(billing_identity_state, ResolvedBillingIdentity):
         if limit.allow_unpriced:
             return None
         price = budget_price(
             limit,
             provider_name=effective_provider_name,
-            model=session.model,
+            model=effective_model,
             effective_at=effective_at,
         )
         if price is None:
@@ -2111,19 +2222,19 @@ def _budget_limit_preflight_error(
                 limit=limit,
                 events=[],
                 provider_name=effective_provider_name,
-                model=session.model,
+                model=effective_model,
                 effective_at=effective_at,
             )
             if not deferred.limit_reached:
                 return None
             return (
                 "Estimated cost budget cannot be verified because "
-                f"{effective_provider_name}/{session.model} has no matching pricing."
+                f"{effective_provider_name}/{effective_model} has no matching pricing."
             )
         if price.currency.upper() != limit.currency.upper():
             return (
                 "Estimated cost budget cannot be verified because "
-                f"{effective_provider_name}/{session.model} pricing currency {price.currency} "
+                f"{effective_provider_name}/{effective_model} pricing currency {price.currency} "
                 f"does not match requested {limit.currency}."
             )
         return None
@@ -2131,7 +2242,7 @@ def _budget_limit_preflight_error(
         limit=limit,
         events=[],
         provider_name=effective_provider_name,
-        model=session.model,
+        model=effective_model,
         billing_identity_state=billing_identity_state,
         effective_at=effective_at,
     )

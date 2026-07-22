@@ -319,6 +319,50 @@ def test_controller_returns_typed_limit_decision_without_finalizing_session():
     assert session.status == SessionStatus.RUNNING
 
 
+def test_operation_session_limit_deduplicates_persisted_operation_events():
+    store = InMemorySessionStore()
+    controller = _controller(store)
+
+    async def scenario():
+        session = await _running_session(store, "sess_operation_limit_deduplication")
+        completion = Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id=session.id,
+            agent_name="assistant",
+            payload={
+                "provider_name": "fake",
+                "model": "fake-model",
+                "usage": {
+                    "input_tokens": 8,
+                    "output_tokens": 2,
+                    "total_tokens": 10,
+                },
+            },
+        )
+        await store.append_event(session.id, completion)
+
+        below_limit = await controller.evaluate_operation_run_limit(
+            session=session,
+            limits=RunLimits(max_total_tokens=15, scope="session"),
+            operation_events=[completion],
+            operation_started_at=time.monotonic(),
+        )
+        at_limit = await controller.evaluate_operation_run_limit(
+            session=session,
+            limits=RunLimits(max_total_tokens=10, scope="session"),
+            operation_events=[completion],
+            operation_started_at=time.monotonic(),
+        )
+        return below_limit, at_limit
+
+    below_limit, at_limit = asyncio.run(scenario())
+
+    assert below_limit is None
+    assert at_limit is not None
+    assert at_limit.limit == StopLimit.TOTAL_TOKENS
+    assert at_limit.actual == 10
+
+
 def test_run_limit_gate_reuses_incremental_usage_without_finalizing_session():
     store = InMemorySessionStore()
     controller = _controller(store)
@@ -813,6 +857,112 @@ def test_controller_arbitrates_operation_heartbeat_lease_loss():
                 authoritative_failure_note="lease lost as operation failed",
                 concurrent_failure_note="operation failed while lease loss was handled",
             )
+
+    asyncio.run(scenario())
+
+    assert ledger.heartbeat_calls == 2
+
+
+@pytest.mark.parametrize("operation_failure_type", [RuntimeError, asyncio.CancelledError])
+def test_controller_preserves_completed_metadata_when_caller_cancellation_wins(
+    operation_failure_type: type[BaseException],
+) -> None:
+    store = InMemorySessionStore()
+    ledger = InMemoryBudgetLedger(reservation_ttl_seconds=30)
+    controller = _controller(store, ledger=ledger)
+    completed_metadata = {
+        "model": "fake-model",
+        "usage": {"input_tokens": 8, "output_tokens": 2},
+    }
+
+    async def scenario() -> None:
+        setup = await controller.reserve_operation_budgets(
+            budget_limits=(_reserved_limit("2"),),
+            session_id="sess_operation_caller_cancel_metadata",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+            rejection_release_reason="reservation rejected",
+            accepted_record_error="accepted reservation missing record",
+        )
+        operation_started = asyncio.Event()
+
+        async def operation() -> str:
+            operation_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as exc:
+                operation_failure = operation_failure_type("operation ended after completion")
+                operation_failure.__dict__["completed_metadata"] = completed_metadata
+                raise operation_failure from exc
+
+        task = asyncio.create_task(
+            controller.run_operation_with_reservation_heartbeat(
+                operation,
+                reservations=list(setup.reservations),
+                authoritative_failure_types=(),
+                lease_lost_before_dispatch_message="lease lost before operation",
+                authoritative_failure_note="lease lost as operation failed",
+                concurrent_failure_note="operation failed while lease loss was handled",
+            )
+        )
+        await operation_started.wait()
+        task.cancel("caller cancelled")
+
+        with pytest.raises(asyncio.CancelledError, match="caller cancelled") as raised:
+            await task
+
+        assert raised.value.__dict__["completed_metadata"] == completed_metadata
+        assert raised.value.__dict__["completed_metadata"] is not completed_metadata
+        assert task.cancelling() == 1
+        assert task.cancelled()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("operation_failure_type", [RuntimeError, asyncio.CancelledError])
+def test_controller_preserves_completed_metadata_when_heartbeat_lease_loss_wins(
+    operation_failure_type: type[BaseException],
+) -> None:
+    store = InMemorySessionStore()
+    ledger = _LoseLeaseOnSecondHeartbeat()
+    controller = _controller(store, ledger=ledger)
+    completed_metadata = {
+        "model": "fake-model",
+        "usage": {"input_tokens": 8, "output_tokens": 2},
+    }
+
+    async def scenario() -> None:
+        setup = await controller.reserve_operation_budgets(
+            budget_limits=(_reserved_limit("2"),),
+            session_id="sess_operation_lease_loss_metadata",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+            rejection_release_reason="reservation rejected",
+            accepted_record_error="accepted reservation missing record",
+        )
+
+        async def operation() -> str:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as exc:
+                operation_failure = operation_failure_type("operation ended after completion")
+                operation_failure.__dict__["completed_metadata"] = completed_metadata
+                raise operation_failure from exc
+
+        with pytest.raises(BudgetReservationLeaseLost) as raised:
+            await controller.run_operation_with_reservation_heartbeat(
+                operation,
+                reservations=list(setup.reservations),
+                authoritative_failure_types=(),
+                lease_lost_before_dispatch_message="lease lost before operation",
+                authoritative_failure_note="lease lost as operation failed",
+                concurrent_failure_note="operation failed while lease loss was handled",
+            )
+
+        assert raised.value.__dict__["completed_metadata"] == completed_metadata
+        assert raised.value.__dict__["completed_metadata"] is not completed_metadata
 
     asyncio.run(scenario())
 

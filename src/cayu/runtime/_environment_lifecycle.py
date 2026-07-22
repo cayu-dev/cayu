@@ -358,26 +358,42 @@ class EnvironmentLifecycle:
         session_id: str,
         checkpoint: dict[str, Any],
     ) -> None:
+        await self._session_store.transform_checkpoint(
+            session_id,
+            self.checkpoint_transform_preserving_runtime_state(checkpoint),
+        )
+
+    def checkpoint_transform_preserving_runtime_state(
+        self,
+        checkpoint: dict[str, Any],
+    ) -> CheckpointTransform:
+        """Build one atomic transform retaining environment-owned checkpoint state."""
+
         copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
         runtime_keys = (
             ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY,
             ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
         )
-        if any(key not in copied_checkpoint for key in runtime_keys):
-            current_checkpoint = await self._session_store.load_checkpoint(session_id)
-            if current_checkpoint is not None:
+
+        def transform(session: Session, current: dict[str, Any] | None) -> dict[str, Any]:
+            replacement = copy_json_value(copied_checkpoint, "checkpoint")
+            if current is not None:
                 for key in runtime_keys:
-                    if key in copied_checkpoint:
+                    if key in replacement:
                         continue
-                    state = current_checkpoint.get(key)
+                    state = current.get(key)
                     if state is not None:
                         if type(state) is not dict:
                             raise ValueError(f"{key} checkpoint state must be an object.")
-                        copied_checkpoint[key] = copy_json_value(state, key)
-        await self._session_store.transform_checkpoint(
-            session_id,
-            self._checkpoint_transform(copied_checkpoint),
-        )
+                        replacement[key] = copy_json_value(state, key)
+            transformed = self._checkpoint_transform(replacement)(session, current)
+            if transformed is None:
+                raise RuntimeError(
+                    "Checkpoint preservation transform unexpectedly deleted the checkpoint."
+                )
+            return transformed
+
+        return transform
 
     async def emit_binding_started(
         self,

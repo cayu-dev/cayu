@@ -18,6 +18,11 @@ from dataclasses import dataclass
 from typing import Any, cast
 from uuid import uuid4
 
+from cayu._task_wait import (
+    await_shielded_task_outcome,
+    consume_pending_task_cancellation,
+    unexpected_child_cancellation_error,
+)
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
 from cayu.artifacts import (
     RESOLVED_FILE_ATTACHMENTS_OPTION,
@@ -93,6 +98,7 @@ from cayu.runtime.budgets import (
     has_deferred_contextual_price,
 )
 from cayu.runtime.context import (
+    _COMPACTION_ATTEMPT_ID_KEY,
     CompactionRequest,
     CompactionResult,
     ContextBuildError,
@@ -107,10 +113,14 @@ from cayu.runtime.context import (
     RuntimeManagedContextPolicy,
     _automatic_compaction_dispatch_runner_scope,
     _automatic_compaction_runner_scope,
+    _AutomaticCompactionRunner,
+    _compaction_completion_publisher_scope,
+    context_build_termination_compaction_telemetry,
     copy_context_messages,
     estimate_context_pressure,
     estimate_model_request_context_pressure,
     noteify_unresolvable_prompt_files,
+    sanitize_context_compaction_telemetry,
 )
 from cayu.runtime.context_counting import ContextCountingConfig, ContextCountingMode
 from cayu.runtime.model_steps import (
@@ -127,7 +137,13 @@ from cayu.runtime.retry_policy import (
     retry_decision,
     retry_event_payload,
 )
-from cayu.runtime.sessions import EventOrder, EventQuery, Session, SessionStore
+from cayu.runtime.sessions import (
+    CheckpointTransform,
+    EventOrder,
+    EventQuery,
+    Session,
+    SessionStore,
+)
 from cayu.runtime.structured_output import (
     StructuredOutputSpec,
     StructuredOutputStrategy,
@@ -188,6 +204,18 @@ class ModelStepFlowOutcome:
             )
 
 
+_CONTEXT_TERMINATION_PERSIST_TIMEOUT_S = 5.0
+_CONTEXT_EVENT_STORE_WAIT_TIMEOUT_S = 5.0
+_CONTEXT_USAGE_AUXILIARY_PAGE_SIZE = 100
+
+
+def _consume_detached_task_outcome(task: asyncio.Task[Any]) -> None:
+    """Retrieve a timed-out task's eventual result after requesting cancellation."""
+
+    with contextlib.suppress(asyncio.CancelledError):
+        task.exception()
+
+
 @dataclass(frozen=True)
 class ModelStepBudgetEvaluationRequest:
     evaluation: BudgetEvaluation
@@ -239,13 +267,31 @@ BudgetReservationFailureEventStream = Callable[
     [ModelStepBudgetReservationFailureRequest],
     AsyncIterator[Event],
 ]
-CheckpointSession = Callable[[str, dict[str, Any]], Awaitable[None]]
+CheckpointTransformFactory = Callable[[dict[str, Any]], CheckpointTransform]
 
 
 class _AutomaticCompactionBudgetReservationFailed(RuntimeError):
     def __init__(self, result: BudgetReservationResult) -> None:
         super().__init__(f"Context compaction budget reservation failed: {result.message}")
         self.result = result
+
+
+class _AutomaticCompactionAdmissionStopped(RuntimeError):
+    """The session was stopped by a limit before a compactor provider dispatch."""
+
+    def __init__(
+        self,
+        *,
+        budget_evaluation: BudgetEvaluation | None = None,
+        limit_evaluation: LimitEvaluation | None = None,
+    ) -> None:
+        if (budget_evaluation is None) == (limit_evaluation is None):
+            raise ValueError(
+                "Automatic compaction admission must contain one rejecting evaluation."
+            )
+        self.budget_evaluation = budget_evaluation
+        self.limit_evaluation = limit_evaluation
+        super().__init__("Automatic compaction provider dispatch was stopped by a limit.")
 
 
 class ModelStepExecutor:
@@ -262,7 +308,7 @@ class ModelStepExecutor:
         max_file_attachment_bytes: int,
         max_total_file_attachment_bytes: int,
         max_file_attachments_per_request: int,
-        checkpoint_session: CheckpointSession,
+        checkpoint_transform: CheckpointTransformFactory,
         apply_budget_evaluation: BudgetEvaluationEventStream,
         apply_limit_evaluation: LimitEvaluationEventStream,
         stop_for_budget_reservation_failure: BudgetReservationFailureEventStream,
@@ -275,7 +321,7 @@ class ModelStepExecutor:
         self._max_file_attachment_bytes = max_file_attachment_bytes
         self._max_total_file_attachment_bytes = max_total_file_attachment_bytes
         self._max_file_attachments_per_request = max_file_attachments_per_request
-        self._checkpoint_session = checkpoint_session
+        self._checkpoint_transform = checkpoint_transform
         self._apply_budget_evaluation = apply_budget_evaluation
         self._apply_limit_evaluation = apply_limit_evaluation
         self._stop_for_budget_reservation_failure = stop_for_budget_reservation_failure
@@ -1067,21 +1113,50 @@ class ModelStepRun:
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
         context_messages: list[Message]
         compaction_budget_events: list[Event] = []
+        published_compaction_attempt_ids: set[str] = set()
+        compaction_start_events: list[Event] = []
+        compaction_completion_events: dict[str, Event] = {}
 
         async def run_automatic_compaction(
             compactor: ContextCompactor,
             compaction_request: CompactionRequest,
+            compaction_started: ContextCompactionTelemetry,
             execute: Callable[[], Awaitable[CompactionResult]],
             completed_payloads: Callable[[], list[dict[str, Any]]],
         ) -> CompactionResult:
-            return await self._run_automatic_compaction_with_budget(
-                compactor=compactor,
-                compaction_request=compaction_request,
-                execute=execute,
-                completed_payloads=completed_payloads,
-                budget_events=compaction_budget_events,
+            await self._persist_automatic_compaction_started(
+                compaction_started,
+                published_events=compaction_budget_events,
+                start_events=compaction_start_events,
             )
 
+            async def publish_completions(payloads: list[dict[str, Any]]) -> None:
+                await self._persist_automatic_compaction_completions(
+                    payloads,
+                    published_attempt_ids=published_compaction_attempt_ids,
+                    published_events=compaction_budget_events,
+                    completion_events=compaction_completion_events,
+                )
+
+            async def run() -> CompactionResult:
+                return await self._run_automatic_compaction_with_budget(
+                    compactor=compactor,
+                    compaction_request=compaction_request,
+                    execute=execute,
+                    completed_payloads=completed_payloads,
+                    budget_events=compaction_budget_events,
+                    messages=messages,
+                )
+
+            if not compactor._uses_runtime_provider_dispatch_runner_for_request(compaction_request):
+                return await run()
+            with _compaction_completion_publisher_scope(publish_completions):
+                return await run()
+
+        current_task = asyncio.current_task()
+        context_build_cancellation_requests = (
+            0 if current_task is None else current_task.cancelling()
+        )
         try:
             (
                 context_messages,
@@ -1115,10 +1190,27 @@ class ModelStepRun:
                 run_compaction=run_automatic_compaction,
             )
         except ContextBuildError as exc:
+            (
+                context_failure_events,
+                context_failure_persistence,
+            ) = await self._context_build_failure_events(
+                exc,
+                published_compaction_attempt_ids=published_compaction_attempt_ids,
+                compaction_completion_events=compaction_completion_events,
+                compaction_start_event=(
+                    compaction_start_events[0] if compaction_start_events else None
+                ),
+                compaction_started_published=any(
+                    event.type == EventType.CONTEXT_COMPACTION_STARTED
+                    for event in compaction_budget_events
+                ),
+            )
             for event in compaction_budget_events:
                 yield event, None
-            async for event in self._context_build_failure_events(exc):
+            for event in context_failure_events:
                 yield event, None
+            if context_failure_persistence is not None:
+                raise context_failure_persistence from exc
             if isinstance(exc.cause, _AutomaticCompactionBudgetReservationFailed):
                 async for event in self._stop_for_budget_reservation_failure(
                     result=exc.cause.result,
@@ -1127,17 +1219,56 @@ class ModelStepRun:
                     yield event, None
                 yield None, ModelStepFlowOutcome(stop_session=True)
                 return
+            if isinstance(exc.cause, _AutomaticCompactionAdmissionStopped):
+                admission_events = self._automatic_compaction_admission_events(
+                    exc.cause,
+                    messages=messages,
+                )
+                try:
+                    async for event in admission_events:
+                        yield event, None
+                finally:
+                    await _close_async_iterator(admission_events)
+                yield None, ModelStepFlowOutcome(stop_session=True)
+                return
             raise exc.cause from exc
+        except BaseException as exc:
+            await self._persist_context_build_termination_events(
+                exc,
+                published_compaction_attempt_ids=published_compaction_attempt_ids,
+                compaction_completion_events=compaction_completion_events,
+                compaction_start_event=(
+                    compaction_start_events[0] if compaction_start_events else None
+                ),
+                compaction_started_published=any(
+                    event.type == EventType.CONTEXT_COMPACTION_STARTED
+                    for event in compaction_budget_events
+                ),
+                cancellation_requests_before_build=context_build_cancellation_requests,
+            )
+            raise
 
-        for event in compaction_budget_events:
-            yield event, None
-        async for event in self._context_success_events(
+        context_success_events, context_success_persistence = await self._context_success_events(
             checkpoint_update=checkpoint_update,
             checkpoint_event_payload=checkpoint_event_payload,
             compaction_telemetry=context_compaction_telemetry,
             knowledge_telemetry=context_knowledge_telemetry,
-        ):
+            published_compaction_attempt_ids=published_compaction_attempt_ids,
+            compaction_completion_events=compaction_completion_events,
+            compaction_start_event=(
+                compaction_start_events[0] if compaction_start_events else None
+            ),
+            compaction_started_published=any(
+                event.type == EventType.CONTEXT_COMPACTION_STARTED
+                for event in compaction_budget_events
+            ),
+        )
+        for event in compaction_budget_events:
             yield event, None
+        for event in context_success_events:
+            yield event, None
+        if context_success_persistence is not None:
+            raise context_success_persistence
         await self._executor._session_control.raise_if_interrupted(self._session.id)
 
         if _has_provider_backed_context_compaction(context_compaction_telemetry):
@@ -1538,6 +1669,9 @@ class ModelStepRun:
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
         overflow_policy = self._registered_agent.context_overflow_policy
         compaction_budget_events: list[Event] = []
+        published_compaction_attempt_ids: set[str] = set()
+        compaction_start_events: list[Event] = []
+        compaction_completion_events: dict[str, Event] = {}
 
         def run_attempt(
             request: ModelRequest,
@@ -1595,17 +1729,43 @@ class ModelStepRun:
         async def run_automatic_compaction(
             compactor: ContextCompactor,
             compaction_request: CompactionRequest,
+            compaction_started: ContextCompactionTelemetry,
             execute: Callable[[], Awaitable[CompactionResult]],
             completed_payloads: Callable[[], list[dict[str, Any]]],
         ) -> CompactionResult:
-            return await self._run_automatic_compaction_with_budget(
-                compactor=compactor,
-                compaction_request=compaction_request,
-                execute=execute,
-                completed_payloads=completed_payloads,
-                budget_events=compaction_budget_events,
+            await self._persist_automatic_compaction_started(
+                compaction_started,
+                published_events=compaction_budget_events,
+                start_events=compaction_start_events,
             )
 
+            async def publish_completions(payloads: list[dict[str, Any]]) -> None:
+                await self._persist_automatic_compaction_completions(
+                    payloads,
+                    published_attempt_ids=published_compaction_attempt_ids,
+                    published_events=compaction_budget_events,
+                    completion_events=compaction_completion_events,
+                )
+
+            async def run() -> CompactionResult:
+                return await self._run_automatic_compaction_with_budget(
+                    compactor=compactor,
+                    compaction_request=compaction_request,
+                    execute=execute,
+                    completed_payloads=completed_payloads,
+                    budget_events=compaction_budget_events,
+                    messages=messages,
+                )
+
+            if not compactor._uses_runtime_provider_dispatch_runner_for_request(compaction_request):
+                return await run()
+            with _compaction_completion_publisher_scope(publish_completions):
+                return await run()
+
+        current_task = asyncio.current_task()
+        context_build_cancellation_requests = (
+            0 if current_task is None else current_task.cancelling()
+        )
         try:
             (
                 recovery_context_messages,
@@ -1640,10 +1800,27 @@ class ModelStepRun:
                 force_bounded_compaction=True,
             )
         except ContextBuildError as exc:
+            (
+                context_failure_events,
+                context_failure_persistence,
+            ) = await self._context_build_failure_events(
+                exc,
+                published_compaction_attempt_ids=published_compaction_attempt_ids,
+                compaction_completion_events=compaction_completion_events,
+                compaction_start_event=(
+                    compaction_start_events[0] if compaction_start_events else None
+                ),
+                compaction_started_published=any(
+                    event.type == EventType.CONTEXT_COMPACTION_STARTED
+                    for event in compaction_budget_events
+                ),
+            )
             for event in compaction_budget_events:
                 yield event, None
-            async for event in self._context_build_failure_events(exc):
+            for event in context_failure_events:
                 yield event, None
+            if context_failure_persistence is not None:
+                raise context_failure_persistence from exc
             if isinstance(exc.cause, _AutomaticCompactionBudgetReservationFailed):
                 settlement_events, settlement_error = await settle_provider_dispatch()
                 for event in settlement_events:
@@ -1655,6 +1832,23 @@ class ModelStepRun:
                     messages=messages,
                 ):
                     yield event, None
+                yield None, ModelStepFlowOutcome(stop_session=True)
+                return
+            if isinstance(exc.cause, _AutomaticCompactionAdmissionStopped):
+                settlement_events, settlement_error = await settle_provider_dispatch()
+                for event in settlement_events:
+                    yield event, None
+                if settlement_error is not None:
+                    raise settlement_error from exc.cause
+                admission_events = self._automatic_compaction_admission_events(
+                    exc.cause,
+                    messages=messages,
+                )
+                try:
+                    async for event in admission_events:
+                        yield event, None
+                finally:
+                    await _close_async_iterator(admission_events)
                 yield None, ModelStepFlowOutcome(stop_session=True)
                 return
             yield (
@@ -1676,16 +1870,43 @@ class ModelStepRun:
                 None,
             )
             raise exc.cause from exc
+        except BaseException as exc:
+            await self._persist_context_build_termination_events(
+                exc,
+                published_compaction_attempt_ids=published_compaction_attempt_ids,
+                compaction_completion_events=compaction_completion_events,
+                compaction_start_event=(
+                    compaction_start_events[0] if compaction_start_events else None
+                ),
+                compaction_started_published=any(
+                    event.type == EventType.CONTEXT_COMPACTION_STARTED
+                    for event in compaction_budget_events
+                ),
+                cancellation_requests_before_build=context_build_cancellation_requests,
+            )
+            raise
 
-        for event in compaction_budget_events:
-            yield event, None
-        async for event in self._context_success_events(
+        context_success_events, context_success_persistence = await self._context_success_events(
             checkpoint_update=checkpoint_update,
             checkpoint_event_payload=checkpoint_event_payload,
             compaction_telemetry=compaction_telemetry,
             knowledge_telemetry=knowledge_telemetry,
-        ):
+            published_compaction_attempt_ids=published_compaction_attempt_ids,
+            compaction_completion_events=compaction_completion_events,
+            compaction_start_event=(
+                compaction_start_events[0] if compaction_start_events else None
+            ),
+            compaction_started_published=any(
+                event.type == EventType.CONTEXT_COMPACTION_STARTED
+                for event in compaction_budget_events
+            ),
+        )
+        for event in compaction_budget_events:
             yield event, None
+        for event in context_success_events:
+            yield event, None
+        if context_success_persistence is not None:
+            raise context_success_persistence
         await self._executor._session_control.raise_if_interrupted(self._session.id)
         if _has_provider_backed_context_compaction(compaction_telemetry):
             settlement_events, settlement_error = await settle_provider_dispatch()
@@ -1768,42 +1989,813 @@ class ModelStepRun:
         finally:
             await _close_async_iterator(recovery_events)
 
+    def _automatic_compaction_admission_events(
+        self,
+        rejection: _AutomaticCompactionAdmissionStopped,
+        *,
+        messages: list[Message],
+    ) -> AsyncIterator[Event]:
+        if rejection.budget_evaluation is not None:
+            return self._executor._apply_budget_evaluation(
+                ModelStepBudgetEvaluationRequest(
+                    evaluation=rejection.budget_evaluation,
+                    session=self._session,
+                    registered_agent=self._registered_agent,
+                    registered_environment=self._registered_environment,
+                    environment_name=self._environment_name,
+                    messages=messages,
+                    run_started_at=self._run_started_at,
+                    turn_usage_tracker=self._turn_usage_tracker,
+                    active_run=self._active_run,
+                )
+            )
+        if rejection.limit_evaluation is None:
+            raise RuntimeError(
+                "Automatic compaction admission rejection lost its evaluation."
+            ) from rejection
+        return self._executor._apply_limit_evaluation(
+            ModelStepLimitEvaluationRequest(
+                evaluation=rejection.limit_evaluation,
+                session=self._session,
+                registered_agent=self._registered_agent,
+                registered_environment=self._registered_environment,
+                environment_name=self._environment_name,
+                messages=messages,
+                run_started_at=self._run_started_at,
+                turn_usage_tracker=self._turn_usage_tracker,
+                active_run=self._active_run,
+            )
+        )
+
+    async def _reconcile_automatic_compaction_events(
+        self,
+        events: list[Event],
+        *,
+        cancellation: asyncio.CancelledError | None,
+        operation: str,
+    ) -> tuple[
+        list[bool] | None,
+        BaseException | None,
+        asyncio.CancelledError | None,
+    ]:
+        """Read durable event state without losing cancellation during the read."""
+
+        async def reconcile() -> list[bool]:
+            return [await self._executor._event_writer.is_persisted(event) for event in events]
+
+        reconciliation_task = asyncio.create_task(reconcile())
+        outcome = await await_shielded_task_outcome(
+            reconciliation_task,
+            cancellation=cancellation,
+            timeout_s=_CONTEXT_EVENT_STORE_WAIT_TIMEOUT_S,
+        )
+        if outcome.timed_out:
+            reconciliation_task.cancel()
+            reconciliation_task.add_done_callback(_consume_detached_task_outcome)
+            reconciliation_error = TimeoutError(
+                f"{operation} reconciliation exceeded "
+                f"{_CONTEXT_EVENT_STORE_WAIT_TIMEOUT_S:g} seconds."
+            )
+            return None, reconciliation_error, outcome.cancellation
+        reconciliation_error = outcome.error
+        if isinstance(reconciliation_error, asyncio.CancelledError):
+            reconciliation_error = unexpected_child_cancellation_error(
+                reconciliation_error,
+                operation=f"{operation} reconciliation",
+            )
+        if outcome.result is None and reconciliation_error is None:
+            reconciliation_error = RuntimeError(f"{operation} reconciliation returned no result.")
+        return outcome.result, reconciliation_error, outcome.cancellation
+
+    async def _fan_out_reconciled_automatic_compaction_events(
+        self,
+        events: list[Event],
+        *,
+        cancellation: asyncio.CancelledError | None,
+        operation: str,
+    ) -> tuple[BaseException | None, asyncio.CancelledError | None]:
+        """Retry durable side effects with a bounded cancellation-safe wait."""
+
+        fan_out_task = asyncio.create_task(self._executor._event_writer.fan_out_persisted(events))
+        outcome = await await_shielded_task_outcome(
+            fan_out_task,
+            cancellation=cancellation,
+            timeout_s=_CONTEXT_EVENT_STORE_WAIT_TIMEOUT_S,
+        )
+        if outcome.timed_out:
+            fan_out_task.cancel()
+            fan_out_task.add_done_callback(_consume_detached_task_outcome)
+            return (
+                TimeoutError(
+                    f"{operation} side-effect delivery exceeded "
+                    f"{_CONTEXT_EVENT_STORE_WAIT_TIMEOUT_S:g} seconds."
+                ),
+                outcome.cancellation,
+            )
+        error = outcome.error
+        if isinstance(error, asyncio.CancelledError):
+            error = unexpected_child_cancellation_error(
+                error,
+                operation=f"{operation} side-effect delivery",
+            )
+        return error, outcome.cancellation
+
+    async def _persist_automatic_compaction_started(
+        self,
+        telemetry: ContextCompactionTelemetry,
+        *,
+        published_events: list[Event],
+        start_events: list[Event],
+    ) -> None:
+        """Make the causal start durable before the first provider dispatch."""
+
+        if telemetry.event_type != EventType.CONTEXT_COMPACTION_STARTED:
+            raise TypeError("Automatic compaction start telemetry has the wrong event type.")
+        if any(event.type == EventType.CONTEXT_COMPACTION_STARTED for event in published_events):
+            return
+        if start_events:
+            event = start_events[0].model_copy(deep=True)
+        else:
+            event = _context_compaction_telemetry_event(
+                telemetry=telemetry,
+                session=self._session,
+                registered_agent=self._registered_agent,
+                environment_name=self._environment_name,
+            )
+            start_events.append(event.model_copy(deep=True))
+        persistence_task = asyncio.create_task(
+            self._executor._event_writer.emit_many(self._session.id, [event])
+        )
+        outcome = await await_shielded_task_outcome(
+            persistence_task,
+            timeout_s=_CONTEXT_EVENT_STORE_WAIT_TIMEOUT_S,
+        )
+        cancellation = outcome.cancellation
+        if outcome.timed_out:
+            persistence_task.cancel()
+            persistence_task.add_done_callback(_consume_detached_task_outcome)
+            publication_error: BaseException = TimeoutError(
+                "Compaction start publication exceeded "
+                f"{_CONTEXT_EVENT_STORE_WAIT_TIMEOUT_S:g} seconds."
+            )
+        else:
+            publication_error = outcome.error
+        try:
+            if publication_error is not None:
+                if isinstance(publication_error, asyncio.CancelledError) and cancellation is None:
+                    raise unexpected_child_cancellation_error(
+                        publication_error,
+                        operation="Compaction start publication",
+                    )
+                raise publication_error
+            persisted = outcome.result
+            if persisted is None:
+                raise RuntimeError("Compaction start publication returned no result.")
+        except BaseException as publication_error:
+            try:
+                (
+                    commit_states,
+                    reconciliation_error,
+                    cancellation,
+                ) = await self._reconcile_automatic_compaction_events(
+                    [event],
+                    cancellation=cancellation,
+                    operation="Compaction start publication",
+                )
+                if reconciliation_error is not None:
+                    raise reconciliation_error
+            except BaseException as reconciliation_error:
+                publication_error.add_note(
+                    "Compaction start publication reconciliation also failed: "
+                    f"{type(reconciliation_error).__name__}: {reconciliation_error}"
+                )
+                if cancellation is not None:
+                    cancellation.add_note(
+                        "Compaction start publication and reconciliation also "
+                        "failed during cancellation."
+                    )
+                    raise cancellation from publication_error
+                raise publication_error from reconciliation_error
+            if commit_states is None:
+                raise AssertionError(
+                    "Compaction start reconciliation lost its result."
+                ) from publication_error
+            if not commit_states[0]:
+                if cancellation is not None:
+                    cancellation.add_note(
+                        "Compaction start could not be confirmed durable during cancellation."
+                    )
+                    raise cancellation from publication_error
+                raise publication_error
+            published_events.append(event.model_copy(deep=True))
+            (
+                fan_out_error,
+                cancellation,
+            ) = await self._fan_out_reconciled_automatic_compaction_events(
+                [event],
+                cancellation=cancellation,
+                operation="Compaction start publication",
+            )
+            if fan_out_error is not None:
+                publication_error.add_note(
+                    "Committed compaction start side-effect delivery also failed: "
+                    f"{type(fan_out_error).__name__}: {fan_out_error}"
+                )
+            publication_error.add_note(
+                "Compaction start was durable; no provider dispatch followed the "
+                "failed publication acknowledgement."
+            )
+            if cancellation is not None:
+                cancellation.add_note("Compaction start was durable before cancellation.")
+                raise cancellation from publication_error
+            raise publication_error
+        published_events.extend(persisted)
+        if cancellation is not None:
+            raise cancellation
+
+    async def _persist_automatic_compaction_completions(
+        self,
+        payloads: list[dict[str, Any]],
+        *,
+        published_attempt_ids: set[str],
+        published_events: list[Event],
+        completion_events: dict[str, Event],
+    ) -> None:
+        """Commit finalized provider evidence before another compactor dispatch."""
+
+        pending: list[tuple[str, Event]] = []
+        for payload in payloads:
+            attempt_id = payload.get(_COMPACTION_ATTEMPT_ID_KEY)
+            if type(attempt_id) is not str:
+                raise RuntimeError("Compaction completion evidence lost its attempt identity.")
+            if attempt_id in published_attempt_ids:
+                continue
+            event = completion_events.get(attempt_id)
+            if event is None:
+                event = _context_compaction_telemetry_event(
+                    telemetry=ContextCompactionTelemetry(
+                        event_type=EventType.MODEL_COMPLETED,
+                        payload=payload,
+                    ),
+                    session=self._session,
+                    registered_agent=self._registered_agent,
+                    environment_name=self._environment_name,
+                )
+                completion_events[attempt_id] = event.model_copy(deep=True)
+            pending.append(
+                (
+                    attempt_id,
+                    event.model_copy(deep=True),
+                )
+            )
+        if not pending:
+            return
+
+        events = [event for _attempt_id, event in pending]
+        persistence_task = asyncio.create_task(
+            self._executor._event_writer.persist_many(self._session.id, events)
+        )
+        outcome = await await_shielded_task_outcome(
+            persistence_task,
+            timeout_s=_CONTEXT_EVENT_STORE_WAIT_TIMEOUT_S,
+        )
+        cancellation = outcome.cancellation
+        if outcome.timed_out:
+            persistence_task.cancel()
+            # Only this physical write receives unbounded ownership. Sink and
+            # budget side-effect delivery happens separately below and remains
+            # bounded because the durable handoff can recover it after restart.
+            drain_outcome = await await_shielded_task_outcome(
+                persistence_task,
+                cancellation=cancellation,
+            )
+            cancellation = drain_outcome.cancellation
+            publication_error: BaseException = TimeoutError(
+                "Compaction completion publication exceeded "
+                f"{_CONTEXT_EVENT_STORE_WAIT_TIMEOUT_S:g} seconds."
+            )
+        else:
+            publication_error = outcome.error
+        try:
+            if publication_error is not None:
+                if isinstance(publication_error, asyncio.CancelledError) and cancellation is None:
+                    raise unexpected_child_cancellation_error(
+                        publication_error,
+                        operation="Compaction completion publication",
+                    )
+                raise publication_error
+            persisted = outcome.result
+            if persisted is None:
+                raise RuntimeError("Compaction completion publication returned no result.")
+        except BaseException as publication_error:
+            try:
+                (
+                    commit_states,
+                    reconciliation_error,
+                    cancellation,
+                ) = await self._reconcile_automatic_compaction_events(
+                    events,
+                    cancellation=cancellation,
+                    operation="Compaction completion publication",
+                )
+                if reconciliation_error is not None:
+                    raise reconciliation_error
+            except BaseException as reconciliation_error:
+                publication_error.add_note(
+                    "Compaction completion publication reconciliation also failed: "
+                    f"{type(reconciliation_error).__name__}: {reconciliation_error}"
+                )
+                if cancellation is not None:
+                    cancellation.add_note(
+                        "Compaction completion publication and reconciliation also "
+                        "failed during cancellation."
+                    )
+                    raise cancellation from publication_error
+                raise publication_error from reconciliation_error
+            if commit_states is None:
+                raise AssertionError(
+                    "Compaction completion reconciliation lost its result."
+                ) from publication_error
+            if not all(commit_states):
+                if any(commit_states):
+                    publication_error.add_note(
+                        "The event store violated atomic compaction completion publication."
+                    )
+                if cancellation is not None:
+                    cancellation.add_note(
+                        "Compaction completion evidence could not be confirmed durable "
+                        "during cancellation."
+                    )
+                    raise cancellation from publication_error
+                raise publication_error
+            # The provider evidence reached the durable handoff even though the
+            # publication acknowledgement or a downstream side effect failed.
+            # Remember it before propagating the failure so no failure path can
+            # publish a duplicate completion and no retry can dispatch again.
+            published_attempt_ids.update(attempt_id for attempt_id, _event in pending)
+            published_events.extend(event.model_copy(deep=True) for event in events)
+            (
+                fan_out_error,
+                cancellation,
+            ) = await self._fan_out_reconciled_automatic_compaction_events(
+                events,
+                cancellation=cancellation,
+                operation="Compaction completion publication",
+            )
+            if fan_out_error is not None:
+                publication_error.add_note(
+                    "Committed compaction completion side-effect delivery also failed: "
+                    f"{type(fan_out_error).__name__}: {fan_out_error}"
+                )
+            publication_error.add_note(
+                "Compaction completion evidence was durable; the operation will "
+                "fail closed without another provider dispatch."
+            )
+            if cancellation is not None:
+                cancellation.add_note(
+                    "Compaction completion evidence was durable before cancellation."
+                )
+                raise cancellation from publication_error
+            raise publication_error
+        published_attempt_ids.update(attempt_id for attempt_id, _event in pending)
+        published_events.extend(persisted)
+        (
+            fan_out_error,
+            cancellation,
+        ) = await self._fan_out_reconciled_automatic_compaction_events(
+            events,
+            cancellation=cancellation,
+            operation="Compaction completion publication",
+        )
+        if cancellation is not None:
+            if fan_out_error is not None:
+                cancellation.add_note(
+                    "Committed compaction completion side-effect delivery also failed "
+                    f"during cancellation: {type(fan_out_error).__name__}: "
+                    f"{fan_out_error}"
+                )
+                raise cancellation from fan_out_error
+            raise cancellation
+        if fan_out_error is not None:
+            raise fan_out_error
+
+    async def _emit_context_events_reconciling_late_start(
+        self,
+        events: list[Event],
+        *,
+        compaction_start_event: Event | None,
+    ) -> list[Event]:
+        """Persist a batch without duplicating a concurrently committed start."""
+
+        try:
+            return await self._executor._event_writer.emit_many(self._session.id, events)
+        except BaseException as publication_error:
+            if (
+                not isinstance(publication_error, ValueError)
+                or compaction_start_event is None
+                or all(event.id != compaction_start_event.id for event in events)
+            ):
+                raise
+            try:
+                start_durable = await self._executor._event_writer.is_persisted(
+                    compaction_start_event
+                )
+                remaining = [event for event in events if event.id != compaction_start_event.id]
+                remaining_states = [
+                    await self._executor._event_writer.is_persisted(event) for event in remaining
+                ]
+            except BaseException as reconciliation_error:
+                publication_error.add_note(
+                    "Context start conflict reconciliation also failed: "
+                    f"{type(reconciliation_error).__name__}: {reconciliation_error}"
+                )
+                raise publication_error from reconciliation_error
+            if not start_durable:
+                raise
+            if any(remaining_states):
+                if not all(remaining_states):
+                    publication_error.add_note(
+                        "The context store violated atomic event-batch publication."
+                    )
+                    raise publication_error
+                persisted_remaining = [event.model_copy(deep=True) for event in remaining]
+            else:
+                try:
+                    persisted_remaining = await self._executor._event_writer.persist_many(
+                        self._session.id,
+                        remaining,
+                    )
+                except BaseException as retry_error:
+                    retry_error.add_note(
+                        "Context event publication retried after the original compaction "
+                        "start committed concurrently."
+                    )
+                    raise retry_error from publication_error
+            reconciled = [compaction_start_event.model_copy(deep=True), *persisted_remaining]
+            await self._executor._event_writer.fan_out_persisted(reconciled)
+            return [
+                next(event for event in reconciled if event.id == requested.id).model_copy(
+                    deep=True
+                )
+                for requested in events
+            ]
+
+    async def _persist_context_events(
+        self,
+        *,
+        compaction_telemetry: list[ContextCompactionTelemetry],
+        knowledge_telemetry: list[ContextKnowledgeTelemetry],
+        checkpoint_update: dict[str, Any] | None,
+        checkpoint_event_payload: dict[str, Any] | None,
+        published_compaction_attempt_ids: set[str],
+        compaction_completion_events: dict[str, Event],
+        compaction_start_event: Event | None,
+        compaction_started_published: bool,
+        checkpoint_invariant_cause: BaseException | None = None,
+    ) -> tuple[list[Event], BaseException | None]:
+        """Persist one context outcome completely before exposing its first event."""
+
+        reconciled_start_events: list[Event] = []
+        compaction_start_durable = compaction_started_published
+        if not compaction_start_durable and compaction_start_event is not None:
+            (
+                commit_states,
+                reconciliation_error,
+                cancellation,
+            ) = await self._reconcile_automatic_compaction_events(
+                [compaction_start_event],
+                cancellation=None,
+                operation="Compaction start cleanup",
+            )
+            if cancellation is not None:
+                if reconciliation_error is not None:
+                    raise cancellation from reconciliation_error
+                raise cancellation
+            if reconciliation_error is not None:
+                return [], reconciliation_error
+            if commit_states is None:
+                return [], RuntimeError(
+                    "Compaction start cleanup reconciliation returned no result."
+                )
+            compaction_start_durable = commit_states[0]
+            if compaction_start_durable:
+                reconciled_start_events.append(compaction_start_event.model_copy(deep=True))
+
+        prepared_events: list[Event] = []
+        for telemetry in compaction_telemetry:
+            if (
+                telemetry.event_type == EventType.MODEL_COMPLETED
+                and telemetry.payload.get(_COMPACTION_ATTEMPT_ID_KEY)
+                in published_compaction_attempt_ids
+            ) or (
+                telemetry.event_type == EventType.CONTEXT_COMPACTION_STARTED
+                and compaction_start_durable
+            ):
+                continue
+            compaction_attempt_id = telemetry.payload.get(_COMPACTION_ATTEMPT_ID_KEY)
+            event = (
+                compaction_completion_events.get(compaction_attempt_id)
+                if telemetry.event_type == EventType.MODEL_COMPLETED
+                and type(compaction_attempt_id) is str
+                else (
+                    compaction_start_event
+                    if telemetry.event_type == EventType.CONTEXT_COMPACTION_STARTED
+                    else None
+                )
+            )
+            if event is None:
+                event = _context_compaction_telemetry_event(
+                    telemetry=telemetry,
+                    session=self._session,
+                    registered_agent=self._registered_agent,
+                    environment_name=self._environment_name,
+                )
+                if (
+                    telemetry.event_type == EventType.MODEL_COMPLETED
+                    and type(compaction_attempt_id) is str
+                ):
+                    compaction_completion_events[compaction_attempt_id] = event.model_copy(
+                        deep=True
+                    )
+            prepared_events.append(event.model_copy(deep=True))
+        prepared_events.extend(
+            _context_knowledge_telemetry_event(
+                telemetry=telemetry,
+                session=self._session,
+                registered_agent=self._registered_agent,
+                environment_name=self._environment_name,
+            )
+            for telemetry in knowledge_telemetry
+        )
+
+        async def persist() -> tuple[list[Event], BaseException | None]:
+            if checkpoint_event_payload is None:
+                persisted = await self._emit_context_events_reconciling_late_start(
+                    prepared_events,
+                    compaction_start_event=compaction_start_event,
+                )
+                if reconciled_start_events:
+                    await self._executor._event_writer.fan_out_persisted(reconciled_start_events)
+                return [*reconciled_start_events, *persisted], None
+            if checkpoint_update is None:
+                error = RuntimeError("Context checkpoint event payload requires checkpoint state.")
+                if checkpoint_invariant_cause is not None:
+                    error.__cause__ = checkpoint_invariant_cause
+                return [], error
+
+            checkpoint_event = Event(
+                type=EventType.SESSION_CHECKPOINTED,
+                session_id=self._session.id,
+                agent_name=self._registered_agent.spec.name,
+                environment_name=self._environment_name,
+                payload=checkpoint_event_payload,
+            )
+            atomic_events = [*prepared_events, checkpoint_event]
+            checkpoint_transform = self._executor._checkpoint_transform(checkpoint_update)
+            try:
+                await self._executor._session_store.publish_checkpoint_and_events(
+                    self._session.id,
+                    checkpoint_transform=checkpoint_transform,
+                    events=atomic_events,
+                )
+            except BaseException as publication_error:
+                try:
+                    event_commit_states = [
+                        await self._executor._event_writer.is_persisted(event)
+                        for event in atomic_events
+                    ]
+                    events_committed = all(event_commit_states)
+                    durable_checkpoint = await self._executor._session_store.load_checkpoint(
+                        self._session.id
+                    )
+                    durable_session = await self._executor._session_store.load(self._session.id)
+                    expected_checkpoint = (
+                        None
+                        if durable_checkpoint is None or durable_session is None
+                        else checkpoint_transform(durable_session, durable_checkpoint)
+                    )
+                    checkpoint_committed = (
+                        durable_checkpoint is not None and expected_checkpoint == durable_checkpoint
+                    )
+                except BaseException as reconciliation_error:
+                    publication_error.add_note(
+                        "Context checkpoint publication reconciliation also failed: "
+                        f"{type(reconciliation_error).__name__}: {reconciliation_error}"
+                    )
+                    return [], publication_error
+                if not (events_committed and checkpoint_committed):
+                    if events_committed != checkpoint_committed:
+                        publication_error.add_note(
+                            "The context store violated atomic checkpoint/event publication."
+                        )
+                    return [], publication_error
+            await self._executor._event_writer.fan_out_persisted(
+                [*reconciled_start_events, *atomic_events]
+            )
+            return [
+                *(event.model_copy(deep=True) for event in reconciled_start_events),
+                *(event.model_copy(deep=True) for event in atomic_events),
+            ], None
+
+        persistence_task = asyncio.create_task(persist())
+        outcome = await await_shielded_task_outcome(persistence_task)
+        cancellation = outcome.cancellation
+        if cancellation is not None:
+            if outcome.error is not None:
+                cancellation.add_note(
+                    "Context outcome persistence also failed during cancellation: "
+                    f"{type(outcome.error).__name__}."
+                )
+                raise cancellation from outcome.error
+            persisted_outcome = outcome.result
+            if persisted_outcome is None:
+                persistence_error = RuntimeError("Context persistence returned no result.")
+                raise cancellation from persistence_error
+            _, persistence_failure = persisted_outcome
+            if persistence_failure is not None:
+                cancellation.add_note(
+                    "Context checkpoint persistence also failed during cancellation: "
+                    f"{type(persistence_failure).__name__}."
+                )
+                raise cancellation from persistence_failure
+            raise cancellation
+        if outcome.error is not None:
+            if isinstance(outcome.error, asyncio.CancelledError):
+                return (
+                    [],
+                    unexpected_child_cancellation_error(
+                        outcome.error,
+                        operation="Context outcome persistence",
+                    ),
+                )
+            return [], outcome.error
+        if outcome.result is None:
+            return [], RuntimeError("Context persistence returned no result.")
+        persisted_events, persistence_failure = outcome.result
+        if isinstance(persistence_failure, asyncio.CancelledError):
+            persistence_failure = unexpected_child_cancellation_error(
+                persistence_failure,
+                operation="Context outcome persistence",
+            )
+        return persisted_events, persistence_failure
+
     async def _context_build_failure_events(
         self,
         error: ContextBuildError,
-    ) -> AsyncIterator[Event]:
-        for telemetry in error.compaction_telemetry:
-            yield await self._executor._event_writer.emit(
-                _context_compaction_telemetry_event(
-                    telemetry=telemetry,
-                    session=self._session,
-                    registered_agent=self._registered_agent,
-                    environment_name=self._environment_name,
+        *,
+        published_compaction_attempt_ids: set[str],
+        compaction_completion_events: dict[str, Event],
+        compaction_start_event: Event | None,
+        compaction_started_published: bool,
+    ) -> tuple[list[Event], BaseException | None]:
+        return await self._persist_context_events(
+            compaction_telemetry=list(error.compaction_telemetry),
+            knowledge_telemetry=list(error.knowledge_telemetry),
+            checkpoint_update=error.checkpoint,
+            checkpoint_event_payload=error.checkpoint_event_payload,
+            published_compaction_attempt_ids=published_compaction_attempt_ids,
+            compaction_completion_events=compaction_completion_events,
+            compaction_start_event=compaction_start_event,
+            compaction_started_published=compaction_started_published,
+            checkpoint_invariant_cause=error,
+        )
+
+    async def _persist_context_build_termination_events(
+        self,
+        error: BaseException,
+        *,
+        published_compaction_attempt_ids: set[str],
+        compaction_completion_events: dict[str, Event],
+        compaction_start_event: Event | None,
+        compaction_started_published: bool,
+        cancellation_requests_before_build: int,
+    ) -> None:
+        """Persist completed compaction evidence without replacing a fatal signal."""
+
+        telemetry = context_build_termination_compaction_telemetry(error)
+        compaction_start_durable = compaction_started_published
+        if not compaction_start_durable and compaction_start_event is not None:
+            if isinstance(error, asyncio.CancelledError):
+                # Remove only the cancellation already represented by ``error``.
+                # The bounded reconciliation below must observe a genuinely later
+                # Task.cancel() as a distinct signal rather than folding it into
+                # the historical/provider cancellation.
+                consume_pending_task_cancellation(
+                    error,
+                    preserve_requests=cancellation_requests_before_build,
+                )
+            (
+                commit_states,
+                reconciliation_error,
+                reconciliation_cancellation,
+            ) = await self._reconcile_automatic_compaction_events(
+                [compaction_start_event],
+                cancellation=None,
+                operation="Compaction start termination cleanup",
+            )
+            if reconciliation_error is not None:
+                error.add_note(
+                    "Context compaction start reconciliation also failed during "
+                    f"termination: {type(reconciliation_error).__name__}: "
+                    f"{reconciliation_error}"
+                )
+            elif commit_states is not None:
+                compaction_start_durable = commit_states[0]
+            if reconciliation_cancellation is not None and reconciliation_cancellation is not error:
+                raise BaseExceptionGroup(
+                    "Context compaction start reconciliation observed a later cancellation.",
+                    [error, reconciliation_cancellation],
+                )
+        unpublished_telemetry = [
+            item
+            for item in telemetry
+            if not (
+                (
+                    item.event_type == EventType.MODEL_COMPLETED
+                    and item.payload.get(_COMPACTION_ATTEMPT_ID_KEY)
+                    in published_compaction_attempt_ids
+                )
+                or (
+                    item.event_type == EventType.CONTEXT_COMPACTION_STARTED
+                    and compaction_start_durable
                 )
             )
-        for telemetry in error.knowledge_telemetry:
-            yield await self._executor._event_writer.emit(
-                _context_knowledge_telemetry_event(
-                    telemetry=telemetry,
-                    session=self._session,
-                    registered_agent=self._registered_agent,
-                    environment_name=self._environment_name,
+        ]
+        if not unpublished_telemetry:
+            return
+
+        async def persist() -> None:
+            events = [
+                (
+                    compaction_completion_events[
+                        cast("str", item.payload.get(_COMPACTION_ATTEMPT_ID_KEY))
+                    ].model_copy(deep=True)
+                    if item.event_type == EventType.MODEL_COMPLETED
+                    and type(item.payload.get(_COMPACTION_ATTEMPT_ID_KEY)) is str
+                    and item.payload.get(_COMPACTION_ATTEMPT_ID_KEY) in compaction_completion_events
+                    else compaction_start_event.model_copy(deep=True)
+                    if item.event_type == EventType.CONTEXT_COMPACTION_STARTED
+                    and compaction_start_event is not None
+                    else _context_compaction_telemetry_event(
+                        telemetry=item,
+                        session=self._session,
+                        registered_agent=self._registered_agent,
+                        environment_name=self._environment_name,
+                    )
                 )
+                for item in unpublished_telemetry
+            ]
+            await self._emit_context_events_reconciling_late_start(
+                events,
+                compaction_start_event=compaction_start_event,
             )
-        if error.checkpoint_event_payload is not None:
-            if error.checkpoint is None:
-                raise RuntimeError(
-                    "Context checkpoint event payload requires checkpoint state."
-                ) from error
-            await self._executor._checkpoint_session(self._session.id, error.checkpoint)
-            yield await self._executor._event_writer.emit(
-                Event(
-                    type=EventType.SESSION_CHECKPOINTED,
-                    session_id=self._session.id,
-                    agent_name=self._registered_agent.spec.name,
-                    environment_name=self._environment_name,
-                    payload=error.checkpoint_event_payload,
+
+        if isinstance(error, asyncio.CancelledError):
+            # This cancellation has already crossed the context-build boundary and
+            # remains authoritative. Clear only its task-level delivery state before
+            # shielding cleanup so a genuinely later Task.cancel() is observed as a
+            # distinct signal instead of being normalized back into ``error``.
+            consume_pending_task_cancellation(
+                error,
+                preserve_requests=cancellation_requests_before_build,
+            )
+        task = asyncio.create_task(persist())
+        outcome = await await_shielded_task_outcome(
+            task,
+            timeout_s=_CONTEXT_TERMINATION_PERSIST_TIMEOUT_S,
+        )
+        later_cancellation = (
+            outcome.cancellation
+            if outcome.cancellation is not None and outcome.cancellation is not error
+            else None
+        )
+        if outcome.timed_out:
+            task.add_done_callback(_consume_detached_task_outcome)
+            task.cancel()
+            error.add_note(
+                "Context compaction termination telemetry persistence exceeded "
+                f"{_CONTEXT_TERMINATION_PERSIST_TIMEOUT_S:g} seconds."
+            )
+            if later_cancellation is not None:
+                raise BaseExceptionGroup(
+                    "Context termination telemetry timed out after a later cancellation.",
+                    [error, later_cancellation],
                 )
+            return
+        if outcome.error is not None:
+            error.add_note(
+                "Context compaction termination telemetry also failed to persist: "
+                f"{type(outcome.error).__name__}: {outcome.error}"
+            )
+            if later_cancellation is not None:
+                raise BaseExceptionGroup(
+                    "Context termination telemetry failed after a later cancellation.",
+                    [error, outcome.error, later_cancellation],
+                )
+        elif later_cancellation is not None:
+            raise BaseExceptionGroup(
+                "Context termination telemetry completed after a later cancellation.",
+                [error, later_cancellation],
             )
 
     async def _context_success_events(
@@ -1813,38 +2805,21 @@ class ModelStepRun:
         checkpoint_event_payload: dict[str, Any] | None,
         compaction_telemetry: list[ContextCompactionTelemetry],
         knowledge_telemetry: list[ContextKnowledgeTelemetry],
-    ) -> AsyncIterator[Event]:
-        for telemetry in compaction_telemetry:
-            yield await self._executor._event_writer.emit(
-                _context_compaction_telemetry_event(
-                    telemetry=telemetry,
-                    session=self._session,
-                    registered_agent=self._registered_agent,
-                    environment_name=self._environment_name,
-                )
-            )
-        for telemetry in knowledge_telemetry:
-            yield await self._executor._event_writer.emit(
-                _context_knowledge_telemetry_event(
-                    telemetry=telemetry,
-                    session=self._session,
-                    registered_agent=self._registered_agent,
-                    environment_name=self._environment_name,
-                )
-            )
-        if checkpoint_event_payload is not None:
-            if checkpoint_update is None:
-                raise RuntimeError("Context checkpoint event payload requires checkpoint state.")
-            await self._executor._checkpoint_session(self._session.id, checkpoint_update)
-            yield await self._executor._event_writer.emit(
-                Event(
-                    type=EventType.SESSION_CHECKPOINTED,
-                    session_id=self._session.id,
-                    agent_name=self._registered_agent.spec.name,
-                    environment_name=self._environment_name,
-                    payload=checkpoint_event_payload,
-                )
-            )
+        published_compaction_attempt_ids: set[str],
+        compaction_completion_events: dict[str, Event],
+        compaction_start_event: Event | None,
+        compaction_started_published: bool,
+    ) -> tuple[list[Event], BaseException | None]:
+        return await self._persist_context_events(
+            compaction_telemetry=compaction_telemetry,
+            knowledge_telemetry=knowledge_telemetry,
+            checkpoint_update=checkpoint_update,
+            checkpoint_event_payload=checkpoint_event_payload,
+            published_compaction_attempt_ids=published_compaction_attempt_ids,
+            compaction_completion_events=compaction_completion_events,
+            compaction_start_event=compaction_start_event,
+            compaction_started_published=compaction_started_published,
+        )
 
     async def _post_compaction_gate(
         self,
@@ -2017,6 +2992,7 @@ class ModelStepRun:
         execute: Callable[[], Awaitable[CompactionResult]],
         completed_payloads: Callable[[], list[dict[str, Any]]],
         budget_events: list[Event],
+        messages: list[Message],
     ) -> CompactionResult:
         controller = self._executor._run_limit_controller
         all_limits = controller.provider_budget_limits(
@@ -2025,7 +3001,8 @@ class ModelStepRun:
             budget_policy=self._budget_policy,
             request_budget_limits=self._request_budget_limits,
         )
-        reservation_limits = tuple(limit for limit in all_limits if limit.reservation is not None)
+        if not all_limits and not self._limit_gate.has_run_limits():
+            return await execute()
         strict_contextual_candidates = tuple(
             limit
             for limit in all_limits
@@ -2033,18 +3010,23 @@ class ModelStepRun:
             and not limit.allow_unpriced
             and any(price.pricing_context is not None for price in limit.pricing.prices)
         )
-        if not reservation_limits and not strict_contextual_candidates:
-            return await execute()
         try:
             identity = compactor._provider_budget_identity_for_request(compaction_request)
         except NotImplementedError as exc:
             raise RuntimeError(
-                "Automatic compaction with cost reservations or strict contextual "
-                "pricing requires the "
+                "Automatic provider-backed compaction under run or budget limits requires the "
                 "ContextCompactor to declare provider_budget_identity(session), "
                 "returning provider/model or None for deterministic execution."
             ) from exc
+        uses_dispatch_boundary = compactor._uses_runtime_provider_dispatch_runner_for_request(
+            compaction_request
+        )
         if identity is None:
+            if uses_dispatch_boundary:
+                raise RuntimeError(
+                    "Provider-backed compaction cannot declare a deterministic budget "
+                    "identity under run or cost limits."
+                )
             return await execute()
         if type(identity) is not tuple or len(identity) != 2:
             raise TypeError(
@@ -2069,17 +3051,24 @@ class ModelStepRun:
             for limit in all_limits
             if limit.reservation is not None or limit in contextual_limits
         )
-        if not limits:
-            return await execute()
-        if not compactor._uses_runtime_provider_dispatch_runner_for_request(compaction_request):
+        if not uses_dispatch_boundary:
             raise RuntimeError(
-                "Automatic compaction with cost reservations or strict contextual "
-                "pricing cannot safely run "
+                "Automatic provider-backed compaction under run or budget limits cannot safely run "
                 f"opaque provider-backed compactor {type(compactor).__name__}: "
                 "Cayu cannot admit each provider dispatch independently. Use an "
-                "unmodified built-in provider compactor or remove reservation-bearing "
-                "or strict contextual cost limits."
+                "unmodified built-in provider compactor or remove the applicable "
+                "run and budget limits."
             )
+
+        policy_limits = budget_limits_for_session(
+            policy=self._budget_policy,
+            agent_name=self._registered_agent.spec.name,
+            causal_budget_id=self._session.causal_budget_id,
+        )
+        dispatch_policy_limits = tuple(limit for limit in policy_limits if limit not in limits)
+        dispatch_request_limits = tuple(
+            limit for limit in self._request_budget_limits if limit not in limits
+        )
 
         async def run_provider_dispatch(
             actual_provider: ModelProvider,
@@ -2089,7 +3078,7 @@ class ModelStepRun:
         ) -> tuple[str, dict[str, Any]]:
             before_count = len(completed_payloads())
 
-            def completed_events() -> list[Event]:
+            def completion_events(payloads: list[dict[str, Any]]) -> list[Event]:
                 return [
                     Event(
                         type=EventType.MODEL_COMPLETED,
@@ -2098,19 +3087,54 @@ class ModelStepRun:
                         environment_name=self._environment_name,
                         payload=payload,
                     )
-                    for payload in completed_payloads()[before_count:]
+                    for payload in payloads
                 ]
 
+            prior_completion_events = [
+                event.model_copy(deep=True)
+                for event in budget_events
+                if event.type == EventType.MODEL_COMPLETED
+            ]
+
+            def completed_events() -> list[Event]:
+                return completion_events(completed_payloads()[before_count:])
+
+            actual_pricing_provider_name = require_clean_nonblank(
+                actual_provider.billing_provider_name or actual_provider.name,
+                "compactor_provider_name",
+            )
+            billing_identity_state = resolved_billing_identity(billing_identity)
+            budget_evaluation = await self._limit_gate.evaluate_budget(
+                BudgetPolicy(limits=dispatch_policy_limits),
+                billing_identity_state=billing_identity_state,
+                pricing_provider_name=actual_pricing_provider_name,
+                model=actual_model,
+                additional_usage_events=prior_completion_events,
+            )
+            if budget_evaluation.check is not None:
+                raise _AutomaticCompactionAdmissionStopped(budget_evaluation=budget_evaluation)
+            budget_events.extend(budget_evaluation.events)
+            limit_evaluation = await self._limit_gate.evaluate_limits(
+                billing_identity_state=billing_identity_state,
+                pricing_provider_name=actual_pricing_provider_name,
+                model=actual_model,
+                additional_usage_events=prior_completion_events,
+                budget_limits=dispatch_request_limits,
+            )
+            if limit_evaluation.decision is not None:
+                raise _AutomaticCompactionAdmissionStopped(limit_evaluation=limit_evaluation)
+            budget_events.extend(limit_evaluation.events)
+            if not limits:
+                return await dispatch()
             outcome = await controller.run_automatic_compaction_dispatch(
                 dispatch,
                 completed_events=completed_events,
+                prior_completion_events=prior_completion_events,
                 budget_limits=limits,
                 session=self._session,
                 agent_name=self._registered_agent.spec.name,
                 environment_name=self._environment_name,
-                provider_name=require_clean_nonblank(
-                    actual_provider.name, "compactor_provider_name"
-                ),
+                provider_name=actual_pricing_provider_name,
                 model=require_clean_nonblank(actual_model, "compactor_model"),
                 billing_identity=billing_identity,
                 pricing_provider_name=pricing_provider_name,
@@ -2220,18 +3244,7 @@ async def _build_context(
     pressure_overhead: ContextPressureOverhead,
     count_input_tokens: Callable[[list[Message]], Awaitable[int | None]] | None,
     build_cache_prefix_request: Callable[[list[Message]], Awaitable[ModelRequest]] | None,
-    run_compaction: (
-        Callable[
-            [
-                ContextCompactor,
-                CompactionRequest,
-                Callable[[], Awaitable[CompactionResult]],
-                Callable[[], list[dict[str, Any]]],
-            ],
-            Awaitable[CompactionResult],
-        ]
-        | None
-    ) = None,
+    run_compaction: _AutomaticCompactionRunner | None = None,
     force_bounded_compaction: bool = False,
 ) -> tuple[
     list[Message],
@@ -2289,17 +3302,30 @@ async def _context_usage_state_for_session(
     session_store: SessionStore,
     session_id: str,
 ) -> ContextUsageState:
-    records = await session_store.query_events(
-        EventQuery(
-            session_id=session_id,
-            event_type=EventType.MODEL_COMPLETED,
-            limit=1,
-            order_by=EventOrder.SEQUENCE_DESC,
+    before_sequence: int | None = None
+    page_size = 1
+    while True:
+        records = await session_store.query_events(
+            EventQuery(
+                session_id=session_id,
+                event_type=EventType.MODEL_COMPLETED,
+                before_sequence=before_sequence,
+                limit=page_size,
+                order_by=EventOrder.SEQUENCE_DESC,
+            )
         )
-    )
-    if not records:
-        return ContextUsageState()
-    return _context_usage_state_from_model_completed_event(records[0].event)
+        if not records:
+            return ContextUsageState()
+        for record in records:
+            payload = record.event.payload
+            is_compaction_completion = (
+                payload.get("purpose") == "context_compaction"
+                and _transcript_cursor_from_model_completed_event(record.event) is None
+            )
+            if not is_compaction_completion:
+                return _context_usage_state_from_model_completed_event(record.event)
+        before_sequence = records[-1].sequence
+        page_size = _CONTEXT_USAGE_AUXILIARY_PAGE_SIZE
 
 
 def _context_usage_state_from_model_completed_event(event: Event) -> ContextUsageState:
@@ -2360,12 +3386,13 @@ def _context_compaction_telemetry_event(
         raise TypeError(
             "Context compaction telemetry must be ContextCompactionTelemetry instances."
         )
+    sanitized = sanitize_context_compaction_telemetry(telemetry)
     return Event(
-        type=telemetry.event_type,
+        type=sanitized.event_type,
         session_id=session.id,
         agent_name=registered_agent.spec.name,
         environment_name=environment_name,
-        payload=copy_json_value(telemetry.payload, "payload"),
+        payload=copy_json_value(sanitized.payload, "payload"),
     )
 
 

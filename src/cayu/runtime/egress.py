@@ -850,6 +850,7 @@ async def _await_cleanup_task(
     *,
     timeout_s: float | None = None,
     timeout_message: str | None = None,
+    cancellation: asyncio.CancelledError | None = None,
 ) -> bool:
     """Wait for cleanup to finish even if the awaiting task is cancelled."""
     if timeout_s is not None:
@@ -857,8 +858,12 @@ async def _await_cleanup_task(
             task,
             timeout_s=timeout_s,
             timeout_message=timeout_message or "Cleanup timed out.",
+            cancellation=cancellation,
         )
-    task_outcome = await await_shielded_task_outcome(task)
+    task_outcome = await await_shielded_task_outcome(
+        task,
+        cancellation=cancellation,
+    )
     if task_outcome.error is not None:
         if isinstance(task_outcome.error, asyncio.CancelledError):
             if task_outcome.cancellation is not None:

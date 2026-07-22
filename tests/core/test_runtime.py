@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import threading
@@ -12,6 +13,8 @@ from typing import Any, Literal
 from uuid import UUID
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 from pydantic import ValidationError
 
 import cayu.runtime._environment_lifecycle as environment_lifecycle_module
@@ -21,6 +24,7 @@ import cayu.runtime._run_limits as run_limits_module
 import cayu.runtime._session_control as session_control_module
 import cayu.runtime._session_engine as session_engine_module
 import cayu.runtime.app as runtime_app_module
+import cayu.runtime.context as runtime_context_module
 import cayu.runtime.sessions as sessions_module
 from cayu.artifacts import (
     RESOLVED_FILE_ATTACHMENTS_OPTION,
@@ -37,7 +41,7 @@ from cayu.core import (
     ToolCallPart,
     ToolResultPart,
 )
-from cayu.core.messages import FilePart
+from cayu.core.messages import FilePart, ProviderStatePart
 from cayu.core.tools import (
     _POLICY_DENIAL_TEXT_MAX_BYTES,
     _POLICY_DENIAL_TRUNCATION_MARKER,
@@ -102,6 +106,7 @@ from cayu.runtime import (
     BudgetWindow,
     CayuApp,
     CheckpointCompactionContextPolicy,
+    CompactionPrompt,
     CompactionRequest,
     CompactionResult,
     ContextCompactor,
@@ -195,6 +200,7 @@ from cayu.runtime._binding_cleanup import (
 )
 from cayu.runtime._session_engine import _require_native_structured_output_support
 from cayu.runtime.context import (
+    ContextBuildError,
     ContextBuildResult,
     RuntimeManagedContextPolicy,
     validate_context_messages,
@@ -475,6 +481,10 @@ class RecordingCompactor(ContextCompactor):
     def __init__(self) -> None:
         self.requests: list[CompactionRequest] = []
 
+    def provider_budget_identity(self, session: Session) -> None:
+        del session
+        return None
+
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         self.requests.append(request)
         compacted_text = "|".join(message.content[0].text for message in request.messages)
@@ -484,6 +494,12 @@ class RecordingCompactor(ContextCompactor):
             summary = compacted_text
         return CompactionResult(
             summary=summary,
+            covered_message_count=len(request.messages),
+            represented_existing_summary_sha256=(
+                hashlib.sha256(request.existing_summary.encode("utf-8")).hexdigest()
+                if request.existing_summary is not None
+                else None
+            ),
             metadata={"request_count": len(self.requests)},
         )
 
@@ -2091,7 +2107,7 @@ def test_knowledge_injection_fail_closed_preserves_completed_compaction_checkpoi
     checkpoint = asyncio.run(store.load_checkpoint("sess_knowledge_fail_closed_after_compaction"))
     assert checkpoint == {
         "context_compaction": {
-            "version": 1,
+            "version": 2,
             "summary": "old|old answer",
             "compacted_transcript_cursor": 2,
             "metadata": {"request_count": 1},
@@ -2174,7 +2190,7 @@ def test_knowledge_injection_policy_composes_with_checkpoint_compaction() -> Non
     checkpoint = asyncio.run(store.load_checkpoint("sess_knowledge_injection_compaction"))
     assert checkpoint == {
         "context_compaction": {
-            "version": 1,
+            "version": 2,
             "summary": "old|old answer",
             "compacted_transcript_cursor": 2,
             "metadata": {"request_count": 1},
@@ -11064,6 +11080,328 @@ def test_automatic_compaction_uses_its_bedrock_billing_identity(
         assert ledger._records == {}
 
 
+def test_automatic_contextual_budget_counts_prior_hierarchy_dispatches() -> None:
+    requested_identity = bedrock_billing_identity(
+        invoked_model="global.anthropic.claude-sonnet-4-6",
+        source_region="us-east-1",
+        resource_type="inference_profile",
+        profile_scope="global",
+        requested_service_tier="default",
+    )
+    completed_identity = completed_bedrock_billing_identity(
+        requested_identity,
+        effective_service_tier="default",
+    )
+
+    class ContextualHierarchyProvider(FakeProvider):
+        name = "bedrock-adapter"
+        billing_provider_name = "bedrock"
+
+        async def billing_identity_for_request(
+            self,
+            request: ModelRequest,
+        ) -> BillingIdentity:
+            return requested_identity
+
+        def billing_identity_for_completion(
+            self,
+            identity: BillingIdentity | None,
+            payload: dict[str, Any],
+        ) -> BillingIdentity | None:
+            assert identity == requested_identity
+            return completed_identity
+
+    completed_batch = [
+        ModelStreamEvent.text_delta("short summary"),
+        ModelStreamEvent.completed(
+            {
+                "model": requested_identity.resource_id,
+                "usage": {"input_tokens": 1, "output_tokens": 0},
+            }
+        ),
+    ]
+    compactor_provider = ContextualHierarchyProvider([completed_batch for _index in range(8)])
+    runtime_provider = FakeProvider(
+        [ModelStreamEvent.completed({"usage": {"input_tokens": 1, "output_tokens": 0}})]
+    )
+    pricing = PriceBook(
+        prices=(
+            ModelPrice.fixed(
+                provider_name="fake",
+                model="fake-model",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("1"),
+            ),
+            ModelPrice.fixed(
+                provider_name="bedrock",
+                model=requested_identity.resource_id,
+                match="exact",
+                input_per_million=Decimal("3"),
+                output_per_million=Decimal("1"),
+                pricing_context={
+                    "source_region": ("us-east-1",),
+                    "service_tier": ("default",),
+                },
+            ),
+        )
+    )
+    app = CayuApp(
+        budget_policy=BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal("0.000004"),
+                    pricing=pricing,
+                ),
+            )
+        )
+    )
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compactor_provider,
+                model=requested_identity.resource_id,
+                max_input_chars=1000,
+            ),
+            max_user_turns=1,
+            compact_after_messages=1,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_automatic_contextual_hierarchy_budget",
+                messages=[
+                    Message.text("user", "oversized " + "x" * 5000),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    assert len(compactor_provider.requests) == 2
+    assert runtime_provider.requests == []
+    completions = [
+        event
+        for event in events
+        if event.type == EventType.MODEL_COMPLETED
+        and event.payload.get("purpose") == "context_compaction"
+    ]
+    assert len(completions) == 2
+    assert EventType.BUDGET_RESERVATION_FAILED in {event.type for event in events}
+    assert events[-1].type == EventType.SESSION_INTERRUPTED
+
+
+def test_automatic_hierarchy_enforces_run_limit_before_every_dispatch() -> None:
+    compactor_provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("short summary"),
+                ModelStreamEvent.completed(
+                    {
+                        "model": "summary-model",
+                        "usage": {
+                            "input_tokens": 7,
+                            "output_tokens": 3,
+                            "total_tokens": 10,
+                        },
+                    }
+                ),
+            ]
+        ]
+    )
+    runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
+    app = CayuApp(enable_logging=False)
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compactor_provider,
+                model="summary-model",
+                max_input_chars=1000,
+            ),
+            max_user_turns=1,
+            compact_after_messages=1,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_automatic_hierarchy_run_limit",
+                messages=[
+                    Message.text("user", "oversized " + "x" * 5000),
+                    Message.text("user", "current"),
+                ],
+                limits=RunLimits(max_total_tokens=10),
+            ),
+        )
+    )
+
+    assert len(compactor_provider.requests) == 1
+    assert runtime_provider.requests == []
+    assert (
+        sum(
+            event.type == EventType.MODEL_COMPLETED
+            and event.payload.get("purpose") == "context_compaction"
+            for event in events
+        )
+        == 1
+    )
+    assert EventType.SESSION_LIMIT_REACHED in {event.type for event in events}
+    assert events[-1].type == EventType.SESSION_INTERRUPTED
+
+
+def test_automatic_hierarchy_enforces_static_budget_before_every_dispatch() -> None:
+    compactor_provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("short summary"),
+                ModelStreamEvent.completed(
+                    {
+                        "model": "summary-model",
+                        "usage": {
+                            "input_tokens": 10,
+                            "output_tokens": 0,
+                            "total_tokens": 10,
+                        },
+                    }
+                ),
+            ]
+        ]
+    )
+    runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
+    app = CayuApp(
+        enable_logging=False,
+        budget_policy=BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal("0.000010"),
+                    pricing=compaction_price_book(),
+                ),
+            )
+        ),
+    )
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compactor_provider,
+                model="summary-model",
+                max_input_chars=1000,
+            ),
+            max_user_turns=1,
+            compact_after_messages=1,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_automatic_hierarchy_static_budget",
+                messages=[
+                    Message.text("user", "oversized " + "x" * 5000),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    assert len(compactor_provider.requests) == 1
+    assert runtime_provider.requests == []
+    assert (
+        sum(
+            event.type == EventType.MODEL_COMPLETED
+            and event.payload.get("purpose") == "context_compaction"
+            for event in events
+        )
+        == 1
+    )
+    assert EventType.BUDGET_LIMIT_REACHED in {event.type for event in events}
+    assert events[-1].type == EventType.SESSION_INTERRUPTED
+
+
+def test_automatic_compaction_request_budget_prices_compactor_model_before_dispatch() -> None:
+    compactor_provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("must not be dispatched"),
+            ModelStreamEvent.completed(
+                {
+                    "model": "summary-model",
+                    "usage": {"input_tokens": 10, "output_tokens": 0},
+                }
+            ),
+        ]
+    )
+    runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
+    session_only_pricing = PriceBook(
+        prices=(
+            ModelPrice.fixed(
+                provider_name="fake",
+                model="fake-model",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("1"),
+            ),
+        )
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compactor_provider,
+                model="summary-model",
+            ),
+            max_user_turns=1,
+            compact_after_messages=1,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_compaction_request_budget_model_preflight",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+                budget_limits=(
+                    BudgetLimit(
+                        scope="run",
+                        max_estimated_cost=Decimal("1"),
+                        pricing=session_only_pricing,
+                    ),
+                ),
+            ),
+        )
+    )
+
+    assert compactor_provider.requests == []
+    assert runtime_provider.requests == []
+    limit_event = next(event for event in events if event.type == EventType.SESSION_LIMIT_REACHED)
+    assert limit_event.payload["message"] == (
+        "Budget cannot be verified because fake/summary-model: no matching model pricing."
+    )
+    assert EventType.MODEL_COMPLETED not in {event.type for event in events}
+    assert events[-1].type == EventType.SESSION_INTERRUPTED
+
+
 @pytest.mark.parametrize("limit_source", ["policy", "request"])
 @pytest.mark.parametrize(
     ("resolved_identity", "session_suffix"),
@@ -19666,9 +20004,10 @@ def test_cayu_app_retries_typed_http_sse_idle_timeout_and_keeps_transcript_clean
                     '"delta":{"content":"partial answer"},"finish_reason":null}]}'
                 )
                 yield ""
-                await asyncio.sleep(0.05)
-                yield ""
-                return
+                # Block until the real idle deadline cancels this pending read.
+                # A fixed sleep made the successful retry race a 1 ms deadline
+                # under slower event-loop schedulers (notably CI on Python 3.14).
+                await asyncio.Event().wait()
             yield (
                 'data: {"id":"chat-1","object":"chat.completion.chunk",'
                 '"model":"fake-model","choices":[{"index":0,'
@@ -19712,7 +20051,7 @@ def test_cayu_app_retries_typed_http_sse_idle_timeout_and_keeps_transcript_clean
     provider = ChatCompletionsProvider(
         api_key="test-key",
         base_url="https://example.test/v1",
-        stream_idle_timeout_s=0.001,
+        stream_idle_timeout_s=0.05,
     )
     app = CayuApp(
         session_store=store,
@@ -26082,6 +26421,525 @@ def test_expired_approval_retry_after_recorded_grant_is_not_coerced():
     assert events[-1].type == EventType.SESSION_COMPLETED
 
 
+@pytest.mark.parametrize(
+    ("publication_type", "expected_compactor_calls"),
+    [
+        (EventType.CONTEXT_COMPACTION_STARTED, 0),
+        (EventType.MODEL_COMPLETED, 1),
+    ],
+)
+@pytest.mark.parametrize("release_reconciliation", [True, False])
+def test_automatic_compaction_cancellation_during_publication_reconciliation_propagates(
+    publication_type: EventType,
+    expected_compactor_calls: int,
+    release_reconciliation: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingCompactionProvider(ModelProvider):
+        name = "reconciliation-cancellation-provider"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            del request
+            self.calls += 1
+            yield ModelStreamEvent.text_delta("partial")
+            raise ModelProviderError(
+                "provider failed",
+                provider=self.name,
+                retryable=True,
+            )
+
+    async def run() -> None:
+        store = InMemorySessionStore()
+        compaction_provider = FailingCompactionProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([ModelStreamEvent.completed({})]), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=compaction_provider,
+                    model="summary-model",
+                    retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+                ),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+        reconciliation_started = asyncio.Event()
+        allow_reconciliation = asyncio.Event()
+        original_emit_many = app._event_writer.emit_many
+        original_persist_many = app._event_writer.persist_many
+        original_is_persisted = app._event_writer.is_persisted
+
+        async def fail_start_publication(session_id: str, events: list[Event]):
+            if any(event.type == EventType.CONTEXT_COMPACTION_STARTED for event in events):
+                raise RuntimeError("publication acknowledgement failed")
+            return await original_emit_many(session_id, events)
+
+        async def fail_completion_persistence(session_id: str, events: list[Event]):
+            if any(event.type == EventType.MODEL_COMPLETED for event in events):
+                raise RuntimeError("publication acknowledgement failed")
+            return await original_persist_many(session_id, events)
+
+        async def block_target_reconciliation(event: Event) -> bool:
+            if event.type == publication_type:
+                reconciliation_started.set()
+                await allow_reconciliation.wait()
+                return False
+            return await original_is_persisted(event)
+
+        if publication_type == EventType.CONTEXT_COMPACTION_STARTED:
+            monkeypatch.setattr(app._event_writer, "emit_many", fail_start_publication)
+        else:
+            monkeypatch.setattr(app._event_writer, "persist_many", fail_completion_persistence)
+        monkeypatch.setattr(app._event_writer, "is_persisted", block_target_reconciliation)
+        if not release_reconciliation:
+            monkeypatch.setattr(
+                model_step_executor_module,
+                "_CONTEXT_EVENT_STORE_WAIT_TIMEOUT_S",
+                0.01,
+            )
+        task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=f"sess_reconciliation_cancel_{publication_type.value}",
+                    messages=[
+                        Message.text("user", "old"),
+                        Message.text("assistant", "old answer"),
+                        Message.text("user", "current"),
+                    ],
+                ),
+            )
+        )
+        await asyncio.wait_for(reconciliation_started.wait(), timeout=5)
+        task.cancel("cancel during compaction publication reconciliation")
+        assert task.cancelling() == 1
+        if release_reconciliation:
+            allow_reconciliation.set()
+        with pytest.raises(
+            asyncio.CancelledError,
+            match="cancel during compaction publication reconciliation",
+        ):
+            await asyncio.wait_for(task, timeout=1)
+
+        assert task.cancelled()
+        assert compaction_provider.calls == expected_compactor_calls
+
+    asyncio.run(run())
+
+
+def test_automatic_compaction_cancellation_does_not_wait_for_stalled_completion_sink(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BlockingCompletionSink(InMemoryEventSink):
+        def __init__(self) -> None:
+            super().__init__()
+            self.blocked = asyncio.Event()
+            self.release = asyncio.Event()
+            self.cancellation_observed = asyncio.Event()
+            self.completion_delivery_calls = 0
+
+        async def emit(self, event: Event) -> None:
+            if (
+                event.type == EventType.MODEL_COMPLETED
+                and event.payload.get("purpose") == "context_compaction"
+            ):
+                self.completion_delivery_calls += 1
+                if self.completion_delivery_calls == 1:
+                    self.blocked.set()
+                    while not self.release.is_set():
+                        try:
+                            await self.release.wait()
+                        except asyncio.CancelledError:
+                            # Model a sink whose in-flight delivery cannot be
+                            # interrupted even though Cayu's caller must be.
+                            self.cancellation_observed.set()
+            await super().emit(event)
+
+    class CompletionProvider(ModelProvider):
+        name = "automatic-stalled-completion-sink-provider"
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            yield ModelStreamEvent.text_delta("summary")
+            yield ModelStreamEvent.completed(
+                {
+                    "model": request.model,
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                }
+            )
+
+    async def run() -> None:
+        monkeypatch.setattr(
+            model_step_executor_module,
+            "_CONTEXT_EVENT_STORE_WAIT_TIMEOUT_S",
+            0.01,
+        )
+        store = InMemorySessionStore()
+        sink = BlockingCompletionSink()
+        app = CayuApp(session_store=store, event_sinks=[sink], enable_logging=False)
+        app.register_provider(FakeProvider([ModelStreamEvent.completed({})]), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=CompletionProvider(),
+                    model="summary-model",
+                ),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+
+        task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_automatic_stalled_completion_sink",
+                    messages=[
+                        Message.text("user", "old"),
+                        Message.text("assistant", "old answer"),
+                        Message.text("user", "current"),
+                    ],
+                ),
+            )
+        )
+        await asyncio.wait_for(sink.blocked.wait(), timeout=1)
+        durable = await store.load_events("sess_automatic_stalled_completion_sink")
+        completions = [
+            event
+            for event in durable
+            if event.type == EventType.MODEL_COMPLETED
+            and event.payload.get("purpose") == "context_compaction"
+        ]
+        assert len(completions) == 1
+
+        task.cancel("cancel automatic compaction with stalled completion sink")
+        assert task.cancelling() == 1
+        await asyncio.wait_for(sink.cancellation_observed.wait(), timeout=1)
+        done, _pending = await asyncio.wait({task}, timeout=1)
+        # Prove caller cancellation completes before the non-cancellable sink.
+        assert task in done
+        with pytest.raises(
+            asyncio.CancelledError,
+            match="cancel automatic compaction with stalled completion sink",
+        ):
+            await task
+        assert task.cancelled()
+
+        sink.release.set()
+        for _ in range(100):
+            delivered = [
+                event
+                for event in sink.events
+                if event.type == EventType.MODEL_COMPLETED
+                and event.payload.get("purpose") == "context_compaction"
+            ]
+            if delivered:
+                break
+            await asyncio.sleep(0.01)
+        assert [event.id for event in delivered] == [completions[0].id]
+        assert sink.completion_delivery_calls == 1
+
+    asyncio.run(run())
+
+
+def test_automatic_compaction_late_completion_commit_keeps_one_accounting_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DelayedCompletionStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.blocked = asyncio.Event()
+            self.release = asyncio.Event()
+            self.blocked_once = False
+            self.cancellations = 0
+
+        async def append_events(self, session_id: str, events: list[Event]) -> None:
+            if not self.blocked_once and any(
+                event.type == EventType.MODEL_COMPLETED
+                and event.payload.get("purpose") == "context_compaction"
+                for event in events
+            ):
+                self.blocked_once = True
+                self.blocked.set()
+                while not self.release.is_set():
+                    try:
+                        await self.release.wait()
+                    except asyncio.CancelledError:
+                        # Match a SQLite worker whose physical commit continues
+                        # after cancellation of the awaiting task.
+                        self.cancellations += 1
+            await super().append_events(session_id, events)
+
+    class CompletionProvider(ModelProvider):
+        name = "automatic-late-completion-provider"
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            yield ModelStreamEvent.text_delta("summary")
+            yield ModelStreamEvent.completed(
+                {
+                    "model": request.model,
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                }
+            )
+
+    async def run() -> None:
+        monkeypatch.setattr(
+            model_step_executor_module,
+            "_CONTEXT_EVENT_STORE_WAIT_TIMEOUT_S",
+            0.01,
+        )
+        store = DelayedCompletionStore()
+        sink = InMemoryEventSink()
+        compaction_provider = CompletionProvider()
+        app = CayuApp(session_store=store, event_sinks=[sink], enable_logging=False)
+        app.register_provider(FakeProvider([ModelStreamEvent.completed({})]), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=compaction_provider,
+                    model="summary-model",
+                ),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+
+        task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_automatic_late_completion_commit",
+                    messages=[
+                        Message.text("user", "old"),
+                        Message.text("assistant", "old answer"),
+                        Message.text("user", "current"),
+                    ],
+                ),
+            )
+        )
+        await asyncio.wait_for(store.blocked.wait(), timeout=1)
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        store.release.set()
+        events = await asyncio.wait_for(task, timeout=1)
+        assert events[-1].type == EventType.SESSION_FAILED
+        for _ in range(100):
+            durable = await store.load_events("sess_automatic_late_completion_commit")
+            completions = [
+                event
+                for event in durable
+                if event.type == EventType.MODEL_COMPLETED
+                and event.payload.get("purpose") == "context_compaction"
+            ]
+            if completions:
+                break
+            await asyncio.sleep(0.01)
+
+        assert len(completions) == 1
+        sink_completions = [
+            event
+            for event in sink.events
+            if event.type == EventType.MODEL_COMPLETED
+            and event.payload.get("purpose") == "context_compaction"
+        ]
+        assert [event.id for event in sink_completions] == [completions[0].id]
+
+    asyncio.run(run())
+
+
+def test_automatic_compaction_late_start_commit_reuses_original_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DelayedStartStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.blocked = asyncio.Event()
+            self.release = asyncio.Event()
+            self.committed = asyncio.Event()
+            self.blocked_once = False
+            self.original_event_id: str | None = None
+            self.cancellations = 0
+
+        async def append_events(self, session_id: str, events: list[Event]) -> None:
+            start = next(
+                (event for event in events if event.type == EventType.CONTEXT_COMPACTION_STARTED),
+                None,
+            )
+            if not self.blocked_once and start is not None:
+                self.blocked_once = True
+                self.original_event_id = start.id
+                self.blocked.set()
+                while not self.release.is_set():
+                    try:
+                        await self.release.wait()
+                    except asyncio.CancelledError:
+                        # Match a physical store write that cannot be cancelled.
+                        self.cancellations += 1
+            await super().append_events(session_id, events)
+            if start is not None and start.id == self.original_event_id:
+                self.committed.set()
+
+    class CountingCompactionProvider(ModelProvider):
+        name = "automatic-late-start-provider"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.calls += 1
+            yield ModelStreamEvent.text_delta("summary")
+            yield ModelStreamEvent.completed({"model": request.model})
+
+    async def run() -> None:
+        monkeypatch.setattr(
+            model_step_executor_module,
+            "_CONTEXT_EVENT_STORE_WAIT_TIMEOUT_S",
+            0.01,
+        )
+        store = DelayedStartStore()
+        sink = InMemoryEventSink()
+        compaction_provider = CountingCompactionProvider()
+        app = CayuApp(session_store=store, event_sinks=[sink], enable_logging=False)
+        app.register_provider(FakeProvider([ModelStreamEvent.completed({})]), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=compaction_provider,
+                    model="summary-model",
+                ),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+        original_is_persisted = app._event_writer.is_persisted
+        stale_start_checks = 0
+
+        async def release_after_stale_start_check(event: Event) -> bool:
+            nonlocal stale_start_checks
+            persisted = await original_is_persisted(event)
+            if (
+                stale_start_checks < 2
+                and event.type == EventType.CONTEXT_COMPACTION_STARTED
+                and not persisted
+            ):
+                stale_start_checks += 1
+                if stale_start_checks == 2:
+                    store.release.set()
+                    await store.committed.wait()
+                # Both reconciliation reads are stale; the original physical
+                # write commits immediately before the fallback batch.
+                return False
+            return persisted
+
+        app._event_writer.is_persisted = release_after_stale_start_check
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_automatic_late_start_commit",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+
+        assert events[-1].type == EventType.SESSION_FAILED
+        assert stale_start_checks == 2
+        assert store.committed.is_set()
+        assert store.cancellations >= 1
+        assert compaction_provider.calls == 0
+        durable = await store.load_events("sess_automatic_late_start_commit")
+        starts = [event for event in durable if event.type == EventType.CONTEXT_COMPACTION_STARTED]
+        assert [event.id for event in starts] == [store.original_event_id]
+        assert EventType.CONTEXT_COMPACTION_FAILED in {event.type for event in durable}
+        sink_starts = [
+            event for event in sink.events if event.type == EventType.CONTEXT_COMPACTION_STARTED
+        ]
+        assert [event.id for event in sink_starts] == [store.original_event_id]
+
+    asyncio.run(run())
+
+
+def test_automatic_compaction_failed_start_publication_reuses_causal_event() -> None:
+    class CountingCompactionProvider(ModelProvider):
+        name = "automatic-failed-start-provider"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.calls += 1
+            yield ModelStreamEvent.text_delta("summary")
+            yield ModelStreamEvent.completed({"model": request.model})
+
+    async def run() -> None:
+        store = InMemorySessionStore()
+        compaction_provider = CountingCompactionProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([ModelStreamEvent.completed({})]), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=compaction_provider,
+                    model="summary-model",
+                ),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+        original_emit_many = app._event_writer.emit_many
+        rejected_start_id: str | None = None
+
+        async def reject_first_start(session_id: str, events: list[Event]) -> list[Event]:
+            nonlocal rejected_start_id
+            start = next(
+                (event for event in events if event.type == EventType.CONTEXT_COMPACTION_STARTED),
+                None,
+            )
+            if rejected_start_id is None and start is not None:
+                rejected_start_id = start.id
+                raise ConnectionError("start publication failed before commit")
+            return await original_emit_many(session_id, events)
+
+        app._event_writer.emit_many = reject_first_start
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_automatic_failed_start_publication",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+
+        assert events[-1].type == EventType.SESSION_FAILED
+        assert compaction_provider.calls == 0
+        durable = await store.load_events("sess_automatic_failed_start_publication")
+        starts = [event for event in durable if event.type == EventType.CONTEXT_COMPACTION_STARTED]
+        failures = [event for event in durable if event.type == EventType.CONTEXT_COMPACTION_FAILED]
+        assert [event.id for event in starts] == [rejected_start_id]
+        assert len(failures) == 1
+        assert durable.index(starts[0]) < durable.index(failures[0])
+
+    asyncio.run(run())
+
+
 def test_tool_approval_recovery_events_carry_resolved_by_and_expiry_stamp():
     # Recovery reconciles a side effect authorized in-window before a crash;
     # it is never blocked by expiry, but an out-of-window reconciliation is
@@ -29354,6 +30212,31 @@ class FlakyCompactionProvider(ModelProvider):
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
+class CompletedThenRetryableCompactionProvider(ModelProvider):
+    name = "retry-after-completed"
+
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        attempt = len(self.requests)
+        yield ModelStreamEvent.text_delta(f"summary {attempt}")
+        yield ModelStreamEvent.completed(
+            {
+                "model": request.model,
+                "usage": {"input_tokens": attempt, "output_tokens": 1},
+            }
+        )
+        if attempt == 1:
+            raise ModelProviderError(
+                "transport failed after completed",
+                provider=self.name,
+                status_code=503,
+                retryable=True,
+            )
+
+
 def test_model_compactor_retries_transient_provider_errors():
     provider = FlakyCompactionProvider(
         failures=1,
@@ -29419,6 +30302,126 @@ def test_model_compactor_retries_transient_provider_error_events():
 
     assert result.summary == "recovered summary"
     assert len(provider.requests) == 2
+
+
+def test_model_compactor_reports_every_completion_when_retry_follows_completed():
+    provider = CompletedThenRetryableCompactionProvider()
+    result = asyncio.run(
+        ModelCompactor(
+            provider=provider,
+            model="summary-model",
+            retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+        ).compact(
+            CompactionRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=[Message.text("user", "old request")],
+            )
+        )
+    )
+
+    assert result.summary == "summary 2"
+    assert len(provider.requests) == 2
+    assert [
+        payload["usage_metrics"]["input_tokens"] for payload in result.model_completed_payloads
+    ] == [1, 2]
+    assert all(
+        "compaction_attempt_id" not in payload for payload in result.model_completed_payloads
+    )
+
+
+def test_prompt_cache_compactor_reports_every_completion_when_retry_follows_completed():
+    provider = CompletedThenRetryableCompactionProvider()
+    context_messages = [
+        Message.text("user", "cached request"),
+        Message.text("assistant", "cached answer"),
+    ]
+    result = asyncio.run(
+        PromptCacheCompactor(
+            provider=provider,
+            retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+        ).compact(
+            CompactionRequest(
+                session=Session(
+                    id="sess_prompt_cache_retry_after_completed",
+                    agent_name="assistant",
+                    provider_name=provider.name,
+                    model="fake-model",
+                ),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=[Message.text("user", "old request")],
+                context_messages=context_messages,
+                cache_prefix_request=ModelRequest(
+                    model="fake-model",
+                    messages=context_messages,
+                ),
+            )
+        )
+    )
+
+    assert result.summary == "summary 2"
+    assert len(provider.requests) == 2
+    assert [
+        payload["usage_metrics"]["input_tokens"] for payload in result.model_completed_payloads
+    ] == [1, 2]
+    assert all(
+        "compaction_attempt_id" not in payload for payload in result.model_completed_payloads
+    )
+
+
+def test_runtime_compaction_outer_ledger_does_not_duplicate_retry_completions():
+    compaction_provider = CompletedThenRetryableCompactionProvider()
+    runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
+    budget_store = InMemoryBudgetStore()
+    app = CayuApp(budget_store=budget_store)
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compaction_provider,
+                model="summary-model",
+                retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_compaction_completed_retry",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    completions = [
+        event
+        for event in events
+        if event.type == EventType.MODEL_COMPLETED
+        and event.payload.get("purpose") == "context_compaction"
+    ]
+    assert len(compaction_provider.requests) == 2
+    assert [event.payload["usage_metrics"]["input_tokens"] for event in completions] == [1, 2]
+    assert all("compaction_attempt_id" not in event.payload for event in completions)
+    budget_events = asyncio.run(
+        budget_store.load_events_for_budget(
+            scope="app",
+            key=None,
+            window=BudgetWindow.all_time(),
+        )
+    )
+    assert [
+        event.id for event in budget_events if event.payload.get("purpose") == "context_compaction"
+    ] == [event.id for event in completions]
 
 
 def test_model_compactor_does_not_retry_by_default():
@@ -29563,8 +30566,9 @@ def test_transcript_digest_compactor_preserves_previous_summary_when_clipping():
 
     assert len(result.summary) <= 400
     assert f"Previous summary:\n{previous_summary}" in result.summary
-    assert "Newly compacted transcript:\n[clipped to latest content]" in result.summary
-    assert result.summary.endswith("filler 29 " + "x" * 40)
+    assert result.covered_message_count is not None
+    assert 0 < result.covered_message_count < 30
+    assert result.summary.endswith(f"filler {result.covered_message_count - 1} " + "x" * 40)
 
 
 def test_transcript_digest_compactor_budgets_both_oversized_sections():
@@ -29582,13 +30586,11 @@ def test_transcript_digest_compactor_budgets_both_oversized_sections():
         )
     )
 
-    assert len(result.summary) <= 400
-    previous_section, digest_section = result.summary.split("\n\n")
-    assert previous_section.startswith("Previous summary:\n[clipped to latest content]")
-    assert previous_section.endswith("earlier decision")
-    assert digest_section.startswith("Newly compacted transcript:\n[clipped to latest content]")
-    assert len(previous_section) == 199
-    assert len(digest_section) == 199
+    assert result.summary == previous_summary
+    assert result.covered_message_count == 0
+    assert result.progress_exhausted is True
+    assert result.progress_key == compactor._progress_key()
+    assert result.metadata["progress_reason"] == "existing_summary_exceeds_limit"
 
 
 def test_transcript_digest_compactor_keeps_small_previous_summary_unclipped():
@@ -31191,7 +32193,7 @@ def test_context_overflow_policy_can_checkpoint_compaction_before_retry():
     )
     assert checkpoint == {
         "context_compaction": {
-            "version": 1,
+            "version": 2,
             "summary": "old request",
             "compacted_transcript_cursor": 1,
             "metadata": {"request_count": 1},
@@ -31283,6 +32285,68 @@ def test_context_overflow_model_compaction_stops_before_recovery_at_token_limit(
     usage = asyncio.run(app.get_session_usage(session_id))
     assert usage.model_steps == 1
     assert usage.usage.total_tokens == 20
+
+
+def test_context_overflow_hierarchy_enforces_run_limit_before_every_dispatch() -> None:
+    store = InMemorySessionStore()
+    runtime_provider = ContextOverflowProvider()
+    compactor_provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("short summary"),
+                ModelStreamEvent.completed(
+                    {
+                        "model": "summary-model",
+                        "usage": {
+                            "input_tokens": 7,
+                            "output_tokens": 3,
+                            "total_tokens": 10,
+                        },
+                    }
+                ),
+            ]
+        ]
+    )
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_overflow_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compactor_provider,
+                model="summary-model",
+                max_input_chars=1000,
+            ),
+            max_user_turns=1,
+            compact_after_messages=1,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="context_overflow_hierarchy_run_limit",
+                messages=[
+                    Message.text("user", "oversized " + "x" * 5000),
+                    Message.text("user", "current"),
+                ],
+                limits=RunLimits(max_total_tokens=10),
+            ),
+        )
+    )
+
+    assert len(runtime_provider.requests) == 1
+    assert len(compactor_provider.requests) == 1
+    event_types = [event.type for event in events]
+    assert EventType.CONTEXT_OVERFLOW_RECOVERING not in event_types
+    assert event_types.index(EventType.CONTEXT_COMPACTION_FAILED) < event_types.index(
+        EventType.SESSION_LIMIT_REACHED
+    )
+    assert events[-1].type == EventType.SESSION_INTERRUPTED
+    checkpoint = asyncio.run(store.load_checkpoint("context_overflow_hierarchy_run_limit"))
+    assert checkpoint is None or "context_compaction" not in checkpoint
 
 
 def test_context_overflow_model_compaction_settles_dispatch_before_budget_gate() -> None:
@@ -31503,7 +32567,7 @@ def test_prompt_cache_compactor_bounds_context_overflow_recovery() -> None:
         event for event in recovery_events if event.type == EventType.CONTEXT_COMPACTION_COMPLETED
     ]
     assert len(completed) == 1
-    assert completed[0].payload["metadata"]["compactor"] == "ModelCompactor"
+    assert completed[0].payload["chunk_mode"] == "single_request"
 
 
 def test_context_overflow_without_policy_fails_without_retry():
@@ -31903,12 +32967,11 @@ def test_model_compactor_fails_on_provider_error():
 
 
 def test_model_compactor_bounds_large_compaction_input():
-    provider = FakeProvider(
-        [
-            ModelStreamEvent.text_delta("bounded summary"),
-            ModelStreamEvent.completed({"finish_reason": "stop"}),
-        ]
-    )
+    completed_batch = [
+        ModelStreamEvent.text_delta("bounded summary"),
+        ModelStreamEvent.completed({"finish_reason": "stop"}),
+    ]
+    provider = FakeProvider([completed_batch for _index in range(16)])
     compactor = ModelCompactor(
         provider=provider,
         model="summary-model",
@@ -31926,16 +32989,22 @@ def test_model_compactor_bounds_large_compaction_input():
         )
     )
 
-    prompt = provider.requests[0].messages[1].content[0].text
-    assert len(prompt) == 1000
-    assert prompt.startswith("Summarize the transcript below so a future agent step can continue")
-    assert "Existing summary:\nimportant previous summary" in prompt
-    assert "Transcript to compact:\n[compaction transcript clipped" in prompt
+    assert len(provider.requests) > 1
+    assert all(len(request.messages[1].content[0].text) <= 1000 for request in provider.requests)
+    assert "x" * 100 in provider.requests[0].messages[1].content[0].text
+    assert any(
+        "important previous summary" in request.messages[1].content[0].text
+        for request in provider.requests
+    )
+    assert result.covered_message_count == 1
+    assert result.source_chunk_count > 1
+    assert result.source_chunk_mode == "hierarchical_atomic_unit"
+    assert result.bounded_input is True
     assert result.metadata["input_truncated"] is True
     assert result.metadata["max_input_chars"] == 1000
 
 
-def test_model_compactor_accepts_custom_prompt_builder():
+def test_model_compactor_rejects_legacy_string_prompt_builder_before_dispatch():
     provider = FakeProvider(
         [
             ModelStreamEvent.text_delta("custom summary"),
@@ -31954,19 +33023,3282 @@ def test_model_compactor_accepts_custom_prompt_builder():
         prompt_builder=prompt_builder,
     )
 
+    with pytest.raises(TypeError, match="must return CompactionPrompt"):
+        asyncio.run(
+            compactor.compact(
+                CompactionRequest(
+                    session=_test_session(),
+                    agent=AgentSpec(name="assistant", model="fake-model"),
+                    messages=[Message.text("user", "old request")],
+                )
+            )
+        )
+
+    assert len(seen_requests) == 1
+    assert provider.requests == []
+
+
+def test_legacy_prompt_builder_cannot_replace_seeded_checkpoint_summary() -> None:
+    provider = FakeProvider([ModelStreamEvent.completed({})])
+    seen_requests: list[CompactionRequest] = []
+
+    def legacy_builder(request: CompactionRequest) -> str:
+        seen_requests.append(request)
+        return "summary that omits the existing checkpoint"
+
+    policy = CheckpointCompactionContextPolicy(
+        compactor=ModelCompactor(
+            provider=provider,
+            model="summary-model",
+            prompt_builder=legacy_builder,
+        ),
+        max_user_turns=1,
+        compact_after_messages=1,
+    )
+    checkpoint = {
+        "context_compaction": {
+            "version": 2,
+            "summary": "OLD_HISTORY_FACT",
+            "compacted_transcript_cursor": 2,
+            "metadata": {"source": "seeded"},
+        }
+    }
+    messages = [
+        Message.text("user", "already covered request"),
+        Message.text("assistant", "already covered answer"),
+        Message.text("user", "new compactable request"),
+        Message.text("assistant", "new compactable answer"),
+        Message.text("user", "current"),
+    ]
+
+    with pytest.raises(ContextBuildError, match="must return CompactionPrompt") as exc_info:
+        asyncio.run(
+            policy.build_with_checkpoint(
+                ContextRequest(
+                    session=_test_session(),
+                    agent=AgentSpec(name="assistant", model="fake-model"),
+                    messages=messages,
+                    step=1,
+                    force_compaction=True,
+                ),
+                checkpoint=checkpoint,
+            )
+        )
+
+    assert isinstance(exc_info.value.cause, TypeError)
+    assert len(seen_requests) == 1
+    assert seen_requests[0].existing_summary == "OLD_HISTORY_FACT"
+    assert provider.requests == []
+    assert checkpoint == {
+        "context_compaction": {
+            "version": 2,
+            "summary": "OLD_HISTORY_FACT",
+            "compacted_transcript_cursor": 2,
+            "metadata": {"source": "seeded"},
+        }
+    }
+
+
+def test_model_compactor_custom_prompt_reports_partial_coverage():
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("custom summary"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    compactor = ModelCompactor(
+        provider=provider,
+        model="summary-model",
+        prompt_builder=lambda request: CompactionPrompt(
+            prompt=f"first: {request.messages[0].content[0].text}",
+            covered_message_count=1,
+        ),
+    )
+
     result = asyncio.run(
         compactor.compact(
             CompactionRequest(
                 session=_test_session(),
                 agent=AgentSpec(name="assistant", model="fake-model"),
-                messages=[Message.text("user", "old request")],
+                messages=[
+                    Message.text("user", "first"),
+                    Message.text("user", "omitted"),
+                ],
             )
         )
     )
 
-    assert result.summary == "custom summary"
-    assert len(seen_requests) == 1
-    assert provider.requests[0].messages[1].content[0].text == ("custom prompt for sess_context")
+    assert result.covered_message_count == 1
+
+
+def test_model_compactor_custom_prompt_recompaction_includes_existing_summary():
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("OLD_HISTORY_FACT plus new context"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    policy = CheckpointCompactionContextPolicy(
+        compactor=ModelCompactor(
+            provider=provider,
+            model="summary-model",
+            prompt_builder=lambda request: CompactionPrompt(
+                prompt=f"custom source: {request.messages[0].content[0].text}",
+                covered_message_count=1,
+            ),
+        ),
+        max_user_turns=1,
+        compact_after_messages=1,
+    )
+    checkpoint = {
+        "context_compaction": {
+            "version": 2,
+            "summary": "OLD_HISTORY_FACT",
+            "compacted_transcript_cursor": 2,
+            "metadata": {"source": "seeded"},
+        }
+    }
+
+    result = asyncio.run(
+        policy.build_with_checkpoint(
+            ContextRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=[
+                    Message.text("user", "already covered request"),
+                    Message.text("assistant", "already covered answer"),
+                    Message.text("user", "new compactable request"),
+                    Message.text("assistant", "new compactable answer"),
+                    Message.text("user", "current"),
+                ],
+                step=1,
+                force_compaction=True,
+            ),
+            checkpoint=checkpoint,
+        )
+    )
+
+    provider_prompt = provider.requests[0].messages[-1].content[0].text
+    assert "OLD_HISTORY_FACT" in provider_prompt
+    assert "custom source: new compactable request" in provider_prompt
+    assert result.checkpoint is not None
+    assert result.checkpoint["context_compaction"]["compacted_transcript_cursor"] == 3
+
+
+def test_model_compactor_rejects_invalid_custom_prompt_coverage():
+    provider = FakeProvider([])
+    compactor = ModelCompactor(
+        provider=provider,
+        model="summary-model",
+        prompt_builder=lambda request: CompactionPrompt(
+            prompt="custom prompt",
+            covered_message_count=len(request.messages) + 1,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="coverage beyond"):
+        asyncio.run(
+            compactor.compact(
+                CompactionRequest(
+                    session=_test_session(),
+                    agent=AgentSpec(name="assistant", model="fake-model"),
+                    messages=[Message.text("user", "only message")],
+                )
+            )
+        )
+    assert provider.requests == []
+
+
+def test_model_compactor_rejects_zero_coverage_custom_prompt_before_dispatch():
+    provider = FakeProvider([])
+    compactor = ModelCompactor(
+        provider=provider,
+        model="summary-model",
+        prompt_builder=lambda _request: CompactionPrompt(
+            prompt="custom prompt",
+            covered_message_count=0,
+        ),
+    )
+
+    with pytest.raises(ValueError):
+        asyncio.run(
+            compactor.compact(
+                CompactionRequest(
+                    session=_test_session(),
+                    agent=AgentSpec(name="assistant", model="fake-model"),
+                    messages=[Message.text("user", "only message")],
+                )
+            )
+        )
+
+    assert provider.requests == []
+
+
+def test_checkpoint_policy_rejects_unmarked_zero_coverage_result():
+    class ZeroCoverageCompactor(ContextCompactor):
+        async def compact(self, request: CompactionRequest) -> CompactionResult:
+            del request
+            return CompactionResult(
+                summary="summary without represented source",
+                covered_message_count=0,
+            )
+
+    policy = CheckpointCompactionContextPolicy(
+        compactor=ZeroCoverageCompactor(),
+        max_user_turns=1,
+        compact_after_messages=1,
+    )
+
+    with pytest.raises(
+        ContextBuildError,
+        match="zero coverage must report progress_exhausted=true",
+    ) as exc_info:
+        asyncio.run(
+            policy.build_with_checkpoint(
+                ContextRequest(
+                    session=_test_session(),
+                    agent=AgentSpec(name="assistant", model="fake-model"),
+                    messages=[
+                        Message.text("user", "old"),
+                        Message.text("assistant", "old answer"),
+                        Message.text("user", "current"),
+                    ],
+                    step=1,
+                    force_compaction=True,
+                ),
+                checkpoint=None,
+            )
+        )
+
+    assert isinstance(exc_info.value.cause, ValueError)
+    assert exc_info.value.checkpoint is None
+    assert [item.event_type for item in exc_info.value.compaction_telemetry] == [
+        EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.CONTEXT_COMPACTION_FAILED,
+    ]
+
+
+def test_checkpoint_policy_rejects_zero_coverage_summary_replacement():
+    class ReplacingExhaustedCompactor(ContextCompactor):
+        def _progress_key(self) -> str:
+            return "replace-exhausted:v1"
+
+        async def compact(self, request: CompactionRequest) -> CompactionResult:
+            assert request.existing_summary == "OLD_HISTORY_FACT"
+            return CompactionResult(
+                summary="replacement that omits the old history",
+                covered_message_count=0,
+                source_chunk_count=0,
+                progress_exhausted=True,
+                progress_key="replace-exhausted:v1",
+            )
+
+    policy = CheckpointCompactionContextPolicy(
+        compactor=ReplacingExhaustedCompactor(),
+        max_user_turns=1,
+        compact_after_messages=1,
+    )
+    checkpoint = {
+        "context_compaction": {
+            "version": 2,
+            "summary": "OLD_HISTORY_FACT",
+            "compacted_transcript_cursor": 2,
+            "metadata": {"source": "seeded"},
+        }
+    }
+
+    with pytest.raises(
+        ContextBuildError,
+        match="zero-coverage compaction must preserve the existing summary",
+    ) as exc_info:
+        asyncio.run(
+            policy.build_with_checkpoint(
+                ContextRequest(
+                    session=_test_session(),
+                    agent=AgentSpec(name="assistant", model="fake-model"),
+                    messages=[
+                        Message.text("user", "already covered request"),
+                        Message.text("assistant", "already covered answer"),
+                        Message.text("user", "new compactable request"),
+                        Message.text("assistant", "new compactable answer"),
+                        Message.text("user", "current"),
+                    ],
+                    step=1,
+                    force_compaction=True,
+                ),
+                checkpoint=checkpoint,
+            )
+        )
+
+    assert isinstance(exc_info.value.cause, ValueError)
+    assert checkpoint["context_compaction"] == {
+        "version": 2,
+        "summary": "OLD_HISTORY_FACT",
+        "compacted_transcript_cursor": 2,
+        "metadata": {"source": "seeded"},
+    }
+
+
+@pytest.mark.parametrize(
+    "represented_existing_summary_sha256",
+    [None, "0" * 64],
+    ids=["missing", "wrong"],
+)
+def test_checkpoint_policy_rejects_unbound_existing_summary_replacement(
+    represented_existing_summary_sha256,
+):
+    class UnboundReplacementCompactor(ContextCompactor):
+        async def compact(self, request: CompactionRequest) -> CompactionResult:
+            assert request.existing_summary == "OLD_HISTORY_FACT"
+            return CompactionResult(
+                summary="new context without a prior-summary binding",
+                covered_message_count=len(request.messages),
+                represented_existing_summary_sha256=(represented_existing_summary_sha256),
+            )
+
+    policy = CheckpointCompactionContextPolicy(
+        compactor=UnboundReplacementCompactor(),
+        max_user_turns=1,
+        compact_after_messages=1,
+    )
+
+    with pytest.raises(
+        ContextBuildError,
+        match="must bind represented_existing_summary_sha256",
+    ) as exc_info:
+        asyncio.run(
+            policy.build_with_checkpoint(
+                ContextRequest(
+                    session=_test_session(),
+                    agent=AgentSpec(name="assistant", model="fake-model"),
+                    messages=[
+                        Message.text("user", "already covered request"),
+                        Message.text("assistant", "already covered answer"),
+                        Message.text("user", "new compactable request"),
+                        Message.text("assistant", "new compactable answer"),
+                        Message.text("user", "current"),
+                    ],
+                    step=1,
+                    force_compaction=True,
+                ),
+                checkpoint={
+                    "context_compaction": {
+                        "version": 2,
+                        "summary": "OLD_HISTORY_FACT",
+                        "compacted_transcript_cursor": 2,
+                        "metadata": {"source": "seeded"},
+                    }
+                },
+            )
+        )
+
+    assert isinstance(exc_info.value.cause, ValueError)
+
+
+def test_model_compactor_rejects_custom_prompt_coverage_that_splits_tool_round():
+    provider = FakeProvider([])
+    compactor = ModelCompactor(
+        provider=provider,
+        model="summary-model",
+        prompt_builder=lambda request: CompactionPrompt(
+            prompt="custom prompt",
+            covered_message_count=1,
+        ),
+    )
+    tool_round = [
+        Message.tool_call(
+            tool_call_id="call_custom_boundary",
+            tool_name="inspect",
+            arguments={"query": "status"},
+        ),
+        Message.tool_result(
+            tool_call_id="call_custom_boundary",
+            tool_name="inspect",
+            content="done",
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="splits an assistant/tool round"):
+        asyncio.run(
+            compactor.compact(
+                CompactionRequest(
+                    session=_test_session(),
+                    agent=AgentSpec(name="assistant", model="fake-model"),
+                    messages=tool_round,
+                )
+            )
+        )
+
+    assert provider.requests == []
+
+
+def test_model_compactor_rejects_truncated_string_custom_prompt_before_dispatch():
+    provider = FakeProvider([])
+    compactor = ModelCompactor(
+        provider=provider,
+        model="summary-model",
+        max_input_chars=1000,
+        prompt_builder=lambda request: "x" * 2000,
+    )
+
+    with pytest.raises(TypeError, match="must return CompactionPrompt"):
+        asyncio.run(
+            compactor.compact(
+                CompactionRequest(
+                    session=_test_session(),
+                    agent=AgentSpec(name="assistant", model="fake-model"),
+                    messages=[Message.text("user", "message")],
+                )
+            )
+        )
+    assert provider.requests == []
+
+
+def test_model_compactor_bounds_by_complete_message_prefix_and_reports_coverage():
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("bounded summary"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    compactor = ModelCompactor(
+        provider=provider,
+        model="summary-model",
+        max_input_chars=1000,
+    )
+    messages = [
+        Message.text("user", "OLDEST_MUST_SURVIVE " + "x" * 400),
+        Message.text("assistant", "LATEST_COMPACTABLE " + "x" * 5000),
+    ]
+
+    result = asyncio.run(
+        compactor.compact(
+            CompactionRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=messages,
+            )
+        )
+    )
+
+    prompt = provider.requests[0].messages[1].content[0].text
+    assert result.covered_message_count == 1
+    assert "OLDEST_MUST_SURVIVE" in prompt
+    assert "LATEST_COMPACTABLE" not in prompt
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [Message.text("user", "café 😀"), Message.text("assistant", "résumé")],
+        [
+            Message.tool_call(
+                tool_call_id="call_1",
+                tool_name="inspect",
+                arguments={"path": "report.txt"},
+            ),
+            Message.tool_result(
+                tool_call_id="call_1",
+                tool_name="inspect",
+                content="result",
+            ),
+        ],
+    ],
+    ids=["unicode", "tool_round"],
+)
+def test_digest_compactor_preserves_message_boundaries(messages):
+    result = asyncio.run(
+        TranscriptDigestCompactor(max_summary_chars=800).compact(
+            CompactionRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=messages,
+            )
+        )
+    )
+    assert result.covered_message_count == len(messages)
+    assert result.summary
+
+
+def test_digest_compactor_covers_provider_state_and_attachment_messages():
+    messages = [
+        Message(
+            role=MessageRole.ASSISTANT,
+            content=(ProviderStatePart(provider="fake", state={"opaque": True}),),
+        ),
+        Message(
+            role=MessageRole.USER,
+            content=(
+                FilePart(
+                    attachment=file_attachment(
+                        artifact_id="artifact-coverage",
+                        kind="image",
+                        filename="coverage.png",
+                        content_type="image/png",
+                        size_bytes=5,
+                    )
+                ),
+            ),
+        ),
+    ]
+    result = asyncio.run(
+        TranscriptDigestCompactor(max_summary_chars=800).compact(
+            CompactionRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=messages,
+            )
+        )
+    )
+    assert result.covered_message_count == 2
+    assert "provider_state" in result.summary
+    assert "coverage.png" in result.summary
+    assert "artifact-coverage" in result.summary
+
+
+def test_digest_compactor_represents_tool_result_structured_data_and_artifacts():
+    result = asyncio.run(
+        TranscriptDigestCompactor(max_summary_chars=1200).compact(
+            CompactionRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=[
+                    Message.tool_call(
+                        tool_call_id="call_rich_result",
+                        tool_name="inspect",
+                        arguments={"path": "report.txt"},
+                    ),
+                    Message.tool_result(
+                        tool_call_id="call_rich_result",
+                        tool_name="inspect",
+                        content="visible result",
+                        structured={"decision": "STRUCTURED_MARKER"},
+                        artifacts=[{"artifact_id": "TOOL_ARTIFACT_MARKER"}],
+                    ),
+                ],
+            )
+        )
+    )
+    assert result.covered_message_count == 2
+    assert "STRUCTURED_MARKER" in result.summary
+    assert "TOOL_ARTIFACT_MARKER" in result.summary
+
+
+def test_digest_compactor_keeps_oversized_uncovered_source_in_every_projection():
+    policy = CheckpointCompactionContextPolicy(
+        compactor=TranscriptDigestCompactor(max_summary_chars=200),
+        max_user_turns=1,
+        compact_after_messages=1,
+    )
+    messages = [
+        Message.text("user", "DIGEST_OLDEST_SURVIVES " + "x" * 1000),
+        Message.text("user", "current"),
+    ]
+
+    first = asyncio.run(
+        policy.build_with_checkpoint(
+            ContextRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=messages,
+                step=1,
+                force_compaction=True,
+            ),
+            checkpoint=None,
+        )
+    )
+    assert first.checkpoint is not None
+    assert first.checkpoint["context_compaction"]["compacted_transcript_cursor"] == 0
+    assert first.checkpoint["context_compaction"]["summary"] == ("No source history was compacted.")
+    assert first.checkpoint["context_compaction"]["progress"] == {
+        "exhausted": True,
+        "key": policy.compactor._progress_key(),
+    }
+    first_projection = json.dumps([message.model_dump(mode="json") for message in first.messages])
+    assert first_projection.count("DIGEST_OLDEST_SURVIVES") == 1
+
+    second = asyncio.run(
+        policy.build_with_checkpoint(
+            ContextRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=messages,
+                step=1,
+                force_compaction=True,
+            ),
+            checkpoint=first.checkpoint,
+        )
+    )
+    assert second.checkpoint is not None
+    assert second.checkpoint["context_compaction"]["compacted_transcript_cursor"] == 0
+    second_projection = json.dumps([message.model_dump(mode="json") for message in second.messages])
+    assert second_projection.count("DIGEST_OLDEST_SURVIVES") == 1
+
+    automatic = asyncio.run(
+        policy.build_with_checkpoint(
+            ContextRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=messages,
+                step=2,
+            ),
+            checkpoint=second.checkpoint,
+        )
+    )
+    assert automatic.checkpoint is None
+    assert automatic.compaction_telemetry == []
+
+    changed_policy = CheckpointCompactionContextPolicy(
+        compactor=TranscriptDigestCompactor(max_summary_chars=300),
+        max_user_turns=1,
+        compact_after_messages=1,
+    )
+    changed = asyncio.run(
+        changed_policy.build_with_checkpoint(
+            ContextRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=messages,
+                step=3,
+            ),
+            checkpoint=second.checkpoint,
+        )
+    )
+    assert changed.checkpoint is not None
+    assert (
+        changed.checkpoint["context_compaction"]["progress"]["key"]
+        != second.checkpoint["context_compaction"]["progress"]["key"]
+    )
+    assert any(
+        item.event_type == EventType.CONTEXT_COMPACTION_STARTED
+        for item in changed.compaction_telemetry
+    )
+
+
+def test_digest_compactor_preserves_oversized_seeded_summary_and_stops_retriggering() -> None:
+    policy = CheckpointCompactionContextPolicy(
+        compactor=TranscriptDigestCompactor(max_summary_chars=200),
+        max_user_turns=1,
+        compact_after_messages=1,
+    )
+    previous_summary = "PRIOR_SUMMARY_FACT " * 20
+    checkpoint = {
+        "context_compaction": {
+            "version": 2,
+            "summary": previous_summary,
+            "compacted_transcript_cursor": 2,
+            "metadata": {"source": "larger-compactor"},
+        }
+    }
+    messages = [
+        Message.text("user", "already covered"),
+        Message.text("assistant", "already covered answer"),
+        Message.text("user", "NEW_UNCOVERED_FACT"),
+        Message.text("assistant", "new answer"),
+        Message.text("user", "current"),
+    ]
+
+    first = asyncio.run(
+        policy.build_with_checkpoint(
+            ContextRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=messages,
+                step=1,
+                force_compaction=True,
+            ),
+            checkpoint=checkpoint,
+        )
+    )
+
+    assert first.checkpoint is not None
+    compacted = first.checkpoint["context_compaction"]
+    assert compacted["summary"] == previous_summary
+    assert compacted["compacted_transcript_cursor"] == 2
+    assert compacted["progress"] == {
+        "exhausted": True,
+        "key": policy.compactor._progress_key(),
+    }
+    projection = json.dumps([message.model_dump(mode="json") for message in first.messages])
+    assert projection.count("PRIOR_SUMMARY_FACT") == 20
+    assert projection.count("NEW_UNCOVERED_FACT") == 1
+
+    second = asyncio.run(
+        policy.build_with_checkpoint(
+            ContextRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=messages,
+                step=2,
+            ),
+            checkpoint=first.checkpoint,
+        )
+    )
+    assert second.checkpoint is None
+    assert second.compaction_telemetry == []
+    second_projection = json.dumps([message.model_dump(mode="json") for message in second.messages])
+    assert second_projection.count("PRIOR_SUMMARY_FACT") == 20
+    assert second_projection.count("NEW_UNCOVERED_FACT") == 1
+
+
+def test_digest_exhaustion_does_not_suppress_replacement_subclass() -> None:
+    class ProgressCapableDigestCompactor(TranscriptDigestCompactor):
+        def __init__(self) -> None:
+            super().__init__(max_summary_chars=200)
+            self.requests: list[CompactionRequest] = []
+
+        async def compact(self, request: CompactionRequest) -> CompactionResult:
+            self.requests.append(request)
+            return CompactionResult(
+                summary="replacement summary",
+                covered_message_count=len(request.messages),
+                represented_existing_summary_sha256=(
+                    hashlib.sha256(request.existing_summary.encode("utf-8")).hexdigest()
+                    if request.existing_summary is not None
+                    else None
+                ),
+                source_chunk_mode="custom",
+                bounded_input=True,
+            )
+
+    messages = [
+        Message.text("user", "REPLACEMENT_SOURCE " + "x" * 1000),
+        Message.text("user", "current"),
+    ]
+    exhausted_policy = CheckpointCompactionContextPolicy(
+        compactor=TranscriptDigestCompactor(max_summary_chars=200),
+        max_user_turns=1,
+        compact_after_messages=1,
+    )
+    exhausted = asyncio.run(
+        exhausted_policy.build_with_checkpoint(
+            ContextRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=messages,
+                step=1,
+            ),
+            checkpoint=None,
+        )
+    )
+    assert exhausted.checkpoint is not None
+    exhausted_context = exhausted.checkpoint["context_compaction"]
+    assert exhausted_context["progress"]["exhausted"] is True
+
+    replacement = ProgressCapableDigestCompactor()
+    replacement_policy = CheckpointCompactionContextPolicy(
+        compactor=replacement,
+        max_user_turns=1,
+        compact_after_messages=1,
+    )
+    progressed = asyncio.run(
+        replacement_policy.build_with_checkpoint(
+            ContextRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=messages,
+                step=2,
+            ),
+            checkpoint=exhausted.checkpoint,
+        )
+    )
+
+    assert len(replacement.requests) == 1
+    assert progressed.checkpoint is not None
+    compacted = progressed.checkpoint["context_compaction"]
+    assert compacted["summary"] == "replacement summary"
+    assert compacted["compacted_transcript_cursor"] == 1
+    assert "progress" not in compacted
+
+
+def test_digest_no_progress_modes_survive_public_event_sanitization() -> None:
+    async def run() -> None:
+        session_id = "sess_digest_no_progress_public_telemetry"
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([ModelStreamEvent.completed({})]), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=TranscriptDigestCompactor(max_summary_chars=200),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[
+                    Message.text("user", "oversized " + "x" * 1000),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+
+        completed = next(
+            event for event in events if event.type == EventType.CONTEXT_COMPACTION_COMPLETED
+        )
+        assert completed.payload["coverage_mode"] == "no_progress"
+        assert completed.payload["chunk_mode"] == "digest_capacity_exhausted"
+        assert completed.payload["represented_message_count"] == 0
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        assert checkpoint["context_compaction"]["compacted_transcript_cursor"] == 0
+
+    asyncio.run(run())
+
+
+def test_digest_no_progress_marker_is_discarded_with_invalid_checkpoint() -> None:
+    compactor = TranscriptDigestCompactor(max_summary_chars=400)
+    policy = CheckpointCompactionContextPolicy(
+        compactor=compactor,
+        max_user_turns=1,
+        compact_after_messages=1,
+    )
+    messages = [
+        Message.text("user", "SOURCE_MUST_BE_REBUILT"),
+        Message.text("user", "current"),
+    ]
+    invalid_checkpoint = {
+        "context_compaction": {
+            "version": 2,
+            "summary": "stale summary",
+            "compacted_transcript_cursor": 99,
+            "metadata": {},
+            "progress": {
+                "exhausted": True,
+                "key": compactor._progress_key(),
+            },
+        }
+    }
+
+    result = asyncio.run(
+        policy.build_with_checkpoint(
+            ContextRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=messages,
+                step=1,
+            ),
+            checkpoint=invalid_checkpoint,
+        )
+    )
+
+    assert result.checkpoint is not None
+    assert result.checkpoint["context_compaction"]["compacted_transcript_cursor"] == 1
+    assert "SOURCE_MUST_BE_REBUILT" in result.checkpoint["context_compaction"]["summary"]
+    assert any(
+        item.event_type == EventType.CONTEXT_COMPACTION_STARTED
+        for item in result.compaction_telemetry
+    )
+
+
+def test_runtime_progress_state_does_not_overwrite_custom_compactor_metadata() -> None:
+    class MetadataCompactor(ContextCompactor):
+        async def compact(self, request: CompactionRequest) -> CompactionResult:
+            return CompactionResult(
+                summary="custom summary",
+                covered_message_count=len(request.messages),
+                metadata={
+                    "progress_exhausted": "custom value",
+                    "progress_key": {"owner": "custom compactor"},
+                },
+            )
+
+    result = asyncio.run(
+        CheckpointCompactionContextPolicy(
+            compactor=MetadataCompactor(),
+            max_user_turns=1,
+            compact_after_messages=1,
+        ).build_with_checkpoint(
+            ContextRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("user", "current"),
+                ],
+                step=1,
+                force_compaction=True,
+            ),
+            checkpoint=None,
+        )
+    )
+
+    assert result.checkpoint is not None
+    compacted = result.checkpoint["context_compaction"]
+    assert compacted["metadata"] == {
+        "progress_exhausted": "custom value",
+        "progress_key": {"owner": "custom compactor"},
+    }
+    assert "progress" not in compacted
+
+
+def test_digest_compactor_does_not_acknowledge_half_of_tool_round():
+    result = asyncio.run(
+        TranscriptDigestCompactor(max_summary_chars=240).compact(
+            CompactionRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=[
+                    Message.tool_call(
+                        tool_call_id="call_digest_atomic",
+                        tool_name="inspect",
+                        arguments={"query": "x" * 160},
+                    ),
+                    Message.tool_result(
+                        tool_call_id="call_digest_atomic",
+                        tool_name="inspect",
+                        content="result",
+                    ),
+                ],
+            )
+        )
+    )
+    assert result.covered_message_count == 0
+
+
+def test_digest_compactor_builds_each_source_message_once(monkeypatch):
+    messages = [
+        Message.text(
+            "user" if index % 2 == 0 else "assistant",
+            f"message-{index:04d}",
+        )
+        for index in range(4096)
+    ]
+    original = runtime_context_module._message_digest
+    digest_calls = 0
+
+    def counted_message_digest(message):
+        nonlocal digest_calls
+        digest_calls += 1
+        return original(message)
+
+    monkeypatch.setattr(runtime_context_module, "_message_digest", counted_message_digest)
+    result = asyncio.run(
+        TranscriptDigestCompactor(max_summary_chars=1_000_000).compact(
+            CompactionRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=messages,
+            )
+        )
+    )
+
+    assert result.covered_message_count == len(messages)
+    assert digest_calls == len(messages)
+
+
+def test_compaction_result_rejects_missing_or_negative_coverage():
+    with pytest.raises(ValueError):
+        CompactionResult(summary="summary")
+    with pytest.raises(ValueError):
+        CompactionResult(summary="summary", covered_message_count=-1)
+    with pytest.raises(ValueError):
+        CompactionPrompt(prompt="custom prompt", covered_message_count=0)
+    with pytest.raises(ValueError):
+        CompactionResult(
+            summary="summary",
+            covered_message_count=0,
+            source_chunk_count=-1,
+        )
+    with pytest.raises(ValueError):
+        CompactionResult(
+            summary="summary",
+            covered_message_count=0,
+            source_chunk_mode=" ",
+        )
+    for invalid_sha256 in ("abc", "A" * 64, "g" * 64):
+        with pytest.raises(ValueError, match="lowercase SHA-256"):
+            CompactionResult(
+                summary="summary",
+                covered_message_count=1,
+                represented_existing_summary_sha256=invalid_sha256,
+            )
+    for invalid_mode in ("private\nmode", "x" * 513):
+        with pytest.raises(ValueError):
+            CompactionResult(
+                summary="summary",
+                covered_message_count=0,
+                source_chunk_mode=invalid_mode,
+            )
+    for invalid_progress_key in ("private\nkey", "x" * 513):
+        with pytest.raises(ValueError):
+            CompactionResult(
+                summary="summary",
+                covered_message_count=0,
+                progress_exhausted=True,
+                progress_key=invalid_progress_key,
+            )
+    with pytest.raises(ValueError, match="requires progress_key"):
+        CompactionResult(
+            summary="summary",
+            covered_message_count=0,
+            progress_exhausted=True,
+        )
+    with pytest.raises(ValueError, match="zero coverage"):
+        CompactionResult(
+            summary="summary",
+            covered_message_count=1,
+            progress_exhausted=True,
+            progress_key="test:v1",
+        )
+    for invalid_count in (True, "1", 1.0):
+        with pytest.raises(ValueError):
+            CompactionResult(
+                summary="summary",
+                covered_message_count=invalid_count,
+            )
+        with pytest.raises(ValueError):
+            CompactionPrompt(
+                prompt="custom prompt",
+                covered_message_count=invalid_count,
+            )
+
+
+@pytest.mark.parametrize("second_size", [100, 600, 1200, 5000])
+def test_model_compactor_coverage_never_crosses_a_message_boundary(second_size):
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("summary"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    messages = [
+        Message.text("user", "first-marker"),
+        Message.text("assistant", "second-marker " + "x" * second_size),
+    ]
+    result = asyncio.run(
+        ModelCompactor(
+            provider=provider,
+            model="summary-model",
+            max_input_chars=1000,
+        ).compact(
+            CompactionRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=messages,
+            )
+        )
+    )
+    prompt = provider.requests[0].messages[-1].content[0].text
+    assert result.covered_message_count in {1, 2}
+    assert "first-marker" in prompt
+    assert ("second-marker" in prompt) is (result.covered_message_count == 2)
+
+
+@settings(max_examples=40, deadline=None)
+@given(
+    source_shapes=st.lists(
+        st.tuples(
+            st.one_of(
+                st.sampled_from([0, 1, 700, 799, 800, 801, 999, 1000, 1001, 2000, 4000]),
+                st.integers(min_value=0, max_value=4000),
+            ),
+            st.booleans(),
+        ),
+        min_size=1,
+        max_size=5,
+    )
+)
+def test_model_compaction_property_preserves_every_covered_source_marker(
+    source_shapes: list[tuple[int, bool]],
+) -> None:
+    markers = [f"CAYU_COVERAGE_MARKER_{index:02d}" for index in range(len(source_shapes))]
+
+    class MarkerPreservingProvider(ModelProvider):
+        name = "property-marker-preserving"
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            prompt = request.messages[-1].content[0].text
+            represented = [marker for marker in markers if marker in prompt]
+            yield ModelStreamEvent.text_delta(" ".join(represented) or "bounded fragment")
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    source_messages = [
+        Message.text(
+            MessageRole.USER if index % 2 == 0 else MessageRole.ASSISTANT,
+            marker + " " + (("😀é" * ((size + 1) // 2))[:size] if unicode_filler else "x" * size),
+        )
+        for index, (marker, (size, unicode_filler)) in enumerate(
+            zip(
+                markers,
+                source_shapes,
+                strict=True,
+            )
+        )
+    ]
+    messages = [*source_messages, Message.text(MessageRole.USER, "current turn")]
+    original_messages = [message.model_copy(deep=True) for message in messages]
+    policy = CheckpointCompactionContextPolicy(
+        compactor=ModelCompactor(
+            provider=MarkerPreservingProvider(),
+            model="summary-model",
+            max_input_chars=1000,
+        ),
+        max_user_turns=1,
+        compact_after_messages=1,
+    )
+
+    checkpoint = None
+    previous_cursor = 0
+    for _attempt in range(len(source_messages)):
+        result = asyncio.run(
+            policy.build_with_checkpoint(
+                ContextRequest(
+                    session=_test_session(),
+                    agent=AgentSpec(name="assistant", model="fake-model"),
+                    messages=messages,
+                    step=1,
+                    force_compaction=True,
+                ),
+                checkpoint=checkpoint,
+            )
+        )
+        assert result.checkpoint is not None
+        checkpoint = result.checkpoint
+        compaction_checkpoint = checkpoint["context_compaction"]
+        cursor = compaction_checkpoint["compacted_transcript_cursor"]
+        assert previous_cursor < cursor <= len(source_messages)
+        assert compaction_checkpoint["summary"].split().count(markers[cursor - 1]) == 1
+
+        projection = json.dumps(
+            [message.model_dump(mode="json") for message in result.messages],
+            ensure_ascii=False,
+        )
+        summary = compaction_checkpoint["summary"]
+        for index, marker in enumerate(markers):
+            assert projection.count(marker) == 1
+            assert summary.split().count(marker) == (1 if index < cursor else 0)
+
+        assert messages == original_messages
+        previous_cursor = cursor
+        if cursor == len(source_messages):
+            break
+
+    assert previous_cursor == len(source_messages)
+
+
+def test_bounded_model_compactor_finds_largest_prefix_with_logarithmic_rebuilds(
+    monkeypatch,
+):
+    messages = [
+        Message.text(
+            "user" if index % 2 == 0 else "assistant",
+            f"message-{index:04d} " + "x" * 20,
+        )
+        for index in range(1024)
+    ]
+    request = CompactionRequest(
+        session=_test_session(),
+        agent=AgentSpec(name="assistant", model="fake-model"),
+        messages=messages,
+    )
+    original = runtime_context_module._default_compaction_prompt_parts
+    rebuild_count = 0
+
+    def counted_prompt_parts(candidate):
+        nonlocal rebuild_count
+        rebuild_count += 1
+        return original(candidate)
+
+    monkeypatch.setattr(
+        runtime_context_module,
+        "_default_compaction_prompt_parts",
+        counted_prompt_parts,
+    )
+    prompt, truncated, covered = runtime_context_module._bounded_default_compaction_prompt(
+        request,
+        max_chars=4000,
+    )
+
+    assert prompt is not None
+    assert truncated is True
+    assert 0 < covered < len(messages)
+    assert len(prompt) <= 4000
+    assert rebuild_count <= 12
+
+
+def test_model_compactor_never_splits_tool_call_from_result_at_input_bound():
+    completed_batch = [
+        ModelStreamEvent.text_delta("summary"),
+        ModelStreamEvent.completed({"finish_reason": "stop"}),
+    ]
+    tool_round = [
+        Message.tool_call(
+            tool_call_id="call_atomic",
+            tool_name="inspect",
+            arguments={"query": "TOOL_CALL_MARKER " + "x" * 1500},
+        ),
+        Message.tool_result(
+            tool_call_id="call_atomic",
+            tool_name="inspect",
+            content="TOOL_RESULT_MARKER",
+        ),
+    ]
+
+    prefix_provider = FakeProvider(completed_batch)
+    prefix_result = asyncio.run(
+        ModelCompactor(
+            provider=prefix_provider,
+            model="summary-model",
+            max_input_chars=1000,
+        ).compact(
+            CompactionRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=[Message.text("user", "safe-prefix"), *tool_round],
+            )
+        )
+    )
+    prefix_prompt = prefix_provider.requests[0].messages[-1].content[0].text
+    assert prefix_result.covered_message_count == 1
+    assert "safe-prefix" in prefix_prompt
+    assert "TOOL_CALL_MARKER" not in prefix_prompt
+    assert "TOOL_RESULT_MARKER" not in prefix_prompt
+
+    hierarchy_provider = FakeProvider([completed_batch for _index in range(16)])
+    hierarchy_result = asyncio.run(
+        ModelCompactor(
+            provider=hierarchy_provider,
+            model="summary-model",
+            max_input_chars=1000,
+        ).compact(
+            CompactionRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=tool_round,
+            )
+        )
+    )
+    hierarchy_prompts = [
+        request.messages[-1].content[0].text for request in hierarchy_provider.requests
+    ]
+    assert hierarchy_result.covered_message_count == 2
+    assert hierarchy_result.source_chunk_mode == "hierarchical_atomic_unit"
+    assert any("TOOL_CALL_MARKER" in prompt for prompt in hierarchy_prompts)
+    assert any("TOOL_RESULT_MARKER" in prompt for prompt in hierarchy_prompts)
+
+
+@pytest.mark.parametrize(
+    ("message", "marker"),
+    [
+        (
+            Message(
+                role=MessageRole.USER,
+                content=(
+                    TextPart(text="UNICODE_BOUNDARY_😀 " + "x" * 2000),
+                    FilePart(
+                        attachment=file_attachment(
+                            artifact_id="HIERARCHY_FILE_MARKER",
+                            kind="image",
+                            filename="hierarchy.png",
+                            content_type="image/png",
+                            size_bytes=5,
+                        )
+                    ),
+                ),
+            ),
+            "HIERARCHY_FILE_MARKER",
+        ),
+        (
+            Message(
+                role=MessageRole.ASSISTANT,
+                content=(
+                    TextPart(text="x" * 2000),
+                    ProviderStatePart(
+                        provider="fake",
+                        state={"opaque": "HIERARCHY_PROVIDER_STATE"},
+                    ),
+                ),
+            ),
+            "provider_state provider=fake",
+        ),
+    ],
+    ids=["file_and_unicode", "provider_state"],
+)
+def test_hierarchical_compaction_represents_boundary_message_parts(message, marker):
+    completed_batch = [
+        ModelStreamEvent.text_delta("summary"),
+        ModelStreamEvent.completed({"finish_reason": "stop"}),
+    ]
+    provider = FakeProvider([completed_batch for _index in range(16)])
+    result = asyncio.run(
+        ModelCompactor(
+            provider=provider,
+            model="summary-model",
+            max_input_chars=1000,
+        ).compact(
+            CompactionRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=[message],
+            )
+        )
+    )
+    prompts = [request.messages[-1].content[0].text for request in provider.requests]
+    assert result.covered_message_count == 1
+    assert result.source_chunk_mode == "hierarchical_atomic_unit"
+    assert any(marker in prompt for prompt in prompts)
+    if message.role == MessageRole.USER:
+        assert any("UNICODE_BOUNDARY_😀" in prompt for prompt in prompts)
+
+
+def test_checkpoint_policy_rejects_compactor_coverage_that_splits_tool_round():
+    class SplitToolRoundCompactor(ContextCompactor):
+        async def compact(self, request: CompactionRequest) -> CompactionResult:
+            return CompactionResult(summary="invalid split", covered_message_count=2)
+
+    policy = CheckpointCompactionContextPolicy(
+        compactor=SplitToolRoundCompactor(),
+        max_user_turns=1,
+        compact_after_messages=1,
+    )
+    messages = [
+        Message.text("user", "old"),
+        Message.tool_call(
+            tool_call_id="call_split",
+            tool_name="inspect",
+            arguments={"path": "report.txt"},
+        ),
+        Message.tool_result(
+            tool_call_id="call_split",
+            tool_name="inspect",
+            content="done",
+        ),
+        Message.text("user", "current"),
+    ]
+    with pytest.raises(ContextBuildError, match="splits an assistant/tool round") as exc_info:
+        asyncio.run(
+            policy.build_with_checkpoint(
+                ContextRequest(
+                    session=_test_session(),
+                    agent=AgentSpec(name="assistant", model="fake-model"),
+                    messages=messages,
+                    step=1,
+                    force_compaction=True,
+                ),
+                checkpoint=None,
+            )
+        )
+    assert isinstance(exc_info.value.cause, ValueError)
+    assert exc_info.value.compaction_telemetry[-1].event_type == (
+        EventType.CONTEXT_COMPACTION_FAILED
+    )
+    assert exc_info.value.compaction_telemetry[-1].payload["represented_source_end"] == 0
+
+
+def test_checkpoint_policy_discards_legacy_cursor_that_splits_tool_round():
+    class CaptureCompactor(ContextCompactor):
+        def __init__(self) -> None:
+            self.request: CompactionRequest | None = None
+
+        async def compact(self, request: CompactionRequest) -> CompactionResult:
+            self.request = request
+            return CompactionResult(
+                summary="replacement summary",
+                covered_message_count=len(request.messages),
+            )
+
+    compactor = CaptureCompactor()
+    policy = CheckpointCompactionContextPolicy(
+        compactor=compactor,
+        max_user_turns=1,
+        compact_after_messages=1,
+    )
+    messages = [
+        Message.text("user", "old"),
+        Message.tool_call(
+            tool_call_id="call_legacy_split",
+            tool_name="inspect",
+            arguments={"path": "report.txt"},
+        ),
+        Message.tool_result(
+            tool_call_id="call_legacy_split",
+            tool_name="inspect",
+            content="done",
+        ),
+        Message.text("user", "current"),
+    ]
+    result = asyncio.run(
+        policy.build_with_checkpoint(
+            ContextRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=messages,
+                step=1,
+                force_compaction=True,
+            ),
+            checkpoint={
+                "context_compaction": {
+                    "version": 2,
+                    "summary": "legacy invalid summary",
+                    "compacted_transcript_cursor": 2,
+                    "metadata": {},
+                }
+            },
+        )
+    )
+    assert compactor.request is not None
+    assert compactor.request.existing_summary is None
+    assert compactor.request.messages == messages[:3]
+    assert result.checkpoint is not None
+    assert result.checkpoint["context_compaction"]["compacted_transcript_cursor"] == 3
+
+
+def test_checkpoint_policy_invalidates_version_one_checkpoint_with_valid_boundary():
+    class CaptureCompactor(ContextCompactor):
+        def __init__(self) -> None:
+            self.request: CompactionRequest | None = None
+
+        async def compact(self, request: CompactionRequest) -> CompactionResult:
+            self.request = request
+            return CompactionResult(
+                summary="replacement summary",
+                covered_message_count=len(request.messages),
+            )
+
+    compactor = CaptureCompactor()
+    policy = CheckpointCompactionContextPolicy(
+        compactor=compactor,
+        max_user_turns=1,
+        compact_after_messages=1,
+    )
+    messages = [
+        Message.text("user", "legacy source may have been clipped"),
+        Message.text("assistant", "legacy answer"),
+        Message.text("user", "current"),
+    ]
+    result = asyncio.run(
+        policy.build_with_checkpoint(
+            ContextRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=messages,
+                step=1,
+                force_compaction=True,
+            ),
+            checkpoint={
+                "context_compaction": {
+                    "version": 1,
+                    "summary": "legacy potentially incomplete summary",
+                    "compacted_transcript_cursor": 2,
+                    "metadata": {},
+                }
+            },
+        )
+    )
+
+    assert compactor.request is not None
+    assert compactor.request.existing_summary is None
+    assert compactor.request.messages == messages[:2]
+    assert result.checkpoint is not None
+    assert result.checkpoint["context_compaction"]["version"] == 2
+    assert result.checkpoint["context_compaction"]["compacted_transcript_cursor"] == 2
+
+
+def test_hierarchical_compaction_cancellation_never_returns_partial_coverage():
+    class CancelSecondHierarchyCallProvider(ModelProvider):
+        name = "cancel-hierarchy"
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.second_started = asyncio.Event()
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.calls += 1
+            if self.calls == 2:
+                self.second_started.set()
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+            yield ModelStreamEvent.text_delta("first fragment summary")
+            yield ModelStreamEvent.completed({"usage": {"input_tokens": 5, "output_tokens": 2}})
+
+    async def run() -> None:
+        provider = CancelSecondHierarchyCallProvider()
+        task = asyncio.create_task(
+            ModelCompactor(
+                provider=provider,
+                model="summary-model",
+                max_input_chars=1000,
+            ).compact(
+                CompactionRequest(
+                    session=_test_session(),
+                    agent=AgentSpec(name="assistant", model="fake-model"),
+                    messages=[Message.text("user", "oversized " + "😀" * 3000)],
+                )
+            )
+        )
+        await provider.second_started.wait()
+        task.cancel("cancel hierarchy")
+        with pytest.raises(asyncio.CancelledError, match="cancel hierarchy"):
+            await task
+        assert provider.calls == 2
+
+    asyncio.run(run())
+
+
+def test_automatic_hierarchical_cancellation_persists_completed_chunk_usage():
+    class CancelSecondHierarchyCallProvider(ModelProvider):
+        name = "cancel-hierarchy-accounting"
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.second_started = asyncio.Event()
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.calls += 1
+            if self.calls == 2:
+                self.second_started.set()
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+            yield ModelStreamEvent.text_delta("first fragment summary")
+            yield ModelStreamEvent.completed(
+                {
+                    "model": request.model,
+                    "usage": {"input_tokens": 5, "output_tokens": 2},
+                }
+            )
+
+    async def run() -> None:
+        session_id = "sess_hierarchy_cancelled_after_completion"
+        store = InMemorySessionStore()
+        compactor_provider = CancelSecondHierarchyCallProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([ModelStreamEvent.completed({})]), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=compactor_provider,
+                    model="summary-model",
+                    max_input_chars=1000,
+                ),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+        task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[
+                        Message.text("user", "oversized " + "x" * 5000),
+                        Message.text("user", "current"),
+                    ],
+                ),
+            )
+        )
+        await asyncio.wait_for(compactor_provider.second_started.wait(), timeout=5)
+        task.cancel("cancel hierarchy after first completion")
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+
+        assert exc_info.value.args == ("cancel hierarchy after first completion",)
+        events = await store.load_events(session_id)
+        compaction_completions = [
+            event
+            for event in events
+            if event.type == EventType.MODEL_COMPLETED
+            and event.payload.get("purpose") == "context_compaction"
+        ]
+        assert len(compaction_completions) == 2
+        assert compaction_completions[0].payload["usage_metrics"]["input_tokens"] == 5
+        assert compaction_completions[0].payload["usage_metrics"]["output_tokens"] == 2
+        assert compaction_completions[1].payload["compaction_outcome"] == "cancelled"
+        assert compaction_completions[1].payload["usage_unavailable_reason"]
+        failures = [event for event in events if event.type == EventType.CONTEXT_COMPACTION_FAILED]
+        assert len(failures) == 1
+        assert failures[0].payload["chunk_count"] == 2
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is None or "context_compaction" not in checkpoint
+
+    asyncio.run(run())
+
+
+def test_automatic_hierarchical_cancellation_persists_each_completed_chunk():
+    class CancelThirdHierarchyCallProvider(ModelProvider):
+        name = "cancel-third-hierarchy-accounting"
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.third_started = asyncio.Event()
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.calls += 1
+            if self.calls == 3:
+                self.third_started.set()
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+            yield ModelStreamEvent.text_delta(f"fragment summary {self.calls}")
+            yield ModelStreamEvent.completed(
+                {
+                    "model": request.model,
+                    "usage": {
+                        "input_tokens": self.calls,
+                        "output_tokens": 1,
+                    },
+                }
+            )
+
+    async def run() -> None:
+        session_id = "sess_hierarchy_cancelled_batch_persistence"
+        store = InMemorySessionStore()
+        budget_store = InMemoryBudgetStore()
+        compactor_provider = CancelThirdHierarchyCallProvider()
+        app = CayuApp(
+            session_store=store,
+            budget_store=budget_store,
+            enable_logging=False,
+        )
+        app.register_provider(FakeProvider([ModelStreamEvent.completed({})]), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=compactor_provider,
+                    model="summary-model",
+                    max_input_chars=1000,
+                ),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+        task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[
+                        Message.text("user", "oversized " + "x" * 5000),
+                        Message.text("user", "current"),
+                    ],
+                ),
+            )
+        )
+        await asyncio.wait_for(compactor_provider.third_started.wait(), timeout=5)
+        task.cancel("cancel hierarchy after two completions")
+        assert task.cancelling() == 1
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+
+        assert exc_info.value.args == ("cancel hierarchy after two completions",)
+        assert task.cancelled()
+        events = await store.load_events(session_id)
+        compaction_completions = [
+            event
+            for event in events
+            if event.type == EventType.MODEL_COMPLETED
+            and event.payload.get("purpose") == "context_compaction"
+        ]
+        assert len(compaction_completions) == 3
+        assert [
+            event.payload["usage_metrics"]["input_tokens"] for event in compaction_completions[:2]
+        ] == [1, 2]
+        assert compaction_completions[2].payload["compaction_outcome"] == "cancelled"
+        assert compaction_completions[2].payload["usage_unavailable_reason"]
+        failures = [event for event in events if event.type == EventType.CONTEXT_COMPACTION_FAILED]
+        assert len(failures) == 1
+        assert failures[0].payload["chunk_count"] == 3
+
+    asyncio.run(run())
+
+
+def test_automatic_compaction_stream_abandonment_preserves_success_accounting():
+    async def run() -> None:
+        session_id = "sess_compaction_success_stream_abandonment"
+        store = InMemorySessionStore()
+        compaction_provider = FakeProvider(
+            [
+                ModelStreamEvent.text_delta("summary"),
+                ModelStreamEvent.completed(
+                    {
+                        "model": "summary-model",
+                        "usage": {"input_tokens": 5, "output_tokens": 2},
+                    }
+                ),
+            ]
+        )
+        main_provider = FakeProvider([ModelStreamEvent.completed({})])
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(main_provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=compaction_provider,
+                    model="summary-model",
+                ),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+        stream = app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            )
+        )
+        while (await anext(stream)).type != EventType.CONTEXT_COMPACTION_STARTED:
+            pass
+        await stream.aclose()
+
+        assert main_provider.requests == []
+        events = await store.load_events(session_id)
+        completions = [
+            event
+            for event in events
+            if event.type == EventType.MODEL_COMPLETED
+            and event.payload.get("purpose") == "context_compaction"
+        ]
+        assert len(completions) == 1
+        assert completions[0].payload["usage_metrics"]["total_tokens"] == 7
+        assert sum(event.type == EventType.CONTEXT_COMPACTION_COMPLETED for event in events) == 1
+        assert sum(event.type == EventType.SESSION_CHECKPOINTED for event in events) == 1
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        assert checkpoint["context_compaction"]["compacted_transcript_cursor"] == 2
+
+    asyncio.run(run())
+
+
+def test_automatic_compaction_stream_abandonment_after_budget_event_keeps_outcome():
+    async def run() -> None:
+        session_id = "sess_compaction_budget_stream_abandonment"
+        store = InMemorySessionStore()
+        compaction_provider = FakeProvider(
+            [
+                ModelStreamEvent.text_delta("summary"),
+                ModelStreamEvent.completed(
+                    {
+                        "model": "summary-model",
+                        "usage": {"input_tokens": 5, "output_tokens": 2},
+                    }
+                ),
+            ]
+        )
+        main_provider = FakeProvider([ModelStreamEvent.completed({})])
+        app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            budget_policy=BudgetPolicy(
+                limits=(
+                    BudgetLimit(
+                        scope="app",
+                        max_estimated_cost=Decimal("1"),
+                        pricing=compaction_price_book(),
+                        reservation=BudgetReservation(
+                            max_input_tokens=10,
+                            max_output_tokens=0,
+                        ),
+                    ),
+                )
+            ),
+        )
+        app.register_provider(main_provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=compaction_provider,
+                    model="summary-model",
+                ),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+        stream = app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            )
+        )
+        while (await anext(stream)).type != EventType.BUDGET_RESERVED:
+            pass
+        await stream.aclose()
+
+        assert len(compaction_provider.requests) == 1
+        assert main_provider.requests == []
+        events = await store.load_events(session_id)
+        completions = [
+            event
+            for event in events
+            if event.type == EventType.MODEL_COMPLETED
+            and event.payload.get("purpose") == "context_compaction"
+        ]
+        assert len(completions) == 1
+        assert completions[0].payload["usage_metrics"]["total_tokens"] == 7
+        assert sum(event.type == EventType.BUDGET_RECONCILED for event in events) == 1
+        assert sum(event.type == EventType.CONTEXT_COMPACTION_COMPLETED for event in events) == 1
+        assert sum(event.type == EventType.SESSION_CHECKPOINTED for event in events) == 1
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        assert checkpoint["context_compaction"]["compacted_transcript_cursor"] == 2
+
+    asyncio.run(run())
+
+
+def test_automatic_compaction_stream_abandonment_preserves_failure_accounting():
+    class FailSecondHierarchyCallProvider(ModelProvider):
+        name = "fail-second-hierarchy-call"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("second hierarchy call failed")
+            yield ModelStreamEvent.text_delta("first fragment summary")
+            yield ModelStreamEvent.completed(
+                {
+                    "model": request.model,
+                    "usage": {"input_tokens": 5, "output_tokens": 2},
+                }
+            )
+
+    async def run() -> None:
+        session_id = "sess_compaction_failure_stream_abandonment"
+        store = InMemorySessionStore()
+        compaction_provider = FailSecondHierarchyCallProvider()
+        main_provider = FakeProvider([ModelStreamEvent.completed({})])
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(main_provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=compaction_provider,
+                    model="summary-model",
+                    max_input_chars=1000,
+                ),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+        stream = app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[
+                    Message.text("user", "oversized " + "x" * 5000),
+                    Message.text("user", "current"),
+                ],
+            )
+        )
+        while (await anext(stream)).type != EventType.CONTEXT_COMPACTION_STARTED:
+            pass
+        await stream.aclose()
+
+        assert main_provider.requests == []
+        events = await store.load_events(session_id)
+        completions = [
+            event
+            for event in events
+            if event.type == EventType.MODEL_COMPLETED
+            and event.payload.get("purpose") == "context_compaction"
+        ]
+        assert len(completions) == 2
+        assert completions[0].payload["usage_metrics"]["total_tokens"] == 7
+        assert completions[1].payload["compaction_outcome"] == "unfinished_stream"
+        assert completions[1].payload["usage_unavailable_reason"]
+        assert sum(event.type == EventType.CONTEXT_COMPACTION_FAILED for event in events) == 1
+        assert EventType.SESSION_CHECKPOINTED not in {event.type for event in events}
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is None or "context_compaction" not in checkpoint
+
+    asyncio.run(run())
+
+
+def test_compaction_provider_cancellation_preserves_historical_task_cancellation() -> None:
+    class CancellingProvider(ModelProvider):
+        name = "provider-cancellation"
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            del request
+            yield ModelStreamEvent.text_delta("partial summary")
+            raise asyncio.CancelledError("provider cancellation")
+
+    async def run() -> None:
+        current = asyncio.current_task()
+        assert current is not None
+        current.cancel("historical cancellation")
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.sleep(0)
+        try:
+            with pytest.raises(asyncio.CancelledError) as exc_info:
+                await ModelCompactor(
+                    provider=CancellingProvider(),
+                    model="summary-model",
+                ).compact(
+                    CompactionRequest(
+                        session=_test_session(),
+                        agent=AgentSpec(name="assistant", model="fake-model"),
+                        messages=[Message.text("user", "old request")],
+                    )
+                )
+            assert exc_info.value.args == ("provider cancellation",)
+            assert current.cancelling() == 1
+        finally:
+            current.uncancel()
+
+    asyncio.run(run())
+
+
+def test_automatic_compaction_termination_cleanup_preserves_historical_cancellation() -> None:
+    class CancellingProvider(ModelProvider):
+        name = "automatic-provider-cancellation"
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            del request
+            yield ModelStreamEvent.text_delta("partial summary")
+            raise asyncio.CancelledError("provider cancellation")
+
+    async def run() -> None:
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([ModelStreamEvent.completed({})]), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=CancellingProvider(),
+                    model="summary-model",
+                ),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+        current = asyncio.current_task()
+        assert current is not None
+        current.cancel("historical cancellation")
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.sleep(0)
+        assert current.cancelling() == 1
+        try:
+            with pytest.raises(asyncio.CancelledError, match="provider cancellation"):
+                await collect_events(
+                    app,
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id="sess_termination_historical_cancellation",
+                        messages=[
+                            Message.text("user", "old"),
+                            Message.text("assistant", "old answer"),
+                            Message.text("user", "current"),
+                        ],
+                    ),
+                )
+            assert current.cancelling() == 1
+        finally:
+            current.uncancel()
+
+        events = await store.load_events("sess_termination_historical_cancellation")
+        completions = [
+            event
+            for event in events
+            if event.type == EventType.MODEL_COMPLETED
+            and event.payload.get("purpose") == "context_compaction"
+        ]
+        assert len(completions) == 1
+        assert completions[0].payload["compaction_outcome"] == "cancelled"
+
+    asyncio.run(run())
+
+
+def test_overflow_compaction_termination_cleanup_preserves_historical_cancellation() -> None:
+    class CancellingProvider(ModelProvider):
+        name = "overflow-provider-cancellation"
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            del request
+            yield ModelStreamEvent.text_delta("partial summary")
+            raise asyncio.CancelledError("overflow compactor cancellation")
+
+    async def run() -> None:
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(ContextOverflowProvider(), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_overflow_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=CancellingProvider(),
+                    model="summary-model",
+                ),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+        current = asyncio.current_task()
+        assert current is not None
+        current.cancel("historical cancellation")
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.sleep(0)
+        assert current.cancelling() == 1
+        try:
+            with pytest.raises(
+                asyncio.CancelledError,
+                match="overflow compactor cancellation",
+            ):
+                await collect_events(
+                    app,
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id="sess_overflow_historical_cancellation",
+                        messages=[
+                            Message.text("user", "old"),
+                            Message.text("user", "current"),
+                        ],
+                    ),
+                )
+            assert current.cancelling() == 1
+        finally:
+            current.uncancel()
+
+        events = await store.load_events("sess_overflow_historical_cancellation")
+        completions = [
+            event
+            for event in events
+            if event.type == EventType.MODEL_COMPLETED
+            and event.payload.get("purpose") == "context_compaction"
+        ]
+        assert len(completions) == 1
+        assert completions[0].payload["compaction_outcome"] == "cancelled"
+
+    asyncio.run(run())
+
+
+def test_automatic_compaction_ignores_handled_historical_task_cancellation():
+    async def run() -> None:
+        session_id = "sess_compaction_after_historical_cancellation"
+        store = InMemorySessionStore()
+        compaction_provider = FakeProvider(
+            [
+                ModelStreamEvent.text_delta("summary"),
+                ModelStreamEvent.completed(
+                    {
+                        "model": "summary-model",
+                        "usage": {"input_tokens": 5, "output_tokens": 2},
+                    }
+                ),
+            ]
+        )
+        main_provider = FakeProvider(
+            [
+                ModelStreamEvent.text_delta("answer"),
+                ModelStreamEvent.completed({}),
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(main_provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=compaction_provider,
+                    model="summary-model",
+                ),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+
+        current = asyncio.current_task()
+        assert current is not None
+        current.cancel("historical cancellation")
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await asyncio.sleep(0)
+        assert exc_info.value.args == ("historical cancellation",)
+        assert current.cancelling() == 1
+        try:
+            events = await collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[
+                        Message.text("user", "old"),
+                        Message.text("assistant", "old answer"),
+                        Message.text("user", "current"),
+                    ],
+                ),
+            )
+            assert current.cancelling() == 1
+        finally:
+            current.uncancel()
+
+        assert events[-1].type == EventType.SESSION_COMPLETED
+        assert EventType.CONTEXT_COMPACTION_FAILED not in {event.type for event in events}
+        assert len(compaction_provider.requests) == 1
+        assert len(main_provider.requests) == 1
+
+    asyncio.run(run())
+
+
+def test_automatic_compaction_real_cancellation_during_start_publication_propagates():
+    class BlockingCompactionStartStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.start_publication_started = asyncio.Event()
+            self.allow_start_publication = asyncio.Event()
+
+        async def append_events(self, session_id: str, events: list[Event]) -> None:
+            if any(event.type == EventType.CONTEXT_COMPACTION_STARTED for event in events):
+                self.start_publication_started.set()
+                await self.allow_start_publication.wait()
+            await super().append_events(session_id, events)
+
+    async def run() -> None:
+        session_id = "sess_cancel_compaction_start_publication"
+        store = BlockingCompactionStartStore()
+        compaction_provider = FakeProvider(
+            [
+                ModelStreamEvent.text_delta("summary"),
+                ModelStreamEvent.completed({}),
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([ModelStreamEvent.completed({})]), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=compaction_provider,
+                    model="summary-model",
+                ),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+        task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[
+                        Message.text("user", "old"),
+                        Message.text("assistant", "old answer"),
+                        Message.text("user", "current"),
+                    ],
+                ),
+            )
+        )
+        await asyncio.wait_for(store.start_publication_started.wait(), timeout=5)
+        task.cancel("cancel during compaction start publication")
+        await asyncio.sleep(0)
+        assert not task.done()
+        store.allow_start_publication.set()
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+
+        assert exc_info.value.args == ("cancel during compaction start publication",)
+        assert task.cancelled()
+        assert task.cancelling() == 0
+        assert compaction_provider.requests == []
+        durable = await store.load_events(session_id)
+        assert sum(event.type == EventType.CONTEXT_COMPACTION_STARTED for event in durable) == 1
+        assert sum(event.type == EventType.CONTEXT_COMPACTION_FAILED for event in durable) == 1
+
+    asyncio.run(run())
+
+
+def test_automatic_compaction_cancellation_during_outcome_persistence_is_lossless():
+    class BlockingContextBatchStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.context_batch_started = asyncio.Event()
+            self.allow_context_batch = asyncio.Event()
+
+        async def append_events(self, session_id: str, events: list[Event]) -> None:
+            if any(
+                event.type == EventType.MODEL_COMPLETED
+                and event.payload.get("purpose") == "context_compaction"
+                for event in events
+            ):
+                self.context_batch_started.set()
+                await self.allow_context_batch.wait()
+            await super().append_events(session_id, events)
+
+    async def run() -> None:
+        session_id = "sess_compaction_outcome_persistence_cancellation"
+        store = BlockingContextBatchStore()
+        compaction_provider = FakeProvider(
+            [
+                ModelStreamEvent.text_delta("summary"),
+                ModelStreamEvent.completed(
+                    {
+                        "model": "summary-model",
+                        "usage": {"input_tokens": 5, "output_tokens": 2},
+                    }
+                ),
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([ModelStreamEvent.completed({})]), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=compaction_provider,
+                    model="summary-model",
+                ),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+        task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[
+                        Message.text("user", "old"),
+                        Message.text("assistant", "old answer"),
+                        Message.text("user", "current"),
+                    ],
+                ),
+            )
+        )
+        await asyncio.wait_for(store.context_batch_started.wait(), timeout=5)
+        task.cancel("cancel during context outcome persistence")
+        assert task.cancelling() == 1
+        store.allow_context_batch.set()
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+
+        assert exc_info.value.args == ("cancel during context outcome persistence",)
+        assert task.cancelled()
+        events = await store.load_events(session_id)
+        completions = [
+            event
+            for event in events
+            if event.type == EventType.MODEL_COMPLETED
+            and event.payload.get("purpose") == "context_compaction"
+        ]
+        assert len(completions) == 1
+        assert completions[0].payload["usage_metrics"]["total_tokens"] == 7
+        assert sum(event.type == EventType.CONTEXT_COMPACTION_FAILED for event in events) == 1
+        assert EventType.CONTEXT_COMPACTION_COMPLETED not in {event.type for event in events}
+        assert EventType.SESSION_CHECKPOINTED not in {event.type for event in events}
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is None or "context_compaction" not in checkpoint
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure_point", ["before_commit", "after_commit"])
+def test_automatic_compaction_checkpoint_and_evidence_publish_atomically(
+    failure_point: str,
+) -> None:
+    class FailingAtomicCheckpointStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed = False
+
+        async def publish_checkpoint_and_events(self, session_id: str, **kwargs):
+            events = kwargs["events"]
+            is_compaction_checkpoint = any(
+                event.type == EventType.SESSION_CHECKPOINTED for event in events
+            )
+            if not is_compaction_checkpoint or self.failed:
+                return await super().publish_checkpoint_and_events(session_id, **kwargs)
+            self.failed = True
+            if failure_point == "before_commit":
+                raise ConnectionError("compaction checkpoint rejected before commit")
+            await super().publish_checkpoint_and_events(session_id, **kwargs)
+            raise ConnectionError("compaction checkpoint acknowledgement lost")
+
+    async def run() -> None:
+        session_id = f"sess_atomic_compaction_checkpoint_{failure_point}"
+        store = FailingAtomicCheckpointStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([ModelStreamEvent.completed({})]), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=FakeProvider(
+                        [
+                            ModelStreamEvent.text_delta("summary"),
+                            ModelStreamEvent.completed(
+                                {
+                                    "model": "summary-model",
+                                    "usage": {"input_tokens": 5, "output_tokens": 2},
+                                }
+                            ),
+                        ]
+                    ),
+                    model="summary-model",
+                ),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+
+        returned = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+        durable = await store.load_events(session_id)
+        checkpoint = await store.load_checkpoint(session_id)
+        completed_count = sum(
+            event.type == EventType.CONTEXT_COMPACTION_COMPLETED for event in durable
+        )
+        checkpointed_count = sum(event.type == EventType.SESSION_CHECKPOINTED for event in durable)
+
+        if failure_point == "after_commit":
+            assert returned[-1].type == EventType.SESSION_COMPLETED
+            assert completed_count == 1
+            assert checkpointed_count == 1
+            assert checkpoint is not None
+            assert checkpoint["context_compaction"]["compacted_transcript_cursor"] == 2
+        else:
+            assert returned[-1].type == EventType.SESSION_FAILED
+            assert completed_count == 0
+            assert checkpointed_count == 0
+            assert checkpoint is None or "context_compaction" not in checkpoint
+
+        # Provider usage is committed before the atomic checkpoint publication
+        # attempt and is never duplicated by either failure branch.
+        completions = [
+            event
+            for event in durable
+            if event.type == EventType.MODEL_COMPLETED
+            and event.payload.get("purpose") == "context_compaction"
+        ]
+        assert len(completions) == 1
+
+    asyncio.run(run())
+
+
+def test_automatic_compaction_lost_checkpoint_ack_reconciles_effective_transform() -> None:
+    class RuntimeStateChangingLostAckStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed = False
+
+        async def publish_checkpoint_and_events(self, session_id: str, **kwargs):
+            events = kwargs["events"]
+            is_compaction_checkpoint = any(
+                event.type == EventType.SESSION_CHECKPOINTED for event in events
+            )
+            if not is_compaction_checkpoint or self.failed:
+                return await super().publish_checkpoint_and_events(session_id, **kwargs)
+            self.failed = True
+
+            def clear_runtime_owned_state(
+                _session: Session,
+                checkpoint: dict[str, Any] | None,
+            ) -> dict[str, Any]:
+                updated = {} if checkpoint is None else dict(checkpoint)
+                updated.pop("session_operations", None)
+                return updated
+
+            # Simulate a concurrent runtime-owned checkpoint update after the
+            # context build read its source checkpoint but before the atomic
+            # compaction publication applies its preserving transform.
+            await super().transform_checkpoint(session_id, clear_runtime_owned_state)
+            await super().publish_checkpoint_and_events(session_id, **kwargs)
+            raise ConnectionError("compaction checkpoint acknowledgement lost")
+
+    async def run() -> None:
+        session_id = "sess_compaction_effective_transform_reconciliation"
+        store = RuntimeStateChangingLostAckStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(
+            FakeProvider(
+                [
+                    ModelStreamEvent.text_delta("final answer"),
+                    ModelStreamEvent.completed({}),
+                ]
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=RecordingCompactor(),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        transcript = [
+            Message.text("user", "old"),
+            Message.text("assistant", "old answer"),
+            Message.text("user", "current"),
+        ]
+        await store.append_transcript_messages(session_id, transcript)
+
+        def seed_runtime_owned_state(
+            _session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any]:
+            updated = {} if checkpoint is None else dict(checkpoint)
+            updated["session_operations"] = {
+                "version": 1,
+                "active_operation_id": None,
+                "records": {},
+            }
+            return updated
+
+        await store.transform_checkpoint(session_id, seed_runtime_owned_state)
+        await store.update_status(session_id, SessionStatus.COMPLETED)
+
+        events = await collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id=session_id,
+                messages=[Message.text("user", "next")],
+            ),
+        )
+
+        assert events[-1].type == EventType.SESSION_COMPLETED
+        assert sum(event.type == EventType.SESSION_CHECKPOINTED for event in events) == 1
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        assert "session_operations" not in checkpoint
+        assert checkpoint["context_compaction"]["compacted_transcript_cursor"] > 0
+
+    asyncio.run(run())
+
+
+def test_automatic_compaction_internal_persistence_cancellation_is_not_caller_cancel() -> None:
+    class InternallyCancelledCheckpointStore(InMemorySessionStore):
+        async def publish_checkpoint_and_events(self, session_id: str, **kwargs):
+            del session_id, kwargs
+            raise asyncio.CancelledError("storage pool cancelled its write")
+
+    async def run() -> None:
+        session_id = "sess_compaction_internal_persistence_cancel"
+        store = InternallyCancelledCheckpointStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([ModelStreamEvent.completed({})]), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=RecordingCompactor(),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+
+        task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[
+                        Message.text("user", "old"),
+                        Message.text("assistant", "old answer"),
+                        Message.text("user", "current"),
+                    ],
+                ),
+            )
+        )
+        events = await task
+
+        assert not task.cancelled()
+        assert events[-1].type == EventType.SESSION_FAILED
+        assert events[-1].payload["error_type"] == "RuntimeError"
+        assert events[-1].payload["error"] == (
+            "Context outcome persistence was cancelled without caller cancellation."
+        )
+        assert task.exception() is None
+        assert await store.load_checkpoint(session_id) is None
+
+    asyncio.run(run())
+
+
+def test_automatic_compaction_lost_completion_ack_fails_closed_without_retry() -> None:
+    class LostCompletionAcknowledgementStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed = False
+
+        async def append_events(self, session_id: str, events: list[Event]) -> None:
+            is_compaction_completion = any(
+                event.type == EventType.MODEL_COMPLETED
+                and event.payload.get("purpose") == "context_compaction"
+                for event in events
+            )
+            await super().append_events(session_id, events)
+            if is_compaction_completion and not self.failed:
+                self.failed = True
+                raise ConnectionError("compaction completion acknowledgement lost")
+
+    class RetryableFailureProvider(ModelProvider):
+        name = "retryable-compaction"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            raise ModelProviderError(
+                "provider overloaded",
+                provider=self.name,
+                status_code=503,
+                retryable=True,
+            )
+            yield
+
+    async def run() -> None:
+        session_id = "sess_compaction_completion_lost_ack"
+        store = LostCompletionAcknowledgementStore()
+        provider = RetryableFailureProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([ModelStreamEvent.completed({})]), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=provider,
+                    model="summary-model",
+                    retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+                ),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+
+        returned = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+        durable = await store.load_events(session_id)
+
+        assert len(provider.requests) == 1
+        completions = [
+            event
+            for event in durable
+            if event.type == EventType.MODEL_COMPLETED
+            and event.payload.get("purpose") == "context_compaction"
+        ]
+        assert len(completions) == 1
+        assert completions[0].payload["compaction_outcome"] == "provider_error"
+        assert sum(event.type == EventType.CONTEXT_COMPACTION_FAILED for event in durable) == 1
+        assert returned[-1].type == EventType.SESSION_FAILED
+
+    asyncio.run(run())
+
+
+def test_automatic_compaction_sanitizes_custom_telemetry_end_to_end():
+    class AdversarialAutomaticCompactor(ContextCompactor):
+        async def compact(self, request: CompactionRequest) -> CompactionResult:
+            identity = BillingIdentity(
+                provider_name="adversarial-compactor",
+                resource_id="summary-model-v1",
+            )
+            return CompactionResult(
+                summary="private summary",
+                covered_message_count=len(request.messages),
+                source_chunk_mode="vendor-private-mode",
+                metadata={
+                    "instructions": "metadata instruction secret",
+                    "provider_state": {"secret": "metadata provider secret"},
+                },
+                model_completed_payloads=[
+                    {
+                        "provider_name": "adversarial-compactor",
+                        "requested_model": "summary-model",
+                        "model": "summary-model-v1",
+                        "billing_identity": identity.model_dump(mode="json"),
+                        "usage_metrics": {
+                            "input_tokens": 8,
+                            "output_tokens": 2,
+                            "total_tokens": 10,
+                            "provider_state": {"secret": "nested metrics secret"},
+                            "arbitrary": "q" * 100_000,
+                        },
+                        "summary": "model event summary secret",
+                        "instructions": "model event instruction secret",
+                        "provider_state": {"secret": "opaque continuation secret"},
+                        "arbitrary": "p" * 100_000,
+                    }
+                ],
+            )
+
+    async def run() -> None:
+        session_id = "sess_automatic_adversarial_compaction_telemetry"
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([ModelStreamEvent.completed({})]), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=AdversarialAutomaticCompactor(),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+        await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+        events = await store.load_events(session_id)
+        compaction_completion = next(
+            event
+            for event in events
+            if event.type == EventType.MODEL_COMPLETED
+            and event.payload.get("purpose") == "context_compaction"
+        )
+        assert compaction_completion.payload["usage_metrics"]["total_tokens"] == 10
+        assert compaction_completion.payload["provider_name"] == "adversarial-compactor"
+        assert compaction_completion.payload["requested_model"] == "summary-model"
+        assert compaction_completion.payload["model"] == "summary-model-v1"
+        completed = next(
+            event for event in events if event.type == EventType.CONTEXT_COMPACTION_COMPLETED
+        )
+        assert completed.payload["chunk_mode"] == "custom"
+        serialized = json.dumps(
+            [event.model_dump(mode="json") for event in events],
+            ensure_ascii=False,
+        )
+        for secret in (
+            "metadata instruction secret",
+            "metadata provider secret",
+            "model event summary secret",
+            "model event instruction secret",
+            "opaque continuation secret",
+            "nested metrics secret",
+            "p" * 1000,
+            "q" * 1000,
+            "vendor-private-mode",
+        ):
+            assert secret not in serialized
+
+    asyncio.run(run())
+
+
+def test_compaction_telemetry_rejects_conflicting_billing_identities():
+    event_identity = BillingIdentity(
+        provider_name="event-provider",
+        resource_id="event-model",
+    )
+    metrics_identity = BillingIdentity(
+        provider_name="metrics-provider",
+        resource_id="metrics-model",
+    )
+    telemetry = runtime_context_module.ContextCompactionTelemetry(
+        event_type=EventType.MODEL_COMPLETED,
+        payload={
+            "billing_identity": event_identity.model_dump(mode="json"),
+            "usage_metrics": {
+                "billing_identity": metrics_identity.model_dump(mode="json"),
+                "input_tokens": 8,
+                "output_tokens": 2,
+                "total_tokens": 10,
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="billing identities do not match"):
+        runtime_context_module.sanitize_context_compaction_telemetry(telemetry)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"billing_identity": "not-an-object"},
+        {
+            "usage_metrics": {
+                "billing_identity": {"provider_name": "missing-resource-id"},
+                "input_tokens": 1,
+            }
+        },
+    ],
+)
+def test_compaction_telemetry_rejects_malformed_billing_identity(payload):
+    telemetry = runtime_context_module.ContextCompactionTelemetry(
+        event_type=EventType.MODEL_COMPLETED,
+        payload=payload,
+    )
+
+    with pytest.raises(ValueError, match="billing identity"):
+        runtime_context_module.sanitize_context_compaction_telemetry(telemetry)
+
+
+def test_compaction_telemetry_preserves_exact_maximum_usage_counter():
+    maximum = runtime_context_module._COMPACTION_EVENT_INTEGER_MAX
+    sanitized = runtime_context_module.sanitize_context_compaction_telemetry(
+        runtime_context_module.ContextCompactionTelemetry(
+            event_type=EventType.MODEL_COMPLETED,
+            payload={
+                "provider_name": "provider",
+                "model": "model",
+                "usage_metrics": {"input_tokens": maximum},
+            },
+        )
+    )
+
+    assert sanitized.payload["usage_metrics"]["input_tokens"] == maximum
+    assert "usage_unavailable_reason" not in sanitized.payload
+
+
+def test_compaction_telemetry_does_not_turn_empty_metrics_into_zero_usage():
+    sanitized = runtime_context_module.sanitize_context_compaction_telemetry(
+        runtime_context_module.ContextCompactionTelemetry(
+            event_type=EventType.MODEL_COMPLETED,
+            payload={
+                "provider_name": "provider",
+                "model": "model",
+                "usage_metrics": {},
+            },
+        )
+    )
+
+    assert "usage_metrics" not in sanitized.payload
+
+
+def test_compaction_telemetry_preserves_identity_from_empty_metrics():
+    identity = BillingIdentity(provider_name="provider", resource_id="model")
+    sanitized = runtime_context_module.sanitize_context_compaction_telemetry(
+        runtime_context_module.ContextCompactionTelemetry(
+            event_type=EventType.MODEL_COMPLETED,
+            payload={
+                "usage_metrics": {
+                    "billing_identity": identity.model_dump(mode="json"),
+                },
+            },
+        )
+    )
+
+    assert "usage_metrics" not in sanitized.payload
+    assert sanitized.payload["billing_identity"] == identity.model_dump(mode="json")
+
+
+def test_compaction_telemetry_preserves_provider_model_from_empty_metrics():
+    sanitized = runtime_context_module.sanitize_context_compaction_telemetry(
+        runtime_context_module.ContextCompactionTelemetry(
+            event_type=EventType.MODEL_COMPLETED,
+            payload={
+                "usage_metrics": {
+                    "provider_name": "nested-provider",
+                    "requested_model": "requested-model",
+                    "model": "served-model",
+                },
+            },
+        )
+    )
+
+    assert "usage_metrics" not in sanitized.payload
+    assert sanitized.payload["provider_name"] == "nested-provider"
+    assert sanitized.payload["requested_model"] == "requested-model"
+    assert sanitized.payload["model"] == "served-model"
+
+
+def test_compaction_telemetry_rejects_conflicting_identity_with_empty_metrics():
+    event_identity = BillingIdentity(provider_name="event-provider", resource_id="event-model")
+    metrics_identity = BillingIdentity(
+        provider_name="metrics-provider",
+        resource_id="metrics-model",
+    )
+    telemetry = runtime_context_module.ContextCompactionTelemetry(
+        event_type=EventType.MODEL_COMPLETED,
+        payload={
+            "billing_identity": event_identity.model_dump(mode="json"),
+            "usage_metrics": {
+                "billing_identity": metrics_identity.model_dump(mode="json"),
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="billing identities do not match"):
+        runtime_context_module.sanitize_context_compaction_telemetry(telemetry)
+
+
+@pytest.mark.parametrize(
+    "usage_payload",
+    [
+        {"usage_metrics": {"input_tokens": 2**63}},
+        {"usage_metrics": {"input_tokens": -1}},
+        {"usage_metrics": {"input_tokens": True}},
+        {"usage_metrics": {"cache": {"read_tokens": "1"}}},
+        {"usage": {"input_tokens": 2**63}},
+        {
+            "usage": {
+                "cache_creation": {
+                    "ephemeral_5m": 2**63 - 1,
+                    "ephemeral_1h": 1,
+                }
+            }
+        },
+    ],
+)
+def test_compaction_telemetry_marks_present_invalid_usage_unavailable(usage_payload):
+    sanitized = runtime_context_module.sanitize_context_compaction_telemetry(
+        runtime_context_module.ContextCompactionTelemetry(
+            event_type=EventType.MODEL_COMPLETED,
+            payload={
+                "provider_name": "provider",
+                "model": "model",
+                **usage_payload,
+            },
+        )
+    )
+
+    assert "usage" not in sanitized.payload
+    assert "usage_metrics" not in sanitized.payload
+    assert sanitized.payload["usage_unavailable_reason"] == ("invalid compaction usage telemetry")
+
+
+def test_automatic_compaction_rejects_conflicting_billing_identity_before_checkpoint():
+    event_identity = BillingIdentity(
+        provider_name="event-provider",
+        resource_id="event-model",
+    )
+    metrics_identity = BillingIdentity(
+        provider_name="metrics-provider",
+        resource_id="metrics-model",
+    )
+
+    class ConflictingIdentityCompactor(ContextCompactor):
+        async def compact(self, request: CompactionRequest) -> CompactionResult:
+            return CompactionResult(
+                summary="must not be checkpointed",
+                covered_message_count=len(request.messages),
+                model_completed_payloads=[
+                    {
+                        "billing_identity": event_identity.model_dump(mode="json"),
+                        "usage_metrics": {
+                            "billing_identity": metrics_identity.model_dump(mode="json"),
+                            "input_tokens": 8,
+                            "output_tokens": 2,
+                            "total_tokens": 10,
+                        },
+                    }
+                ],
+            )
+
+    async def run() -> None:
+        session_id = "sess_conflicting_compaction_billing_identity"
+        store = InMemorySessionStore()
+        provider = FakeProvider([ModelStreamEvent.completed({})])
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ConflictingIdentityCompactor(),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+
+        assert provider.requests == []
+        assert EventType.MODEL_COMPLETED not in {event.type for event in events}
+        assert EventType.CONTEXT_COMPACTION_COMPLETED not in {event.type for event in events}
+        assert events[-1].type == EventType.SESSION_FAILED
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is None or "context_compaction" not in checkpoint
+
+    asyncio.run(run())
+
+
+def test_hierarchical_compaction_call_limit_fails_before_unbounded_dispatch():
+    provider = FakeProvider([])
+    compactor = ModelCompactor(
+        provider=provider,
+        model="summary-model",
+        max_input_chars=1000,
+        max_hierarchy_calls=2,
+    )
+    with pytest.raises(ValueError, match="max_hierarchy_calls before dispatch"):
+        asyncio.run(
+            compactor.compact(
+                CompactionRequest(
+                    session=_test_session(),
+                    agent=AgentSpec(name="assistant", model="fake-model"),
+                    messages=[Message.text("user", "oversized " + "x" * 5000)],
+                )
+            )
+        )
+    assert provider.requests == []
+
+
+def test_hierarchical_compaction_retry_consumes_the_actual_dispatch_limit():
+    class RetryThenCompleteProvider(ModelProvider):
+        name = "retry-then-complete"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                raise ModelProviderError(
+                    "retry first hierarchy dispatch",
+                    provider=self.name,
+                    status_code=503,
+                    retryable=True,
+                )
+            yield ModelStreamEvent.text_delta("first fragment summary")
+            yield ModelStreamEvent.completed(
+                {
+                    "model": request.model,
+                    "usage": {"input_tokens": 5, "output_tokens": 2},
+                }
+            )
+
+    provider = RetryThenCompleteProvider()
+    compactor = ModelCompactor(
+        provider=provider,
+        model="summary-model",
+        max_input_chars=1000,
+        max_hierarchy_calls=3,
+        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+    )
+
+    with pytest.raises(ValueError, match="exceeded max_hierarchy_calls"):
+        asyncio.run(
+            compactor.compact(
+                CompactionRequest(
+                    session=_test_session(),
+                    agent=AgentSpec(name="assistant", model="fake-model"),
+                    messages=[Message.text("user", "oversized " + "x" * 1100)],
+                )
+            )
+        )
+
+    # The retry is a real provider dispatch. The final logical hierarchy call is
+    # rejected before it can become an uncounted fourth request.
+    assert len(provider.requests) == 3
+
+
+def test_hierarchical_compaction_preserves_instructions_within_every_bounded_prompt():
+    completed_batch = [
+        ModelStreamEvent.text_delta("short partial summary"),
+        ModelStreamEvent.completed({"finish_reason": "stop"}),
+    ]
+    provider = FakeProvider([completed_batch for _index in range(16)])
+    instruction = "INSTRUCTION_MARKER: retain exact identifiers."
+    result = asyncio.run(
+        ModelCompactor(
+            provider=provider,
+            model="summary-model",
+            max_input_chars=1000,
+        ).compact(
+            CompactionRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=[Message.text("user", "oversized " + "x" * 5000)],
+                instructions=instruction,
+            )
+        )
+    )
+    prompts = [request.messages[-1].content[0].text for request in provider.requests]
+    assert result.covered_message_count == 1
+    assert len(prompts) > 1
+    assert all(instruction in prompt for prompt in prompts)
+    assert all(len(prompt) <= 1000 for prompt in prompts)
+
+
+def test_hierarchical_compaction_fails_closed_when_instructions_leave_no_source_capacity():
+    provider = FakeProvider([])
+    with pytest.raises(
+        ValueError,
+        match="max_input_chars is too small for hierarchical compaction",
+    ):
+        asyncio.run(
+            ModelCompactor(
+                provider=provider,
+                model="summary-model",
+                max_input_chars=1000,
+            ).compact(
+                CompactionRequest(
+                    session=_test_session(),
+                    agent=AgentSpec(name="assistant", model="fake-model"),
+                    messages=[Message.text("user", "oversized " + "x" * 5000)],
+                    instructions="i" * 1000,
+                )
+            )
+        )
+    assert provider.requests == []
+
+
+def test_hierarchical_compaction_validates_merge_capacity_before_dispatch():
+    provider = FakeProvider([])
+    with pytest.raises(
+        ValueError,
+        match="max_input_chars is too small for hierarchical assembly",
+    ):
+        asyncio.run(
+            ModelCompactor(
+                provider=provider,
+                model="summary-model",
+                max_input_chars=1000,
+            ).compact(
+                CompactionRequest(
+                    session=_test_session(),
+                    agent=AgentSpec(name="assistant", model="fake-model"),
+                    messages=[Message.text("user", "x" * 100)],
+                    instructions="i" * 700,
+                )
+            )
+        )
+    assert provider.requests == []
+
+
+def test_hierarchical_compaction_preflights_existing_summary_call_capacity():
+    provider = FakeProvider([])
+    with pytest.raises(
+        ValueError,
+        match="max_hierarchy_calls before dispatch",
+    ):
+        asyncio.run(
+            ModelCompactor(
+                provider=provider,
+                model="summary-model",
+                max_input_chars=1000,
+                max_hierarchy_calls=2,
+            ).compact(
+                CompactionRequest(
+                    session=_test_session(),
+                    agent=AgentSpec(name="assistant", model="fake-model"),
+                    messages=[Message.text("user", "small new source")],
+                    existing_summary="prior " + "x" * 5000,
+                )
+            )
+        )
+    assert provider.requests == []
+
+
+def test_hierarchical_compaction_preflights_every_existing_summary_merge_level():
+    provider = FakeProvider([])
+    with pytest.raises(
+        ValueError,
+        match="max_hierarchy_calls before dispatch",
+    ):
+        asyncio.run(
+            ModelCompactor(
+                provider=provider,
+                model="summary-model",
+                max_input_chars=1000,
+                # The first merge level needs 70 calls. One source call plus
+                # one assumed final call used to make 72 appear sufficient,
+                # even though the optimistic second level still needs two
+                # calls before the actual final merge.
+                max_hierarchy_calls=72,
+            ).compact(
+                CompactionRequest(
+                    session=_test_session(),
+                    agent=AgentSpec(name="assistant", model="fake-model"),
+                    messages=[Message.text("user", "small new source")],
+                    existing_summary="prior " + "x" * 50_000,
+                )
+            )
+        )
+    assert provider.requests == []
+
+
+def test_hierarchical_compaction_merges_existing_summary_exactly_once():
+    class MarkerPreservingProvider(ModelProvider):
+        name = "marker-preserving"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            prompt = request.messages[-1].content[0].text
+            markers = [
+                marker for marker in ("PRIOR_RANGE_MARKER", "NEW_RANGE_MARKER") if marker in prompt
+            ]
+            yield ModelStreamEvent.text_delta(" ".join(markers) or "fragment")
+            yield ModelStreamEvent.completed({})
+
+    provider = MarkerPreservingProvider()
+    result = asyncio.run(
+        ModelCompactor(
+            provider=provider,
+            model="summary-model",
+            max_input_chars=1000,
+        ).compact(
+            CompactionRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=[
+                    Message.text("user", "NEW_RANGE_MARKER " + "x" * 4000),
+                    Message.text("assistant", "unacknowledged suffix"),
+                ],
+                existing_summary="PRIOR_RANGE_MARKER",
+            )
+        )
+    )
+    assert result.covered_message_count == 1
+    assert result.summary.count("PRIOR_RANGE_MARKER") == 1
+    assert result.summary.count("NEW_RANGE_MARKER") == 1
+    assert all(
+        "unacknowledged suffix" not in request.messages[-1].content[0].text
+        for request in provider.requests
+    )
+
+
+def test_hierarchical_compaction_allows_initial_expansion_then_current_pass_shrinkage():
+    class ExpandThenShrinkProvider(ModelProvider):
+        name = "expand-then-shrink"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.calls += 1
+            prompt = request.messages[-1].content[0].text
+            if prompt.startswith("Summarize this ordered fragment"):
+                summary = "L" * 1500
+            elif "L" * 100 in prompt:
+                summary = "M" * 600
+            elif "M" * 100 in prompt:
+                summary = "N" * 300
+            elif "N" * 100 in prompt:
+                summary = "reduced"
+            else:
+                summary = "final"
+            yield ModelStreamEvent.text_delta(summary)
+            yield ModelStreamEvent.completed({})
+
+    provider = ExpandThenShrinkProvider()
+    result = asyncio.run(
+        ModelCompactor(
+            provider=provider,
+            model="summary-model",
+            max_input_chars=1000,
+        ).compact(
+            CompactionRequest(
+                session=_test_session(),
+                agent=AgentSpec(name="assistant", model="fake-model"),
+                messages=[Message.text("user", "oversized " + "x" * 1500)],
+            )
+        )
+    )
+
+    assert result.covered_message_count == 1
+    assert result.summary == "final"
+    assert provider.calls > result.source_chunk_count
+
+
+def test_hierarchical_failure_reports_completed_chunks_without_checkpoint():
+    class FailSecondHierarchyCallProvider(ModelProvider):
+        name = "fail-hierarchy"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.calls += 1
+            if self.calls == 2:
+                yield ModelStreamEvent.error("second hierarchy fragment failed")
+                return
+            yield ModelStreamEvent.text_delta("first fragment summary")
+            yield ModelStreamEvent.completed({"usage": {"input_tokens": 5, "output_tokens": 2}})
+
+    provider = FailSecondHierarchyCallProvider()
+    policy = CheckpointCompactionContextPolicy(
+        compactor=ModelCompactor(
+            provider=provider,
+            model="summary-model",
+            max_input_chars=1000,
+        ),
+        max_user_turns=1,
+        compact_after_messages=1,
+    )
+    with pytest.raises(ContextBuildError, match="second hierarchy fragment failed") as exc_info:
+        asyncio.run(
+            policy.build_with_checkpoint(
+                ContextRequest(
+                    session=_test_session(),
+                    agent=AgentSpec(name="assistant", model="fake-model"),
+                    messages=[
+                        Message.text("user", "oversized " + "x" * 5000),
+                        Message.text("user", "current"),
+                    ],
+                    step=1,
+                    force_compaction=True,
+                ),
+                checkpoint=None,
+            )
+        )
+    event_types = [item.event_type for item in exc_info.value.compaction_telemetry]
+    assert event_types == [
+        EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.MODEL_COMPLETED,
+        EventType.MODEL_COMPLETED,
+        EventType.CONTEXT_COMPACTION_FAILED,
+    ]
+    assert exc_info.value.compaction_telemetry[0].payload["bounded_input"] is True
+    uncertain = exc_info.value.compaction_telemetry[2].payload
+    assert uncertain["compaction_outcome"] == "unfinished_stream"
+    assert uncertain["usage_unavailable_reason"]
+    failure = exc_info.value.compaction_telemetry[-1].payload
+    assert failure["represented_message_count"] == 0
+    assert failure["chunk_count"] == 2
+    assert failure["chunk_mode"] == "failed"
+    assert failure["bounded_input"] is True
 
 
 def test_model_compactor_accepts_exported_default_prompt_builder():
@@ -31980,6 +36312,7 @@ def test_model_compactor_accepts_exported_default_prompt_builder():
         provider=provider,
         model="summary-model",
         prompt_builder=default_compaction_prompt,
+        max_input_chars=1000,
     )
 
     result = asyncio.run(
@@ -31987,15 +36320,19 @@ def test_model_compactor_accepts_exported_default_prompt_builder():
             CompactionRequest(
                 session=_test_session(),
                 agent=AgentSpec(name="assistant", model="fake-model"),
-                messages=[Message.text("user", "old request")],
+                messages=[
+                    Message.text("user", "old request"),
+                    Message.text("user", "uncovered marker " + "x" * 2000),
+                ],
             )
         )
     )
 
     assert result.summary == "default summary"
-    assert "Transcript to compact:\nuser: old request" in (
-        provider.requests[0].messages[1].content[0].text
-    )
+    assert result.covered_message_count == 1
+    prompt = provider.requests[0].messages[1].content[0].text
+    assert "Transcript to compact:\nuser: old request" in prompt
+    assert "uncovered marker" not in prompt
 
 
 def test_prompt_cache_compactor_sends_context_messages_as_prefix():
@@ -32419,7 +36756,7 @@ def test_prompt_cache_policy_deduplicates_exact_overflow_and_completes_with_boun
     completed = next(
         event for event in resume_events if event.type == EventType.CONTEXT_COMPACTION_COMPLETED
     )
-    assert completed.payload["metadata"]["prompt_cache_exact_attempt"] == "context_overflow"
+    assert completed.payload["chunk_mode"] == "single_request"
     assert EventType.CONTEXT_COMPACTION_FAILED not in [event.type for event in resume_events]
     assert resume_events[-1].type == EventType.SESSION_COMPLETED
     usage = asyncio.run(app.get_session_usage("sess_prompt_cache_policy_overflow_success"))
@@ -32492,8 +36829,10 @@ def test_prompt_cache_compactor_records_exact_overflow_when_bounded_attempt_fail
     assert [event.type for event in compaction_events] == [
         EventType.CONTEXT_COMPACTION_STARTED,
         EventType.MODEL_COMPLETED,
+        EventType.MODEL_COMPLETED,
         EventType.CONTEXT_COMPACTION_FAILED,
     ]
+    assert "bounded_input" not in compaction_events[0].payload
     exact_attempt = compaction_events[1]
     assert exact_attempt.payload["purpose"] == "context_compaction"
     assert exact_attempt.payload["compaction_outcome"] == "context_overflow"
@@ -32501,8 +36840,13 @@ def test_prompt_cache_compactor_records_exact_overflow_when_bounded_attempt_fail
         "exact prompt-cache compaction overflowed without provider completion usage"
     )
     assert "usage_metrics" not in exact_attempt.payload
-    failed_compaction = compaction_events[2]
-    assert failed_compaction.payload["error"] == "bounded compaction failed"
+    bounded_attempt = compaction_events[2]
+    assert bounded_attempt.payload["compaction_outcome"] == "unfinished_stream"
+    assert bounded_attempt.payload["usage_unavailable_reason"]
+    assert "usage_metrics" not in bounded_attempt.payload
+    failed_compaction = compaction_events[3]
+    assert failed_compaction.payload["error_type"] == "RuntimeError"
+    assert "error" not in failed_compaction.payload
     assert failed_compaction.payload["error_type"] == "RuntimeError"
     assert resume_events[-1].type == EventType.SESSION_FAILED
     assert resume_events[-1].payload == {
@@ -32510,7 +36854,7 @@ def test_prompt_cache_compactor_records_exact_overflow_when_bounded_attempt_fail
         "error_type": "RuntimeError",
     }
     usage = asyncio.run(app.get_session_usage("sess_prompt_cache_failed_fallback_telemetry"))
-    assert usage.model_steps == 2
+    assert usage.model_steps == 3
     cost = asyncio.run(
         app.get_session_cost(
             "sess_prompt_cache_failed_fallback_telemetry",
@@ -32526,15 +36870,16 @@ def test_prompt_cache_compactor_records_exact_overflow_when_bounded_attempt_fail
             ),
         )
     )
-    assert cost.model_steps == 2
+    assert cost.model_steps == 3
     assert cost.priced_model_steps == 1
-    assert cost.unpriced_model_steps == 1
+    assert cost.unpriced_model_steps == 2
     assert cost.line_items[0].priced is True
-    assert cost.line_items[1].priced is False
-    assert cost.line_items[1].total_cost == Decimal("0")
-    assert cost.line_items[1].missing_pricing_reason == (
-        "model.completed event has no token usage metrics"
-    )
+    for line_item in cost.line_items[1:]:
+        assert line_item.priced is False
+        assert line_item.total_cost == Decimal("0")
+        assert line_item.missing_pricing_reason == (
+            "model.completed event has no token usage metrics"
+        )
 
 
 def test_prompt_cache_compactor_preserves_attempt_order_after_recovered_invalid_summary():
@@ -32627,7 +36972,8 @@ def test_prompt_cache_compactor_preserves_attempt_order_after_recovered_invalid_
     assert bounded_attempt.payload["compaction_outcome"] == "invalid_summary"
     assert bounded_attempt.payload["usage_metrics"]["input_tokens"] == 20
     assert bounded_attempt.payload["usage_metrics"]["output_tokens"] == 1
-    assert compaction_events[-1].payload["error"] == "`summary` cannot be blank."
+    assert compaction_events[-1].payload["error_type"] == "ValueError"
+    assert "error" not in compaction_events[-1].payload
     assert resume_events[-1].type == EventType.SESSION_FAILED
 
 
@@ -32893,6 +37239,13 @@ def test_cayu_app_checkpoint_compacts_model_context_without_rewriting_transcript
         "previous_compacted_transcript_cursor": 1,
         "newly_compacted_message_count": 4,
         "recent_message_count": 1,
+        "requested_source_start": 1,
+        "requested_source_end": 5,
+        "represented_source_start": 1,
+        "represented_source_end": 1,
+        "represented_message_count": 0,
+        "coverage_mode": "pending",
+        "chunk_count": 0,
     }
     assert events[2].payload == {
         "checkpoint": "context_compaction",
@@ -32902,7 +37255,16 @@ def test_cayu_app_checkpoint_compacts_model_context_without_rewriting_transcript
         "newly_compacted_message_count": 4,
         "recent_message_count": 1,
         "summary_chars": len("old one|old answer one|old two|old answer two"),
-        "metadata": {"request_count": 1},
+        "requested_source_start": 1,
+        "requested_source_end": 5,
+        "represented_source_start": 1,
+        "represented_source_end": 5,
+        "represented_message_count": 4,
+        "coverage_mode": "full",
+        "chunk_count": 1,
+        "chunk_mode": "single_request",
+        "bounded_input": False,
+        "compaction_failed": False,
     }
     assert "summary" not in events[2].payload
     assert events[3].payload == {
@@ -32944,7 +37306,7 @@ def test_cayu_app_checkpoint_compacts_model_context_without_rewriting_transcript
     checkpoint = asyncio.run(store.load_checkpoint("sess_compaction"))
     assert checkpoint == {
         "context_compaction": {
-            "version": 1,
+            "version": 2,
             "summary": "old one|old answer one|old two|old answer two",
             "compacted_transcript_cursor": 5,
             "metadata": {"request_count": 1},
@@ -33019,6 +37381,14 @@ def test_cayu_app_checkpoint_compaction_can_use_model_compactor():
         "previous_compacted_transcript_cursor": 0,
         "newly_compacted_message_count": 2,
         "recent_message_count": 1,
+        "requested_source_start": 0,
+        "requested_source_end": 2,
+        "represented_source_start": 0,
+        "represented_source_end": 0,
+        "represented_message_count": 0,
+        "coverage_mode": "pending",
+        "chunk_count": 0,
+        "bounded_input": True,
     }
     assert events[2].payload == {
         "finish_reason": "stop",
@@ -33036,14 +37406,16 @@ def test_cayu_app_checkpoint_compaction_can_use_model_compactor():
         "newly_compacted_message_count": 2,
         "recent_message_count": 1,
         "summary_chars": len("model summary"),
-        "metadata": {
-            "compactor": "ModelCompactor",
-            "provider": "fake",
-            "model": "summary-model",
-            "input_truncated": False,
-            "max_input_chars": 120000,
-            "completed": {"finish_reason": "stop"},
-        },
+        "requested_source_start": 0,
+        "requested_source_end": 2,
+        "represented_source_start": 0,
+        "represented_source_end": 2,
+        "represented_message_count": 2,
+        "coverage_mode": "full",
+        "chunk_count": 1,
+        "chunk_mode": "single_request",
+        "bounded_input": False,
+        "compaction_failed": False,
     }
     assert "model summary" not in str(events[3].payload)
 
@@ -33057,7 +37429,7 @@ def test_cayu_app_checkpoint_compaction_can_use_model_compactor():
     checkpoint = asyncio.run(store.load_checkpoint("sess_model_compaction"))
     assert checkpoint == {
         "context_compaction": {
-            "version": 1,
+            "version": 2,
             "summary": "model summary",
             "compacted_transcript_cursor": 2,
             "metadata": {
@@ -33211,6 +37583,134 @@ def test_cayu_app_stops_before_main_model_when_compaction_reaches_token_limit(
     assert usage.usage.total_tokens == 20
 
 
+def test_resume_after_compaction_limit_stop_uses_latest_agent_completion_for_context() -> None:
+    store = InMemorySessionStore()
+    compactor_provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first model summary"),
+                ModelStreamEvent.completed(
+                    {
+                        "model": "summary-model",
+                        "usage": {
+                            "input_tokens": 16,
+                            "output_tokens": 4,
+                            "total_tokens": 20,
+                        },
+                    }
+                ),
+            ],
+            [
+                ModelStreamEvent.text_delta("second model summary"),
+                ModelStreamEvent.completed(
+                    {
+                        "model": "summary-model",
+                        "usage": {
+                            "input_tokens": 16,
+                            "output_tokens": 4,
+                            "total_tokens": 20,
+                        },
+                    }
+                ),
+            ],
+        ]
+    )
+    runtime_provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("first answer"),
+                ModelStreamEvent.completed(
+                    {
+                        "usage": {
+                            "input_tokens": 8,
+                            "output_tokens": 2,
+                            "total_tokens": 10,
+                        }
+                    }
+                ),
+            ],
+            [
+                ModelStreamEvent.text_delta("resumed answer"),
+                ModelStreamEvent.completed(
+                    {
+                        "usage": {
+                            "input_tokens": 8,
+                            "output_tokens": 2,
+                            "total_tokens": 10,
+                        }
+                    }
+                ),
+            ],
+        ]
+    )
+    policy = UsageTriggeredContextPolicy(
+        base_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compactor_provider,
+                model="summary-model",
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+        triggered_policy=MessageWindowContextPolicy(max_messages=1),
+        min_total_tokens=15,
+        sticky=False,
+    )
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=policy,
+    )
+    session_id = "sess_resume_after_compaction_limit_stop"
+
+    first_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "first request")],
+            ),
+        )
+    )
+    stopped_events = asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id=session_id,
+                messages=[Message.text("user", "second request")],
+                limits=RunLimits(max_total_tokens=15, scope="run"),
+            ),
+        )
+    )
+
+    assert first_events[-1].type == EventType.SESSION_COMPLETED
+    assert stopped_events[-1].type == EventType.SESSION_INTERRUPTED
+    assert any(event.type == EventType.SESSION_LIMIT_REACHED for event in stopped_events)
+    assert len(runtime_provider.requests) == 1
+    assert len(compactor_provider.requests) == 1
+
+    resumed_events = asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id=session_id,
+                messages=[Message.text("user", "third request")],
+            ),
+        )
+    )
+
+    assert resumed_events[-1].type == EventType.SESSION_COMPLETED
+    assert len(compactor_provider.requests) == 2
+    assert len(runtime_provider.requests) == 2
+    resumed_projection = json.dumps(
+        [message.model_dump(mode="json") for message in runtime_provider.requests[-1].messages]
+    )
+    assert "second model summary" in resumed_projection
+    assert "third request" in resumed_projection
+
+
 def test_cayu_app_stops_before_main_model_when_compaction_reaches_app_budget():
     store = InMemorySessionStore()
     pricing = compaction_price_book()
@@ -33270,6 +37770,7 @@ def test_cayu_app_stops_before_main_model_when_compaction_reaches_app_budget():
         EventType.SESSION_STARTED,
         EventType.BUDGET_CHECKED,
         EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.BUDGET_CHECKED,
         EventType.MODEL_COMPLETED,
         EventType.CONTEXT_COMPACTION_COMPLETED,
         EventType.SESSION_CHECKPOINTED,
@@ -33279,9 +37780,9 @@ def test_cayu_app_stops_before_main_model_when_compaction_reaches_app_budget():
         EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
-    assert Decimal(events[6].payload["actual"]) == Decimal("0.00002")
-    assert events[7].payload["scope"] == "app"
-    assert events[8].payload["limit"] == "estimated_cost"
+    assert Decimal(events[7].payload["actual"]) == Decimal("0.00002")
+    assert events[8].payload["scope"] == "app"
+    assert events[9].payload["limit"] == "estimated_cost"
     assert runtime_provider.requests == []
     checkpoint = asyncio.run(store.load_checkpoint("sess_compaction_app_budget"))
     assert checkpoint is not None
@@ -34149,7 +38650,7 @@ def test_automatic_compaction_cancellation_stays_authoritative_if_settlement_fai
         assert exc_info.value.args == ("cancel while settlement fails",)
         assert exc_info.value.__notes__ == [
             "Automatic compaction budget settlement also failed: "
-            "RuntimeError: budget ledger unavailable"
+            "RuntimeError: budget ledger unavailable",
         ]
         assert isinstance(exc_info.value.__cause__, RuntimeError)
         assert len(compactor_provider.requests) == 1
@@ -34257,10 +38758,10 @@ def test_automatic_compaction_settles_other_limits_after_one_reconciliation_fail
         ),
         pytest.param(
             "1",
-            2,
             1,
-            EventType.SESSION_COMPLETED,
-            id="retry-reservation-reconciled",
+            0,
+            EventType.SESSION_INTERRUPTED,
+            id="retry-uncertain-attempt-fails-closed",
         ),
     ],
 )
@@ -34342,13 +38843,11 @@ def test_automatic_compaction_retry_requires_an_independent_reservation(
     assert len(runtime_provider.requests) == runtime_calls
     reconciliations = [event for event in events if event.type == EventType.BUDGET_RECONCILED]
     assert Decimal(reconciliations[0].payload["actual_amount"]) == Decimal("0.00001")
-    if compactor_calls == 1:
-        failure = next(
-            event for event in events if event.type == EventType.BUDGET_RESERVATION_FAILED
-        )
-        assert Decimal(failure.payload["actual"]) == Decimal("0.00002")
-    else:
-        assert Decimal(reconciliations[1].payload["actual_amount"]) == Decimal("0.000001")
+    failure = next(event for event in events if event.type == EventType.BUDGET_RESERVATION_FAILED)
+    assert Decimal(failure.payload["actual"]) == Decimal("0")
+    assert failure.payload["message"] == (
+        "Budget cannot be verified because 1 model step(s) have no matching pricing."
+    )
     assert events[-1].type == terminal_event
 
 
@@ -34521,7 +39020,7 @@ def test_prompt_cache_compaction_does_not_fallback_after_settlement_failure() ->
     assert resume_events[-1].payload["error"] == "context too large"
 
 
-def test_inherited_prompt_cache_compactor_reserves_exact_fallback_independently() -> None:
+def test_inherited_prompt_cache_compactor_fails_closed_before_unpriced_fallback() -> None:
     class InheritedPromptCacheCompactor(PromptCacheCompactor):
         pass
 
@@ -34605,8 +39104,124 @@ def test_inherited_prompt_cache_compactor_reserves_exact_fallback_independently(
     ]
     assert len(failures) == 1, [event.type for event in resume_events]
     failure = failures[0]
-    assert Decimal(failure.payload["actual"]) == Decimal("0.000021")
+    assert Decimal(failure.payload["actual"]) == Decimal("0.000001")
+    assert failure.payload["message"] == (
+        "Budget cannot be verified because 1 model step(s) have no matching pricing."
+    )
     assert resume_events[-1].type == EventType.SESSION_INTERRUPTED
+
+
+@pytest.mark.parametrize("override_target", ["prompt_once", "oversized_atomic_unit"])
+def test_automatic_compaction_rejects_model_compactor_helper_overrides_before_dispatch(
+    override_target: str,
+) -> None:
+    class PromptOnceOverrideCompactor(ModelCompactor):
+        async def _compact_prompt_once(self, *args, **kwargs) -> CompactionResult:
+            del args, kwargs
+            raise AssertionError("overridden prompt helper must not execute")
+
+    class OversizedOverrideCompactor(ModelCompactor):
+        async def _compact_oversized_atomic_unit(
+            self,
+            request: CompactionRequest,
+        ) -> CompactionResult:
+            del request
+            raise AssertionError("overridden hierarchy helper must not execute")
+
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("must not dispatch"),
+            ModelStreamEvent.completed({"usage": {"input_tokens": 1}}),
+        ]
+    )
+    compactor_type = (
+        PromptOnceOverrideCompactor
+        if override_target == "prompt_once"
+        else OversizedOverrideCompactor
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(FakeProvider([ModelStreamEvent.completed({})]), default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=compactor_type(
+                provider=provider,
+                model="summary-model",
+                max_input_chars=1000,
+            ),
+            max_user_turns=1,
+            compact_after_messages=1,
+        ),
+    )
+    old_message = "oversized " + "x" * 5000 if override_target == "oversized_atomic_unit" else "old"
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=f"sess_compaction_helper_override_{override_target}",
+                messages=[
+                    Message.text("user", old_message),
+                    Message.text("user", "current"),
+                ],
+                limits=RunLimits(max_total_tokens=100),
+            ),
+        )
+    )
+
+    assert provider.requests == []
+    assert events[-1].type == EventType.SESSION_FAILED
+    assert "cannot safely run opaque provider-backed compactor" in events[-1].payload["error"]
+
+
+def test_automatic_compaction_rejects_provider_backed_deterministic_identity_claim() -> None:
+    class MisdeclaredModelCompactor(ModelCompactor):
+        def provider_budget_identity(self, session: Session) -> None:
+            del session
+            return None
+
+    compactor_provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("must not dispatch"),
+            ModelStreamEvent.completed({"usage": {"input_tokens": 1}}),
+        ]
+    )
+    runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
+    app = CayuApp(enable_logging=False)
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=MisdeclaredModelCompactor(
+                provider=compactor_provider,
+                model="summary-model",
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_compaction_misdeclared_deterministic_identity",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+                limits=RunLimits(max_total_tokens=10),
+            ),
+        )
+    )
+
+    assert compactor_provider.requests == []
+    assert runtime_provider.requests == []
+    assert events[-1].type == EventType.SESSION_FAILED
+    assert "cannot declare a deterministic budget identity" in events[-1].payload["error"]
 
 
 @pytest.mark.parametrize(
@@ -34620,9 +39235,9 @@ def test_inherited_prompt_cache_compactor_reserves_exact_fallback_independently(
         ),
         pytest.param(
             None,
-            1,
-            EventType.SESSION_INTERRUPTED,
-            id="event-backed-budget-remains-supported",
+            0,
+            EventType.SESSION_FAILED,
+            id="event-backed-budget-also-fails-closed",
         ),
     ],
 )
@@ -34651,6 +39266,7 @@ def test_automatic_compaction_opaque_multi_dispatch_budget_boundary(
                     pass
             return CompactionResult(
                 summary="summary",
+                covered_message_count=len(request.messages),
                 model_completed_payloads=[
                     {
                         "provider_name": "fake",
@@ -34732,17 +39348,9 @@ def test_automatic_compaction_opaque_multi_dispatch_budget_boundary(
     assert len(compactor_provider.requests) == expected_compactor_calls * 2
     assert runtime_provider.requests == []
     assert events[-1].type == expected_terminal_event
-    if reservation is not None:
-        assert EventType.BUDGET_RESERVED not in [event.type for event in events]
-        assert EventType.MODEL_COMPLETED not in [event.type for event in events]
-        assert "cannot safely run opaque provider-backed compactor" in events[-1].payload["error"]
-    else:
-        assert [event.type for event in events].count(EventType.MODEL_COMPLETED) == 2
-        assert EventType.BUDGET_LIMIT_REACHED in [event.type for event in events]
-        budget_limit = next(
-            event for event in events if event.type == EventType.BUDGET_LIMIT_REACHED
-        )
-        assert Decimal(budget_limit.payload["actual"]) == Decimal("0.00002")
+    assert EventType.BUDGET_RESERVED not in [event.type for event in events]
+    assert EventType.MODEL_COMPLETED not in [event.type for event in events]
+    assert "cannot safely run opaque provider-backed compactor" in events[-1].payload["error"]
 
 
 def test_deterministic_automatic_compaction_does_not_consume_strict_reservation() -> None:
@@ -34852,7 +39460,7 @@ def test_prompt_cache_deterministic_fallback_does_not_consume_compaction_reserva
     compaction_completed = next(
         event for event in events if event.type == EventType.CONTEXT_COMPACTION_COMPLETED
     )
-    assert compaction_completed.payload["metadata"]["compactor"] == ("TranscriptDigestCompactor")
+    assert compaction_completed.payload["chunk_mode"] == "digest_prefix"
     assert events[-1].type == EventType.SESSION_COMPLETED
 
 
@@ -35133,6 +39741,7 @@ def test_cayu_app_keeps_invalid_summary_spend_when_custom_compactor_recovers():
             except ValueError:
                 return CompactionResult(
                     summary="recovered summary",
+                    covered_message_count=len(request.messages),
                     model_completed_payloads=[
                         {
                             "model": "fallback-summary-model",
@@ -35293,7 +39902,8 @@ def test_cayu_app_keeps_successful_inner_compaction_spend_when_wrapper_fails():
     completed = events[2]
     assert completed.payload["usage_metrics"]["input_tokens"] == 10
     assert completed.payload["usage_metrics"]["output_tokens"] == 2
-    assert events[3].payload["error"] == "wrapper post-processing failed"
+    assert events[3].payload["error_type"] == "RuntimeError"
+    assert "error" not in events[3].payload
     assert runtime_provider.requests == []
     usage = asyncio.run(app.get_session_usage("sess_failed_compaction_wrapper"))
     assert usage.model_steps == 1
@@ -35361,7 +39971,8 @@ def test_cayu_app_keeps_compaction_completion_when_stream_fails_after_completed(
     assert completed.payload["usage_metrics"]["output_tokens"] == 2
     assert "compaction_attempt_id" not in completed.payload
     failed = next(event for event in events if event.type == EventType.CONTEXT_COMPACTION_FAILED)
-    assert failed.payload["error"] == "stream teardown failed"
+    assert failed.payload["error_type"] == "RuntimeError"
+    assert "error" not in failed.payload
     assert runtime_provider.requests == []
     usage = asyncio.run(app.get_session_usage("sess_compaction_stream_teardown_failure"))
     assert usage.model_steps == 1
@@ -35486,6 +40097,7 @@ def test_cayu_app_inserts_returned_only_completion_before_anchored_inner_call():
             ).compact(request)
             return CompactionResult(
                 summary=inner.summary,
+                covered_message_count=inner.covered_message_count,
                 model_completed_payloads=[
                     {
                         "model": "custom-model",
@@ -35756,7 +40368,8 @@ def test_cayu_app_counts_completed_compaction_with_invalid_summary(
             "uncached_input_tokens": 100,
         },
     }
-    assert events[3].payload["error"] == expected_error
+    assert events[3].payload["error_type"] == "ValueError"
+    assert "error" not in events[3].payload
     assert events[3].payload["error_type"] == "ValueError"
     assert events[4].payload["step_count"] == 1
     assert events[4].payload["token_usage"]["input_tokens"] == 100
@@ -35880,7 +40493,8 @@ def test_cayu_app_counts_completed_compaction_rejected_for_tool_call():
     assert completed.payload["usage_metrics"]["input_tokens"] == 80
     assert completed.payload["usage_metrics"]["output_tokens"] == 6
     assert "compaction_attempt_id" not in completed.payload
-    assert events[3].payload["error"] == "Compaction model must not call tools."
+    assert events[3].payload["error_type"] == "_CompactionToolCallError"
+    assert "error" not in events[3].payload
     assert events[4].payload["step_count"] == 1
     assert events[4].payload["token_usage"]["total_tokens"] == 86
     assert events[5].payload["error"] == "Compaction model must not call tools."
@@ -35920,11 +40534,12 @@ def test_cayu_app_counts_completed_compaction_rejected_for_tool_call():
 
 
 @pytest.mark.parametrize(
-    ("compactor_events", "expected_error"),
+    ("compactor_events", "expected_error", "expected_outcome"),
     [
         (
             [ModelStreamEvent.text_delta("partial summary")],
             "Compaction model stream ended without a completed event.",
+            "unfinished_stream",
         ),
         (
             [
@@ -35935,6 +40550,7 @@ def test_cayu_app_counts_completed_compaction_rejected_for_tool_call():
                 )
             ],
             "Compaction model must not call tools.",
+            "rejected_tool_call",
         ),
     ],
     ids=["partial-text", "tool-call"],
@@ -35942,6 +40558,7 @@ def test_cayu_app_counts_completed_compaction_rejected_for_tool_call():
 def test_cayu_app_does_not_invent_usage_for_unfinished_compaction_stream(
     compactor_events: list[ModelStreamEvent],
     expected_error: str,
+    expected_outcome: str,
 ):
     store = InMemorySessionStore()
     budget_store = InMemoryBudgetStore()
@@ -35984,18 +40601,24 @@ def test_cayu_app_does_not_invent_usage_for_unfinished_compaction_stream(
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.MODEL_COMPLETED,
         EventType.CONTEXT_COMPACTION_FAILED,
         EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
-    assert events[2].payload["error"] == expected_error
-    assert events[3].payload["step_count"] == 0
-    assert events[4].payload["error"] == expected_error
+    uncertain = events[2]
+    assert uncertain.payload["compaction_outcome"] == expected_outcome
+    assert uncertain.payload["usage_unavailable_reason"]
+    assert "usage_metrics" not in uncertain.payload
+    assert events[3].payload["error_type"] in {"RuntimeError", "_CompactionToolCallError"}
+    assert "error" not in events[3].payload
+    assert events[4].payload["step_count"] == 1
+    assert events[5].payload["error"] == expected_error
     assert runtime_provider.requests == []
     assert asyncio.run(store.load_checkpoint("sess_unfinished_compaction")) is None
 
     usage = asyncio.run(app.get_session_usage("sess_unfinished_compaction"))
-    assert usage.model_steps == 0
+    assert usage.model_steps == 1
     assert usage.usage.total_tokens == 0
     budget_events = asyncio.run(
         budget_store.load_events_for_budget(
@@ -36004,7 +40627,308 @@ def test_cayu_app_does_not_invent_usage_for_unfinished_compaction_stream(
             window=BudgetWindow.all_time(),
         )
     )
-    assert budget_events == []
+    assert [event.id for event in budget_events] == [uncertain.id]
+
+
+def test_unfinished_automatic_compaction_fails_closed_after_restart() -> None:
+    class UnfinishedThenSuccessfulProvider(ModelProvider):
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                yield ModelStreamEvent.text_delta("partial summary")
+                return
+            yield ModelStreamEvent.text_delta("must not run")
+            yield ModelStreamEvent.completed(
+                {
+                    "model": request.model,
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                }
+            )
+
+    async def run() -> None:
+        store = InMemorySessionStore()
+        budget_store = InMemoryBudgetStore()
+        compactor_provider = UnfinishedThenSuccessfulProvider()
+        policy = BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=Decimal("1"),
+                    pricing=compaction_price_book(),
+                ),
+            )
+        )
+
+        def new_app() -> CayuApp:
+            app = CayuApp(
+                session_store=store,
+                budget_store=budget_store,
+                budget_policy=policy,
+                enable_logging=False,
+            )
+            app.register_provider(FakeProvider([ModelStreamEvent.completed({})]), default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                context_policy=CheckpointCompactionContextPolicy(
+                    compactor=ModelCompactor(
+                        provider=compactor_provider,
+                        model="summary-model",
+                    ),
+                    max_user_turns=1,
+                    compact_after_messages=2,
+                ),
+            )
+            return app
+
+        first_events = await collect_events(
+            new_app(),
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_unfinished_compaction_first_process",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+        assert first_events[-1].type == EventType.SESSION_FAILED
+        uncertain = next(
+            event
+            for event in first_events
+            if event.type == EventType.MODEL_COMPLETED
+            and event.payload.get("purpose") == "context_compaction"
+        )
+        assert uncertain.payload["compaction_outcome"] == "unfinished_stream"
+        assert uncertain.payload["usage_unavailable_reason"]
+
+        restart_events = await collect_events(
+            new_app(),
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_unfinished_compaction_second_process",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+
+        assert len(compactor_provider.requests) == 1
+        assert any(event.type == EventType.BUDGET_LIMIT_REACHED for event in restart_events)
+        assert not any(
+            event.type == EventType.MODEL_COMPLETED
+            and event.payload.get("purpose") == "context_compaction"
+            for event in restart_events
+        )
+        durable_budget_events = await budget_store.load_events_for_budget(
+            scope="app",
+            key=None,
+            window=BudgetWindow.all_time(),
+        )
+        assert [event.id for event in durable_budget_events] == [uncertain.id]
+
+    asyncio.run(run())
+
+
+def test_automatic_compaction_real_cancellation_records_uncertain_dispatch() -> None:
+    class BlockingPartialProvider(ModelProvider):
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+            self.partial_emitted = asyncio.Event()
+            self.cancelled = asyncio.Event()
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            yield ModelStreamEvent.text_delta("partial summary")
+            self.partial_emitted.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+
+    async def run() -> None:
+        session_id = "sess_cancelled_compaction_dispatch"
+        store = InMemorySessionStore()
+        budget_store = InMemoryBudgetStore()
+        compactor_provider = BlockingPartialProvider()
+        app = CayuApp(
+            session_store=store,
+            budget_store=budget_store,
+            enable_logging=False,
+        )
+        app.register_provider(FakeProvider([ModelStreamEvent.completed({})]), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=compactor_provider,
+                    model="summary-model",
+                ),
+                max_user_turns=1,
+                compact_after_messages=2,
+            ),
+        )
+
+        task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[
+                        Message.text("user", "old"),
+                        Message.text("assistant", "old answer"),
+                        Message.text("user", "current"),
+                    ],
+                ),
+            )
+        )
+        await asyncio.wait_for(compactor_provider.partial_emitted.wait(), timeout=5)
+        task.cancel("cancel compaction after provider dispatch")
+        assert task.cancelling() == 1
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+
+        assert exc_info.value.args == ("cancel compaction after provider dispatch",)
+        assert task.cancelled()
+        assert compactor_provider.cancelled.is_set()
+        events = await store.load_events(session_id)
+        completions = [
+            event
+            for event in events
+            if event.type == EventType.MODEL_COMPLETED
+            and event.payload.get("purpose") == "context_compaction"
+        ]
+        assert len(completions) == 1
+        assert completions[0].payload["compaction_outcome"] == "cancelled"
+        assert completions[0].payload["usage_unavailable_reason"]
+        assert sum(event.type == EventType.CONTEXT_COMPACTION_FAILED for event in events) == 1
+        assert await store.load_checkpoint(session_id) is None
+        usage = await app.get_session_usage(session_id)
+        assert usage.model_steps == 1
+        assert usage.usage.total_tokens == 0
+        durable_budget_events = await budget_store.load_events_for_budget(
+            scope="app",
+            key=None,
+            window=BudgetWindow.all_time(),
+        )
+        assert [event.id for event in durable_budget_events] == [completions[0].id]
+
+    asyncio.run(run())
+
+
+def test_automatic_compaction_preserves_later_cancellation_during_termination_persistence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BlockingPartialProvider(ModelProvider):
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+            self.partial_emitted = asyncio.Event()
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            yield ModelStreamEvent.text_delta("partial summary")
+            self.partial_emitted.set()
+            await asyncio.Event().wait()
+
+    async def run() -> None:
+        session_id = "sess_cancelled_compaction_termination_persistence"
+        store = InMemorySessionStore()
+        compactor_provider = BlockingPartialProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([ModelStreamEvent.completed({})]), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=compactor_provider,
+                    model="summary-model",
+                ),
+                max_user_turns=1,
+                compact_after_messages=2,
+            ),
+        )
+
+        termination_persistence_started = asyncio.Event()
+        allow_termination_persistence = asyncio.Event()
+        original_emit_many = app._event_writer.emit_many
+
+        async def block_termination_persistence(
+            emitted_session_id: str,
+            events: list[Event],
+        ) -> list[Event]:
+            if any(event.type == EventType.CONTEXT_COMPACTION_FAILED for event in events):
+                termination_persistence_started.set()
+                await allow_termination_persistence.wait()
+            return await original_emit_many(emitted_session_id, events)
+
+        monkeypatch.setattr(app._event_writer, "emit_many", block_termination_persistence)
+        task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[
+                        Message.text("user", "old"),
+                        Message.text("assistant", "old answer"),
+                        Message.text("user", "current"),
+                    ],
+                ),
+            )
+        )
+        await asyncio.wait_for(compactor_provider.partial_emitted.wait(), timeout=5)
+        task.cancel("primary cancellation during provider dispatch")
+        await asyncio.wait_for(termination_persistence_started.wait(), timeout=5)
+
+        task.cancel("later cancellation during termination persistence")
+        await asyncio.sleep(0)
+        assert not task.done()
+        allow_termination_persistence.set()
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            await task
+
+        def leaves(error: BaseException) -> list[BaseException]:
+            if isinstance(error, BaseExceptionGroup):
+                return [leaf for nested in error.exceptions for leaf in leaves(nested)]
+            return [error]
+
+        cancellations = [
+            leaf for leaf in leaves(exc_info.value) if isinstance(leaf, asyncio.CancelledError)
+        ]
+        assert [cancellation.args for cancellation in cancellations] == [
+            ("primary cancellation during provider dispatch",),
+            ("later cancellation during termination persistence",),
+        ]
+        assert len(leaves(exc_info.value)) == 2
+        assert task.cancelling() == 0
+        assert not task.cancelled()
+
+        events = await store.load_events(session_id)
+        assert (
+            sum(
+                event.type == EventType.MODEL_COMPLETED
+                and event.payload.get("purpose") == "context_compaction"
+                for event in events
+            )
+            == 1
+        )
+        assert sum(event.type == EventType.CONTEXT_COMPACTION_FAILED for event in events) == 1
+        assert len(compactor_provider.requests) == 1
+
+    asyncio.run(run())
 
 
 def test_cayu_app_emits_compaction_failed_event_before_session_failure():
@@ -36051,12 +40975,20 @@ def test_cayu_app_emits_compaction_failed_event_before_session_failure():
     assert events[2].payload == {
         "checkpoint": "context_compaction",
         "compactor": "FailingCompactor",
-        "compacted_transcript_cursor": 2,
+        "compacted_transcript_cursor": 0,
         "previous_compacted_transcript_cursor": 0,
-        "newly_compacted_message_count": 2,
+        "newly_compacted_message_count": 0,
         "recent_message_count": 1,
-        "error": "compaction unavailable",
         "error_type": "RuntimeError",
+        "requested_source_start": 0,
+        "requested_source_end": 2,
+        "represented_source_start": 0,
+        "represented_source_end": 0,
+        "represented_message_count": 0,
+        "coverage_mode": "failed",
+        "chunk_count": 0,
+        "chunk_mode": "failed",
+        "compaction_failed": True,
     }
     assert events[4].payload == {
         "error": "compaction unavailable",
@@ -36068,7 +41000,8 @@ def test_cayu_app_emits_compaction_failed_event_before_session_failure():
 
 def test_cayu_app_emits_compaction_events_before_checkpoint_failure():
     class BrokenCheckpointStore(InMemorySessionStore):
-        async def transform_checkpoint(self, session_id, checkpoint_transform) -> None:
+        async def publish_checkpoint_and_events(self, session_id, **kwargs):
+            del session_id, kwargs
             raise RuntimeError("checkpoint unavailable")
 
     store = BrokenCheckpointStore()
@@ -36117,28 +41050,12 @@ def test_cayu_app_emits_compaction_events_before_checkpoint_failure():
         EventType.SESSION_STARTED,
         EventType.CONTEXT_COMPACTION_STARTED,
         EventType.MODEL_COMPLETED,
-        EventType.CONTEXT_COMPACTION_COMPLETED,
         EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
-    assert events[3].payload == {
-        "checkpoint": "context_compaction",
-        "compactor": "ModelCompactor",
-        "compacted_transcript_cursor": 2,
-        "previous_compacted_transcript_cursor": 0,
-        "newly_compacted_message_count": 2,
-        "recent_message_count": 1,
-        "summary_chars": len("model summary"),
-        "metadata": {
-            "compactor": "ModelCompactor",
-            "provider": "fake",
-            "model": "summary-model",
-            "input_truncated": False,
-            "max_input_chars": 120000,
-            "completed": {"finish_reason": "stop"},
-        },
-    }
-    assert events[5].payload == {
+    assert EventType.CONTEXT_COMPACTION_COMPLETED not in {event.type for event in events}
+    assert EventType.SESSION_CHECKPOINTED not in {event.type for event in events}
+    assert events[4].payload == {
         "error": "checkpoint unavailable",
         "error_type": "RuntimeError",
     }
@@ -36192,7 +41109,7 @@ def test_cayu_app_checkpoint_compaction_ignores_cursor_without_valid_summary():
             session.id,
             {
                 "context_compaction": {
-                    "version": 1,
+                    "version": 2,
                     "summary": 123,
                     "compacted_transcript_cursor": 2,
                     "metadata": {},
@@ -36283,7 +41200,7 @@ def test_cayu_app_checkpoint_compaction_ignores_summary_without_valid_cursor():
             session.id,
             {
                 "context_compaction": {
-                    "version": 1,
+                    "version": 2,
                     "summary": "stale summary",
                     "compacted_transcript_cursor": "bad",
                     "metadata": {},

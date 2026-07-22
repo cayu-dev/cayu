@@ -118,6 +118,48 @@ def test_cleanup_wait_preserves_caller_cancellation_and_child_failure(bounded: b
     assert failure.exceptions[1] is cleanup_error
 
 
+@pytest.mark.parametrize("bounded", [False, True])
+def test_cleanup_wait_preserves_explicit_unwinding_cancellation(
+    bounded: bool,
+) -> None:
+    cleanup_error = RuntimeError("cleanup failed")
+    failures: list[BaseExceptionGroup] = []
+
+    async def cleanup() -> None:
+        raise cleanup_error
+
+    async def run() -> None:
+        current = asyncio.current_task()
+        assert current is not None
+        current.cancel("unwinding cancellation")
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError as cancellation:
+            child = asyncio.create_task(cleanup())
+            try:
+                if bounded:
+                    await _await_bounded_cleanup_task(
+                        child,
+                        timeout_s=1,
+                        timeout_message="cleanup timed out",
+                        cancellation=cancellation,
+                    )
+                else:
+                    await _await_cleanup_task(child, cancellation=cancellation)
+            except BaseExceptionGroup as failure:
+                failures.append(failure)
+            raise
+
+    with pytest.raises(asyncio.CancelledError, match="unwinding cancellation"):
+        asyncio.run(run())
+
+    assert len(failures) == 1
+    failure = failures[0]
+    assert isinstance(failure.exceptions[0], asyncio.CancelledError)
+    assert failure.exceptions[0].args == ("unwinding cancellation",)
+    assert failure.exceptions[1] is cleanup_error
+
+
 def test_bounded_cleanup_preserves_caller_cancellation_when_it_times_out() -> None:
     cleanup_started = asyncio.Event()
 
@@ -152,7 +194,7 @@ def test_bounded_cleanup_preserves_caller_cancellation_when_it_times_out() -> No
 
 
 @pytest.mark.parametrize("bounded", [False, True])
-def test_cleanup_wait_retains_cancellation_pending_before_entry(bounded: bool) -> None:
+def test_cleanup_wait_ignores_handled_historical_cancellation(bounded: bool) -> None:
     async def run() -> bool:
         current = asyncio.current_task()
         assert current is not None
@@ -162,16 +204,19 @@ def test_cleanup_wait_retains_cancellation_pending_before_entry(bounded: bool) -
         child = asyncio.create_task(asyncio.sleep(0))
         try:
             if bounded:
-                return await _await_bounded_cleanup_task(
+                result = await _await_bounded_cleanup_task(
                     child,
                     timeout_s=1,
                     timeout_message="cleanup timed out",
                 )
-            return await _await_cleanup_task(child)
+            else:
+                result = await _await_cleanup_task(child)
+            assert current.cancelling() == 1
+            return result
         finally:
             current.uncancel()
 
-    assert asyncio.run(run()) is True
+    assert asyncio.run(run()) is False
 
 
 def test_managed_cleanup_does_not_replace_grouped_timeout_cancellation() -> None:
@@ -383,7 +428,7 @@ def test_finalize_evidence_reconciliation_preserves_cancellation_and_failure() -
     assert failure.__cause__ is reconciliation_error
 
 
-def test_finalize_evidence_persistence_retains_cancellation_pending_before_entry() -> None:
+def test_finalize_evidence_persistence_ignores_handled_historical_cancellation() -> None:
     event = Event(type="custom.test.finalize", session_id="sess_pre_cancelled_persist")
 
     class _Writer:
@@ -398,17 +443,19 @@ def test_finalize_evidence_persistence_retains_cancellation_pending_before_entry
         with pytest.raises(asyncio.CancelledError):
             await asyncio.sleep(0)
         try:
-            return await _persist_binding_finalize_failure_event(  # type: ignore[arg-type]
+            result = await _persist_binding_finalize_failure_event(  # type: ignore[arg-type]
                 _Writer(),
                 event,
             )
+            assert current.cancelling() == 1
+            return result
         finally:
             current.uncancel()
 
     persisted, cancellation = asyncio.run(run())
 
     assert persisted is event
-    assert isinstance(cancellation, asyncio.CancelledError)
+    assert cancellation is None
 
 
 class _FakeDocker:

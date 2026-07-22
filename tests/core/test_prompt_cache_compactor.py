@@ -666,7 +666,17 @@ def test_prompt_cache_compaction_failure_telemetry_is_invocation_scoped() -> Non
     assert [telemetry.event_type for telemetry in exact_failure.value.compaction_telemetry] == [
         EventType.CONTEXT_COMPACTION_STARTED,
         EventType.MODEL_COMPLETED,
+        EventType.MODEL_COMPLETED,
         EventType.CONTEXT_COMPACTION_FAILED,
+    ]
+    exact_attempts = [
+        telemetry
+        for telemetry in exact_failure.value.compaction_telemetry
+        if telemetry.event_type == EventType.MODEL_COMPLETED
+    ]
+    assert [item.payload["compaction_outcome"] for item in exact_attempts] == [
+        "rejected_tool_call",
+        "provider_error",
     ]
 
     with pytest.raises(ContextBuildError) as bounded_only_failure:
@@ -683,8 +693,14 @@ def test_prompt_cache_compaction_failure_telemetry_is_invocation_scoped() -> Non
         telemetry.event_type for telemetry in bounded_only_failure.value.compaction_telemetry
     ] == [
         EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.MODEL_COMPLETED,
         EventType.CONTEXT_COMPACTION_FAILED,
     ]
+    bounded_attempt = bounded_only_failure.value.compaction_telemetry[1]
+    assert bounded_attempt.payload["compaction_outcome"] == "provider_error"
+    assert bounded_attempt.payload["usage_unavailable_reason"] == (
+        "compaction provider dispatch failed without completion usage"
+    )
 
 
 def test_prompt_cache_compactor_retains_usage_before_post_completion_stream_failure() -> None:
@@ -905,6 +921,165 @@ def test_checkpoint_policy_builds_the_cache_prefix_with_runtime_request_shape() 
         "effort": "high",
     }
     assert provider.requests[0].messages[:-1] == messages
+
+
+def test_checkpoint_policy_reports_start_when_cache_prefix_build_fails() -> None:
+    provider = RecordingProvider([])
+    policy = CheckpointCompactionContextPolicy(
+        compactor=PromptCacheCompactor(provider=provider),
+        max_user_turns=1,
+        compact_after_messages=2,
+    )
+
+    async def failing_builder(context_messages: list[Message]) -> ModelRequest:
+        assert context_messages
+        raise RuntimeError("cache prefix construction failed")
+
+    with pytest.raises(ContextBuildError, match="cache prefix construction failed") as exc_info:
+        asyncio.run(
+            policy.build_with_checkpoint(
+                ContextRequest(
+                    session=Session(
+                        id="checkpoint-cache-prefix-failure",
+                        agent_name="assistant",
+                        provider_name="recording",
+                        model="claude-sonnet-4-6",
+                    ),
+                    agent=AgentSpec(name="assistant", model="claude-sonnet-4-6"),
+                    messages=[
+                        Message.text("user", "old request"),
+                        Message.text("assistant", "old answer"),
+                        Message.text("user", "current request"),
+                    ],
+                    step=1,
+                    context_usage=ContextUsageState(
+                        last_transcript_cursor=2,
+                        last_provider_name="recording",
+                        last_requested_model="claude-sonnet-4-6",
+                    ),
+                    build_cache_prefix_request=failing_builder,
+                ),
+                checkpoint=None,
+            )
+        )
+
+    assert [telemetry.event_type for telemetry in exc_info.value.compaction_telemetry] == [
+        EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.CONTEXT_COMPACTION_FAILED,
+    ]
+    assert all(
+        "bounded_input" not in telemetry.payload
+        for telemetry in exc_info.value.compaction_telemetry
+    )
+    assert provider.requests == []
+
+
+def test_prompt_cache_digest_exhaustion_can_progress_on_bounded_followup() -> None:
+    provider = RecordingProvider(
+        [
+            ModelStreamEvent.text_delta("provider summary"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    policy = CheckpointCompactionContextPolicy(
+        compactor=PromptCacheCompactor(provider=provider),
+        max_user_turns=1,
+        compact_after_messages=1,
+    )
+    messages = [
+        Message.text("user", "oversized " + "x" * 10_000),
+        Message.text("user", "current"),
+    ]
+
+    first = asyncio.run(
+        policy.build_with_checkpoint(
+            ContextRequest(
+                session=Session(
+                    id="prompt-cache-digest-exhaustion",
+                    agent_name="assistant",
+                    provider_name="recording",
+                    model="claude-sonnet-4-6",
+                ),
+                agent=AgentSpec(name="assistant", model="claude-sonnet-4-6"),
+                messages=messages,
+                step=1,
+            ),
+            checkpoint=None,
+        )
+    )
+
+    assert first.checkpoint is not None
+    assert first.checkpoint["context_compaction"]["compacted_transcript_cursor"] == 0
+    assert first.checkpoint["context_compaction"]["progress"]["exhausted"] is True
+    assert provider.requests == []
+
+    second = asyncio.run(
+        policy.build_with_checkpoint(
+            ContextRequest(
+                session=Session(
+                    id="prompt-cache-digest-exhaustion",
+                    agent_name="assistant",
+                    provider_name="recording",
+                    model="claude-sonnet-4-6",
+                ),
+                agent=AgentSpec(name="assistant", model="claude-sonnet-4-6"),
+                messages=messages,
+                step=2,
+            ),
+            checkpoint=first.checkpoint,
+        )
+    )
+
+    assert second.checkpoint is not None
+    assert second.checkpoint["context_compaction"]["compacted_transcript_cursor"] == 1
+    assert second.checkpoint["context_compaction"]["summary"] == "provider summary"
+    assert "progress" not in second.checkpoint["context_compaction"]
+    assert len(provider.requests) == 1
+
+
+@pytest.mark.parametrize("last_transcript_cursor", [None, 0, 3])
+def test_prompt_cache_digest_exhaustion_uses_fallback_key_without_valid_usage_cursor(
+    last_transcript_cursor: int | None,
+) -> None:
+    provider = RecordingProvider([])
+    policy = CheckpointCompactionContextPolicy(
+        compactor=PromptCacheCompactor(provider=provider),
+        max_user_turns=1,
+        compact_after_messages=1,
+    )
+    messages = [
+        Message.text("user", "oversized " + "x" * 10_000),
+        Message.text("user", "current"),
+    ]
+
+    async def unexpected_cache_prefix_builder(_messages: list[Message]) -> ModelRequest:
+        raise AssertionError("an invalid usage cursor cannot reconstruct a cache prefix")
+
+    request = ContextRequest(
+        session=Session(
+            id="prompt-cache-missing-usage-cursor",
+            agent_name="assistant",
+            provider_name="recording",
+            model="claude-sonnet-4-6",
+        ),
+        agent=AgentSpec(name="assistant", model="claude-sonnet-4-6"),
+        messages=messages,
+        step=1,
+        context_usage=ContextUsageState(
+            last_transcript_cursor=last_transcript_cursor,
+            last_provider_name="recording",
+            last_requested_model="claude-sonnet-4-6",
+        ),
+        build_cache_prefix_request=unexpected_cache_prefix_builder,
+    )
+    first = asyncio.run(policy.build_with_checkpoint(request, checkpoint=None))
+
+    assert first.checkpoint is not None
+    compacted = first.checkpoint["context_compaction"]
+    assert compacted["compacted_transcript_cursor"] == 0
+    assert compacted["progress"]["exhausted"] is True
+    assert compacted["progress"]["key"].startswith("transcript-digest:v2:")
+    assert provider.requests == []
 
 
 def test_checkpoint_policy_skips_cache_request_after_provider_identity_changes() -> None:
@@ -1409,7 +1584,7 @@ def test_cayu_app_resume_model_override_cannot_reuse_previous_model_cache() -> N
     ]
     assert len(compaction_completed) == 1
     assert compaction_completed[0].payload["compactor"] == "PromptCacheCompactor"
-    assert compaction_completed[0].payload["metadata"]["compactor"] == "ModelCompactor"
+    assert compaction_completed[0].payload["chunk_mode"] == "single_request"
     assert resume_events[-1].type == EventType.SESSION_COMPLETED
 
 

@@ -80,6 +80,7 @@ from cayu.runtime.checks import (
 )
 from cayu.runtime.context import (
     CheckpointCompactionContextPolicy,
+    CompactionPrompt,
     CompactionPromptBuilder,
     CompactionRequest,
     CompactionResult,
@@ -410,6 +411,7 @@ __all__ = [
     "CheckpointCompactionContextPolicy",
     "CheckpointTransform",
     "CompactSessionRequest",
+    "CompactionPrompt",
     "CompactionPromptBuilder",
     "CompactionRequest",
     "CompactionResult",

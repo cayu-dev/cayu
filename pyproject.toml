@@ -25,6 +25,7 @@ dev = [
   "cryptography>=42",
   "fastapi>=0.115",
   "httpx2>=2.3,<3",
+  "hypothesis>=6,<7",
   "opentelemetry-api>=1.20",
   "opentelemetry-sdk>=1.20",
   "pillow>=10",

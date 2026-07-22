@@ -4,6 +4,8 @@ import asyncio
 from copy import deepcopy
 from typing import Any
 
+import pytest
+
 from cayu.core import Message
 from cayu.environments import WorkspaceInstructions
 from cayu.runtime import InMemorySessionStore, RunRequest, SessionIdentity
@@ -85,6 +87,46 @@ def test_checkpoint_preserves_factory_reconnect_state_and_current_control_state(
         "context_compaction": {"summary": "bounded"},
         "pending_session_interrupt": {"reason": "current"},
     }
+
+
+def test_checkpoint_preservation_rejects_deleting_transform() -> None:
+    store = InMemorySessionStore()
+
+    def deleting_transform(_checkpoint: dict[str, Any]) -> CheckpointTransform:
+        def transform(
+            _session: Session,
+            _current: dict[str, Any] | None,
+        ) -> None:
+            return None
+
+        return transform
+
+    lifecycle = EnvironmentLifecycle(
+        session_store=store,
+        event_writer=RuntimeEventWriter(
+            session_store=store,
+            budget_store=InMemoryBudgetStore(),
+            event_sinks=(),
+        ),
+        checkpoint_transform=deleting_transform,
+    )
+    transform = lifecycle.checkpoint_transform_preserving_runtime_state(
+        {"context_compaction": {"summary": "bounded"}}
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="Checkpoint preservation transform unexpectedly deleted the checkpoint",
+    ):
+        transform(
+            Session(
+                id="environment_checkpoint_deletion",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            ),
+            None,
+        )
 
 
 def test_render_initial_system_prompt_keeps_agent_and_workspace_provenance() -> None:
