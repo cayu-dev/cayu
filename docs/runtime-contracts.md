@@ -785,7 +785,7 @@ dashboard, API, recovery, or shutdown behavior. It is independent from Cayu's
 agent execution `Environment`. Configuration is resolved and validated once at
 startup, and the same immutable object drives route, middleware, dashboard, and
 lifecycle construction. See [server configuration](server-configuration.md)
-for programmatic and external-secret examples.
+for programmatic, environment, dotenv, and external-secret examples.
 
 Authentication and tenant isolation are separate contracts. `AuthContext.tenant`
 is verified actor provenance: the server may stamp it into approval,

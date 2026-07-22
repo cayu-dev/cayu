@@ -29,10 +29,13 @@ tightens server policy. Applications must select `AuthenticatedAccess` or
 deliberate `OpenAccess`, and can resolve credentials through any external
 provider before constructing the config.
 
-`create_server(...)` requires the resolved configuration, and
-`mount_cayu(...)` requires an explicit access policy; there is no parallel
-flag-based policy path. See [server configuration](server-configuration.md)
-for profiles and external authentication.
+The optional `cayu[server-settings]` extra adds typed environment and `.env`
+loading with explicit constructor values taking precedence over process
+environment and dotenv values. `create_server(...)` requires the resolved
+configuration, and `mount_cayu(...)` requires an explicit access policy; there
+is no parallel flag-based policy path. See [server
+configuration](server-configuration.md) for profiles, external authentication,
+and settings variables.
 
 ### Virtual egress supports GitHub-style CLI tokens
 

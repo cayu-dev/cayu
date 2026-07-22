@@ -257,6 +257,7 @@ forcing their dependencies into every deployment:
 | Extra | Adds |
 | --- | --- |
 | `cayu[server]` | FastAPI control plane and packaged dashboard |
+| `cayu[server-settings]` | Server extra plus typed environment and `.env` loading |
 | `cayu[postgres]` | PostgreSQL session, task, knowledge, and related stores |
 | `cayu[aws]` | Amazon Bedrock and Lambda MicroVM support |
 | `cayu[vertex]` | Anthropic models through Google Cloud Vertex AI |

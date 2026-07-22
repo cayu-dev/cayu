@@ -100,6 +100,79 @@ non-empty operator-defined value, such as `qa`, `production`, `preprod-eu`, or
 `Environment`, which owns runners, workspaces, bindings, vaults, and execution
 capabilities.
 
+## Optional environment and dotenv loading
+
+Install the source-specific loader separately:
+
+```bash
+pip install "cayu[server-settings]"
+```
+
+```python
+from cayu.server import create_server
+from cayu.server.settings import ServerSettings
+
+settings = ServerSettings()
+server = create_server(cayu_app, config=settings.to_config())
+```
+
+The prefix is `CAYU_SERVER_` and nested fields use `__`:
+
+```dotenv
+CAYU_SERVER_DEPLOYMENT_NAME=development
+CAYU_SERVER_ACCESS__MODE=open
+CAYU_SERVER_DOCS__ENABLED=true
+CAYU_SERVER_CORS__ALLOWED_ORIGINS=["http://localhost:5173"]
+```
+
+Built-in Basic authentication is also source-loadable without exposing the
+password in representations or serialized settings:
+
+```dotenv
+CAYU_SERVER_DEPLOYMENT_NAME=production-eu
+CAYU_SERVER_ACCESS__MODE=basic
+CAYU_SERVER_ACCESS__USERNAME=operator
+CAYU_SERVER_ACCESS__PASSWORD=resolved-at-deploy-time
+```
+
+For application-defined authentication loaded from an external provider, pass
+the resolved policy explicitly:
+
+```python
+from cayu.server import AuthenticatedAccess
+
+settings = ServerSettings()
+config = settings.to_config(
+    access=AuthenticatedAccess(dependency=require_operator),
+)
+```
+
+If the environment declares `CAYU_SERVER_ACCESS__MODE=external`, an explicit
+policy must be supplied to `to_config()`. If it declares `open` or `basic`, an
+explicit policy cannot silently replace that selection.
+
+`pydantic-settings` provides deterministic precedence: explicit
+`ServerSettings(...)` constructor values, process environment, `.env`, secret
+files/customized sources, then defaults. Applications that use another source
+can bypass `ServerSettings` completely and construct `ServerConfig` directly.
+Missing access policy fails when settings are resolved. Unknown constructor
+fields and unknown `CAYU_SERVER_` settings are rejected so misspelled policy
+does not silently fall back to a default; unrelated entries in a shared `.env`
+file are ignored.
+
+File-secret directories use the same `CAYU_SERVER_` prefix and `__` nesting as
+environment variables. For example, a file named
+`CAYU_SERVER_ACCESS__PASSWORD` supplies the Basic-authentication password and
+can be combined with mode and username from the process environment:
+
+```python
+settings = ServerSettings(_secrets_dir="/run/secrets")
+```
+
+Only regular files with the Cayu prefix are interpreted. Unknown prefixed
+filenames fail validation, while unrelated files in a shared secrets directory
+are ignored.
+
 ## Mounted host applications
 
 When a product already owns the FastAPI application, select access explicitly:

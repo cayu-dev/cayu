@@ -33,6 +33,7 @@ dev = [
   "pypdf>=4",
   "pytest>=8.0",
   "pytest-cov>=7.1",
+  "pydantic-settings>=2.7,<3",
   "ruff>=0.11",
   "sse-starlette>=2.0",
   "testcontainers[postgres]>=4.0",
@@ -80,6 +81,12 @@ server = [
   "uvicorn>=0.30",
   "sse-starlette>=2.0",
 ]
+server-settings = [
+  "fastapi>=0.115",
+  "pydantic-settings>=2.7,<3",
+  "sse-starlette>=2.0",
+  "uvicorn>=0.30",
+]
 all = [
   "boto3>=1.43.44,<2",
   "cryptography>=42",
@@ -93,6 +100,7 @@ all = [
   "psycopg[binary]>=3.2",
   "psycopg_pool>=3.2",
   "pypdf>=4",
+  "pydantic-settings>=2.7,<3",
   "uvicorn>=0.30",
   "sse-starlette>=2.0",
 ]
