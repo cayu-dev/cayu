@@ -1,14 +1,17 @@
 {
-  "price_book_version": "2026-07-16",
-  "generated_at": "2026-07-16",
+  "contextual_pricing_requirements": [],
+  "generated_at": "2026-07-22",
+  "price_book_version": "2026-07-22",
   "prices": [
     {
       "aliases": [],
+      "cache_write_ttls": [],
       "match": "exact",
       "match_prefixes": [
         "claude-fable-5-20"
       ],
       "model": "claude-fable-5",
+      "pricing_context": null,
       "provider_name": "anthropic",
       "schedules": [
         {
@@ -43,11 +46,13 @@
     },
     {
       "aliases": [],
+      "cache_write_ttls": [],
       "match": "exact",
       "match_prefixes": [
         "claude-haiku-4-5-20"
       ],
       "model": "claude-haiku-4-5",
+      "pricing_context": null,
       "provider_name": "anthropic",
       "schedules": [
         {
@@ -82,11 +87,13 @@
     },
     {
       "aliases": [],
+      "cache_write_ttls": [],
       "match": "exact",
       "match_prefixes": [
         "claude-opus-4-8-20"
       ],
       "model": "claude-opus-4-8",
+      "pricing_context": null,
       "provider_name": "anthropic",
       "schedules": [
         {
@@ -121,11 +128,13 @@
     },
     {
       "aliases": [],
+      "cache_write_ttls": [],
       "match": "exact",
       "match_prefixes": [
         "claude-sonnet-4-6-20"
       ],
       "model": "claude-sonnet-4-6",
+      "pricing_context": null,
       "provider_name": "anthropic",
       "schedules": [
         {
@@ -160,11 +169,13 @@
     },
     {
       "aliases": [],
+      "cache_write_ttls": [],
       "match": "exact",
       "match_prefixes": [
         "claude-sonnet-5-20"
       ],
       "model": "claude-sonnet-5",
+      "pricing_context": null,
       "provider_name": "anthropic",
       "schedules": [
         {
@@ -227,11 +238,13 @@
     },
     {
       "aliases": [],
+      "cache_write_ttls": [],
       "match": "exact",
       "match_prefixes": [
         "gpt-5.4-mini-20"
       ],
       "model": "gpt-5.4-mini",
+      "pricing_context": null,
       "provider_name": "azure",
       "schedules": [
         {
@@ -261,11 +274,13 @@
     },
     {
       "aliases": [],
+      "cache_write_ttls": [],
       "match": "exact",
       "match_prefixes": [
         "gpt-5.4-nano-20"
       ],
       "model": "gpt-5.4-nano",
+      "pricing_context": null,
       "provider_name": "azure",
       "schedules": [
         {
@@ -295,11 +310,13 @@
     },
     {
       "aliases": [],
+      "cache_write_ttls": [],
       "match": "exact",
       "match_prefixes": [
         "gpt-5.5-20"
       ],
       "model": "gpt-5.5",
+      "pricing_context": null,
       "provider_name": "azure",
       "schedules": [
         {
@@ -412,11 +429,13 @@
     },
     {
       "aliases": [],
+      "cache_write_ttls": [],
       "match": "exact",
       "match_prefixes": [
         "gemini-3.1-flash-lite-00"
       ],
       "model": "gemini-3.1-flash-lite",
+      "pricing_context": null,
       "provider_name": "google",
       "schedules": [
         {
@@ -446,11 +465,13 @@
     },
     {
       "aliases": [],
+      "cache_write_ttls": [],
       "match": "exact",
       "match_prefixes": [
         "gemini-3.1-pro-preview-00"
       ],
       "model": "gemini-3.1-pro-preview",
+      "pricing_context": null,
       "provider_name": "google",
       "schedules": [
         {
@@ -477,7 +498,7 @@
             ]
           },
           "provenance": {
-            "as_of": "2026-06-21",
+            "as_of": "2026-07-22",
             "source": "official",
             "url": "https://ai.google.dev/gemini-api/docs/pricing"
           }
@@ -486,11 +507,13 @@
     },
     {
       "aliases": [],
+      "cache_write_ttls": [],
       "match": "exact",
       "match_prefixes": [
         "gemini-3.5-flash-00"
       ],
       "model": "gemini-3.5-flash",
+      "pricing_context": null,
       "provider_name": "google",
       "schedules": [
         {
@@ -520,9 +543,11 @@
     },
     {
       "aliases": [],
+      "cache_write_ttls": [],
       "match": "exact",
       "match_prefixes": [],
       "model": "gpt-5.6-luna",
+      "pricing_context": null,
       "provider_name": "openai",
       "schedules": [
         {
@@ -562,9 +587,11 @@
       "aliases": [
         "gpt-5.6"
       ],
+      "cache_write_ttls": [],
       "match": "exact",
       "match_prefixes": [],
       "model": "gpt-5.6-sol",
+      "pricing_context": null,
       "provider_name": "openai",
       "schedules": [
         {
@@ -602,9 +629,11 @@
     },
     {
       "aliases": [],
+      "cache_write_ttls": [],
       "match": "exact",
       "match_prefixes": [],
       "model": "gpt-5.6-terra",
+      "pricing_context": null,
       "provider_name": "openai",
       "schedules": [
         {
@@ -642,12 +671,14 @@
     },
     {
       "aliases": [],
+      "cache_write_ttls": [],
       "match": "exact",
       "match_prefixes": [
         "claude-fable-5-20",
         "claude-fable-5@20"
       ],
       "model": "claude-fable-5",
+      "pricing_context": null,
       "provider_name": "vertex",
       "schedules": [
         {
@@ -677,12 +708,14 @@
     },
     {
       "aliases": [],
+      "cache_write_ttls": [],
       "match": "exact",
       "match_prefixes": [
         "claude-opus-4-8-20",
         "claude-opus-4-8@20"
       ],
       "model": "claude-opus-4-8",
+      "pricing_context": null,
       "provider_name": "vertex",
       "schedules": [
         {
@@ -712,12 +745,14 @@
     },
     {
       "aliases": [],
+      "cache_write_ttls": [],
       "match": "exact",
       "match_prefixes": [
         "claude-sonnet-4-6-20",
         "claude-sonnet-4-6@20"
       ],
       "model": "claude-sonnet-4-6",
+      "pricing_context": null,
       "provider_name": "vertex",
       "schedules": [
         {
@@ -747,12 +782,14 @@
     },
     {
       "aliases": [],
+      "cache_write_ttls": [],
       "match": "exact",
       "match_prefixes": [
         "claude-sonnet-5-20",
         "claude-sonnet-5@20"
       ],
       "model": "claude-sonnet-5",
+      "pricing_context": null,
       "provider_name": "vertex",
       "schedules": [
         {
@@ -813,5 +850,6 @@
         }
       ]
     }
-  ]
+  ],
+  "resource_mappings": []
 }

@@ -1,6 +1,6 @@
 {
-  "catalog_version": "2026-07-16",
-  "generated_at": "2026-07-16",
+  "catalog_version": "2026-07-22",
+  "generated_at": "2026-07-22",
   "models": [
     {
       "aliases": [],
@@ -351,9 +351,9 @@
       "model": "gemini-3.1-pro-preview",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-06-21",
+        "as_of": "2026-07-22",
         "source": "official",
-        "url": "https://ai.google.dev/gemini-api/docs/pricing"
+        "url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.1-pro-preview"
       },
       "provider_name": "google",
       "reasoning": true,
