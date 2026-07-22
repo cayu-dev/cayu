@@ -2141,6 +2141,7 @@ class SQLiteSessionStore(SessionStore):
             checkpoint_transform=checkpoint_transform,
             operation_idempotency_key=None,
             operation_transform=None,
+            operation_commit_guard=None,
             events=events,
             expected_statuses=expected_statuses,
             expected_run_epoch=expected_run_epoch,
@@ -2186,6 +2187,34 @@ class SQLiteSessionStore(SessionStore):
                 "idempotency_key",
             ),
             operation_transform=operation_transform,
+            operation_commit_guard=None,
+            events=events,
+            expected_statuses=expected_statuses,
+            expected_run_epoch=expected_run_epoch,
+            expected_transcript_cursor=expected_transcript_cursor,
+        )
+
+    async def publish_session_operation_guarded(
+        self,
+        session_id: str,
+        *,
+        idempotency_key: str,
+        operation_transform: SessionOperationTransform,
+        commit_guard: Callable[[], None],
+        events: list[Event],
+        expected_statuses: set[SessionStatus] | None = None,
+        expected_run_epoch: int | None = None,
+        expected_transcript_cursor: int | None = None,
+    ) -> Session:
+        return await self._publish_checkpoint_and_events(
+            session_id,
+            checkpoint_transform=None,
+            operation_idempotency_key=require_clean_nonblank(
+                idempotency_key,
+                "idempotency_key",
+            ),
+            operation_transform=operation_transform,
+            operation_commit_guard=commit_guard,
             events=events,
             expected_statuses=expected_statuses,
             expected_run_epoch=expected_run_epoch,
@@ -2199,6 +2228,7 @@ class SQLiteSessionStore(SessionStore):
         checkpoint_transform: CheckpointTransform | None,
         operation_idempotency_key: str | None,
         operation_transform: SessionOperationTransform | None,
+        operation_commit_guard: Callable[[], None] | None,
         events: list[Event],
         expected_statuses: set[SessionStatus] | None,
         expected_run_epoch: int | None,
@@ -2360,6 +2390,8 @@ class SQLiteSessionStore(SessionStore):
                         session_id,
                         [event.id for event in copied_events],
                     )
+                if operation_commit_guard is not None:
+                    operation_commit_guard()
                 connection.commit()
             except sqlite3.IntegrityError as exc:
                 connection.rollback()

@@ -2359,6 +2359,24 @@ class SessionStore(ABC):
     ) -> Session:
         """Atomically publish a checkpoint, events, and terminal operation records."""
 
+    async def publish_session_operation_guarded(
+        self,
+        session_id: str,
+        *,
+        idempotency_key: str,
+        operation_transform: SessionOperationTransform,
+        commit_guard: Callable[[], None],
+        events: list[Event],
+        expected_statuses: set[SessionStatus] | None = None,
+        expected_run_epoch: int | None = None,
+        expected_transcript_cursor: int | None = None,
+    ) -> Session:
+        """Publish with a guard evaluated at the backend's commit boundary."""
+
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement atomic guarded operation publication."
+        )
+
     @abstractmethod
     async def load_events(self, session_id: str) -> list[Event]:
         """Load all events for a session."""
@@ -3840,6 +3858,52 @@ class InMemorySessionStore(SessionStore):
         expected_run_epoch: int | None = None,
         expected_transcript_cursor: int | None = None,
     ) -> Session:
+        return await self._publish_session_operation(
+            session_id,
+            idempotency_key=idempotency_key,
+            operation_transform=operation_transform,
+            commit_guard=None,
+            events=events,
+            expected_statuses=expected_statuses,
+            expected_run_epoch=expected_run_epoch,
+            expected_transcript_cursor=expected_transcript_cursor,
+        )
+
+    async def publish_session_operation_guarded(
+        self,
+        session_id: str,
+        *,
+        idempotency_key: str,
+        operation_transform: SessionOperationTransform,
+        commit_guard: Callable[[], None],
+        events: list[Event],
+        expected_statuses: set[SessionStatus] | None = None,
+        expected_run_epoch: int | None = None,
+        expected_transcript_cursor: int | None = None,
+    ) -> Session:
+        return await self._publish_session_operation(
+            session_id,
+            idempotency_key=idempotency_key,
+            operation_transform=operation_transform,
+            commit_guard=commit_guard,
+            events=events,
+            expected_statuses=expected_statuses,
+            expected_run_epoch=expected_run_epoch,
+            expected_transcript_cursor=expected_transcript_cursor,
+        )
+
+    async def _publish_session_operation(
+        self,
+        session_id: str,
+        *,
+        idempotency_key: str,
+        operation_transform: SessionOperationTransform,
+        commit_guard: Callable[[], None] | None,
+        events: list[Event],
+        expected_statuses: set[SessionStatus] | None,
+        expected_run_epoch: int | None,
+        expected_transcript_cursor: int | None,
+    ) -> Session:
         session_id, copied_events = _copy_session_event_batch(session_id, events)
         idempotency_key = require_clean_nonblank(idempotency_key, "idempotency_key")
         if operation_transform is None:
@@ -3892,6 +3956,8 @@ class InMemorySessionStore(SessionStore):
                 publication.operation_records,
                 "operation_records",
             )
+            if commit_guard is not None:
+                commit_guard()
             updated = self._append_events_unlocked(session, copied_events)
             self._store_checkpoint_unlocked(session_id, copied_checkpoint)
             operation_records = self._session_operation_records.setdefault(session_id, {})

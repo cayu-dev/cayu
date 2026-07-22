@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 
+import cayu.runtime._model_step_executor as model_step_executor_module
+import cayu.runtime.app as runtime_app_module
 from cayu import SQLiteSessionStore
 from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.core.billing import BillingIdentity
@@ -28,6 +31,7 @@ from cayu.runtime import (
     SessionIdentity,
     SessionMessageDeliveryMode,
     SessionMessageQueueStatus,
+    SessionOperationPublication,
     SessionOrder,
     SessionQuery,
     SessionQueuedMessagesPending,
@@ -85,6 +89,18 @@ async def _close_store(store: SessionStore) -> None:
         await close()
 
 
+def _summary_with_existing(request: CompactionRequest, summary: str) -> str:
+    if request.existing_summary is None:
+        return summary
+    return f"{request.existing_summary}|{summary}"
+
+
+def _represented_existing_summary_sha256(request: CompactionRequest) -> str | None:
+    if request.existing_summary is None:
+        return None
+    return hashlib.sha256(request.existing_summary.encode("utf-8")).hexdigest()
+
+
 class _ConformanceCompactor(ContextCompactor):
     def __init__(self) -> None:
         self.calls = 0
@@ -95,7 +111,11 @@ class _ConformanceCompactor(ContextCompactor):
         if self.fail_next:
             self.fail_next = False
             raise RuntimeError("conformance compactor failed")
-        return CompactionResult(summary=f"summary-{self.calls}")
+        return CompactionResult(
+            summary=_summary_with_existing(request, f"summary-{self.calls}"),
+            covered_message_count=len(request.messages),
+            represented_existing_summary_sha256=(_represented_existing_summary_sha256(request)),
+        )
 
 
 class _ConformanceOverlappingCompactor(ContextCompactor):
@@ -110,7 +130,9 @@ class _ConformanceOverlappingCompactor(ContextCompactor):
         self.started[call].set()
         await self.release[call].wait()
         return CompactionResult(
-            summary=f"summary from attempt {call + 1}",
+            summary=_summary_with_existing(request, f"summary from attempt {call + 1}"),
+            covered_message_count=len(request.messages),
+            represented_existing_summary_sha256=(_represented_existing_summary_sha256(request)),
             model_completed_payloads=[
                 {
                     "provider_name": "overlap-compactor",
@@ -118,6 +140,60 @@ class _ConformanceOverlappingCompactor(ContextCompactor):
                     "usage": {"input_tokens": call + 1, "output_tokens": 1},
                 }
             ],
+        )
+
+
+class _ConformanceBlockingCompactor(ContextCompactor):
+    def __init__(self) -> None:
+        self.calls = 0
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def compact(self, request: CompactionRequest) -> CompactionResult:
+        self.calls += 1
+        self.started.set()
+        await self.release.wait()
+        return CompactionResult(
+            summary=_summary_with_existing(request, "heartbeat conformance summary"),
+            covered_message_count=len(request.messages),
+            represented_existing_summary_sha256=(_represented_existing_summary_sha256(request)),
+        )
+
+
+class _ConformancePartialCompactor(ContextCompactor):
+    async def compact(self, request: CompactionRequest) -> CompactionResult:
+        return CompactionResult(
+            summary=_summary_with_existing(request, "partial coverage"),
+            covered_message_count=min(1, len(request.messages)),
+            represented_existing_summary_sha256=(_represented_existing_summary_sha256(request)),
+        )
+
+
+class _ConformancePartialCancellationCompactor(ContextCompactor):
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    async def compact(self, request: CompactionRequest) -> CompactionResult:
+        self.started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+class _ConformancePartialOverlapCompactor(ContextCompactor):
+    def __init__(self) -> None:
+        self.started = [asyncio.Event(), asyncio.Event()]
+        self.release = [asyncio.Event(), asyncio.Event()]
+        self.calls = 0
+
+    async def compact(self, request: CompactionRequest) -> CompactionResult:
+        call = self.calls
+        self.calls += 1
+        self.started[call].set()
+        await self.release[call].wait()
+        return CompactionResult(
+            summary=_summary_with_existing(request, f"partial-{call}"),
+            covered_message_count=1,
+            represented_existing_summary_sha256=(_represented_existing_summary_sha256(request)),
         )
 
 
@@ -266,6 +342,72 @@ def test_session_store_conformance_preserves_only_safe_bedrock_aggregate_evidenc
     asyncio.run(run())
 
 
+def test_session_store_conformance_context_usage_pages_past_compaction(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = f"context-usage-pagination-{session_store_case[0]}"
+        try:
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "hello")],
+                ),
+                identity=_identity(),
+            )
+            await store.append_events(
+                session_id,
+                [
+                    Event(
+                        type=EventType.MODEL_COMPLETED,
+                        session_id=session_id,
+                        payload={
+                            "model": "fake-model",
+                            "transcript_cursor": 2,
+                            "usage": {
+                                "input_tokens": 8,
+                                "output_tokens": 2,
+                                "total_tokens": 10,
+                            },
+                        },
+                    ),
+                    *[
+                        Event(
+                            type=EventType.MODEL_COMPLETED,
+                            session_id=session_id,
+                            payload={
+                                "purpose": "context_compaction",
+                                "model": "summary-model",
+                                "usage": {
+                                    "input_tokens": index,
+                                    "output_tokens": 1,
+                                    "total_tokens": index + 1,
+                                },
+                            },
+                        )
+                        for index in range(1, 102)
+                    ],
+                ],
+            )
+
+            usage = await model_step_executor_module._context_usage_state_for_session(
+                session_store=store,
+                session_id=session_id,
+            )
+
+            assert usage.last_input_tokens == 8
+            assert usage.last_output_tokens == 2
+            assert usage.last_total_tokens == 10
+            assert usage.last_transcript_cursor == 2
+            assert usage.last_model == "fake-model"
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
 def test_session_store_conformance_explicit_compaction_operation(session_store_case) -> None:
     async def run() -> None:
         store = await _open_store(session_store_case)
@@ -372,6 +514,222 @@ def test_session_store_conformance_explicit_compaction_operation(session_store_c
             checkpoint = await store.load_checkpoint(created.id)
             assert checkpoint is not None
             assert "session_operations" not in checkpoint
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_partial_compaction_cursor_survives_reopen(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                context_policy=CheckpointCompactionContextPolicy(
+                    compactor=_ConformancePartialCompactor(), max_user_turns=1
+                ),
+            )
+            created = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_partial_coverage_conformance",
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            transcript = [
+                Message.text("user", "old"),
+                Message.text("assistant", "old answer"),
+                Message.text("user", "current"),
+            ]
+            await store.append_transcript_messages(created.id, transcript)
+            completed = await store.update_status(created.id, SessionStatus.COMPLETED)
+            request = CompactSessionRequest(
+                session_id=created.id,
+                idempotency_key="partial-coverage-1",
+                expected_run_epoch=completed.run_epoch,
+                expected_transcript_cursor=len(transcript),
+            )
+            events = [event async for event in app.compact_session(request)]
+            checkpoint = await store.load_checkpoint(created.id)
+            assert checkpoint is not None
+            assert checkpoint["context_compaction"]["compacted_transcript_cursor"] == 1
+            assert await store.load_transcript(created.id) == transcript
+            reopened = await _reopen_store(session_store_case, store)
+            store = reopened
+            assert (await store.load_checkpoint(created.id))["context_compaction"][
+                "compacted_transcript_cursor"
+            ] == 1
+            assert any(event.type == EventType.SESSION_CHECKPOINTED for event in events)
+
+            replay_app = CayuApp(session_store=store, enable_logging=False)
+            replay_app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                context_policy=CheckpointCompactionContextPolicy(
+                    compactor=_ConformancePartialCompactor(), max_user_turns=1
+                ),
+            )
+            second = request.model_copy(update={"idempotency_key": "partial-coverage-2"})
+            second_events = [event async for event in replay_app.compact_session(second)]
+            second_checkpoint = await store.load_checkpoint(created.id)
+            assert second_checkpoint is not None
+            assert second_checkpoint["context_compaction"]["compacted_transcript_cursor"] == 2
+            assert await store.load_transcript(created.id) == transcript
+            assert any(event.type == EventType.SESSION_CHECKPOINTED for event in second_events)
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_cancelled_partial_compaction_publishes_no_cursor(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            compactor = _ConformancePartialCancellationCompactor()
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                context_policy=CheckpointCompactionContextPolicy(
+                    compactor=compactor,
+                    max_user_turns=1,
+                ),
+            )
+            created = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_partial_cancel_conformance",
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            transcript = [
+                Message.text("user", "old"),
+                Message.text("assistant", "old answer"),
+                Message.text("user", "current"),
+            ]
+            await store.append_transcript_messages(created.id, transcript)
+            completed = await store.update_status(created.id, SessionStatus.COMPLETED)
+            request = CompactSessionRequest(
+                session_id=created.id,
+                idempotency_key="partial-cancel",
+                expected_run_epoch=completed.run_epoch,
+                expected_transcript_cursor=len(transcript),
+            )
+
+            async def collect() -> list[Event]:
+                return [event async for event in app.compact_session(request)]
+
+            task = asyncio.create_task(collect())
+            await compactor.started.wait()
+            task.cancel("cancel partial publication")
+            with pytest.raises(asyncio.CancelledError, match="cancel partial publication"):
+                await task
+
+            checkpoint = await store.load_checkpoint(created.id)
+            assert checkpoint is None or "context_compaction" not in checkpoint
+            assert await store.load_transcript(created.id) == transcript
+            durable_events = [
+                record.event
+                for record in await store.query_events(EventQuery(session_id=created.id, limit=100))
+            ]
+            assert EventType.CONTEXT_COMPACTION_COMPLETED not in {
+                event.type for event in durable_events
+            }
+            assert EventType.SESSION_CHECKPOINTED not in {event.type for event in durable_events}
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_reclaimed_partial_publication_has_one_prefix(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        accepted_at = datetime(2026, 7, 20, 12, 0, tzinfo=UTC)
+        store = await _open_store(session_store_case)
+        try:
+            compactor = _ConformancePartialOverlapCompactor()
+
+            def configured_app(now: datetime) -> CayuApp:
+                app = CayuApp(session_store=store, enable_logging=False, clock=lambda: now)
+                app.register_agent(
+                    AgentSpec(name="assistant", model="fake-model"),
+                    context_policy=CheckpointCompactionContextPolicy(
+                        compactor=compactor,
+                        max_user_turns=1,
+                    ),
+                )
+                return app
+
+            first_app = configured_app(accepted_at)
+            reclaimed_app = configured_app(accepted_at + timedelta(minutes=6))
+            created = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_partial_reclaim_conformance",
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            transcript = [
+                Message.text("user", "old"),
+                Message.text("assistant", "old answer"),
+                Message.text("user", "current"),
+            ]
+            await store.append_transcript_messages(created.id, transcript)
+            completed = await store.update_status(created.id, SessionStatus.COMPLETED)
+            request = CompactSessionRequest(
+                session_id=created.id,
+                idempotency_key="partial-reclaim",
+                expected_run_epoch=completed.run_epoch,
+                expected_transcript_cursor=len(transcript),
+                requested_by=ResolutionActor(subject="operator-a"),
+            )
+
+            async def collect(app: CayuApp, requested_by: str) -> list[Event]:
+                attempted = request.model_copy(
+                    update={"requested_by": ResolutionActor(subject=requested_by)}
+                )
+                return [event async for event in app.compact_session(attempted)]
+
+            first = asyncio.create_task(collect(first_app, "operator-a"))
+            await compactor.started[0].wait()
+            reclaimed = asyncio.create_task(collect(reclaimed_app, "operator-b"))
+            await compactor.started[1].wait()
+            compactor.release[1].set()
+            reclaimed_events = await reclaimed
+            compactor.release[0].set()
+            with pytest.raises(RuntimeError, match="superseded"):
+                await first
+
+            store = await _reopen_store(session_store_case, store)
+            checkpoint = await store.load_checkpoint(created.id)
+            assert checkpoint is not None
+            assert checkpoint["context_compaction"]["compacted_transcript_cursor"] == 1
+            assert checkpoint["context_compaction"]["summary"] == "partial-1"
+            assert await store.load_transcript(created.id) == transcript
+            assert (
+                sum(
+                    event.type == EventType.CONTEXT_COMPACTION_COMPLETED
+                    for event in reclaimed_events
+                )
+                == 1
+            )
+            durable_events = [
+                record.event
+                for record in await store.query_events(EventQuery(session_id=created.id, limit=100))
+            ]
+            assert (
+                sum(event.type == EventType.SESSION_CHECKPOINTED for event in durable_events) == 1
+            )
         finally:
             await _close_store(store)
 
@@ -695,6 +1053,135 @@ def test_session_store_conformance_fences_reclaimed_compaction_attempts(
             assert checkpoint["context_compaction"]["summary"] == "summary from attempt 2"
         finally:
             await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_operation_commit_guard_is_atomic(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            created = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_operation_commit_guard_conformance",
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            event = Event(
+                type=EventType.CONTEXT_COMPACTION_STARTED,
+                session_id=created.id,
+                agent_name="assistant",
+                payload={"operation_id": "guarded-operation"},
+            )
+
+            def transform(_session, checkpoint, _persisted_record):
+                updated = {} if checkpoint is None else dict(checkpoint)
+                updated["guarded_operation"] = True
+                return SessionOperationPublication(
+                    checkpoint=updated,
+                    operation_records={
+                        "guarded-request": {
+                            "operation_id": "guarded-operation",
+                            "status": "completed",
+                        }
+                    },
+                )
+
+            def reject_commit() -> None:
+                raise RuntimeError("operation commit guard rejected publication")
+
+            with pytest.raises(RuntimeError, match="commit guard rejected"):
+                await store.publish_session_operation_guarded(
+                    created.id,
+                    idempotency_key="guarded-request",
+                    operation_transform=transform,
+                    commit_guard=reject_commit,
+                    events=[event],
+                )
+
+            assert await store.load_checkpoint(created.id) is None
+            assert await store.load_session_operation(created.id, "guarded-request") is None
+            assert await store.load_events(created.id) == []
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_guarded_operation_publication_requires_native_commit_boundary() -> None:
+    class LegacyOverrideStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.publication_calls = 0
+
+        async def publish_session_operation(
+            self,
+            session_id: str,
+            *,
+            idempotency_key: str,
+            operation_transform,
+            events: list[Event],
+            expected_statuses: set[SessionStatus] | None = None,
+            expected_run_epoch: int | None = None,
+            expected_transcript_cursor: int | None = None,
+        ) -> Session:
+            self.publication_calls += 1
+            return await super().publish_session_operation(
+                session_id,
+                idempotency_key=idempotency_key,
+                operation_transform=operation_transform,
+                events=events,
+                expected_statuses=expected_statuses,
+                expected_run_epoch=expected_run_epoch,
+                expected_transcript_cursor=expected_transcript_cursor,
+            )
+
+    async def run() -> None:
+        store = LegacyOverrideStore()
+        created = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_guarded_legacy_override",
+                messages=[],
+            ),
+            identity=_identity(),
+        )
+        guard_calls = 0
+
+        def transform(_session, checkpoint, _persisted_record):
+            updated = {} if checkpoint is None else dict(checkpoint)
+            updated["legacy_guarded_operation"] = True
+            return SessionOperationPublication(checkpoint=updated)
+
+        def commit_guard() -> None:
+            nonlocal guard_calls
+            guard_calls += 1
+
+        await store.publish_session_operation_guarded(
+            created.id,
+            idempotency_key="guarded-request",
+            operation_transform=transform,
+            commit_guard=commit_guard,
+            events=[],
+        )
+
+        assert store.publication_calls == 0
+        assert guard_calls == 1
+        assert await store.load_checkpoint(created.id) == {"legacy_guarded_operation": True}
+
+        with pytest.raises(NotImplementedError, match="atomic guarded operation publication"):
+            await SessionStore.publish_session_operation_guarded(
+                store,
+                created.id,
+                idempotency_key="unsupported-guarded-request",
+                operation_transform=transform,
+                commit_guard=commit_guard,
+                events=[],
+            )
 
     asyncio.run(run())
 
