@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from hashlib import sha256
 from typing import Any, ClassVar, Literal
 from uuid import uuid4
 from weakref import ReferenceType, ref
@@ -35,6 +36,7 @@ from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs 
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     JsonUtf8SizeCounter,
+    canonical_durable_json_bytes,
     compact_json_utf8_size,
     copy_durable_json_object,
     copy_durable_json_value,
@@ -49,8 +51,20 @@ from cayu._validation import (
     require_durable_nonblank as require_nonblank,
 )
 from cayu.core.events import EVENT_ID_MAX_CHARS, Event, EventType, copy_event
-from cayu.core.messages import Message, MessageRole, ThinkingPart, copy_message, detach_message
+from cayu.core.messages import (
+    Message,
+    MessageRole,
+    ThinkingPart,
+    ToolCallPart,
+    ToolResultPart,
+    copy_message,
+    detach_message,
+)
 from cayu.core.thinking import ThinkingConfig
+from cayu.runtime._model_completion_publication import (
+    LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
+    ModelStepPublicationCheckpoint,
+)
 from cayu.runtime.aggregates import (
     EXACT_AGGREGATE,
     AggregateAccuracy,
@@ -70,6 +84,7 @@ from cayu.runtime.aggregates import (
     project_aggregate_usage_inspection_event,
 )
 from cayu.runtime.approvals import (
+    PendingToolCallApproval,
     ResolutionActor,
     copy_resolution_actor,
     resolution_actor_payload,
@@ -87,7 +102,14 @@ from cayu.runtime.budgets import (
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
-from cayu.runtime.structured_output import StructuredOutputSpec, copy_structured_output_spec
+from cayu.runtime.structured_output import (
+    STRUCTURED_OUTPUT_TOOL_NAME,
+    StructuredOutputError,
+    StructuredOutputSpec,
+    StructuredOutputStrategy,
+    copy_structured_output_spec,
+    validate_structured_output_tool_arguments,
+)
 from cayu.runtime.usage import UsageMetrics
 
 
@@ -162,6 +184,18 @@ def portable_persisted_event_side_effect_error(value: object) -> str:
 
 class SessionQueuedMessagesPending(RuntimeError):
     """Terminalization lost a race to durable queued session input."""
+
+
+class SessionRuntimePublicationConflict(ValueError):
+    """A runtime publication identity conflicts with its durable receipt."""
+
+
+class SessionModelCompletionStageConflict(SessionRuntimePublicationConflict):
+    """A logical model-completion stage conflicts with immutable durable evidence."""
+
+
+class SessionModelCompletionStageIncomplete(RuntimeError):
+    """A logical model step was prepared but has no durable terminal completion."""
 
 
 _SESSION_RUN_FENCES: ContextVar[dict[str, int] | None] = ContextVar(
@@ -1035,6 +1069,819 @@ def transform_fork_checkpoint(
         raise
 
 
+RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX = "__cayu_runtime_publication_v1__:"
+RUNTIME_PUBLICATION_RECORD_TYPE = "cayu.runtime-publication"
+RUNTIME_PUBLICATION_SCHEMA_VERSION = 1
+RUNTIME_PUBLICATION_MAX_CHECKPOINT_OPERATIONS = 128
+RUNTIME_PUBLICATION_MAX_TRANSCRIPT_MESSAGES = 512
+RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS = 512
+RUNTIME_PUBLICATION_MAX_TOOL_CALLS = 256
+_PENDING_TOOL_ROUND_CHECKPOINT_KEY = "pending_tool_round"
+_TOOL_ROUND_TERMINAL_EVENT_TYPES = frozenset(
+    {
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.TOOL_CALL_FAILED,
+        EventType.TOOL_CALL_BLOCKED,
+        EventType.TOOL_CALL_APPROVAL_DENIED,
+    }
+)
+_TOOL_ROUND_LIFECYCLE_EVENT_TYPES = frozenset(
+    {EventType.TOOL_CALL_STARTED, *_TOOL_ROUND_TERMINAL_EVENT_TYPES}
+)
+_STRUCTURED_OUTPUT_AUXILIARY_SCHEMA_VERSION = 1
+_STRUCTURED_OUTPUT_AUXILIARY_KIND = "structured-output-validation"
+_STRUCTURED_OUTPUT_AUXILIARY_INTENT_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "step",
+        "attempt",
+        "valid",
+        "retry_scheduled",
+        "event_ids",
+    }
+)
+RuntimePublicationKind = Literal["model-step", "context-compaction", "tool-round"]
+
+
+@dataclass(frozen=True, slots=True)
+class _StructuredOutputToolRoundAuxiliary:
+    step: int
+    attempt: int
+    valid: bool
+    retry_scheduled: bool
+    event_ids: tuple[str, ...]
+    session_id: str
+    output_present: bool
+    output: Any
+    errors: tuple[dict[str, Any], ...]
+
+
+class RuntimePublicationEventReference(BaseModel):
+    """Content-bound reference to one already-durable runtime event."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    event_id: str = Field(max_length=EVENT_ID_MAX_CHARS)
+    event_digest: str
+
+    @field_validator("event_id")
+    @classmethod
+    def validate_event_id(cls, value: str) -> str:
+        return require_clean_nonblank(value, "event_id")
+
+    @field_validator("event_digest")
+    @classmethod
+    def validate_event_digest(cls, value: str) -> str:
+        if (
+            type(value) is not str
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError("event_digest must be a lowercase SHA-256 digest.")
+        return value
+
+
+def _copy_runtime_publication_event_reference(
+    reference: RuntimePublicationEventReference | dict[str, Any],
+) -> RuntimePublicationEventReference:
+    try:
+        if type(reference) is RuntimePublicationEventReference:
+            return RuntimePublicationEventReference(
+                event_id=reference.event_id,
+                event_digest=reference.event_digest,
+            )
+        if type(reference) is dict:
+            return RuntimePublicationEventReference.model_validate(reference)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("Runtime publication event reference is malformed.") from exc
+    raise TypeError(
+        "Runtime publication event references must be "
+        "RuntimePublicationEventReference values or objects."
+    )
+
+
+class RuntimePublicationCheckpointOperation(BaseModel):
+    """One independently fenced top-level checkpoint mutation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    key: str = Field(max_length=256)
+    expected_value_digest: str | None
+    action: Literal["set", "delete"]
+    value: Any = None
+
+    @field_validator("key")
+    @classmethod
+    def validate_key(cls, value: str) -> str:
+        return require_clean_nonblank(value, "checkpoint operation key")
+
+    @field_validator("expected_value_digest")
+    @classmethod
+    def validate_expected_value_digest(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if (
+            type(value) is not str
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError("expected_value_digest must be a lowercase SHA-256 digest.")
+        return value
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def copy_value(cls, value: Any) -> Any:
+        return copy_durable_json_value(value, "checkpoint operation value")
+
+    @model_validator(mode="after")
+    def validate_action(self) -> RuntimePublicationCheckpointOperation:
+        if self.action == "delete":
+            if self.expected_value_digest is None:
+                raise ValueError("A delete checkpoint operation requires a present-value digest.")
+            if self.value is not None:
+                raise ValueError("A delete checkpoint operation cannot carry a value.")
+        return self
+
+
+def _copy_runtime_publication_checkpoint_operation(
+    operation: RuntimePublicationCheckpointOperation | dict[str, Any],
+) -> RuntimePublicationCheckpointOperation:
+    try:
+        if type(operation) is RuntimePublicationCheckpointOperation:
+            return RuntimePublicationCheckpointOperation(
+                key=operation.key,
+                expected_value_digest=operation.expected_value_digest,
+                action=operation.action,
+                value=operation.value,
+            )
+        if type(operation) is dict:
+            return RuntimePublicationCheckpointOperation.model_validate(operation)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("Runtime publication checkpoint operation is malformed.") from exc
+    raise TypeError(
+        "Checkpoint operations must be RuntimePublicationCheckpointOperation values or objects."
+    )
+
+
+class RuntimePublicationMutation(BaseModel):
+    """Deterministic checkpoint patch committed with a publication."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    operations: tuple[RuntimePublicationCheckpointOperation, ...] = Field(default_factory=tuple)
+
+    @field_validator("operations", mode="before")
+    @classmethod
+    def copy_operations(
+        cls,
+        value,
+    ) -> tuple[RuntimePublicationCheckpointOperation, ...]:
+        if type(value) not in (list, tuple):
+            raise TypeError("operations must be a list or tuple of checkpoint operations.")
+        if len(value) > RUNTIME_PUBLICATION_MAX_CHECKPOINT_OPERATIONS:
+            raise ValueError(
+                "operations cannot contain more than "
+                f"{RUNTIME_PUBLICATION_MAX_CHECKPOINT_OPERATIONS} checkpoint mutations."
+            )
+        copied = tuple(
+            sorted(
+                (_copy_runtime_publication_checkpoint_operation(operation) for operation in value),
+                key=lambda operation: operation.key,
+            )
+        )
+        keys = tuple(operation.key for operation in copied)
+        if len(set(keys)) != len(keys):
+            raise ValueError("operations cannot mutate the same checkpoint key more than once.")
+        return copied
+
+
+def _copy_runtime_publication_mutation_value(
+    mutation: RuntimePublicationMutation | dict[str, Any],
+) -> RuntimePublicationMutation:
+    try:
+        if type(mutation) is RuntimePublicationMutation:
+            return RuntimePublicationMutation(
+                operations=mutation.operations,
+            )
+        if type(mutation) is dict:
+            return RuntimePublicationMutation.model_validate(mutation)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("Runtime publication mutation is malformed.") from exc
+    raise TypeError("Runtime publication mutation must be a RuntimePublicationMutation or object.")
+
+
+class RuntimePublicationRequest(BaseModel):
+    """Immutable input bundle for one logical model-step or tool-round publication."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    publication_id: str = Field(max_length=256)
+    kind: RuntimePublicationKind
+    intent: dict[str, Any]
+    mutation: RuntimePublicationMutation
+    transcript_messages: tuple[Message, ...]
+    events: tuple[Event, ...]
+    referenced_events: tuple[RuntimePublicationEventReference, ...] = Field(default_factory=tuple)
+
+    @field_validator("publication_id", "kind")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("intent", mode="before")
+    @classmethod
+    def copy_intent(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return copy_durable_json_object(value, "intent")
+
+    @field_validator("mutation", mode="before")
+    @classmethod
+    def copy_mutation(
+        cls,
+        value: RuntimePublicationMutation | dict[str, Any],
+    ) -> RuntimePublicationMutation:
+        return _copy_runtime_publication_mutation_value(value)
+
+    @field_validator("transcript_messages", mode="before")
+    @classmethod
+    def copy_transcript_messages(cls, value) -> tuple[Message, ...]:
+        if type(value) not in (list, tuple):
+            raise TypeError("transcript_messages must be a list or tuple of Message values.")
+        return tuple(detach_message(message) for message in value)
+
+    @field_validator("events", mode="before")
+    @classmethod
+    def copy_events(cls, value) -> tuple[Event, ...]:
+        if type(value) not in (list, tuple):
+            raise TypeError("events must be a list or tuple of Event values.")
+        copied: list[Event] = []
+        seen: set[str] = set()
+        for event in value:
+            copied_event = copy_event(event)
+            if copied_event.id in seen:
+                raise ValueError(f"Runtime publication event id is duplicated: {copied_event.id}")
+            seen.add(copied_event.id)
+            copied.append(copied_event)
+        return tuple(copied)
+
+    @field_validator("referenced_events", mode="before")
+    @classmethod
+    def copy_referenced_events(
+        cls,
+        value,
+    ) -> tuple[RuntimePublicationEventReference, ...]:
+        if type(value) not in (list, tuple):
+            raise TypeError("referenced_events must be a list or tuple of event references.")
+        copied: list[RuntimePublicationEventReference] = []
+        seen: set[str] = set()
+        for reference in value:
+            try:
+                copied_reference = _copy_runtime_publication_event_reference(reference)
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise ValueError("referenced_events contains a malformed reference.") from exc
+            if copied_reference.event_id in seen:
+                raise ValueError(f"Referenced event id is duplicated: {copied_reference.event_id}")
+            seen.add(copied_reference.event_id)
+            copied.append(copied_reference)
+        return tuple(copied)
+
+    @model_validator(mode="after")
+    def validate_batch_limits(self) -> RuntimePublicationRequest:
+        if len(self.transcript_messages) > RUNTIME_PUBLICATION_MAX_TRANSCRIPT_MESSAGES:
+            raise ValueError(
+                "transcript_messages cannot contain more than "
+                f"{RUNTIME_PUBLICATION_MAX_TRANSCRIPT_MESSAGES} messages."
+            )
+        event_binding_count = len(self.events) + len(self.referenced_events)
+        if event_binding_count > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS:
+            raise ValueError(
+                "events and referenced_events cannot contain more than "
+                f"{RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS} total event bindings."
+            )
+        appended_event_ids = {event.id for event in self.events}
+        referenced_event_ids = {reference.event_id for reference in self.referenced_events}
+        if appended_event_ids & referenced_event_ids:
+            raise ValueError("Appended and referenced runtime publication events cannot overlap.")
+        return self
+
+
+class RuntimePublicationReceipt(BaseModel):
+    """Store-owned, insert-only proof of one atomic runtime publication."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    record_type: Literal["cayu.runtime-publication"] = RUNTIME_PUBLICATION_RECORD_TYPE
+    schema_version: Literal[1] = RUNTIME_PUBLICATION_SCHEMA_VERSION
+    session_id: str
+    publication_id: str = Field(max_length=256)
+    kind: RuntimePublicationKind
+    intent: dict[str, Any]
+    request_digest: str
+    publication_digest: str
+    checkpoint_digest: str
+    transcript_digest: str
+    events_digest: str
+    source_status: SessionStatus
+    source_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    transcript_start_cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    transcript_end_cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    appended_event_ids: tuple[str, ...]
+    referenced_events: tuple[RuntimePublicationEventReference, ...]
+    published_at: datetime
+
+    @field_validator("session_id", "publication_id", "kind")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("intent", mode="before")
+    @classmethod
+    def copy_intent(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return copy_durable_json_object(value, "intent")
+
+    @field_validator(
+        "request_digest",
+        "publication_digest",
+        "checkpoint_digest",
+        "transcript_digest",
+        "events_digest",
+    )
+    @classmethod
+    def validate_digest(cls, value: str, info) -> str:
+        if (
+            type(value) is not str
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError(f"{info.field_name} must be a lowercase SHA-256 digest.")
+        return value
+
+    @field_validator("appended_event_ids", mode="before")
+    @classmethod
+    def copy_event_ids(cls, value, info) -> tuple[str, ...]:
+        if type(value) not in (list, tuple):
+            raise TypeError(f"{info.field_name} must be a list or tuple of event ids.")
+        copied = tuple(
+            require_clean_nonblank(event_id, f"{info.field_name} item") for event_id in value
+        )
+        if len(set(copied)) != len(copied):
+            raise ValueError(f"{info.field_name} must not contain duplicate event ids.")
+        return copied
+
+    @field_validator("referenced_events", mode="before")
+    @classmethod
+    def copy_referenced_events(
+        cls,
+        value,
+    ) -> tuple[RuntimePublicationEventReference, ...]:
+        if type(value) not in (list, tuple):
+            raise TypeError("referenced_events must be a list or tuple of event references.")
+        copied = tuple(_copy_runtime_publication_event_reference(item) for item in value)
+        event_ids = tuple(reference.event_id for reference in copied)
+        if len(set(event_ids)) != len(event_ids):
+            raise ValueError("referenced_events must not contain duplicate event ids.")
+        return copied
+
+    @field_validator("published_at")
+    @classmethod
+    def normalize_published_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("published_at must include a timezone.")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def validate_boundaries(self) -> RuntimePublicationReceipt:
+        if self.transcript_end_cursor < self.transcript_start_cursor:
+            raise ValueError("transcript_end_cursor cannot precede transcript_start_cursor.")
+        if (
+            self.transcript_end_cursor - self.transcript_start_cursor
+            > RUNTIME_PUBLICATION_MAX_TRANSCRIPT_MESSAGES
+        ):
+            raise ValueError("Runtime publication receipt transcript span is too large.")
+        if (
+            len(self.appended_event_ids) + len(self.referenced_events)
+            > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS
+        ):
+            raise ValueError("Runtime publication receipt event binding count is too large.")
+        referenced_event_ids = {reference.event_id for reference in self.referenced_events}
+        if set(self.appended_event_ids) & referenced_event_ids:
+            raise ValueError("Appended and referenced event ids must not overlap.")
+        return self
+
+
+class RuntimePublicationResult(BaseModel):
+    """Result of a new runtime publication or an exact durable replay."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    session: Session
+    receipt: RuntimePublicationReceipt
+    replayed: StrictBool
+
+
+@dataclass(frozen=True)
+class _PreparedRuntimePublication:
+    session_id: str
+    storage_key: str
+    request: RuntimePublicationRequest
+    request_digest: str
+    transcript_payloads: tuple[dict[str, Any], ...]
+    event_payloads: tuple[dict[str, Any], ...]
+    transcript_digest: str
+    events_digest: str
+    expected_statuses: frozenset[SessionStatus] | None
+    expected_run_epoch: int | None
+    expected_transcript_cursor: int | None
+
+
+MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX = "__cayu_model_completion_stage_v1__:"
+MODEL_COMPLETION_STAGE_RECORD_TYPE = "cayu.model-completion-stage"
+MODEL_COMPLETION_STAGE_PREPARATION_RECORD_TYPE = "cayu.model-completion-stage.prepared"
+MODEL_COMPLETION_STAGE_TERMINAL_RECORD_TYPE = "cayu.model-completion-stage.completed"
+MODEL_COMPLETION_ACTIVE_STAGE_RECORD_TYPE = "cayu.model-completion-stage.active"
+MODEL_COMPLETION_WINNER_RECORD_TYPE = "cayu.model-completion-stage.winner"
+MODEL_COMPLETION_STAGE_ABANDONMENT_RECORD_TYPE = "cayu.model-completion-stage.abandoned"
+MODEL_COMPLETION_STAGE_SCHEMA_VERSION = 1
+MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY = MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX + "active"
+_NON_TURN_MODEL_COMPLETION_CLASSIFICATIONS = frozenset({"failed", "filtered", "invalid", "length"})
+ModelCompletionPurpose = Literal["assistant-turn", "context-compaction"]
+
+
+class ModelCompletionStageRequest(BaseModel):
+    """Immutable identity and accounting link prepared before provider dispatch."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    stage_id: str = Field(max_length=256)
+    logical_step_id: str = Field(max_length=256)
+    dispatch_ordinal: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    purpose: ModelCompletionPurpose = "assistant-turn"
+    intent: dict[str, Any]
+    reservation_ids: tuple[str, ...] = Field(default_factory=tuple)
+
+    @field_validator("stage_id", "logical_step_id")
+    @classmethod
+    def validate_stage_id(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("intent", mode="before")
+    @classmethod
+    def copy_intent(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return copy_durable_json_object(value, "intent")
+
+    @field_validator("reservation_ids", mode="before")
+    @classmethod
+    def copy_reservation_ids(cls, value) -> tuple[str, ...]:
+        if type(value) not in (list, tuple):
+            raise TypeError("reservation_ids must be a list or tuple of reservation ids.")
+        copied = tuple(
+            require_clean_nonblank(reservation_id, "reservation_ids item")
+            for reservation_id in value
+        )
+        if len(copied) > 32:
+            raise ValueError("reservation_ids cannot contain more than 32 ids.")
+        if len(set(copied)) != len(copied):
+            raise ValueError("reservation_ids must not contain duplicate ids.")
+        return copied
+
+
+class ModelCompletionStage(BaseModel):
+    """Verified view assembled from append-only preparation and completion records."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    record_type: Literal["cayu.model-completion-stage"] = MODEL_COMPLETION_STAGE_RECORD_TYPE
+    schema_version: Literal[1] = MODEL_COMPLETION_STAGE_SCHEMA_VERSION
+    session_id: str
+    stage_id: str = Field(max_length=256)
+    logical_step_id: str = Field(max_length=256)
+    dispatch_ordinal: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    purpose: ModelCompletionPurpose
+    state: Literal["in_flight", "completed"]
+    intent: dict[str, Any]
+    reservation_ids: tuple[str, ...]
+    preparation_request_digest: str
+    preparation_digest: str
+    source_status: SessionStatus
+    source_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    source_transcript_cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    prepared_at: datetime
+    publication: RuntimePublicationRequest | None = None
+    publication_material_digest: str | None = None
+    completion_digest: str | None = None
+    completed_at: datetime | None = None
+
+    @field_validator("session_id", "stage_id", "logical_step_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("intent", mode="before")
+    @classmethod
+    def copy_intent(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return copy_durable_json_object(value, "intent")
+
+    @field_validator("reservation_ids", mode="before")
+    @classmethod
+    def copy_reservation_ids(cls, value) -> tuple[str, ...]:
+        return ModelCompletionStageRequest.copy_reservation_ids(value)
+
+    @field_validator(
+        "preparation_request_digest",
+        "preparation_digest",
+        "publication_material_digest",
+        "completion_digest",
+    )
+    @classmethod
+    def validate_digest(cls, value: str | None, info) -> str | None:
+        if value is None and info.field_name in {
+            "publication_material_digest",
+            "completion_digest",
+        }:
+            return None
+        if (
+            type(value) is not str
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError(f"{info.field_name} must be a lowercase SHA-256 digest.")
+        return value
+
+    @field_validator("prepared_at", "completed_at")
+    @classmethod
+    def normalize_timestamp(cls, value: datetime | None, info) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(f"{info.field_name} must include a timezone.")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def validate_state(self) -> ModelCompletionStage:
+        terminal_fields = (
+            self.publication,
+            self.publication_material_digest,
+            self.completion_digest,
+            self.completed_at,
+        )
+        if self.state == "in_flight" and any(value is not None for value in terminal_fields):
+            raise ValueError("An in-flight model-completion stage cannot contain terminal data.")
+        if self.state == "completed" and any(value is None for value in terminal_fields):
+            raise ValueError("A completed model-completion stage requires all terminal data.")
+        if self.completed_at is not None and self.completed_at < self.prepared_at:
+            raise ValueError("completed_at cannot precede prepared_at.")
+        return self
+
+
+class ModelCompletionStageResult(BaseModel):
+    """Result of preparing or terminally completing one immutable stage."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    stage: ModelCompletionStage
+    replayed: StrictBool
+    dispatch_authorized: StrictBool
+
+    @model_validator(mode="after")
+    def validate_dispatch_authorization(self) -> ModelCompletionStageResult:
+        expected = self.stage.state == "in_flight" and not self.replayed
+        if self.dispatch_authorized != expected:
+            raise ValueError(
+                "dispatch_authorized must be true exactly for a newly inserted "
+                "in-flight preparation."
+            )
+        return self
+
+
+class ActiveModelCompletionStage(BaseModel):
+    """Verified snapshot of the model dispatch currently eligible to publish."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    stage: ModelCompletionStage
+    activated_at: datetime
+    marker_digest: str
+
+    @field_validator("activated_at")
+    @classmethod
+    def normalize_activated_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("activated_at must include a timezone.")
+        return value.astimezone(UTC)
+
+    @field_validator("marker_digest")
+    @classmethod
+    def validate_marker_digest(cls, value: str) -> str:
+        if (
+            type(value) is not str
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError("marker_digest must be a lowercase SHA-256 digest.")
+        return value
+
+
+class ModelCompletionStageAbandonment(BaseModel):
+    """Durable proof that an exact pre-dispatch preparation was abandoned."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    record_type: Literal["cayu.model-completion-stage.abandoned"] = (
+        MODEL_COMPLETION_STAGE_ABANDONMENT_RECORD_TYPE
+    )
+    schema_version: Literal[1] = MODEL_COMPLETION_STAGE_SCHEMA_VERSION
+    session_id: str
+    stage_id: str = Field(max_length=256)
+    logical_step_id: str = Field(max_length=256)
+    dispatch_ordinal: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    purpose: ModelCompletionPurpose
+    preparation_request_digest: str
+    preparation_digest: str
+    active_marker_digest: str
+    source_status: SessionStatus
+    source_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    source_transcript_cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    abandoned_at: datetime
+    abandonment_digest: str
+
+    @field_validator("session_id", "stage_id", "logical_step_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator(
+        "preparation_request_digest",
+        "preparation_digest",
+        "active_marker_digest",
+        "abandonment_digest",
+    )
+    @classmethod
+    def validate_digest(cls, value: str, info) -> str:
+        if (
+            type(value) is not str
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError(f"{info.field_name} must be a lowercase SHA-256 digest.")
+        return value
+
+    @field_validator("abandoned_at")
+    @classmethod
+    def normalize_abandoned_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("abandoned_at must include a timezone.")
+        return value.astimezone(UTC)
+
+
+class ModelCompletionStageAbandonmentResult(BaseModel):
+    """Result of a new abandonment or an exact durable replay."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    abandonment: ModelCompletionStageAbandonment
+    replayed: StrictBool
+
+
+class _ModelCompletionStagePreparationRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    record_type: Literal["cayu.model-completion-stage.prepared"]
+    schema_version: Literal[1]
+    session_id: str
+    stage_id: str
+    logical_step_id: str
+    dispatch_ordinal: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    purpose: ModelCompletionPurpose
+    intent: dict[str, Any]
+    reservation_ids: tuple[str, ...]
+    request_digest: str
+    source_status: SessionStatus
+    source_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    source_transcript_cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    prepared_at: datetime
+    record_digest: str
+
+
+class _ModelCompletionStageTerminalRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    record_type: Literal["cayu.model-completion-stage.completed"]
+    schema_version: Literal[1]
+    session_id: str
+    stage_id: str
+    logical_step_id: str
+    dispatch_ordinal: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    purpose: ModelCompletionPurpose
+    preparation_digest: str
+    publication: RuntimePublicationRequest
+    publication_material_digest: str
+    completed_at: datetime
+    record_digest: str
+
+
+class _ActiveModelCompletionStageRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    record_type: Literal["cayu.model-completion-stage.active"]
+    schema_version: Literal[1]
+    session_id: str
+    stage_id: str
+    logical_step_id: str
+    dispatch_ordinal: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    purpose: ModelCompletionPurpose
+    preparation_digest: str
+    source_status: SessionStatus
+    source_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    source_transcript_cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    activated_at: datetime
+    record_digest: str
+
+
+class _ModelCompletionStageWinnerRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    record_type: Literal["cayu.model-completion-stage.winner"]
+    schema_version: Literal[1]
+    session_id: str
+    stage_id: str
+    logical_step_id: str
+    dispatch_ordinal: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    purpose: ModelCompletionPurpose
+    preparation_digest: str
+    completion_digest: str
+    publication_material_digest: str
+    receipt_request_digest: str
+    publication_digest: str
+    published_at: datetime
+    record_digest: str
+
+
+class _ModelCompletionStageAbandonmentRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    record_type: Literal["cayu.model-completion-stage.abandoned"]
+    schema_version: Literal[1]
+    session_id: str
+    stage_id: str
+    logical_step_id: str
+    dispatch_ordinal: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    purpose: ModelCompletionPurpose
+    preparation_request_digest: str
+    preparation_digest: str
+    active_marker_digest: str
+    source_status: SessionStatus
+    source_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    source_transcript_cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    abandoned_at: datetime
+    record_digest: str
+
+
+@dataclass(frozen=True)
+class _PreparedModelCompletionStage:
+    session_id: str
+    preparation_storage_key: str
+    terminal_storage_key: str
+    abandonment_storage_key: str
+    winner_storage_key: str
+    publication_storage_key: str
+    request: ModelCompletionStageRequest
+    request_digest: str
+    expected_statuses: frozenset[SessionStatus]
+    expected_run_epoch: int
+    expected_transcript_cursor: int
+
+
+@dataclass(frozen=True)
+class _PreparedModelCompletionStageTerminal:
+    session_id: str
+    stage_id: str
+    preparation_storage_key: str
+    terminal_storage_key: str
+    publication: RuntimePublicationRequest
+    publication_material_digest: str
+
+
+@dataclass(frozen=True)
+class _PreparedModelCompletionStageAbandonment:
+    session_id: str
+    stage_id: str
+    preparation_storage_key: str
+    terminal_storage_key: str
+    abandonment_storage_key: str
+    preparation_digest: str
+    expected_run_epoch: int
+
+
+@dataclass(frozen=True)
+class _ModelCompletionStagePromotionContext:
+    stage_id: str
+    preparation_storage_key: str
+    terminal_storage_key: str
+    active_storage_key: str
+    winner_storage_key: str
+    completion_digest: str
+
+
 class SessionOperationPublication(BaseModel):
     """One atomic checkpoint/event publication plus terminal operation records."""
 
@@ -1057,6 +1904,16 @@ class SessionOperationPublication(BaseModel):
         copied = copy_durable_json_object(value, "operation_records")
         for key, record in copied.items():
             require_clean_nonblank(key, "operation_records key")
+            if key.startswith(RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX):
+                raise ValueError(
+                    "Session operation record keys cannot use the reserved runtime "
+                    "publication namespace."
+                )
+            if key.startswith(MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX):
+                raise ValueError(
+                    "Session operation record keys cannot use the reserved model-completion "
+                    "stage namespace."
+                )
             if type(record) is not dict:
                 raise ValueError("Session operation records must be objects.")
         return copied
@@ -2856,9 +3713,370 @@ class SessionStore(ABC):
             f"{type(self).__name__} must implement atomic guarded operation publication."
         )
 
+    async def load_runtime_publication_receipt(
+        self,
+        session_id: str,
+        publication_id: str,
+    ) -> RuntimePublicationReceipt | None:
+        """Load and verify one store-owned runtime publication receipt."""
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        publication_id = require_clean_nonblank(publication_id, "publication_id")
+        storage_key = _runtime_publication_storage_key(publication_id)
+        record = await self._load_runtime_publication_receipt_record(
+            session_id,
+            storage_key,
+            publication_id,
+        )
+        if record is None:
+            return None
+        return _reconstruct_runtime_publication_receipt(
+            record,
+            storage_key=storage_key,
+            session_id=session_id,
+            publication_id=publication_id,
+        )
+
+    async def publish_runtime_publication(
+        self,
+        session_id: str,
+        *,
+        request: RuntimePublicationRequest,
+        expected_statuses: set[SessionStatus] | None = None,
+        expected_run_epoch: int | None = None,
+        expected_transcript_cursor: int | None = None,
+    ) -> RuntimePublicationResult:
+        """Atomically publish or exactly replay one logical runtime boundary."""
+
+        prepared = _prepare_runtime_publication(
+            session_id,
+            request,
+            expected_statuses=expected_statuses,
+            expected_run_epoch=expected_run_epoch,
+            expected_transcript_cursor=expected_transcript_cursor,
+        )
+        return await self._publish_runtime_publication_atomic(prepared)
+
+    async def _load_runtime_publication_receipt_record(
+        self,
+        session_id: str,
+        storage_key: str,
+        publication_id: str,
+    ) -> dict[str, Any] | None:
+        """Backend receipt/material lookup hook; fail closed for custom stores.
+
+        Implementations must verify the committed transcript slice, appended
+        event batch, and exact content of every referenced event in the same
+        locked or transactional snapshot used to load the receipt.
+        """
+
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support durable runtime publications."
+        )
+
+    async def _publish_runtime_publication_atomic(
+        self,
+        prepared: _PreparedRuntimePublication,
+    ) -> RuntimePublicationResult:
+        """Backend atomic publication hook; intentionally non-abstract for compatibility."""
+
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support durable runtime publications."
+        )
+
+    async def load_model_completion_stage(
+        self,
+        session_id: str,
+        stage_id: str,
+    ) -> ModelCompletionStage | None:
+        """Load and verify append-only pre-dispatch and terminal completion evidence."""
+
+        session_id, stage_id, preparation_key, terminal_key = (
+            _model_completion_stage_storage_identity(session_id, stage_id)
+        )
+        preparation_record, terminal_record = await self._load_model_completion_stage_records(
+            session_id,
+            preparation_key,
+            terminal_key,
+        )
+        return _reconstruct_model_completion_stage(
+            preparation_record,
+            terminal_record,
+            session_id=session_id,
+            stage_id=stage_id,
+            preparation_storage_key=preparation_key,
+            terminal_storage_key=terminal_key,
+        )
+
+    async def load_active_model_completion_stage(
+        self,
+        session_id: str,
+    ) -> ActiveModelCompletionStage | None:
+        """Load a verified snapshot of the dispatch currently eligible to publish."""
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        (
+            active_record,
+            preparation_record,
+            terminal_record,
+        ) = await self._load_active_model_completion_stage_records(session_id)
+        return _reconstruct_active_model_completion_stage(
+            active_record,
+            preparation_record,
+            terminal_record,
+            session_id=session_id,
+        )
+
+    async def prepare_model_completion_stage(
+        self,
+        session_id: str,
+        *,
+        request: ModelCompletionStageRequest,
+        expected_statuses: set[SessionStatus],
+        expected_run_epoch: int,
+        expected_transcript_cursor: int,
+    ) -> ModelCompletionStageResult:
+        """Insert or replay a stage; dispatch only when the result explicitly authorizes it."""
+
+        prepared = _prepare_model_completion_stage(
+            session_id,
+            request,
+            expected_statuses=expected_statuses,
+            expected_run_epoch=expected_run_epoch,
+            expected_transcript_cursor=expected_transcript_cursor,
+        )
+        return await self._prepare_model_completion_stage_atomic(prepared)
+
+    async def complete_model_completion_stage(
+        self,
+        session_id: str,
+        *,
+        stage_id: str,
+        publication: RuntimePublicationRequest,
+    ) -> ModelCompletionStageResult:
+        """Append or exactly replay immutable terminal provider-response material."""
+
+        prepared = _prepare_model_completion_stage_terminal(
+            session_id,
+            stage_id=stage_id,
+            publication=publication,
+        )
+        return await self._complete_model_completion_stage_atomic(prepared)
+
+    async def abandon_model_completion_stage(
+        self,
+        session_id: str,
+        *,
+        stage_id: str,
+        preparation_digest: str,
+        expected_run_epoch: int,
+    ) -> ModelCompletionStageAbandonmentResult:
+        """Atomically abandon one exact active stage before provider dispatch.
+
+        An exact replay reconstructs the durable abandonment tombstone. A later
+        preparation of the same request receives a new preparation digest, so a
+        delayed retry of an older abandonment can never clear it.
+        """
+
+        prepared = _prepare_model_completion_stage_abandonment(
+            session_id,
+            stage_id=stage_id,
+            preparation_digest=preparation_digest,
+            expected_run_epoch=expected_run_epoch,
+        )
+        return await self._abandon_model_completion_stage_atomic(prepared)
+
+    async def promote_model_completion_stage(
+        self,
+        session_id: str,
+        *,
+        stage_id: str,
+        expected_run_epoch: int,
+    ) -> RuntimePublicationResult:
+        """Atomically verify and publish a terminal stage without a load/publish race."""
+
+        expected_run_epoch = _validate_required_runtime_fence(
+            expected_run_epoch,
+            "expected_run_epoch",
+        )
+        session_id, stage_id, preparation_key, terminal_key = (
+            _model_completion_stage_storage_identity(session_id, stage_id)
+        )
+        return await self._promote_model_completion_stage_atomic(
+            session_id=session_id,
+            stage_id=stage_id,
+            preparation_storage_key=preparation_key,
+            terminal_storage_key=terminal_key,
+            expected_run_epoch=expected_run_epoch,
+        )
+
+    async def _load_model_completion_stage_records(
+        self,
+        session_id: str,
+        preparation_storage_key: str,
+        terminal_storage_key: str,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Backend stage lookup hook; intentionally fail closed for custom stores."""
+
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support durable model-completion stages."
+        )
+
+    async def _load_active_model_completion_stage_records(
+        self,
+        session_id: str,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
+        """Backend snapshot hook for the active marker and its immutable stage."""
+
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support durable model-completion stages."
+        )
+
+    async def _prepare_model_completion_stage_atomic(
+        self,
+        prepared: _PreparedModelCompletionStage,
+    ) -> ModelCompletionStageResult:
+        """Backend hook for an insert-only, fenced preparation record."""
+
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support durable model-completion stages."
+        )
+
+    async def _complete_model_completion_stage_atomic(
+        self,
+        prepared: _PreparedModelCompletionStageTerminal,
+    ) -> ModelCompletionStageResult:
+        """Backend hook for an insert-only terminal completion record."""
+
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support durable model-completion stages."
+        )
+
+    async def _abandon_model_completion_stage_atomic(
+        self,
+        prepared: _PreparedModelCompletionStageAbandonment,
+    ) -> ModelCompletionStageAbandonmentResult:
+        """Backend hook for an exact, fenced pre-dispatch abandonment."""
+
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support durable model-completion stages."
+        )
+
+    async def _promote_model_completion_stage_atomic(
+        self,
+        *,
+        session_id: str,
+        stage_id: str,
+        preparation_storage_key: str,
+        terminal_storage_key: str,
+        expected_run_epoch: int,
+    ) -> RuntimePublicationResult:
+        """Backend hook that verifies the stage and publishes under one store lock."""
+
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support durable model-completion stages."
+        )
+
     @abstractmethod
     async def load_events(self, session_id: str) -> list[Event]:
         """Load all events for a session."""
+
+    async def load_tool_round_lifecycle_events(
+        self,
+        session_id: str,
+        tool_call_ids: list[str] | tuple[str, ...],
+    ) -> list[Event]:
+        """Load exact started/terminal candidates for bounded tool-call identities.
+
+        Built-in stores override this with their fixed-size pending-action
+        indexes. The paginated fallback preserves correctness for custom stores
+        without silently truncating lifecycle evidence.
+        """
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        copied_ids = _validate_tool_round_call_ids(
+            tool_call_ids,
+            "tool_call_ids",
+        )
+        selected_ids = set(copied_ids)
+        lifecycle_events: list[Event] = []
+        after_sequence = 0
+        while True:
+            records = await self.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    event_types=tuple(_TOOL_ROUND_LIFECYCLE_EVENT_TYPES),
+                    after_sequence=after_sequence,
+                    limit=5000,
+                    order_by=EventOrder.SEQUENCE_ASC,
+                )
+            )
+            if not records:
+                break
+            for record in records:
+                if record.event.payload.get("tool_call_id") not in selected_ids:
+                    continue
+                lifecycle_events.append(copy_event(record.event))
+                if len(lifecycle_events) > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS:
+                    raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
+            after_sequence = records[-1].sequence
+            if len(records) < 5000:
+                break
+        return lifecycle_events
+
+    async def load_tool_round_lifecycle_events_for_round(
+        self,
+        session_id: str,
+        tool_call_ids: list[str] | tuple[str, ...],
+        *,
+        tool_round_id: str,
+    ) -> list[Event]:
+        """Load bounded lifecycle evidence for one exact logical tool round.
+
+        The separate method preserves compatibility with custom stores that
+        override :meth:`load_tool_round_lifecycle_events` while giving built-in
+        stores an efficient round-scoped query. The fallback pages over durable
+        lifecycle events so reused provider call ids cannot hide current-round
+        evidence behind the publication binding limit.
+        """
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        copied_ids = _validate_tool_round_call_ids(
+            tool_call_ids,
+            "tool_call_ids",
+        )
+        tool_round_id = require_clean_nonblank(tool_round_id, "tool_round_id")
+        selected_ids = set(copied_ids)
+        lifecycle_events: list[Event] = []
+        after_sequence = 0
+        while True:
+            records = await self.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    event_types=tuple(_TOOL_ROUND_LIFECYCLE_EVENT_TYPES),
+                    after_sequence=after_sequence,
+                    limit=5000,
+                    order_by=EventOrder.SEQUENCE_ASC,
+                )
+            )
+            if not records:
+                break
+            for record in records:
+                event = record.event
+                if event.payload.get(
+                    "tool_call_id"
+                ) not in selected_ids or not _tool_round_event_matches_scope_or_is_ambiguous(
+                    event,
+                    tool_round_id,
+                ):
+                    continue
+                lifecycle_events.append(copy_event(event))
+                if len(lifecycle_events) > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS:
+                    raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
+            after_sequence = records[-1].sequence
+            if len(records) < 5000:
+                break
+        return lifecycle_events
 
     @abstractmethod
     async def query_events(self, query: EventQuery | None = None) -> list[EventRecord]:
@@ -5799,6 +7017,2545 @@ def _validate_session_fork_source(
             f"{fork.provider_name} != {source_session.provider_name}"
         )
     return source_session
+
+
+def _reject_reserved_runtime_publication_key(value: str, field_name: str) -> str:
+    value = require_clean_nonblank(value, field_name)
+    if value.startswith(RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX):
+        raise ValueError(f"{field_name} cannot use the reserved runtime publication namespace.")
+    if value.startswith(MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX):
+        raise ValueError(f"{field_name} cannot use the reserved model-completion stage namespace.")
+    return value
+
+
+def _validate_session_operation_record_keys(records: Mapping[str, Any]) -> None:
+    for key in records:
+        _reject_reserved_runtime_publication_key(key, "operation_records key")
+
+
+def _runtime_publication_storage_key(publication_id: str) -> str:
+    publication_id = require_clean_nonblank(publication_id, "publication_id")
+    if len(publication_id) > 256:
+        raise ValueError("publication_id must contain at most 256 characters.")
+    return (
+        RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX
+        + sha256(publication_id.encode("utf-8")).hexdigest()
+    )
+
+
+def _model_completion_stage_storage_identity(
+    session_id: str,
+    stage_id: str,
+) -> tuple[str, str, str, str]:
+    session_id = require_clean_nonblank(session_id, "session_id")
+    stage_id = require_clean_nonblank(stage_id, "stage_id")
+    if len(stage_id) > 256:
+        raise ValueError("stage_id must contain at most 256 characters.")
+    identity_hash = sha256(stage_id.encode("utf-8")).hexdigest()
+    return (
+        session_id,
+        stage_id,
+        MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX + "prepared:" + identity_hash,
+        MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX + "completed:" + identity_hash,
+    )
+
+
+def _model_completion_stage_winner_storage_key(logical_step_id: str) -> str:
+    logical_step_id = require_clean_nonblank(logical_step_id, "logical_step_id")
+    if len(logical_step_id) > 256:
+        raise ValueError("logical_step_id must contain at most 256 characters.")
+    return (
+        MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX
+        + "winner:"
+        + sha256(logical_step_id.encode("utf-8")).hexdigest()
+    )
+
+
+def _model_completion_stage_abandonment_storage_key(stage_id: str) -> str:
+    stage_id = require_clean_nonblank(stage_id, "stage_id")
+    if len(stage_id) > 256:
+        raise ValueError("stage_id must contain at most 256 characters.")
+    return (
+        MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX
+        + "abandoned:"
+        + sha256(stage_id.encode("utf-8")).hexdigest()
+    )
+
+
+def _canonical_runtime_publication_digest(value: Any) -> str:
+    encoded = canonical_durable_json_bytes(value, "runtime_publication")
+    return sha256(encoded).hexdigest()
+
+
+def runtime_publication_checkpoint_value_digest(value: Any) -> str:
+    """Return the canonical digest used to fence one checkpoint value."""
+
+    return _canonical_runtime_publication_digest(value)
+
+
+def runtime_publication_checkpoint_mutation(
+    source_checkpoint: dict[str, Any] | None,
+    checkpoint: dict[str, Any] | None,
+) -> RuntimePublicationMutation:
+    """Build a deterministic top-level CAS patch without fencing unrelated keys."""
+
+    if checkpoint is None:
+        if source_checkpoint is not None:
+            raise ValueError(
+                "Runtime publication checkpoint mutations cannot delete the whole checkpoint."
+            )
+        return RuntimePublicationMutation()
+    source = (
+        {}
+        if source_checkpoint is None
+        else copy_durable_json_object(source_checkpoint, "source_checkpoint")
+    )
+    target = copy_durable_json_object(checkpoint, "checkpoint")
+    operations: list[RuntimePublicationCheckpointOperation] = []
+    for key in sorted(source.keys() | target.keys()):
+        source_present = key in source
+        target_present = key in target
+        if (
+            source_present
+            and target_present
+            and _runtime_publication_json_equal(
+                source[key],
+                target[key],
+            )
+        ):
+            continue
+        expected_value_digest = (
+            runtime_publication_checkpoint_value_digest(source[key]) if source_present else None
+        )
+        if target_present:
+            operations.append(
+                RuntimePublicationCheckpointOperation(
+                    key=key,
+                    expected_value_digest=expected_value_digest,
+                    action="set",
+                    value=target[key],
+                )
+            )
+        else:
+            operations.append(
+                RuntimePublicationCheckpointOperation(
+                    key=key,
+                    expected_value_digest=expected_value_digest,
+                    action="delete",
+                )
+            )
+    return RuntimePublicationMutation(operations=tuple(operations))
+
+
+def _apply_runtime_publication_checkpoint_mutation(
+    mutation: RuntimePublicationMutation,
+    checkpoint: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if checkpoint is None and not mutation.operations:
+        return None
+    updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
+    for operation in mutation.operations:
+        present = operation.key in updated
+        if operation.expected_value_digest is None:
+            matches = not present
+        else:
+            matches = present and (
+                runtime_publication_checkpoint_value_digest(updated[operation.key])
+                == operation.expected_value_digest
+            )
+        if not matches:
+            raise SessionRuntimePublicationConflict(
+                "A runtime publication checkpoint key changed before publication: "
+                f"{operation.key!r}."
+            )
+        if operation.action == "set":
+            updated[operation.key] = copy_durable_json_value(
+                operation.value,
+                "checkpoint operation value",
+            )
+        else:
+            del updated[operation.key]
+    return updated
+
+
+def _runtime_publication_event_digest(event: Event) -> str:
+    copied_event = copy_event(event)
+    return _canonical_runtime_publication_digest(copied_event.model_dump(mode="json"))
+
+
+def runtime_publication_event_reference(event: Event) -> RuntimePublicationEventReference:
+    """Return an immutable ID-and-content reference for one exact event value."""
+
+    copied_event = copy_event(event)
+    return RuntimePublicationEventReference(
+        event_id=copied_event.id,
+        event_digest=_canonical_runtime_publication_digest(copied_event.model_dump(mode="json")),
+    )
+
+
+def _runtime_publication_referenced_event_ids(
+    references: Iterable[RuntimePublicationEventReference],
+) -> tuple[str, ...]:
+    return tuple(reference.event_id for reference in references)
+
+
+def _validate_runtime_publication_event_references(
+    references: Iterable[RuntimePublicationEventReference],
+    durable_events_by_id: Mapping[str, Event],
+) -> None:
+    for reference in references:
+        durable_event = durable_events_by_id.get(reference.event_id)
+        if durable_event is None:
+            raise ValueError(
+                "Runtime publication references an event that is not durable for the "
+                f"session: {reference.event_id}"
+            )
+        if _runtime_publication_event_digest(durable_event) != reference.event_digest:
+            raise ValueError(
+                "Runtime publication event reference does not match durable event content "
+                f"for the session: {reference.event_id}"
+            )
+
+
+def _validate_tool_round_call_ids(
+    value: Any,
+    field_name: str,
+) -> tuple[str, ...]:
+    if type(value) not in (list, tuple):
+        raise TypeError(f"{field_name} must be a list or tuple.")
+    tool_call_ids = tuple(
+        require_clean_nonblank(tool_call_id, f"{field_name} item") for tool_call_id in value
+    )
+    if not tool_call_ids or len(tool_call_ids) > RUNTIME_PUBLICATION_MAX_TOOL_CALLS:
+        raise ValueError(
+            f"{field_name} must contain between 1 and {RUNTIME_PUBLICATION_MAX_TOOL_CALLS} values."
+        )
+    if len(set(tool_call_ids)) != len(tool_call_ids):
+        raise ValueError(f"{field_name} cannot repeat tool call ids.")
+    return tool_call_ids
+
+
+def _tool_round_event_matches_scope_or_is_ambiguous(
+    event: Event,
+    tool_round_id: str,
+) -> bool:
+    """Select exact-round evidence plus legacy evidence that cannot be scoped.
+
+    Well-formed evidence for another round is safe to ignore when providers
+    reuse a call id. Missing or malformed round identity is ambiguous and must
+    still reach the publication validator so the transaction fails closed.
+    """
+
+    event_round_id = event.payload.get("tool_round_id")
+    if event_round_id == tool_round_id:
+        return True
+    if type(event_round_id) is not str:
+        return True
+    try:
+        require_clean_nonblank(event_round_id, "tool-round durable event round id")
+    except ValueError:
+        return True
+    return False
+
+
+def _tool_round_publication_identity(
+    request: RuntimePublicationRequest,
+) -> tuple[str, tuple[str, ...]] | None:
+    if request.kind != "tool-round":
+        return None
+
+    round_id = request.intent.get("round_id")
+    raw_tool_call_ids = request.intent.get("tool_call_ids")
+    if type(round_id) is not str or not round_id.strip():
+        raise ValueError("A tool-round publication requires a nonblank intent.round_id.")
+    if request.publication_id != f"tool-round:{round_id}":
+        raise ValueError("A tool-round publication_id must be derived from its intent.round_id.")
+    if type(raw_tool_call_ids) is not list:
+        raise ValueError("A tool-round publication requires intent.tool_call_ids as a list.")
+    tool_call_ids = _validate_tool_round_call_ids(
+        raw_tool_call_ids,
+        "intent.tool_call_ids",
+    )
+    return round_id, tool_call_ids
+
+
+def _validate_structured_output_auxiliary_integer(
+    value: Any,
+    field_name: str,
+) -> int:
+    if type(value) is not int:
+        raise TypeError(f"{field_name} must be an integer.")
+    if not 1 <= value <= MAX_DURABLE_JSON_INTEGER:
+        raise ValueError(f"{field_name} must be between 1 and {MAX_DURABLE_JSON_INTEGER}.")
+    return value
+
+
+def _validate_structured_output_tool_round_auxiliary(
+    request: RuntimePublicationRequest,
+    *,
+    round_id: str,
+) -> _StructuredOutputToolRoundAuxiliary | None:
+    if "auxiliary" not in request.intent:
+        if request.events:
+            raise ValueError(
+                "A tool-round publication cannot append events without a validated "
+                "intent.auxiliary contract."
+            )
+        return None
+
+    raw_auxiliary = request.intent["auxiliary"]
+    if type(raw_auxiliary) is not dict:
+        raise TypeError("A tool-round intent.auxiliary value must be an object.")
+    if set(raw_auxiliary) != _STRUCTURED_OUTPUT_AUXILIARY_INTENT_KEYS:
+        raise ValueError(
+            "A structured-output tool-round intent.auxiliary value has invalid fields."
+        )
+    if (
+        type(raw_auxiliary["schema_version"]) is not int
+        or raw_auxiliary["schema_version"] != _STRUCTURED_OUTPUT_AUXILIARY_SCHEMA_VERSION
+    ):
+        raise ValueError(
+            "A structured-output tool-round intent.auxiliary schema_version must be 1."
+        )
+    if raw_auxiliary["kind"] != _STRUCTURED_OUTPUT_AUXILIARY_KIND:
+        raise ValueError("A structured-output tool-round intent.auxiliary kind is invalid.")
+    step = _validate_structured_output_auxiliary_integer(
+        raw_auxiliary["step"],
+        "intent.auxiliary.step",
+    )
+    attempt = _validate_structured_output_auxiliary_integer(
+        raw_auxiliary["attempt"],
+        "intent.auxiliary.attempt",
+    )
+    valid = raw_auxiliary["valid"]
+    retry_scheduled = raw_auxiliary["retry_scheduled"]
+    if type(valid) is not bool:
+        raise TypeError("intent.auxiliary.valid must be a boolean.")
+    if type(retry_scheduled) is not bool:
+        raise TypeError("intent.auxiliary.retry_scheduled must be a boolean.")
+    if valid and retry_scheduled:
+        raise ValueError("A valid structured-output result cannot schedule a retry.")
+
+    raw_event_ids = raw_auxiliary["event_ids"]
+    if type(raw_event_ids) is not list:
+        raise TypeError("intent.auxiliary.event_ids must be a list.")
+    event_ids = tuple(
+        require_clean_nonblank(event_id, "intent.auxiliary.event_ids item")
+        for event_id in raw_event_ids
+    )
+    if len(set(event_ids)) != len(event_ids):
+        raise ValueError("intent.auxiliary.event_ids cannot contain duplicates.")
+
+    expected_event_types = (
+        (
+            EventType.STRUCTURED_OUTPUT_VALIDATING,
+            EventType.STRUCTURED_OUTPUT_VALIDATED,
+        )
+        if valid
+        else (
+            (
+                EventType.STRUCTURED_OUTPUT_VALIDATING,
+                EventType.STRUCTURED_OUTPUT_FAILED,
+                EventType.STRUCTURED_OUTPUT_RETRY,
+            )
+            if retry_scheduled
+            else (
+                EventType.STRUCTURED_OUTPUT_VALIDATING,
+                EventType.STRUCTURED_OUTPUT_FAILED,
+            )
+        )
+    )
+    if event_ids != tuple(event.id for event in request.events):
+        raise ValueError(
+            "Structured-output auxiliary event ids and order must exactly match "
+            "intent.auxiliary.event_ids."
+        )
+    if tuple(event.type for event in request.events) != expected_event_types:
+        raise ValueError("Structured-output auxiliary events have an invalid type sequence.")
+
+    event_session_ids = {event.session_id for event in request.events}
+    if len(event_session_ids) != 1:
+        raise ValueError("Structured-output auxiliary events must belong to one session.")
+    event_session_id = next(iter(event_session_ids))
+    first_event = request.events[0]
+    expected_name = first_event.payload.get("name")
+    if expected_name is not None:
+        require_clean_nonblank(expected_name, "structured-output event name")
+    expected_max_retries = first_event.payload.get("max_retries")
+    if type(expected_max_retries) is not int or not 0 <= expected_max_retries <= 8:
+        raise ValueError("Structured-output auxiliary events require a valid max_retries value.")
+
+    outcome_output_present = False
+    outcome_output: Any = None
+    outcome_errors: tuple[dict[str, Any], ...] | None = None
+    for event in request.events:
+        if event.tool_name is not None:
+            raise ValueError("Structured-output auxiliary events cannot carry a tool identity.")
+        if event.payload.get("tool_round_id") != round_id:
+            raise ValueError("A structured-output auxiliary event has a conflicting round id.")
+        if type(event.payload.get("step")) is not int or event.payload["step"] != step:
+            raise ValueError("A structured-output auxiliary event has a conflicting step.")
+        if type(event.payload.get("attempt")) is not int or event.payload["attempt"] != attempt:
+            raise ValueError("A structured-output auxiliary event has a conflicting attempt.")
+        if event.payload.get("name") != expected_name:
+            raise ValueError("Structured-output auxiliary events have conflicting names.")
+        if (
+            type(event.payload.get("max_retries")) is not int
+            or event.payload["max_retries"] != expected_max_retries
+        ):
+            raise ValueError("Structured-output auxiliary events have conflicting max_retries.")
+        if event.type == EventType.STRUCTURED_OUTPUT_VALIDATING:
+            if event.payload.get("strategy") != StructuredOutputStrategy.TOOL.value:
+                raise ValueError("A structured-output validating event must use tool strategy.")
+            if any(field in event.payload for field in ("valid", "output", "errors")):
+                raise ValueError("A structured-output validating event cannot claim an outcome.")
+            continue
+        event_valid = event.payload.get("valid")
+        if type(event_valid) is not bool or event_valid != valid:
+            raise ValueError(
+                "A structured-output outcome event conflicts with intent.auxiliary.valid."
+            )
+        raw_errors = event.payload.get("errors")
+        if type(raw_errors) is not list:
+            raise ValueError("A structured-output outcome event requires an errors list.")
+        normalized_errors: list[dict[str, Any]] = []
+        for raw_error in raw_errors:
+            try:
+                normalized_error = StructuredOutputError.model_validate(raw_error).model_dump(
+                    mode="json"
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "A structured-output outcome event contains an invalid error."
+                ) from exc
+            normalized_errors.append(normalized_error)
+        event_errors = tuple(normalized_errors)
+        event_output_present = "output" in event.payload
+        event_output = (
+            copy_durable_json_value(event.payload["output"], "structured_output_event.output")
+            if event_output_present
+            else None
+        )
+        if valid:
+            if event_errors or not event_output_present:
+                raise ValueError("A valid structured-output event requires output and no errors.")
+        elif not event_errors or event_output_present:
+            raise ValueError("A failed structured-output event requires errors and no output.")
+        if outcome_errors is None:
+            outcome_output_present = event_output_present
+            outcome_output = event_output
+            outcome_errors = event_errors
+        elif (
+            event_output_present != outcome_output_present
+            or not _runtime_publication_json_equal(event_output, outcome_output)
+            or event_errors != outcome_errors
+        ):
+            raise ValueError(
+                "Structured-output outcome and retry events contain conflicting results."
+            )
+
+    assert outcome_errors is not None
+
+    return _StructuredOutputToolRoundAuxiliary(
+        step=step,
+        attempt=attempt,
+        valid=valid,
+        retry_scheduled=retry_scheduled,
+        event_ids=event_ids,
+        session_id=event_session_id,
+        output_present=outcome_output_present,
+        output=outcome_output,
+        errors=outcome_errors,
+    )
+
+
+def _validate_tool_round_publication(
+    request: RuntimePublicationRequest,
+    durable_events_by_id: Mapping[str, Event],
+    *,
+    durable_tool_events: Iterable[Event] | None = None,
+) -> None:
+    identity = _tool_round_publication_identity(request)
+    if identity is None:
+        return
+    round_id, tool_call_ids = identity
+    auxiliary = _validate_structured_output_tool_round_auxiliary(
+        request,
+        round_id=round_id,
+    )
+
+    result_parts: list[ToolResultPart] = []
+    if len(request.transcript_messages) != 1:
+        raise ValueError("A tool-round publication must append one grouped tool-result message.")
+    for message in request.transcript_messages:
+        if message.role != MessageRole.TOOL:
+            raise ValueError("A tool-round publication can append only tool-result messages.")
+        for part in message.content:
+            if not isinstance(part, ToolResultPart):
+                raise ValueError(
+                    "A tool-round publication transcript can contain only tool results."
+                )
+            result_parts.append(part)
+    if tuple(part.tool_call_id for part in result_parts) != tool_call_ids:
+        raise ValueError(
+            "Tool-round result order and identities must exactly match intent.tool_call_ids."
+        )
+
+    candidate_durable_events = (
+        tuple(durable_events_by_id.values())
+        if durable_tool_events is None
+        else tuple(durable_tool_events)
+    )
+    scoped_durable_events: list[Event] = []
+    for event in candidate_durable_events:
+        if event.type not in _TOOL_ROUND_LIFECYCLE_EVENT_TYPES:
+            raise ValueError("Tool-round durable evidence may contain only lifecycle events.")
+        tool_call_id = event.payload.get("tool_call_id")
+        if type(tool_call_id) is not str or tool_call_id not in tool_call_ids:
+            raise ValueError("Tool-round durable evidence must identify one intended tool call.")
+        event_round_id = event.payload.get("tool_round_id")
+        if type(event_round_id) is not str:
+            raise ValueError("Tool-round durable evidence requires a valid round id.")
+        try:
+            event_round_id = require_clean_nonblank(
+                event_round_id,
+                "tool-round durable event round id",
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Tool-round durable evidence requires a valid round id.") from exc
+        if event_round_id == round_id:
+            scoped_durable_events.append(event)
+
+    scoped_durable_event_ids = tuple(event.id for event in scoped_durable_events)
+    referenced_event_ids = tuple(reference.event_id for reference in request.referenced_events)
+    if len(set(scoped_durable_event_ids)) != len(scoped_durable_event_ids) or set(
+        scoped_durable_event_ids
+    ) != set(referenced_event_ids):
+        raise SessionRuntimePublicationConflict(
+            "A tool-round publication must bind every durable lifecycle event for "
+            "its intended tool calls."
+        )
+    if auxiliary is not None and any(
+        event.session_id != auxiliary.session_id for event in scoped_durable_events
+    ):
+        raise ValueError(
+            "Structured-output auxiliary and lifecycle events belong to different sessions."
+        )
+
+    material_events = tuple(scoped_durable_events)
+    started_by_call: dict[str, Event] = {}
+    terminal_by_call: dict[str, Event] = {}
+    for event in material_events:
+        if event.type != EventType.TOOL_CALL_STARTED and (
+            event.type not in _TOOL_ROUND_TERMINAL_EVENT_TYPES
+        ):
+            raise ValueError(
+                "A tool-round publication may bind only started and terminal tool events."
+            )
+        tool_call_id = event.payload.get("tool_call_id")
+        if type(tool_call_id) is not str or tool_call_id not in tool_call_ids:
+            raise ValueError("A tool-round publication event must identify one intended tool call.")
+        event_round_id = event.payload.get("tool_round_id")
+        if event_round_id != round_id:
+            raise ValueError("A tool-round publication event has a conflicting round id.")
+        destination = (
+            started_by_call if event.type == EventType.TOOL_CALL_STARTED else terminal_by_call
+        )
+        if tool_call_id in destination:
+            raise ValueError(
+                "A tool-round publication cannot bind duplicate started or terminal events "
+                f"for tool call {tool_call_id}."
+            )
+        destination[tool_call_id] = event
+
+    if set(terminal_by_call) != set(tool_call_ids):
+        raise ValueError("A tool-round publication requires exactly one terminal event per result.")
+    if not set(started_by_call).issubset(terminal_by_call):
+        raise ValueError(
+            "Every started tool call in a publication requires a matching terminal event."
+        )
+
+    for part in result_parts:
+        terminal = terminal_by_call[part.tool_call_id]
+        if terminal.tool_name != part.tool_name:
+            raise ValueError(
+                "A tool-round terminal event tool name conflicts with its transcript result."
+            )
+        terminal_idempotency_key = terminal.payload.get("idempotency_key")
+        if type(terminal_idempotency_key) is not str or not terminal_idempotency_key:
+            raise ValueError("A tool-round terminal event requires a stable idempotency key.")
+        started = started_by_call.get(part.tool_call_id)
+        if started is not None and (
+            started.tool_name != part.tool_name
+            or started.payload.get("idempotency_key") != terminal_idempotency_key
+        ):
+            raise ValueError("A tool-round started event conflicts with its terminal event.")
+        expected_result = {
+            "content": part.content,
+            "structured": part.structured,
+            "artifacts": part.artifacts,
+            "is_error": part.is_error,
+        }
+        if not _runtime_publication_json_equal(
+            terminal.payload.get("result"),
+            expected_result,
+        ):
+            raise ValueError(
+                "A tool-round terminal event result conflicts with its transcript result."
+            )
+        if (terminal.type == EventType.TOOL_CALL_COMPLETED and part.is_error) or (
+            terminal.type != EventType.TOOL_CALL_COMPLETED and not part.is_error
+        ):
+            raise ValueError(
+                "A tool-round terminal event outcome conflicts with its transcript result."
+            )
+
+    pending_round_deletions = [
+        operation
+        for operation in request.mutation.operations
+        if operation.key == _PENDING_TOOL_ROUND_CHECKPOINT_KEY and operation.action == "delete"
+    ]
+    if len(pending_round_deletions) != 1:
+        raise ValueError(
+            "A tool-round publication must delete exactly one fenced pending round marker."
+        )
+
+
+def _validate_structured_output_tool_round_marker(
+    request: RuntimePublicationRequest,
+    *,
+    marker: dict[str, Any],
+    raw_calls: list[dict[str, Any]],
+) -> None:
+    round_id = request.intent["round_id"]
+    auxiliary = _validate_structured_output_tool_round_auxiliary(
+        request,
+        round_id=round_id,
+    )
+    structured_calls = [
+        call for call in raw_calls if call.get("tool_name") == STRUCTURED_OUTPUT_TOOL_NAME
+    ]
+    if auxiliary is None:
+        if structured_calls:
+            raise SessionRuntimePublicationConflict(
+                "A pending structured-output tool round requires validated "
+                "intent.auxiliary evidence."
+            )
+        return
+    if not structured_calls:
+        raise SessionRuntimePublicationConflict(
+            "Structured-output auxiliary evidence requires the reserved tool "
+            "in the durable pending marker."
+        )
+
+    raw_spec = marker.get("structured_output")
+    if type(raw_spec) is not dict:
+        raise SessionRuntimePublicationConflict(
+            "Structured-output auxiliary evidence requires durable structured-output config."
+        )
+    try:
+        spec = StructuredOutputSpec.model_validate(raw_spec)
+    except (TypeError, ValueError) as exc:
+        raise SessionRuntimePublicationConflict(
+            "The durable structured-output config is malformed."
+        ) from exc
+    if spec.strategy != StructuredOutputStrategy.TOOL:
+        raise SessionRuntimePublicationConflict(
+            "Structured-output tool-round auxiliary evidence requires tool strategy."
+        )
+    if auxiliary.attempt > spec.max_retries + 1:
+        raise SessionRuntimePublicationConflict(
+            "Structured-output auxiliary attempt exceeds the durable retry policy."
+        )
+    if auxiliary.retry_scheduled and auxiliary.attempt > spec.max_retries:
+        raise SessionRuntimePublicationConflict(
+            "Structured-output auxiliary retry exceeds the durable retry policy."
+        )
+    deterministic_valid = False
+    if len(structured_calls) == 1 and len(raw_calls) == 1:
+        raw_arguments = structured_calls[0].get("arguments")
+        if type(raw_arguments) is not dict:
+            raise SessionRuntimePublicationConflict(
+                "The reserved structured-output call arguments are malformed."
+            )
+        deterministic_valid = validate_structured_output_tool_arguments(
+            raw_arguments,
+            spec,
+        ).valid
+    if auxiliary.valid != deterministic_valid:
+        raise SessionRuntimePublicationConflict(
+            "Structured-output auxiliary validity conflicts with the durable tool calls."
+        )
+    marker_model_step = marker.get("model_step")
+    if marker_model_step is not None and (
+        type(marker_model_step) is not int or marker_model_step != auxiliary.step
+    ):
+        raise SessionRuntimePublicationConflict(
+            "Structured-output auxiliary step conflicts with the durable pending marker."
+        )
+    marker_structured_output_attempt = marker.get("structured_output_attempt")
+    if marker_structured_output_attempt is not None and (
+        type(marker_structured_output_attempt) is not int
+        or marker_structured_output_attempt != auxiliary.attempt
+    ):
+        raise SessionRuntimePublicationConflict(
+            "Structured-output auxiliary attempt conflicts with the durable pending marker."
+        )
+
+    marker_agent_name = marker.get("agent_name")
+    if type(marker_agent_name) is not str:
+        raise SessionRuntimePublicationConflict(
+            "The durable pending tool round agent identity is malformed."
+        )
+    try:
+        marker_agent_name = require_clean_nonblank(
+            marker_agent_name,
+            "pending tool round agent_name",
+        )
+    except (TypeError, ValueError) as exc:
+        raise SessionRuntimePublicationConflict(
+            "The durable pending tool round agent identity is malformed."
+        ) from exc
+    marker_environment_name = marker.get("environment_name")
+    if marker_environment_name is not None:
+        try:
+            marker_environment_name = require_clean_nonblank(
+                marker_environment_name,
+                "pending tool round environment_name",
+            )
+        except (TypeError, ValueError) as exc:
+            raise SessionRuntimePublicationConflict(
+                "The durable pending tool round environment identity is malformed."
+            ) from exc
+
+    for event in request.events:
+        if (
+            event.agent_name != marker_agent_name
+            or event.environment_name != marker_environment_name
+        ):
+            raise SessionRuntimePublicationConflict(
+                "A structured-output auxiliary event conflicts with the durable "
+                "pending-round identity."
+            )
+        if event.payload.get("name") != spec.name:
+            raise SessionRuntimePublicationConflict(
+                "A structured-output auxiliary event conflicts with the durable output name."
+            )
+        if (
+            type(event.payload.get("max_retries")) is not int
+            or event.payload["max_retries"] != spec.max_retries
+        ):
+            raise SessionRuntimePublicationConflict(
+                "A structured-output auxiliary event conflicts with the durable retry policy."
+            )
+
+    result_parts = [
+        part
+        for message in request.transcript_messages
+        for part in message.content
+        if isinstance(part, ToolResultPart)
+    ]
+    result_parts_by_id = {part.tool_call_id: part for part in result_parts}
+    for structured_call in structured_calls:
+        tool_call_id = structured_call.get("tool_call_id")
+        if type(tool_call_id) is not str:
+            raise SessionRuntimePublicationConflict(
+                "The reserved structured-output call identity is malformed."
+            )
+        result_part = result_parts_by_id.get(tool_call_id)
+        if result_part is None or result_part.tool_name != STRUCTURED_OUTPUT_TOOL_NAME:
+            raise SessionRuntimePublicationConflict(
+                "The reserved structured-output call is not bound to its transcript result."
+            )
+    if auxiliary.valid:
+        if len(structured_calls) != 1 or len(raw_calls) != 1:
+            raise SessionRuntimePublicationConflict(
+                "A valid structured-output auxiliary outcome requires exactly one "
+                "reserved tool call."
+            )
+        structured_call_id = structured_calls[0]["tool_call_id"]
+        if result_parts_by_id[structured_call_id].is_error:
+            raise SessionRuntimePublicationConflict(
+                "A valid structured-output auxiliary outcome conflicts with its tool result."
+            )
+        structured_result = result_parts_by_id[structured_call_id].structured
+        if (
+            type(structured_result) is not dict
+            or set(structured_result) != {"output"}
+            or not auxiliary.output_present
+            or not _runtime_publication_json_equal(
+                structured_result["output"],
+                auxiliary.output,
+            )
+        ):
+            raise SessionRuntimePublicationConflict(
+                "A valid structured-output event conflicts with its grouped tool result."
+            )
+    elif any(not part.is_error for part in result_parts):
+        raise SessionRuntimePublicationConflict(
+            "A failed structured-output auxiliary outcome conflicts with its tool results."
+        )
+    else:
+        expected_errors = list(auxiliary.errors)
+        for result_part in result_parts:
+            structured_result = result_part.structured
+            if (
+                type(structured_result) is not dict
+                or set(structured_result) != {"structured_output_errors"}
+                or not _runtime_publication_json_equal(
+                    structured_result["structured_output_errors"],
+                    expected_errors,
+                )
+            ):
+                raise SessionRuntimePublicationConflict(
+                    "A failed structured-output event conflicts with its grouped tool results."
+                )
+
+
+def _validate_tool_round_checkpoint_mutation(
+    request: RuntimePublicationRequest,
+    checkpoint: dict[str, Any] | None,
+) -> None:
+    if request.kind != "tool-round":
+        return
+    marker = None if checkpoint is None else checkpoint.get(_PENDING_TOOL_ROUND_CHECKPOINT_KEY)
+    if type(marker) is not dict:
+        raise SessionRuntimePublicationConflict(
+            "A tool-round publication requires its durable pending round marker."
+        )
+    raw_calls = marker.get("tool_calls")
+    if type(raw_calls) is not list or any(type(call) is not dict for call in raw_calls):
+        raise SessionRuntimePublicationConflict(
+            "The durable pending tool round call list is malformed."
+        )
+    marker_call_ids = tuple(call.get("tool_call_id") for call in raw_calls)
+    intended_call_ids = tuple(request.intent["tool_call_ids"])
+    if marker.get("round_id") != request.intent["round_id"] or marker_call_ids != intended_call_ids:
+        raise SessionRuntimePublicationConflict(
+            "The durable pending tool round conflicts with the publication intent."
+        )
+    _validate_structured_output_tool_round_marker(
+        request,
+        marker=marker,
+        raw_calls=raw_calls,
+    )
+    deletion = next(
+        operation
+        for operation in request.mutation.operations
+        if operation.key == _PENDING_TOOL_ROUND_CHECKPOINT_KEY and operation.action == "delete"
+    )
+    if runtime_publication_checkpoint_value_digest(marker) != deletion.expected_value_digest:
+        raise SessionRuntimePublicationConflict(
+            "The tool-round publication does not fence its exact pending marker."
+        )
+
+
+def _runtime_publication_json_equal(left: Any, right: Any) -> bool:
+    """Compare validated JSON material under the durable canonicalization contract."""
+
+    return _canonical_runtime_publication_digest(left) == _canonical_runtime_publication_digest(
+        right
+    )
+
+
+def _validate_required_runtime_fence(value: int, field_name: str) -> int:
+    validated = _validate_optional_runtime_publication_fence(value, field_name)
+    if validated is None:
+        raise TypeError(f"{field_name} must be an integer.")
+    return validated
+
+
+def _validate_optional_runtime_publication_fence(
+    value: int | None,
+    field_name: str,
+) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int:
+        raise TypeError(f"{field_name} must be an integer or None.")
+    if value < 0:
+        raise ValueError(f"{field_name} must be greater than or equal to 0.")
+    if value > MAX_DURABLE_JSON_INTEGER:
+        raise ValueError(f"{field_name} must be at most {MAX_DURABLE_JSON_INTEGER}.")
+    return value
+
+
+def _prepare_model_completion_stage(
+    session_id: str,
+    request: ModelCompletionStageRequest,
+    *,
+    expected_statuses: set[SessionStatus],
+    expected_run_epoch: int,
+    expected_transcript_cursor: int,
+) -> _PreparedModelCompletionStage:
+    session_id = require_clean_nonblank(session_id, "session_id")
+    if type(request) is not ModelCompletionStageRequest:
+        raise TypeError("Model completion staging requires a ModelCompletionStageRequest.")
+    try:
+        copied_request = ModelCompletionStageRequest(
+            stage_id=request.stage_id,
+            logical_step_id=request.logical_step_id,
+            dispatch_ordinal=request.dispatch_ordinal,
+            purpose=request.purpose,
+            intent=request.intent,
+            reservation_ids=request.reservation_ids,
+        )
+    except AttributeError as exc:
+        raise ValueError("Model completion stage request is malformed.") from exc
+    allowed_statuses = frozenset(_validate_status_set(expected_statuses, "expected_statuses"))
+    expected_run_epoch = _validate_required_runtime_fence(
+        expected_run_epoch,
+        "expected_run_epoch",
+    )
+    expected_transcript_cursor = _validate_required_runtime_fence(
+        expected_transcript_cursor,
+        "expected_transcript_cursor",
+    )
+    _, _, preparation_key, terminal_key = _model_completion_stage_storage_identity(
+        session_id,
+        copied_request.stage_id,
+    )
+    winner_key = _model_completion_stage_winner_storage_key(copied_request.logical_step_id)
+    request_digest = _canonical_runtime_publication_digest(
+        {
+            "session_id": session_id,
+            "stage_id": copied_request.stage_id,
+            "logical_step_id": copied_request.logical_step_id,
+            "dispatch_ordinal": copied_request.dispatch_ordinal,
+            "purpose": copied_request.purpose,
+            "intent": copied_request.intent,
+            "reservation_ids": list(copied_request.reservation_ids),
+            "expected_statuses": sorted(str(status) for status in allowed_statuses),
+            "expected_run_epoch": expected_run_epoch,
+            "expected_transcript_cursor": expected_transcript_cursor,
+        }
+    )
+    return _PreparedModelCompletionStage(
+        session_id=session_id,
+        preparation_storage_key=preparation_key,
+        terminal_storage_key=terminal_key,
+        abandonment_storage_key=_model_completion_stage_abandonment_storage_key(
+            copied_request.stage_id
+        ),
+        winner_storage_key=winner_key,
+        publication_storage_key=_runtime_publication_storage_key(copied_request.logical_step_id),
+        request=copied_request,
+        request_digest=request_digest,
+        expected_statuses=allowed_statuses,
+        expected_run_epoch=expected_run_epoch,
+        expected_transcript_cursor=expected_transcript_cursor,
+    )
+
+
+def _prepare_model_completion_stage_abandonment(
+    session_id: str,
+    *,
+    stage_id: str,
+    preparation_digest: str,
+    expected_run_epoch: int,
+) -> _PreparedModelCompletionStageAbandonment:
+    session_id, stage_id, preparation_key, terminal_key = _model_completion_stage_storage_identity(
+        session_id, stage_id
+    )
+    try:
+        _require_raw_sha256_digest(preparation_digest)
+    except ValueError as exc:
+        raise ValueError("preparation_digest must be a lowercase SHA-256 digest.") from exc
+    expected_run_epoch = _validate_required_runtime_fence(
+        expected_run_epoch,
+        "expected_run_epoch",
+    )
+    return _PreparedModelCompletionStageAbandonment(
+        session_id=session_id,
+        stage_id=stage_id,
+        preparation_storage_key=preparation_key,
+        terminal_storage_key=terminal_key,
+        abandonment_storage_key=_model_completion_stage_abandonment_storage_key(stage_id),
+        preparation_digest=preparation_digest,
+        expected_run_epoch=expected_run_epoch,
+    )
+
+
+def _prepare_model_completion_stage_terminal(
+    session_id: str,
+    *,
+    stage_id: str,
+    publication: RuntimePublicationRequest,
+) -> _PreparedModelCompletionStageTerminal:
+    session_id, stage_id, preparation_key, terminal_key = _model_completion_stage_storage_identity(
+        session_id, stage_id
+    )
+    if type(publication) is not RuntimePublicationRequest:
+        raise TypeError("publication must be a RuntimePublicationRequest.")
+    try:
+        copied_publication = RuntimePublicationRequest(
+            publication_id=publication.publication_id,
+            kind=publication.kind,
+            intent=publication.intent,
+            mutation=publication.mutation,
+            transcript_messages=publication.transcript_messages,
+            events=publication.events,
+            referenced_events=publication.referenced_events,
+        )
+    except AttributeError as exc:
+        raise ValueError("Model completion publication is malformed.") from exc
+    publication_payload = copied_publication.model_dump(mode="json")
+    return _PreparedModelCompletionStageTerminal(
+        session_id=session_id,
+        stage_id=stage_id,
+        preparation_storage_key=preparation_key,
+        terminal_storage_key=terminal_key,
+        publication=copied_publication,
+        publication_material_digest=_canonical_runtime_publication_digest(publication_payload),
+    )
+
+
+def _validate_model_completion_stage_publication(
+    publication: RuntimePublicationRequest,
+    *,
+    session_id: str,
+    stage: ModelCompletionStage | _ModelCompletionStagePreparationRecord,
+) -> None:
+    if publication.publication_id != stage.logical_step_id:
+        raise ValueError("Model completion publication_id must equal logical_step_id.")
+    if not _runtime_publication_json_equal(publication.intent, stage.intent):
+        raise SessionModelCompletionStageConflict(
+            "The terminal model completion intent conflicts with its preparation."
+        )
+    if stage.purpose == "assistant-turn":
+        if publication.kind != "model-step":
+            raise ValueError("Assistant-turn publication kind must be 'model-step'.")
+        if len(publication.transcript_messages) > 1 or any(
+            message.role != MessageRole.ASSISTANT for message in publication.transcript_messages
+        ):
+            raise ValueError(
+                "An assistant-turn publication may contain at most one assistant message."
+            )
+    else:
+        if publication.kind != "context-compaction":
+            raise ValueError("Context-compaction publication kind must be 'context-compaction'.")
+        if publication.transcript_messages:
+            raise ValueError("A context-compaction publication cannot append transcript messages.")
+    completed_events = [
+        event for event in publication.events if event.type == EventType.MODEL_COMPLETED
+    ]
+    if len(completed_events) != 1:
+        raise ValueError(
+            "A model completion publication must append exactly one model.completed event."
+        )
+    if stage.purpose == "assistant-turn" and (
+        len(publication.events) != 1 or publication.referenced_events
+    ):
+        raise ValueError(
+            "An assistant-turn publication must bind exactly its model.completed event."
+        )
+    completed_event = completed_events[0]
+    classification = completed_event.payload.get("step_classification")
+    if (
+        stage.purpose == "assistant-turn"
+        and not publication.transcript_messages
+        and (
+            type(classification) is not dict
+            or classification.get("type") not in _NON_TURN_MODEL_COMPLETION_CLASSIFICATIONS
+        )
+    ):
+        raise ValueError(
+            "A model completion publication without an assistant message requires "
+            "a non-turn model.completed step classification."
+        )
+    if (
+        stage.purpose == "assistant-turn"
+        and completed_event.payload.get("purpose") == "context_compaction"
+    ):
+        raise ValueError("An assistant-turn publication cannot carry context-compaction evidence.")
+    if (
+        stage.purpose == "context-compaction"
+        and completed_event.payload.get("purpose") != "context_compaction"
+    ):
+        raise ValueError(
+            "A context-compaction publication requires matching model completion evidence."
+        )
+    for event in publication.events:
+        if event.session_id != session_id:
+            raise ValueError("Model completion event session_id does not match target session.")
+    appended_event_ids = {event.id for event in publication.events}
+    overlap = appended_event_ids & set(
+        _runtime_publication_referenced_event_ids(publication.referenced_events)
+    )
+    if overlap:
+        raise ValueError(
+            f"Model completion cannot both append and reference event id {min(overlap)}."
+        )
+    if stage.purpose == "assistant-turn":
+        _validate_assistant_model_completion_publication(
+            publication,
+            stage=stage,
+            completed_event=completed_event,
+            classification=classification,
+        )
+
+
+def _validate_assistant_model_completion_publication(
+    publication: RuntimePublicationRequest,
+    *,
+    stage: ModelCompletionStage | _ModelCompletionStagePreparationRecord,
+    completed_event: Event,
+    classification: Any,
+) -> None:
+    if type(classification) is not dict:
+        raise ValueError("An assistant-turn publication requires a model step classification.")
+    assistant_message = (
+        publication.transcript_messages[0] if publication.transcript_messages else None
+    )
+    tool_calls = (
+        tuple(part for part in assistant_message.content if isinstance(part, ToolCallPart))
+        if assistant_message is not None
+        else ()
+    )
+    classification_type = classification.get("type")
+    if tool_calls and classification_type != "continue":
+        raise ValueError(
+            "An assistant model completion with tool calls must be classified as continue."
+        )
+    if not tool_calls and classification_type == "continue":
+        raise ValueError(
+            "An assistant model completion without tool calls cannot be classified as continue."
+        )
+
+    expected_tool_round_id = f"{stage.logical_step_id}:tool-round" if tool_calls else None
+    expected_operation_keys = {LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY}
+    if tool_calls:
+        expected_operation_keys.add(_PENDING_TOOL_ROUND_CHECKPOINT_KEY)
+    operations_by_key = {operation.key: operation for operation in publication.mutation.operations}
+    if set(operations_by_key) != expected_operation_keys:
+        raise ValueError(
+            "An assistant model completion must atomically publish exactly its model-step "
+            "pointer and optional pending tool-round marker."
+        )
+
+    pointer_operation = operations_by_key[LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY]
+    if pointer_operation.action != "set":
+        raise ValueError("A model-step publication pointer must use a set operation.")
+    try:
+        pointer = ModelStepPublicationCheckpoint.model_validate(pointer_operation.value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("The model-step publication pointer is malformed.") from exc
+    expected_transcript_end = stage.source_transcript_cursor + int(assistant_message is not None)
+    expected_pointer = ModelStepPublicationCheckpoint(
+        logical_step_id=stage.logical_step_id,
+        stage_id=stage.stage_id,
+        source_transcript_cursor=stage.source_transcript_cursor,
+        transcript_end_cursor=expected_transcript_end,
+        completion_event_id=completed_event.id,
+        classification=classification,
+        assistant_message_published=assistant_message is not None,
+        tool_round_id=expected_tool_round_id,
+    )
+    if pointer != expected_pointer:
+        raise ValueError("The model-step publication pointer conflicts with its staged completion.")
+    transcript_cursor = completed_event.payload.get("transcript_cursor")
+    if type(transcript_cursor) is not int or transcript_cursor != expected_transcript_end:
+        raise ValueError(
+            "The model.completed transcript cursor conflicts with its staged completion."
+        )
+
+    if not tool_calls:
+        return
+    pending_operation = operations_by_key[_PENDING_TOOL_ROUND_CHECKPOINT_KEY]
+    if pending_operation.action != "set" or type(pending_operation.value) is not dict:
+        raise ValueError("A model-step pending tool-round marker must use an object set operation.")
+    marker = pending_operation.value
+    expected_marker_keys = {
+        "round_id",
+        "agent_name",
+        "environment_name",
+        "task_id",
+        "tool_calls",
+        "structured_output",
+        "source_model_step_id",
+        "source_transcript_cursor",
+        "model_step",
+        "structured_output_attempt",
+    }
+    if set(marker) != expected_marker_keys:
+        raise ValueError("The model-step pending tool-round marker has invalid fields.")
+    if marker.get("round_id") != expected_tool_round_id:
+        raise ValueError("The pending tool-round identity conflicts with its model step.")
+    if marker.get("source_model_step_id") != stage.logical_step_id:
+        raise ValueError("The pending tool round has a conflicting source model-step identity.")
+    if marker.get("source_transcript_cursor") != stage.source_transcript_cursor:
+        raise ValueError("The pending tool round has a conflicting source transcript cursor.")
+    try:
+        require_clean_nonblank(marker.get("agent_name"), "pending tool-round agent_name")
+        for field_name in ("environment_name", "task_id"):
+            value = marker.get(field_name)
+            if value is not None:
+                require_clean_nonblank(value, f"pending tool-round {field_name}")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("The pending tool-round runtime identity is malformed.") from exc
+    marker_model_step = marker.get("model_step")
+    if type(marker_model_step) is not int or marker_model_step < 1:
+        raise ValueError("The pending tool round has an invalid model step.")
+    completed_model_step = completed_event.payload.get("step")
+    if completed_model_step is not None and (
+        type(completed_model_step) is not int or completed_model_step != marker_model_step
+    ):
+        raise ValueError("The pending tool round has a conflicting model step.")
+
+    raw_calls = marker.get("tool_calls")
+    if type(raw_calls) is not list or len(raw_calls) != len(tool_calls):
+        raise ValueError("The pending tool-round calls conflict with the assistant message.")
+    try:
+        pending_calls = tuple(
+            PendingToolCallApproval.model_validate(raw_call) for raw_call in raw_calls
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("The pending tool-round call records are malformed.") from exc
+    for pending_call, tool_call in zip(pending_calls, tool_calls, strict=True):
+        if (
+            pending_call.tool_call_id != tool_call.tool_call_id
+            or pending_call.tool_name != tool_call.tool_name
+            or not _runtime_publication_json_equal(
+                pending_call.arguments,
+                tool_call.arguments,
+            )
+        ):
+            raise ValueError("The pending tool-round calls conflict with the assistant message.")
+        if (
+            pending_call.policy_decision is not None
+            or pending_call.reason is not None
+            or pending_call.metadata
+            or pending_call.active_taint_labels
+        ):
+            raise ValueError("A newly published pending tool round cannot contain policy outcomes.")
+
+    raw_structured_output = marker.get("structured_output")
+    structured_output = None
+    if raw_structured_output is not None:
+        if type(raw_structured_output) is not dict:
+            raise ValueError("The pending tool-round structured-output config is malformed.")
+        try:
+            structured_output = StructuredOutputSpec.model_validate(raw_structured_output)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "The pending tool-round structured-output config is malformed."
+            ) from exc
+    has_structured_finalizer = any(
+        tool_call.tool_name == STRUCTURED_OUTPUT_TOOL_NAME for tool_call in tool_calls
+    )
+    structured_output_attempt = marker.get("structured_output_attempt")
+    if has_structured_finalizer:
+        if structured_output is None or structured_output.strategy != StructuredOutputStrategy.TOOL:
+            raise ValueError(
+                "The reserved structured-output call requires matching durable config."
+            )
+        if (
+            type(structured_output_attempt) is not int
+            or not 1 <= structured_output_attempt <= structured_output.max_retries + 1
+        ):
+            raise ValueError("The pending structured-output round requires a valid attempt number.")
+    elif structured_output_attempt is not None:
+        raise ValueError("An ordinary pending tool round cannot carry a structured-output attempt.")
+
+
+def _model_completion_stage_preparation_record(
+    prepared: _PreparedModelCompletionStage,
+    *,
+    source_session: Session,
+    prepared_at: datetime,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "record_type": MODEL_COMPLETION_STAGE_PREPARATION_RECORD_TYPE,
+        "schema_version": MODEL_COMPLETION_STAGE_SCHEMA_VERSION,
+        "session_id": prepared.session_id,
+        "stage_id": prepared.request.stage_id,
+        "logical_step_id": prepared.request.logical_step_id,
+        "dispatch_ordinal": prepared.request.dispatch_ordinal,
+        "purpose": prepared.request.purpose,
+        "intent": prepared.request.intent,
+        "reservation_ids": list(prepared.request.reservation_ids),
+        "request_digest": prepared.request_digest,
+        "source_status": str(source_session.status),
+        "source_run_epoch": source_session.run_epoch,
+        "source_transcript_cursor": prepared.expected_transcript_cursor,
+        "prepared_at": prepared_at.isoformat().replace("+00:00", "Z"),
+    }
+    payload["record_digest"] = _canonical_runtime_publication_digest(payload)
+    return copy_durable_json_object(payload, "model_completion_stage_preparation")
+
+
+def _model_completion_stage_terminal_record(
+    prepared: _PreparedModelCompletionStageTerminal,
+    *,
+    stage: ModelCompletionStage,
+    completed_at: datetime,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "record_type": MODEL_COMPLETION_STAGE_TERMINAL_RECORD_TYPE,
+        "schema_version": MODEL_COMPLETION_STAGE_SCHEMA_VERSION,
+        "session_id": prepared.session_id,
+        "stage_id": prepared.stage_id,
+        "logical_step_id": stage.logical_step_id,
+        "dispatch_ordinal": stage.dispatch_ordinal,
+        "purpose": stage.purpose,
+        "preparation_digest": stage.preparation_digest,
+        "publication": prepared.publication.model_dump(mode="json"),
+        "publication_material_digest": prepared.publication_material_digest,
+        "completed_at": completed_at.isoformat().replace("+00:00", "Z"),
+    }
+    payload["record_digest"] = _canonical_runtime_publication_digest(payload)
+    return copy_durable_json_object(payload, "model_completion_stage_terminal")
+
+
+def _active_model_completion_stage_record(
+    stage: ModelCompletionStage,
+    *,
+    activated_at: datetime,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "record_type": MODEL_COMPLETION_ACTIVE_STAGE_RECORD_TYPE,
+        "schema_version": MODEL_COMPLETION_STAGE_SCHEMA_VERSION,
+        "session_id": stage.session_id,
+        "stage_id": stage.stage_id,
+        "logical_step_id": stage.logical_step_id,
+        "dispatch_ordinal": stage.dispatch_ordinal,
+        "purpose": stage.purpose,
+        "preparation_digest": stage.preparation_digest,
+        "source_status": str(stage.source_status),
+        "source_run_epoch": stage.source_run_epoch,
+        "source_transcript_cursor": stage.source_transcript_cursor,
+        "activated_at": activated_at.isoformat().replace("+00:00", "Z"),
+    }
+    payload["record_digest"] = _canonical_runtime_publication_digest(payload)
+    return copy_durable_json_object(payload, "active_model_completion_stage")
+
+
+def _model_completion_stage_abandonment_record(
+    stage: ModelCompletionStage,
+    *,
+    active: ActiveModelCompletionStage,
+    abandoned_at: datetime,
+) -> dict[str, Any]:
+    if stage.state != "in_flight" or active.stage != stage:
+        raise SessionModelCompletionStageConflict(
+            "Only the exact active in-flight model-completion stage can be abandoned."
+        )
+    payload: dict[str, Any] = {
+        "record_type": MODEL_COMPLETION_STAGE_ABANDONMENT_RECORD_TYPE,
+        "schema_version": MODEL_COMPLETION_STAGE_SCHEMA_VERSION,
+        "session_id": stage.session_id,
+        "stage_id": stage.stage_id,
+        "logical_step_id": stage.logical_step_id,
+        "dispatch_ordinal": stage.dispatch_ordinal,
+        "purpose": stage.purpose,
+        "preparation_request_digest": stage.preparation_request_digest,
+        "preparation_digest": stage.preparation_digest,
+        "active_marker_digest": active.marker_digest,
+        "source_status": str(stage.source_status),
+        "source_run_epoch": stage.source_run_epoch,
+        "source_transcript_cursor": stage.source_transcript_cursor,
+        "abandoned_at": abandoned_at.isoformat().replace("+00:00", "Z"),
+    }
+    payload["record_digest"] = _canonical_runtime_publication_digest(payload)
+    return copy_durable_json_object(payload, "model_completion_stage_abandonment")
+
+
+def _model_completion_stage_winner_record(
+    stage: ModelCompletionStage,
+    *,
+    receipt: RuntimePublicationReceipt,
+) -> dict[str, Any]:
+    if (
+        stage.state != "completed"
+        or stage.completion_digest is None
+        or stage.publication_material_digest is None
+    ):
+        raise SessionModelCompletionStageIncomplete(
+            f"Model-completion stage is still in flight: {stage.stage_id}"
+        )
+    payload: dict[str, Any] = {
+        "record_type": MODEL_COMPLETION_WINNER_RECORD_TYPE,
+        "schema_version": MODEL_COMPLETION_STAGE_SCHEMA_VERSION,
+        "session_id": stage.session_id,
+        "stage_id": stage.stage_id,
+        "logical_step_id": stage.logical_step_id,
+        "dispatch_ordinal": stage.dispatch_ordinal,
+        "purpose": stage.purpose,
+        "preparation_digest": stage.preparation_digest,
+        "completion_digest": stage.completion_digest,
+        "publication_material_digest": stage.publication_material_digest,
+        "receipt_request_digest": receipt.request_digest,
+        "publication_digest": receipt.publication_digest,
+        "published_at": receipt.published_at.isoformat().replace("+00:00", "Z"),
+    }
+    payload["record_digest"] = _canonical_runtime_publication_digest(payload)
+    return copy_durable_json_object(payload, "model_completion_stage_winner")
+
+
+def _require_raw_sha256_digest(value: Any) -> None:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError
+
+
+def _reconstruct_active_model_completion_stage_record(
+    record: dict[str, Any],
+    *,
+    session_id: str,
+    storage_key: str = MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+) -> _ActiveModelCompletionStageRecord:
+    try:
+        if type(record) is not dict:
+            raise TypeError
+        if set(record) != set(_ActiveModelCompletionStageRecord.model_fields):
+            raise ValueError
+        for field in (
+            "record_type",
+            "session_id",
+            "stage_id",
+            "logical_step_id",
+            "purpose",
+            "preparation_digest",
+            "source_status",
+            "activated_at",
+            "record_digest",
+        ):
+            if type(record[field]) is not str:
+                raise TypeError
+        for field in (
+            "schema_version",
+            "dispatch_ordinal",
+            "source_run_epoch",
+            "source_transcript_cursor",
+        ):
+            if type(record[field]) is not int:
+                raise TypeError
+        _require_raw_sha256_digest(record["preparation_digest"])
+        _require_raw_sha256_digest(record["record_digest"])
+        reconstructed = _ActiveModelCompletionStageRecord.model_validate(record)
+        if reconstructed.record_type != MODEL_COMPLETION_ACTIVE_STAGE_RECORD_TYPE:
+            raise ValueError
+        if reconstructed.schema_version != MODEL_COMPLETION_STAGE_SCHEMA_VERSION:
+            raise ValueError
+        if reconstructed.session_id != session_id:
+            raise ValueError
+        if storage_key != MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY:
+            raise ValueError
+        digest_payload = reconstructed.model_dump(mode="json", exclude={"record_digest"})
+        if _canonical_runtime_publication_digest(digest_payload) != reconstructed.record_digest:
+            raise ValueError
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SessionModelCompletionStageConflict(
+            "The durable active model-completion marker is malformed."
+        ) from exc
+    return reconstructed
+
+
+def _reconstruct_model_completion_stage_abandonment(
+    record: dict[str, Any],
+    *,
+    session_id: str,
+    stage_id: str,
+    storage_key: str,
+) -> ModelCompletionStageAbandonment:
+    try:
+        if type(record) is not dict:
+            raise TypeError
+        if set(record) != set(_ModelCompletionStageAbandonmentRecord.model_fields):
+            raise ValueError
+        for field in (
+            "record_type",
+            "session_id",
+            "stage_id",
+            "logical_step_id",
+            "purpose",
+            "preparation_request_digest",
+            "preparation_digest",
+            "active_marker_digest",
+            "source_status",
+            "abandoned_at",
+            "record_digest",
+        ):
+            if type(record[field]) is not str:
+                raise TypeError
+        for field in (
+            "schema_version",
+            "dispatch_ordinal",
+            "source_run_epoch",
+            "source_transcript_cursor",
+        ):
+            if type(record[field]) is not int:
+                raise TypeError
+        for field in (
+            "preparation_request_digest",
+            "preparation_digest",
+            "active_marker_digest",
+            "record_digest",
+        ):
+            _require_raw_sha256_digest(record[field])
+        reconstructed = _ModelCompletionStageAbandonmentRecord.model_validate(record)
+        if reconstructed.record_type != MODEL_COMPLETION_STAGE_ABANDONMENT_RECORD_TYPE:
+            raise ValueError
+        if reconstructed.schema_version != MODEL_COMPLETION_STAGE_SCHEMA_VERSION:
+            raise ValueError
+        if reconstructed.session_id != session_id or reconstructed.stage_id != stage_id:
+            raise ValueError
+        if storage_key != _model_completion_stage_abandonment_storage_key(stage_id):
+            raise ValueError
+        digest_payload = reconstructed.model_dump(mode="json", exclude={"record_digest"})
+        if _canonical_runtime_publication_digest(digest_payload) != reconstructed.record_digest:
+            raise ValueError
+        return ModelCompletionStageAbandonment(
+            session_id=reconstructed.session_id,
+            stage_id=reconstructed.stage_id,
+            logical_step_id=reconstructed.logical_step_id,
+            dispatch_ordinal=reconstructed.dispatch_ordinal,
+            purpose=reconstructed.purpose,
+            preparation_request_digest=reconstructed.preparation_request_digest,
+            preparation_digest=reconstructed.preparation_digest,
+            active_marker_digest=reconstructed.active_marker_digest,
+            source_status=reconstructed.source_status,
+            source_run_epoch=reconstructed.source_run_epoch,
+            source_transcript_cursor=reconstructed.source_transcript_cursor,
+            abandoned_at=reconstructed.abandoned_at,
+            abandonment_digest=reconstructed.record_digest,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SessionModelCompletionStageConflict(
+            "The durable model-completion abandonment is malformed or conflicts with its key."
+        ) from exc
+
+
+def _reconstruct_model_completion_stage_winner_record(
+    record: dict[str, Any],
+    *,
+    session_id: str,
+    logical_step_id: str,
+    storage_key: str,
+) -> _ModelCompletionStageWinnerRecord:
+    try:
+        if type(record) is not dict:
+            raise TypeError
+        if set(record) != set(_ModelCompletionStageWinnerRecord.model_fields):
+            raise ValueError
+        for field in (
+            "record_type",
+            "session_id",
+            "stage_id",
+            "logical_step_id",
+            "purpose",
+            "preparation_digest",
+            "completion_digest",
+            "publication_material_digest",
+            "receipt_request_digest",
+            "publication_digest",
+            "published_at",
+            "record_digest",
+        ):
+            if type(record[field]) is not str:
+                raise TypeError
+        if type(record["schema_version"]) is not int:
+            raise TypeError
+        if type(record["dispatch_ordinal"]) is not int:
+            raise TypeError
+        for field in (
+            "preparation_digest",
+            "completion_digest",
+            "publication_material_digest",
+            "receipt_request_digest",
+            "publication_digest",
+            "record_digest",
+        ):
+            _require_raw_sha256_digest(record[field])
+        reconstructed = _ModelCompletionStageWinnerRecord.model_validate(record)
+        if reconstructed.record_type != MODEL_COMPLETION_WINNER_RECORD_TYPE:
+            raise ValueError
+        if reconstructed.schema_version != MODEL_COMPLETION_STAGE_SCHEMA_VERSION:
+            raise ValueError
+        if (
+            reconstructed.session_id != session_id
+            or reconstructed.logical_step_id != logical_step_id
+            or storage_key != _model_completion_stage_winner_storage_key(logical_step_id)
+        ):
+            raise ValueError
+        digest_payload = reconstructed.model_dump(mode="json", exclude={"record_digest"})
+        if _canonical_runtime_publication_digest(digest_payload) != reconstructed.record_digest:
+            raise ValueError
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SessionModelCompletionStageConflict(
+            "The durable model-completion winner is malformed or conflicts with its key."
+        ) from exc
+    return reconstructed
+
+
+def _reconstruct_model_completion_stage_preparation(
+    record: dict[str, Any],
+    *,
+    session_id: str,
+    stage_id: str,
+    storage_key: str,
+) -> _ModelCompletionStagePreparationRecord:
+    try:
+        if type(record) is not dict:
+            raise TypeError
+        if set(record) != set(_ModelCompletionStagePreparationRecord.model_fields):
+            raise ValueError
+        for field in (
+            "record_type",
+            "session_id",
+            "stage_id",
+            "logical_step_id",
+            "purpose",
+            "request_digest",
+            "source_status",
+            "prepared_at",
+            "record_digest",
+        ):
+            if type(record[field]) is not str:
+                raise TypeError
+        if type(record["schema_version"]) is not int:
+            raise TypeError
+        if type(record["dispatch_ordinal"]) is not int:
+            raise TypeError
+        if type(record["intent"]) is not dict or type(record["reservation_ids"]) is not list:
+            raise TypeError
+        if type(record["source_run_epoch"]) is not int:
+            raise TypeError
+        if type(record["source_transcript_cursor"]) is not int:
+            raise TypeError
+        _require_raw_sha256_digest(record["request_digest"])
+        _require_raw_sha256_digest(record["record_digest"])
+        reconstructed = _ModelCompletionStagePreparationRecord.model_validate(record)
+        if reconstructed.record_type != MODEL_COMPLETION_STAGE_PREPARATION_RECORD_TYPE:
+            raise ValueError
+        if reconstructed.schema_version != MODEL_COMPLETION_STAGE_SCHEMA_VERSION:
+            raise ValueError
+        if reconstructed.session_id != session_id or reconstructed.stage_id != stage_id:
+            raise ValueError
+        _, _, expected_key, _ = _model_completion_stage_storage_identity(session_id, stage_id)
+        if storage_key != expected_key:
+            raise ValueError
+        digest_payload = reconstructed.model_dump(mode="json", exclude={"record_digest"})
+        if _canonical_runtime_publication_digest(digest_payload) != reconstructed.record_digest:
+            raise ValueError
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SessionModelCompletionStageConflict(
+            "The durable model-completion preparation is malformed or conflicts with its key."
+        ) from exc
+    return reconstructed
+
+
+def _reconstruct_model_completion_stage_terminal(
+    record: dict[str, Any],
+    *,
+    session_id: str,
+    stage_id: str,
+    storage_key: str,
+) -> _ModelCompletionStageTerminalRecord:
+    try:
+        if type(record) is not dict:
+            raise TypeError
+        if set(record) != set(_ModelCompletionStageTerminalRecord.model_fields):
+            raise ValueError
+        for field in (
+            "record_type",
+            "session_id",
+            "stage_id",
+            "logical_step_id",
+            "purpose",
+            "preparation_digest",
+            "publication_material_digest",
+            "completed_at",
+            "record_digest",
+        ):
+            if type(record[field]) is not str:
+                raise TypeError
+        if (
+            type(record["schema_version"]) is not int
+            or type(record["dispatch_ordinal"]) is not int
+            or type(record["publication"]) is not dict
+        ):
+            raise TypeError
+        _require_raw_sha256_digest(record["preparation_digest"])
+        _require_raw_sha256_digest(record["publication_material_digest"])
+        _require_raw_sha256_digest(record["record_digest"])
+        publication_record = record["publication"]
+        if set(publication_record) != set(RuntimePublicationRequest.model_fields):
+            raise ValueError
+        raw_transcript = publication_record["transcript_messages"]
+        raw_events = publication_record["events"]
+        if type(raw_transcript) is not list or type(raw_events) is not list:
+            raise TypeError
+        publication = RuntimePublicationRequest(
+            publication_id=publication_record["publication_id"],
+            kind=publication_record["kind"],
+            intent=publication_record["intent"],
+            mutation=publication_record["mutation"],
+            transcript_messages=tuple(
+                Message.model_validate(message) for message in raw_transcript
+            ),
+            events=tuple(Event.model_validate(event) for event in raw_events),
+            referenced_events=publication_record["referenced_events"],
+        )
+        reconstructed = _ModelCompletionStageTerminalRecord.model_validate(
+            {**record, "publication": publication}
+        )
+        if reconstructed.record_type != MODEL_COMPLETION_STAGE_TERMINAL_RECORD_TYPE:
+            raise ValueError
+        if reconstructed.schema_version != MODEL_COMPLETION_STAGE_SCHEMA_VERSION:
+            raise ValueError
+        if reconstructed.session_id != session_id or reconstructed.stage_id != stage_id:
+            raise ValueError
+        _, _, _, expected_key = _model_completion_stage_storage_identity(session_id, stage_id)
+        if storage_key != expected_key:
+            raise ValueError
+        publication_payload = reconstructed.publication.model_dump(mode="json")
+        if (
+            _canonical_runtime_publication_digest(publication_payload)
+            != reconstructed.publication_material_digest
+        ):
+            raise ValueError
+        digest_payload = reconstructed.model_dump(mode="json", exclude={"record_digest"})
+        if _canonical_runtime_publication_digest(digest_payload) != reconstructed.record_digest:
+            raise ValueError
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SessionModelCompletionStageConflict(
+            "The durable terminal model completion is malformed or conflicts with its key."
+        ) from exc
+    return reconstructed
+
+
+def _reconstruct_model_completion_stage(
+    preparation_record: dict[str, Any] | None,
+    terminal_record: dict[str, Any] | None,
+    *,
+    session_id: str,
+    stage_id: str,
+    preparation_storage_key: str,
+    terminal_storage_key: str,
+) -> ModelCompletionStage | None:
+    if preparation_record is None:
+        if terminal_record is not None:
+            raise SessionModelCompletionStageConflict(
+                "A terminal model completion exists without its immutable preparation."
+            )
+        return None
+    preparation = _reconstruct_model_completion_stage_preparation(
+        preparation_record,
+        session_id=session_id,
+        stage_id=stage_id,
+        storage_key=preparation_storage_key,
+    )
+    terminal = None
+    if terminal_record is not None:
+        terminal = _reconstruct_model_completion_stage_terminal(
+            terminal_record,
+            session_id=session_id,
+            stage_id=stage_id,
+            storage_key=terminal_storage_key,
+        )
+        if terminal.preparation_digest != preparation.record_digest:
+            raise SessionModelCompletionStageConflict(
+                "The terminal model completion does not match its immutable preparation."
+            )
+        if (
+            terminal.logical_step_id != preparation.logical_step_id
+            or terminal.dispatch_ordinal != preparation.dispatch_ordinal
+            or terminal.purpose != preparation.purpose
+        ):
+            raise SessionModelCompletionStageConflict(
+                "The terminal model completion identity conflicts with its preparation."
+            )
+        if not _runtime_publication_json_equal(terminal.publication.intent, preparation.intent):
+            raise SessionModelCompletionStageConflict(
+                "The terminal model completion intent conflicts with its preparation."
+            )
+        try:
+            _validate_model_completion_stage_publication(
+                terminal.publication,
+                session_id=session_id,
+                stage=preparation,
+            )
+        except (TypeError, ValueError) as exc:
+            raise SessionModelCompletionStageConflict(
+                "The terminal model completion publication conflicts with its preparation."
+            ) from exc
+
+    try:
+        return ModelCompletionStage(
+            session_id=session_id,
+            stage_id=stage_id,
+            logical_step_id=preparation.logical_step_id,
+            dispatch_ordinal=preparation.dispatch_ordinal,
+            purpose=preparation.purpose,
+            state="in_flight" if terminal is None else "completed",
+            intent=preparation.intent,
+            reservation_ids=preparation.reservation_ids,
+            preparation_request_digest=preparation.request_digest,
+            preparation_digest=preparation.record_digest,
+            source_status=preparation.source_status,
+            source_run_epoch=preparation.source_run_epoch,
+            source_transcript_cursor=preparation.source_transcript_cursor,
+            prepared_at=preparation.prepared_at,
+            publication=None if terminal is None else terminal.publication,
+            publication_material_digest=(
+                None if terminal is None else terminal.publication_material_digest
+            ),
+            completion_digest=None if terminal is None else terminal.record_digest,
+            completed_at=None if terminal is None else terminal.completed_at,
+        )
+    except (TypeError, ValueError) as exc:
+        raise SessionModelCompletionStageConflict(
+            "The durable model-completion stage is malformed."
+        ) from exc
+
+
+def _reconstruct_active_model_completion_stage(
+    active_record: dict[str, Any] | None,
+    preparation_record: dict[str, Any] | None,
+    terminal_record: dict[str, Any] | None,
+    *,
+    session_id: str,
+) -> ActiveModelCompletionStage | None:
+    if active_record is None:
+        if preparation_record is not None or terminal_record is not None:
+            raise SessionModelCompletionStageConflict(
+                "Active model-completion material exists without its marker."
+            )
+        return None
+    marker = _reconstruct_active_model_completion_stage_record(
+        active_record,
+        session_id=session_id,
+    )
+    _, _, preparation_key, terminal_key = _model_completion_stage_storage_identity(
+        session_id,
+        marker.stage_id,
+    )
+    stage = _reconstruct_model_completion_stage(
+        preparation_record,
+        terminal_record,
+        session_id=session_id,
+        stage_id=marker.stage_id,
+        preparation_storage_key=preparation_key,
+        terminal_storage_key=terminal_key,
+    )
+    if stage is None:
+        raise SessionModelCompletionStageConflict(
+            "The active model-completion marker references a missing stage."
+        )
+    if (
+        stage.logical_step_id != marker.logical_step_id
+        or stage.dispatch_ordinal != marker.dispatch_ordinal
+        or stage.purpose != marker.purpose
+        or stage.preparation_digest != marker.preparation_digest
+        or stage.source_status != marker.source_status
+        or stage.source_run_epoch != marker.source_run_epoch
+        or stage.source_transcript_cursor != marker.source_transcript_cursor
+    ):
+        raise SessionModelCompletionStageConflict(
+            "The active model-completion marker conflicts with its stage."
+        )
+    try:
+        return ActiveModelCompletionStage(
+            stage=stage,
+            activated_at=marker.activated_at,
+            marker_digest=marker.record_digest,
+        )
+    except (TypeError, ValueError) as exc:
+        raise SessionModelCompletionStageConflict(
+            "The active model-completion snapshot is malformed."
+        ) from exc
+
+
+def _reconstruct_active_model_completion_stage_from_records(
+    records: Mapping[str, dict[str, Any]],
+    *,
+    session_id: str,
+) -> ActiveModelCompletionStage | None:
+    active_record = records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY)
+    if active_record is None:
+        return None
+    marker = _reconstruct_active_model_completion_stage_record(
+        active_record,
+        session_id=session_id,
+    )
+    _, _, preparation_key, terminal_key = _model_completion_stage_storage_identity(
+        session_id,
+        marker.stage_id,
+    )
+    return _reconstruct_active_model_completion_stage(
+        active_record,
+        records.get(preparation_key),
+        records.get(terminal_key),
+        session_id=session_id,
+    )
+
+
+def _validate_model_completion_active_marker_for_preparation(
+    active: ActiveModelCompletionStage | None,
+    prepared: _PreparedModelCompletionStage,
+    *,
+    source_status: SessionStatus,
+) -> None:
+    if active is None:
+        return
+    current = active.stage
+    request = prepared.request
+    if current.state == "completed":
+        raise SessionModelCompletionStageConflict(
+            "A terminal model-completion stage must be published before another dispatch."
+        )
+    if (
+        current.logical_step_id != request.logical_step_id
+        or current.purpose != request.purpose
+        or current.source_status != source_status
+        or current.source_run_epoch != prepared.expected_run_epoch
+        or current.source_transcript_cursor != prepared.expected_transcript_cursor
+    ):
+        raise SessionModelCompletionStageConflict(
+            "A different logical model completion is already active for the session."
+        )
+    if request.dispatch_ordinal <= current.dispatch_ordinal:
+        raise SessionModelCompletionStageConflict(
+            "A model-completion retry must advance dispatch_ordinal monotonically."
+        )
+
+
+def _validate_model_completion_preparation_replay_state(
+    stage: ModelCompletionStage,
+    *,
+    active: ActiveModelCompletionStage | None,
+    winner_exists: bool,
+    receipt_exists: bool,
+) -> None:
+    if winner_exists or receipt_exists:
+        raise SessionModelCompletionStageConflict(
+            "A prepared model-completion stage already has durable publication state."
+        )
+    if active is None:
+        raise SessionModelCompletionStageConflict(
+            "A prepared model-completion stage no longer has an active marker."
+        )
+    active_stage = active.stage
+    if (
+        active_stage.stage_id != stage.stage_id
+        or active_stage.logical_step_id != stage.logical_step_id
+        or active_stage.dispatch_ordinal != stage.dispatch_ordinal
+        or active_stage.purpose != stage.purpose
+        or active_stage.preparation_digest != stage.preparation_digest
+        or active_stage.source_status != stage.source_status
+        or active_stage.source_run_epoch != stage.source_run_epoch
+        or active_stage.source_transcript_cursor != stage.source_transcript_cursor
+    ):
+        raise SessionModelCompletionStageConflict(
+            "The prepared model-completion stage is no longer the exact active dispatch."
+        )
+
+
+def _validate_model_completion_stage_repreparation(
+    abandonment_record: dict[str, Any] | None,
+    prepared: _PreparedModelCompletionStage,
+    *,
+    source_status: SessionStatus,
+) -> None:
+    if abandonment_record is None:
+        return
+    abandonment = _reconstruct_model_completion_stage_abandonment(
+        abandonment_record,
+        session_id=prepared.session_id,
+        stage_id=prepared.request.stage_id,
+        storage_key=prepared.abandonment_storage_key,
+    )
+    request = prepared.request
+    if (
+        abandonment.logical_step_id != request.logical_step_id
+        or abandonment.dispatch_ordinal != request.dispatch_ordinal
+        or abandonment.purpose != request.purpose
+        or abandonment.preparation_request_digest != prepared.request_digest
+        or abandonment.source_status != source_status
+        or abandonment.source_run_epoch != prepared.expected_run_epoch
+        or abandonment.source_transcript_cursor != prepared.expected_transcript_cursor
+    ):
+        raise SessionModelCompletionStageConflict(
+            "An abandoned model-completion stage id can only be reused for its exact "
+            "request and durable source boundary."
+        )
+
+
+def _replay_model_completion_stage_abandonment(
+    prepared: _PreparedModelCompletionStageAbandonment,
+    abandonment_record: dict[str, Any] | None,
+) -> ModelCompletionStageAbandonmentResult:
+    if abandonment_record is None:
+        raise KeyError(f"Model-completion stage not found: {prepared.stage_id}")
+    abandonment = _reconstruct_model_completion_stage_abandonment(
+        abandonment_record,
+        session_id=prepared.session_id,
+        stage_id=prepared.stage_id,
+        storage_key=prepared.abandonment_storage_key,
+    )
+    if (
+        abandonment.preparation_digest != prepared.preparation_digest
+        or abandonment.source_run_epoch != prepared.expected_run_epoch
+    ):
+        raise SessionModelCompletionStageConflict(
+            "The model-completion abandonment conflicts with the durable tombstone."
+        )
+    return ModelCompletionStageAbandonmentResult(
+        abandonment=abandonment,
+        replayed=True,
+    )
+
+
+def _validate_model_completion_stage_for_abandonment(
+    *,
+    session: Session,
+    stage: ModelCompletionStage,
+    active: ActiveModelCompletionStage | None,
+    prepared: _PreparedModelCompletionStageAbandonment,
+    abandonment_record: dict[str, Any] | None,
+    winner_exists: bool,
+    receipt_exists: bool,
+) -> None:
+    if stage.state != "in_flight":
+        raise SessionModelCompletionStageConflict(
+            "A terminal model-completion stage cannot be abandoned."
+        )
+    if stage.preparation_digest != prepared.preparation_digest:
+        raise SessionModelCompletionStageConflict(
+            "The model-completion abandonment preparation digest is stale."
+        )
+    if stage.source_run_epoch != prepared.expected_run_epoch:
+        raise SessionRunFenced(
+            "Model-completion stage run epoch is stale: expected "
+            f"{prepared.expected_run_epoch}, prepared {stage.source_run_epoch}."
+        )
+    _assert_session_run_epoch(prepared.session_id, session)
+    if session.run_epoch != prepared.expected_run_epoch:
+        raise SessionRunFenced(
+            "Session source run epoch is stale: expected "
+            f"{prepared.expected_run_epoch}, current {session.run_epoch}."
+        )
+    if active is None or active.stage != stage:
+        raise SessionModelCompletionStageConflict(
+            "Only the exact active model-completion stage can be abandoned."
+        )
+    if winner_exists or receipt_exists:
+        raise SessionModelCompletionStageConflict(
+            "A model-completion stage with durable publication state cannot be abandoned."
+        )
+    if abandonment_record is None:
+        return
+    prior = _reconstruct_model_completion_stage_abandonment(
+        abandonment_record,
+        session_id=prepared.session_id,
+        stage_id=prepared.stage_id,
+        storage_key=prepared.abandonment_storage_key,
+    )
+    if (
+        prior.logical_step_id != stage.logical_step_id
+        or prior.dispatch_ordinal != stage.dispatch_ordinal
+        or prior.purpose != stage.purpose
+        or prior.preparation_request_digest != stage.preparation_request_digest
+        or prior.source_status != stage.source_status
+        or prior.source_run_epoch != stage.source_run_epoch
+        or prior.source_transcript_cursor != stage.source_transcript_cursor
+    ):
+        raise SessionModelCompletionStageConflict(
+            "The active model-completion stage conflicts with its prior abandonment."
+        )
+    if prior.preparation_digest == stage.preparation_digest:
+        raise SessionModelCompletionStageConflict(
+            "An abandoned model-completion preparation was unexpectedly restored."
+        )
+
+
+def _validate_model_completion_promotion_replay_active_marker(
+    active: ActiveModelCompletionStage | None,
+    stage: ModelCompletionStage,
+) -> None:
+    if active is not None and active.stage.logical_step_id == stage.logical_step_id:
+        raise SessionModelCompletionStageConflict(
+            "A published model-completion winner still has an active marker."
+        )
+
+
+def _model_completion_terminal_advances_last_activity(
+    active_record: dict[str, Any] | None,
+    *,
+    stage: ModelCompletionStage,
+    current_run_epoch: int,
+) -> bool:
+    if active_record is None:
+        return False
+    try:
+        marker = _reconstruct_active_model_completion_stage_record(
+            active_record,
+            session_id=stage.session_id,
+        )
+    except SessionModelCompletionStageConflict:
+        # Terminal provider evidence is append-only even when unrelated active
+        # state is corrupt. A malformed marker can never refresh run liveness.
+        return False
+    return (
+        stage.source_run_epoch == current_run_epoch
+        and marker.stage_id == stage.stage_id
+        and marker.logical_step_id == stage.logical_step_id
+        and marker.dispatch_ordinal == stage.dispatch_ordinal
+        and marker.purpose == stage.purpose
+        and marker.preparation_digest == stage.preparation_digest
+        and marker.source_status == stage.source_status
+        and marker.source_run_epoch == stage.source_run_epoch
+        and marker.source_transcript_cursor == stage.source_transcript_cursor
+    )
+
+
+def _validate_model_completion_active_marker_for_promotion(
+    active: ActiveModelCompletionStage | None,
+    stage: ModelCompletionStage,
+) -> None:
+    if active is None:
+        raise SessionModelCompletionStageConflict(
+            "The model-completion stage is no longer active and cannot be promoted."
+        )
+    if (
+        active.stage.stage_id != stage.stage_id
+        or active.stage.logical_step_id != stage.logical_step_id
+        or active.stage.dispatch_ordinal != stage.dispatch_ordinal
+        or active.stage.purpose != stage.purpose
+        or active.stage.preparation_digest != stage.preparation_digest
+    ):
+        raise SessionModelCompletionStageConflict(
+            "The model-completion stage was superseded before promotion."
+        )
+
+
+def _validate_model_completion_stage_winner(
+    winner_record: dict[str, Any] | None,
+    *,
+    stage: ModelCompletionStage,
+    receipt: RuntimePublicationReceipt,
+    winner_storage_key: str,
+) -> _ModelCompletionStageWinnerRecord:
+    if winner_record is None:
+        raise SessionModelCompletionStageConflict(
+            "A model-completion receipt exists without its durable winner claim."
+        )
+    winner = _reconstruct_model_completion_stage_winner_record(
+        winner_record,
+        session_id=stage.session_id,
+        logical_step_id=stage.logical_step_id,
+        storage_key=winner_storage_key,
+    )
+    if (
+        winner.stage_id != stage.stage_id
+        or winner.dispatch_ordinal != stage.dispatch_ordinal
+        or winner.purpose != stage.purpose
+        or winner.preparation_digest != stage.preparation_digest
+        or winner.completion_digest != stage.completion_digest
+        or winner.publication_material_digest != stage.publication_material_digest
+        or winner.receipt_request_digest != receipt.request_digest
+        or winner.publication_digest != receipt.publication_digest
+        or winner.published_at != receipt.published_at
+    ):
+        raise SessionModelCompletionStageConflict(
+            "The runtime publication receipt belongs to a different model-completion winner."
+        )
+    return winner
+
+
+def _validate_model_completion_stage_preparation_replay(
+    stage: ModelCompletionStage,
+    prepared: _PreparedModelCompletionStage,
+) -> None:
+    if stage.preparation_request_digest != prepared.request_digest:
+        raise SessionModelCompletionStageConflict(
+            "The model-completion stage id was already prepared for a different request."
+        )
+
+
+def _validate_model_completion_stage_terminal_replay(
+    stage: ModelCompletionStage,
+    prepared: _PreparedModelCompletionStageTerminal,
+) -> None:
+    if (
+        stage.state != "completed"
+        or stage.publication_material_digest != prepared.publication_material_digest
+    ):
+        raise SessionModelCompletionStageConflict(
+            "The model-completion stage already has different terminal material."
+        )
+
+
+def _prepare_model_completion_stage_promotion(
+    stage: ModelCompletionStage,
+    *,
+    expected_run_epoch: int,
+) -> _PreparedRuntimePublication:
+    if stage.state != "completed" or stage.publication is None:
+        raise SessionModelCompletionStageIncomplete(
+            f"Model-completion stage is still in flight: {stage.stage_id}"
+        )
+    return _prepare_runtime_publication(
+        stage.session_id,
+        stage.publication,
+        expected_statuses={
+            stage.source_status,
+            SessionStatus.INTERRUPTING,
+        },
+        expected_run_epoch=expected_run_epoch,
+        expected_transcript_cursor=stage.source_transcript_cursor,
+    )
+
+
+def _replay_promoted_model_completion_stage(
+    *,
+    session: Session,
+    stage: ModelCompletionStage,
+    receipt_record: dict[str, Any],
+    winner_record: dict[str, Any] | None,
+) -> RuntimePublicationResult:
+    if stage.state != "completed" or stage.publication is None:
+        raise SessionModelCompletionStageIncomplete(
+            f"Model-completion stage is still in flight: {stage.stage_id}"
+        )
+    storage_key = _runtime_publication_storage_key(stage.logical_step_id)
+    receipt = _reconstruct_runtime_publication_receipt(
+        receipt_record,
+        storage_key=storage_key,
+        session_id=stage.session_id,
+        publication_id=stage.logical_step_id,
+    )
+    if (
+        receipt.source_status
+        not in {
+            stage.source_status,
+            SessionStatus.INTERRUPTING,
+        }
+        or receipt.transcript_start_cursor != stage.source_transcript_cursor
+    ):
+        raise SessionModelCompletionStageConflict(
+            "The runtime publication receipt conflicts with its model-completion stage."
+        )
+    _validate_model_completion_stage_winner(
+        winner_record,
+        stage=stage,
+        receipt=receipt,
+        winner_storage_key=_model_completion_stage_winner_storage_key(stage.logical_step_id),
+    )
+    prepared = _prepare_runtime_publication(
+        stage.session_id,
+        stage.publication,
+        expected_statuses={stage.source_status},
+        expected_run_epoch=receipt.source_run_epoch,
+        expected_transcript_cursor=stage.source_transcript_cursor,
+    )
+    receipt = _reconstruct_runtime_publication_receipt(
+        receipt_record,
+        storage_key=prepared.storage_key,
+        session_id=stage.session_id,
+        publication_id=stage.logical_step_id,
+        request_digest=prepared.request_digest,
+    )
+    _validate_runtime_publication_replay_receipt(receipt, prepared)
+    return RuntimePublicationResult(
+        session=session.model_copy(deep=True),
+        receipt=receipt,
+        replayed=True,
+    )
+
+
+def _prepare_runtime_publication(
+    session_id: str,
+    request: RuntimePublicationRequest,
+    *,
+    expected_statuses: set[SessionStatus] | None,
+    expected_run_epoch: int | None,
+    expected_transcript_cursor: int | None,
+) -> _PreparedRuntimePublication:
+    session_id = require_clean_nonblank(session_id, "session_id")
+    if type(request) is not RuntimePublicationRequest:
+        raise TypeError("Runtime publication requires a RuntimePublicationRequest.")
+    try:
+        copied_request = RuntimePublicationRequest(
+            publication_id=request.publication_id,
+            kind=request.kind,
+            intent=request.intent,
+            mutation=request.mutation,
+            transcript_messages=request.transcript_messages,
+            events=request.events,
+            referenced_events=request.referenced_events,
+        )
+    except AttributeError as exc:
+        raise ValueError("Runtime publication request is malformed.") from exc
+
+    appended_event_ids = {event.id for event in copied_request.events}
+    referenced_event_ids = set(
+        _runtime_publication_referenced_event_ids(copied_request.referenced_events)
+    )
+    overlap = appended_event_ids & referenced_event_ids
+    if overlap:
+        raise ValueError(
+            f"Runtime publication cannot both append and reference event id {min(overlap)}."
+        )
+    for event in copied_request.events:
+        if event.session_id != session_id:
+            raise ValueError("Runtime publication event session_id does not match target session.")
+
+    allowed_statuses = (
+        None
+        if expected_statuses is None
+        else frozenset(_validate_status_set(expected_statuses, "expected_statuses"))
+    )
+    expected_run_epoch = _validate_optional_runtime_publication_fence(
+        expected_run_epoch,
+        "expected_run_epoch",
+    )
+    expected_transcript_cursor = _validate_optional_runtime_publication_fence(
+        expected_transcript_cursor,
+        "expected_transcript_cursor",
+    )
+    transcript_payloads = tuple(
+        message.model_dump(mode="json") for message in copied_request.transcript_messages
+    )
+    event_payloads = tuple(event.model_dump(mode="json") for event in copied_request.events)
+    transcript_digest = _canonical_runtime_publication_digest(list(transcript_payloads))
+    events_digest = _canonical_runtime_publication_digest(list(event_payloads))
+    request_digest = _canonical_runtime_publication_digest(
+        {
+            "session_id": session_id,
+            "publication_id": copied_request.publication_id,
+            "kind": copied_request.kind,
+            "intent": copied_request.intent,
+            "mutation": copied_request.mutation.model_dump(mode="json"),
+            "transcript_messages": list(transcript_payloads),
+            "events": list(event_payloads),
+            "referenced_events": [
+                reference.model_dump(mode="json") for reference in copied_request.referenced_events
+            ],
+        }
+    )
+    return _PreparedRuntimePublication(
+        session_id=session_id,
+        storage_key=_runtime_publication_storage_key(copied_request.publication_id),
+        request=copied_request,
+        request_digest=request_digest,
+        transcript_payloads=transcript_payloads,
+        event_payloads=event_payloads,
+        transcript_digest=transcript_digest,
+        events_digest=events_digest,
+        expected_statuses=allowed_statuses,
+        expected_run_epoch=expected_run_epoch,
+        expected_transcript_cursor=expected_transcript_cursor,
+    )
+
+
+def _next_runtime_publication_timestamp(session: Session) -> datetime:
+    now = datetime.now(UTC)
+    persisted = max(session.updated_at.astimezone(UTC), session.last_activity_at.astimezone(UTC))
+    if now <= persisted:
+        return persisted + timedelta(microseconds=1)
+    return now
+
+
+def _build_runtime_publication_receipt(
+    prepared: _PreparedRuntimePublication,
+    *,
+    source_session: Session,
+    checkpoint: dict[str, Any] | None,
+    transcript_start_cursor: int,
+    published_at: datetime,
+) -> RuntimePublicationReceipt:
+    request = prepared.request
+    receipt_payload: dict[str, Any] = {
+        "record_type": RUNTIME_PUBLICATION_RECORD_TYPE,
+        "schema_version": RUNTIME_PUBLICATION_SCHEMA_VERSION,
+        "session_id": prepared.session_id,
+        "publication_id": request.publication_id,
+        "kind": request.kind,
+        "intent": request.intent,
+        "request_digest": prepared.request_digest,
+        "checkpoint_digest": _canonical_runtime_publication_digest(checkpoint),
+        "transcript_digest": prepared.transcript_digest,
+        "events_digest": prepared.events_digest,
+        "source_status": str(source_session.status),
+        "source_run_epoch": source_session.run_epoch,
+        "transcript_start_cursor": transcript_start_cursor,
+        "transcript_end_cursor": transcript_start_cursor + len(request.transcript_messages),
+        "appended_event_ids": [event.id for event in request.events],
+        "referenced_events": [
+            reference.model_dump(mode="json") for reference in request.referenced_events
+        ],
+        "published_at": published_at.isoformat().replace("+00:00", "Z"),
+    }
+    publication_digest = _canonical_runtime_publication_digest(receipt_payload)
+    return RuntimePublicationReceipt(
+        **receipt_payload,
+        publication_digest=publication_digest,
+    )
+
+
+def _runtime_publication_receipt_record(
+    receipt: RuntimePublicationReceipt,
+) -> dict[str, Any]:
+    return copy_durable_json_object(
+        receipt.model_dump(mode="json"),
+        "runtime_publication_receipt",
+    )
+
+
+def _reconstruct_runtime_publication_receipt(
+    record: dict[str, Any],
+    *,
+    storage_key: str,
+    session_id: str,
+    publication_id: str,
+    request_digest: str | None = None,
+) -> RuntimePublicationReceipt:
+    try:
+        if type(record) is not dict:
+            raise TypeError
+        if set(record) != set(RuntimePublicationReceipt.model_fields):
+            raise ValueError
+        string_fields = (
+            "record_type",
+            "session_id",
+            "publication_id",
+            "kind",
+            "request_digest",
+            "publication_digest",
+            "checkpoint_digest",
+            "transcript_digest",
+            "events_digest",
+            "source_status",
+            "published_at",
+        )
+        if any(type(record[field]) is not str for field in string_fields):
+            raise TypeError
+        if type(record["schema_version"]) is not int:
+            raise TypeError
+        if type(record["intent"]) is not dict:
+            raise TypeError
+        for field in (
+            "source_run_epoch",
+            "transcript_start_cursor",
+            "transcript_end_cursor",
+        ):
+            if type(record[field]) is not int:
+                raise TypeError
+        if type(record["appended_event_ids"]) is not list:
+            raise TypeError
+        if type(record["referenced_events"]) is not list:
+            raise TypeError
+        receipt = RuntimePublicationReceipt.model_validate(record)
+        if receipt.record_type != RUNTIME_PUBLICATION_RECORD_TYPE:
+            raise ValueError
+        if receipt.schema_version != RUNTIME_PUBLICATION_SCHEMA_VERSION:
+            raise ValueError
+        if receipt.session_id != session_id or receipt.publication_id != publication_id:
+            raise ValueError
+        if _runtime_publication_storage_key(receipt.publication_id) != storage_key:
+            raise ValueError
+        digest_payload = receipt.model_dump(mode="json", exclude={"publication_digest"})
+        if _canonical_runtime_publication_digest(digest_payload) != receipt.publication_digest:
+            raise ValueError
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SessionRuntimePublicationConflict(
+            "The durable runtime publication receipt is malformed or conflicts with its key."
+        ) from exc
+    if request_digest is not None and receipt.request_digest != request_digest:
+        raise SessionRuntimePublicationConflict(
+            "The runtime publication id was already used for a different request."
+        )
+    return receipt
+
+
+def _validate_runtime_publication_replay_receipt(
+    receipt: RuntimePublicationReceipt,
+    prepared: _PreparedRuntimePublication,
+) -> None:
+    request = prepared.request
+    if (
+        receipt.kind != request.kind
+        or not _runtime_publication_json_equal(receipt.intent, request.intent)
+        or receipt.transcript_digest != prepared.transcript_digest
+        or receipt.events_digest != prepared.events_digest
+        or receipt.appended_event_ids != tuple(event.id for event in request.events)
+        or receipt.referenced_events != request.referenced_events
+        or receipt.transcript_end_cursor - receipt.transcript_start_cursor
+        != len(request.transcript_messages)
+    ):
+        raise SessionRuntimePublicationConflict(
+            "The durable runtime publication receipt conflicts with its request material."
+        )
+
+
+def _validate_runtime_publication_durable_material(
+    receipt: RuntimePublicationReceipt,
+    *,
+    transcript_messages: Iterable[Message],
+    appended_events: Iterable[Event],
+    durable_referenced_events: Iterable[Event],
+) -> None:
+    """Fail closed when a receipt no longer describes its committed durable material.
+
+    Checkpoints intentionally are not re-read here: later legitimate checkpoint
+    transforms replace that mutable snapshot. ``checkpoint_digest`` remains
+    commit-time evidence, while transcript/event records are immutable material
+    that must continue to match on every load and replay.
+    """
+
+    try:
+        transcript = tuple(detach_message(message) for message in transcript_messages)
+        events = tuple(copy_event(event) for event in appended_events)
+        durable_references = tuple(copy_event(event) for event in durable_referenced_events)
+    except (AttributeError, KeyError, TypeError, UnicodeError, ValueError) as exc:
+        raise SessionRuntimePublicationConflict(
+            "The durable runtime publication material is malformed."
+        ) from exc
+    expected_transcript_count = receipt.transcript_end_cursor - receipt.transcript_start_cursor
+    if len(transcript) != expected_transcript_count:
+        raise SessionRuntimePublicationConflict(
+            "The durable runtime publication transcript segment is missing or truncated."
+        )
+    transcript_digest = _canonical_runtime_publication_digest(
+        [message.model_dump(mode="json") for message in transcript]
+    )
+    if transcript_digest != receipt.transcript_digest:
+        raise SessionRuntimePublicationConflict(
+            "The durable runtime publication transcript segment conflicts with its receipt."
+        )
+
+    if tuple(event.id for event in events) != receipt.appended_event_ids:
+        raise SessionRuntimePublicationConflict(
+            "The durable runtime publication event batch is missing or reordered."
+        )
+    events_digest = _canonical_runtime_publication_digest(
+        [event.model_dump(mode="json") for event in events]
+    )
+    if events_digest != receipt.events_digest:
+        raise SessionRuntimePublicationConflict(
+            "The durable runtime publication event batch conflicts with its receipt."
+        )
+
+    referenced_event_ids = _runtime_publication_referenced_event_ids(receipt.referenced_events)
+    if tuple(event.id for event in durable_references) != referenced_event_ids:
+        raise SessionRuntimePublicationConflict(
+            "The durable runtime publication references a missing event."
+        )
+    for reference, durable_event in zip(
+        receipt.referenced_events,
+        durable_references,
+        strict=True,
+    ):
+        if _runtime_publication_event_digest(durable_event) != reference.event_digest:
+            raise SessionRuntimePublicationConflict(
+                "The durable runtime publication referenced event content conflicts with "
+                "its receipt."
+            )
 
 
 def _copy_session_event_batch(session_id: str, events: list[Event]) -> tuple[str, list[Event]]:
