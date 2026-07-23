@@ -11,7 +11,12 @@ from typing import Any, cast
 from urllib.parse import quote
 from uuid import uuid4
 
-from cayu._validation import copy_durable_json_object, copy_label_map
+from cayu._validation import (
+    copy_durable_json_object,
+    copy_label_map,
+    require_clean_nonblank,
+    require_execution_unit_id,
+)
 from cayu.core.events import Event
 from cayu.runtime.sessions import (
     PENDING_ACTION_EVENT_TYPE_VALUES,
@@ -61,10 +66,40 @@ def _register_sqlite_functions(connection: sqlite3.Connection) -> None:
     def lookup_key(value: object) -> str | None:
         return pending_action_lookup_key(value) if type(value) is str else None
 
+    def is_clean_nonblank_text(value: object) -> int:
+        if type(value) is not str:
+            return 0
+        try:
+            require_clean_nonblank(value, "value")
+        except ValueError:
+            return 0
+        return 1
+
+    def is_execution_unit_id(value: object, field_name: object) -> int:
+        if type(value) is not str or type(field_name) is not str:
+            return 0
+        try:
+            require_execution_unit_id(value, field_name)
+        except (TypeError, ValueError):
+            return 0
+        return 1
+
     connection.create_function(
         "cayu_pending_action_lookup_key",
         1,
         lookup_key,
+        deterministic=True,
+    )
+    connection.create_function(
+        "cayu_is_clean_nonblank_text",
+        1,
+        is_clean_nonblank_text,
+        deterministic=True,
+    )
+    connection.create_function(
+        "cayu_is_execution_unit_id",
+        2,
+        is_execution_unit_id,
         deterministic=True,
     )
     connection.create_aggregate(

@@ -24,11 +24,16 @@ from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, MessageRole
 from cayu.runtime.aggregates import EXACT_AGGREGATE, UsageRollupStoreResult
 from cayu.runtime.approvals import ResolutionActor, resolution_actor_payload
+from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.runtime.sessions import (
+    _TOOL_ROUND_LIFECYCLE_EVENT_TYPES,
     DELETE_BLOCKED_SESSION_STATUSES,
     FORK_TRANSCRIPT_VALIDATION_ERROR,
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
     MAX_PENDING_ACTION_TOOL_CALLS,
+    MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+    RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS,
+    RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX,
     SESSION_INSPECTION_LABEL_LIMIT,
     SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
     BudgetReservationIdentityConflict,
@@ -42,6 +47,8 @@ from cayu.runtime.sessions import (
     McpManifestBaseline,
     McpManifestBaselineLoadResult,
     McpManifestPublicationResult,
+    ModelCompletionStageAbandonmentResult,
+    ModelCompletionStageResult,
     PendingActionIssue,
     PendingActionKind,
     PendingActionListResult,
@@ -52,6 +59,8 @@ from cayu.runtime.sessions import (
     PersistedEventSideEffectDelivery,
     PersistedEventSideEffectStatus,
     RunRequest,
+    RuntimePublicationReceipt,
+    RuntimePublicationResult,
     Session,
     SessionAggregateFilter,
     SessionIdentity,
@@ -59,6 +68,7 @@ from cayu.runtime.sessions import (
     SessionListResult,
     SessionMessageDeliveryBatch,
     SessionMessageQueueStatus,
+    SessionModelCompletionStageConflict,
     SessionOperationalSnapshot,
     SessionOperationPublication,
     SessionOperationTransform,
@@ -68,6 +78,7 @@ from cayu.runtime.sessions import (
     SessionQueuedMessage,
     SessionQueuedMessagesPending,
     SessionRunFenced,
+    SessionRuntimePublicationConflict,
     SessionStateSnapshot,
     SessionStatus,
     SessionStatusConflict,
@@ -78,23 +89,69 @@ from cayu.runtime.sessions import (
     TranscriptRecord,
     UsageRollupQuery,
     _activate_session_run_fence,
+    _active_model_completion_stage_record,
     _active_unexpired_incomplete_recovery_claim_id,
     _active_unexpired_session_operation_id,
+    _apply_runtime_publication_checkpoint_mutation,
     _assert_session_run_epoch,
     _assert_session_run_epoch_value,
+    _build_runtime_publication_receipt,
     _copy_mcp_manifest_publication,
     _copy_session_event_batch,
     _current_session_run_epoch,
     _deactivate_session_run_fence,
+    _model_completion_stage_abandonment_record,
+    _model_completion_stage_preparation_record,
+    _model_completion_stage_storage_identity,
+    _model_completion_stage_terminal_record,
+    _model_completion_stage_winner_record,
+    _model_completion_stage_winner_storage_key,
+    _model_completion_terminal_advances_last_activity,
+    _ModelCompletionStagePromotionContext,
+    _next_runtime_publication_timestamp,
+    _prepare_model_completion_stage_promotion,
     _prepare_session_fork_request,
+    _PreparedModelCompletionStage,
+    _PreparedModelCompletionStageAbandonment,
+    _PreparedModelCompletionStageTerminal,
+    _PreparedRuntimePublication,
     _project_interruption_cascade_marker_fields,
     _queued_session_message_event_payload,
+    _reconstruct_active_model_completion_stage,
+    _reconstruct_active_model_completion_stage_record,
+    _reconstruct_model_completion_stage,
+    _reconstruct_model_completion_stage_abandonment,
+    _reconstruct_runtime_publication_receipt,
+    _reject_reserved_runtime_publication_key,
+    _replay_model_completion_stage_abandonment,
+    _replay_promoted_model_completion_stage,
+    _runtime_publication_json_equal,
+    _runtime_publication_receipt_record,
+    _runtime_publication_referenced_event_ids,
+    _runtime_publication_storage_key,
     _stored_mcp_manifest_baseline_json,
+    _tool_round_publication_identity,
     _validate_equivalent_queued_session_message,
     _validate_mcp_manifest_history_keys,
     _validate_mcp_manifest_publication_state,
+    _validate_model_completion_active_marker_for_preparation,
+    _validate_model_completion_active_marker_for_promotion,
+    _validate_model_completion_preparation_replay_state,
+    _validate_model_completion_promotion_replay_active_marker,
+    _validate_model_completion_stage_for_abandonment,
+    _validate_model_completion_stage_preparation_replay,
+    _validate_model_completion_stage_publication,
+    _validate_model_completion_stage_repreparation,
+    _validate_model_completion_stage_terminal_replay,
+    _validate_runtime_publication_durable_material,
+    _validate_runtime_publication_event_references,
+    _validate_runtime_publication_replay_receipt,
     _validate_session_fork_source,
+    _validate_session_operation_record_keys,
     _validate_status_set,
+    _validate_tool_round_call_ids,
+    _validate_tool_round_checkpoint_mutation,
+    _validate_tool_round_publication,
     copy_enqueue_session_message_request,
     copy_event_query,
     copy_run_request,
@@ -554,6 +611,29 @@ def _first_existing_event_id(
     return None
 
 
+def _decode_runtime_publication_record(value: str) -> Any:
+    try:
+        return json.loads(value)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise SessionRuntimePublicationConflict(
+            "The durable runtime publication receipt is malformed or conflicts with its key."
+        ) from exc
+
+
+def _decode_model_completion_stage_record(value: str) -> dict[str, Any]:
+    try:
+        decoded = json.loads(value)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise SessionModelCompletionStageConflict(
+            "The durable model-completion stage record is malformed."
+        ) from exc
+    if type(decoded) is not dict:
+        raise SessionModelCompletionStageConflict(
+            "The durable model-completion stage record is malformed."
+        )
+    return decoded
+
+
 def _event_query_session_id_batches(
     session_ids: tuple[str, ...],
 ) -> list[tuple[str, ...]]:
@@ -602,6 +682,23 @@ _EVENT_COLUMN_NAMES: tuple[str, ...] = (
     "tool_name",
     "payload_json",
 )
+
+# Keep this predicate text aligned with the revision-17 partial index. SQLite
+# can prove a parameterized lifecycle subset is covered by that index only when
+# the query also carries the index's literal predicate.
+_PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL = """
+    event_type IN (
+        'tool.call.approval_requested',
+        'session.awaiting_user_input',
+        'session.interrupted',
+        'tool.call.started',
+        'tool.call.completed',
+        'tool.call.failed',
+        'tool.call.blocked',
+        'tool.call.approval_denied'
+    )
+    AND pending_action_lookup_key IS NOT NULL
+"""
 
 
 def _event_from_row(row: sqlite3.Row) -> Event:
@@ -909,6 +1006,19 @@ class SQLiteSessionStore(SessionStore):
                     allowed_statuses=allowed_statuses,
                     expected_source_run_epoch=expected_source_run_epoch,
                 )
+                active_stage = self._connection.execute(
+                    "SELECT 1 FROM cayu_session_operations "
+                    "WHERE session_id = ? AND idempotency_key = ?",
+                    (
+                        source_session_id,
+                        MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+                    ),
+                ).fetchone()
+                if active_stage is not None:
+                    raise ValueError(
+                        "Cannot fork a session while a model-completion stage is active: "
+                        f"{source_session_id}"
+                    )
                 transcript_rows = self._connection.execute(
                     """
                     SELECT message_json
@@ -1199,6 +1309,19 @@ class SQLiteSessionStore(SessionStore):
                     raise ValueError(
                         "Cannot delete a session while durable operation "
                         f"{active_operation_id} is active: {session_id}"
+                    )
+                active_stage = self._connection.execute(
+                    "SELECT 1 FROM cayu_session_operations "
+                    "WHERE session_id = ? AND idempotency_key = ?",
+                    (
+                        session_id,
+                        MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+                    ),
+                ).fetchone()
+                if active_stage is not None:
+                    raise ValueError(
+                        "Cannot delete a session while a model-completion stage is active: "
+                        f"{session_id}"
                     )
                 # ON DELETE CASCADE removes events/labels/checkpoint/transcript;
                 # the self-FK is ON DELETE SET NULL so children keep loading.
@@ -2551,7 +2674,10 @@ class SQLiteSessionStore(SessionStore):
         idempotency_key: str,
     ) -> dict[str, Any] | None:
         session_id = require_clean_nonblank(session_id, "session_id")
-        idempotency_key = require_clean_nonblank(idempotency_key, "idempotency_key")
+        idempotency_key = _reject_reserved_runtime_publication_key(
+            idempotency_key,
+            "idempotency_key",
+        )
 
         def query(connection: sqlite3.Connection) -> dict[str, Any] | None:
             if not _session_exists(connection, session_id):
@@ -2564,6 +2690,1175 @@ class SQLiteSessionStore(SessionStore):
             return None if row is None else json.loads(row["record_json"])
 
         return await self._run_read(query)
+
+    async def _load_runtime_publication_receipt_record(
+        self,
+        session_id: str,
+        storage_key: str,
+        publication_id: str,
+    ) -> dict[str, Any] | None:
+        def query(connection: sqlite3.Connection) -> dict[str, Any] | None:
+            connection.execute("BEGIN")
+            try:
+                if not _session_exists(connection, session_id):
+                    raise KeyError(f"Session not found: {session_id}")
+                row = connection.execute(
+                    "SELECT record_json FROM cayu_session_operations "
+                    "WHERE session_id = ? AND idempotency_key = ?",
+                    (session_id, storage_key),
+                ).fetchone()
+                if row is None:
+                    return None
+                record = _decode_runtime_publication_record(row["record_json"])
+                receipt = _reconstruct_runtime_publication_receipt(
+                    record,
+                    storage_key=storage_key,
+                    session_id=session_id,
+                    publication_id=publication_id,
+                )
+                self._validate_runtime_publication_material(connection, receipt)
+                return record
+            finally:
+                connection.rollback()
+
+        return await self._run_read(query)
+
+    def _validate_runtime_publication_material(
+        self,
+        connection: sqlite3.Connection,
+        receipt: RuntimePublicationReceipt,
+    ) -> None:
+        try:
+            transcript_count = receipt.transcript_end_cursor - receipt.transcript_start_cursor
+            transcript_rows = connection.execute(
+                "SELECT message_json FROM cayu_transcript_messages "
+                "WHERE session_id = ? ORDER BY sequence ASC LIMIT ? OFFSET ?",
+                (
+                    receipt.session_id,
+                    transcript_count,
+                    receipt.transcript_start_cursor,
+                ),
+            ).fetchall()
+            transcript = [Message(**json.loads(row["message_json"])) for row in transcript_rows]
+
+            referenced_event_ids = _runtime_publication_referenced_event_ids(
+                receipt.referenced_events
+            )
+            requested_event_ids = tuple(
+                dict.fromkeys((*receipt.appended_event_ids, *referenced_event_ids))
+            )
+            events_by_id: dict[str, Event] = {}
+            if requested_event_ids:
+                placeholders = ", ".join("?" for _ in requested_event_ids)
+                rows = connection.execute(
+                    f"SELECT {', '.join(_EVENT_COLUMN_NAMES)} FROM cayu_events "
+                    f"WHERE session_id = ? AND event_id IN ({placeholders})",
+                    (receipt.session_id, *requested_event_ids),
+                ).fetchall()
+                events_by_id = {row["event_id"]: _event_from_row(row) for row in rows}
+            _validate_runtime_publication_durable_material(
+                receipt,
+                transcript_messages=transcript,
+                appended_events=(
+                    events_by_id[event_id]
+                    for event_id in receipt.appended_event_ids
+                    if event_id in events_by_id
+                ),
+                durable_referenced_events=(
+                    events_by_id[event_id]
+                    for event_id in referenced_event_ids
+                    if event_id in events_by_id
+                ),
+            )
+        except SessionRuntimePublicationConflict:
+            raise
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise SessionRuntimePublicationConflict(
+                "The durable runtime publication material is malformed."
+            ) from exc
+
+    async def _load_model_completion_stage_records(
+        self,
+        session_id: str,
+        preparation_storage_key: str,
+        terminal_storage_key: str,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        def query(
+            connection: sqlite3.Connection,
+        ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+            if not _session_exists(connection, session_id):
+                raise KeyError(f"Session not found: {session_id}")
+            rows = connection.execute(
+                "SELECT idempotency_key, record_json FROM cayu_session_operations "
+                "WHERE session_id = ? AND idempotency_key IN (?, ?)",
+                (session_id, preparation_storage_key, terminal_storage_key),
+            ).fetchall()
+            records = {
+                row["idempotency_key"]: _decode_model_completion_stage_record(row["record_json"])
+                for row in rows
+            }
+            return records.get(preparation_storage_key), records.get(terminal_storage_key)
+
+        return await self._run_read(query)
+
+    async def _load_active_model_completion_stage_records(
+        self,
+        session_id: str,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
+        def query(
+            connection: sqlite3.Connection,
+        ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
+            try:
+                connection.execute("BEGIN")
+                if not _session_exists(connection, session_id):
+                    raise KeyError(f"Session not found: {session_id}")
+                row = connection.execute(
+                    "SELECT record_json FROM cayu_session_operations "
+                    "WHERE session_id = ? AND idempotency_key = ?",
+                    (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+                ).fetchone()
+                if row is None:
+                    connection.rollback()
+                    return None, None, None
+                active_record = _decode_model_completion_stage_record(row["record_json"])
+                marker = _reconstruct_active_model_completion_stage_record(
+                    active_record,
+                    session_id=session_id,
+                )
+                _, _, preparation_key, terminal_key = _model_completion_stage_storage_identity(
+                    session_id, marker.stage_id
+                )
+                rows = connection.execute(
+                    "SELECT idempotency_key, record_json FROM cayu_session_operations "
+                    "WHERE session_id = ? AND idempotency_key IN (?, ?)",
+                    (session_id, preparation_key, terminal_key),
+                ).fetchall()
+                records = {
+                    record_row["idempotency_key"]: _decode_model_completion_stage_record(
+                        record_row["record_json"]
+                    )
+                    for record_row in rows
+                }
+                connection.rollback()
+                return (
+                    active_record,
+                    records.get(preparation_key),
+                    records.get(terminal_key),
+                )
+            except BaseException:
+                connection.rollback()
+                raise
+
+        return await self._run_read(query)
+
+    async def _prepare_model_completion_stage_atomic(
+        self,
+        prepared: _PreparedModelCompletionStage,
+    ) -> ModelCompletionStageResult:
+        session_id = prepared.session_id
+
+        def statement(connection: sqlite3.Connection) -> ModelCompletionStageResult:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                loaded = self._load_unlocked(session_id)
+                if loaded is None:
+                    raise KeyError(f"Session not found: {session_id}")
+                rows = connection.execute(
+                    "SELECT idempotency_key, record_json FROM cayu_session_operations "
+                    "WHERE session_id = ? AND idempotency_key IN (?, ?, ?)",
+                    (
+                        session_id,
+                        prepared.preparation_storage_key,
+                        prepared.terminal_storage_key,
+                        prepared.abandonment_storage_key,
+                    ),
+                ).fetchall()
+                records = {
+                    row["idempotency_key"]: _decode_model_completion_stage_record(
+                        row["record_json"]
+                    )
+                    for row in rows
+                }
+                stage = _reconstruct_model_completion_stage(
+                    records.get(prepared.preparation_storage_key),
+                    records.get(prepared.terminal_storage_key),
+                    session_id=session_id,
+                    stage_id=prepared.request.stage_id,
+                    preparation_storage_key=prepared.preparation_storage_key,
+                    terminal_storage_key=prepared.terminal_storage_key,
+                )
+                _validate_model_completion_stage_repreparation(
+                    records.get(prepared.abandonment_storage_key),
+                    prepared,
+                    source_status=loaded.status if stage is None else stage.source_status,
+                )
+                if stage is not None:
+                    _validate_model_completion_stage_preparation_replay(stage, prepared)
+
+                active_row = connection.execute(
+                    "SELECT record_json FROM cayu_session_operations "
+                    "WHERE session_id = ? AND idempotency_key = ?",
+                    (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+                ).fetchone()
+                active = None
+                if active_row is not None:
+                    active_record = _decode_model_completion_stage_record(active_row["record_json"])
+                    marker = _reconstruct_active_model_completion_stage_record(
+                        active_record,
+                        session_id=session_id,
+                    )
+                    _, _, active_preparation_key, active_terminal_key = (
+                        _model_completion_stage_storage_identity(
+                            session_id,
+                            marker.stage_id,
+                        )
+                    )
+                    active_rows = connection.execute(
+                        "SELECT idempotency_key, record_json FROM cayu_session_operations "
+                        "WHERE session_id = ? AND idempotency_key IN (?, ?)",
+                        (session_id, active_preparation_key, active_terminal_key),
+                    ).fetchall()
+                    active_records = {
+                        row["idempotency_key"]: _decode_model_completion_stage_record(
+                            row["record_json"]
+                        )
+                        for row in active_rows
+                    }
+                    active = _reconstruct_active_model_completion_stage(
+                        active_record,
+                        active_records.get(active_preparation_key),
+                        active_records.get(active_terminal_key),
+                        session_id=session_id,
+                    )
+                publication_rows = connection.execute(
+                    "SELECT idempotency_key FROM cayu_session_operations "
+                    "WHERE session_id = ? AND idempotency_key IN (?, ?)",
+                    (
+                        session_id,
+                        prepared.winner_storage_key,
+                        prepared.publication_storage_key,
+                    ),
+                ).fetchall()
+                publication_keys = {row["idempotency_key"] for row in publication_rows}
+                winner_exists = prepared.winner_storage_key in publication_keys
+                receipt_exists = prepared.publication_storage_key in publication_keys
+                if stage is not None:
+                    _validate_model_completion_preparation_replay_state(
+                        stage,
+                        active=active,
+                        winner_exists=winner_exists,
+                        receipt_exists=receipt_exists,
+                    )
+                    connection.rollback()
+                    return ModelCompletionStageResult(
+                        stage=stage,
+                        replayed=True,
+                        dispatch_authorized=False,
+                    )
+                _validate_model_completion_active_marker_for_preparation(
+                    active,
+                    prepared,
+                    source_status=loaded.status,
+                )
+                if winner_exists or receipt_exists:
+                    raise SessionModelCompletionStageConflict(
+                        "The logical model step already has durable publication state."
+                    )
+
+                _assert_session_run_epoch(session_id, loaded)
+                if loaded.status not in prepared.expected_statuses:
+                    raise SessionStatusConflict(
+                        "Session status is not eligible for model-completion preparation: "
+                        f"{loaded.status}"
+                    )
+                if loaded.run_epoch != prepared.expected_run_epoch:
+                    raise SessionRunFenced(
+                        "Session source run epoch is stale: expected "
+                        f"{prepared.expected_run_epoch}, current {loaded.run_epoch}."
+                    )
+                cursor_row = connection.execute(
+                    "SELECT COUNT(*) AS count FROM cayu_transcript_messages WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                current_cursor = cursor_row["count"]
+                if current_cursor != prepared.expected_transcript_cursor:
+                    raise ValueError(
+                        "Session source transcript cursor is stale: expected "
+                        f"{prepared.expected_transcript_cursor}, current {current_cursor}."
+                    )
+
+                prepared_at = _next_runtime_publication_timestamp(loaded)
+                record = _model_completion_stage_preparation_record(
+                    prepared,
+                    source_session=loaded,
+                    prepared_at=prepared_at,
+                )
+                stage = _reconstruct_model_completion_stage(
+                    record,
+                    None,
+                    session_id=session_id,
+                    stage_id=prepared.request.stage_id,
+                    preparation_storage_key=prepared.preparation_storage_key,
+                    terminal_storage_key=prepared.terminal_storage_key,
+                )
+                assert stage is not None
+                formatted_at = sqlite_support.format_datetime(prepared_at)
+                connection.execute(
+                    "INSERT INTO cayu_session_operations "
+                    "(session_id, idempotency_key, record_json, updated_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        session_id,
+                        prepared.preparation_storage_key,
+                        sqlite_support.json_dumps(record),
+                        formatted_at,
+                    ),
+                )
+                active_record = _active_model_completion_stage_record(
+                    stage,
+                    activated_at=prepared_at,
+                )
+                connection.execute(
+                    "INSERT INTO cayu_session_operations "
+                    "(session_id, idempotency_key, record_json, updated_at) "
+                    "VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(session_id, idempotency_key) DO UPDATE SET "
+                    "record_json = excluded.record_json, updated_at = excluded.updated_at",
+                    (
+                        session_id,
+                        MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+                        sqlite_support.json_dumps(active_record),
+                        formatted_at,
+                    ),
+                )
+                cursor = connection.execute(
+                    "UPDATE cayu_sessions SET updated_at = ?, last_activity_at = ? WHERE id = ?",
+                    (formatted_at, formatted_at, session_id),
+                )
+                if cursor.rowcount != 1:
+                    raise KeyError(f"Session not found: {session_id}")
+                connection.commit()
+                return ModelCompletionStageResult(
+                    stage=stage,
+                    replayed=False,
+                    dispatch_authorized=True,
+                )
+            except BaseException:
+                connection.rollback()
+                raise
+
+        return await self._run_write(statement)
+
+    async def _complete_model_completion_stage_atomic(
+        self,
+        prepared: _PreparedModelCompletionStageTerminal,
+    ) -> ModelCompletionStageResult:
+        session_id = prepared.session_id
+
+        def statement(connection: sqlite3.Connection) -> ModelCompletionStageResult:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                loaded = self._load_unlocked(session_id)
+                if loaded is None:
+                    raise KeyError(f"Session not found: {session_id}")
+                rows = connection.execute(
+                    "SELECT idempotency_key, record_json FROM cayu_session_operations "
+                    "WHERE session_id = ? AND idempotency_key IN (?, ?)",
+                    (
+                        session_id,
+                        prepared.preparation_storage_key,
+                        prepared.terminal_storage_key,
+                    ),
+                ).fetchall()
+                records = {
+                    row["idempotency_key"]: _decode_model_completion_stage_record(
+                        row["record_json"]
+                    )
+                    for row in rows
+                }
+                stage = _reconstruct_model_completion_stage(
+                    records.get(prepared.preparation_storage_key),
+                    records.get(prepared.terminal_storage_key),
+                    session_id=session_id,
+                    stage_id=prepared.stage_id,
+                    preparation_storage_key=prepared.preparation_storage_key,
+                    terminal_storage_key=prepared.terminal_storage_key,
+                )
+                if stage is None:
+                    raise KeyError(f"Model-completion stage not found: {prepared.stage_id}")
+                if stage.state == "completed":
+                    _validate_model_completion_stage_terminal_replay(stage, prepared)
+                    connection.rollback()
+                    return ModelCompletionStageResult(
+                        stage=stage,
+                        replayed=True,
+                        dispatch_authorized=False,
+                    )
+                _validate_model_completion_stage_publication(
+                    prepared.publication,
+                    session_id=session_id,
+                    stage=stage,
+                )
+                if not _runtime_publication_json_equal(prepared.publication.intent, stage.intent):
+                    raise SessionModelCompletionStageConflict(
+                        "The terminal model completion intent conflicts with its preparation."
+                    )
+
+                completed_at = _next_runtime_publication_timestamp(loaded)
+                terminal_record = _model_completion_stage_terminal_record(
+                    prepared,
+                    stage=stage,
+                    completed_at=completed_at,
+                )
+                completed_stage = _reconstruct_model_completion_stage(
+                    records[prepared.preparation_storage_key],
+                    terminal_record,
+                    session_id=session_id,
+                    stage_id=prepared.stage_id,
+                    preparation_storage_key=prepared.preparation_storage_key,
+                    terminal_storage_key=prepared.terminal_storage_key,
+                )
+                assert completed_stage is not None
+                active_row = connection.execute(
+                    "SELECT record_json FROM cayu_session_operations "
+                    "WHERE session_id = ? AND idempotency_key = ?",
+                    (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+                ).fetchone()
+                active_record = (
+                    None
+                    if active_row is None
+                    else _decode_model_completion_stage_record(active_row["record_json"])
+                )
+                advances_last_activity = _model_completion_terminal_advances_last_activity(
+                    active_record,
+                    stage=stage,
+                    current_run_epoch=loaded.run_epoch,
+                )
+                formatted_at = sqlite_support.format_datetime(completed_at)
+                connection.execute(
+                    "INSERT INTO cayu_session_operations "
+                    "(session_id, idempotency_key, record_json, updated_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        session_id,
+                        prepared.terminal_storage_key,
+                        sqlite_support.json_dumps(terminal_record),
+                        formatted_at,
+                    ),
+                )
+                cursor = connection.execute(
+                    "UPDATE cayu_sessions SET updated_at = ?, "
+                    "last_activity_at = CASE WHEN ? THEN ? ELSE last_activity_at END "
+                    "WHERE id = ?",
+                    (
+                        formatted_at,
+                        advances_last_activity,
+                        formatted_at,
+                        session_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise KeyError(f"Session not found: {session_id}")
+                connection.commit()
+                return ModelCompletionStageResult(
+                    stage=completed_stage,
+                    replayed=False,
+                    dispatch_authorized=False,
+                )
+            except BaseException:
+                connection.rollback()
+                raise
+
+        return await self._run_write(statement)
+
+    async def _abandon_model_completion_stage_atomic(
+        self,
+        prepared: _PreparedModelCompletionStageAbandonment,
+    ) -> ModelCompletionStageAbandonmentResult:
+        session_id = prepared.session_id
+
+        def statement(
+            connection: sqlite3.Connection,
+        ) -> ModelCompletionStageAbandonmentResult:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                loaded = self._load_unlocked(session_id)
+                if loaded is None:
+                    raise KeyError(f"Session not found: {session_id}")
+                rows = connection.execute(
+                    "SELECT idempotency_key, record_json FROM cayu_session_operations "
+                    "WHERE session_id = ? AND idempotency_key IN (?, ?, ?)",
+                    (
+                        session_id,
+                        prepared.preparation_storage_key,
+                        prepared.terminal_storage_key,
+                        prepared.abandonment_storage_key,
+                    ),
+                ).fetchall()
+                records = {
+                    row["idempotency_key"]: _decode_model_completion_stage_record(
+                        row["record_json"]
+                    )
+                    for row in rows
+                }
+                stage = _reconstruct_model_completion_stage(
+                    records.get(prepared.preparation_storage_key),
+                    records.get(prepared.terminal_storage_key),
+                    session_id=session_id,
+                    stage_id=prepared.stage_id,
+                    preparation_storage_key=prepared.preparation_storage_key,
+                    terminal_storage_key=prepared.terminal_storage_key,
+                )
+                active_row = connection.execute(
+                    "SELECT record_json FROM cayu_session_operations "
+                    "WHERE session_id = ? AND idempotency_key = ?",
+                    (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+                ).fetchone()
+                active_record = (
+                    None
+                    if active_row is None
+                    else _decode_model_completion_stage_record(active_row["record_json"])
+                )
+                if stage is None:
+                    if active_record is not None:
+                        active_marker = _reconstruct_active_model_completion_stage_record(
+                            active_record,
+                            session_id=session_id,
+                        )
+                        if active_marker.stage_id == prepared.stage_id:
+                            raise SessionModelCompletionStageConflict(
+                                "The active model-completion marker references a missing stage."
+                            )
+                    replayed = _replay_model_completion_stage_abandonment(
+                        prepared,
+                        records.get(prepared.abandonment_storage_key),
+                    )
+                    publication_rows = connection.execute(
+                        "SELECT idempotency_key FROM cayu_session_operations "
+                        "WHERE session_id = ? AND idempotency_key IN (?, ?)",
+                        (
+                            session_id,
+                            _model_completion_stage_winner_storage_key(
+                                replayed.abandonment.logical_step_id
+                            ),
+                            _runtime_publication_storage_key(replayed.abandonment.logical_step_id),
+                        ),
+                    ).fetchall()
+                    if publication_rows:
+                        raise SessionModelCompletionStageConflict(
+                            "An abandoned model-completion stage has durable publication state."
+                        )
+                    connection.rollback()
+                    return replayed
+
+                active = _reconstruct_active_model_completion_stage(
+                    active_record,
+                    records.get(prepared.preparation_storage_key),
+                    records.get(prepared.terminal_storage_key),
+                    session_id=session_id,
+                )
+                winner_storage_key = _model_completion_stage_winner_storage_key(
+                    stage.logical_step_id
+                )
+                publication_storage_key = _runtime_publication_storage_key(stage.logical_step_id)
+                publication_rows = connection.execute(
+                    "SELECT idempotency_key FROM cayu_session_operations "
+                    "WHERE session_id = ? AND idempotency_key IN (?, ?)",
+                    (session_id, winner_storage_key, publication_storage_key),
+                ).fetchall()
+                publication_keys = {row["idempotency_key"] for row in publication_rows}
+                _validate_model_completion_stage_for_abandonment(
+                    session=loaded,
+                    stage=stage,
+                    active=active,
+                    prepared=prepared,
+                    abandonment_record=records.get(prepared.abandonment_storage_key),
+                    winner_exists=winner_storage_key in publication_keys,
+                    receipt_exists=publication_storage_key in publication_keys,
+                )
+                assert active is not None
+                abandoned_at = _next_runtime_publication_timestamp(loaded)
+                abandonment_record = _model_completion_stage_abandonment_record(
+                    stage,
+                    active=active,
+                    abandoned_at=abandoned_at,
+                )
+                abandonment = _reconstruct_model_completion_stage_abandonment(
+                    abandonment_record,
+                    session_id=session_id,
+                    stage_id=prepared.stage_id,
+                    storage_key=prepared.abandonment_storage_key,
+                )
+                formatted_at = sqlite_support.format_datetime(abandoned_at)
+                connection.execute(
+                    "INSERT INTO cayu_session_operations "
+                    "(session_id, idempotency_key, record_json, updated_at) "
+                    "VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(session_id, idempotency_key) DO UPDATE SET "
+                    "record_json = excluded.record_json, updated_at = excluded.updated_at",
+                    (
+                        session_id,
+                        prepared.abandonment_storage_key,
+                        sqlite_support.json_dumps(abandonment_record),
+                        formatted_at,
+                    ),
+                )
+                deleted_preparation = connection.execute(
+                    "DELETE FROM cayu_session_operations "
+                    "WHERE session_id = ? AND idempotency_key = ?",
+                    (session_id, prepared.preparation_storage_key),
+                )
+                if deleted_preparation.rowcount != 1:
+                    raise SessionModelCompletionStageConflict(
+                        "The model-completion preparation changed during abandonment."
+                    )
+                deleted_active = connection.execute(
+                    "DELETE FROM cayu_session_operations "
+                    "WHERE session_id = ? AND idempotency_key = ?",
+                    (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+                )
+                if deleted_active.rowcount != 1:
+                    raise SessionModelCompletionStageConflict(
+                        "The active model-completion marker changed during abandonment."
+                    )
+                cursor = connection.execute(
+                    "UPDATE cayu_sessions SET updated_at = ?, last_activity_at = ? WHERE id = ?",
+                    (formatted_at, formatted_at, session_id),
+                )
+                if cursor.rowcount != 1:
+                    raise KeyError(f"Session not found: {session_id}")
+                connection.commit()
+                return ModelCompletionStageAbandonmentResult(
+                    abandonment=abandonment,
+                    replayed=False,
+                )
+            except BaseException:
+                connection.rollback()
+                raise
+
+        return await self._run_write(statement)
+
+    async def _promote_model_completion_stage_atomic(
+        self,
+        *,
+        session_id: str,
+        stage_id: str,
+        preparation_storage_key: str,
+        terminal_storage_key: str,
+        expected_run_epoch: int,
+    ) -> RuntimePublicationResult:
+        stage = await self.load_model_completion_stage(session_id, stage_id)
+        if stage is None:
+            raise KeyError(f"Model-completion stage not found: {stage_id}")
+        prepared = _prepare_model_completion_stage_promotion(
+            stage,
+            expected_run_epoch=expected_run_epoch,
+        )
+        assert stage.completion_digest is not None
+        return await self._publish_runtime_publication_atomic(
+            prepared,
+            _model_completion_stage=_ModelCompletionStagePromotionContext(
+                stage_id=stage_id,
+                preparation_storage_key=preparation_storage_key,
+                terminal_storage_key=terminal_storage_key,
+                active_storage_key=MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+                winner_storage_key=_model_completion_stage_winner_storage_key(
+                    stage.logical_step_id
+                ),
+                completion_digest=stage.completion_digest,
+            ),
+        )
+
+    async def _publish_runtime_publication_atomic(
+        self,
+        prepared: _PreparedRuntimePublication,
+        *,
+        _model_completion_stage: _ModelCompletionStagePromotionContext | None = None,
+    ) -> RuntimePublicationResult:
+        from cayu.runtime.pending_actions import (
+            pending_action_event_storage_values,
+            pending_action_lookup_key,
+        )
+
+        session_id = prepared.session_id
+        request = prepared.request
+
+        def statement(connection: sqlite3.Connection) -> RuntimePublicationResult:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                loaded = self._load_unlocked(session_id)
+                if loaded is None:
+                    raise KeyError(f"Session not found: {session_id}")
+
+                locked_stage = None
+                active_record = None
+                winner_record = None
+                if _model_completion_stage is not None:
+                    stage_rows = connection.execute(
+                        "SELECT idempotency_key, record_json FROM cayu_session_operations "
+                        "WHERE session_id = ? AND idempotency_key IN (?, ?, ?, ?)",
+                        (
+                            session_id,
+                            _model_completion_stage.preparation_storage_key,
+                            _model_completion_stage.terminal_storage_key,
+                            _model_completion_stage.active_storage_key,
+                            _model_completion_stage.winner_storage_key,
+                        ),
+                    ).fetchall()
+                    stage_records = {
+                        row["idempotency_key"]: _decode_model_completion_stage_record(
+                            row["record_json"]
+                        )
+                        for row in stage_rows
+                    }
+                    locked_stage = _reconstruct_model_completion_stage(
+                        stage_records.get(_model_completion_stage.preparation_storage_key),
+                        stage_records.get(_model_completion_stage.terminal_storage_key),
+                        session_id=session_id,
+                        stage_id=_model_completion_stage.stage_id,
+                        preparation_storage_key=(_model_completion_stage.preparation_storage_key),
+                        terminal_storage_key=_model_completion_stage.terminal_storage_key,
+                    )
+                    if locked_stage is None:
+                        raise KeyError(
+                            f"Model-completion stage not found: {_model_completion_stage.stage_id}"
+                        )
+                    if (
+                        locked_stage.completion_digest != _model_completion_stage.completion_digest
+                        or locked_stage.publication is None
+                        or not _runtime_publication_json_equal(
+                            locked_stage.publication.model_dump(mode="json"),
+                            prepared.request.model_dump(mode="json"),
+                        )
+                    ):
+                        raise SessionModelCompletionStageConflict(
+                            "Model-completion stage changed before atomic promotion."
+                        )
+                    active_record = stage_records.get(_model_completion_stage.active_storage_key)
+                    winner_record = stage_records.get(_model_completion_stage.winner_storage_key)
+
+                receipt_row = connection.execute(
+                    "SELECT record_json FROM cayu_session_operations "
+                    "WHERE session_id = ? AND idempotency_key = ?",
+                    (session_id, prepared.storage_key),
+                ).fetchone()
+                if receipt_row is not None:
+                    receipt_record = _decode_runtime_publication_record(receipt_row["record_json"])
+                    if locked_stage is not None:
+                        replay_active = None
+                        if active_record is not None:
+                            active_marker = _reconstruct_active_model_completion_stage_record(
+                                active_record,
+                                session_id=session_id,
+                            )
+                            _, _, active_preparation_key, active_terminal_key = (
+                                _model_completion_stage_storage_identity(
+                                    session_id,
+                                    active_marker.stage_id,
+                                )
+                            )
+                            active_rows = connection.execute(
+                                "SELECT idempotency_key, record_json "
+                                "FROM cayu_session_operations "
+                                "WHERE session_id = ? AND idempotency_key IN (?, ?)",
+                                (
+                                    session_id,
+                                    active_preparation_key,
+                                    active_terminal_key,
+                                ),
+                            ).fetchall()
+                            active_records = {
+                                row["idempotency_key"]: (
+                                    _decode_model_completion_stage_record(row["record_json"])
+                                )
+                                for row in active_rows
+                            }
+                            replay_active = _reconstruct_active_model_completion_stage(
+                                active_record,
+                                active_records.get(active_preparation_key),
+                                active_records.get(active_terminal_key),
+                                session_id=session_id,
+                            )
+                        _validate_model_completion_promotion_replay_active_marker(
+                            replay_active,
+                            locked_stage,
+                        )
+                        receipt = _reconstruct_runtime_publication_receipt(
+                            receipt_record,
+                            storage_key=prepared.storage_key,
+                            session_id=session_id,
+                            publication_id=request.publication_id,
+                        )
+                        self._validate_runtime_publication_material(connection, receipt)
+                        result = _replay_promoted_model_completion_stage(
+                            session=loaded,
+                            stage=locked_stage,
+                            receipt_record=receipt_record,
+                            winner_record=winner_record,
+                        )
+                        connection.rollback()
+                        return result
+                    receipt = _reconstruct_runtime_publication_receipt(
+                        receipt_record,
+                        storage_key=prepared.storage_key,
+                        session_id=session_id,
+                        publication_id=request.publication_id,
+                        request_digest=prepared.request_digest,
+                    )
+                    _validate_runtime_publication_replay_receipt(receipt, prepared)
+                    self._validate_runtime_publication_material(connection, receipt)
+                    connection.rollback()
+                    return RuntimePublicationResult(
+                        session=loaded.model_copy(deep=True),
+                        receipt=receipt,
+                        replayed=True,
+                    )
+
+                if locked_stage is not None:
+                    assert _model_completion_stage is not None
+                    if winner_record is not None:
+                        raise SessionModelCompletionStageConflict(
+                            "A model-completion winner exists without its runtime publication "
+                            "receipt."
+                        )
+                    if active_record is not None:
+                        active_marker = _reconstruct_active_model_completion_stage_record(
+                            active_record,
+                            session_id=session_id,
+                        )
+                        if active_marker.stage_id != locked_stage.stage_id:
+                            raise SessionModelCompletionStageConflict(
+                                "The model-completion stage was superseded before promotion."
+                            )
+                    active = _reconstruct_active_model_completion_stage(
+                        active_record,
+                        stage_records.get(_model_completion_stage.preparation_storage_key),
+                        stage_records.get(_model_completion_stage.terminal_storage_key),
+                        session_id=session_id,
+                    )
+                    _validate_model_completion_active_marker_for_promotion(
+                        active,
+                        locked_stage,
+                    )
+
+                _assert_session_run_epoch(session_id, loaded)
+                if (
+                    prepared.expected_statuses is not None
+                    and loaded.status not in prepared.expected_statuses
+                ):
+                    raise SessionStatusConflict(
+                        f"Session status is not eligible for runtime publication: {loaded.status}"
+                    )
+                if (
+                    prepared.expected_run_epoch is not None
+                    and loaded.run_epoch != prepared.expected_run_epoch
+                ):
+                    raise SessionRunFenced(
+                        "Session source run epoch is stale: expected "
+                        f"{prepared.expected_run_epoch}, current {loaded.run_epoch}."
+                    )
+                cursor_row = connection.execute(
+                    "SELECT COUNT(*) AS count FROM cayu_transcript_messages WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                transcript_start_cursor = cursor_row["count"]
+                if (
+                    prepared.expected_transcript_cursor is not None
+                    and transcript_start_cursor != prepared.expected_transcript_cursor
+                ):
+                    raise ValueError(
+                        "Session source transcript cursor is stale: expected "
+                        f"{prepared.expected_transcript_cursor}, "
+                        f"current {transcript_start_cursor}."
+                    )
+
+                appended_event_ids = {event.id for event in request.events}
+                referenced_event_ids = set(
+                    _runtime_publication_referenced_event_ids(request.referenced_events)
+                )
+                if appended_event_ids & referenced_event_ids:
+                    raise ValueError("Appended and referenced runtime publication events overlap.")
+                durable_referenced_events: dict[str, Event] = {}
+                if referenced_event_ids:
+                    placeholders = ", ".join("?" for _ in referenced_event_ids)
+                    rows = connection.execute(
+                        f"SELECT {', '.join(_EVENT_COLUMN_NAMES)} FROM cayu_events "
+                        f"WHERE session_id = ? AND event_id IN ({placeholders})",
+                        (session_id, *referenced_event_ids),
+                    ).fetchall()
+                    durable_referenced_events = {
+                        row["event_id"]: _event_from_row(row) for row in rows
+                    }
+                _validate_runtime_publication_event_references(
+                    request.referenced_events,
+                    durable_referenced_events,
+                )
+                current_checkpoint = self._load_checkpoint_unlocked(session_id)
+                _validate_tool_round_checkpoint_mutation(
+                    request,
+                    current_checkpoint,
+                )
+                durable_tool_events: list[Event] = []
+                tool_round_identity = _tool_round_publication_identity(request)
+                if tool_round_identity is not None:
+                    execution_identity, tool_call_ids = tool_round_identity
+                    lookup_keys = tuple(
+                        pending_action_lookup_key(tool_call_id) for tool_call_id in tool_call_ids
+                    )
+                    lifecycle_event_types = tuple(
+                        sorted(str(event_type) for event_type in _TOOL_ROUND_LIFECYCLE_EVENT_TYPES)
+                    )
+                    lookup_placeholders = ", ".join("?" for _ in lookup_keys)
+                    event_type_placeholders = ", ".join("?" for _ in lifecycle_event_types)
+                    rows = connection.execute(
+                        f"SELECT {', '.join(_EVENT_COLUMN_NAMES)} FROM cayu_events "
+                        "INDEXED BY idx_cayu_events_pending_action_lookup "
+                        f"WHERE session_id = ? AND pending_action_lookup_key IN "
+                        f"({lookup_placeholders}) AND event_type IN "
+                        f"({event_type_placeholders}) AND "
+                        f"({_PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL}) "
+                        "AND (json_extract(payload_json, '$.tool_round_id') = ? "
+                        "OR (json_extract(payload_json, '$.model_step_id') = ? "
+                        "AND json_extract(payload_json, '$.model_attempt_id') = ?) "
+                        "OR cayu_is_execution_unit_id("
+                        "json_extract(payload_json, '$.tool_round_id'), 'tool_round_id') = 0 "
+                        "OR cayu_is_execution_unit_id("
+                        "json_extract(payload_json, '$.model_step_id'), 'model_step_id') = 0 "
+                        "OR cayu_is_execution_unit_id("
+                        "json_extract(payload_json, '$.model_attempt_id'), 'model_attempt_id') = 0) "
+                        "ORDER BY sequence ASC LIMIT ?",
+                        (
+                            session_id,
+                            *lookup_keys,
+                            *lifecycle_event_types,
+                            execution_identity.tool_round_id,
+                            execution_identity.model_step_id,
+                            execution_identity.model_attempt_id,
+                            RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS + 1,
+                        ),
+                    ).fetchall()
+                    if len(rows) > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS:
+                        raise ValueError(
+                            "Tool-round lifecycle evidence exceeds the publication limit."
+                        )
+                    durable_tool_events = [_event_from_row(row) for row in rows]
+                _validate_tool_round_publication(
+                    request,
+                    durable_referenced_events,
+                    durable_tool_events=durable_tool_events,
+                )
+                existing_event_id = _first_existing_event_id(
+                    connection,
+                    session_id,
+                    [event.id for event in request.events],
+                )
+                if existing_event_id is not None:
+                    raise ValueError(
+                        f"Event already exists for session {session_id}: {existing_event_id}"
+                    )
+
+                checkpoint = _apply_runtime_publication_checkpoint_mutation(
+                    request.mutation,
+                    current_checkpoint,
+                )
+
+                transcript_rows = [
+                    (
+                        session_id,
+                        str(message.role),
+                        sqlite_support.json_dumps(message_payload),
+                    )
+                    for message, message_payload in zip(
+                        request.transcript_messages,
+                        prepared.transcript_payloads,
+                        strict=True,
+                    )
+                ]
+                event_rows = []
+                for event, event_payload in zip(
+                    request.events,
+                    prepared.event_payloads,
+                    strict=True,
+                ):
+                    lookup_key, projection, projection_bytes = pending_action_event_storage_values(
+                        event
+                    )
+                    event_rows.append(
+                        (
+                            session_id,
+                            event.id,
+                            str(event.type),
+                            sqlite_support.format_datetime(event.timestamp),
+                            event.agent_name,
+                            event.environment_name,
+                            event.workflow_name,
+                            event.tool_name,
+                            sqlite_support.json_dumps(event_payload["payload"]),
+                            lookup_key,
+                            projection,
+                            projection_bytes,
+                        )
+                    )
+
+                published_at = _next_runtime_publication_timestamp(loaded)
+                checkpoint_values = (
+                    None
+                    if checkpoint is None or not request.mutation.operations
+                    else sqlite_support.checkpoint_row_values(
+                        session_id,
+                        checkpoint,
+                        published_at,
+                    )
+                )
+                receipt = _build_runtime_publication_receipt(
+                    prepared,
+                    source_session=loaded,
+                    checkpoint=checkpoint,
+                    transcript_start_cursor=transcript_start_cursor,
+                    published_at=published_at,
+                )
+                receipt_json = sqlite_support.json_dumps(
+                    _runtime_publication_receipt_record(receipt)
+                )
+                formatted_published_at = sqlite_support.format_datetime(published_at)
+
+                if transcript_rows:
+                    connection.executemany(
+                        """
+                        INSERT INTO cayu_transcript_messages (
+                            session_id, role, message_json
+                        )
+                        VALUES (?, ?, ?)
+                        """,
+                        transcript_rows,
+                    )
+                if checkpoint_values is not None:
+                    connection.execute(
+                        """
+                        INSERT INTO cayu_checkpoints (
+                            session_id, state_json, updated_at,
+                            pending_action_source_bytes,
+                            pending_action_tool_call_count,
+                            pending_action_flags,
+                            pending_action_metrics_ready
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(session_id) DO UPDATE SET
+                            state_json = excluded.state_json,
+                            updated_at = excluded.updated_at,
+                            pending_action_source_bytes = excluded.pending_action_source_bytes,
+                            pending_action_tool_call_count = excluded.pending_action_tool_call_count,
+                            pending_action_flags = excluded.pending_action_flags,
+                            pending_action_metrics_ready = excluded.pending_action_metrics_ready
+                        """,
+                        checkpoint_values,
+                    )
+                if event_rows:
+                    connection.executemany(
+                        """
+                        INSERT INTO cayu_events (
+                            session_id, event_id, event_type, timestamp,
+                            agent_name, environment_name, workflow_name, tool_name,
+                            payload_json, pending_action_lookup_key,
+                            pending_action_projection_json, pending_action_projection_bytes
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        event_rows,
+                    )
+                    _enqueue_persisted_event_side_effects(
+                        connection,
+                        session_id,
+                        [event.id for event in request.events],
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO cayu_session_operations (
+                        session_id, idempotency_key, record_json, updated_at
+                    )
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        session_id,
+                        prepared.storage_key,
+                        receipt_json,
+                        formatted_published_at,
+                    ),
+                )
+                if locked_stage is not None and _model_completion_stage is not None:
+                    winner = _model_completion_stage_winner_record(
+                        locked_stage,
+                        receipt=receipt,
+                    )
+                    connection.execute(
+                        "INSERT INTO cayu_session_operations "
+                        "(session_id, idempotency_key, record_json, updated_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (
+                            session_id,
+                            _model_completion_stage.winner_storage_key,
+                            sqlite_support.json_dumps(winner),
+                            formatted_published_at,
+                        ),
+                    )
+                    active_delete = connection.execute(
+                        "DELETE FROM cayu_session_operations "
+                        "WHERE session_id = ? AND idempotency_key = ?",
+                        (session_id, _model_completion_stage.active_storage_key),
+                    )
+                    if active_delete.rowcount != 1:
+                        raise SessionModelCompletionStageConflict(
+                            "The active model-completion marker changed before commit."
+                        )
+                cursor = connection.execute(
+                    """
+                    UPDATE cayu_sessions
+                    SET updated_at = ?, last_activity_at = ?
+                    WHERE id = ?
+                    """,
+                    (formatted_published_at, formatted_published_at, session_id),
+                )
+                if cursor.rowcount != 1:
+                    raise KeyError(f"Session not found: {session_id}")
+                connection.commit()
+            except sqlite3.IntegrityError as exc:
+                connection.rollback()
+                existing_event_id = _first_existing_event_id(
+                    connection,
+                    session_id,
+                    [event.id for event in request.events],
+                )
+                if existing_event_id is not None:
+                    raise ValueError(
+                        f"Event already exists for session {session_id}: {existing_event_id}"
+                    ) from exc
+                receipt_row = connection.execute(
+                    "SELECT 1 FROM cayu_session_operations "
+                    "WHERE session_id = ? AND idempotency_key = ?",
+                    (session_id, prepared.storage_key),
+                ).fetchone()
+                if receipt_row is not None:
+                    raise SessionRuntimePublicationConflict(
+                        "Runtime publication receipt was inserted concurrently."
+                    ) from exc
+                raise
+            except BaseException:
+                connection.rollback()
+                raise
+            updated = loaded.model_copy(
+                update={
+                    "updated_at": published_at,
+                    "last_activity_at": published_at,
+                },
+                deep=True,
+            )
+            return RuntimePublicationResult(
+                session=updated,
+                receipt=receipt,
+                replayed=False,
+            )
+
+        return await self._run_write(statement)
 
     async def publish_session_operation(
         self,
@@ -2579,7 +3874,7 @@ class SQLiteSessionStore(SessionStore):
         return await self._publish_checkpoint_and_events(
             session_id,
             checkpoint_transform=None,
-            operation_idempotency_key=require_clean_nonblank(
+            operation_idempotency_key=_reject_reserved_runtime_publication_key(
                 idempotency_key,
                 "idempotency_key",
             ),
@@ -2703,6 +3998,7 @@ class SQLiteSessionStore(SessionStore):
                         publication.operation_records,
                         "operation_records",
                     )
+                    _validate_session_operation_record_keys(operation_records)
                 else:
                     assert checkpoint_transform is not None
                     transformed = checkpoint_transform(loaded, current_checkpoint)
@@ -2830,6 +4126,101 @@ class SQLiteSessionStore(SessionStore):
                 """,
                 (session_id,),
             ).fetchall()
+            return [_event_from_row(row) for row in rows]
+
+        return await self._run_read(query)
+
+    async def load_tool_round_lifecycle_events(
+        self,
+        session_id: str,
+        tool_call_ids: list[str] | tuple[str, ...],
+    ) -> list[Event]:
+        from cayu.runtime.pending_actions import pending_action_lookup_key
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        copied_ids = _validate_tool_round_call_ids(tool_call_ids, "tool_call_ids")
+        lookup_keys = tuple(pending_action_lookup_key(call_id) for call_id in copied_ids)
+        lifecycle_event_types = tuple(
+            sorted(str(event_type) for event_type in _TOOL_ROUND_LIFECYCLE_EVENT_TYPES)
+        )
+
+        def query(connection: sqlite3.Connection) -> list[Event]:
+            if not _session_exists(connection, session_id):
+                raise KeyError(f"Session not found: {session_id}")
+            lookup_placeholders = ", ".join("?" for _ in lookup_keys)
+            event_type_placeholders = ", ".join("?" for _ in lifecycle_event_types)
+            rows = connection.execute(
+                f"SELECT {', '.join(_EVENT_COLUMN_NAMES)} FROM cayu_events "
+                "INDEXED BY idx_cayu_events_pending_action_lookup "
+                f"WHERE session_id = ? AND pending_action_lookup_key IN "
+                f"({lookup_placeholders}) AND event_type IN "
+                f"({event_type_placeholders}) AND "
+                f"({_PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL}) "
+                "ORDER BY sequence ASC LIMIT ?",
+                (
+                    session_id,
+                    *lookup_keys,
+                    *lifecycle_event_types,
+                    RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS + 1,
+                ),
+            ).fetchall()
+            if len(rows) > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS:
+                raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
+            return [_event_from_row(row) for row in rows]
+
+        return await self._run_read(query)
+
+    async def load_tool_round_lifecycle_events_for_round(
+        self,
+        session_id: str,
+        tool_call_ids: list[str] | tuple[str, ...],
+        *,
+        tool_round_identity: ToolRoundIdentity,
+    ) -> list[Event]:
+        from cayu.runtime.pending_actions import pending_action_lookup_key
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        copied_ids = _validate_tool_round_call_ids(tool_call_ids, "tool_call_ids")
+        tool_round_identity = copy_tool_round_identity(tool_round_identity)
+        lookup_keys = tuple(pending_action_lookup_key(call_id) for call_id in copied_ids)
+        lifecycle_event_types = tuple(
+            sorted(str(event_type) for event_type in _TOOL_ROUND_LIFECYCLE_EVENT_TYPES)
+        )
+
+        def query(connection: sqlite3.Connection) -> list[Event]:
+            if not _session_exists(connection, session_id):
+                raise KeyError(f"Session not found: {session_id}")
+            lookup_placeholders = ", ".join("?" for _ in lookup_keys)
+            event_type_placeholders = ", ".join("?" for _ in lifecycle_event_types)
+            rows = connection.execute(
+                f"SELECT {', '.join(_EVENT_COLUMN_NAMES)} FROM cayu_events "
+                "INDEXED BY idx_cayu_events_pending_action_lookup "
+                f"WHERE session_id = ? AND pending_action_lookup_key IN "
+                f"({lookup_placeholders}) AND event_type IN "
+                f"({event_type_placeholders}) AND "
+                f"({_PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL}) "
+                "AND (json_extract(payload_json, '$.tool_round_id') = ? "
+                "OR (json_extract(payload_json, '$.model_step_id') = ? "
+                "AND json_extract(payload_json, '$.model_attempt_id') = ?) "
+                "OR cayu_is_execution_unit_id("
+                "json_extract(payload_json, '$.tool_round_id'), 'tool_round_id') = 0 "
+                "OR cayu_is_execution_unit_id("
+                "json_extract(payload_json, '$.model_step_id'), 'model_step_id') = 0 "
+                "OR cayu_is_execution_unit_id("
+                "json_extract(payload_json, '$.model_attempt_id'), 'model_attempt_id') = 0) "
+                "ORDER BY sequence ASC LIMIT ?",
+                (
+                    session_id,
+                    *lookup_keys,
+                    *lifecycle_event_types,
+                    tool_round_identity.tool_round_id,
+                    tool_round_identity.model_step_id,
+                    tool_round_identity.model_attempt_id,
+                    RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS + 1,
+                ),
+            ).fetchall()
+            if len(rows) > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS:
+                raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
             return [_event_from_row(row) for row in rows]
 
         return await self._run_read(query)
@@ -2982,6 +4373,9 @@ class SQLiteSessionStore(SessionStore):
         ``before`` is compared against each event's timestamp (events strictly
         older are removed). When ``session_id`` is given the prune is scoped to
         that session (which must exist); otherwise every session is pruned.
+        Sessions with an active model-completion stage, pending tool round, or
+        immutable runtime-publication receipt are retained because deleting
+        their evidence would make exact recovery or receipt replay impossible.
         Returns the number of events deleted.
         """
         if not isinstance(before, datetime):
@@ -2993,6 +4387,7 @@ class SQLiteSessionStore(SessionStore):
         def statement(connection: sqlite3.Connection) -> int:
             if session_id is not None and not _session_exists(connection, session_id):
                 raise KeyError(f"Session not found: {session_id}")
+            publication_key_pattern = RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX + "*"
             with connection:
                 if session_id is None:
                     cursor = connection.execute(
@@ -3006,8 +4401,33 @@ class SQLiteSessionStore(SessionStore):
                                 AND delivery.event_id = cayu_events.event_id
                                 AND delivery.status <> 'delivered'
                           )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM cayu_session_operations AS operation
+                              WHERE operation.session_id = cayu_events.session_id
+                                AND operation.idempotency_key GLOB ?
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM cayu_session_operations AS active_stage
+                              WHERE active_stage.session_id = cayu_events.session_id
+                                AND active_stage.idempotency_key = ?
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM cayu_checkpoints AS checkpoint
+                              WHERE checkpoint.session_id = cayu_events.session_id
+                                AND json_type(
+                                    checkpoint.state_json,
+                                    '$.pending_tool_round'
+                                ) IS NOT NULL
+                          )
                         """,
-                        (cutoff,),
+                        (
+                            cutoff,
+                            publication_key_pattern,
+                            MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+                        ),
                     )
                 else:
                     cursor = connection.execute(
@@ -3021,8 +4441,34 @@ class SQLiteSessionStore(SessionStore):
                                 AND delivery.event_id = cayu_events.event_id
                                 AND delivery.status <> 'delivered'
                           )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM cayu_session_operations AS operation
+                              WHERE operation.session_id = cayu_events.session_id
+                                AND operation.idempotency_key GLOB ?
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM cayu_session_operations AS active_stage
+                              WHERE active_stage.session_id = cayu_events.session_id
+                                AND active_stage.idempotency_key = ?
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM cayu_checkpoints AS checkpoint
+                              WHERE checkpoint.session_id = cayu_events.session_id
+                                AND json_type(
+                                    checkpoint.state_json,
+                                    '$.pending_tool_round'
+                                ) IS NOT NULL
+                          )
                         """,
-                        (session_id, cutoff),
+                        (
+                            session_id,
+                            cutoff,
+                            publication_key_pattern,
+                            MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+                        ),
                     )
             return cursor.rowcount
 
@@ -3033,7 +4479,9 @@ class SQLiteSessionStore(SessionStore):
 
         Retains the ``keep_last`` newest transcript messages (by insertion order)
         for ``session_id`` and deletes the rest, bounding transcript growth for
-        long-lived sessions. Returns the number of messages deleted.
+        long-lived sessions. Active model stages, pending tool rounds, and
+        immutable publication receipts pin the transcript until their recovery
+        material is no longer needed. Returns the number of messages deleted.
         """
         if type(keep_last) is not int:
             raise TypeError("compact_transcript 'keep_last' must be an int.")
@@ -3045,6 +4493,31 @@ class SQLiteSessionStore(SessionStore):
             if not _session_exists(connection, session_id):
                 raise KeyError(f"Session not found: {session_id}")
             with connection:
+                durability_guard = connection.execute(
+                    """
+                    SELECT 1
+                    FROM cayu_session_operations
+                    WHERE session_id = ?
+                      AND (
+                          idempotency_key GLOB ?
+                          OR idempotency_key = ?
+                      )
+                    UNION ALL
+                    SELECT 1
+                    FROM cayu_checkpoints
+                    WHERE session_id = ?
+                      AND json_type(state_json, '$.pending_tool_round') IS NOT NULL
+                    LIMIT 1
+                    """,
+                    (
+                        session_id,
+                        RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX + "*",
+                        MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+                        session_id,
+                    ),
+                ).fetchone()
+                if durability_guard is not None:
+                    return 0
                 cursor = connection.execute(
                     """
                     DELETE FROM cayu_transcript_messages
