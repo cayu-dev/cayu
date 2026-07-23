@@ -993,21 +993,43 @@ class ModelStepExecutor:
                             }
                     model_completed = True
                     completed_stream_event = stream_event
-                    provider_state_parts = transcript_helpers.provider_state_parts(
-                        stream_event.payload
-                    )
-                    assistant_message = transcript_helpers.assistant_message(
-                        content_parts=assistant_parts,
-                        provider_state_parts=provider_state_parts,
-                    )
-                    step_result = _assistant_step_result(
-                        session_id=session.id,
-                        step=step,
-                        assistant_message=assistant_message,
-                        tool_calls=tool_calls,
-                        completion=_stream_event_completion(completed_stream_event),
-                    )
-                    classification = classify_assistant_step(step_result)
+                    assistant_message = None
+                    classification = None
+                    if completion_terminal_error is None:
+                        try:
+                            provider_state_parts = transcript_helpers.provider_state_parts(
+                                stream_event.payload
+                            )
+                            assistant_message = transcript_helpers.assistant_message(
+                                content_parts=assistant_parts,
+                                provider_state_parts=provider_state_parts,
+                            )
+                        except (TypeError, ValueError):
+                            completion_terminal_error = ModelProviderError(
+                                "Model provider emitted invalid completion transcript state.",
+                                provider=registered_provider.name,
+                                error_type="ValueError",
+                                error_code="invalid_model_completion_transcript",
+                                retryable=False,
+                            )
+                            completion_diagnostics = {
+                                "completion_outcome": "invalid_transcript_state",
+                                "completion_error": {
+                                    "error": str(completion_terminal_error),
+                                    "error_type": type(completion_terminal_error).__name__,
+                                    "stage": "completion_transcript_projection",
+                                    **completion_terminal_error.error_payload_fields(),
+                                },
+                            }
+                    if completion_terminal_error is None:
+                        step_result = _assistant_step_result(
+                            session_id=session.id,
+                            step=step,
+                            assistant_message=assistant_message,
+                            tool_calls=tool_calls,
+                            completion=_stream_event_completion(completed_stream_event),
+                        )
+                        classification = classify_assistant_step(step_result)
                     event = _model_stream_event_to_runtime_event(
                         stream_event,
                         session=session,
@@ -1017,7 +1039,9 @@ class ModelStepExecutor:
                         step=step,
                         attempt=attempt,
                         max_attempts=max_attempts,
-                        classification=classification.payload(),
+                        classification=(
+                            classification.payload() if classification is not None else None
+                        ),
                         context_pressure_estimate=context_pressure_estimate,
                         transcript_cursor_after_completion=(
                             transcript_cursor_before_request

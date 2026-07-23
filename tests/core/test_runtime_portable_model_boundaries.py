@@ -257,6 +257,77 @@ def test_cayu_app_terminalizes_non_portable_completion_with_fail_closed_usage(
     assert events[-1].type == EventType.SESSION_FAILED
 
 
+@pytest.mark.parametrize(
+    "provider_state",
+    [
+        {},
+        ["not-an-object"],
+        [{"provider": 7, "state": {}}],
+        [{"provider": "fake", "state": []}],
+    ],
+    ids=["not-a-list", "part-not-an-object", "provider-not-text", "state-not-an-object"],
+)
+def test_cayu_app_preserves_completed_usage_when_provider_state_is_structurally_invalid(
+    provider_state: object,
+) -> None:
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.completed(
+                {
+                    "model": "fake-model",
+                    "usage": {
+                        "input_tokens": 7,
+                        "output_tokens": 3,
+                        "total_tokens": 10,
+                    },
+                    "provider_state": provider_state,
+                }
+            )
+        ]
+    )
+    app = CayuApp(
+        session_store=store,
+        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    session_id = "sess_invalid_provider_state"
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    assert len(provider.requests) == 1
+    assert EventType.MODEL_RETRY not in [event.type for event in events]
+    completed = next(event for event in events if event.type == EventType.MODEL_COMPLETED)
+    assert completed.payload["usage_metrics"]["input_tokens"] == 7
+    assert completed.payload["usage_metrics"]["output_tokens"] == 3
+    assert completed.payload["usage_metrics"]["total_tokens"] == 10
+    assert completed.payload["completion_outcome"] == "invalid_transcript_state"
+    assert completed.payload["completion_error"]["provider_error_code"] == (
+        "invalid_model_completion_transcript"
+    )
+    assert completed.payload["transcript_cursor"] == 1
+    assert "provider_state" not in completed.payload
+
+    usage = asyncio.run(app.get_session_usage(session_id))
+    assert usage.model_steps == 1
+    assert usage.usage.input_tokens == 7
+    assert usage.usage.output_tokens == 3
+    assert usage.usage.total_tokens == 10
+    transcript = asyncio.run(store.load_transcript(session_id))
+    assert transcript == [Message.text("user", "hello")]
+    assert events[-1].type == EventType.SESSION_FAILED
+
+
 def test_cayu_app_does_not_invoke_hostile_completion_key_equality_or_redispatch():
     rejected_key = "provider-owned-secret-key"
 

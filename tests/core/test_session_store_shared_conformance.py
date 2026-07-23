@@ -473,6 +473,90 @@ def test_session_store_conformance_preserves_undurable_completion_spend(
     asyncio.run(run())
 
 
+def test_session_store_conformance_preserves_usage_for_invalid_provider_state(
+    session_store_case,
+) -> None:
+    class InvalidProviderStateProvider(ModelProvider):
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream(self, request):
+            del request
+            self.calls += 1
+            yield ModelStreamEvent.completed(
+                {
+                    "model": "fake-model",
+                    "usage": {
+                        "input_tokens": 7,
+                        "output_tokens": 3,
+                        "total_tokens": 10,
+                    },
+                    "provider_state": {},
+                }
+            )
+
+    async def assert_durable_result(
+        store: SessionStore,
+        session_id: str,
+    ) -> None:
+        events = await store.load_events(session_id)
+        completed = next(event for event in events if event.type == EventType.MODEL_COMPLETED)
+        assert completed.payload["usage_metrics"]["input_tokens"] == 7
+        assert completed.payload["usage_metrics"]["output_tokens"] == 3
+        assert completed.payload["usage_metrics"]["total_tokens"] == 10
+        assert completed.payload["completion_outcome"] == "invalid_transcript_state"
+        assert completed.payload["completion_error"]["provider_error_code"] == (
+            "invalid_model_completion_transcript"
+        )
+        assert completed.payload["transcript_cursor"] == 1
+        assert "provider_state" not in completed.payload
+
+        app = CayuApp(session_store=store, enable_logging=False)
+        usage = await app.get_session_usage(session_id)
+        assert usage.model_steps == 1
+        assert usage.usage.input_tokens == 7
+        assert usage.usage.output_tokens == 3
+        assert usage.usage.total_tokens == 10
+        assert await store.load_transcript(session_id) == [Message.text("user", "hello")]
+        session = await store.load(session_id)
+        assert session is not None
+        assert session.status == SessionStatus.FAILED
+
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        provider = InvalidProviderStateProvider()
+        session_id = f"invalid-provider-state-{session_store_case[0]}"
+        try:
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            events = [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "hello")],
+                    )
+                )
+            ]
+
+            assert provider.calls == 1
+            assert EventType.MODEL_RETRY not in {event.type for event in events}
+            assert EventType.MODEL_ERROR not in {event.type for event in events}
+            assert events[-1].type == EventType.SESSION_FAILED
+            await assert_durable_result(store, session_id)
+
+            store = await _reopen_store(session_store_case, store)
+            await assert_durable_result(store, session_id)
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
 def _assert_durable_error(exc: BaseException, code: str) -> None:
     durable_error = extract_durable_value_error(exc)
     assert durable_error is not None
