@@ -548,7 +548,15 @@ def test_session_store_conformance_context_usage_pages_past_compaction(
                             type=EventType.MODEL_COMPLETED,
                             session_id=session_id,
                             payload={
-                                "purpose": "context_compaction",
+                                **(
+                                    {"purpose": "context_compaction"}
+                                    if index % 3 == 0
+                                    else (
+                                        {"purpose": "future_auxiliary_call"}
+                                        if index % 3 == 1
+                                        else {}
+                                    )
+                                ),
                                 "model": "summary-model",
                                 "usage": {
                                     "input_tokens": index,

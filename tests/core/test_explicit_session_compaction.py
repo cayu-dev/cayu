@@ -4228,8 +4228,9 @@ def test_sqlite_stalled_claim_renewal_cannot_keep_work_running_after_deadline(
                 raise
 
     class StalledCommitGuardSQLiteStore(SQLiteSessionStore):
-        def __init__(self) -> None:
+        def __init__(self, work_started: asyncio.Event) -> None:
             super().__init__(tmp_path / "stalled-renewal.sqlite")
+            self.work_started = work_started
             self.guard_started = threading.Event()
             self.release_guard = threading.Event()
             self.failure_publication_started = asyncio.Event()
@@ -4250,7 +4251,12 @@ def test_sqlite_stalled_claim_renewal_cannot_keep_work_running_after_deadline(
                 finally:
                     self.failure_publication_finished.set()
             commit_guard = kwargs.get("commit_guard")
-            if not self.delayed_renewal and kwargs.get("events") == [] and commit_guard is not None:
+            if (
+                self.work_started.is_set()
+                and not self.delayed_renewal
+                and kwargs.get("events") == []
+                and commit_guard is not None
+            ):
                 self.delayed_renewal = True
 
                 def delayed_commit_guard() -> None:
@@ -4278,8 +4284,8 @@ def test_sqlite_stalled_claim_renewal_cannot_keep_work_running_after_deadline(
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
-        store = StalledCommitGuardSQLiteStore()
         compactor = CancellableCompactor()
+        store = StalledCommitGuardSQLiteStore(compactor.started)
         try:
             app = CayuApp(
                 session_store=store,
@@ -4375,8 +4381,9 @@ def test_sqlite_caller_cancellation_does_not_wait_for_stalled_claim_write(
                 raise
 
     class StalledClaimWriteSQLiteStore(SQLiteSessionStore):
-        def __init__(self) -> None:
+        def __init__(self, work_started: asyncio.Event) -> None:
             super().__init__(tmp_path / "cancel-stalled-renewal.sqlite")
+            self.work_started = work_started
             self.guard_started = threading.Event()
             self.release_guard = threading.Event()
             self.failure_publication_finished = asyncio.Event()
@@ -4395,7 +4402,12 @@ def test_sqlite_caller_cancellation_does_not_wait_for_stalled_claim_write(
                 finally:
                     self.failure_publication_finished.set()
             commit_guard = kwargs.get("commit_guard")
-            if not self.delayed_renewal and kwargs.get("events") == [] and commit_guard is not None:
+            if (
+                self.work_started.is_set()
+                and not self.delayed_renewal
+                and kwargs.get("events") == []
+                and commit_guard is not None
+            ):
                 self.delayed_renewal = True
 
                 def delayed_commit_guard() -> None:
@@ -4413,8 +4425,8 @@ def test_sqlite_caller_cancellation_does_not_wait_for_stalled_claim_write(
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
-        store = StalledClaimWriteSQLiteStore()
         compactor = CancellableCompactor()
+        store = StalledClaimWriteSQLiteStore(compactor.started)
         try:
             app = CayuApp(session_store=store, enable_logging=False)
             app.register_agent(

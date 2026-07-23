@@ -50,8 +50,10 @@ from cayu.runtime.stop_policy import (
     has_run_limits,
 )
 from cayu.runtime.usage import (
+    ModelCompletionPurpose,
     causal_budget_usage_summary,
     durable_model_completed_payload,
+    is_conversational_model_completion_payload,
     normalize_usage_metrics,
     session_usage_summary,
     usage_metrics_from_event_payload,
@@ -66,6 +68,45 @@ class MutableClock:
 
     def __call__(self) -> datetime:
         return self.value
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({}, False),
+        ({"transcript_cursor": 0}, True),
+        (
+            {"purpose": ModelCompletionPurpose.CONTEXT_COMPACTION.value},
+            False,
+        ),
+        ({"purpose": "future_auxiliary_call"}, False),
+        (
+            {
+                "purpose": ModelCompletionPurpose.CONTEXT_COMPACTION.value,
+                "transcript_cursor": 2,
+            },
+            True,
+        ),
+        ({"purpose": "future_auxiliary_call", "transcript_cursor": True}, False),
+        ({"purpose": "future_auxiliary_call", "transcript_cursor": -1}, False),
+        ({"transcript_cursor": "0"}, False),
+    ],
+    ids=[
+        "markerless-cursorless",
+        "runtime-cursored-ordinary",
+        "context-compaction",
+        "future-auxiliary",
+        "provider-purpose-collision",
+        "boolean-cursor",
+        "negative-cursor",
+        "string-cursor",
+    ],
+)
+def test_model_completion_context_eligibility_is_fail_closed(
+    payload: dict[str, object],
+    expected: bool,
+) -> None:
+    assert is_conversational_model_completion_payload(payload) is expected
 
 
 def test_durable_completion_projection_drops_only_undurable_metadata() -> None:

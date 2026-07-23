@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from decimal import Decimal
 
 import pytest
 
@@ -25,13 +26,17 @@ from cayu.runtime import (
     EventOrder,
     EventQuery,
     InMemorySessionStore,
+    ModelPrice,
+    PriceBook,
     RunRequest,
     Session,
     SessionIdentity,
     StructuredOutputSpec,
+    estimate_session_cost,
 )
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
+from cayu.runtime.usage import session_usage_summary
 
 
 def test_context_usage_state_uses_one_latest_completed_event_query() -> None:
@@ -65,6 +70,7 @@ def test_context_usage_state_uses_one_latest_completed_event_query() -> None:
                     session_id=session_id,
                     payload={
                         "model": "fake-model",
+                        "transcript_cursor": index,
                         "usage": {"input_tokens": index, "output_tokens": 1},
                     },
                 )
@@ -81,6 +87,7 @@ def test_context_usage_state_uses_one_latest_completed_event_query() -> None:
     assert usage.last_input_tokens == 105
     assert usage.last_output_tokens == 1
     assert usage.last_total_tokens == 106
+    assert usage.last_transcript_cursor == 105
     assert usage.last_provider_name is None
     assert usage.last_requested_model is None
     assert usage.last_model == "fake-model"
@@ -136,7 +143,13 @@ def test_context_usage_state_pages_past_compaction_completions() -> None:
                         type=EventType.MODEL_COMPLETED,
                         session_id=session_id,
                         payload={
-                            "purpose": "context_compaction",
+                            **(
+                                {"purpose": "context_compaction"}
+                                if index % 3 == 0
+                                else (
+                                    {"purpose": "future_auxiliary_call"} if index % 3 == 1 else {}
+                                )
+                            ),
                             "model": "summary-model",
                             "usage": {
                                 "input_tokens": index,
@@ -166,7 +179,220 @@ def test_context_usage_state_pages_past_compaction_completions() -> None:
     assert all(query.order_by == EventOrder.SEQUENCE_DESC for query in store.event_queries)
 
 
-def test_context_usage_state_is_empty_with_only_compaction_completions() -> None:
+def test_later_ordinary_completion_becomes_the_context_usage_anchor() -> None:
+    store = InMemorySessionStore()
+    session_id = "usage_context_policy_later_ordinary"
+
+    async def run():
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.append_events(
+            session_id,
+            [
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id=session_id,
+                    payload={
+                        "model": "first-model",
+                        "transcript_cursor": 2,
+                        "usage": {
+                            "input_tokens": 8,
+                            "output_tokens": 2,
+                            "total_tokens": 10,
+                        },
+                    },
+                ),
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id=session_id,
+                    payload={
+                        "purpose": "future_auxiliary_call",
+                        "model": "auxiliary-model",
+                        "usage": {
+                            "input_tokens": 20,
+                            "output_tokens": 5,
+                            "total_tokens": 25,
+                        },
+                    },
+                ),
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id=session_id,
+                    payload={
+                        "model": "later-model",
+                        "transcript_cursor": 4,
+                        "usage": {
+                            "input_tokens": 12,
+                            "output_tokens": 3,
+                            "total_tokens": 15,
+                        },
+                    },
+                ),
+            ],
+        )
+        return await model_step_executor_module._context_usage_state_for_session(
+            session_store=store,
+            session_id=session_id,
+        )
+
+    usage = asyncio.run(run())
+
+    assert usage.last_input_tokens == 12
+    assert usage.last_output_tokens == 3
+    assert usage.last_total_tokens == 15
+    assert usage.last_transcript_cursor == 4
+    assert usage.last_model == "later-model"
+
+
+def test_markerless_cursorless_completion_does_not_replace_conversational_anchor() -> None:
+    store = InMemorySessionStore()
+    session_id = "usage_context_policy_skips_markerless_cursorless"
+
+    async def run():
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.append_events(
+            session_id,
+            [
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id=session_id,
+                    payload={
+                        "model": "ordinary-model",
+                        "transcript_cursor": 2,
+                        "usage": {
+                            "input_tokens": 8,
+                            "output_tokens": 2,
+                            "total_tokens": 10,
+                        },
+                    },
+                ),
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id=session_id,
+                    payload={
+                        "model": "cursorless-model",
+                        "usage": {
+                            "input_tokens": 20,
+                            "output_tokens": 5,
+                            "total_tokens": 25,
+                        },
+                    },
+                ),
+            ],
+        )
+        return await model_step_executor_module._context_usage_state_for_session(
+            session_store=store,
+            session_id=session_id,
+        )
+
+    usage = asyncio.run(run())
+
+    assert usage.last_input_tokens == 8
+    assert usage.last_output_tokens == 2
+    assert usage.last_total_tokens == 10
+    assert usage.last_transcript_cursor == 2
+    assert usage.last_model == "ordinary-model"
+
+
+def test_auxiliary_completion_is_billable_but_not_a_conversational_anchor() -> None:
+    store = InMemorySessionStore()
+    session_id = "usage_context_policy_accounting_separation"
+    completions = [
+        Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id=session_id,
+            payload={
+                "provider_name": "fake",
+                "model": "agent-model",
+                "transcript_cursor": 2,
+                "usage": {
+                    "input_tokens": 8,
+                    "output_tokens": 2,
+                    "total_tokens": 10,
+                },
+            },
+        ),
+        Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id=session_id,
+            payload={
+                "purpose": "context_compaction",
+                "provider_name": "fake",
+                "model": "summary-model",
+                "usage": {
+                    "input_tokens": 20,
+                    "output_tokens": 5,
+                    "total_tokens": 25,
+                },
+            },
+        ),
+    ]
+
+    async def run():
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="agent-model"),
+        )
+        await store.append_events(session_id, completions)
+        return await model_step_executor_module._context_usage_state_for_session(
+            session_store=store,
+            session_id=session_id,
+        )
+
+    context_usage = asyncio.run(run())
+    aggregate_usage = session_usage_summary(session_id, completions)
+    cost = estimate_session_cost(
+        session_id=session_id,
+        events=completions,
+        pricing=PriceBook(
+            prices=(
+                ModelPrice.fixed(
+                    provider_name="fake",
+                    model="agent-model",
+                    input_per_million=Decimal("1"),
+                    output_per_million=Decimal("1"),
+                ),
+                ModelPrice.fixed(
+                    provider_name="fake",
+                    model="summary-model",
+                    input_per_million=Decimal("1"),
+                    output_per_million=Decimal("1"),
+                ),
+            )
+        ),
+    )
+
+    assert context_usage.last_input_tokens == 8
+    assert context_usage.last_output_tokens == 2
+    assert context_usage.last_total_tokens == 10
+    assert context_usage.last_model == "agent-model"
+    assert aggregate_usage.model_steps == 2
+    assert aggregate_usage.usage.input_tokens == 28
+    assert aggregate_usage.usage.output_tokens == 7
+    assert aggregate_usage.usage.total_tokens == 35
+    assert cost.model_steps == 2
+    assert cost.priced_model_steps == 2
+    assert cost.total_cost == Decimal("0.000035")
+
+
+def test_context_usage_state_is_empty_with_only_cursorless_completions() -> None:
     store = InMemorySessionStore()
     session_id = "usage_context_policy_only_compaction"
 
@@ -186,6 +412,18 @@ def test_context_usage_state_is_empty_with_only_compaction_completions() -> None
                     type=EventType.MODEL_COMPLETED,
                     session_id=session_id,
                     payload={
+                        "model": "markerless-model",
+                        "usage": {
+                            "input_tokens": 10,
+                            "output_tokens": 2,
+                            "total_tokens": 12,
+                        },
+                    },
+                ),
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id=session_id,
+                    payload={
                         "purpose": "context_compaction",
                         "model": "summary-model",
                         "usage": {
@@ -194,7 +432,7 @@ def test_context_usage_state_is_empty_with_only_compaction_completions() -> None
                             "total_tokens": 25,
                         },
                     },
-                )
+                ),
             ],
         )
         return await model_step_executor_module._context_usage_state_for_session(

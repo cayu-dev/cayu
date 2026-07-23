@@ -153,6 +153,7 @@ from cayu.runtime.structured_output import (
 )
 from cayu.runtime.usage import (
     durable_model_completed_payload,
+    is_conversational_model_completion_payload,
     normalize_usage_metrics,
     usage_metrics_from_event_payload,
     usage_metrics_payload,
@@ -3318,12 +3319,7 @@ async def _context_usage_state_for_session(
         if not records:
             return ContextUsageState()
         for record in records:
-            payload = record.event.payload
-            is_compaction_completion = (
-                payload.get("purpose") == "context_compaction"
-                and _transcript_cursor_from_model_completed_event(record.event) is None
-            )
-            if not is_compaction_completion:
+            if is_conversational_model_completion_payload(record.event.payload):
                 return _context_usage_state_from_model_completed_event(record.event)
         before_sequence = records[-1].sequence
         page_size = _CONTEXT_USAGE_AUXILIARY_PAGE_SIZE

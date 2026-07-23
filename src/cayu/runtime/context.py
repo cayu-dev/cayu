@@ -69,6 +69,7 @@ from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy, retry_deci
 from cayu.runtime.sessions import Session
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.runtime.usage import (
+    ModelCompletionPurpose,
     UsageMetrics,
     durable_model_completed_payload,
     normalize_usage_metrics,
@@ -1021,7 +1022,7 @@ def sanitize_context_compaction_telemetry(
             raise ValueError("Compaction model.completed billing identities do not match.")
         if billing_identity is None:
             billing_identity = metrics_identity
-        payload["purpose"] = "context_compaction"
+        payload["purpose"] = ModelCompletionPurpose.CONTEXT_COMPACTION.value
         if billing_identity is not None:
             payload["billing_identity"] = billing_identity.model_dump(mode="json")
         raw_usage, invalid_raw_usage = _compaction_raw_usage(source.get("usage"))
@@ -3696,7 +3697,7 @@ def _durable_compaction_completion_evidence(
         "model": resolved_model,
         "provider_name": provider_name,
         "requested_model": fallback_model,
-        "purpose": "context_compaction",
+        "purpose": ModelCompletionPurpose.CONTEXT_COMPACTION.value,
         "compactor": compactor,
     }
     attempt_id = copied.get(_COMPACTION_ATTEMPT_ID_KEY)
@@ -5020,7 +5021,7 @@ def _compaction_model_completed_payload(
         payload["model"] = fallback_model
     payload["provider_name"] = provider_name
     payload["requested_model"] = fallback_model
-    payload["purpose"] = "context_compaction"
+    payload["purpose"] = ModelCompletionPurpose.CONTEXT_COMPACTION.value
     payload["compactor"] = compactor
     # When raw usage is present, the runtime below owns its normalized
     # projection and durable failure decision. Preserve the established path

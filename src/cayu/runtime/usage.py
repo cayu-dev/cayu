@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
@@ -12,6 +13,25 @@ from cayu._validation import (
 )
 from cayu.core.billing import BillingIdentity
 from cayu.core.events import Event, EventType
+
+
+class ModelCompletionPurpose(StrEnum):
+    """Runtime-owned purpose markers for auxiliary model completions."""
+
+    CONTEXT_COMPACTION = "context_compaction"
+
+
+def is_conversational_model_completion_payload(payload: dict[str, Any]) -> bool:
+    """Whether one completion may anchor the next conversational context.
+
+    A valid transcript cursor is the sole runtime-owned evidence that the
+    completion belongs to an ordinary model step, even when provider metadata
+    supplied a colliding ``purpose`` key. Cursorless completions are ineligible
+    regardless of whether they carry an explicit purpose.
+    """
+
+    transcript_cursor = payload.get("transcript_cursor")
+    return type(transcript_cursor) is int and transcript_cursor >= 0
 
 
 class CacheUsageMetrics(BaseModel):
