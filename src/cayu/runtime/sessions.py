@@ -99,6 +99,7 @@ from cayu.runtime.budgets import (
     project_budget_model_attempt_inspection_event,
     session_budget_inspection,
 )
+from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
@@ -4029,15 +4030,14 @@ class SessionStore(ABC):
         session_id: str,
         tool_call_ids: list[str] | tuple[str, ...],
         *,
-        tool_round_id: str,
+        tool_round_identity: ToolRoundIdentity,
     ) -> list[Event]:
         """Load bounded lifecycle evidence for one exact logical tool round.
 
-        The separate method preserves compatibility with custom stores that
-        override :meth:`load_tool_round_lifecycle_events` while giving built-in
-        stores an efficient round-scoped query. The fallback pages over durable
-        lifecycle events so reused provider call ids cannot hide current-round
-        evidence behind the publication binding limit.
+        Built-in stores provide indexed implementations. The default
+        implementation pages over durable lifecycle events so reused provider
+        call ids cannot hide current-round evidence behind the publication
+        binding limit.
         """
 
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -4045,7 +4045,7 @@ class SessionStore(ABC):
             tool_call_ids,
             "tool_call_ids",
         )
-        tool_round_id = require_clean_nonblank(tool_round_id, "tool_round_id")
+        tool_round_identity = copy_tool_round_identity(tool_round_identity)
         selected_ids = set(copied_ids)
         lifecycle_events: list[Event] = []
         after_sequence = 0
@@ -4067,7 +4067,7 @@ class SessionStore(ABC):
                     "tool_call_id"
                 ) not in selected_ids or not _tool_round_event_matches_scope_or_is_ambiguous(
                     event,
-                    tool_round_id,
+                    tool_round_identity,
                 ):
                     continue
                 lifecycle_events.append(copy_event(event))
@@ -4387,6 +4387,32 @@ class SessionStore(ABC):
         """Load a bounded structural projection of the durable cascade marker."""
 
 
+@dataclass(frozen=True)
+class _PreparedInMemoryEvent:
+    record: EventRecord
+    event_type: str
+    projected_record: EventRecord | None
+    retained_lookup_keys: tuple[str, ...]
+    history_lookup_keys: tuple[str, ...]
+    delivery: PersistedEventSideEffectDelivery | None
+
+
+@dataclass(frozen=True)
+class _PreparedInMemoryEventAppend:
+    events: tuple[_PreparedInMemoryEvent, ...]
+    next_sequence: int
+    budget_reservation_publications: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
+class _PreparedInMemoryCheckpointStore:
+    checkpoint: dict[str, Any]
+    has_pending_action: bool
+    rebuilt_records: dict[str, dict[str, EventRecord]] | None = None
+    rebuilt_event_history: dict[str, list[EventRecord]] | None = None
+    rebuilt_index_scope: tuple[frozenset[str], str | None, str | None, str | None] | None = None
+
+
 class InMemorySessionStore(SessionStore):
     """In-process session store for tests, local development, and examples."""
 
@@ -4413,6 +4439,14 @@ class InMemorySessionStore(SessionStore):
         self._pending_action_index_scopes: dict[
             str,
             tuple[frozenset[str], str | None, str | None, str | None],
+        ] = {}
+        # Unlike the bounded pending-action projection above, runtime publication
+        # validation must observe *every* lifecycle event for the active tool
+        # round so a caller cannot omit a contradictory second terminal event.
+        # This history is identifier-scoped and released with the pending marker.
+        self._pending_action_event_history: dict[
+            str,
+            dict[str, list[EventRecord]],
         ] = {}
         self._pending_action_latest_barrier_records: dict[str, EventRecord] = {}
         self._event_records_by_id: dict[tuple[str, str], EventRecord] = {}
@@ -4442,13 +4476,19 @@ class InMemorySessionStore(SessionStore):
         ] = {}
         self._next_session_message_ordering_key = 1
 
-    def _store_checkpoint_unlocked(self, session_id: str, checkpoint: dict[str, Any]) -> None:
+    def _prepare_checkpoint_store_unlocked(
+        self,
+        session_id: str,
+        checkpoint: dict[str, Any],
+        *,
+        additional_event_records: tuple[EventRecord, ...] = (),
+    ) -> _PreparedInMemoryCheckpointStore:
         from cayu.runtime.pending_actions import (
             checkpoint_has_pending_action_candidate,
             pending_action_checkpoint_lookup_ids,
             pending_action_event_has_unknown_round_call,
+            pending_action_event_is_from_different_tool_round,
             pending_action_event_lookup_id,
-            pending_action_event_matches_tool_round,
             pending_action_event_retains_history,
             pending_action_evidence_round_from_checkpoint,
             pending_action_lookup_key,
@@ -4456,57 +4496,71 @@ class InMemorySessionStore(SessionStore):
             retain_pending_action_index_record,
         )
 
-        self._checkpoints[session_id] = checkpoint
-        if checkpoint_has_pending_action_candidate(checkpoint):
-            lookup_keys = frozenset(
-                pending_action_lookup_key(identifier)
-                for identifier in pending_action_checkpoint_lookup_ids(checkpoint)
+        if not checkpoint_has_pending_action_candidate(checkpoint):
+            return _PreparedInMemoryCheckpointStore(
+                checkpoint=checkpoint,
+                has_pending_action=False,
             )
-            try:
-                pending_round = pending_action_evidence_round_from_checkpoint(checkpoint)
-            except (TypeError, ValueError):
-                pending_round = None
-            index_scope = (
-                lookup_keys,
-                None if pending_round is None else pending_round.model_step_id,
-                None if pending_round is None else pending_round.model_attempt_id,
-                None if pending_round is None else pending_round.tool_round_id,
-            )
+
+        lookup_keys = frozenset(
+            pending_action_lookup_key(identifier)
+            for identifier in pending_action_checkpoint_lookup_ids(checkpoint)
+        )
+        try:
+            pending_round = pending_action_evidence_round_from_checkpoint(checkpoint)
+        except (TypeError, ValueError):
+            pending_round = None
+        index_scope = (
+            lookup_keys,
+            None if pending_round is None else pending_round.model_step_id,
+            None if pending_round is None else pending_round.model_attempt_id,
+            None if pending_round is None else pending_round.tool_round_id,
+        )
+        rebuilt: dict[str, dict[str, EventRecord]] | None = None
+        rebuilt_history: dict[str, list[EventRecord]] | None = None
+        if self._pending_action_index_scopes.get(session_id) != index_scope:
+            # A public checkpoint transform may legitimately reintroduce a
+            # previously cleared durable action or reuse a provider call id for
+            # a later execution. SQL stores retain the source events, so rebuild
+            # both identity-scoped projections from complete durable evidence.
+            rebuilt = {}
+            rebuilt_history = {}
             round_lookup_key = (
                 None
                 if pending_round is None
                 else pending_action_lookup_key(pending_round.tool_round_id)
             )
-            if self._pending_action_index_scopes.get(session_id) != index_scope:
-                # Public checkpoint transforms may reintroduce a cleared action
-                # or reuse an identifier for a later execution. Rebuild the
-                # bounded, identity-scoped projection to match SQL stores.
-                rebuilt: dict[str, dict[str, EventRecord]] = {}
-                for record in self._session_event_records.get(session_id, []):
-                    event_type = str(record.event.type)
-                    if (
-                        event_type not in PENDING_ACTION_EVENT_TYPE_VALUES
-                        or event_type in PENDING_ACTION_BARRIER_EVENT_TYPE_VALUES
-                    ):
-                        continue
-                    retain_for_scope = (
-                        pending_round is not None
-                        and pending_action_event_has_unknown_round_call(
-                            record.event,
-                            pending_round,
-                        )
+            records = (
+                *self._session_event_records.get(session_id, ()),
+                *additional_event_records,
+            )
+            for record in records:
+                event_type = str(record.event.type)
+                if (
+                    event_type not in PENDING_ACTION_EVENT_TYPE_VALUES
+                    or event_type in PENDING_ACTION_BARRIER_EVENT_TYPE_VALUES
+                ):
+                    continue
+                retain_for_scope = (
+                    pending_round is not None
+                    and pending_action_event_has_unknown_round_call(
+                        record.event,
+                        pending_round,
                     )
-                    lookup_id = pending_action_event_lookup_id(record.event)
-                    if lookup_id is None and not retain_for_scope:
-                        continue
-                    projected_record = project_pending_action_event_record(record)
-                    if lookup_id is not None:
-                        lookup_key = pending_action_lookup_key(lookup_id)
-                        if lookup_key in lookup_keys and not (
+                )
+                lookup_id = pending_action_event_lookup_id(record.event)
+                if lookup_id is None and not retain_for_scope:
+                    continue
+                projected_record = project_pending_action_event_record(record)
+                if lookup_id is not None:
+                    lookup_key = pending_action_lookup_key(lookup_id)
+                    if lookup_key in lookup_keys:
+                        rebuilt_history.setdefault(lookup_key, []).append(record)
+                        if not (
                             pending_action_event_retains_history(event_type)
                             and (
                                 pending_round is None
-                                or not pending_action_event_matches_tool_round(
+                                or pending_action_event_is_from_different_tool_round(
                                     record.event,
                                     pending_round,
                                 )
@@ -4516,28 +4570,54 @@ class InMemorySessionStore(SessionStore):
                                 rebuilt.setdefault(lookup_key, {}),
                                 projected_record,
                             )
-                    if retain_for_scope:
-                        assert round_lookup_key is not None
-                        retain_pending_action_index_record(
-                            rebuilt.setdefault(round_lookup_key, {}),
-                            projected_record,
-                        )
-                self._pending_action_event_records[session_id] = rebuilt
-                self._pending_action_index_scopes[session_id] = index_scope
+                if retain_for_scope:
+                    assert round_lookup_key is not None
+                    retain_pending_action_index_record(
+                        rebuilt.setdefault(round_lookup_key, {}),
+                        projected_record,
+                    )
+                    rebuilt_history.setdefault(round_lookup_key, []).append(record)
+        return _PreparedInMemoryCheckpointStore(
+            checkpoint=checkpoint,
+            has_pending_action=True,
+            rebuilt_records=rebuilt,
+            rebuilt_event_history=rebuilt_history,
+            rebuilt_index_scope=index_scope if rebuilt is not None else None,
+        )
+
+    def _apply_checkpoint_store_unlocked(
+        self,
+        session_id: str,
+        prepared: _PreparedInMemoryCheckpointStore,
+    ) -> None:
+        self._checkpoints[session_id] = prepared.checkpoint
+        if prepared.has_pending_action:
+            if prepared.rebuilt_records is not None:
+                self._pending_action_event_records[session_id] = prepared.rebuilt_records
+                assert prepared.rebuilt_event_history is not None
+                self._pending_action_event_history[session_id] = prepared.rebuilt_event_history
+                assert prepared.rebuilt_index_scope is not None
+                self._pending_action_index_scopes[session_id] = prepared.rebuilt_index_scope
             self._pending_action_session_ids.add(session_id)
-        else:
-            self._pending_action_session_ids.discard(session_id)
-            # Once the checkpoint no longer names a pending action, identifier-
-            # scoped event history cannot contribute to a future action. Keep the
-            # latest lifecycle barrier, but release the potentially growing map.
-            removed = self._pending_action_event_records.pop(session_id, None)
-            if removed or session_id in self._pending_action_index_scopes:
-                self._pending_action_index_scopes[session_id] = (
-                    frozenset(),
-                    None,
-                    None,
-                    None,
-                )
+            return
+
+        self._pending_action_session_ids.discard(session_id)
+        # Once the checkpoint no longer names a pending action, identifier-
+        # scoped event history cannot contribute to a future action. Keep the
+        # latest lifecycle barrier, but release the potentially growing maps.
+        removed = self._pending_action_event_records.pop(session_id, None)
+        self._pending_action_event_history.pop(session_id, None)
+        if removed or session_id in self._pending_action_index_scopes:
+            self._pending_action_index_scopes[session_id] = (
+                frozenset(),
+                None,
+                None,
+                None,
+            )
+
+    def _store_checkpoint_unlocked(self, session_id: str, checkpoint: dict[str, Any]) -> None:
+        prepared = self._prepare_checkpoint_store_unlocked(session_id, checkpoint)
+        self._apply_checkpoint_store_unlocked(session_id, prepared)
 
     async def create(
         self,
@@ -4656,6 +4736,13 @@ class InMemorySessionStore(SessionStore):
                 allowed_statuses=allowed_statuses,
                 expected_source_run_epoch=expected_source_run_epoch,
             )
+            if MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY in self._session_operation_records.get(
+                source_session_id, {}
+            ):
+                raise ValueError(
+                    "Cannot fork a session while a model-completion stage is active: "
+                    f"{source_session_id}"
+                )
             if fork.id in self._sessions:
                 raise ValueError(f"Session already exists: {fork.id}")
 
@@ -4822,6 +4909,13 @@ class InMemorySessionStore(SessionStore):
                 raise ValueError(
                     "Cannot delete a session while durable operation "
                     f"{active_operation_id} is active: {session_id}"
+                )
+            if MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY in self._session_operation_records.get(
+                session_id, {}
+            ):
+                raise ValueError(
+                    "Cannot delete a session while a model-completion stage is active: "
+                    f"{session_id}"
                 )
             self._sessions.pop(session_id, None)
             self._events.pop(session_id, None)
@@ -5132,30 +5226,32 @@ class InMemorySessionStore(SessionStore):
                     "Budget ledger reused a reservation identity."
                 )
 
-    def _append_events_unlocked(
+    def _prepare_event_append_unlocked(
         self,
         session: Session,
-        events: list[Event],
-    ) -> Session:
+        events: Iterable[Event],
+        *,
+        events_are_detached: bool = False,
+    ) -> _PreparedInMemoryEventAppend:
         from cayu.runtime.pending_actions import (
             pending_action_event_has_unknown_round_call,
+            pending_action_event_is_from_different_tool_round,
             pending_action_event_lookup_id,
-            pending_action_event_matches_tool_round,
             pending_action_event_retains_history,
             pending_action_evidence_round_from_checkpoint,
             pending_action_lookup_key,
             project_pending_action_event_record,
-            retain_pending_action_index_record,
         )
 
         session_id = session.id
         existing_ids = self._event_ids[session_id]
-        for event in events:
-            if event.id in existing_ids:
-                raise ValueError(f"Event already exists for session {session_id}: {event.id}")
-
+        event_batch = tuple(events)
+        batch_ids: set[str] = set()
         budget_reservation_publications: dict[str, str] = {}
-        for event in events:
+        for event in event_batch:
+            if event.id in existing_ids or event.id in batch_ids:
+                raise ValueError(f"Event already exists for session {session_id}: {event.id}")
+            batch_ids.add(event.id)
             if event.type != EventType.BUDGET_RESERVED:
                 continue
             raw_reservation_id = event.payload.get("reservation_id")
@@ -5178,7 +5274,6 @@ class InMemorySessionStore(SessionStore):
                     "Budget ledger reused a reservation identity."
                 )
 
-        prepared: list[tuple[EventRecord, str, EventRecord | None, tuple[str, ...]]] = []
         try:
             pending_round = pending_action_evidence_round_from_checkpoint(
                 self._checkpoints.get(session_id)
@@ -5192,13 +5287,15 @@ class InMemorySessionStore(SessionStore):
             if pending_round is None
             else pending_action_lookup_key(pending_round.tool_round_id)
         )
+        prepared: list[_PreparedInMemoryEvent] = []
         next_sequence = self._next_event_sequence
-        for event in events:
-            stored_event = event.model_copy(deep=True)
+        for event in event_batch:
+            stored_event = event if events_are_detached else event.model_copy(deep=True)
             record = EventRecord(sequence=next_sequence, event=stored_event)
             event_type = str(stored_event.type)
             projected_record: EventRecord | None = None
             retention_keys: list[str] = []
+            history_keys: list[str] = []
             if event_type in PENDING_ACTION_EVENT_TYPE_VALUES:
                 retain_for_scope = (
                     pending_round is not None
@@ -5211,17 +5308,73 @@ class InMemorySessionStore(SessionStore):
                 if lookup_id is not None:
                     lookup_key = pending_action_lookup_key(lookup_id)
                     if lookup_key in active_lookup_keys:
-                        retention_keys.append(lookup_key)
+                        history_keys.append(lookup_key)
+                        if not (
+                            pending_action_event_retains_history(event_type)
+                            and (
+                                pending_round is None
+                                or pending_action_event_is_from_different_tool_round(
+                                    stored_event,
+                                    pending_round,
+                                )
+                            )
+                        ):
+                            retention_keys.append(lookup_key)
                 if retain_for_scope:
                     assert round_lookup_key is not None
                     retention_keys.append(round_lookup_key)
-                if event_type in PENDING_ACTION_BARRIER_EVENT_TYPE_VALUES or retention_keys:
+                    history_keys.append(round_lookup_key)
+                if (
+                    event_type in PENDING_ACTION_BARRIER_EVENT_TYPE_VALUES
+                    or retention_keys
+                    or history_keys
+                ):
                     projected_record = project_pending_action_event_record(record)
-            prepared.append((record, event_type, projected_record, tuple(retention_keys)))
+            delivery = (
+                None
+                if event_type == str(EventType.RUNTIME_SINK_FAILED)
+                else PersistedEventSideEffectDelivery(
+                    session_id=session_id,
+                    event_id=stored_event.id,
+                    event_sequence=record.sequence,
+                    status=PersistedEventSideEffectStatus.PENDING,
+                )
+            )
+            prepared.append(
+                _PreparedInMemoryEvent(
+                    record=record,
+                    event_type=event_type,
+                    projected_record=projected_record,
+                    retained_lookup_keys=tuple(dict.fromkeys(retention_keys)),
+                    history_lookup_keys=tuple(dict.fromkeys(history_keys)),
+                    delivery=delivery,
+                )
+            )
             next_sequence += 1
+        return _PreparedInMemoryEventAppend(
+            events=tuple(prepared),
+            next_sequence=next_sequence,
+            budget_reservation_publications=tuple(budget_reservation_publications.items()),
+        )
 
+    def _apply_event_append_unlocked(
+        self,
+        session: Session,
+        prepared: _PreparedInMemoryEventAppend,
+        *,
+        activity_at: datetime | None = None,
+    ) -> Session:
+        from cayu.runtime.pending_actions import retain_pending_action_index_record
+
+        session_id = session.id
+        existing_ids = self._event_ids[session_id]
         session_records = self._session_event_records.setdefault(session_id, [])
-        for record, event_type, projected_record, retained_lookup_keys in prepared:
+        for prepared_event in prepared.events:
+            record = prepared_event.record
+            event_type = prepared_event.event_type
+            projected_record = prepared_event.projected_record
+            retained_lookup_keys = prepared_event.retained_lookup_keys
+            history_lookup_keys = prepared_event.history_lookup_keys
             stored_event = record.event
             self._events[session_id].append(stored_event)
             self._event_records.append(record)
@@ -5232,41 +5385,41 @@ class InMemorySessionStore(SessionStore):
                     self._pending_action_latest_barrier_records[session_id] = projected_record
                 else:
                     by_lookup_id = self._pending_action_event_records.setdefault(session_id, {})
+                    event_history = self._pending_action_event_history.setdefault(
+                        session_id,
+                        {},
+                    )
                     for retention_key in retained_lookup_keys:
-                        if (
-                            pending_action_event_retains_history(event_type)
-                            and pending_round is not None
-                            and not pending_action_event_matches_tool_round(
-                                projected_record.event,
-                                pending_round,
-                            )
-                        ):
-                            continue
                         retain_pending_action_index_record(
                             by_lookup_id.setdefault(retention_key, {}),
                             projected_record,
                         )
+                    for history_key in history_lookup_keys:
+                        event_history.setdefault(history_key, []).append(record)
             self._type_event_records.setdefault(event_type, []).append(record)
             existing_ids.add(stored_event.id)
-            if event_type != str(EventType.RUNTIME_SINK_FAILED):
+            if prepared_event.delivery is not None:
                 self._persisted_event_side_effect_deliveries[(session_id, stored_event.id)] = (
-                    PersistedEventSideEffectDelivery(
-                        session_id=session_id,
-                        event_id=stored_event.id,
-                        event_sequence=record.sequence,
-                        status=PersistedEventSideEffectStatus.PENDING,
-                    )
+                    prepared_event.delivery
                 )
         self._budget_reservation_identities.update(
             {
                 reservation_id: (session_id, publication_id, True)
-                for reservation_id, publication_id in budget_reservation_publications.items()
+                for reservation_id, publication_id in (prepared.budget_reservation_publications)
             }
         )
-        self._next_event_sequence = next_sequence
-        if not events:
+        self._next_event_sequence = prepared.next_sequence
+        if not prepared.events:
             return session
-        return session.model_copy(update={"last_activity_at": datetime.now(UTC)})
+        return session.model_copy(update={"last_activity_at": activity_at or datetime.now(UTC)})
+
+    def _append_events_unlocked(
+        self,
+        session: Session,
+        events: list[Event],
+    ) -> Session:
+        prepared = self._prepare_event_append_unlocked(session, events)
+        return self._apply_event_append_unlocked(session, prepared)
 
     async def append_events(self, session_id: str, events: list[Event]) -> None:
         session_id, copied_events = _copy_session_event_batch(session_id, events)
@@ -5838,12 +5991,67 @@ class InMemorySessionStore(SessionStore):
         idempotency_key: str,
     ) -> dict[str, Any] | None:
         session_id = require_clean_nonblank(session_id, "session_id")
-        idempotency_key = require_clean_nonblank(idempotency_key, "idempotency_key")
+        idempotency_key = _reject_reserved_runtime_publication_key(
+            idempotency_key,
+            "idempotency_key",
+        )
         async with self._lock:
             if session_id not in self._sessions:
                 raise KeyError(f"Session not found: {session_id}")
             record = self._session_operation_records.get(session_id, {}).get(idempotency_key)
             return None if record is None else copy_durable_json_object(record, "session_operation")
+
+    async def _load_runtime_publication_receipt_record(
+        self,
+        session_id: str,
+        storage_key: str,
+        publication_id: str,
+    ) -> dict[str, Any] | None:
+        async with self._lock:
+            if session_id not in self._sessions:
+                raise KeyError(f"Session not found: {session_id}")
+            record = self._session_operation_records.get(session_id, {}).get(storage_key)
+            if record is None:
+                return None
+            copied = deepcopy(record)
+            receipt = _reconstruct_runtime_publication_receipt(
+                copied,
+                storage_key=storage_key,
+                session_id=session_id,
+                publication_id=publication_id,
+            )
+            self._validate_runtime_publication_material_unlocked(receipt)
+            return copied
+
+    def _validate_runtime_publication_material_unlocked(
+        self,
+        receipt: RuntimePublicationReceipt,
+    ) -> None:
+        transcript = self._transcripts.get(receipt.session_id, [])
+        transcript_segment = transcript[
+            receipt.transcript_start_cursor : receipt.transcript_end_cursor
+        ]
+        referenced_event_ids = _runtime_publication_referenced_event_ids(receipt.referenced_events)
+        requested_event_ids = set((*receipt.appended_event_ids, *referenced_event_ids))
+        events_by_id = {}
+        for event_id in requested_event_ids:
+            record = self._event_records_by_id.get((receipt.session_id, event_id))
+            if record is not None:
+                events_by_id[event_id] = record.event
+        _validate_runtime_publication_durable_material(
+            receipt,
+            transcript_messages=transcript_segment,
+            appended_events=(
+                events_by_id[event_id]
+                for event_id in receipt.appended_event_ids
+                if event_id in events_by_id
+            ),
+            durable_referenced_events=(
+                events_by_id[event_id]
+                for event_id in referenced_event_ids
+                if event_id in events_by_id
+            ),
+        )
 
     async def publish_session_operation(
         self,
@@ -5903,7 +6111,10 @@ class InMemorySessionStore(SessionStore):
         expected_transcript_cursor: int | None,
     ) -> Session:
         session_id, copied_events = _copy_session_event_batch(session_id, events)
-        idempotency_key = require_clean_nonblank(idempotency_key, "idempotency_key")
+        idempotency_key = _reject_reserved_runtime_publication_key(
+            idempotency_key,
+            "idempotency_key",
+        )
         if operation_transform is None:
             raise TypeError("operation_transform is required.")
         allowed_statuses = (
@@ -5957,6 +6168,7 @@ class InMemorySessionStore(SessionStore):
                 publication.operation_records,
                 "operation_records",
             )
+            _validate_session_operation_record_keys(copied_records)
             if commit_guard is not None:
                 commit_guard()
             updated = self._append_events_unlocked(session, copied_events)
@@ -5966,12 +6178,627 @@ class InMemorySessionStore(SessionStore):
             self._sessions[session_id] = updated
             return updated.model_copy(deep=True)
 
+    async def _load_model_completion_stage_records(
+        self,
+        session_id: str,
+        preparation_storage_key: str,
+        terminal_storage_key: str,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        async with self._lock:
+            if session_id not in self._sessions:
+                raise KeyError(f"Session not found: {session_id}")
+            records = self._session_operation_records[session_id]
+            preparation = records.get(preparation_storage_key)
+            terminal = records.get(terminal_storage_key)
+            return (
+                None if preparation is None else deepcopy(preparation),
+                None if terminal is None else deepcopy(terminal),
+            )
+
+    async def _load_active_model_completion_stage_records(
+        self,
+        session_id: str,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
+        async with self._lock:
+            if session_id not in self._sessions:
+                raise KeyError(f"Session not found: {session_id}")
+            records = self._session_operation_records[session_id]
+            active_record = records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY)
+            if active_record is None:
+                return None, None, None
+            marker = _reconstruct_active_model_completion_stage_record(
+                active_record,
+                session_id=session_id,
+            )
+            _, _, preparation_key, terminal_key = _model_completion_stage_storage_identity(
+                session_id,
+                marker.stage_id,
+            )
+            preparation = records.get(preparation_key)
+            terminal = records.get(terminal_key)
+            return (
+                deepcopy(active_record),
+                None if preparation is None else deepcopy(preparation),
+                None if terminal is None else deepcopy(terminal),
+            )
+
+    async def _prepare_model_completion_stage_atomic(
+        self,
+        prepared: _PreparedModelCompletionStage,
+    ) -> ModelCompletionStageResult:
+        session_id = prepared.session_id
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            records = self._session_operation_records[session_id]
+            stage = _reconstruct_model_completion_stage(
+                records.get(prepared.preparation_storage_key),
+                records.get(prepared.terminal_storage_key),
+                session_id=session_id,
+                stage_id=prepared.request.stage_id,
+                preparation_storage_key=prepared.preparation_storage_key,
+                terminal_storage_key=prepared.terminal_storage_key,
+            )
+            _validate_model_completion_stage_repreparation(
+                records.get(prepared.abandonment_storage_key),
+                prepared,
+                source_status=session.status if stage is None else stage.source_status,
+            )
+            if stage is not None:
+                _validate_model_completion_stage_preparation_replay(stage, prepared)
+                active = _reconstruct_active_model_completion_stage_from_records(
+                    records,
+                    session_id=session_id,
+                )
+                _validate_model_completion_preparation_replay_state(
+                    stage,
+                    active=active,
+                    winner_exists=records.get(prepared.winner_storage_key) is not None,
+                    receipt_exists=(records.get(prepared.publication_storage_key) is not None),
+                )
+                return ModelCompletionStageResult(
+                    stage=stage,
+                    replayed=True,
+                    dispatch_authorized=False,
+                )
+
+            active = _reconstruct_active_model_completion_stage_from_records(
+                records,
+                session_id=session_id,
+            )
+            _validate_model_completion_active_marker_for_preparation(
+                active,
+                prepared,
+                source_status=session.status,
+            )
+            if (
+                records.get(prepared.winner_storage_key) is not None
+                or records.get(prepared.publication_storage_key) is not None
+            ):
+                raise SessionModelCompletionStageConflict(
+                    "The logical model step already has durable publication state."
+                )
+
+            _assert_session_run_epoch(session_id, session)
+            if session.status not in prepared.expected_statuses:
+                raise SessionStatusConflict(
+                    "Session status is not eligible for model-completion preparation: "
+                    f"{session.status}"
+                )
+            if session.run_epoch != prepared.expected_run_epoch:
+                raise SessionRunFenced(
+                    "Session source run epoch is stale: expected "
+                    f"{prepared.expected_run_epoch}, current {session.run_epoch}."
+                )
+            current_cursor = len(self._transcripts.get(session_id, []))
+            if current_cursor != prepared.expected_transcript_cursor:
+                raise ValueError(
+                    "Session source transcript cursor is stale: expected "
+                    f"{prepared.expected_transcript_cursor}, current {current_cursor}."
+                )
+
+            prepared_at = _next_runtime_publication_timestamp(session)
+            preparation_record = _model_completion_stage_preparation_record(
+                prepared,
+                source_session=session,
+                prepared_at=prepared_at,
+            )
+            stage = _reconstruct_model_completion_stage(
+                preparation_record,
+                None,
+                session_id=session_id,
+                stage_id=prepared.request.stage_id,
+                preparation_storage_key=prepared.preparation_storage_key,
+                terminal_storage_key=prepared.terminal_storage_key,
+            )
+            assert stage is not None
+            active_record = _active_model_completion_stage_record(
+                stage,
+                activated_at=prepared_at,
+            )
+            records[prepared.preparation_storage_key] = preparation_record
+            records[MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY] = active_record
+            self._sessions[session_id] = session.model_copy(
+                update={"updated_at": prepared_at, "last_activity_at": prepared_at},
+                deep=True,
+            )
+            return ModelCompletionStageResult(
+                stage=stage,
+                replayed=False,
+                dispatch_authorized=True,
+            )
+
+    async def _complete_model_completion_stage_atomic(
+        self,
+        prepared: _PreparedModelCompletionStageTerminal,
+    ) -> ModelCompletionStageResult:
+        session_id = prepared.session_id
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            records = self._session_operation_records[session_id]
+            stage = _reconstruct_model_completion_stage(
+                records.get(prepared.preparation_storage_key),
+                records.get(prepared.terminal_storage_key),
+                session_id=session_id,
+                stage_id=prepared.stage_id,
+                preparation_storage_key=prepared.preparation_storage_key,
+                terminal_storage_key=prepared.terminal_storage_key,
+            )
+            if stage is None:
+                raise KeyError(f"Model-completion stage not found: {prepared.stage_id}")
+            if stage.state == "completed":
+                _validate_model_completion_stage_terminal_replay(stage, prepared)
+                return ModelCompletionStageResult(
+                    stage=stage,
+                    replayed=True,
+                    dispatch_authorized=False,
+                )
+            _validate_model_completion_stage_publication(
+                prepared.publication,
+                session_id=session_id,
+                stage=stage,
+            )
+            if not _runtime_publication_json_equal(prepared.publication.intent, stage.intent):
+                raise SessionModelCompletionStageConflict(
+                    "The terminal model completion intent conflicts with its preparation."
+                )
+
+            completed_at = _next_runtime_publication_timestamp(session)
+            terminal_record = _model_completion_stage_terminal_record(
+                prepared,
+                stage=stage,
+                completed_at=completed_at,
+            )
+            completed_stage = _reconstruct_model_completion_stage(
+                records[prepared.preparation_storage_key],
+                terminal_record,
+                session_id=session_id,
+                stage_id=prepared.stage_id,
+                preparation_storage_key=prepared.preparation_storage_key,
+                terminal_storage_key=prepared.terminal_storage_key,
+            )
+            assert completed_stage is not None
+            advances_last_activity = _model_completion_terminal_advances_last_activity(
+                records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+                stage=stage,
+                current_run_epoch=session.run_epoch,
+            )
+            records[prepared.terminal_storage_key] = terminal_record
+            self._sessions[session_id] = session.model_copy(
+                update={
+                    "updated_at": completed_at,
+                    "last_activity_at": (
+                        completed_at if advances_last_activity else session.last_activity_at
+                    ),
+                },
+                deep=True,
+            )
+            return ModelCompletionStageResult(
+                stage=completed_stage,
+                replayed=False,
+                dispatch_authorized=False,
+            )
+
+    async def _abandon_model_completion_stage_atomic(
+        self,
+        prepared: _PreparedModelCompletionStageAbandonment,
+    ) -> ModelCompletionStageAbandonmentResult:
+        session_id = prepared.session_id
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            records = self._session_operation_records[session_id]
+            stage = _reconstruct_model_completion_stage(
+                records.get(prepared.preparation_storage_key),
+                records.get(prepared.terminal_storage_key),
+                session_id=session_id,
+                stage_id=prepared.stage_id,
+                preparation_storage_key=prepared.preparation_storage_key,
+                terminal_storage_key=prepared.terminal_storage_key,
+            )
+            if stage is None:
+                active_record = records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY)
+                if active_record is not None:
+                    active_marker = _reconstruct_active_model_completion_stage_record(
+                        active_record,
+                        session_id=session_id,
+                    )
+                    if active_marker.stage_id == prepared.stage_id:
+                        raise SessionModelCompletionStageConflict(
+                            "The active model-completion marker references a missing stage."
+                        )
+                replayed = _replay_model_completion_stage_abandonment(
+                    prepared,
+                    records.get(prepared.abandonment_storage_key),
+                )
+                logical_step_id = replayed.abandonment.logical_step_id
+                if (
+                    records.get(_model_completion_stage_winner_storage_key(logical_step_id))
+                    is not None
+                    or records.get(_runtime_publication_storage_key(logical_step_id)) is not None
+                ):
+                    raise SessionModelCompletionStageConflict(
+                        "An abandoned model-completion stage has durable publication state."
+                    )
+                return replayed
+
+            active = _reconstruct_active_model_completion_stage_from_records(
+                records,
+                session_id=session_id,
+            )
+            winner_storage_key = _model_completion_stage_winner_storage_key(stage.logical_step_id)
+            publication_storage_key = _runtime_publication_storage_key(stage.logical_step_id)
+            _validate_model_completion_stage_for_abandonment(
+                session=session,
+                stage=stage,
+                active=active,
+                prepared=prepared,
+                abandonment_record=records.get(prepared.abandonment_storage_key),
+                winner_exists=records.get(winner_storage_key) is not None,
+                receipt_exists=records.get(publication_storage_key) is not None,
+            )
+            assert active is not None
+            abandoned_at = _next_runtime_publication_timestamp(session)
+            abandonment_record = _model_completion_stage_abandonment_record(
+                stage,
+                active=active,
+                abandoned_at=abandoned_at,
+            )
+            abandonment = _reconstruct_model_completion_stage_abandonment(
+                abandonment_record,
+                session_id=session_id,
+                stage_id=prepared.stage_id,
+                storage_key=prepared.abandonment_storage_key,
+            )
+
+            records[prepared.abandonment_storage_key] = abandonment_record
+            del records[prepared.preparation_storage_key]
+            del records[MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY]
+            self._sessions[session_id] = session.model_copy(
+                update={"updated_at": abandoned_at, "last_activity_at": abandoned_at},
+                deep=True,
+            )
+            return ModelCompletionStageAbandonmentResult(
+                abandonment=abandonment,
+                replayed=False,
+            )
+
+    async def _promote_model_completion_stage_atomic(
+        self,
+        *,
+        session_id: str,
+        stage_id: str,
+        preparation_storage_key: str,
+        terminal_storage_key: str,
+        expected_run_epoch: int,
+    ) -> RuntimePublicationResult:
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            records = self._session_operation_records[session_id]
+            stage = _reconstruct_model_completion_stage(
+                records.get(preparation_storage_key),
+                records.get(terminal_storage_key),
+                session_id=session_id,
+                stage_id=stage_id,
+                preparation_storage_key=preparation_storage_key,
+                terminal_storage_key=terminal_storage_key,
+            )
+            if stage is None:
+                raise KeyError(f"Model-completion stage not found: {stage_id}")
+
+            publication_storage_key = _runtime_publication_storage_key(stage.logical_step_id)
+            winner_storage_key = _model_completion_stage_winner_storage_key(stage.logical_step_id)
+            receipt_record = records.get(publication_storage_key)
+            if receipt_record is not None:
+                active = _reconstruct_active_model_completion_stage_from_records(
+                    records,
+                    session_id=session_id,
+                )
+                _validate_model_completion_promotion_replay_active_marker(active, stage)
+                receipt = _reconstruct_runtime_publication_receipt(
+                    deepcopy(receipt_record),
+                    storage_key=publication_storage_key,
+                    session_id=session_id,
+                    publication_id=stage.logical_step_id,
+                )
+                self._validate_runtime_publication_material_unlocked(receipt)
+                return _replay_promoted_model_completion_stage(
+                    session=session,
+                    stage=stage,
+                    receipt_record=deepcopy(receipt_record),
+                    winner_record=deepcopy(records.get(winner_storage_key)),
+                )
+            if records.get(winner_storage_key) is not None:
+                raise SessionModelCompletionStageConflict(
+                    "A model-completion winner exists without its runtime publication receipt."
+                )
+            active = _reconstruct_active_model_completion_stage_from_records(
+                records,
+                session_id=session_id,
+            )
+            _validate_model_completion_active_marker_for_promotion(active, stage)
+            prepared = _prepare_model_completion_stage_promotion(
+                stage,
+                expected_run_epoch=expected_run_epoch,
+            )
+            result = self._publish_runtime_publication_unlocked(
+                prepared,
+                session=session,
+                model_completion_stage=stage,
+            )
+            return result
+
+    async def _publish_runtime_publication_atomic(
+        self,
+        prepared: _PreparedRuntimePublication,
+    ) -> RuntimePublicationResult:
+        async with self._lock:
+            session = self._sessions.get(prepared.session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {prepared.session_id}")
+            return self._publish_runtime_publication_unlocked(
+                prepared,
+                session=session,
+            )
+
+    def _publish_runtime_publication_unlocked(
+        self,
+        prepared: _PreparedRuntimePublication,
+        *,
+        session: Session,
+        model_completion_stage: ModelCompletionStage | None = None,
+    ) -> RuntimePublicationResult:
+        session_id = prepared.session_id
+        request = prepared.request
+        operation_records = self._session_operation_records[session_id]
+        existing_record = operation_records.get(prepared.storage_key)
+        if existing_record is not None:
+            receipt = _reconstruct_runtime_publication_receipt(
+                deepcopy(existing_record),
+                storage_key=prepared.storage_key,
+                session_id=session_id,
+                publication_id=request.publication_id,
+                request_digest=prepared.request_digest,
+            )
+            _validate_runtime_publication_replay_receipt(receipt, prepared)
+            self._validate_runtime_publication_material_unlocked(receipt)
+            return RuntimePublicationResult(
+                session=session.model_copy(deep=True),
+                receipt=receipt,
+                replayed=True,
+            )
+
+        _assert_session_run_epoch(session_id, session)
+        if (
+            prepared.expected_statuses is not None
+            and session.status not in prepared.expected_statuses
+        ):
+            raise SessionStatusConflict(
+                f"Session status is not eligible for runtime publication: {session.status}"
+            )
+        if (
+            prepared.expected_run_epoch is not None
+            and session.run_epoch != prepared.expected_run_epoch
+        ):
+            raise SessionRunFenced(
+                "Session source run epoch is stale: expected "
+                f"{prepared.expected_run_epoch}, current {session.run_epoch}."
+            )
+        transcript_start_cursor = len(self._transcripts.get(session_id, []))
+        if (
+            prepared.expected_transcript_cursor is not None
+            and transcript_start_cursor != prepared.expected_transcript_cursor
+        ):
+            raise ValueError(
+                "Session source transcript cursor is stale: expected "
+                f"{prepared.expected_transcript_cursor}, "
+                f"current {transcript_start_cursor}."
+            )
+
+        appended_event_ids = {event.id for event in request.events}
+        referenced_event_ids = set(
+            _runtime_publication_referenced_event_ids(request.referenced_events)
+        )
+        if appended_event_ids & referenced_event_ids:
+            raise ValueError("Appended and referenced runtime publication events overlap.")
+        durable_events_by_id = {}
+        for event_id in referenced_event_ids:
+            record = self._event_records_by_id.get((session_id, event_id))
+            if record is not None:
+                durable_events_by_id[event_id] = record.event
+        _validate_runtime_publication_event_references(
+            request.referenced_events,
+            durable_events_by_id,
+        )
+        current_checkpoint = self._checkpoints.get(session_id)
+        _validate_tool_round_checkpoint_mutation(request, current_checkpoint)
+        durable_tool_events: list[Event] = []
+        tool_round_identity = _tool_round_publication_identity(request)
+        if tool_round_identity is not None:
+            from cayu.runtime.pending_actions import pending_action_lookup_key
+
+            execution_identity, tool_call_ids = tool_round_identity
+            event_history = self._pending_action_event_history.get(session_id, {})
+            for tool_call_id in tool_call_ids:
+                lookup_key = pending_action_lookup_key(tool_call_id)
+                durable_tool_events.extend(
+                    record.event
+                    for record in event_history.get(lookup_key, ())
+                    if record.event.type in _TOOL_ROUND_LIFECYCLE_EVENT_TYPES
+                    and _tool_round_event_matches_scope_or_is_ambiguous(
+                        record.event,
+                        execution_identity,
+                    )
+                )
+            if len(durable_tool_events) > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS:
+                raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
+        _validate_tool_round_publication(
+            request,
+            durable_events_by_id,
+            durable_tool_events=durable_tool_events,
+        )
+        existing_event_ids = appended_event_ids & self._event_ids[session_id]
+        if existing_event_ids:
+            raise ValueError(
+                f"Event already exists for session {session_id}: {min(existing_event_ids)}"
+            )
+
+        checkpoint = _apply_runtime_publication_checkpoint_mutation(
+            request.mutation,
+            current_checkpoint,
+        )
+        if prepared.storage_key in operation_records:
+            raise SessionRuntimePublicationConflict(
+                "Runtime publication receipt appeared while the session lock was held."
+            )
+        prepared_events = self._prepare_event_append_unlocked(
+            session,
+            request.events,
+            events_are_detached=True,
+        )
+        prepared_checkpoint = (
+            None
+            if checkpoint is None or not request.mutation.operations
+            else self._prepare_checkpoint_store_unlocked(
+                session_id,
+                checkpoint,
+                additional_event_records=tuple(event.record for event in prepared_events.events),
+            )
+        )
+
+        published_at = _next_runtime_publication_timestamp(session)
+        receipt = _build_runtime_publication_receipt(
+            prepared,
+            source_session=session,
+            checkpoint=checkpoint,
+            transcript_start_cursor=transcript_start_cursor,
+            published_at=published_at,
+        )
+        receipt_record = _runtime_publication_receipt_record(receipt)
+        winner_record = (
+            None
+            if model_completion_stage is None
+            else _model_completion_stage_winner_record(
+                model_completion_stage,
+                receipt=receipt,
+            )
+        )
+
+        updated = self._apply_event_append_unlocked(
+            session,
+            prepared_events,
+            activity_at=published_at,
+        ).model_copy(
+            update={
+                "updated_at": published_at,
+                "last_activity_at": published_at,
+            }
+        )
+        self._transcripts[session_id].extend(request.transcript_messages)
+        if prepared_checkpoint is not None:
+            self._apply_checkpoint_store_unlocked(session_id, prepared_checkpoint)
+        operation_records[prepared.storage_key] = receipt_record
+        if model_completion_stage is not None:
+            assert winner_record is not None
+            winner_storage_key = _model_completion_stage_winner_storage_key(
+                model_completion_stage.logical_step_id
+            )
+            operation_records[winner_storage_key] = winner_record
+            operation_records.pop(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY)
+        self._sessions[session_id] = updated
+        return RuntimePublicationResult(
+            session=updated.model_copy(deep=True),
+            receipt=receipt,
+            replayed=False,
+        )
+
     async def load_events(self, session_id: str) -> list[Event]:
         session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
             if session_id not in self._sessions:
                 raise KeyError(f"Session not found: {session_id}")
             return [event.model_copy(deep=True) for event in self._events.get(session_id, [])]
+
+    async def load_tool_round_lifecycle_events(
+        self,
+        session_id: str,
+        tool_call_ids: list[str] | tuple[str, ...],
+    ) -> list[Event]:
+        from cayu.runtime.pending_actions import pending_action_lookup_key
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        copied_ids = _validate_tool_round_call_ids(tool_call_ids, "tool_call_ids")
+        async with self._lock:
+            if session_id not in self._sessions:
+                raise KeyError(f"Session not found: {session_id}")
+            history = self._pending_action_event_history.get(session_id, {})
+            records = [
+                record
+                for tool_call_id in copied_ids
+                for record in history.get(pending_action_lookup_key(tool_call_id), ())
+                if record.event.type in _TOOL_ROUND_LIFECYCLE_EVENT_TYPES
+            ]
+            records.sort(key=lambda record: record.sequence)
+            if len(records) > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS:
+                raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
+            return [copy_event(record.event) for record in records]
+
+    async def load_tool_round_lifecycle_events_for_round(
+        self,
+        session_id: str,
+        tool_call_ids: list[str] | tuple[str, ...],
+        *,
+        tool_round_identity: ToolRoundIdentity,
+    ) -> list[Event]:
+        from cayu.runtime.pending_actions import pending_action_lookup_key
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        copied_ids = _validate_tool_round_call_ids(tool_call_ids, "tool_call_ids")
+        tool_round_identity = copy_tool_round_identity(tool_round_identity)
+        async with self._lock:
+            if session_id not in self._sessions:
+                raise KeyError(f"Session not found: {session_id}")
+            history = self._pending_action_event_history.get(session_id, {})
+            records = [
+                record
+                for tool_call_id in copied_ids
+                for record in history.get(pending_action_lookup_key(tool_call_id), ())
+                if record.event.type in _TOOL_ROUND_LIFECYCLE_EVENT_TYPES
+                and _tool_round_event_matches_scope_or_is_ambiguous(
+                    record.event,
+                    tool_round_identity,
+                )
+            ]
+            records.sort(key=lambda record: record.sequence)
+            if len(records) > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS:
+                raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
+            return [copy_event(record.event) for record in records]
 
     async def query_events(self, query: EventQuery | None = None) -> list[EventRecord]:
         query = copy_event_query(query)
@@ -7237,30 +8064,42 @@ def _validate_tool_round_call_ids(
 
 def _tool_round_event_matches_scope_or_is_ambiguous(
     event: Event,
-    tool_round_id: str,
+    tool_round_identity: ToolRoundIdentity,
 ) -> bool:
-    """Select exact-round evidence plus legacy evidence that cannot be scoped.
+    """Select exact or contradictory evidence while excluding a valid prior round.
 
-    Well-formed evidence for another round is safe to ignore when providers
-    reuse a call id. Missing or malformed round identity is ambiguous and must
-    still reach the publication validator so the transaction fails closed.
+    Only a complete valid identity whose round and originating model attempt
+    both differ is safely stale. Missing, malformed, or partially conflicting
+    identity remains visible so the publication transaction fails closed.
     """
 
-    event_round_id = event.payload.get("tool_round_id")
-    if event_round_id == tool_round_id:
-        return True
-    if type(event_round_id) is not str:
-        return True
+    target = copy_tool_round_identity(tool_round_identity)
     try:
-        require_clean_nonblank(event_round_id, "tool-round durable event round id")
-    except ValueError:
+        event_identity = ToolRoundIdentity.model_validate(
+            {
+                "model_step_id": event.payload.get("model_step_id"),
+                "model_attempt_id": event.payload.get("model_attempt_id"),
+                "tool_round_id": event.payload.get("tool_round_id"),
+            }
+        )
+    except (TypeError, ValueError):
         return True
-    return False
+    return not (
+        event_identity.tool_round_id != target.tool_round_id
+        and (
+            event_identity.model_step_id,
+            event_identity.model_attempt_id,
+        )
+        != (
+            target.model_step_id,
+            target.model_attempt_id,
+        )
+    )
 
 
 def _tool_round_publication_identity(
     request: RuntimePublicationRequest,
-) -> tuple[str, tuple[str, ...]] | None:
+) -> tuple[ToolRoundIdentity, tuple[str, ...]] | None:
     if request.kind != "tool-round":
         return None
 
@@ -7270,13 +8109,34 @@ def _tool_round_publication_identity(
         raise ValueError("A tool-round publication requires a nonblank intent.round_id.")
     if request.publication_id != f"tool-round:{round_id}":
         raise ValueError("A tool-round publication_id must be derived from its intent.round_id.")
+    model_step_id = request.intent.get("model_step_id")
+    model_attempt_id = request.intent.get("model_attempt_id")
+    tool_round_id = request.intent.get("tool_round_id")
+    if (
+        type(model_step_id) is not str
+        or type(model_attempt_id) is not str
+        or type(tool_round_id) is not str
+    ):
+        raise ValueError("A tool-round publication requires a complete execution identity.")
+    try:
+        execution_identity = ToolRoundIdentity(
+            model_step_id=model_step_id,
+            model_attempt_id=model_attempt_id,
+            tool_round_id=tool_round_id,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("A tool-round publication execution identity is malformed.") from exc
+    if execution_identity.tool_round_id != round_id:
+        raise ValueError(
+            "A tool-round publication intent.round_id conflicts with its execution identity."
+        )
     if type(raw_tool_call_ids) is not list:
         raise ValueError("A tool-round publication requires intent.tool_call_ids as a list.")
     tool_call_ids = _validate_tool_round_call_ids(
         raw_tool_call_ids,
         "intent.tool_call_ids",
     )
-    return round_id, tool_call_ids
+    return execution_identity, tool_call_ids
 
 
 def _validate_structured_output_auxiliary_integer(
@@ -7478,7 +8338,8 @@ def _validate_tool_round_publication(
     identity = _tool_round_publication_identity(request)
     if identity is None:
         return
-    round_id, tool_call_ids = identity
+    execution_identity, tool_call_ids = identity
+    round_id = execution_identity.tool_round_id
     auxiliary = _validate_structured_output_tool_round_auxiliary(
         request,
         round_id=round_id,
@@ -7513,18 +8374,21 @@ def _validate_tool_round_publication(
         tool_call_id = event.payload.get("tool_call_id")
         if type(tool_call_id) is not str or tool_call_id not in tool_call_ids:
             raise ValueError("Tool-round durable evidence must identify one intended tool call.")
-        event_round_id = event.payload.get("tool_round_id")
-        if type(event_round_id) is not str:
-            raise ValueError("Tool-round durable evidence requires a valid round id.")
         try:
-            event_round_id = require_clean_nonblank(
-                event_round_id,
-                "tool-round durable event round id",
+            durable_identity = ToolRoundIdentity.model_validate(
+                {
+                    "model_step_id": event.payload.get("model_step_id"),
+                    "model_attempt_id": event.payload.get("model_attempt_id"),
+                    "tool_round_id": event.payload.get("tool_round_id"),
+                }
             )
         except (TypeError, ValueError) as exc:
-            raise ValueError("Tool-round durable evidence requires a valid round id.") from exc
-        if event_round_id == round_id:
-            scoped_durable_events.append(event)
+            raise ValueError(
+                "Tool-round durable evidence requires a complete valid execution identity."
+            ) from exc
+        if durable_identity != execution_identity:
+            raise ValueError("Tool-round durable evidence has a conflicting execution identity.")
+        scoped_durable_events.append(event)
 
     scoped_durable_event_ids = tuple(event.id for event in scoped_durable_events)
     referenced_event_ids = tuple(reference.event_id for reference in request.referenced_events)
@@ -7576,6 +8440,12 @@ def _validate_tool_round_publication(
         )
 
     for part in result_parts:
+        if (
+            part.model_step_id != execution_identity.model_step_id
+            or part.model_attempt_id != execution_identity.model_attempt_id
+            or part.tool_round_id != execution_identity.tool_round_id
+        ):
+            raise ValueError("A tool-round transcript result has a conflicting execution identity.")
         terminal = terminal_by_call[part.tool_call_id]
         if terminal.tool_name != part.tool_name:
             raise ValueError(
@@ -7816,8 +8686,10 @@ def _validate_tool_round_checkpoint_mutation(
     request: RuntimePublicationRequest,
     checkpoint: dict[str, Any] | None,
 ) -> None:
-    if request.kind != "tool-round":
+    publication_identity = _tool_round_publication_identity(request)
+    if publication_identity is None:
         return
+    execution_identity, intended_call_ids = publication_identity
     marker = None if checkpoint is None else checkpoint.get(_PENDING_TOOL_ROUND_CHECKPOINT_KEY)
     if type(marker) is not dict:
         raise SessionRuntimePublicationConflict(
@@ -7829,21 +8701,34 @@ def _validate_tool_round_checkpoint_mutation(
             "The durable pending tool round call list is malformed."
         )
     marker_call_ids = tuple(call.get("tool_call_id") for call in raw_calls)
-    intended_call_ids = tuple(request.intent["tool_call_ids"])
-    if marker.get("round_id") != request.intent["round_id"] or marker_call_ids != intended_call_ids:
+    if (
+        marker.get("tool_round_id") != execution_identity.tool_round_id
+        or marker_call_ids != intended_call_ids
+    ):
         raise SessionRuntimePublicationConflict(
             "The durable pending tool round conflicts with the publication intent."
         )
+    for field_name in ("model_step_id", "model_attempt_id", "tool_round_id"):
+        if marker.get(field_name) != getattr(execution_identity, field_name):
+            raise SessionRuntimePublicationConflict(
+                "The durable pending tool-round execution identity conflicts "
+                "with the publication intent."
+            )
     _validate_structured_output_tool_round_marker(
         request,
         marker=marker,
         raw_calls=raw_calls,
     )
-    deletion = next(
+    deletions = [
         operation
         for operation in request.mutation.operations
         if operation.key == _PENDING_TOOL_ROUND_CHECKPOINT_KEY and operation.action == "delete"
-    )
+    ]
+    if len(deletions) != 1:
+        raise SessionRuntimePublicationConflict(
+            "A tool-round publication must delete exactly one fenced pending round marker."
+        )
+    deletion = deletions[0]
     if runtime_publication_checkpoint_value_digest(marker) != deletion.expected_value_digest:
         raise SessionRuntimePublicationConflict(
             "The tool-round publication does not fence its exact pending marker."

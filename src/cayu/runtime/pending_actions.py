@@ -20,6 +20,7 @@ from cayu.runtime.approvals import (
     _PENDING_TOOL_APPROVAL_EVENT_PROJECTION_KEYS,
     PendingToolApproval,
 )
+from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.sessions import (
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
     MAX_PENDING_ACTION_RESULT_BYTES,
@@ -137,6 +138,37 @@ def pending_action_event_matches_tool_round(
     return event.payload.get("tool_round_id") == pending_round.tool_round_id or (
         event.payload.get("model_step_id") == pending_round.model_step_id
         and event.payload.get("model_attempt_id") == pending_round.model_attempt_id
+    )
+
+
+def pending_action_event_is_from_different_tool_round(
+    event: Event,
+    pending_round: tool_round_recovery.PendingToolRound,
+) -> bool:
+    """Whether complete valid evidence belongs to a genuinely different round.
+
+    Missing, malformed, or internally contradictory identity remains in the
+    active projection so publication and recovery fail closed. Only a complete
+    identity whose round and originating model attempt are both different is
+    safely classified as stale evidence for a reused provider tool-call id.
+    """
+
+    try:
+        identity = ToolRoundIdentity.model_validate(
+            {
+                "model_step_id": event.payload.get("model_step_id"),
+                "model_attempt_id": event.payload.get("model_attempt_id"),
+                "tool_round_id": event.payload.get("tool_round_id"),
+            }
+        )
+    except (TypeError, ValueError):
+        return False
+    return identity.tool_round_id != pending_round.tool_round_id and (
+        identity.model_step_id,
+        identity.model_attempt_id,
+    ) != (
+        pending_round.model_step_id,
+        pending_round.model_attempt_id,
     )
 
 
