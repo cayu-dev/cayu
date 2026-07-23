@@ -57,6 +57,7 @@ from cayu.providers import (
     ModelProvider,
     ModelRequest,
     ModelStreamEvent,
+    UsageDialect,
     bedrock_billing_identity,
     completed_bedrock_billing_identity,
 )
@@ -118,6 +119,7 @@ class OneShotProvider(ModelProvider):
 
 class UsageProvider(ModelProvider):
     name = "fake"
+    usage_dialect = UsageDialect.OPENAI
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         yield ModelStreamEvent.text_delta("done")
@@ -1996,7 +1998,7 @@ def test_server_exposes_session_usage_summary() -> None:
             "reasoning_output_tokens": 0,
             "requested_model": None,
             "cache": {
-                "read_tokens": 0,
+                "read_tokens": 4,
                 "write_tokens": 0,
                 "cached_input_tokens": 4,
                 "uncached_input_tokens": 6,
@@ -2781,7 +2783,7 @@ def test_server_exposes_filtered_sessions_summary() -> None:
                 "total_tokens": 24,
                 "reasoning_output_tokens": 0,
                 "cache": {
-                    "read_tokens": 0,
+                    "read_tokens": 8,
                     "write_tokens": 0,
                     "cached_input_tokens": 8,
                     "uncached_input_tokens": 12,
@@ -2804,7 +2806,7 @@ def test_server_exposes_filtered_sessions_summary() -> None:
                 "total_tokens": 24,
                 "reasoning_output_tokens": 0,
                 "cache": {
-                    "read_tokens": 0,
+                    "read_tokens": 8,
                     "write_tokens": 0,
                     "cached_input_tokens": 8,
                     "uncached_input_tokens": 12,
@@ -2813,7 +2815,7 @@ def test_server_exposes_filtered_sessions_summary() -> None:
         }
     ]
     assert body["cost"]["session_count"] == 2
-    assert body["cost"]["total_cost"] == "0.00020"
+    assert body["cost"]["total_cost"] == "0.000216"
     assert body["cost"]["line_items"][0]["pricing_tier_max_input_tokens"] is None
     assert body["cost"]["line_items"][0]["pricing_provenance"] == {
         "source": "official",
@@ -3554,7 +3556,7 @@ def test_server_exposes_session_cost_estimate() -> None:
         "model_steps": 1,
         "priced_model_steps": 1,
         "unpriced_model_steps": 0,
-        "total_cost": "0.000010",
+        "total_cost": "0.000011",
         "line_items": [
             {
                 "model_step": 1,
@@ -3576,14 +3578,14 @@ def test_server_exposes_session_cost_estimate() -> None:
                 "currency": "USD",
                 "input_tokens": 10,
                 "output_tokens": 2,
-                "cache_read_input_tokens": 0,
+                "cache_read_input_tokens": 4,
                 "cache_write_input_tokens": 0,
                 "uncached_input_tokens": 6,
                 "input_cost": "0.000006",
                 "output_cost": "0.000004",
-                "cache_read_input_cost": "0.00",
+                "cache_read_input_cost": "0.000001",
                 "cache_write_input_cost": "0",
-                "total_cost": "0.000010",
+                "total_cost": "0.000011",
                 "missing_pricing_reason": None,
             }
         ],
@@ -3711,7 +3713,7 @@ def test_server_cost_accepts_tiered_price_book() -> None:
 
     assert response.status_code == 200
     body = response.json()
-    assert body["total_cost"] == "0.00010"
+    assert body["total_cost"] == "0.000108"
     assert body["line_items"][0]["pricing_tier_max_input_tokens"] is None
     assert (
         body["line_items"][0]["pricing_provenance"]
@@ -3806,7 +3808,7 @@ def test_server_exposes_causal_budget_usage_and_cost_with_tiered_price_book() ->
             "reasoning_output_tokens": 0,
             "requested_model": None,
             "cache": {
-                "read_tokens": 0,
+                "read_tokens": 8,
                 "write_tokens": 0,
                 "cached_input_tokens": 8,
                 "uncached_input_tokens": 12,
@@ -3828,7 +3830,7 @@ def test_server_exposes_causal_budget_usage_and_cost_with_tiered_price_book() ->
                     "reasoning_output_tokens": 0,
                     "requested_model": None,
                     "cache": {
-                        "read_tokens": 0,
+                        "read_tokens": 4,
                         "write_tokens": 0,
                         "cached_input_tokens": 4,
                         "uncached_input_tokens": 6,
@@ -3850,7 +3852,7 @@ def test_server_exposes_causal_budget_usage_and_cost_with_tiered_price_book() ->
                     "reasoning_output_tokens": 0,
                     "requested_model": None,
                     "cache": {
-                        "read_tokens": 0,
+                        "read_tokens": 4,
                         "write_tokens": 0,
                         "cached_input_tokens": 4,
                         "uncached_input_tokens": 6,
@@ -3864,7 +3866,7 @@ def test_server_exposes_causal_budget_usage_and_cost_with_tiered_price_book() ->
     assert cost_response.json()["session_ids"] == ["causal_parent", "causal_child"]
     assert cost_response.json()["session_count"] == 2
     assert cost_response.json()["model_steps"] == 2
-    assert cost_response.json()["total_cost"] == "0.00020"
+    assert cost_response.json()["total_cost"] == "0.00028"
     assert all(
         item["line_items"][0]["pricing_provenance"]
         == price_book["prices"][0]["schedules"][0]["provenance"]
@@ -3896,7 +3898,7 @@ def test_server_exposes_causal_budget_usage_and_cost_with_tiered_price_book() ->
         assert item["events"]["counts_by_type"]["session.completed"] == 1
         assert item["events"]["latest_event"]["type"] == "session.completed"
     assert summary_body["usage"]["usage"]["total_tokens"] == 24
-    assert summary_body["cost"]["total_cost"] == "0.00020"
+    assert summary_body["cost"]["total_cost"] == "0.00028"
 
     missing_summary_response = client.post(
         "/api/causal-budgets/missing/summary",
@@ -4047,7 +4049,7 @@ def test_server_exposes_session_summary() -> None:
             "reasoning_output_tokens": 0,
             "requested_model": None,
             "cache": {
-                "read_tokens": 0,
+                "read_tokens": 4,
                 "write_tokens": 0,
                 "cached_input_tokens": 4,
                 "uncached_input_tokens": 6,

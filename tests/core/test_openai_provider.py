@@ -34,6 +34,7 @@ from cayu.providers import (
     OpenAIContextOverflowError,
     OpenAIProtocolError,
     OpenAIProvider,
+    UsageDialect,
     build_openai_embedding_payload,
     build_openai_payload,
     openai_embedding_result,
@@ -2047,6 +2048,16 @@ def test_openai_provider_requires_https_base_url() -> None:
             api_key="test-key",
             base_url="http://api.openai.com",
         )
+
+
+def test_openai_provider_declares_usage_dialect_when_renamed_for_a_gateway() -> None:
+    provider = OpenAIProvider(
+        api_key="test-key",
+        name="company-gateway",
+        base_url="https://gateway.example.com/openai",
+    )
+
+    assert provider.usage_dialect is UsageDialect.OPENAI
 
 
 @pytest.mark.anyio

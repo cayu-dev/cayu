@@ -69,6 +69,43 @@ def test_resolved_state_revalidates_provider_supplied_identity() -> None:
         state.identity.request_evidence["tenant"] = "tenant-b"  # type: ignore[index]
 
 
+@pytest.mark.parametrize("invalid_text", ["invalid\x00text", "\ud800"], ids=["nul", "surrogate"])
+@pytest.mark.parametrize(
+    "field",
+    ["provider_name", "resource_id", "dimension_name", "dimension_value"],
+)
+def test_billing_identity_rejects_undurable_commercial_identity_text(
+    invalid_text: str,
+    field: str,
+) -> None:
+    if field == "dimension_name":
+        with pytest.raises(ValueError):
+            PricingContext(dimensions={invalid_text: "reserved"})
+        return
+    if field == "dimension_value":
+        with pytest.raises(ValueError):
+            PricingContext(dimensions={"tier": invalid_text})
+        return
+
+    values = {
+        "provider_name": "commercial-cloud",
+        "resource_id": "opaque-resource-1",
+    }
+    values[field] = invalid_text
+    with pytest.raises(ValueError):
+        BillingIdentity(**values)
+
+
+@pytest.mark.parametrize("invalid_text", ["invalid\x00text", "\ud800"], ids=["nul", "surrogate"])
+def test_resolved_state_rejects_an_undurable_model_copy(
+    invalid_text: str,
+) -> None:
+    identity = _identity(contexts=()).model_copy(update={"resource_id": invalid_text})
+
+    with pytest.raises(ValueError):
+        ResolvedBillingIdentity(identity=identity)
+
+
 def test_completion_may_narrow_contexts_and_add_evidence() -> None:
     north = PricingContext(dimensions={"zone": "north", "tier": "reserved"})
     fallback = PricingContext(dimensions={"zone": "north", "tier": "standard"})

@@ -51,6 +51,7 @@ from cayu.runtime.stop_policy import (
 )
 from cayu.runtime.usage import (
     causal_budget_usage_summary,
+    durable_model_completed_payload,
     normalize_usage_metrics,
     session_usage_summary,
     usage_metrics_from_event_payload,
@@ -65,6 +66,176 @@ class MutableClock:
 
     def __call__(self) -> datetime:
         return self.value
+
+
+def test_durable_completion_projection_drops_only_undurable_metadata() -> None:
+    payload = durable_model_completed_payload(
+        {
+            "model": "gpt-served",
+            "provider_metadata": "invalid\x00metadata",
+            "usage": {"input_tokens": 10, "output_tokens": 2},
+            "usage_metrics": {
+                "provider_name": "renamed-openai",
+                "model": "gpt-served",
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "total_tokens": 12,
+                "cache": {"uncached_input_tokens": 10},
+            },
+        },
+        fallback_fields={
+            "provider_name": "renamed-openai",
+            "model": "gpt-test",
+        },
+        unavailable_reason="invalid model completion usage telemetry",
+    )
+
+    assert "provider_metadata" not in payload
+    assert payload["model"] == "gpt-served"
+    assert payload["usage"] == {"input_tokens": 10, "output_tokens": 2}
+    assert payload["usage_metrics"]["total_tokens"] == 12
+    assert "usage_normalization_failed" not in payload
+    assert "usage_unavailable_reason" not in payload
+
+
+@pytest.mark.parametrize("invalid_text", ["identity\x00", "\ud800"], ids=["nul", "surrogate"])
+def test_durable_completion_projection_fails_closed_when_billing_identity_is_lost(
+    invalid_text: str,
+) -> None:
+    payload = durable_model_completed_payload(
+        {
+            "model": "gpt-served",
+            "billing_identity": {
+                "provider_name": invalid_text,
+                "resource_id": "commercial-model",
+                "request_evidence": {},
+                "completion_evidence": {},
+                "pricing_contexts": [],
+            },
+            "usage": {"input_tokens": 10, "output_tokens": 2},
+            "usage_metrics": {
+                "provider_name": "renamed-openai",
+                "model": "gpt-served",
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "total_tokens": 12,
+                "cache": {"uncached_input_tokens": 10},
+            },
+        },
+        fallback_fields={
+            "provider_name": "renamed-openai",
+            "model": "gpt-test",
+        },
+        unavailable_reason="invalid model completion usage telemetry",
+    )
+
+    assert "billing_identity" not in payload
+    assert payload["usage"] == {"input_tokens": 10, "output_tokens": 2}
+    assert "usage_metrics" not in payload
+    assert payload["usage_normalization_failed"] is True
+    assert payload["usage_unavailable_reason"] == ("invalid model completion usage telemetry")
+    cost = estimate_session_cost(
+        session_id="lost-billing-identity",
+        events=[
+            Event(
+                type=EventType.MODEL_COMPLETED,
+                session_id="lost-billing-identity",
+                payload=payload,
+            )
+        ],
+        pricing=PriceBook(
+            prices=(
+                ModelPrice.fixed(
+                    provider_name="renamed-openai",
+                    model="gpt-served",
+                    input_per_million=Decimal("1"),
+                    output_per_million=Decimal("1"),
+                ),
+            )
+        ),
+    )
+    assert cost.priced_model_steps == 0
+    assert cost.unpriced_model_steps == 1
+    assert cost.total_cost == 0
+
+
+@pytest.mark.parametrize("invalid_text", ["10\x00", "\ud800"], ids=["nul", "surrogate"])
+def test_durable_completion_projection_keeps_failure_evidence_when_raw_usage_is_undurable(
+    invalid_text: str,
+) -> None:
+    payload = durable_model_completed_payload(
+        {
+            "model": "gpt-test",
+            "usage": {"input_tokens": invalid_text, "output_tokens": 2},
+            "usage_normalization_failed": True,
+        },
+        fallback_fields={
+            "provider_name": "renamed-openai",
+            "model": "gpt-test",
+        },
+        unavailable_reason="invalid model completion usage telemetry",
+    )
+
+    assert "usage" not in payload
+    assert payload["usage_normalization_failed"] is True
+    assert payload["usage_unavailable_reason"] == ("invalid model completion usage telemetry")
+
+
+@pytest.mark.parametrize("invalid_text", ["note\x00", "\ud800"], ids=["nul", "surrogate"])
+def test_durable_completion_projection_invalidates_metrics_when_raw_usage_is_lost(
+    invalid_text: str,
+) -> None:
+    payload = durable_model_completed_payload(
+        {
+            "model": "gpt-test",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "provider_note": invalid_text,
+            },
+            "usage_metrics": {
+                "provider_name": "renamed-openai",
+                "model": "gpt-test",
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "total_tokens": 12,
+                "cache": {"uncached_input_tokens": 10},
+            },
+        },
+        fallback_fields={
+            "provider_name": "renamed-openai",
+            "model": "gpt-test",
+        },
+        unavailable_reason="invalid model completion usage telemetry",
+    )
+
+    assert "usage" not in payload
+    assert "usage_metrics" not in payload
+    assert payload["usage_normalization_failed"] is True
+    assert payload["usage_unavailable_reason"] == ("invalid model completion usage telemetry")
+
+
+def test_durable_completion_projection_fails_closed_when_normalized_usage_is_undurable() -> None:
+    payload = durable_model_completed_payload(
+        {
+            "usage_metrics": {
+                "provider_name": "renamed-openai",
+                "model": "invalid\ud800model",
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "total_tokens": 12,
+            }
+        },
+        fallback_fields={
+            "provider_name": "renamed-openai",
+            "model": "gpt-test",
+        },
+        unavailable_reason="invalid model completion usage telemetry",
+    )
+
+    assert "usage_metrics" not in payload
+    assert payload["usage_normalization_failed"] is True
+    assert payload["usage_unavailable_reason"] == ("invalid model completion usage telemetry")
 
 
 def test_normalize_openai_usage_metrics() -> None:
@@ -147,6 +318,545 @@ def test_normalize_openai_chat_usage_shape() -> None:
     assert metrics.cache.read_tokens == 40
     assert metrics.cache.cached_input_tokens == 40
     assert metrics.cache.uncached_input_tokens == 60
+
+
+@pytest.mark.parametrize(
+    ("input_tokens", "cached_tokens", "expected_uncached"),
+    [(100, 0, 100), (100, 40, 60), (100, 100, 0)],
+)
+def test_declared_openai_usage_partitions_every_input_token_once(
+    input_tokens: int,
+    cached_tokens: int,
+    expected_uncached: int,
+) -> None:
+    metrics = normalize_usage_metrics(
+        provider_name="renamed-gateway",
+        model="gpt",
+        raw_usage={
+            "input_tokens": input_tokens,
+            "output_tokens": 0,
+            "input_tokens_details": {"cached_tokens": cached_tokens},
+        },
+        usage_dialect=UsageDialect.OPENAI,
+    )
+
+    assert metrics is not None
+    assert metrics.cache.read_tokens == cached_tokens
+    assert metrics.cache.cached_input_tokens == cached_tokens
+    assert metrics.cache.uncached_input_tokens == expected_uncached
+    assert metrics.cache.read_tokens + metrics.cache.uncached_input_tokens == input_tokens
+
+
+def test_generic_openai_shaped_usage_keeps_all_input_billable_at_the_ordinary_rate() -> None:
+    metrics = normalize_usage_metrics(
+        provider_name="unknown-gateway",
+        model="unknown-model",
+        raw_usage={
+            "input_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 80},
+        },
+    )
+
+    assert metrics is not None
+    assert metrics.input_tokens == 100
+    assert metrics.cache.read_tokens == 0
+    assert metrics.cache.cached_input_tokens == 0
+    assert metrics.cache.uncached_input_tokens == 100
+
+
+@pytest.mark.parametrize(
+    "raw_usage",
+    [
+        {"input_tokens": "100", "output_tokens": 20},
+        {"input_tokens": True, "output_tokens": 20},
+        {"input_tokens": -1, "output_tokens": 20},
+        {"input_tokens": 100, "prompt_tokens": 200, "output_tokens": 20},
+        {"input_tokens": 100, "output_tokens": 10, "completion_tokens": 20},
+        {"input_tokens": 100, "output_tokens": 20, "total_tokens": 119},
+        {
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_read_input_tokens": "80",
+        },
+        {
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_creation_input_tokens": -1,
+        },
+        {
+            "input_tokens": 100,
+            "prompt_tokens": 200,
+            "output_tokens": 1,
+            "total_tokens": 201,
+            "input_tokens_details": {"cached_tokens": 80},
+        },
+        {
+            "input_tokens": 100,
+            "prompt_tokens": 200,
+            "output_tokens": 1,
+            "total_tokens": 201,
+            "input_tokens_details": {},
+        },
+        {
+            "input_tokens": 100,
+            "output_tokens": 10,
+            "completion_tokens": 20,
+            "total_tokens": 120,
+            "input_tokens_details": {"cached_tokens": 80},
+        },
+        {
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "total_tokens": 119,
+            "input_tokens_details": {"cached_tokens": 80},
+        },
+    ],
+    ids=(
+        "malformed-input-string-without-details",
+        "malformed-input-bool-without-details",
+        "malformed-input-negative-without-details",
+        "input-aliases-without-details",
+        "output-aliases-without-details",
+        "total-without-details",
+        "malformed-inferred-cache-read",
+        "malformed-inferred-cache-write",
+        "input-aliases",
+        "input-aliases-empty-details",
+        "output-aliases",
+        "total",
+    ),
+)
+def test_generic_openai_shaped_usage_rejects_contradictory_primary_counters(
+    raw_usage: dict[str, object],
+) -> None:
+    assert (
+        normalize_usage_metrics(
+            provider_name="unknown-gateway",
+            model="unknown-model",
+            raw_usage=raw_usage,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "raw_usage",
+    [
+        {"input_tokens": 100, "total_tokens": 100},
+        {"output_tokens": 20, "total_tokens": 20},
+    ],
+    ids=("missing-output", "missing-input"),
+)
+def test_declared_openai_usage_requires_both_primary_counters(
+    raw_usage: dict[str, object],
+) -> None:
+    assert (
+        normalize_usage_metrics(
+            provider_name="renamed-gateway",
+            model="gpt",
+            raw_usage=raw_usage,
+            usage_dialect=UsageDialect.OPENAI,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "raw_usage",
+    [
+        {"input_tokens": 100, "input_tokens_details": {"cached_tokens": 101}},
+        {"input_tokens": 100, "input_tokens_details": {"cached_tokens": -1}},
+        {"input_tokens": 100, "input_tokens_details": {"cached_tokens": "80"}},
+        {
+            "input_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 80},
+            "prompt_tokens_details": {"cached_tokens": 70},
+        },
+        {
+            "input_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 80},
+            "cache_read_input_tokens": 70,
+        },
+        {
+            "input_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 80},
+            "cache_read_input_tokens": -1,
+        },
+        {
+            "input_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 80},
+            "cache_read_input_tokens": "80",
+        },
+        {
+            "input_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 80},
+            "cache_read_input_tokens": True,
+        },
+        {
+            "input_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 80},
+            "cache_creation_input_tokens": 10,
+        },
+        {
+            "input_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 80},
+            "cache_creation_input_tokens": -1,
+        },
+        {
+            "input_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 80},
+            "cache_creation_input_tokens": "10",
+        },
+        {
+            "input_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 80},
+            "cache_creation_input_tokens": True,
+        },
+        {
+            "input_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 80},
+            "cache_creation": {"ephemeral_5m_input_tokens": "10"},
+        },
+        {
+            "input_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 80},
+            "cache_details": [{"input_tokens": -1}],
+        },
+        {
+            "input_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 80},
+            "cache_details": ["invalid"],
+        },
+        {
+            "input_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 80},
+            "cache_details": [{"ttl": "5m"}],
+        },
+        {"input_tokens": "100", "output_tokens": 1},
+        {"input_tokens": True, "output_tokens": 1},
+        {"input_tokens": -1, "output_tokens": 1},
+        {"input_tokens": 50, "prompt_tokens": 100, "output_tokens": 1},
+        {"input_tokens": 100, "prompt_tokens": "100", "output_tokens": 1},
+        {"input_tokens": 100, "output_tokens": "20"},
+        {"input_tokens": 100, "output_tokens": True},
+        {"input_tokens": 100, "output_tokens": -1},
+        {"input_tokens": 100, "output_tokens": 10, "completion_tokens": 20},
+        {"input_tokens": 100, "output_tokens": 20, "total_tokens": "120"},
+        {"input_tokens": 100, "output_tokens": 20, "total_tokens": 119},
+    ],
+)
+def test_declared_openai_usage_rejects_malformed_or_contradictory_counters(
+    raw_usage: dict[str, object],
+) -> None:
+    assert (
+        normalize_usage_metrics(
+            provider_name="renamed-gateway",
+            model="gpt",
+            raw_usage={"output_tokens": 0, **raw_usage},
+            usage_dialect=UsageDialect.OPENAI,
+        )
+        is None
+    )
+
+
+def test_declared_openai_usage_counts_equivalent_duplicate_cache_counters_once() -> None:
+    metrics = normalize_usage_metrics(
+        provider_name="renamed-gateway",
+        model="gpt",
+        raw_usage={
+            "input_tokens": 100,
+            "prompt_tokens": 100,
+            "output_tokens": 20,
+            "completion_tokens": 20,
+            "total_tokens": 120,
+            "input_tokens_details": {"cached_tokens": 80},
+            "prompt_tokens_details": {"cached_tokens": 80},
+            "cache_read_input_tokens": 80,
+            "cache_creation_input_tokens": 0,
+            "cache_creation": {"ephemeral_5m_input_tokens": 0},
+            "cache_details": [],
+        },
+        usage_dialect=UsageDialect.OPENAI,
+    )
+
+    assert metrics is not None
+    assert metrics.input_tokens == 100
+    assert metrics.output_tokens == 20
+    assert metrics.total_tokens == 120
+    assert metrics.cache.read_tokens == 80
+    assert metrics.cache.uncached_input_tokens == 20
+
+
+def test_declared_openai_usage_accepts_explicit_zero_cache_counters_without_details() -> None:
+    metrics = normalize_usage_metrics(
+        provider_name="renamed-gateway",
+        model="gpt",
+        raw_usage={
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+        },
+        usage_dialect=UsageDialect.OPENAI,
+    )
+
+    assert metrics is not None
+    assert metrics.input_tokens == 100
+    assert metrics.cache.read_tokens == 0
+    assert metrics.cache.uncached_input_tokens == 100
+
+
+def test_declared_openai_usage_accepts_explicit_zero_primary_counters() -> None:
+    metrics = normalize_usage_metrics(
+        provider_name="renamed-gateway",
+        model="gpt",
+        raw_usage={
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        },
+        usage_dialect=UsageDialect.OPENAI,
+    )
+
+    assert metrics is not None
+    assert metrics.input_tokens == 0
+    assert metrics.output_tokens == 0
+    assert metrics.total_tokens == 0
+    assert metrics.cache.read_tokens == 0
+    assert metrics.cache.uncached_input_tokens == 0
+
+
+@pytest.mark.parametrize("nullable_details_key", ["input_tokens_details", "prompt_tokens_details"])
+def test_declared_openai_usage_treats_nullable_cache_details_as_absent(
+    nullable_details_key: str,
+) -> None:
+    metrics = normalize_usage_metrics(
+        provider_name="renamed-gateway",
+        model="gpt",
+        raw_usage={
+            "input_tokens": 100,
+            nullable_details_key: None,
+            "output_tokens": 20,
+        },
+        usage_dialect=UsageDialect.OPENAI,
+    )
+
+    assert metrics is not None
+    assert metrics.input_tokens == 100
+    assert metrics.output_tokens == 20
+    assert metrics.cache.read_tokens == 0
+    assert metrics.cache.uncached_input_tokens == 100
+
+
+@pytest.mark.parametrize("details_key", ["input_tokens_details", "prompt_tokens_details"])
+def test_declared_openai_usage_treats_nullable_cached_counter_as_absent(
+    details_key: str,
+) -> None:
+    metrics = normalize_usage_metrics(
+        provider_name="renamed-gateway",
+        model="gpt",
+        raw_usage={
+            "input_tokens": 100,
+            "output_tokens": 20,
+            details_key: {"cached_tokens": None},
+        },
+        usage_dialect=UsageDialect.OPENAI,
+    )
+
+    assert metrics is not None
+    assert metrics.input_tokens == 100
+    assert metrics.output_tokens == 20
+    assert metrics.cache.read_tokens == 0
+    assert metrics.cache.uncached_input_tokens == 100
+
+
+@pytest.mark.parametrize(
+    "output_details",
+    [
+        {"reasoning_tokens": "10"},
+        {"reasoning_tokens": True},
+        {"reasoning_tokens": -1},
+        {"reasoning_tokens": 11},
+        {"reasoning_tokens": 5, "thinking_tokens": 4},
+    ],
+    ids=("string", "boolean", "negative", "exceeds-output", "conflicting-aliases"),
+)
+def test_declared_openai_usage_rejects_malformed_reasoning_details(
+    output_details: dict[str, object],
+) -> None:
+    assert (
+        normalize_usage_metrics(
+            provider_name="renamed-gateway",
+            model="gpt",
+            raw_usage={
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "output_tokens_details": output_details,
+            },
+            usage_dialect=UsageDialect.OPENAI,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("details_key", "counter_key"),
+    [
+        ("output_tokens_details", "reasoning_tokens"),
+        ("completion_tokens_details", "reasoning_tokens"),
+        ("output_tokens_details", "thinking_tokens"),
+        ("completion_tokens_details", "thinking_tokens"),
+    ],
+)
+def test_declared_openai_usage_treats_nullable_reasoning_counter_as_absent(
+    details_key: str,
+    counter_key: str,
+) -> None:
+    metrics = normalize_usage_metrics(
+        provider_name="renamed-gateway",
+        model="gpt",
+        raw_usage={
+            "input_tokens": 100,
+            "output_tokens": 10,
+            details_key: {counter_key: None},
+        },
+        usage_dialect=UsageDialect.OPENAI,
+    )
+
+    assert metrics is not None
+    assert metrics.reasoning_output_tokens == 0
+
+
+@pytest.mark.parametrize("usage_dialect", [UsageDialect.AUTO, UsageDialect.GENERIC])
+def test_undeclared_usage_rejects_matching_mixed_cache_evidence(
+    usage_dialect: UsageDialect,
+) -> None:
+    assert (
+        normalize_usage_metrics(
+            provider_name="unknown-gateway",
+            model="unknown-model",
+            raw_usage={
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "input_tokens_details": {"cached_tokens": 80},
+                "cache_read_input_tokens": 80,
+            },
+            usage_dialect=usage_dialect,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("usage_dialect", "expected_input_tokens", "expected_uncached_input_tokens"),
+    [
+        (UsageDialect.OPENAI, 100, 20),
+        (UsageDialect.ANTHROPIC, 180, 100),
+    ],
+)
+def test_authoritative_dialect_resolves_matching_mixed_cache_evidence(
+    usage_dialect: UsageDialect,
+    expected_input_tokens: int,
+    expected_uncached_input_tokens: int,
+) -> None:
+    metrics = normalize_usage_metrics(
+        provider_name="unknown-gateway",
+        model="unknown-model",
+        raw_usage={
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "input_tokens_details": {"cached_tokens": 80},
+            "cache_read_input_tokens": 80,
+        },
+        usage_dialect=usage_dialect,
+    )
+
+    assert metrics is not None
+    assert metrics.input_tokens == expected_input_tokens
+    assert metrics.total_tokens == expected_input_tokens + 20
+    assert metrics.cache.read_tokens == 80
+    assert metrics.cache.cached_input_tokens == 80
+    assert metrics.cache.uncached_input_tokens == expected_uncached_input_tokens
+    assert (
+        metrics.cache.cached_input_tokens + metrics.cache.uncached_input_tokens
+        == metrics.input_tokens
+    )
+
+
+@pytest.mark.parametrize(
+    "raw_usage",
+    [
+        {
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "input_tokens_details": {"cached_tokens": 80},
+            "cache_read_input_tokens": 70,
+        },
+        {
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "input_tokens_details": {"cached_tokens": "80"},
+            "cache_read_input_tokens": 80,
+        },
+        {
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "input_tokens_details": "invalid",
+            "cache_read_input_tokens": 80,
+        },
+        {
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "input_tokens_details": {"cached_tokens": 80},
+            "cache_read_input_tokens": "80",
+        },
+        {
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "input_tokens_details": {"cached_tokens": 80},
+            "cache_creation_input_tokens": 10,
+        },
+    ],
+    ids=(
+        "conflicting-read-counters",
+        "malformed-nested-read",
+        "malformed-nested-details",
+        "malformed-top-level-read",
+        "nested-read-without-top-level-read",
+    ),
+)
+def test_auto_usage_rejects_unreconciled_mixed_cache_evidence(
+    raw_usage: dict[str, object],
+) -> None:
+    assert (
+        normalize_usage_metrics(
+            provider_name="unknown-gateway",
+            model="unknown-model",
+            raw_usage=raw_usage,
+        )
+        is None
+    )
+
+
+def test_durable_normalization_failure_is_not_reinterpreted_from_raw_usage() -> None:
+    assert (
+        usage_metrics_from_event_payload(
+            {
+                "provider_name": "renamed-openai",
+                "usage_normalization_failed": True,
+                "usage_metrics": {
+                    "input_tokens": 1,
+                    "cache": {"uncached_input_tokens": 1},
+                },
+                "usage": {
+                    "input_tokens": 100,
+                    "input_tokens_details": {"cached_tokens": 80},
+                    "cache_read_input_tokens": 70,
+                },
+            }
+        )
+        is None
+    )
 
 
 def test_budget_policy_validates_scope_keys_and_duplicates() -> None:
@@ -2080,6 +2790,53 @@ def test_normalize_bedrock_anthropic_shape_by_payload() -> None:
     assert metrics.cache.write_tokens == 5
     assert metrics.cache.cached_input_tokens == 70
     assert metrics.cache.uncached_input_tokens == 100
+
+
+@pytest.mark.parametrize("reported_total_tokens", [13, 17])
+def test_normalize_bedrock_total_before_expanding_separate_cache_tokens(
+    reported_total_tokens: int,
+) -> None:
+    metrics = normalize_usage_metrics(
+        provider_name="bedrock",
+        model="us.anthropic.claude-sonnet-4-6-v1",
+        raw_usage={
+            "input_tokens": 11,
+            "output_tokens": 2,
+            "total_tokens": reported_total_tokens,
+            "cache_read_input_tokens": 3,
+            "cache_creation_input_tokens": 1,
+            "cache_details": [{"ttl": "5m", "input_tokens": 1}],
+        },
+        usage_dialect=UsageDialect.ANTHROPIC,
+    )
+
+    assert metrics is not None
+    assert metrics.input_tokens == 15
+    assert metrics.output_tokens == 2
+    assert metrics.total_tokens == 17
+    assert metrics.cache.read_tokens == 3
+    assert metrics.cache.write_tokens == 1
+    assert metrics.cache.write_5m_tokens == 1
+    assert metrics.cache.cached_input_tokens == 3
+    assert metrics.cache.uncached_input_tokens == 11
+
+
+def test_normalize_bedrock_rejects_contradictory_provider_total() -> None:
+    assert (
+        normalize_usage_metrics(
+            provider_name="bedrock",
+            model="us.anthropic.claude-sonnet-4-6-v1",
+            raw_usage={
+                "input_tokens": 11,
+                "output_tokens": 2,
+                "total_tokens": 14,
+                "cache_read_input_tokens": 3,
+                "cache_creation_input_tokens": 1,
+            },
+            usage_dialect=UsageDialect.ANTHROPIC,
+        )
+        is None
+    )
 
 
 def test_normalize_declared_anthropic_dialect_overrides_unknown_name() -> None:

@@ -30,7 +30,7 @@ from cayu import (
 )
 from cayu.core import Event, EventType
 from cayu.observability import otel
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent, UsageDialect
 from cayu.runtime import InMemorySessionStore, SessionIdentity
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime.budgets import InMemoryBudgetStore
@@ -182,6 +182,45 @@ def test_model_span_carries_genai_usage_attributes() -> None:
     assert attrs["gen_ai.usage.reasoning.output_tokens"] == 50
     assert attrs["gen_ai.usage.cache_read.input_tokens"] == 3800
     assert attrs["gen_ai.usage.cache_creation.input_tokens"] == 120
+
+
+def test_real_runtime_exports_renamed_openai_cached_input_from_normalized_usage() -> None:
+    class RenamedOpenAIProvider(FakeProvider):
+        name = "company-gateway"
+        usage_dialect = UsageDialect.OPENAI
+
+    exporter, sink = _make_sink()
+    provider = RenamedOpenAIProvider(
+        [
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed(
+                {
+                    "model": "gpt-gateway",
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 2,
+                        "input_tokens_details": {"cached_tokens": 80},
+                    },
+                }
+            ),
+        ]
+    )
+    app = CayuApp(enable_logging=False, event_sinks=[sink])
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="gpt-gateway"))
+
+    _run(
+        app,
+        RunRequest(
+            agent_name="assistant",
+            session_id="sess_openai_cached_usage",
+            messages=[Message.text("user", "hello")],
+        ),
+    )
+
+    model = _spans_by_name(exporter)["chat gpt-gateway"]
+    assert model.attributes["gen_ai.usage.input_tokens"] == 100
+    assert model.attributes["gen_ai.usage.cache_read.input_tokens"] == 80
 
 
 def test_tool_span_carries_genai_tool_attributes() -> None:

@@ -143,6 +143,7 @@ from cayu.runtime.context import (
     _automatic_compaction_dispatch_runner_scope,
     _compaction_completion_publisher_scope,
     _compaction_model_completed_payload,
+    _durable_compaction_completion_evidence,
     context_build_termination_compaction_telemetry,
     sanitize_context_compaction_telemetry,
 )
@@ -3037,19 +3038,25 @@ class SessionEngine:
                 actual_model: str,
                 completed_metadata: dict[str, Any],
             ) -> Event:
+                provider_name = actual_provider.billing_provider_name or actual_provider.name
+                compactor = type(context_policy.compactor).__name__
+                payload = _compaction_model_completed_payload(
+                    completed_payload=completed_metadata,
+                    provider_name=provider_name,
+                    fallback_model=actual_model,
+                    compactor=compactor,
+                    usage_dialect=actual_provider.usage_dialect,
+                )
                 return Event(
                     type=EventType.MODEL_COMPLETED,
                     session_id=loaded_session.id,
                     agent_name=registered_agent.spec.name,
                     environment_name=environment_name,
-                    payload=_compaction_model_completed_payload(
-                        completed_payload=completed_metadata,
-                        provider_name=(
-                            actual_provider.billing_provider_name or actual_provider.name
-                        ),
+                    payload=_durable_compaction_completion_evidence(
+                        payload,
+                        provider_name=provider_name,
                         fallback_model=actual_model,
-                        compactor=type(context_policy.compactor).__name__,
-                        usage_dialect=actual_provider.usage_dialect,
+                        compactor=compactor,
                     ),
                 )
 

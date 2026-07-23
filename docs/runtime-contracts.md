@@ -1117,13 +1117,16 @@ rollback is required.
 The durable billing envelope is provider-neutral: `provider_name` and
 `resource_id` identify the commercial resource, request/completion evidence
 remain opaque provider-owned JSON, and `pricing_contexts` enumerate exact
-commercial dimensions core may select. Before a provider request hook runs the
-runtime carries an explicit unresolved state; after it runs, a resolved state
-contains either an identity or `None`. Completion may add evidence and narrow
-the request's possible contexts to a non-empty subset, but cannot erase them,
-rewrite request evidence, replace the resource, introduce/remove an identity,
-or widen possible pricing. These rules apply equally to normal model steps,
-compaction, durable usage, and budget reservation/reconciliation.
+commercial dimensions core may select. Every identity string, including
+pricing-context names and values, must round-trip through every supported
+durable store; an invalid provider request identity fails before reservation or
+dispatch. Before a provider request hook runs the runtime carries an explicit
+unresolved state; after it runs, a resolved state contains either an identity
+or `None`. Completion may add evidence and narrow the request's possible
+contexts to a non-empty subset, but cannot erase them, rewrite request evidence,
+replace the resource, introduce/remove an identity, or widen possible pricing.
+These rules apply equally to normal model steps, compaction, durable usage, and
+budget reservation/reconciliation.
 
 ## Event Watchers
 
@@ -1378,8 +1381,37 @@ Normalized usage includes:
 OpenAI cached input token counters and Anthropic cache read/write token counters
 are normalized into this shape. The provider-specific raw `usage` value remains
 available for callers that need exact provider fields. If Cayu cannot normalize
-a provider's usage payload, the durable `model.completed` event still keeps raw
-`usage`; it simply omits `usage_metrics`.
+a provider's usage payload, the durable `model.completed` event keeps raw
+`usage` whenever it is portable across the supported stores and omits
+`usage_metrics`.
+
+Providers declare the usage dialect of their wire format independently of their
+registration name or base URL. In the OpenAI dialect, `input_tokens` includes
+cached input, so normalization partitions it into exactly one cache-read bucket
+and one uncached-input bucket. A generic provider with undeclared OpenAI-shaped
+cache details keeps all reported input in the ordinary bucket rather than making
+the unclassified cached portion free. Malformed or contradictory cache details
+or equivalent OpenAI token-counter aliases omit normalized metrics while
+preserving raw usage and a durable normalization-failure marker so later readers
+cannot reinterpret the rejected evidence under a different dialect.
+If provider-controlled usage contains text that cannot round-trip through every
+supported durable store, Cayu drops the undurable raw field, invalidates its
+derived normalized metrics, and preserves a bounded normalization-failure marker
+and reason. The dispatched model attempt therefore remains visible and unpriced
+instead of disappearing at persistence.
+Declared OpenAI usage must include both an input and an output counter, including
+explicit zero when applicable. Optional nested detail counters may be absent or
+`null`; non-null malformed values and conflicting mixed-dialect cache evidence
+remain normalization failures. Every present recognized primary or cache counter
+must be a non-negative integer, and equivalent aliases must agree. When no
+authoritative dialect is declared, nested OpenAI cache evidence combined with
+top-level Anthropic cache evidence is ambiguous and therefore fails
+normalization even when the reported counts match.
+Anthropic-shaped provider totals may describe either the provider's primary
+input-plus-output counters or the cache-inclusive total; Cayu validates either
+known convention and always emits one cache-inclusive normalized total.
+When pricing has no cache-read rate, cached input uses the ordinary input rate;
+an explicitly configured zero cache-read rate remains zero.
 
 Prompt caching behavior is not a universal runtime contract. Providers differ:
 some apply prompt caching automatically, some require or benefit from explicit

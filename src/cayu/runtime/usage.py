@@ -5,7 +5,11 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import (
+    copy_json_value,
+    require_clean_nonblank,
+    require_durable_json_text,
+)
 from cayu.core.billing import BillingIdentity
 from cayu.core.events import Event, EventType
 
@@ -151,38 +155,113 @@ def normalize_usage_metrics(
 
     if type(raw_usage) is not dict:
         return None
-    if not _has_usage_counter(raw_usage):
-        return None
 
-    input_tokens = _first_nonnegative_int(raw_usage, ("input_tokens", "prompt_tokens"))
-    output_tokens = _first_nonnegative_int(
+    provider = provider_name.strip().lower() if type(provider_name) is str else None
+    dialect = _resolve_usage_dialect(
+        provider=provider,
+        declared_dialect=usage_dialect,
+        raw_usage=raw_usage,
+    )
+    authoritative_dialect = _authoritative_usage_dialect(
+        provider=provider,
+        declared_dialect=usage_dialect,
+    )
+
+    strict_input_tokens = _equivalent_nonnegative_int_fields(
+        raw_usage,
+        ("input_tokens", "prompt_tokens"),
+    )
+    strict_output_tokens = _equivalent_nonnegative_int_fields(
         raw_usage,
         ("output_tokens", "completion_tokens"),
     )
-    total_tokens = _nonnegative_int(raw_usage.get("total_tokens"))
-    if total_tokens == 0:
-        total_tokens = input_tokens + output_tokens
+    strict_total_tokens = _optional_nonnegative_int_field(raw_usage, "total_tokens")
+    strict_cache_read_tokens = _optional_nonnegative_int_field(
+        raw_usage,
+        "cache_read_input_tokens",
+    )
+    strict_cache_write_tokens = _strict_cache_write_tokens(raw_usage)
+    if (
+        strict_input_tokens is None
+        or strict_output_tokens is None
+        or strict_total_tokens is None
+        or strict_cache_read_tokens is None
+        or strict_cache_write_tokens is None
+    ):
+        return None
 
-    cached_input_tokens = 0
+    input_tokens, has_input_tokens = strict_input_tokens
+    output_tokens, has_output_tokens = strict_output_tokens
+    reported_total_tokens, has_reported_total_tokens = strict_total_tokens
+    cache_read_tokens, has_explicit_cache_read = strict_cache_read_tokens
+    cache_write_tokens = strict_cache_write_tokens
+    if dialect == _DIALECT_OPENAI and (not has_input_tokens or not has_output_tokens):
+        return None
+
+    if not _has_usage_counter(raw_usage) and dialect != _DIALECT_OPENAI:
+        return None
+    nested_cached_input = _nested_cached_input_tokens(raw_usage)
+    has_nested_cached_container = _has_nested_cached_input_container(raw_usage)
+    if nested_cached_input is None and (
+        dialect in {_DIALECT_OPENAI, _DIALECT_GENERIC}
+        or (dialect == _DIALECT_ANTHROPIC and has_nested_cached_container)
+    ):
+        return None
+    cached_input_tokens, has_nested_cached_input = (
+        nested_cached_input if nested_cached_input is not None else (0, False)
+    )
+    mixed_cache_evidence = has_nested_cached_input and _has_top_level_anthropic_cache_evidence(
+        raw_usage
+    )
+    if mixed_cache_evidence and authoritative_dialect not in {
+        _DIALECT_OPENAI,
+        _DIALECT_ANTHROPIC,
+    }:
+        return None
+
+    computed_primary_total = input_tokens + output_tokens
+    if has_reported_total_tokens:
+        accepted_reported_totals = {computed_primary_total}
+        if dialect == _DIALECT_ANTHROPIC:
+            # Bedrock surfaces both conventions across supported model payloads:
+            # totalTokens may be the primary input-plus-output sum, or may already
+            # include the separately reported cache read/write counters.
+            accepted_reported_totals.add(
+                computed_primary_total + cache_read_tokens + cache_write_tokens
+            )
+        if reported_total_tokens not in accepted_reported_totals:
+            return None
+    total_tokens = reported_total_tokens if has_reported_total_tokens else computed_primary_total
+
+    if dialect in {_DIALECT_OPENAI, _DIALECT_GENERIC} and cached_input_tokens > input_tokens:
+        return None
+    strict_reasoning_output = (
+        _nested_reasoning_output_tokens(raw_usage) if dialect == _DIALECT_OPENAI else None
+    )
+    if dialect == _DIALECT_OPENAI and strict_reasoning_output is None:
+        return None
     reasoning_output_tokens = 0
     input_details = raw_usage.get("input_tokens_details")
     if type(input_details) is not dict:
         input_details = raw_usage.get("prompt_tokens_details")
-    if type(input_details) is dict:
+    if dialect == _DIALECT_ANTHROPIC and type(input_details) is dict:
         cached_input_tokens = _nonnegative_int(input_details.get("cached_tokens"))
 
-    output_details = raw_usage.get("output_tokens_details")
-    if type(output_details) is not dict:
-        output_details = raw_usage.get("completion_tokens_details")
-    if type(output_details) is dict:
-        reasoning_output_tokens = _nonnegative_int(output_details.get("reasoning_tokens"))
-        if reasoning_output_tokens == 0:
-            # Anthropic reports extended-thinking tokens as `thinking_tokens` (already
-            # billed inside output_tokens); surface them in the same neutral field.
-            reasoning_output_tokens = _nonnegative_int(output_details.get("thinking_tokens"))
+    if strict_reasoning_output is not None:
+        reasoning_output_tokens, _ = strict_reasoning_output
+        if reasoning_output_tokens > output_tokens:
+            return None
+    else:
+        output_details = raw_usage.get("output_tokens_details")
+        if type(output_details) is not dict:
+            output_details = raw_usage.get("completion_tokens_details")
+        if type(output_details) is dict:
+            reasoning_output_tokens = _nonnegative_int(output_details.get("reasoning_tokens"))
+            if reasoning_output_tokens == 0:
+                # Anthropic reports extended-thinking tokens as `thinking_tokens` (already
+                # billed inside output_tokens); surface them in the same neutral field.
+                reasoning_output_tokens = _nonnegative_int(output_details.get("thinking_tokens"))
 
-    cache_read_tokens = _nonnegative_int(raw_usage.get("cache_read_input_tokens"))
-    cache_write_tokens = _nonnegative_int(raw_usage.get("cache_creation_input_tokens"))
     cache_write_5m_tokens = 0
     cache_write_1h_tokens = 0
     cache_write_unknown_ttl_tokens = 0
@@ -230,21 +309,32 @@ def normalize_usage_metrics(
     elif cache_write_tokens > detailed_cache_writes:
         cache_write_unknown_ttl_tokens += cache_write_tokens - detailed_cache_writes
 
-    provider = provider_name.strip().lower() if type(provider_name) is str else None
-    dialect = _resolve_usage_dialect(
-        provider=provider,
-        declared_dialect=usage_dialect,
-        raw_usage=raw_usage,
-    )
     anthropic_shaped = dialect == _DIALECT_ANTHROPIC
     if dialect == _DIALECT_OPENAI:
-        cache_read_tokens = max(cache_read_tokens, cached_input_tokens)
+        if cache_write_tokens > 0:
+            return None
+        if has_explicit_cache_read and cache_read_tokens != cached_input_tokens:
+            return None
+        cache_read_tokens = cached_input_tokens
     elif anthropic_shaped:
+        if has_nested_cached_input and (
+            not has_explicit_cache_read or cache_read_tokens != cached_input_tokens
+        ):
+            return None
         cached_input_tokens = max(cached_input_tokens, cache_read_tokens)
         input_tokens = input_tokens + cache_read_tokens + cache_write_tokens
+    else:
+        if cache_read_tokens > 0 or cache_write_tokens > 0:
+            return None
+        # An undeclared provider may expose OpenAI-shaped cache details, but the
+        # runtime has no authoritative dialect proving how to bill them. Keep all
+        # reported input in the ordinary bucket rather than subtracting a cached
+        # portion whose cache-read price would otherwise be missing.
+        cached_input_tokens = 0
 
-    if total_tokens == 0 or anthropic_shaped:
-        total_tokens = input_tokens + output_tokens
+    if anthropic_shaped:
+        computed_total_tokens = input_tokens + output_tokens
+        total_tokens = computed_total_tokens
 
     uncached_input_tokens = max(input_tokens - cached_input_tokens, 0)
     if anthropic_shaped:
@@ -275,6 +365,75 @@ def usage_metrics_payload(metrics: UsageMetrics | None) -> dict[str, Any] | None
     if metrics is None:
         return None
     return metrics.model_dump()
+
+
+def durable_model_completed_payload(
+    payload: dict[str, Any],
+    *,
+    fallback_fields: dict[str, Any],
+    unavailable_reason: str,
+) -> dict[str, Any]:
+    """Project provider completion metadata onto the cross-store JSON boundary.
+
+    Provider payloads normally remain equivalent JSON. When one top-level field
+    contains text that a supported durable store cannot represent, retain every
+    independently durable non-derived field plus the caller's runtime-owned
+    identity fallback. Usage fails closed whenever raw or normalized evidence
+    crosses a lossy persistence boundary.
+    """
+
+    copied = copy_json_value(payload, "model_completed_payload")
+    try:
+        require_durable_json_text(copied, "model_completed_payload")
+    except ValueError:
+        projected: dict[str, Any] = {}
+        for key, value in copied.items():
+            candidate = {key: value}
+            try:
+                require_durable_json_text(candidate, f"model_completed_payload.{key}")
+            except ValueError:
+                continue
+            projected[key] = value
+
+        runtime_fields = copy_json_value(fallback_fields, "fallback_fields")
+        for key, value in runtime_fields.items():
+            candidate = {key: value}
+            try:
+                require_durable_json_text(candidate, f"fallback_fields.{key}")
+            except ValueError:
+                continue
+            projected.setdefault(key, value)
+
+        lost_raw_usage = "usage" in copied and "usage" not in projected
+        lost_billing_identity = "billing_identity" in copied and "billing_identity" not in projected
+        if lost_raw_usage or lost_billing_identity:
+            # Normalized counters cannot remain authoritative after their raw
+            # provider evidence or commercial identity crosses a lossy
+            # persistence boundary. Dropping the derived representation keeps
+            # every cost and aggregate reader fail-closed instead of letting
+            # optimized readers price a projection whose billing basis changed.
+            projected.pop("usage_metrics", None)
+        lost_normalized_usage = "usage_metrics" in copied and "usage_metrics" not in projected
+        lost_all_usage = (
+            ("usage" in copied or "usage_metrics" in copied)
+            and "usage" not in projected
+            and "usage_metrics" not in projected
+        )
+        if (
+            copied.get("usage_normalization_failed") is True
+            or lost_raw_usage
+            or lost_billing_identity
+            or lost_normalized_usage
+            or lost_all_usage
+        ):
+            projected["usage_normalization_failed"] = True
+            projected["usage_unavailable_reason"] = require_clean_nonblank(
+                unavailable_reason,
+                "unavailable_reason",
+            )
+        require_durable_json_text(projected, "model_completed_payload")
+        return projected
+    return copied
 
 
 def strip_provider_billing_identity(payload: dict[str, Any]) -> None:
@@ -397,6 +556,12 @@ def usage_metrics_from_event_payload(payload: dict[str, Any]) -> UsageMetrics | 
     event_identity = (
         BillingIdentity.model_validate(raw_identity) if type(raw_identity) is dict else None
     )
+    # New runtime events record a failed normalization decision explicitly so
+    # durable readers do not reinterpret the same raw payload later without the
+    # provider's authoritative dialect. Events written before this marker was
+    # introduced retain the legacy raw-usage fallback below.
+    if payload.get("usage_normalization_failed") is True:
+        return None
     metrics = payload.get("usage_metrics")
     if type(metrics) is dict:
         parsed = UsageMetrics(**copy_json_value(metrics, "usage_metrics"))
@@ -472,10 +637,27 @@ def _resolve_usage_dialect(
     if _is_anthropic_shaped_payload(raw_usage):
         return _DIALECT_ANTHROPIC
     # OpenAI-style nested ``*_tokens_details.cached_tokens`` is left as generic
-    # unless a provider declares the ``openai`` dialect: the generic path already
-    # records the cached-input counter, so shape-detecting it would only shift
-    # where those tokens surface without correcting an undercount.
+    # unless a provider declares the ``openai`` dialect. Without authoritative
+    # semantics, the generic path keeps every reported input token in the
+    # ordinary billable bucket instead of treating an unclassified portion as free.
     return _DIALECT_GENERIC
+
+
+def _authoritative_usage_dialect(
+    *,
+    provider: str | None,
+    declared_dialect: str | None,
+) -> str | None:
+    """Return a declared or built-in dialect, excluding payload-shape inference."""
+
+    declared = declared_dialect.strip().lower() if isinstance(declared_dialect, str) else None
+    if declared in _KNOWN_DIALECTS:
+        return declared
+    if provider in _ANTHROPIC_SHAPED_PROVIDERS:
+        return _DIALECT_ANTHROPIC
+    if provider == _DIALECT_OPENAI:
+        return _DIALECT_OPENAI
+    return None
 
 
 def _is_anthropic_shaped_payload(raw_usage: dict[str, Any]) -> bool:
@@ -492,12 +674,160 @@ def _is_anthropic_shaped_payload(raw_usage: dict[str, Any]) -> bool:
     return type(raw_usage.get("cache_creation")) is dict
 
 
+def _has_top_level_anthropic_cache_evidence(raw_usage: dict[str, Any]) -> bool:
+    """Return whether the payload carries any non-null Anthropic cache field."""
+
+    return any(
+        key in raw_usage and raw_usage[key] is not None
+        for key in (
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "cache_creation",
+            "cache_details",
+        )
+    )
+
+
 def _nonnegative_int(value: Any) -> int:
     if type(value) is bool:
         return 0
     if type(value) is int and value >= 0:
         return value
     return 0
+
+
+def _optional_nonnegative_int_field(values: dict[str, Any], key: str) -> tuple[int, bool] | None:
+    """Return a present non-negative integer field, or ``None`` when malformed."""
+
+    if key not in values:
+        return 0, False
+    value = values[key]
+    if type(value) is not int or value < 0:
+        return None
+    return value, True
+
+
+def _equivalent_nonnegative_int_fields(
+    values: dict[str, Any],
+    keys: tuple[str, ...],
+) -> tuple[int, bool] | None:
+    """Read equivalent counters once and reject malformed or conflicting aliases."""
+
+    observed: list[int] = []
+    for key in keys:
+        parsed = _optional_nonnegative_int_field(values, key)
+        if parsed is None:
+            return None
+        value, present = parsed
+        if present:
+            observed.append(value)
+    if not observed:
+        return 0, False
+    if any(value != observed[0] for value in observed[1:]):
+        return None
+    return observed[0], True
+
+
+def _nested_cached_input_tokens(raw_usage: dict[str, Any]) -> tuple[int, bool] | None:
+    """Read equivalent OpenAI cached-token details once and reject contradictions."""
+
+    observed: list[int] = []
+    for key in ("input_tokens_details", "prompt_tokens_details"):
+        if key not in raw_usage:
+            continue
+        details = raw_usage[key]
+        if details is None:
+            continue
+        if type(details) is not dict:
+            return None
+        if "cached_tokens" not in details:
+            continue
+        value = details["cached_tokens"]
+        if value is None:
+            continue
+        if type(value) is not int or value < 0:
+            return None
+        observed.append(value)
+    if not observed:
+        return 0, False
+    if any(value != observed[0] for value in observed[1:]):
+        return None
+    return observed[0], True
+
+
+def _has_nested_cached_input_container(raw_usage: dict[str, Any]) -> bool:
+    """Return whether a non-null OpenAI input-details container was supplied."""
+
+    for key in ("input_tokens_details", "prompt_tokens_details"):
+        if key in raw_usage and raw_usage[key] is not None:
+            return True
+    return False
+
+
+def _nested_reasoning_output_tokens(
+    raw_usage: dict[str, Any],
+) -> tuple[int, bool] | None:
+    """Read equivalent optional reasoning counters without lossy coercion."""
+
+    observed: list[int] = []
+    for key in ("output_tokens_details", "completion_tokens_details"):
+        if key not in raw_usage:
+            continue
+        details = raw_usage[key]
+        if details is None:
+            continue
+        if type(details) is not dict:
+            return None
+        for detail_key in ("reasoning_tokens", "thinking_tokens"):
+            if detail_key not in details or details[detail_key] is None:
+                continue
+            value = details[detail_key]
+            if type(value) is not int or value < 0:
+                return None
+            observed.append(value)
+    if not observed:
+        return 0, False
+    if any(value != observed[0] for value in observed[1:]):
+        return None
+    return observed[0], True
+
+
+def _strict_cache_write_tokens(raw_usage: dict[str, Any]) -> int | None:
+    """Validate cache-write evidence before an OpenAI-dialect payload can be priced."""
+
+    counter = _optional_nonnegative_int_field(raw_usage, "cache_creation_input_tokens")
+    if counter is None:
+        return None
+    total, _ = counter
+
+    cache_creation = raw_usage.get("cache_creation")
+    if "cache_creation" in raw_usage and cache_creation is not None:
+        if type(cache_creation) is not dict:
+            return None
+        creation_total = 0
+        for value in cache_creation.values():
+            if type(value) is not int or value < 0:
+                return None
+            creation_total += value
+        total = max(total, creation_total)
+
+    cache_details = raw_usage.get("cache_details")
+    if "cache_details" in raw_usage and cache_details is not None:
+        if type(cache_details) is not list:
+            return None
+        details_total = 0
+        for detail in cache_details:
+            if type(detail) is not dict:
+                return None
+            tokens = _optional_nonnegative_int_field(detail, "input_tokens")
+            if tokens is None:
+                return None
+            value, present = tokens
+            if not present:
+                return None
+            details_total += value
+        total = max(total, details_total)
+    return total
 
 
 def _has_usage_counter(values: dict[str, Any]) -> bool:

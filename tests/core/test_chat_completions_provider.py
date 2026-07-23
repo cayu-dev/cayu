@@ -28,6 +28,7 @@ from cayu.providers import (
     ModelFinishReason,
     ModelRequest,
     ModelStreamEventType,
+    UsageDialect,
     build_chat_completions_payload,
 )
 from cayu.providers._sse import aiter_sse_json_events
@@ -1153,6 +1154,16 @@ def test_provider_requires_https_base_url() -> None:
             name="gemini",
             base_url="http://insecure.example.com",
         )
+
+
+def test_provider_declares_openai_usage_dialect_for_renamed_gateway() -> None:
+    provider = ChatCompletionsProvider(
+        api_key="test-key",
+        name="gemini-through-gateway",
+        base_url="https://gateway.example.com/openai/v1",
+    )
+
+    assert provider.usage_dialect is UsageDialect.OPENAI
 
 
 def test_provider_endpoint_includes_api_version() -> None:

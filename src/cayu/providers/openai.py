@@ -64,6 +64,7 @@ from cayu.providers.base import (
     ModelStreamEvent,
     ModelStreamEventType,
     NativeStructuredOutputSchemaInvalid,
+    UsageDialect,
 )
 
 if TYPE_CHECKING:
@@ -283,6 +284,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
     """OpenAI Responses API adapter for Cayu's provider-neutral runtime."""
 
     name = "openai"
+    usage_dialect = UsageDialect.OPENAI
     supports_native_structured_output = True
 
     @property

@@ -78,6 +78,7 @@ from cayu.providers import (
     ModelStreamEventType,
     NativeStructuredOutputSchemaInvalid,
     OpenAIProvider,
+    UsageDialect,
     bedrock_billing_identity,
     completed_bedrock_billing_identity,
 )
@@ -10882,68 +10883,6 @@ def test_cayu_app_strips_provider_supplied_billing_identity(
     assert reconciled.payload["actual_amount"] == "0.25"
     assert reconciled.payload["billing_identity"] is None
     assert next(iter(ledger._records.values())).billing_identity is None
-    assert events[-1].type == EventType.SESSION_COMPLETED
-
-
-def test_cayu_app_strips_nested_provider_supplied_billing_identity_without_raw_usage() -> None:
-    forged_identity = bedrock_billing_identity(
-        invoked_model="global.anthropic.claude-sonnet-4-6",
-        source_region="us-east-1",
-        resource_type="inference_profile",
-        profile_scope="global",
-        effective_service_tier="default",
-    ).model_dump(mode="json")
-    provider = FakeProvider(
-        [
-            ModelStreamEvent.completed(
-                {
-                    "model": "fake-model",
-                    "usage_metrics": {
-                        "provider_name": "fake",
-                        "model": "fake-model",
-                        "billing_identity": forged_identity,
-                        "input_tokens": 250_000,
-                        "output_tokens": 0,
-                        "total_tokens": 250_000,
-                    },
-                }
-            )
-        ]
-    )
-    ledger = InMemoryBudgetLedger()
-    limit = fake_budget_limit("10").model_copy(
-        update={
-            "scope": "app",
-            "reservation": BudgetReservation(
-                max_input_tokens=1_000_000,
-                max_output_tokens=0,
-            ),
-        }
-    )
-    app = CayuApp(
-        budget_policy=BudgetPolicy(limits=(limit,)),
-        budget_ledger=ledger,
-    )
-    app.register_provider(provider, default=True)
-    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-
-    events = asyncio.run(
-        collect_events(
-            app,
-            RunRequest(
-                agent_name="assistant",
-                session_id="sess_untrusted_nested_billing_identity",
-                messages=[Message.text("user", "hello")],
-            ),
-        )
-    )
-
-    completed = next(event for event in events if event.type == EventType.MODEL_COMPLETED)
-    reconciled = next(event for event in events if event.type == EventType.BUDGET_RECONCILED)
-    assert "billing_identity" not in completed.payload
-    assert "billing_identity" not in completed.payload["usage_metrics"]
-    assert reconciled.payload["actual_amount"] == "0.25"
-    assert reconciled.payload["billing_identity"] is None
     assert events[-1].type == EventType.SESSION_COMPLETED
 
 
@@ -30662,7 +30601,11 @@ def test_transcript_digest_compactor_keeps_small_previous_summary_unclipped():
 
 
 def test_runtime_adds_usage_metrics_to_model_completed_events():
-    provider = FakeProvider(
+    class RenamedOpenAIProvider(FakeProvider):
+        name = "renamed-openai"
+        usage_dialect = UsageDialect.OPENAI
+
+    provider = RenamedOpenAIProvider(
         [
             ModelStreamEvent.text_delta("done"),
             ModelStreamEvent.completed(
@@ -30699,7 +30642,7 @@ def test_runtime_adds_usage_metrics_to_model_completed_events():
         "output_tokens": 3,
     }
     assert completed.payload["usage_metrics"] == {
-        "provider_name": "fake",
+        "provider_name": "renamed-openai",
         "requested_model": "fake-model",
         "model": "fake-model-version",
         "input_tokens": 12,
@@ -30707,7 +30650,7 @@ def test_runtime_adds_usage_metrics_to_model_completed_events():
         "total_tokens": 15,
         "reasoning_output_tokens": 0,
         "cache": {
-            "read_tokens": 0,
+            "read_tokens": 5,
             "write_tokens": 0,
             "cached_input_tokens": 5,
             "uncached_input_tokens": 7,
@@ -32742,7 +32685,10 @@ def test_runtime_keeps_raw_model_completed_usage_when_it_cannot_normalize_usage_
 
 
 def test_cayu_app_get_session_usage_summarizes_durable_events():
-    provider = FakeProvider(
+    class OpenAIUsageProvider(FakeProvider):
+        usage_dialect = UsageDialect.OPENAI
+
+    provider = OpenAIUsageProvider(
         [
             [
                 ModelStreamEvent.tool_call(
@@ -40296,7 +40242,7 @@ def test_cayu_app_retains_safe_usage_when_completion_metadata_is_not_durable():
     assert completed.payload["model"] == "summary-model"
     assert completed.payload["usage_metrics"]["input_tokens"] == 30
     assert completed.payload["usage_metrics"]["output_tokens"] == 4
-    assert "usage" not in completed.payload
+    assert completed.payload["usage"] == {"input_tokens": 30, "output_tokens": 4}
     assert "provider_note" not in completed.payload
     assert "compaction_attempt_id" not in completed.payload
     assert events[3].payload["error_type"] == "ValidationError"

@@ -152,6 +152,7 @@ from cayu.runtime.structured_output import (
     structured_output_tool_spec,
 )
 from cayu.runtime.usage import (
+    durable_model_completed_payload,
     normalize_usage_metrics,
     usage_metrics_from_event_payload,
     usage_metrics_payload,
@@ -3747,8 +3748,22 @@ def _model_stream_event_to_runtime_event(
         payload = {"delta": stream_event.delta}
     elif stream_event.type == ModelStreamEventType.COMPLETED:
         payload = transcript_helpers.model_completed_event_payload(stream_event.payload)
+        # When raw usage is present, its normalized projection and failure
+        # marker are runtime-owned accounting evidence. Providers that expose
+        # only the established normalized-usage payload retain compatibility.
+        has_raw_usage = payload.get("usage") is not None
+        if has_raw_usage:
+            payload.pop("usage_metrics", None)
+        payload.pop("usage_normalization_failed", None)
         resolved_model = _payload_model(payload, fallback=session.model)
         payload["requested_model"] = session.model
+        if provider_name is None:
+            payload.pop("provider_name", None)
+        else:
+            # Provider attribution is runtime-owned. The provider-returned model
+            # remains authoritative, but completion metadata cannot relabel the
+            # commercial provider used by cost and diagnostic readers.
+            payload["provider_name"] = provider_name
         # Billing identity is runtime-owned. Providers may report completion facts
         # consumed by their hook, but cannot inject an identity in the raw payload.
         payload.pop("billing_identity", None)
@@ -3778,6 +3793,8 @@ def _model_stream_event_to_runtime_event(
             # accounting evidence when normalized usage is unavailable.
             metrics.pop("billing_identity", None)
             payload["usage_metrics"] = metrics
+        elif has_raw_usage:
+            payload["usage_normalization_failed"] = True
         if context_pressure_estimate is not None:
             payload["context_pressure"] = {
                 "estimated_tool_schema_input_tokens": (
@@ -3801,17 +3818,31 @@ def _model_stream_event_to_runtime_event(
         payload = copy_json_value(stream_event.payload, "payload")
     else:
         raise ValueError(f"Unsupported model stream event type: {stream_event.type}")
+    payload = _retry_attempt_payload(
+        payload,
+        step=step,
+        attempt=attempt,
+        max_attempts=max_attempts,
+    )
+    if event_type == EventType.MODEL_COMPLETED:
+        payload = durable_model_completed_payload(
+            payload,
+            fallback_fields={
+                "provider_name": provider_name,
+                "requested_model": session.model,
+                "model": session.model,
+                "step": step,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+            },
+            unavailable_reason="invalid model completion usage telemetry",
+        )
     return Event(
         type=event_type,
         session_id=session.id,
         agent_name=registered_agent.spec.name,
         environment_name=environment_name,
-        payload=_retry_attempt_payload(
-            payload,
-            step=step,
-            attempt=attempt,
-            max_attempts=max_attempts,
-        ),
+        payload=payload,
     )
 
 

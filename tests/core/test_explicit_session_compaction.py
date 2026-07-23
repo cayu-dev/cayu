@@ -18,6 +18,7 @@ from cayu.providers import (
     ModelProviderError,
     ModelRequest,
     ModelStreamEvent,
+    UsageDialect,
     bedrock_billing_identity,
     completed_bedrock_billing_identity,
 )
@@ -6143,6 +6144,137 @@ def test_compact_session_attributes_provider_usage_and_honors_run_limits() -> No
             checkpoint_after_limit["context_compaction"]
             == checkpoint_before_limit["context_compaction"]
         )
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("invalid_text", ["100\x00", "\ud800"], ids=["nul", "surrogate"])
+@pytest.mark.parametrize(
+    "invalid_primary_counter",
+    [True, False],
+    ids=["invalid-primary", "invalid-extra-field"],
+)
+def test_explicit_compaction_persists_undurable_usage_as_unpriced_evidence(
+    invalid_text: str,
+    invalid_primary_counter: bool,
+) -> None:
+    class UndurableUsageProvider(ModelProvider):
+        name = "renamed-openai"
+        usage_dialect = UsageDialect.OPENAI
+
+        async def stream(self, request: ModelRequest):
+            yield ModelStreamEvent.text_delta("provider summary")
+            yield ModelStreamEvent.completed(
+                {
+                    "model": request.model,
+                    "usage": (
+                        {
+                            "input_tokens": invalid_text,
+                            "output_tokens": 1,
+                        }
+                        if invalid_primary_counter
+                        else {
+                            "input_tokens": 10,
+                            "output_tokens": 1,
+                            "provider_note": invalid_text,
+                        }
+                    ),
+                }
+            )
+
+    async def run() -> None:
+        store = InMemorySessionStore()
+        ledger = InMemoryBudgetLedger()
+        pricing = PriceBook(
+            prices=(
+                ModelPrice.fixed(
+                    provider_name="renamed-openai",
+                    model="summary-model",
+                    input_per_million=Decimal("1"),
+                    output_per_million=Decimal("1"),
+                ),
+            )
+        )
+        app = CayuApp(
+            session_store=store,
+            budget_policy=BudgetPolicy(
+                limits=(
+                    BudgetLimit(
+                        scope="app",
+                        max_estimated_cost=Decimal("1"),
+                        pricing=pricing,
+                        reservation=BudgetReservation(
+                            max_input_tokens=1_000_000,
+                            max_output_tokens=0,
+                        ),
+                    ),
+                )
+            ),
+            budget_ledger=ledger,
+            enable_logging=False,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=UndurableUsageProvider(),
+                    model="summary-model",
+                ),
+                max_user_turns=1,
+            ),
+        )
+        created = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=(
+                    "explicit-undurable-compaction-"
+                    f"{invalid_primary_counter}-{ord(invalid_text[-1])}"
+                ),
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        transcript = [
+            Message.text("user", "old request"),
+            Message.text("assistant", "old answer"),
+            Message.text("user", "current request"),
+        ]
+        await store.append_transcript_messages(created.id, transcript)
+        completed_session = await store.update_status(created.id, SessionStatus.COMPLETED)
+        events = []
+        with pytest.raises(ContextBuildError):
+            async for event in app.compact_session(
+                CompactSessionRequest(
+                    session_id=created.id,
+                    idempotency_key="explicit-undurable-compaction",
+                    expected_run_epoch=completed_session.run_epoch,
+                    expected_transcript_cursor=len(transcript),
+                )
+            ):
+                events.append(event)
+        completed = next(event for event in events if event.type == EventType.MODEL_COMPLETED)
+        reserved = next(event for event in events if event.type == EventType.BUDGET_RESERVED)
+        reconciled = next(event for event in events if event.type == EventType.BUDGET_RECONCILED)
+        cost = await app.get_session_cost(created.id, pricing)
+
+        assert "usage" not in completed.payload
+        assert "usage_metrics" not in completed.payload
+        assert completed.payload["usage_normalization_failed"] is True
+        assert completed.payload["usage_unavailable_reason"] == (
+            "invalid compaction usage telemetry"
+        )
+        assert cost.model_steps == 1
+        assert cost.priced_model_steps == 0
+        assert cost.unpriced_model_steps == 1
+        assert reserved.payload["actual"] == "1"
+        assert reconciled.payload["actual_amount"] == "1"
+        assert reconciled.payload["released_amount"] == "0"
+        assert reconciled.payload["reason"] == "application_requested"
+        ledger_record = next(iter(ledger._records.values()))
+        assert ledger_record.reason == (
+            "compaction completed without priced usage; charged reserved amount"
+        )
+        assert events[-1].type == EventType.CONTEXT_COMPACTION_FAILED
 
     asyncio.run(run())
 

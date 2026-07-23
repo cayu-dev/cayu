@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -12,7 +13,13 @@ import cayu.runtime._session_engine as session_engine_module
 from cayu import SQLiteSessionStore
 from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.core.billing import BillingIdentity
-from cayu.providers import bedrock_billing_identity, completed_bedrock_billing_identity
+from cayu.providers import (
+    ModelProvider,
+    ModelStreamEvent,
+    UsageDialect,
+    bedrock_billing_identity,
+    completed_bedrock_billing_identity,
+)
 from cayu.runtime import (
     CayuApp,
     CheckpointCompactionContextPolicy,
@@ -40,6 +47,8 @@ from cayu.runtime import (
     SessionStore,
     UsageRollupQuery,
 )
+from cayu.runtime.budgets import BudgetLimit, BudgetPolicy, BudgetReservation
+from cayu.runtime.costs import ModelPrice, PriceBook
 from cayu.runtime.usage import UsageMetrics
 
 _POSTGRES_TABLES = (
@@ -233,6 +242,154 @@ def test_session_store_conformance_declares_usage_aggregate_support(
         store = await _open_store(session_store_case)
         try:
             assert store.supports_usage_aggregates is True
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("invalid_text", ["100\x00", "\ud800"], ids=["nul", "surrogate"])
+@pytest.mark.parametrize(
+    "invalid_primary_counter",
+    [True, False],
+    ids=["invalid-primary", "invalid-extra-field"],
+)
+@pytest.mark.parametrize("with_reservation", [False, True], ids=["strict", "reservation"])
+def test_session_store_conformance_preserves_undurable_completion_spend(
+    session_store_case,
+    invalid_text: str,
+    invalid_primary_counter: bool,
+    with_reservation: bool,
+) -> None:
+    class MalformedUsageProvider(ModelProvider):
+        name = "renamed-openai"
+        usage_dialect = UsageDialect.OPENAI
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream(self, request):
+            del request
+            self.calls += 1
+            yield ModelStreamEvent.text_delta("done")
+            yield ModelStreamEvent.completed(
+                {
+                    "provider_name": "provider-controlled-spoof",
+                    "model": "gpt-test",
+                    "usage": (
+                        {
+                            "input_tokens": invalid_text,
+                            "output_tokens": 1,
+                        }
+                        if invalid_primary_counter
+                        else {
+                            "input_tokens": 10,
+                            "output_tokens": 1,
+                            "provider_note": invalid_text,
+                        }
+                    ),
+                }
+            )
+
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        provider = MalformedUsageProvider()
+        pricing = PriceBook(
+            prices=(
+                ModelPrice.fixed(
+                    provider_name=provider.name,
+                    model="gpt-test",
+                    input_per_million=Decimal("10"),
+                    output_per_million=Decimal("10"),
+                ),
+            )
+        )
+        reservation = (
+            BudgetReservation(
+                max_input_tokens=1_000_000,
+                max_output_tokens=0,
+            )
+            if with_reservation
+            else None
+        )
+        maximum = Decimal("10") if with_reservation else Decimal("100")
+        policy = BudgetPolicy(
+            limits=(
+                BudgetLimit(
+                    scope="app",
+                    max_estimated_cost=maximum,
+                    pricing=pricing,
+                    reservation=reservation,
+                ),
+            )
+        )
+
+        def build_app(current_store: SessionStore) -> CayuApp:
+            app = CayuApp(
+                session_store=current_store,
+                budget_policy=policy,
+                enable_logging=False,
+            )
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="assistant", model="gpt-test"))
+            return app
+
+        store_kind = session_store_case[0]
+        case_suffix = f"{store_kind}-{with_reservation}-{invalid_primary_counter}"
+        first_session_id = f"undurable-completion-{case_suffix}-first"
+        second_session_id = f"undurable-completion-{case_suffix}-second"
+        try:
+            app = build_app(store)
+            first_events = [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        session_id=first_session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "first")],
+                    )
+                )
+            ]
+            completed = next(
+                event for event in first_events if event.type == EventType.MODEL_COMPLETED
+            )
+            assert "usage" not in completed.payload
+            assert "usage_metrics" not in completed.payload
+            assert completed.payload["usage_normalization_failed"] is True
+            assert completed.payload["usage_unavailable_reason"] == (
+                "invalid model completion usage telemetry"
+            )
+            assert completed.payload["provider_name"] == provider.name
+
+            cost = await app.get_session_cost(first_session_id, pricing)
+            assert cost.model_steps == 1
+            assert cost.priced_model_steps == 0
+            assert cost.unpriced_model_steps == 1
+            assert cost.line_items[0].provider_name == provider.name
+            if with_reservation:
+                reconciliation = next(
+                    event for event in first_events if event.type == EventType.BUDGET_RECONCILED
+                )
+                assert reconciliation.payload["actual_amount"] == "10"
+                assert reconciliation.payload["reason"] == (
+                    "model completed without priced usage; charged reserved amount"
+                )
+
+            store = await _reopen_store(session_store_case, store)
+            restarted_app = build_app(store)
+            second_events = [
+                event
+                async for event in restarted_app.run(
+                    RunRequest(
+                        session_id=second_session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "second")],
+                    )
+                )
+            ]
+            assert provider.calls == 1
+            assert EventType.MODEL_STARTED not in {event.type for event in second_events}
+            assert EventType.BUDGET_LIMIT_REACHED in {event.type for event in second_events}
         finally:
             await _close_store(store)
 

@@ -70,6 +70,7 @@ from cayu.runtime.sessions import Session
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.runtime.usage import (
     UsageMetrics,
+    durable_model_completed_payload,
     normalize_usage_metrics,
     strip_provider_billing_identity,
     usage_metrics_from_event_payload,
@@ -853,12 +854,14 @@ def _compaction_raw_usage(value: Any) -> tuple[dict[str, Any] | None, bool]:
         ("completion_tokens_details", ("reasoning_tokens", "thinking_tokens")),
     ):
         details = value.get(key)
-        if key in value and type(details) is not dict:
+        if key in value and details is not None and type(details) is not dict:
             return None, True
         if type(details) is not dict:
             continue
         bounded_details: dict[str, int] = {}
         for detail_key in allowed_keys:
+            if detail_key in details and details[detail_key] is None:
+                continue
             bounded, invalid = _compaction_usage_integer_field(details, detail_key)
             if invalid:
                 return None, True
@@ -867,7 +870,11 @@ def _compaction_raw_usage(value: Any) -> tuple[dict[str, Any] | None, bool]:
         if bounded_details:
             raw_usage[key] = bounded_details
     cache_creation = value.get("cache_creation")
-    if "cache_creation" in value and type(cache_creation) is not dict:
+    if (
+        "cache_creation" in value
+        and cache_creation is not None
+        and type(cache_creation) is not dict
+    ):
         return None, True
     if type(cache_creation) is dict:
         if len(cache_creation) > 16:
@@ -888,6 +895,8 @@ def _compaction_raw_usage(value: Any) -> tuple[dict[str, Any] | None, bool]:
 def _compaction_usage_metrics(
     payload: dict[str, Any],
 ) -> tuple[UsageMetrics | None, bool, BillingIdentity | None]:
+    if payload.get("usage_normalization_failed") is True:
+        return None, False, None
     supplied_metrics = payload.get("usage_metrics")
     provider_name = _compaction_event_text(
         supplied_metrics.get("provider_name") if type(supplied_metrics) is dict else None
@@ -1038,6 +1047,9 @@ def sanitize_context_compaction_telemetry(
                 ) or _compaction_event_text(source.get(key))
                 if value is not None:
                     payload[key] = value
+        normalization_failed = source.get("usage_normalization_failed") is True
+        if normalization_failed:
+            payload["usage_normalization_failed"] = True
         for key in (
             "compactor",
             "compaction_outcome",
@@ -1048,7 +1060,7 @@ def sanitize_context_compaction_telemetry(
             value = _compaction_event_text(source.get(key))
             if value is not None:
                 payload[key] = value
-        if invalid_usage:
+        if normalization_failed or invalid_usage:
             payload["usage_unavailable_reason"] = "invalid compaction usage telemetry"
         context_overflow = _compaction_event_bool(source.get("context_overflow"))
         if context_overflow is not None:
@@ -3674,35 +3686,32 @@ def _durable_compaction_completion_evidence(
     """Retain full durable metadata or a safe normalized accounting projection."""
 
     copied = copy_json_value(payload, "model_completed_payload")
+    resolved_model = copied.get("model")
     try:
-        require_durable_json_text(copied, "model_completed_payload")
+        resolved_model = require_nonblank(resolved_model, "model")
+        require_durable_json_text(resolved_model, "model")
     except ValueError:
-        resolved_model = copied.get("model")
+        resolved_model = fallback_model
+    fallback_fields: dict[str, Any] = {
+        "model": resolved_model,
+        "provider_name": provider_name,
+        "requested_model": fallback_model,
+        "purpose": "context_compaction",
+        "compactor": compactor,
+    }
+    attempt_id = copied.get(_COMPACTION_ATTEMPT_ID_KEY)
+    if type(attempt_id) is str:
         try:
-            resolved_model = require_nonblank(resolved_model, "model")
-            require_durable_json_text(resolved_model, "model")
+            require_durable_json_text(attempt_id, _COMPACTION_ATTEMPT_ID_KEY)
         except ValueError:
-            resolved_model = fallback_model
-        safe_payload: dict[str, Any] = {
-            "model": resolved_model,
-            "provider_name": provider_name,
-            "requested_model": fallback_model,
-            "purpose": "context_compaction",
-            "compactor": compactor,
-        }
-        attempt_id = copied.get(_COMPACTION_ATTEMPT_ID_KEY)
-        if type(attempt_id) is str:
-            safe_payload[_COMPACTION_ATTEMPT_ID_KEY] = attempt_id
-        usage_metrics = copied.get("usage_metrics")
-        if type(usage_metrics) is dict:
-            safe_usage_metrics = copy_json_value(usage_metrics, "usage_metrics")
-            safe_usage_metrics["provider_name"] = provider_name
-            safe_usage_metrics["requested_model"] = fallback_model
-            safe_usage_metrics["model"] = resolved_model
-            safe_payload["usage_metrics"] = safe_usage_metrics
-        require_durable_json_text(safe_payload, "model_completed_payload")
-        return safe_payload
-    return copied
+            pass
+        else:
+            fallback_fields[_COMPACTION_ATTEMPT_ID_KEY] = attempt_id
+    return durable_model_completed_payload(
+        copied,
+        fallback_fields=fallback_fields,
+        unavailable_reason="invalid compaction usage telemetry",
+    )
 
 
 def _rejected_compaction_tool_call_payload(
@@ -5013,6 +5022,13 @@ def _compaction_model_completed_payload(
     payload["requested_model"] = fallback_model
     payload["purpose"] = "context_compaction"
     payload["compactor"] = compactor
+    # When raw usage is present, the runtime below owns its normalized
+    # projection and durable failure decision. Preserve the established path
+    # for providers that expose only normalized usage metrics.
+    has_raw_usage = payload.get("usage") is not None
+    if has_raw_usage:
+        payload.pop("usage_metrics", None)
+    payload.pop("usage_normalization_failed", None)
     raw_billing_identity = payload.get("billing_identity")
     billing_identity = (
         BillingIdentity.model_validate(raw_billing_identity)
@@ -5034,6 +5050,8 @@ def _compaction_model_completed_payload(
         # it to parsed usage after validating the completion payload.
         usage_metrics.pop("billing_identity", None)
         payload["usage_metrics"] = usage_metrics
+    elif has_raw_usage:
+        payload["usage_normalization_failed"] = True
     return payload
 
 

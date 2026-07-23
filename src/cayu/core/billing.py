@@ -21,6 +21,12 @@ from cayu._validation import (
 )
 
 
+def _require_durable_identity_text(value: str, field_name: str) -> str:
+    value = require_clean_nonblank(value, field_name)
+    require_durable_json_text(value, field_name)
+    return value
+
+
 class PricingContext(BaseModel):
     """One exact set of commercial dimensions that may price a dispatch."""
 
@@ -38,10 +44,13 @@ class PricingContext(BaseModel):
             raise ValueError("dimensions must not be empty.")
         result: dict[str, str] = {}
         for key, item in copied.items():
-            clean_key = require_clean_nonblank(key, "dimension name")
+            clean_key = _require_durable_identity_text(key, "dimension name")
             if type(item) is not str:
                 raise ValueError(f"Pricing dimension {clean_key!r} must be a string.")
-            result[clean_key] = require_clean_nonblank(item, f"dimensions.{clean_key}")
+            result[clean_key] = _require_durable_identity_text(
+                item,
+                f"dimensions.{clean_key}",
+            )
         return result
 
     @field_validator("dimensions")
@@ -76,7 +85,7 @@ class BillingIdentity(BaseModel):
     @field_validator("provider_name", "resource_id")
     @classmethod
     def validate_identity_text(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return _require_durable_identity_text(value, info.field_name)
 
     @field_validator("request_evidence", "completion_evidence", mode="before")
     @classmethod
