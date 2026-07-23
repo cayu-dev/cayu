@@ -84,14 +84,19 @@ from cayu.runtime.event_watchers import (
 )
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
+    ToolRoundIdentity,
     copy_model_attempt_identity,
+    copy_tool_round_identity,
 )
 from cayu.runtime.sessions import (
+    _TOOL_ROUND_LIFECYCLE_EVENT_TYPES,
     DELETE_BLOCKED_SESSION_STATUSES,
     FORK_TRANSCRIPT_VALIDATION_ERROR,
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
     MAX_PENDING_ACTION_RESULT_BYTES,
     MAX_PENDING_ACTION_TOOL_CALLS,
+    MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+    RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS,
     SESSION_INSPECTION_LABEL_LIMIT,
     SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
     BudgetReservationIdentityConflict,
@@ -105,6 +110,8 @@ from cayu.runtime.sessions import (
     McpManifestBaseline,
     McpManifestBaselineLoadResult,
     McpManifestPublicationResult,
+    ModelCompletionStageAbandonmentResult,
+    ModelCompletionStageResult,
     PendingActionIssue,
     PendingActionKind,
     PendingActionListResult,
@@ -115,6 +122,8 @@ from cayu.runtime.sessions import (
     PersistedEventSideEffectDelivery,
     PersistedEventSideEffectStatus,
     RunRequest,
+    RuntimePublicationReceipt,
+    RuntimePublicationResult,
     Session,
     SessionAggregateFilter,
     SessionIdentity,
@@ -122,6 +131,7 @@ from cayu.runtime.sessions import (
     SessionListResult,
     SessionMessageDeliveryBatch,
     SessionMessageQueueStatus,
+    SessionModelCompletionStageConflict,
     SessionOperationalSnapshot,
     SessionOperationPublication,
     SessionOperationTransform,
@@ -131,6 +141,7 @@ from cayu.runtime.sessions import (
     SessionQueuedMessage,
     SessionQueuedMessagesPending,
     SessionRunFenced,
+    SessionRuntimePublicationConflict,
     SessionStateSnapshot,
     SessionStatus,
     SessionStatusConflict,
@@ -141,23 +152,69 @@ from cayu.runtime.sessions import (
     TranscriptRecord,
     UsageRollupQuery,
     _activate_session_run_fence,
+    _active_model_completion_stage_record,
     _active_unexpired_incomplete_recovery_claim_id,
     _active_unexpired_session_operation_id,
+    _apply_runtime_publication_checkpoint_mutation,
     _assert_session_run_epoch,
     _assert_session_run_epoch_value,
+    _build_runtime_publication_receipt,
     _copy_mcp_manifest_publication,
     _copy_session_event_batch,
     _current_session_run_epoch,
     _deactivate_session_run_fence,
+    _model_completion_stage_abandonment_record,
+    _model_completion_stage_preparation_record,
+    _model_completion_stage_storage_identity,
+    _model_completion_stage_terminal_record,
+    _model_completion_stage_winner_record,
+    _model_completion_stage_winner_storage_key,
+    _model_completion_terminal_advances_last_activity,
+    _ModelCompletionStagePromotionContext,
+    _next_runtime_publication_timestamp,
+    _prepare_model_completion_stage_promotion,
     _prepare_session_fork_request,
+    _PreparedModelCompletionStage,
+    _PreparedModelCompletionStageAbandonment,
+    _PreparedModelCompletionStageTerminal,
+    _PreparedRuntimePublication,
     _project_interruption_cascade_marker_fields,
     _queued_session_message_event_payload,
+    _reconstruct_active_model_completion_stage,
+    _reconstruct_active_model_completion_stage_record,
+    _reconstruct_model_completion_stage,
+    _reconstruct_model_completion_stage_abandonment,
+    _reconstruct_runtime_publication_receipt,
+    _reject_reserved_runtime_publication_key,
+    _replay_model_completion_stage_abandonment,
+    _replay_promoted_model_completion_stage,
+    _runtime_publication_json_equal,
+    _runtime_publication_receipt_record,
+    _runtime_publication_referenced_event_ids,
+    _runtime_publication_storage_key,
     _stored_mcp_manifest_baseline,
+    _tool_round_publication_identity,
     _validate_equivalent_queued_session_message,
     _validate_mcp_manifest_history_keys,
     _validate_mcp_manifest_publication_state,
+    _validate_model_completion_active_marker_for_preparation,
+    _validate_model_completion_active_marker_for_promotion,
+    _validate_model_completion_preparation_replay_state,
+    _validate_model_completion_promotion_replay_active_marker,
+    _validate_model_completion_stage_for_abandonment,
+    _validate_model_completion_stage_preparation_replay,
+    _validate_model_completion_stage_publication,
+    _validate_model_completion_stage_repreparation,
+    _validate_model_completion_stage_terminal_replay,
+    _validate_runtime_publication_durable_material,
+    _validate_runtime_publication_event_references,
+    _validate_runtime_publication_replay_receipt,
     _validate_session_fork_source,
+    _validate_session_operation_record_keys,
     _validate_status_set,
+    _validate_tool_round_call_ids,
+    _validate_tool_round_checkpoint_mutation,
+    _validate_tool_round_publication,
     copy_enqueue_session_message_request,
     copy_event_query,
     copy_run_request,
@@ -251,6 +308,19 @@ _SCHEMA_ADVISORY_LOCK_POLL_SECONDS = 0.25
 _POSTGRES_MIN_REQUIRED_REVISION = 18
 _POSTGRES_SESSION_MIN_REQUIRED_REVISION = 23
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
+_PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL = """
+    event_type IN (
+        'tool.call.approval_requested',
+        'session.awaiting_user_input',
+        'session.interrupted',
+        'tool.call.started',
+        'tool.call.completed',
+        'tool.call.failed',
+        'tool.call.blocked',
+        'tool.call.approval_denied'
+    )
+    AND pending_action_lookup_key IS NOT NULL
+"""
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="%s",
     contains_style="postgres_ilike",
@@ -4807,6 +4877,19 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         allowed_statuses=allowed_statuses,
                         expected_source_run_epoch=expected_source_run_epoch,
                     )
+                    await cur.execute(
+                        "SELECT 1 FROM cayu_session_operations "
+                        "WHERE session_id = %s AND idempotency_key = %s",
+                        (
+                            source_session_id,
+                            MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+                        ),
+                    )
+                    if await cur.fetchone() is not None:
+                        raise ValueError(
+                            "Cannot fork a session while a model-completion stage is active: "
+                            f"{source_session_id}"
+                        )
 
                     await cur.execute(
                         """
@@ -5075,6 +5158,19 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise ValueError(
                             "Cannot delete a session while durable operation "
                             f"{active_operation_id} is active: {session_id}"
+                        )
+                    await cur.execute(
+                        "SELECT 1 FROM cayu_session_operations "
+                        "WHERE session_id = %s AND idempotency_key = %s",
+                        (
+                            session_id,
+                            MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+                        ),
+                    )
+                    if await cur.fetchone() is not None:
+                        raise ValueError(
+                            "Cannot delete a session while a model-completion stage is active: "
+                            f"{session_id}"
                         )
                     # ON DELETE CASCADE removes events/labels/checkpoint/transcript;
                     # the self-FK is ON DELETE SET NULL so children keep loading.
@@ -6600,7 +6696,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         idempotency_key: str,
     ) -> dict[str, Any] | None:
         session_id = require_clean_nonblank(session_id, "session_id")
-        idempotency_key = require_clean_nonblank(idempotency_key, "idempotency_key")
+        idempotency_key = _reject_reserved_runtime_publication_key(
+            idempotency_key,
+            "idempotency_key",
+        )
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
             await cur.execute(
@@ -6616,6 +6715,1211 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 raise KeyError(f"Session not found: {session_id}")
             return None
 
+    async def _load_runtime_publication_receipt_record(
+        self,
+        session_id: str,
+        storage_key: str,
+        publication_id: str,
+    ) -> dict[str, Any] | None:
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT record FROM cayu_session_operations "
+                "WHERE session_id = %s AND idempotency_key = %s FOR SHARE",
+                (session_id, storage_key),
+            )
+            row = await cur.fetchone()
+            if row is not None:
+                record = _decode_runtime_publication_record(row[0])
+                receipt = _reconstruct_runtime_publication_receipt(
+                    record,
+                    storage_key=storage_key,
+                    session_id=session_id,
+                    publication_id=publication_id,
+                )
+                await self._validate_runtime_publication_material(cur, receipt)
+                return record
+            await cur.execute("SELECT 1 FROM cayu_sessions WHERE id = %s", (session_id,))
+            if await cur.fetchone() is None:
+                raise KeyError(f"Session not found: {session_id}")
+            return None
+
+    async def _validate_runtime_publication_material(
+        self,
+        cur,
+        receipt: RuntimePublicationReceipt,
+    ) -> None:
+        try:
+            transcript_count = receipt.transcript_end_cursor - receipt.transcript_start_cursor
+            await cur.execute(
+                "SELECT message FROM cayu_transcript_messages "
+                "WHERE session_id = %s ORDER BY sequence ASC LIMIT %s OFFSET %s",
+                (
+                    receipt.session_id,
+                    transcript_count,
+                    receipt.transcript_start_cursor,
+                ),
+            )
+            transcript = [Message(**_json_obj(row[0])) for row in await cur.fetchall()]
+
+            referenced_event_ids = _runtime_publication_referenced_event_ids(
+                receipt.referenced_events
+            )
+            requested_event_ids = tuple(
+                dict.fromkeys((*receipt.appended_event_ids, *referenced_event_ids))
+            )
+            events_by_id: dict[str, Event] = {}
+            if requested_event_ids:
+                await cur.execute(
+                    "SELECT event_id, event FROM cayu_events "
+                    "WHERE session_id = %s AND event_id = ANY(%s) FOR SHARE",
+                    (receipt.session_id, list(requested_event_ids)),
+                )
+                events_by_id = {row[0]: Event(**_json_obj(row[1])) for row in await cur.fetchall()}
+            _validate_runtime_publication_durable_material(
+                receipt,
+                transcript_messages=transcript,
+                appended_events=(
+                    events_by_id[event_id]
+                    for event_id in receipt.appended_event_ids
+                    if event_id in events_by_id
+                ),
+                durable_referenced_events=(
+                    events_by_id[event_id]
+                    for event_id in referenced_event_ids
+                    if event_id in events_by_id
+                ),
+            )
+        except SessionRuntimePublicationConflict:
+            raise
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise SessionRuntimePublicationConflict(
+                "The durable runtime publication material is malformed."
+            ) from exc
+
+    async def _load_model_completion_stage_records(
+        self,
+        session_id: str,
+        preparation_storage_key: str,
+        terminal_storage_key: str,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT idempotency_key, record FROM cayu_session_operations "
+                "WHERE session_id = %s AND idempotency_key = ANY(%s)",
+                (session_id, [preparation_storage_key, terminal_storage_key]),
+            )
+            records = {
+                row[0]: _decode_model_completion_stage_record(row[1])
+                for row in await cur.fetchall()
+            }
+            if records:
+                return records.get(preparation_storage_key), records.get(terminal_storage_key)
+            await cur.execute("SELECT 1 FROM cayu_sessions WHERE id = %s", (session_id,))
+            if await cur.fetchone() is None:
+                raise KeyError(f"Session not found: {session_id}")
+            return None, None
+
+    async def _load_active_model_completion_stage_records(
+        self,
+        session_id: str,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            await cur.execute(
+                "SELECT 1 FROM cayu_sessions WHERE id = %s",
+                (session_id,),
+            )
+            if await cur.fetchone() is None:
+                raise KeyError(f"Session not found: {session_id}")
+            await cur.execute(
+                "SELECT record FROM cayu_session_operations "
+                "WHERE session_id = %s AND idempotency_key = %s",
+                (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None, None, None
+            active_record = _decode_model_completion_stage_record(row[0])
+            marker = _reconstruct_active_model_completion_stage_record(
+                active_record,
+                session_id=session_id,
+            )
+            _, _, preparation_key, terminal_key = _model_completion_stage_storage_identity(
+                session_id,
+                marker.stage_id,
+            )
+            await cur.execute(
+                "SELECT idempotency_key, record FROM cayu_session_operations "
+                "WHERE session_id = %s AND idempotency_key = ANY(%s)",
+                (session_id, [preparation_key, terminal_key]),
+            )
+            records = {
+                record_row[0]: _decode_model_completion_stage_record(record_row[1])
+                for record_row in await cur.fetchall()
+            }
+            return (
+                active_record,
+                records.get(preparation_key),
+                records.get(terminal_key),
+            )
+
+    async def _prepare_model_completion_stage_atomic(
+        self,
+        prepared: _PreparedModelCompletionStage,
+    ) -> ModelCompletionStageResult:
+        session_id = prepared.session_id
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    loaded = await self._load_for_update(cur, session_id)
+                    if loaded is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    await cur.execute(
+                        "SELECT idempotency_key, record FROM cayu_session_operations "
+                        "WHERE session_id = %s AND idempotency_key = ANY(%s)",
+                        (
+                            session_id,
+                            [
+                                prepared.preparation_storage_key,
+                                prepared.terminal_storage_key,
+                                prepared.abandonment_storage_key,
+                            ],
+                        ),
+                    )
+                    records = {
+                        row[0]: _decode_model_completion_stage_record(row[1])
+                        for row in await cur.fetchall()
+                    }
+                    stage = _reconstruct_model_completion_stage(
+                        records.get(prepared.preparation_storage_key),
+                        records.get(prepared.terminal_storage_key),
+                        session_id=session_id,
+                        stage_id=prepared.request.stage_id,
+                        preparation_storage_key=prepared.preparation_storage_key,
+                        terminal_storage_key=prepared.terminal_storage_key,
+                    )
+                    _validate_model_completion_stage_repreparation(
+                        records.get(prepared.abandonment_storage_key),
+                        prepared,
+                        source_status=loaded.status if stage is None else stage.source_status,
+                    )
+                    if stage is not None:
+                        _validate_model_completion_stage_preparation_replay(stage, prepared)
+
+                    await cur.execute(
+                        "SELECT record FROM cayu_session_operations "
+                        "WHERE session_id = %s AND idempotency_key = %s",
+                        (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+                    )
+                    active_row = await cur.fetchone()
+                    active = None
+                    if active_row is not None:
+                        active_record = _decode_model_completion_stage_record(active_row[0])
+                        marker = _reconstruct_active_model_completion_stage_record(
+                            active_record,
+                            session_id=session_id,
+                        )
+                        _, _, active_preparation_key, active_terminal_key = (
+                            _model_completion_stage_storage_identity(
+                                session_id,
+                                marker.stage_id,
+                            )
+                        )
+                        await cur.execute(
+                            "SELECT idempotency_key, record FROM cayu_session_operations "
+                            "WHERE session_id = %s AND idempotency_key = ANY(%s)",
+                            (
+                                session_id,
+                                [active_preparation_key, active_terminal_key],
+                            ),
+                        )
+                        active_records = {
+                            row[0]: _decode_model_completion_stage_record(row[1])
+                            for row in await cur.fetchall()
+                        }
+                        active = _reconstruct_active_model_completion_stage(
+                            active_record,
+                            active_records.get(active_preparation_key),
+                            active_records.get(active_terminal_key),
+                            session_id=session_id,
+                        )
+                    await cur.execute(
+                        "SELECT idempotency_key FROM cayu_session_operations "
+                        "WHERE session_id = %s AND idempotency_key = ANY(%s)",
+                        (
+                            session_id,
+                            [
+                                prepared.winner_storage_key,
+                                prepared.publication_storage_key,
+                            ],
+                        ),
+                    )
+                    publication_keys = {row[0] for row in await cur.fetchall()}
+                    winner_exists = prepared.winner_storage_key in publication_keys
+                    receipt_exists = prepared.publication_storage_key in publication_keys
+                    if stage is not None:
+                        _validate_model_completion_preparation_replay_state(
+                            stage,
+                            active=active,
+                            winner_exists=winner_exists,
+                            receipt_exists=receipt_exists,
+                        )
+                        await conn.rollback()
+                        return ModelCompletionStageResult(
+                            stage=stage,
+                            replayed=True,
+                            dispatch_authorized=False,
+                        )
+                    _validate_model_completion_active_marker_for_preparation(
+                        active,
+                        prepared,
+                        source_status=loaded.status,
+                    )
+                    if winner_exists or receipt_exists:
+                        raise SessionModelCompletionStageConflict(
+                            "The logical model step already has durable publication state."
+                        )
+
+                    _assert_session_run_epoch(session_id, loaded)
+                    if loaded.status not in prepared.expected_statuses:
+                        raise SessionStatusConflict(
+                            "Session status is not eligible for model-completion preparation: "
+                            f"{loaded.status}"
+                        )
+                    if loaded.run_epoch != prepared.expected_run_epoch:
+                        raise SessionRunFenced(
+                            "Session source run epoch is stale: expected "
+                            f"{prepared.expected_run_epoch}, current {loaded.run_epoch}."
+                        )
+                    await cur.execute(
+                        "SELECT COUNT(*) FROM cayu_transcript_messages WHERE session_id = %s",
+                        (session_id,),
+                    )
+                    cursor_row = await cur.fetchone()
+                    current_cursor = cursor_row[0] if cursor_row is not None else 0
+                    if current_cursor != prepared.expected_transcript_cursor:
+                        raise ValueError(
+                            "Session source transcript cursor is stale: expected "
+                            f"{prepared.expected_transcript_cursor}, current {current_cursor}."
+                        )
+
+                    prepared_at = _next_runtime_publication_timestamp(loaded)
+                    record = _model_completion_stage_preparation_record(
+                        prepared,
+                        source_session=loaded,
+                        prepared_at=prepared_at,
+                    )
+                    stage = _reconstruct_model_completion_stage(
+                        record,
+                        None,
+                        session_id=session_id,
+                        stage_id=prepared.request.stage_id,
+                        preparation_storage_key=prepared.preparation_storage_key,
+                        terminal_storage_key=prepared.terminal_storage_key,
+                    )
+                    assert stage is not None
+                    await cur.execute(
+                        "INSERT INTO cayu_session_operations "
+                        "(session_id, idempotency_key, record, updated_at) "
+                        "VALUES (%s, %s, %s, %s)",
+                        (
+                            session_id,
+                            prepared.preparation_storage_key,
+                            _dumps(record),
+                            prepared_at,
+                        ),
+                    )
+                    active_record = _active_model_completion_stage_record(
+                        stage,
+                        activated_at=prepared_at,
+                    )
+                    await cur.execute(
+                        "INSERT INTO cayu_session_operations "
+                        "(session_id, idempotency_key, record, updated_at) "
+                        "VALUES (%s, %s, %s, %s) "
+                        "ON CONFLICT(session_id, idempotency_key) DO UPDATE SET "
+                        "record = EXCLUDED.record, updated_at = EXCLUDED.updated_at",
+                        (
+                            session_id,
+                            MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+                            _dumps(active_record),
+                            prepared_at,
+                        ),
+                    )
+                    await cur.execute(
+                        "UPDATE cayu_sessions SET updated_at = %s, last_activity_at = %s "
+                        "WHERE id = %s",
+                        (prepared_at, prepared_at, session_id),
+                    )
+                await conn.commit()
+                return ModelCompletionStageResult(
+                    stage=stage,
+                    replayed=False,
+                    dispatch_authorized=True,
+                )
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def _complete_model_completion_stage_atomic(
+        self,
+        prepared: _PreparedModelCompletionStageTerminal,
+    ) -> ModelCompletionStageResult:
+        session_id = prepared.session_id
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    loaded = await self._load_for_update(cur, session_id)
+                    if loaded is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    await cur.execute(
+                        "SELECT idempotency_key, record FROM cayu_session_operations "
+                        "WHERE session_id = %s AND idempotency_key = ANY(%s)",
+                        (
+                            session_id,
+                            [
+                                prepared.preparation_storage_key,
+                                prepared.terminal_storage_key,
+                            ],
+                        ),
+                    )
+                    records = {
+                        row[0]: _decode_model_completion_stage_record(row[1])
+                        for row in await cur.fetchall()
+                    }
+                    stage = _reconstruct_model_completion_stage(
+                        records.get(prepared.preparation_storage_key),
+                        records.get(prepared.terminal_storage_key),
+                        session_id=session_id,
+                        stage_id=prepared.stage_id,
+                        preparation_storage_key=prepared.preparation_storage_key,
+                        terminal_storage_key=prepared.terminal_storage_key,
+                    )
+                    if stage is None:
+                        raise KeyError(f"Model-completion stage not found: {prepared.stage_id}")
+                    if stage.state == "completed":
+                        _validate_model_completion_stage_terminal_replay(stage, prepared)
+                        await conn.rollback()
+                        return ModelCompletionStageResult(
+                            stage=stage,
+                            replayed=True,
+                            dispatch_authorized=False,
+                        )
+                    _validate_model_completion_stage_publication(
+                        prepared.publication,
+                        session_id=session_id,
+                        stage=stage,
+                    )
+                    if not _runtime_publication_json_equal(
+                        prepared.publication.intent,
+                        stage.intent,
+                    ):
+                        raise SessionModelCompletionStageConflict(
+                            "The terminal model completion intent conflicts with its preparation."
+                        )
+
+                    completed_at = _next_runtime_publication_timestamp(loaded)
+                    terminal_record = _model_completion_stage_terminal_record(
+                        prepared,
+                        stage=stage,
+                        completed_at=completed_at,
+                    )
+                    completed_stage = _reconstruct_model_completion_stage(
+                        records[prepared.preparation_storage_key],
+                        terminal_record,
+                        session_id=session_id,
+                        stage_id=prepared.stage_id,
+                        preparation_storage_key=prepared.preparation_storage_key,
+                        terminal_storage_key=prepared.terminal_storage_key,
+                    )
+                    assert completed_stage is not None
+                    await cur.execute(
+                        "SELECT record FROM cayu_session_operations "
+                        "WHERE session_id = %s AND idempotency_key = %s",
+                        (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+                    )
+                    active_row = await cur.fetchone()
+                    active_record = (
+                        None
+                        if active_row is None
+                        else _decode_model_completion_stage_record(active_row[0])
+                    )
+                    advances_last_activity = _model_completion_terminal_advances_last_activity(
+                        active_record,
+                        stage=stage,
+                        current_run_epoch=loaded.run_epoch,
+                    )
+                    await cur.execute(
+                        "INSERT INTO cayu_session_operations "
+                        "(session_id, idempotency_key, record, updated_at) "
+                        "VALUES (%s, %s, %s, %s)",
+                        (
+                            session_id,
+                            prepared.terminal_storage_key,
+                            _dumps(terminal_record),
+                            completed_at,
+                        ),
+                    )
+                    await cur.execute(
+                        "UPDATE cayu_sessions SET updated_at = %s, "
+                        "last_activity_at = CASE WHEN %s THEN %s ELSE last_activity_at END "
+                        "WHERE id = %s",
+                        (
+                            completed_at,
+                            advances_last_activity,
+                            completed_at,
+                            session_id,
+                        ),
+                    )
+                await conn.commit()
+                return ModelCompletionStageResult(
+                    stage=completed_stage,
+                    replayed=False,
+                    dispatch_authorized=False,
+                )
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def _abandon_model_completion_stage_atomic(
+        self,
+        prepared: _PreparedModelCompletionStageAbandonment,
+    ) -> ModelCompletionStageAbandonmentResult:
+        session_id = prepared.session_id
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    loaded = await self._load_for_update(cur, session_id)
+                    if loaded is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    await cur.execute(
+                        "SELECT idempotency_key, record FROM cayu_session_operations "
+                        "WHERE session_id = %s AND idempotency_key = ANY(%s)",
+                        (
+                            session_id,
+                            [
+                                prepared.preparation_storage_key,
+                                prepared.terminal_storage_key,
+                                prepared.abandonment_storage_key,
+                            ],
+                        ),
+                    )
+                    records = {
+                        row[0]: _decode_model_completion_stage_record(row[1])
+                        for row in await cur.fetchall()
+                    }
+                    stage = _reconstruct_model_completion_stage(
+                        records.get(prepared.preparation_storage_key),
+                        records.get(prepared.terminal_storage_key),
+                        session_id=session_id,
+                        stage_id=prepared.stage_id,
+                        preparation_storage_key=prepared.preparation_storage_key,
+                        terminal_storage_key=prepared.terminal_storage_key,
+                    )
+                    await cur.execute(
+                        "SELECT record FROM cayu_session_operations "
+                        "WHERE session_id = %s AND idempotency_key = %s",
+                        (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+                    )
+                    active_row = await cur.fetchone()
+                    active_record = (
+                        None
+                        if active_row is None
+                        else _decode_model_completion_stage_record(active_row[0])
+                    )
+                    if stage is None:
+                        if active_record is not None:
+                            active_marker = _reconstruct_active_model_completion_stage_record(
+                                active_record,
+                                session_id=session_id,
+                            )
+                            if active_marker.stage_id == prepared.stage_id:
+                                raise SessionModelCompletionStageConflict(
+                                    "The active model-completion marker references a missing stage."
+                                )
+                        replayed = _replay_model_completion_stage_abandonment(
+                            prepared,
+                            records.get(prepared.abandonment_storage_key),
+                        )
+                        await cur.execute(
+                            "SELECT idempotency_key FROM cayu_session_operations "
+                            "WHERE session_id = %s AND idempotency_key = ANY(%s)",
+                            (
+                                session_id,
+                                [
+                                    _model_completion_stage_winner_storage_key(
+                                        replayed.abandonment.logical_step_id
+                                    ),
+                                    _runtime_publication_storage_key(
+                                        replayed.abandonment.logical_step_id
+                                    ),
+                                ],
+                            ),
+                        )
+                        if await cur.fetchone() is not None:
+                            raise SessionModelCompletionStageConflict(
+                                "An abandoned model-completion stage has durable publication state."
+                            )
+                        await conn.rollback()
+                        return replayed
+
+                    active = _reconstruct_active_model_completion_stage(
+                        active_record,
+                        records.get(prepared.preparation_storage_key),
+                        records.get(prepared.terminal_storage_key),
+                        session_id=session_id,
+                    )
+                    winner_storage_key = _model_completion_stage_winner_storage_key(
+                        stage.logical_step_id
+                    )
+                    publication_storage_key = _runtime_publication_storage_key(
+                        stage.logical_step_id
+                    )
+                    await cur.execute(
+                        "SELECT idempotency_key FROM cayu_session_operations "
+                        "WHERE session_id = %s AND idempotency_key = ANY(%s)",
+                        (
+                            session_id,
+                            [winner_storage_key, publication_storage_key],
+                        ),
+                    )
+                    publication_keys = {row[0] for row in await cur.fetchall()}
+                    _validate_model_completion_stage_for_abandonment(
+                        session=loaded,
+                        stage=stage,
+                        active=active,
+                        prepared=prepared,
+                        abandonment_record=records.get(prepared.abandonment_storage_key),
+                        winner_exists=winner_storage_key in publication_keys,
+                        receipt_exists=publication_storage_key in publication_keys,
+                    )
+                    assert active is not None
+                    abandoned_at = _next_runtime_publication_timestamp(loaded)
+                    abandonment_record = _model_completion_stage_abandonment_record(
+                        stage,
+                        active=active,
+                        abandoned_at=abandoned_at,
+                    )
+                    abandonment = _reconstruct_model_completion_stage_abandonment(
+                        abandonment_record,
+                        session_id=session_id,
+                        stage_id=prepared.stage_id,
+                        storage_key=prepared.abandonment_storage_key,
+                    )
+                    await cur.execute(
+                        "INSERT INTO cayu_session_operations "
+                        "(session_id, idempotency_key, record, updated_at) "
+                        "VALUES (%s, %s, %s, %s) "
+                        "ON CONFLICT(session_id, idempotency_key) DO UPDATE SET "
+                        "record = EXCLUDED.record, updated_at = EXCLUDED.updated_at",
+                        (
+                            session_id,
+                            prepared.abandonment_storage_key,
+                            _dumps(abandonment_record),
+                            abandoned_at,
+                        ),
+                    )
+                    await cur.execute(
+                        "DELETE FROM cayu_session_operations "
+                        "WHERE session_id = %s AND idempotency_key = %s "
+                        "AND record->>'record_digest' = %s",
+                        (
+                            session_id,
+                            prepared.preparation_storage_key,
+                            prepared.preparation_digest,
+                        ),
+                    )
+                    if cur.rowcount != 1:
+                        raise SessionModelCompletionStageConflict(
+                            "The model-completion preparation changed during abandonment."
+                        )
+                    await cur.execute(
+                        "DELETE FROM cayu_session_operations "
+                        "WHERE session_id = %s AND idempotency_key = %s "
+                        "AND record->>'record_digest' = %s "
+                        "AND record->>'preparation_digest' = %s",
+                        (
+                            session_id,
+                            MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+                            active.marker_digest,
+                            prepared.preparation_digest,
+                        ),
+                    )
+                    if cur.rowcount != 1:
+                        raise SessionModelCompletionStageConflict(
+                            "The active model-completion marker changed during abandonment."
+                        )
+                    await cur.execute(
+                        "UPDATE cayu_sessions SET updated_at = %s, last_activity_at = %s "
+                        "WHERE id = %s",
+                        (abandoned_at, abandoned_at, session_id),
+                    )
+                    if cur.rowcount != 1:
+                        raise KeyError(f"Session not found: {session_id}")
+                await conn.commit()
+                return ModelCompletionStageAbandonmentResult(
+                    abandonment=abandonment,
+                    replayed=False,
+                )
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def _promote_model_completion_stage_atomic(
+        self,
+        *,
+        session_id: str,
+        stage_id: str,
+        preparation_storage_key: str,
+        terminal_storage_key: str,
+        expected_run_epoch: int,
+    ) -> RuntimePublicationResult:
+        stage = await self.load_model_completion_stage(session_id, stage_id)
+        if stage is None:
+            raise KeyError(f"Model-completion stage not found: {stage_id}")
+        prepared = _prepare_model_completion_stage_promotion(
+            stage,
+            expected_run_epoch=expected_run_epoch,
+        )
+        assert stage.completion_digest is not None
+        return await self._publish_runtime_publication_atomic(
+            prepared,
+            _model_completion_stage=_ModelCompletionStagePromotionContext(
+                stage_id=stage_id,
+                preparation_storage_key=preparation_storage_key,
+                terminal_storage_key=terminal_storage_key,
+                active_storage_key=MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+                winner_storage_key=_model_completion_stage_winner_storage_key(
+                    stage.logical_step_id
+                ),
+                completion_digest=stage.completion_digest,
+            ),
+        )
+
+    async def _publish_runtime_publication_atomic(
+        self,
+        prepared: _PreparedRuntimePublication,
+        *,
+        _model_completion_stage: _ModelCompletionStagePromotionContext | None = None,
+    ) -> RuntimePublicationResult:
+        from cayu.runtime.pending_actions import (
+            pending_action_event_storage_values,
+            pending_action_lookup_key,
+        )
+
+        session_id = prepared.session_id
+        request = prepared.request
+        published_at: datetime
+        receipt: RuntimePublicationReceipt
+        loaded: Session
+
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    loaded_result = await self._load_for_update(cur, session_id)
+                    if loaded_result is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    loaded = loaded_result
+
+                    locked_stage = None
+                    active_record = None
+                    winner_record = None
+                    if _model_completion_stage is not None:
+                        await cur.execute(
+                            "SELECT idempotency_key, record FROM cayu_session_operations "
+                            "WHERE session_id = %s AND idempotency_key = ANY(%s)",
+                            (
+                                session_id,
+                                [
+                                    _model_completion_stage.preparation_storage_key,
+                                    _model_completion_stage.terminal_storage_key,
+                                    _model_completion_stage.active_storage_key,
+                                    _model_completion_stage.winner_storage_key,
+                                ],
+                            ),
+                        )
+                        stage_records = {
+                            row[0]: _decode_model_completion_stage_record(row[1])
+                            for row in await cur.fetchall()
+                        }
+                        locked_stage = _reconstruct_model_completion_stage(
+                            stage_records.get(_model_completion_stage.preparation_storage_key),
+                            stage_records.get(_model_completion_stage.terminal_storage_key),
+                            session_id=session_id,
+                            stage_id=_model_completion_stage.stage_id,
+                            preparation_storage_key=(
+                                _model_completion_stage.preparation_storage_key
+                            ),
+                            terminal_storage_key=_model_completion_stage.terminal_storage_key,
+                        )
+                        if locked_stage is None:
+                            raise KeyError(
+                                "Model-completion stage not found: "
+                                f"{_model_completion_stage.stage_id}"
+                            )
+                        if (
+                            locked_stage.completion_digest
+                            != _model_completion_stage.completion_digest
+                            or locked_stage.publication is None
+                            or not _runtime_publication_json_equal(
+                                locked_stage.publication.model_dump(mode="json"),
+                                prepared.request.model_dump(mode="json"),
+                            )
+                        ):
+                            raise SessionModelCompletionStageConflict(
+                                "Model-completion stage changed before atomic promotion."
+                            )
+                        active_record = stage_records.get(
+                            _model_completion_stage.active_storage_key
+                        )
+                        winner_record = stage_records.get(
+                            _model_completion_stage.winner_storage_key
+                        )
+
+                    await cur.execute(
+                        "SELECT record FROM cayu_session_operations "
+                        "WHERE session_id = %s AND idempotency_key = %s",
+                        (session_id, prepared.storage_key),
+                    )
+                    receipt_row = await cur.fetchone()
+                    if receipt_row is not None:
+                        receipt_record = _decode_runtime_publication_record(receipt_row[0])
+                        if locked_stage is not None:
+                            replay_active = None
+                            if active_record is not None:
+                                active_marker = _reconstruct_active_model_completion_stage_record(
+                                    active_record,
+                                    session_id=session_id,
+                                )
+                                _, _, active_preparation_key, active_terminal_key = (
+                                    _model_completion_stage_storage_identity(
+                                        session_id,
+                                        active_marker.stage_id,
+                                    )
+                                )
+                                await cur.execute(
+                                    "SELECT idempotency_key, record "
+                                    "FROM cayu_session_operations "
+                                    "WHERE session_id = %s AND idempotency_key = ANY(%s)",
+                                    (
+                                        session_id,
+                                        [active_preparation_key, active_terminal_key],
+                                    ),
+                                )
+                                active_records = {
+                                    row[0]: _decode_model_completion_stage_record(row[1])
+                                    for row in await cur.fetchall()
+                                }
+                                replay_active = _reconstruct_active_model_completion_stage(
+                                    active_record,
+                                    active_records.get(active_preparation_key),
+                                    active_records.get(active_terminal_key),
+                                    session_id=session_id,
+                                )
+                            _validate_model_completion_promotion_replay_active_marker(
+                                replay_active,
+                                locked_stage,
+                            )
+                            receipt = _reconstruct_runtime_publication_receipt(
+                                receipt_record,
+                                storage_key=prepared.storage_key,
+                                session_id=session_id,
+                                publication_id=request.publication_id,
+                            )
+                            await self._validate_runtime_publication_material(cur, receipt)
+                            result = _replay_promoted_model_completion_stage(
+                                session=loaded,
+                                stage=locked_stage,
+                                receipt_record=receipt_record,
+                                winner_record=winner_record,
+                            )
+                            await conn.rollback()
+                            return result
+                        receipt = _reconstruct_runtime_publication_receipt(
+                            receipt_record,
+                            storage_key=prepared.storage_key,
+                            session_id=session_id,
+                            publication_id=request.publication_id,
+                            request_digest=prepared.request_digest,
+                        )
+                        _validate_runtime_publication_replay_receipt(receipt, prepared)
+                        await self._validate_runtime_publication_material(cur, receipt)
+                        await conn.rollback()
+                        return RuntimePublicationResult(
+                            session=loaded.model_copy(deep=True),
+                            receipt=receipt,
+                            replayed=True,
+                        )
+
+                    if locked_stage is not None:
+                        assert _model_completion_stage is not None
+                        if winner_record is not None:
+                            raise SessionModelCompletionStageConflict(
+                                "A model-completion winner exists without its runtime "
+                                "publication receipt."
+                            )
+                        if active_record is not None:
+                            active_marker = _reconstruct_active_model_completion_stage_record(
+                                active_record,
+                                session_id=session_id,
+                            )
+                            if active_marker.stage_id != locked_stage.stage_id:
+                                raise SessionModelCompletionStageConflict(
+                                    "The model-completion stage was superseded before promotion."
+                                )
+                        active = _reconstruct_active_model_completion_stage(
+                            active_record,
+                            stage_records.get(_model_completion_stage.preparation_storage_key),
+                            stage_records.get(_model_completion_stage.terminal_storage_key),
+                            session_id=session_id,
+                        )
+                        _validate_model_completion_active_marker_for_promotion(
+                            active,
+                            locked_stage,
+                        )
+
+                    _assert_session_run_epoch(session_id, loaded)
+                    if (
+                        prepared.expected_statuses is not None
+                        and loaded.status not in prepared.expected_statuses
+                    ):
+                        raise SessionStatusConflict(
+                            "Session status is not eligible for runtime publication: "
+                            f"{loaded.status}"
+                        )
+                    if (
+                        prepared.expected_run_epoch is not None
+                        and loaded.run_epoch != prepared.expected_run_epoch
+                    ):
+                        raise SessionRunFenced(
+                            "Session source run epoch is stale: expected "
+                            f"{prepared.expected_run_epoch}, current {loaded.run_epoch}."
+                        )
+                    await cur.execute(
+                        "SELECT COUNT(*) FROM cayu_transcript_messages WHERE session_id = %s",
+                        (session_id,),
+                    )
+                    cursor_row = await cur.fetchone()
+                    transcript_start_cursor = cursor_row[0] if cursor_row is not None else 0
+                    if (
+                        prepared.expected_transcript_cursor is not None
+                        and transcript_start_cursor != prepared.expected_transcript_cursor
+                    ):
+                        raise ValueError(
+                            "Session source transcript cursor is stale: expected "
+                            f"{prepared.expected_transcript_cursor}, "
+                            f"current {transcript_start_cursor}."
+                        )
+
+                    appended_event_ids = {event.id for event in request.events}
+                    referenced_event_ids = set(
+                        _runtime_publication_referenced_event_ids(request.referenced_events)
+                    )
+                    if appended_event_ids & referenced_event_ids:
+                        raise ValueError(
+                            "Appended and referenced runtime publication events overlap."
+                        )
+                    durable_references: dict[str, Event] = {}
+                    if referenced_event_ids:
+                        await cur.execute(
+                            "SELECT event_id, event FROM cayu_events "
+                            "WHERE session_id = %s AND event_id = ANY(%s) FOR SHARE",
+                            (session_id, list(referenced_event_ids)),
+                        )
+                        durable_references = {
+                            row[0]: Event(**_json_obj(row[1])) for row in await cur.fetchall()
+                        }
+                    _validate_runtime_publication_event_references(
+                        request.referenced_events,
+                        durable_references,
+                    )
+                    current_checkpoint = await self._load_checkpoint(cur, session_id)
+                    _validate_tool_round_checkpoint_mutation(
+                        request,
+                        current_checkpoint,
+                    )
+                    durable_tool_events: list[Event] = []
+                    tool_round_identity = _tool_round_publication_identity(request)
+                    if tool_round_identity is not None:
+                        execution_identity, tool_call_ids = tool_round_identity
+                        lookup_keys = [
+                            pending_action_lookup_key(tool_call_id)
+                            for tool_call_id in tool_call_ids
+                        ]
+                        lifecycle_event_types = [
+                            str(event_type)
+                            for event_type in sorted(
+                                _TOOL_ROUND_LIFECYCLE_EVENT_TYPES,
+                                key=str,
+                            )
+                        ]
+                        await cur.execute(
+                            "SELECT event_id, event FROM cayu_events "
+                            "WHERE session_id = %s "
+                            "AND pending_action_lookup_key = ANY(%s) "
+                            "AND event_type = ANY(%s) "
+                            f"AND ({_PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL}) "
+                            "AND (event -> 'payload' ->> 'tool_round_id' = %s "
+                            "OR (event -> 'payload' ->> 'model_step_id' = %s "
+                            "AND event -> 'payload' ->> 'model_attempt_id' = %s) "
+                            "OR ((event -> 'payload' ->> 'tool_round_id') "
+                            "~ '^tround_[0-9a-f]{32}$') IS NOT TRUE "
+                            "OR ((event -> 'payload' ->> 'model_step_id') "
+                            "~ '^mstep_[0-9a-f]{32}$') IS NOT TRUE "
+                            "OR ((event -> 'payload' ->> 'model_attempt_id') "
+                            "~ '^matt_[0-9a-f]{32}$') IS NOT TRUE) "
+                            "ORDER BY session_order ASC LIMIT %s FOR SHARE",
+                            (
+                                session_id,
+                                lookup_keys,
+                                lifecycle_event_types,
+                                execution_identity.tool_round_id,
+                                execution_identity.model_step_id,
+                                execution_identity.model_attempt_id,
+                                RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS + 1,
+                            ),
+                        )
+                        rows = await cur.fetchall()
+                        if len(rows) > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS:
+                            raise ValueError(
+                                "Tool-round lifecycle evidence exceeds the publication limit."
+                            )
+                        durable_tool_events = [Event(**_json_obj(row[1])) for row in rows]
+                    _validate_tool_round_publication(
+                        request,
+                        durable_references,
+                        durable_tool_events=durable_tool_events,
+                    )
+                    if request.events:
+                        await cur.execute(
+                            "SELECT event_id FROM cayu_events "
+                            "WHERE session_id = %s AND event_id = ANY(%s)",
+                            (session_id, [event.id for event in request.events]),
+                        )
+                        existing_event_row = await cur.fetchone()
+                        if existing_event_row is not None:
+                            raise ValueError(
+                                f"Event already exists for session {session_id}: "
+                                f"{existing_event_row[0]}"
+                            )
+
+                    checkpoint = _apply_runtime_publication_checkpoint_mutation(
+                        request.mutation,
+                        current_checkpoint,
+                    )
+
+                    transcript_rows = [
+                        (session_id, _dumps(message_payload))
+                        for message_payload in prepared.transcript_payloads
+                    ]
+                    prepared_event_rows = []
+                    for event, event_payload in zip(
+                        request.events,
+                        prepared.event_payloads,
+                        strict=True,
+                    ):
+                        lookup_key, projection, projection_bytes = (
+                            pending_action_event_storage_values(event)
+                        )
+                        prepared_event_rows.append(
+                            (
+                                session_id,
+                                event.id,
+                                str(event.type),
+                                pg_support.to_utc(event.timestamp),
+                                event.agent_name,
+                                event.environment_name,
+                                event.workflow_name,
+                                event.tool_name,
+                                _dumps(event_payload["payload"]),
+                                _dumps(event_payload),
+                                lookup_key,
+                                projection,
+                                projection_bytes,
+                            )
+                        )
+
+                    published_at = _next_runtime_publication_timestamp(loaded)
+                    checkpoint_values = (
+                        None
+                        if checkpoint is None or not request.mutation.operations
+                        else _checkpoint_row_values(
+                            session_id,
+                            checkpoint,
+                            published_at,
+                        )
+                    )
+                    receipt = _build_runtime_publication_receipt(
+                        prepared,
+                        source_session=loaded,
+                        checkpoint=checkpoint,
+                        transcript_start_cursor=transcript_start_cursor,
+                        published_at=published_at,
+                    )
+                    receipt_record = _runtime_publication_receipt_record(receipt)
+                    receipt_json = _dumps(receipt_record)
+
+                    await cur.execute(
+                        """
+                        UPDATE cayu_sessions
+                        SET event_seq = event_seq + %s,
+                            updated_at = %s,
+                            last_activity_at = %s
+                        WHERE id = %s
+                        RETURNING event_seq
+                        """,
+                        (len(request.events), published_at, published_at, session_id),
+                    )
+                    order_row = await cur.fetchone()
+                    if order_row is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    if transcript_rows:
+                        await cur.executemany(
+                            """
+                            INSERT INTO cayu_transcript_messages (session_id, message)
+                            VALUES (%s, %s)
+                            """,
+                            transcript_rows,
+                        )
+                    if checkpoint_values is not None:
+                        await cur.execute(
+                            """
+                            INSERT INTO cayu_checkpoints (
+                                session_id, state, updated_at,
+                                pending_action_source_bytes,
+                                pending_action_tool_call_count,
+                                pending_action_flags,
+                                pending_action_metrics_ready
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (session_id) DO UPDATE SET
+                                state = EXCLUDED.state,
+                                updated_at = EXCLUDED.updated_at,
+                                pending_action_source_bytes = EXCLUDED.pending_action_source_bytes,
+                                pending_action_tool_call_count = EXCLUDED.pending_action_tool_call_count,
+                                pending_action_flags = EXCLUDED.pending_action_flags,
+                                pending_action_metrics_ready = EXCLUDED.pending_action_metrics_ready
+                            """,
+                            checkpoint_values,
+                        )
+
+                    next_order = order_row[0] - len(prepared_event_rows)
+                    event_rows = []
+                    for row in prepared_event_rows:
+                        next_order += 1
+                        event_rows.append((row[0], next_order, *row[1:]))
+                    if event_rows:
+                        await cur.executemany(
+                            """
+                            INSERT INTO cayu_events (
+                                session_id, session_order, event_id, event_type, timestamp,
+                                agent_name, environment_name, workflow_name, tool_name,
+                                payload, event, pending_action_lookup_key,
+                                pending_action_projection, pending_action_projection_bytes
+                            )
+                            VALUES (
+                                %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s, %s
+                            )
+                            """,
+                            event_rows,
+                        )
+                        await self._enqueue_persisted_event_side_effects(
+                            cur,
+                            session_id,
+                            [event.id for event in request.events],
+                        )
+                    await cur.execute(
+                        """
+                        INSERT INTO cayu_session_operations (
+                            session_id, idempotency_key, record, updated_at
+                        )
+                        VALUES (%s, %s, %s, %s)
+                        """,
+                        (
+                            session_id,
+                            prepared.storage_key,
+                            receipt_json,
+                            published_at,
+                        ),
+                    )
+                    if locked_stage is not None and _model_completion_stage is not None:
+                        winner = _model_completion_stage_winner_record(
+                            locked_stage,
+                            receipt=receipt,
+                        )
+                        await cur.execute(
+                            "INSERT INTO cayu_session_operations "
+                            "(session_id, idempotency_key, record, updated_at) "
+                            "VALUES (%s, %s, %s, %s)",
+                            (
+                                session_id,
+                                _model_completion_stage.winner_storage_key,
+                                _dumps(winner),
+                                published_at,
+                            ),
+                        )
+                        await cur.execute(
+                            "DELETE FROM cayu_session_operations "
+                            "WHERE session_id = %s AND idempotency_key = %s",
+                            (session_id, _model_completion_stage.active_storage_key),
+                        )
+                        if cur.rowcount != 1:
+                            raise SessionModelCompletionStageConflict(
+                                "The active model-completion marker changed before commit."
+                            )
+                await conn.commit()
+            except UniqueViolation as exc:
+                await conn.rollback()
+                existing = None
+                async with conn.cursor() as cur:
+                    for event in request.events:
+                        await cur.execute(
+                            "SELECT 1 FROM cayu_events WHERE session_id = %s AND event_id = %s",
+                            (session_id, event.id),
+                        )
+                        if await cur.fetchone() is not None:
+                            existing = event.id
+                            break
+                    await cur.execute(
+                        "SELECT 1 FROM cayu_session_operations "
+                        "WHERE session_id = %s AND idempotency_key = %s",
+                        (session_id, prepared.storage_key),
+                    )
+                    receipt_exists = await cur.fetchone() is not None
+                if existing is not None:
+                    raise ValueError(
+                        f"Event already exists for session {session_id}: {existing}"
+                    ) from exc
+                if receipt_exists:
+                    raise SessionRuntimePublicationConflict(
+                        "Runtime publication receipt was inserted concurrently."
+                    ) from exc
+                raise
+            except BaseException:
+                await conn.rollback()
+                raise
+
+        updated = loaded.model_copy(
+            update={
+                "updated_at": published_at,
+                "last_activity_at": published_at,
+            },
+            deep=True,
+        )
+        return RuntimePublicationResult(
+            session=updated,
+            receipt=receipt,
+            replayed=False,
+        )
+
     async def publish_session_operation(
         self,
         session_id: str,
@@ -6630,7 +7934,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         return await self._publish_checkpoint_and_events(
             session_id,
             checkpoint_transform=None,
-            operation_idempotency_key=require_clean_nonblank(
+            operation_idempotency_key=_reject_reserved_runtime_publication_key(
                 idempotency_key,
                 "idempotency_key",
             ),
@@ -6757,6 +8061,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             publication.operation_records,
                             "operation_records",
                         )
+                        _validate_session_operation_record_keys(operation_records)
                     else:
                         assert checkpoint_transform is not None
                         transformed = checkpoint_transform(loaded, current_checkpoint)
@@ -6884,6 +8189,101 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 (session_id,),
             )
             rows = await cur.fetchall()
+            return [Event(**_json_obj(row[0])) for row in rows]
+
+    async def load_tool_round_lifecycle_events(
+        self,
+        session_id: str,
+        tool_call_ids: list[str] | tuple[str, ...],
+    ) -> list[Event]:
+        from cayu.runtime.pending_actions import pending_action_lookup_key
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        copied_ids = _validate_tool_round_call_ids(tool_call_ids, "tool_call_ids")
+        lookup_keys = [pending_action_lookup_key(call_id) for call_id in copied_ids]
+        lifecycle_event_types = [
+            str(event_type) for event_type in sorted(_TOOL_ROUND_LIFECYCLE_EVENT_TYPES, key=str)
+        ]
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT 1 FROM cayu_sessions WHERE id = %s",
+                (session_id,),
+            )
+            if await cur.fetchone() is None:
+                raise KeyError(f"Session not found: {session_id}")
+            await cur.execute(
+                "SELECT event FROM cayu_events "
+                "WHERE session_id = %s "
+                "AND pending_action_lookup_key = ANY(%s) "
+                "AND event_type = ANY(%s) "
+                f"AND ({_PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL}) "
+                "ORDER BY session_order ASC LIMIT %s",
+                (
+                    session_id,
+                    lookup_keys,
+                    lifecycle_event_types,
+                    RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS + 1,
+                ),
+            )
+            rows = await cur.fetchall()
+            if len(rows) > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS:
+                raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
+            return [Event(**_json_obj(row[0])) for row in rows]
+
+    async def load_tool_round_lifecycle_events_for_round(
+        self,
+        session_id: str,
+        tool_call_ids: list[str] | tuple[str, ...],
+        *,
+        tool_round_identity: ToolRoundIdentity,
+    ) -> list[Event]:
+        from cayu.runtime.pending_actions import pending_action_lookup_key
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        copied_ids = _validate_tool_round_call_ids(tool_call_ids, "tool_call_ids")
+        tool_round_identity = copy_tool_round_identity(tool_round_identity)
+        lookup_keys = [pending_action_lookup_key(call_id) for call_id in copied_ids]
+        lifecycle_event_types = [
+            str(event_type) for event_type in sorted(_TOOL_ROUND_LIFECYCLE_EVENT_TYPES, key=str)
+        ]
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT 1 FROM cayu_sessions WHERE id = %s",
+                (session_id,),
+            )
+            if await cur.fetchone() is None:
+                raise KeyError(f"Session not found: {session_id}")
+            await cur.execute(
+                "SELECT event FROM cayu_events "
+                "WHERE session_id = %s "
+                "AND pending_action_lookup_key = ANY(%s) "
+                "AND event_type = ANY(%s) "
+                f"AND ({_PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL}) "
+                "AND (event -> 'payload' ->> 'tool_round_id' = %s "
+                "OR (event -> 'payload' ->> 'model_step_id' = %s "
+                "AND event -> 'payload' ->> 'model_attempt_id' = %s) "
+                "OR ((event -> 'payload' ->> 'tool_round_id') "
+                "~ '^tround_[0-9a-f]{32}$') IS NOT TRUE "
+                "OR ((event -> 'payload' ->> 'model_step_id') "
+                "~ '^mstep_[0-9a-f]{32}$') IS NOT TRUE "
+                "OR ((event -> 'payload' ->> 'model_attempt_id') "
+                "~ '^matt_[0-9a-f]{32}$') IS NOT TRUE) "
+                "ORDER BY session_order ASC LIMIT %s",
+                (
+                    session_id,
+                    lookup_keys,
+                    lifecycle_event_types,
+                    tool_round_identity.tool_round_id,
+                    tool_round_identity.model_step_id,
+                    tool_round_identity.model_attempt_id,
+                    RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS + 1,
+                ),
+            )
+            rows = await cur.fetchall()
+            if len(rows) > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS:
+                raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
             return [Event(**_json_obj(row[0])) for row in rows]
 
     async def query_events(self, query: EventQuery | None = None) -> list[EventRecord]:
@@ -9161,6 +10561,22 @@ def _checkpoint_row_values(
 def _json_obj(value: Any) -> dict[str, Any]:
     if isinstance(value, str):
         return json.loads(value)
+    return value
+
+
+def _decode_runtime_publication_record(value: Any) -> dict[str, Any]:
+    if type(value) is not dict:
+        raise SessionRuntimePublicationConflict(
+            "The durable runtime publication receipt is malformed or conflicts with its key."
+        )
+    return value
+
+
+def _decode_model_completion_stage_record(value: Any) -> dict[str, Any]:
+    if type(value) is not dict:
+        raise SessionModelCompletionStageConflict(
+            "The durable model-completion stage record is malformed."
+        )
     return value
 
 
