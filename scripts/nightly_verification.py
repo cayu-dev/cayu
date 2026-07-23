@@ -290,7 +290,7 @@ CHECKS: tuple[VerificationCheck, ...] = (
     ),
     VerificationCheck(
         id="docker-runner",
-        capability="DockerRunner real container exec and timeout cleanup",
+        capability="DockerRunner real exec, timeout cleanup, and bounded workspace search",
         lane="docker",
         command=("uv", "run", "pytest", "tests/runners/test_docker_live.py", "-q"),
         status_on_success=STATUS_VERIFIED,

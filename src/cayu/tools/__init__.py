@@ -29,6 +29,7 @@ from cayu.tools.knowledge import (
     RememberKnowledgeTool,
     SearchKnowledgeTool,
 )
+from cayu.tools.search import SearchTextTool
 from cayu.tools.subagents import (
     BackgroundSubagentTaskRegistry,
     SubagentContextMode,
@@ -62,6 +63,7 @@ __all__ = [
     "RememberKnowledgePolicy",
     "RememberKnowledgeTool",
     "SearchKnowledgeTool",
+    "SearchTextTool",
     "SubagentContextMode",
     "SubagentExecutionMode",
     "SubagentResultTool",
