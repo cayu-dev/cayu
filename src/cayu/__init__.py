@@ -1,5 +1,6 @@
 """Cayu public API."""
 
+from cayu._validation import DurableValueError, extract_durable_value_error
 from cayu._version import __version__
 from cayu.artifacts import (
     DEFAULT_ARTIFACT_WORKSPACE_COPY_LIMIT_BYTES,
@@ -857,6 +858,7 @@ __all__ = [
     "Dispatcher",
     "DockerCloseAction",
     "DockerRunner",
+    "DurableValueError",
     "E2BCloseAction",
     "E2BGuestHandoffError",
     "E2BGuestHandoffPhase",
@@ -1309,6 +1311,7 @@ __all__ = [
     "eval_run_to_json",
     "evaluate_assertions",
     "evaluate_execution_admission",
+    "extract_durable_value_error",
     "file_attachment",
     "file_attachment_from_payload",
     "final_output_text",
