@@ -36,8 +36,10 @@ def test_release_jobs_pin_every_external_action_to_immutable_commit() -> None:
     references = [
         reference
         for job_name in (
+            "verification-scope",
             "static",
             "test",
+            "sqlite-cancellation",
             "package",
             "dashboard",
             "publish",
@@ -120,3 +122,24 @@ def test_release_workflow_gates_publish_and_reuses_validated_artifact() -> None:
     assert "--verify-tag" in github_release
     assert "--prerelease" in github_release
     assert "--latest=false" in github_release
+
+
+def test_pull_request_scopes_expensive_verification_jobs() -> None:
+    workflow = _CI_WORKFLOW.read_text()
+    scope = _job_block(workflow, "verification-scope")
+    sqlite = _job_block(workflow, "sqlite-cancellation")
+    package = _job_block(workflow, "package")
+    dashboard = _job_block(workflow, "dashboard")
+
+    assert "python3 scripts/select_ci_jobs.py" in scope
+    assert 'if test "$EVENT_NAME" != "pull_request"' in scope
+    for output in ("dashboard", "release_artifacts", "sqlite_cancellation"):
+        assert f'echo "{output}=true"' in scope
+        assert f"{output}: ${{{{ steps.scope.outputs.{output} }}}}" in scope
+
+    assert "needs: verification-scope" in sqlite
+    assert "needs.verification-scope.outputs.sqlite_cancellation == 'true'" in sqlite
+    assert "needs: verification-scope" in dashboard
+    assert "needs.verification-scope.outputs.dashboard == 'true'" in dashboard
+    assert "needs: verification-scope" in package
+    assert "needs.verification-scope.outputs.release_artifacts == 'true'" in package

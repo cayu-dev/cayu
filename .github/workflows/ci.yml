@@ -14,6 +14,43 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  verification-scope:
+    name: Verification scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    # Pull requests run expensive specialist lanes only when their contracts can
+    # change. Main and release tags deliberately fail open to the complete gate.
+    outputs:
+      dashboard: ${{ steps.scope.outputs.dashboard }}
+      release_artifacts: ${{ steps.scope.outputs.release_artifacts }}
+      sqlite_cancellation: ${{ steps.scope.outputs.sqlite_cancellation }}
+    steps:
+      - name: Check out pull request history
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Select conditional verification
+        id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if test "$EVENT_NAME" != "pull_request"; then
+            {
+              echo "dashboard=true"
+              echo "release_artifacts=true"
+              echo "sqlite_cancellation=true"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          python3 scripts/select_ci_jobs.py \
+            --base-sha "$BASE_SHA" \
+            --head-sha "$HEAD_SHA" >> "$GITHUB_OUTPUT"
+
   static:
     name: Static checks
     runs-on: ubuntu-latest
@@ -57,6 +94,8 @@ jobs:
 
   sqlite-cancellation:
     name: SQLite cancellation (Python ${{ matrix.python-version }})
+    needs: verification-scope
+    if: needs.verification-scope.outputs.sqlite_cancellation == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     strategy:
@@ -81,54 +120,10 @@ jobs:
               tests/core/test_runtime.py::test_cancelled_sqlite_factory_checkpoint_preserves_committed_allocation
           done
 
-  release-artifact-scope:
-    name: Release artifact scope
-    runs-on: ubuntu-latest
-    timeout-minutes: 2
-    outputs:
-      run: ${{ steps.scope.outputs.run }}
-    steps:
-      - name: Check out pull request history
-        if: github.event_name == 'pull_request'
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha }}
-      - name: Select release artifact verification
-        id: scope
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          EVENT_NAME: ${{ github.event_name }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          if test "$EVENT_NAME" != "pull_request"; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if git diff --quiet "$BASE_SHA...$HEAD_SHA" -- \
-            .github/workflows/ci.yml \
-            LICENSE \
-            NOTICE \
-            pyproject.toml \
-            uv.lock \
-            scripts/check_release_artifacts.py \
-            scripts/generate_sidecar_manifest.py \
-            ':(glob)maintenance/model_catalog/**' \
-            ':(glob)src/cayu/data/**' \
-            ':(glob)src/cayu/**/*lambda_microvm*' \
-            ':(glob)src/cayu/**/*manifest*' \
-            ':(glob)examples/aws/**/*lambda_microvm*' \
-            ':(glob)examples/aws/lambda_microvm*/**'; then
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          fi
-
   package:
     name: Release artifacts
-    needs: release-artifact-scope
-    if: needs.release-artifact-scope.outputs.run == 'true'
+    needs: verification-scope
+    if: needs.verification-scope.outputs.release_artifacts == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -408,6 +403,8 @@ jobs:
 
   dashboard:
     name: Dashboard
+    needs: verification-scope
+    if: needs.verification-scope.outputs.dashboard == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:

@@ -133,6 +133,14 @@ npm run build:package
 `build:package` regenerates `src/cayu/server/dashboard/`. Commit those packaged assets
 when dashboard source changes; CI fails when the committed assets are stale.
 
+### Pull request verification scope
+
+Every pull request runs the repository-wide static checks and the complete Python 3.14
+test suite. CI adds the cross-version SQLite cancellation matrix, release-artifact
+verification, and dashboard checks only when the changed paths affect those contracts.
+The selector is intentionally fail-open for CI configuration, dependency, and selector
+changes. Pushes to `main` and `v*` release tags always run every verification job.
+
 ## Pull request process
 
 ### Keep PRs focused
