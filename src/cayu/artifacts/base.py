@@ -17,12 +17,12 @@ from pydantic import (
 )
 
 from cayu._validation import (
-    copy_json_value,
+    MAX_DURABLE_JSON_INTEGER,
+    copy_durable_json_object,
     freeze_json_value,
     require_clean_nonblank,
+    require_durable_text,
     require_nonblank,
-    require_unicode_scalar_json,
-    require_unicode_scalar_text,
     thaw_json_value,
 )
 
@@ -43,7 +43,12 @@ class ArtifactStoreUnavailableError(RuntimeError):
 
 
 class ArtifactMetadata(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, validate_default=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        validate_default=True,
+        hide_input_in_errors=True,
+    )
 
     id: str
     filename: str
@@ -59,8 +64,7 @@ class ArtifactMetadata(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: Mapping[str, Any]) -> dict[str, Any]:
-        copied = copy_json_value(value, "metadata")
-        return require_unicode_scalar_json(copied, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
     @field_validator("metadata")
     @classmethod
@@ -74,8 +78,10 @@ class ArtifactMetadata(BaseModel):
     @field_validator("id")
     @classmethod
     def validate_clean_nonblank(cls, value: str, info) -> str:
-        value = require_clean_nonblank(value, info.field_name)
-        return require_unicode_scalar_text(value, info.field_name)
+        return require_clean_nonblank(
+            require_durable_text(value, info.field_name),
+            info.field_name,
+        )
 
     @field_validator("content_type")
     @classmethod
@@ -95,8 +101,10 @@ class ArtifactMetadata(BaseModel):
     @field_validator("filename")
     @classmethod
     def validate_filename(cls, value: str, info) -> str:
-        value = require_nonblank(value, info.field_name)
-        return require_unicode_scalar_text(value, info.field_name)
+        return require_nonblank(
+            require_durable_text(value, info.field_name),
+            info.field_name,
+        )
 
     @field_validator("session_id", "agent_name", "environment_name")
     @classmethod
@@ -107,8 +115,10 @@ class ArtifactMetadata(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        value = require_clean_nonblank(value, info.field_name)
-        return require_unicode_scalar_text(value, info.field_name)
+        return require_clean_nonblank(
+            require_durable_text(value, info.field_name),
+            info.field_name,
+        )
 
     @field_validator("size_bytes")
     @classmethod
@@ -117,6 +127,8 @@ class ArtifactMetadata(BaseModel):
             raise ValueError(f"`{info.field_name}` must be an integer.")
         if value < 0:
             raise ValueError(f"`{info.field_name}` must be non-negative.")
+        if value > MAX_DURABLE_JSON_INTEGER:
+            raise ValueError(f"`{info.field_name}` must fit in a signed 64-bit integer.")
         return value
 
     @model_validator(mode="after")

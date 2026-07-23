@@ -47,7 +47,8 @@ from cayu.environments import (
     EnvironmentFactoryOperation,
 )
 from cayu.providers import (
-    ModelProvider,
+    UsageDialect,
+    copy_usage_dialect,
 )
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
@@ -147,6 +148,7 @@ from cayu.runtime.context import (
     _automatic_compaction_dispatch_runner_scope,
     _compaction_completion_publisher_scope,
     _compaction_model_completed_payload,
+    _CompactionAccountingUsageError,
     _defer_billing_identity_cancellation_scope,
     _durable_compaction_completion_evidence,
     context_build_termination_compaction_telemetry,
@@ -2587,6 +2589,10 @@ class SessionEngine:
                 "Explicit session compaction requires a configured "
                 "CheckpointCompactionContextPolicy."
             )
+        compactor_name = _require_application_compaction_event_text(
+            type(context_policy.compactor).__name__,
+            "compactor",
+        )
         registered_environment = self._get_registered_environment_for_session(
             loaded_session.environment_name
         )
@@ -2738,7 +2744,7 @@ class SessionEngine:
                 operation_id=operation_id,
                 attempt_id=attempt_id,
                 source_cursor=len(transcript),
-                compactor=type(context_policy.compactor).__name__,
+                compactor=compactor_name,
             ),
         )
         claimed_checkpoint: dict[str, Any] | None = None
@@ -3053,7 +3059,7 @@ class SessionEngine:
                 attempt_id=attempt_id,
                 registered_agent=registered_agent,
                 environment_name=environment_name,
-                compactor=type(context_policy.compactor).__name__,
+                compactor=compactor_name,
                 provider_name=compactor_provider_name,
                 model=compactor_model,
             )
@@ -3088,7 +3094,7 @@ class SessionEngine:
                 request=request,
                 operation_id=operation_id,
                 attempt_id=attempt_id,
-                compactor=type(context_policy.compactor).__name__,
+                compactor=compactor_name,
                 reservations=budget_reservations,
                 events=attempt_events,
             )
@@ -3105,7 +3111,7 @@ class SessionEngine:
                         session=loaded_session,
                         registered_agent=registered_agent,
                         environment_name=environment_name,
-                        compactor=type(context_policy.compactor).__name__,
+                        compactor=compactor_name,
                     )
                 )
                 reservation_error = RuntimeError(
@@ -3153,19 +3159,27 @@ class SessionEngine:
 
             def dispatch_completion_event(
                 *,
-                actual_provider: ModelProvider,
+                actual_pricing_provider_name: str,
                 actual_model: str,
+                actual_usage_dialect: UsageDialect,
                 completed_metadata: dict[str, Any],
             ) -> Event:
-                provider_name = actual_provider.billing_provider_name or actual_provider.name
-                compactor = type(context_policy.compactor).__name__
-                payload = _compaction_model_completed_payload(
-                    completed_payload=completed_metadata,
-                    provider_name=provider_name,
-                    fallback_model=actual_model,
-                    compactor=compactor,
-                    usage_dialect=actual_provider.usage_dialect,
-                )
+                provider_name = actual_pricing_provider_name
+                compactor = compactor_name
+                try:
+                    payload = _compaction_model_completed_payload(
+                        completed_payload=completed_metadata,
+                        provider_name=provider_name,
+                        fallback_model=actual_model,
+                        compactor=compactor,
+                        usage_dialect=actual_usage_dialect,
+                    )
+                except _CompactionAccountingUsageError as exc:
+                    # A provider call still completed when normalized counters
+                    # overflowed the durable int64 contract. Preserve the safe
+                    # rejected-usage evidence so its reservation is settled at
+                    # the reserved amount instead of being left uncertain.
+                    payload = exc.payload
                 return Event(
                     type=EventType.MODEL_COMPLETED,
                     session_id=loaded_session.id,
@@ -3205,7 +3219,7 @@ class SessionEngine:
                                 session=loaded_session,
                                 registered_agent=registered_agent,
                                 environment_name=environment_name,
-                                compactor=type(context_policy.compactor).__name__,
+                                compactor=compactor_name,
                             ),
                         )
                     )
@@ -3285,7 +3299,7 @@ class SessionEngine:
                         request=request,
                         operation_id=operation_id,
                         attempt_id=attempt_id,
-                        compactor=type(context_policy.compactor).__name__,
+                        compactor=compactor_name,
                         reason=release_reason,
                     )
                 elif completed_event is None:
@@ -3297,7 +3311,7 @@ class SessionEngine:
                         request=request,
                         operation_id=operation_id,
                         attempt_id=attempt_id,
-                        compactor=type(context_policy.compactor).__name__,
+                        compactor=compactor_name,
                     )
                 else:
                     settlement = self._reconcile_compaction_budget_reservations(
@@ -3309,7 +3323,7 @@ class SessionEngine:
                         request=request,
                         operation_id=operation_id,
                         attempt_id=attempt_id,
-                        compactor=type(context_policy.compactor).__name__,
+                        compactor=compactor_name,
                     )
                 settlement_events: list[Event] = []
                 try:
@@ -3336,14 +3350,32 @@ class SessionEngine:
                     ]
 
             async def run_provider_dispatch(
-                actual_provider: ModelProvider,
+                actual_pricing_provider_name: str,
                 actual_model: str,
+                actual_usage_dialect: UsageDialect,
                 billing_identity: BillingIdentity | None,
                 dispatch: Callable[[], Awaitable[tuple[str, dict[str, Any]]]],
             ) -> tuple[str, dict[str, Any]]:
-                actual_pricing_provider_name = (
-                    actual_provider.billing_provider_name or actual_provider.name
+                actual_pricing_provider_name = _require_application_compaction_event_text(
+                    actual_pricing_provider_name,
+                    "compactor_provider_name",
                 )
+                actual_model = _require_application_compaction_event_text(
+                    actual_model,
+                    "compactor_model",
+                )
+                actual_usage_dialect = copy_usage_dialect(
+                    actual_usage_dialect,
+                    "provider.usage_dialect",
+                )
+                if actual_pricing_provider_name != compactor_provider_name:
+                    raise RuntimeError(
+                        "Compaction dispatch provider identity differs from its admitted identity."
+                    )
+                if actual_model != compactor_model:
+                    raise RuntimeError(
+                        "Compaction dispatch model identity differs from its admitted identity."
+                    )
                 limit_decision = await self._run_limit_controller.evaluate_operation_run_limit(
                     session=loaded_session,
                     limits=request.limits,
@@ -3368,7 +3400,7 @@ class SessionEngine:
                     attempt_id=attempt_id,
                     registered_agent=registered_agent,
                     environment_name=environment_name,
-                    compactor=type(context_policy.compactor).__name__,
+                    compactor=compactor_name,
                     provider_name=actual_pricing_provider_name,
                     model=actual_model,
                     billing_identity_state=resolved_billing_identity(billing_identity),
@@ -3389,7 +3421,7 @@ class SessionEngine:
                     request=request,
                     operation_id=operation_id,
                     attempt_id=attempt_id,
-                    compactor=type(context_policy.compactor).__name__,
+                    compactor=compactor_name,
                     reservations=budget_reservations,
                     events=attempt_events,
                     billing_identity=billing_identity,
@@ -3406,7 +3438,7 @@ class SessionEngine:
                             session=loaded_session,
                             registered_agent=registered_agent,
                             environment_name=environment_name,
-                            compactor=type(context_policy.compactor).__name__,
+                            compactor=compactor_name,
                         )
                     )
                     await publish_dispatch_budget_events()
@@ -3445,8 +3477,9 @@ class SessionEngine:
                     raw_completed = getattr(exc, "completed_metadata", None)
                     completed_event = (
                         dispatch_completion_event(
-                            actual_provider=actual_provider,
+                            actual_pricing_provider_name=actual_pricing_provider_name,
                             actual_model=actual_model,
+                            actual_usage_dialect=actual_usage_dialect,
                             completed_metadata=raw_completed,
                         )
                         if type(raw_completed) is dict
@@ -3494,8 +3527,9 @@ class SessionEngine:
                     raw_completed = getattr(exc, "completed_metadata", None)
                     completed_event = (
                         dispatch_completion_event(
-                            actual_provider=actual_provider,
+                            actual_pricing_provider_name=actual_pricing_provider_name,
                             actual_model=actual_model,
+                            actual_usage_dialect=actual_usage_dialect,
                             completed_metadata=raw_completed,
                         )
                         if type(raw_completed) is dict
@@ -3532,8 +3566,9 @@ class SessionEngine:
                     raise
 
                 completed_event = dispatch_completion_event(
-                    actual_provider=actual_provider,
+                    actual_pricing_provider_name=actual_pricing_provider_name,
                     actual_model=actual_model,
+                    actual_usage_dialect=actual_usage_dialect,
                     completed_metadata=dispatch_result[1],
                 )
 
@@ -3653,7 +3688,7 @@ class SessionEngine:
                     session=loaded_session,
                     registered_agent=registered_agent,
                     environment_name=environment_name,
-                    compactor=type(context_policy.compactor).__name__,
+                    compactor=compactor_name,
                 )
                 for telemetry in result.compaction_telemetry
                 if telemetry.event_type != EventType.CONTEXT_COMPACTION_STARTED
@@ -3686,7 +3721,7 @@ class SessionEngine:
                 request=request,
                 operation_id=operation_id,
                 attempt_id=attempt_id,
-                compactor=type(context_policy.compactor).__name__,
+                compactor=compactor_name,
             ):
                 attempt_events.append(event)
             budget_reservations_settled = True
@@ -3719,7 +3754,7 @@ class SessionEngine:
                 attempt_id=attempt_id,
                 registered_agent=registered_agent,
                 environment_name=environment_name,
-                compactor=type(context_policy.compactor).__name__,
+                compactor=compactor_name,
                 provider_name=compactor_provider_name,
                 model=compactor_model,
             )
@@ -3746,7 +3781,7 @@ class SessionEngine:
                         result_cursor=result.checkpoint_event_payload.get(
                             "compacted_transcript_cursor"
                         ),
-                        compactor=type(context_policy.compactor).__name__,
+                        compactor=compactor_name,
                     ),
                 },
             )
@@ -4025,7 +4060,7 @@ class SessionEngine:
                             request=request,
                             operation_id=operation_id,
                             attempt_id=attempt_id,
-                            compactor=type(context_policy.compactor).__name__,
+                            compactor=compactor_name,
                             reason="compaction operation abandoned",
                         ):
                             release_events.append(event)
@@ -4055,7 +4090,7 @@ class SessionEngine:
                         session=loaded_session,
                         registered_agent=registered_agent,
                         environment_name=environment_name,
-                        compactor=type(context_policy.compactor).__name__,
+                        compactor=compactor_name,
                     )
                     for telemetry in termination_telemetry
                     if telemetry.event_type == EventType.MODEL_COMPLETED
@@ -4079,7 +4114,7 @@ class SessionEngine:
                             request=request,
                             operation_id=operation_id,
                             attempt_id=attempt_id,
-                            compactor=type(context_policy.compactor).__name__,
+                            compactor=compactor_name,
                         )
                         if model_completed_events
                         else self._release_compaction_budget_reservations(
@@ -4090,7 +4125,7 @@ class SessionEngine:
                             request=request,
                             operation_id=operation_id,
                             attempt_id=attempt_id,
-                            compactor=type(context_policy.compactor).__name__,
+                            compactor=compactor_name,
                             reason="compaction operation abandoned",
                         )
                     )
@@ -4110,7 +4145,7 @@ class SessionEngine:
                     operation_id=operation_id,
                     attempt_id=attempt_id,
                     source_cursor=request.expected_transcript_cursor,
-                    compactor=type(context_policy.compactor).__name__,
+                    compactor=compactor_name,
                 )
                 if failed_telemetry is not None:
                     failed_payload = _application_compaction_event(
@@ -4121,7 +4156,7 @@ class SessionEngine:
                         session=loaded_session,
                         registered_agent=registered_agent,
                         environment_name=environment_name,
-                        compactor=type(context_policy.compactor).__name__,
+                        compactor=compactor_name,
                     ).payload
                 safe_error_type = (
                     _application_compaction_event_text(type(exc).__name__) or "BaseException"
@@ -4210,7 +4245,7 @@ class SessionEngine:
                             session=loaded_session,
                             registered_agent=registered_agent,
                             environment_name=environment_name,
-                            compactor=type(context_policy.compactor).__name__,
+                            compactor=compactor_name,
                         )
                         for telemetry in failure_telemetry
                         if telemetry.event_type == EventType.MODEL_COMPLETED
@@ -4252,7 +4287,7 @@ class SessionEngine:
                             request=request,
                             operation_id=operation_id,
                             attempt_id=attempt_id,
-                            compactor=type(context_policy.compactor).__name__,
+                            compactor=compactor_name,
                         )
                     elif isinstance(
                         authoritative_failure,
@@ -4266,7 +4301,7 @@ class SessionEngine:
                             request=request,
                             operation_id=operation_id,
                             attempt_id=attempt_id,
-                            compactor=type(context_policy.compactor).__name__,
+                            compactor=compactor_name,
                             reason="compaction reservation lease lost before provider dispatch",
                         )
                     elif isinstance(authoritative_failure, BudgetReservationLeaseLost):
@@ -4279,7 +4314,7 @@ class SessionEngine:
                                 request=request,
                                 operation_id=operation_id,
                                 attempt_id=attempt_id,
-                                compactor=type(context_policy.compactor).__name__,
+                                compactor=compactor_name,
                             )
                         )
                     else:
@@ -4291,7 +4326,7 @@ class SessionEngine:
                             request=request,
                             operation_id=operation_id,
                             attempt_id=attempt_id,
-                            compactor=type(context_policy.compactor).__name__,
+                            compactor=compactor_name,
                             reason="compaction provider step did not complete",
                         )
                     settlement_failure: BaseException | None = None
@@ -4319,7 +4354,7 @@ class SessionEngine:
                     operation_id=operation_id,
                     attempt_id=attempt_id,
                     source_cursor=request.expected_transcript_cursor,
-                    compactor=type(context_policy.compactor).__name__,
+                    compactor=compactor_name,
                 )
                 if failure_telemetry:
                     failed_telemetry = next(
@@ -4339,7 +4374,7 @@ class SessionEngine:
                             session=loaded_session,
                             registered_agent=registered_agent,
                             environment_name=environment_name,
-                            compactor=type(context_policy.compactor).__name__,
+                            compactor=compactor_name,
                         ).payload
                 safe_error_type = (
                     _application_compaction_event_text(type(authoritative_failure).__name__)

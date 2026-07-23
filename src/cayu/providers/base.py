@@ -7,9 +7,17 @@ from typing import Any, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
+    copy_durable_json_value,
+    copy_json_value,
+    require_clean_nonblank,
+    require_durable_clean_nonblank,
+    require_durable_text,
+    require_nonblank,
+)
 from cayu.core.billing import BillingIdentity
-from cayu.core.messages import Message, copy_message
+from cayu.core.messages import Message, detach_message
 
 
 class ModelStreamEventType(StrEnum):
@@ -62,6 +70,26 @@ class UsageDialect(StrEnum):
     ANTHROPIC = "anthropic"
     OPENAI = "openai"
     GENERIC = "generic"
+
+
+def copy_usage_dialect(value: object, field_name: str = "usage_dialect") -> UsageDialect:
+    """Validate and detach a provider's declared usage-accounting dialect.
+
+    Provider attributes are extension-owned and remain mutable after registration.
+    Accept exact built-in strings for compatibility, but never invoke methods on a
+    provider-owned ``str`` subclass while establishing accounting authority.
+    """
+
+    if type(value) is UsageDialect:
+        return value
+    if type(value) is not str:
+        raise TypeError(f"{field_name} must be a UsageDialect or string.")
+    try:
+        return UsageDialect(value)
+    except ValueError:
+        raise ValueError(
+            f"{field_name} must be one of: auto, anthropic, openai, generic."
+        ) from None
 
 
 class ModelProviderError(RuntimeError):
@@ -193,9 +221,9 @@ class InputTokenCountResult(BaseModel):
     as hard provider-limit guarantees.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
-    input_tokens: int | None = Field(default=None, ge=0)
+    input_tokens: int | None = Field(default=None, ge=0, le=MAX_DURABLE_JSON_INTEGER)
     method: InputTokenCountMethod
     confidence: InputTokenCountConfidence
     components: dict[str, int] = Field(default_factory=dict)
@@ -208,7 +236,7 @@ class InputTokenCountResult(BaseModel):
             return value
         if not isinstance(value, str):
             raise ValueError("`method` must be a string.")
-        return InputTokenCountMethod(require_clean_nonblank(value, "method"))
+        return InputTokenCountMethod(require_durable_clean_nonblank(value, "method"))
 
     @field_validator("confidence", mode="before")
     @classmethod
@@ -217,19 +245,19 @@ class InputTokenCountResult(BaseModel):
             return value
         if not isinstance(value, str):
             raise ValueError("`confidence` must be a string.")
-        return InputTokenCountConfidence(require_clean_nonblank(value, "confidence"))
+        return InputTokenCountConfidence(require_durable_clean_nonblank(value, "confidence"))
 
     @field_validator("components", mode="before")
     @classmethod
     def copy_components(cls, value: dict[str, Any]) -> dict[str, int]:
-        copied = copy_json_value(value, "components")
+        copied = copy_durable_json_value(value, "components")
         if type(copied) is not dict:
             raise ValueError("`components` must be a dictionary.")
         result: dict[str, int] = {}
         for key, component_value in copied.items():
             if type(key) is not str:
                 raise ValueError("Input token count component keys must be strings.")
-            clean_key = require_clean_nonblank(key, "component key")
+            clean_key = require_durable_clean_nonblank(key, "component key")
             if type(component_value) is not int:
                 raise ValueError("Input token count component values must be integers.")
             if component_value < 0:
@@ -240,7 +268,7 @@ class InputTokenCountResult(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        copied = copy_json_value(value, "metadata")
+        copied = copy_durable_json_value(value, "metadata")
         if type(copied) is not dict:
             raise ValueError("`metadata` must be a dictionary.")
         return copied
@@ -270,7 +298,7 @@ def copy_model_context_pressure_profile(
 class ModelCompletion(BaseModel):
     """Provider-neutral completion metadata for a model step."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     finish_reason: ModelFinishReason
     raw_finish_reason: str | None = None
@@ -284,14 +312,14 @@ class ModelCompletion(BaseModel):
             return value
         if not isinstance(value, str):
             raise ValueError("`finish_reason` must be a string.")
-        return ModelFinishReason(require_clean_nonblank(value, "finish_reason"))
+        return ModelFinishReason(require_durable_clean_nonblank(value, "finish_reason"))
 
     @field_validator("raw_finish_reason", "status")
     @classmethod
     def validate_optional_clean_string(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("end_turn", mode="before")
     @classmethod
@@ -302,7 +330,7 @@ class ModelCompletion(BaseModel):
 
 
 class ModelRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     model: str
     messages: list[Message]
@@ -312,17 +340,17 @@ class ModelRequest(BaseModel):
     @field_validator("messages")
     @classmethod
     def copy_messages(cls, value):
-        return [copy_message(message) for message in value]
+        return [detach_message(message) for message in value]
 
     @field_validator("tools", "options", mode="before")
     @classmethod
     def copy_json_request_data(cls, value, info):
-        return copy_json_value(value, info.field_name)
+        return copy_durable_json_value(value, info.field_name)
 
     @field_validator("model")
     @classmethod
     def validate_nonblank_model(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
 
 class ModelStreamEvent(BaseModel):
@@ -333,7 +361,7 @@ class ModelStreamEvent(BaseModel):
     records before persisting, dashboarding, or forwarding them.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     type: ModelStreamEventType
     delta: str = ""
@@ -343,6 +371,10 @@ class ModelStreamEvent(BaseModel):
     @field_validator("payload", mode="before")
     @classmethod
     def copy_payload(cls, value: dict[str, Any]) -> dict[str, Any]:
+        # Provider stream events are ephemeral, untrusted observations. They
+        # must remain representable long enough to retain terminal usage even
+        # when unrelated provider metadata is non-portable. Runtime consumers
+        # validate strictly before any transcript, event, or checkpoint write.
         return copy_json_value(value, "payload")
 
     @field_validator("type", mode="before")
@@ -352,7 +384,7 @@ class ModelStreamEvent(BaseModel):
             return value
         if not isinstance(value, str):
             raise ValueError("`type` must be a string.")
-        return ModelStreamEventType(require_clean_nonblank(value, "type"))
+        return ModelStreamEventType(require_durable_clean_nonblank(value, "type"))
 
     @model_validator(mode="after")
     def validate_completion(self) -> ModelStreamEvent:
@@ -457,8 +489,8 @@ def copy_model_stream_event(event: ModelStreamEvent) -> ModelStreamEvent:
         raise ValueError("Model provider stream event payload must be an object.")
     return ModelStreamEvent(
         type=event_type,
-        delta=event.delta,
-        payload=copy_json_value(event.payload, "payload"),
+        delta=require_durable_text(event.delta, "delta"),
+        payload=copy_durable_json_value(event.payload, "payload"),
         completion=copy_model_completion(event.completion),
     )
 
@@ -487,8 +519,8 @@ def copy_input_token_count_result(
         input_tokens=result.input_tokens,
         method=result.method,
         confidence=result.confidence,
-        components=copy_json_value(result.components, "components"),
-        metadata=copy_json_value(result.metadata, "metadata"),
+        components=copy_durable_json_value(result.components, "components"),
+        metadata=copy_durable_json_value(result.metadata, "metadata"),
     )
 
 
@@ -578,7 +610,7 @@ def _optional_payload_string(payload: dict[str, Any], key: str) -> str | None:
     value = payload[key]
     if type(value) is not str:
         raise ValueError(f"Model completed payload `{key}` must be a string.")
-    return require_clean_nonblank(value, key)
+    return require_durable_clean_nonblank(value, key)
 
 
 def _optional_payload_boolean(payload: dict[str, Any], key: str) -> bool | None:

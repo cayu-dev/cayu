@@ -30,6 +30,7 @@ from cayu.providers.base import (
     copy_input_token_count_result,
     copy_model_context_pressure_profile,
     copy_model_stream_event,
+    copy_usage_dialect,
     normalize_model_completion,
 )
 from cayu.providers.bedrock import (
@@ -159,6 +160,7 @@ __all__ = [
     "copy_input_token_count_result",
     "copy_model_context_pressure_profile",
     "copy_model_stream_event",
+    "copy_usage_dialect",
     "normalize_model_completion",
     "openai_embedding_result",
     "openai_response_events",

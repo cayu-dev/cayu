@@ -16,7 +16,7 @@ from typing import Any
 from uuid import uuid4
 
 from cayu._validation import (
-    copy_json_value,
+    copy_durable_json_object,
     require_clean_nonblank,
     require_nonblank,
     require_unicode_scalar_text,
@@ -90,7 +90,7 @@ class LocalArtifactStore(ArtifactStore):
         agent_name = _validate_optional_id(agent_name, "agent_name")
         environment_name = _validate_optional_id(environment_name, "environment_name")
         _validate_scope_owner(scope, session_id=session_id, environment_name=environment_name)
-        copied_metadata = copy_json_value(metadata or {}, "metadata")
+        copied_metadata = copy_durable_json_object(metadata or {}, "metadata")
 
         artifact = ArtifactMetadata(
             id=_new_artifact_id(),

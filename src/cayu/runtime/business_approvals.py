@@ -37,7 +37,11 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu._validation import (
+    copy_durable_json_value,
+    require_durable_clean_nonblank,
+    require_durable_nonblank,
+)
 from cayu.core.events import Event, EventType
 from cayu.runtime._approval_support import pending_approval_from_checkpoint
 from cayu.runtime.approvals import (
@@ -109,7 +113,7 @@ class BusinessApprovalRouting(BaseModel):
     id, amount, cost center, ...) for the approval UI and the audit trail.
     """
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     kind: str = BUSINESS_APPROVAL_ROUTING_KIND
     required_tier: str
@@ -128,14 +132,14 @@ class BusinessApprovalRouting(BaseModel):
     @field_validator("required_tier")
     @classmethod
     def validate_required_tier(cls, value: str) -> str:
-        return require_clean_nonblank(value, "required_tier")
+        return require_durable_clean_nonblank(value, "required_tier")
 
     @field_validator("chain", mode="before")
     @classmethod
     def validate_chain(cls, value: Any) -> tuple[str, ...]:
         if isinstance(value, str) or not isinstance(value, Sequence):
             raise ValueError("`chain` must be a sequence of tier names.")
-        tiers = tuple(require_clean_nonblank(tier, "chain") for tier in value)
+        tiers = tuple(require_durable_clean_nonblank(tier, "chain") for tier in value)
         if not tiers:
             raise ValueError("`chain` cannot be empty.")
         if len(set(tiers)) != len(tiers):
@@ -145,7 +149,7 @@ class BusinessApprovalRouting(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: Any) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_value(value, "metadata")
 
     @model_validator(mode="after")
     def validate_required_tier_in_chain(self) -> BusinessApprovalRouting:
@@ -206,7 +210,7 @@ class TieredApprovalPolicy(ToolPolicy):
         if not callable(compute_routing):
             raise TypeError("compute_routing must be callable.")
         self._compute_routing = compute_routing
-        self._reason = require_nonblank(reason, "reason") if reason is not None else None
+        self._reason = require_durable_nonblank(reason, "reason") if reason is not None else None
         self._expires_in_seconds = expires_in_seconds
 
     async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
@@ -304,13 +308,13 @@ async def resolve_business_approval(
     denial events with ``expired: true``, and the audit record shows
     ``expired=True`` next to the asserted outcome.
     """
-    session_id = require_clean_nonblank(session_id, "session_id")
-    approval_id = require_clean_nonblank(approval_id, "approval_id")
-    approver_id = require_clean_nonblank(approver_id, "approver_id")
-    approver_tier = require_clean_nonblank(approver_tier, "approver_tier")
+    session_id = require_durable_clean_nonblank(session_id, "session_id")
+    approval_id = require_durable_clean_nonblank(approval_id, "approval_id")
+    approver_id = require_durable_clean_nonblank(approver_id, "approver_id")
+    approver_tier = require_durable_clean_nonblank(approver_tier, "approver_tier")
     outcome = BusinessApprovalOutcome(outcome)
     if outcome is BusinessApprovalOutcome.CONDITIONED:
-        condition_text = require_nonblank(
+        condition_text = require_durable_nonblank(
             condition_text if condition_text is not None else "", "condition_text"
         )
     elif condition_text is not None:
@@ -345,7 +349,7 @@ async def resolve_business_approval(
 
     if metadata is not None and type(metadata) is not dict:
         raise TypeError("metadata must be a dict.")
-    resolution_metadata = copy_json_value(metadata or {}, "metadata")
+    resolution_metadata = copy_durable_json_value(metadata or {}, "metadata")
     if BUSINESS_APPROVAL_RESOLUTION_METADATA_KEY in resolution_metadata:
         raise ValueError(
             f"metadata must not contain the reserved key "

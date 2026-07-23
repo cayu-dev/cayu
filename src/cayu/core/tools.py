@@ -18,7 +18,14 @@ from pydantic import (
     field_validator,
 )
 
-from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu._validation import (
+    copy_durable_json_value,
+    copy_json_value,
+    require_clean_nonblank,
+    require_durable_clean_nonblank,
+    require_durable_text,
+    require_nonblank,
+)
 
 
 class ToolEffect(StrEnum):
@@ -94,7 +101,7 @@ def _mutable_value(value: Any) -> Any:
 
 
 class _ToolSpecInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     name: str
     description: str = ""
@@ -105,12 +112,17 @@ class _ToolSpecInput(BaseModel):
     @field_validator("input_schema", mode="before")
     @classmethod
     def copy_input_schema(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "input_schema")
+        return copy_durable_json_value(value, "input_schema")
 
     @field_validator("name")
     @classmethod
     def validate_nonblank_name(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("description")
+    @classmethod
+    def validate_description(cls, value: str) -> str:
+        return require_durable_text(value, "description")
 
 
 class ToolSpec(BaseModel):
@@ -121,7 +133,7 @@ class ToolSpec(BaseModel):
     registration treats the public property as authoritative.
     """
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     name: str
     description: str = ""
@@ -216,7 +228,7 @@ class ToolResult(BaseModel):
     treated as read-only once returned from a tool.
     """
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     content: str = ""
     structured: dict[str, Any] | None = None
@@ -226,7 +238,12 @@ class ToolResult(BaseModel):
     @field_validator("structured", "artifacts", mode="before")
     @classmethod
     def copy_result_data(cls, value, info):
-        return copy_json_value(value, info.field_name)
+        return copy_durable_json_value(value, info.field_name)
+
+    @field_validator("content")
+    @classmethod
+    def validate_content(cls, value: str) -> str:
+        return require_durable_text(value, "content")
 
 
 _TOOL_POLICY_DENIAL_SOURCE = "tool_policy"

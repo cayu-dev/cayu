@@ -55,6 +55,7 @@ from cayu.environments import (
 )
 from cayu.providers import (
     ModelProvider,
+    copy_usage_dialect,
 )
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._environment_lifecycle import (
@@ -771,20 +772,22 @@ class CayuApp:
         if not isinstance(default, bool):
             raise TypeError("Provider default flag must be a bool.")
         stored_model_patterns = _validate_provider_model_patterns(model_patterns)
-        require_clean_nonblank(provider.name, "provider.name")
-        if provider.name in self._providers:
-            raise ValueError(f"Provider already registered: {provider.name}")
+        provider_name = require_clean_nonblank(provider.name, "provider.name")
+        usage_dialect = copy_usage_dialect(provider.usage_dialect, "provider.usage_dialect")
+        if provider_name in self._providers:
+            raise ValueError(f"Provider already registered: {provider_name}")
 
         registration_source, registration_symbol = _registration_site()
-        self._providers[provider.name] = runtime_records.RegisteredProvider(
-            name=provider.name,
+        self._providers[provider_name] = runtime_records.RegisteredProvider(
+            name=provider_name,
             provider=provider,
             model_patterns=stored_model_patterns,
             registration_source=registration_source,
             registration_symbol=registration_symbol,
+            usage_dialect=usage_dialect,
         )
         if default or self._default_provider_name is None:
-            self._default_provider_name = provider.name
+            self._default_provider_name = provider_name
         return provider
 
     def register_environment(

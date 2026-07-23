@@ -5,7 +5,11 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs this at runtime.
 
-from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu._validation import (
+    copy_durable_json_value,
+    require_durable_clean_nonblank,
+    require_durable_nonblank,
+)
 from cayu.core.thinking import ThinkingConfig
 from cayu.runtime.approvals import (
     ResolutionActor,
@@ -31,7 +35,11 @@ class ToolRoundRecoveryRequest(BaseModel):
     for the resumed run (the pending tool round persists no run configuration).
     """
 
-    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        arbitrary_types_allowed=True,
+        hide_input_in_errors=True,
+    )
 
     session_id: str
     round_id: str
@@ -57,12 +65,12 @@ class ToolRoundRecoveryRequest(BaseModel):
     @field_validator("session_id", "round_id", "tool_call_id")
     @classmethod
     def validate_nonblank_ids(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("message")
     @classmethod
     def validate_message(cls, value: str, info) -> str:
-        return require_nonblank(value, info.field_name)
+        return require_durable_nonblank(value, info.field_name)
 
     @field_validator("reason")
     @classmethod
@@ -73,12 +81,12 @@ class ToolRoundRecoveryRequest(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, info.field_name)
+        return require_durable_nonblank(value, info.field_name)
 
     @field_validator("structured", "artifacts", "metadata", mode="before")
     @classmethod
     def copy_json_fields(cls, value, info):
-        return copy_json_value(value, info.field_name)
+        return copy_durable_json_value(value, info.field_name)
 
     @field_validator("resolved_by")
     @classmethod
@@ -119,10 +127,10 @@ def copy_tool_round_recovery_request(
         tool_call_id=request.tool_call_id,
         outcome=request.outcome,
         message=request.message,
-        structured=copy_json_value(request.structured, "structured"),
-        artifacts=copy_json_value(request.artifacts, "artifacts"),
+        structured=copy_durable_json_value(request.structured, "structured"),
+        artifacts=copy_durable_json_value(request.artifacts, "artifacts"),
         reason=request.reason,
-        metadata=copy_json_value(request.metadata, "metadata"),
+        metadata=copy_durable_json_value(request.metadata, "metadata"),
         resolved_by=copy_resolution_actor(request.resolved_by),
         max_steps=request.max_steps,
         limits=copy_run_limits(request.limits) if request.limits is not None else None,

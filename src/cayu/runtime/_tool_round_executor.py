@@ -19,14 +19,17 @@ from typing import Any, cast
 from uuid import uuid4
 
 from cayu._validation import (
+    copy_durable_json_object,
+    copy_durable_json_value,
     copy_json_object,
     copy_json_value,
     require_clean_nonblank,
+    require_durable_text,
     require_nonblank,
     require_unicode_scalar_text,
 )
 from cayu.core.agents import AgentSpec
-from cayu.core.events import Event, EventType
+from cayu.core.events import Event, EventType, copy_event
 from cayu.core.messages import Message
 from cayu.core.thinking import ThinkingConfig
 from cayu.core.tools import (
@@ -933,8 +936,9 @@ class ToolRoundExecutor:
             metadata=ctx_metadata,
         )
         try:
-            result = await tool_execution.run_tool(
+            execution_outcome = await tool_execution.run_tool(
                 tool=registered_tool.tool,
+                effect=registered_tool.effect,
                 ctx=tool_context,
                 arguments=effective_tool_call.arguments,
                 timeout_seconds=self._tool_timeout_seconds,
@@ -960,10 +964,50 @@ class ToolRoundExecutor:
                 ):
                     yield event, None
             raise
+        result = execution_outcome.result
         redactor = _redactor_with_resolved_secrets(
             self._secret_redactor,
             resolved_proxy_secrets,
         )
+        policy_denial = tool_context._policy_denial_for(registered_tool.tool)
+        result_event: Event | None = None
+        published_terminal_event: Event | None = None
+        if policy_denial is None:
+            event_type = (
+                EventType.TOOL_CALL_FAILED if result.is_error else EventType.TOOL_CALL_COMPLETED
+            )
+            payload = {
+                "tool_call_id": tool_call.id,
+                "idempotency_key": idempotency_key,
+                "result": result.model_dump(),
+                **effective_arguments_payload,
+                **execution_outcome.terminal_payload_fields(),
+            }
+            if tool_round_id is not None:
+                payload["tool_round_id"] = tool_round_id
+            if approval_id is not None:
+                payload["approval_id"] = approval_id
+            if input_id is not None:
+                payload["input_id"] = input_id
+            result_event = Event(
+                type=event_type,
+                session_id=session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                tool_name=tool_call.name,
+                payload=payload,
+            )
+            if execution_outcome.publish_before_hooks:
+                result_event, result = _prepare_tool_result_event(
+                    event=result_event,
+                    result=result,
+                    redactor=redactor,
+                )
+                published_terminal_event = await self._event_writer.emit(result_event)
+                yield (
+                    published_terminal_event,
+                    runtime_records.ToolCallOutcome(call=effective_tool_call, result=result),
+                )
         async for event in self._emit_proxy_authorization_events(
             session=session,
             registered_agent=registered_agent,
@@ -981,7 +1025,6 @@ class ToolRoundExecutor:
         tool_swallowed_cancellation = current_task is not None and current_task.cancelling() > 0
         if tool_swallowed_cancellation and await self._session_control.is_interrupting(session.id):
             raise SessionInterruptedByRequest(session.id)
-        policy_denial = tool_context._policy_denial_for(registered_tool.tool)
         if policy_denial is not None:
             async for event in self._emit_terminal_tool_result(
                 session=session,
@@ -1009,30 +1052,30 @@ class ToolRoundExecutor:
             ):
                 yield event
             return
-        event_type = (
-            EventType.TOOL_CALL_FAILED if result.is_error else EventType.TOOL_CALL_COMPLETED
-        )
-        payload = {
-            "tool_call_id": tool_call.id,
-            "idempotency_key": idempotency_key,
-            "result": result.model_dump(),
-            **effective_arguments_payload,
-        }
-        if tool_round_id is not None:
-            payload["tool_round_id"] = tool_round_id
-        if approval_id is not None:
-            payload["approval_id"] = approval_id
-        if input_id is not None:
-            payload["input_id"] = input_id
+        if published_terminal_event is not None:
+            async for hook_event, modified in self.run_tool_call_hooks(
+                session=session,
+                tool_event=published_terminal_event,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                tool_call=effective_tool_call,
+                result=result,
+                task_id=task_id,
+                redactor=redactor,
+                allow_modification=False,
+            ):
+                if modified is not None:
+                    raise AssertionError(
+                        "Observational after-tool hook modified terminal evidence."
+                    )
+                yield hook_event, None
+            if await self._session_control.is_interrupting(session.id):
+                raise SessionInterruptedByRequest(session.id)
+            return
+        if result_event is None:
+            raise AssertionError("Ordinary tool result event was not constructed.")
         async for event in self.emit_tool_call_result_with_hooks(
-            event=Event(
-                type=event_type,
-                session_id=session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=environment_name,
-                tool_name=tool_call.name,
-                payload=payload,
-            ),
+            event=result_event,
             session=session,
             registered_agent=registered_agent,
             registered_environment=registered_environment,
@@ -1040,7 +1083,8 @@ class ToolRoundExecutor:
             result=result,
             task_id=task_id,
             redactor=redactor,
-            allow_modification=True,
+            allow_modification=execution_outcome.allows_hook_modification,
+            publish_before_hooks=False,
         ):
             yield event
         if await self._session_control.is_interrupting(session.id):
@@ -1308,9 +1352,14 @@ class ToolRoundExecutor:
                             payload={
                                 "tool_name": tool_call.name,
                                 "tool_call_id": tool_call.id,
-                                "error": str(exc),
-                                "error_type": type(exc).__name__,
-                                "actions": context.actions,
+                                **_hook_failure_payload(
+                                    exc,
+                                    redactor=self._secret_redactor,
+                                ),
+                                **_hook_actions_payload(
+                                    context,
+                                    redactor=self._secret_redactor,
+                                ),
                             },
                         )
                     )
@@ -1328,7 +1377,10 @@ class ToolRoundExecutor:
                         payload={
                             "tool_name": tool_call.name,
                             "tool_call_id": tool_call.id,
-                            "actions": context.actions,
+                            **_hook_actions_payload(
+                                context,
+                                redactor=self._secret_redactor,
+                            ),
                         },
                     )
                 )
@@ -1347,13 +1399,38 @@ class ToolRoundExecutor:
         task_id: str | None,
         redactor: SecretRedactor | None = None,
         allow_modification: bool = False,
+        publish_before_hooks: bool = False,
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
+        if publish_before_hooks and allow_modification:
+            raise ValueError("Pre-hook tool-result publication cannot allow hook modification.")
+        if publish_before_hooks and "terminal_outcome" not in event.payload:
+            raise ValueError("Pre-hook tool-result publication requires terminal controls.")
         resolved_redactor = redactor if redactor is not None else self._secret_redactor
         event, result = _prepare_tool_result_event(
             event=event,
             result=result,
             redactor=resolved_redactor,
         )
+        if publish_before_hooks:
+            tool_event = await self._event_writer.emit(event)
+            yield tool_event, runtime_records.ToolCallOutcome(call=tool_call, result=result)
+            async for hook_event, modified in self.run_tool_call_hooks(
+                session=session,
+                tool_event=tool_event,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                tool_call=tool_call,
+                result=result,
+                task_id=task_id,
+                redactor=resolved_redactor,
+                allow_modification=False,
+            ):
+                if modified is not None:
+                    raise AssertionError(
+                        "Observational after-tool hook modified terminal evidence."
+                    )
+                yield hook_event, None
+            return
         final_result = result
         async for hook_event, modified in self.run_tool_call_hooks(
             session=session,
@@ -1497,9 +1574,8 @@ class ToolRoundExecutor:
                             payload={
                                 "tool_name": tool_call.name,
                                 "tool_call_id": tool_call.id,
-                                "error": str(exc),
-                                "error_type": type(exc).__name__,
-                                "actions": context.actions,
+                                **_hook_failure_payload(exc, redactor=redactor),
+                                **_hook_actions_payload(context, redactor=redactor),
                             },
                         )
                     ),
@@ -1522,7 +1598,7 @@ class ToolRoundExecutor:
                         payload={
                             "tool_name": tool_call.name,
                             "tool_call_id": tool_call.id,
-                            "actions": context.actions,
+                            **_hook_actions_payload(context, redactor=redactor),
                         },
                     )
                 ),
@@ -2201,6 +2277,50 @@ class _ProxyAuthorizationRecord:
     result: ProxyAuthorizationResult
 
 
+def _copy_durable_proxy_secret_ref(ref: SecretRef) -> SecretRef:
+    """Detach the credential identity retained for durable proxy telemetry."""
+
+    copied = copy_secret_ref(ref)
+    return SecretRef(
+        name=require_clean_nonblank(
+            require_durable_text(copied.name, "credential.name"),
+            "credential.name",
+        ),
+        handle=(
+            None
+            if copied.handle is None
+            else require_clean_nonblank(
+                require_durable_text(copied.handle, "credential.handle"),
+                "credential.handle",
+            )
+        ),
+        metadata=copy_durable_json_object(copied.metadata, "credential.metadata"),
+    )
+
+
+def _copy_durable_proxy_authorization_result(
+    result: ProxyAuthorizationResult,
+) -> ProxyAuthorizationResult:
+    """Detach the proxy result fields published after the tool call."""
+
+    copied = copy_proxy_authorization_result(result)
+    return ProxyAuthorizationResult(
+        allowed=copied.allowed,
+        reason=(
+            None
+            if copied.reason is None
+            else require_clean_nonblank(
+                require_durable_text(copied.reason, "proxy_authorization.reason"),
+                "proxy_authorization.reason",
+            )
+        ),
+        metadata=copy_durable_json_object(
+            copied.metadata,
+            "proxy_authorization.metadata",
+        ),
+    )
+
+
 class _RedactingCredentialProxy(CredentialProxy):
     def __init__(
         self,
@@ -2243,19 +2363,35 @@ class _RedactingCredentialProxy(CredentialProxy):
         action: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> ProxyAuthorizationResult:
-        copied_destination = require_clean_nonblank(destination, "destination")
-        copied_credential = None if credential is None else copy_secret_ref(credential)
-        copied_action = None if action is None else require_clean_nonblank(action, "action")
-        copied_metadata = {} if metadata is None else copy_json_object(metadata, "metadata")
+        copied_destination = require_clean_nonblank(
+            require_durable_text(destination, "destination"),
+            "destination",
+        )
+        copied_credential = (
+            None if credential is None else _copy_durable_proxy_secret_ref(credential)
+        )
+        copied_action = (
+            None
+            if action is None
+            else require_clean_nonblank(
+                require_durable_text(action, "action"),
+                "action",
+            )
+        )
+        copied_metadata = {} if metadata is None else copy_durable_json_object(metadata, "metadata")
         result = await self._proxy.authorize_request(
             destination=copied_destination,
-            credential=copied_credential,
+            credential=(
+                None
+                if copied_credential is None
+                else _copy_durable_proxy_secret_ref(copied_credential)
+            ),
             action=copied_action,
-            metadata=copy_json_object(copied_metadata, "metadata"),
+            metadata=copy_durable_json_object(copied_metadata, "metadata"),
         )
         if type(result) is not ProxyAuthorizationResult:
             raise TypeError("Proxy authorization must return ProxyAuthorizationResult.")
-        copied_result = copy_proxy_authorization_result(result)
+        copied_result = _copy_durable_proxy_authorization_result(result)
         self._on_authorize(
             _ProxyAuthorizationRecord(
                 destination=copied_destination,
@@ -2265,7 +2401,7 @@ class _RedactingCredentialProxy(CredentialProxy):
                 result=copied_result,
             )
         )
-        return copied_result
+        return _copy_durable_proxy_authorization_result(copied_result)
 
 
 def _proxy(
@@ -2463,18 +2599,28 @@ def _resolve_before_tool_call_decision(
         modified_arguments = decision.modified_arguments
         if modified_arguments is None:
             raise TypeError("A proceed_modified decision must carry modified_arguments.")
-        resolution.arguments = copy_json_value(modified_arguments, "modified_arguments")
+        copied_arguments = copy_durable_json_value(
+            modified_arguments,
+            "modified_arguments",
+        )
+        if type(copied_arguments) is not dict:
+            raise TypeError("A proceed_modified decision must carry object arguments.")
+        resolution.arguments = copied_arguments
         return False
     if decision.action == "short_circuit":
         synthetic = decision.synthetic_result
         if synthetic is None:
             raise TypeError("A short_circuit decision must carry a synthetic_result.")
-        resolution.short_circuit_result = synthetic.model_copy(deep=True)
+        resolution.short_circuit_result = tool_results.normalize_tool_result(
+            tool_results.validate_tool_result(synthetic)
+        )
         return True
+    if decision.action != "block":
+        raise ValueError("Unsupported before_tool_call decision action.")
     reason = decision.block_reason
     if reason is None:
         raise TypeError("A block decision must carry a block_reason.")
-    resolution.block_reason = reason
+    resolution.block_reason = require_durable_text(reason, "block_reason")
     return True
 
 
@@ -2489,8 +2635,12 @@ def _resolve_after_tool_call_decision(
         modified = decision.modified_result
         if modified is None:
             raise TypeError("An after_tool_call modify decision must carry a modified_result.")
-        return modified.model_copy(deep=True)
-    return None
+        return tool_results.normalize_tool_result(tool_results.validate_tool_result(modified))
+    if decision.action == "pass_through":
+        if decision.modified_result is not None:
+            raise TypeError("A pass_through decision must not carry a modified_result.")
+        return None
+    raise ValueError("Unsupported after_tool_call decision action.")
 
 
 def _runtime_hook_event(
@@ -2540,6 +2690,10 @@ def _prepare_tool_result_event(
     result: ToolResult,
     redactor: SecretRedactor,
 ) -> tuple[Event, ToolResult]:
+    event, result = _validate_and_synchronize_tool_result_event(
+        event=event,
+        result=result,
+    )
     if _is_policy_denial_event(event):
         event, result = _redact_policy_denial_event(
             event=event,
@@ -2552,7 +2706,53 @@ def _prepare_tool_result_event(
             result=result,
             redactor=redactor,
         )
-    return _bound_policy_denial_event(event=event, result=result)
+    event, result = _bound_policy_denial_event(event=event, result=result)
+    return _validate_and_synchronize_tool_result_event(event=event, result=result)
+
+
+def _validate_and_synchronize_tool_result_event(
+    *,
+    event: Event,
+    result: ToolResult,
+) -> tuple[Event, ToolResult]:
+    validated_result = tool_results.normalize_tool_result(tool_results.validate_tool_result(result))
+    payload = copy_durable_json_object(event.payload, "tool_result_event.payload")
+    payload["result"] = copy_durable_json_value(
+        validated_result.model_dump(mode="python"),
+        "tool_result_event.result",
+    )
+    synchronized = copy_event(event.model_copy(update={"payload": payload}))
+    return synchronized, validated_result
+
+
+def _hook_failure_payload(
+    exc: Exception,
+    *,
+    redactor: SecretRedactor,
+) -> dict[str, Any]:
+    diagnostic = tool_results.exception_diagnostic(
+        exc,
+        empty_message="runtime hook failed",
+        nonportable_message="Runtime hook failed with a non-portable diagnostic.",
+    )
+    diagnostic = tool_results.redact_exception_diagnostic(diagnostic, redactor)
+    return copy_durable_json_object(diagnostic.payload_fields(), "hook_failure")
+
+
+def _hook_actions_payload(
+    context: BeforeToolCallHookContext | ToolCallHookContext,
+    *,
+    redactor: SecretRedactor,
+) -> dict[str, Any]:
+    try:
+        actions = copy_durable_json_value(context.actions, "hook_actions")
+        actions = redactor.redact_json(actions)
+        actions = copy_durable_json_value(actions, "hook_actions")
+    except Exception:
+        return {"actions": [], "actions_omitted": True}
+    if type(actions) is not list:
+        return {"actions": [], "actions_omitted": True}
+    return {"actions": actions}
 
 
 def _redact_tool_result_for_event(
@@ -2563,7 +2763,12 @@ def _redact_tool_result_for_event(
 ) -> ToolResult:
     if _is_policy_denial_event(event):
         return _redact_policy_denial_result(result, redactor)
-    return tool_results.redact_tool_result(result, redactor)
+    _, redacted_result = tool_results.redact_tool_result_event(
+        event=event,
+        result=result,
+        redactor=redactor,
+    )
+    return redacted_result
 
 
 def _is_policy_denial_event(event: Event) -> bool:

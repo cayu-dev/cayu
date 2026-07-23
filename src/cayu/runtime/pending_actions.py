@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from cayu._validation import JsonUtf8SizeCounter, copy_json_value
+from cayu._validation import JsonUtf8SizeCounter, copy_durable_json_value
 from cayu.core.events import Event, EventType
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
@@ -80,7 +80,7 @@ def project_pending_action_checkpoint(
     if checkpoint is None:
         return None
     projected = {
-        key: copy_json_value(checkpoint[key], key)
+        key: copy_durable_json_value(checkpoint[key], key)
         for key in PENDING_ACTION_CHECKPOINT_KEYS
         if checkpoint.get(key) is not None
     }

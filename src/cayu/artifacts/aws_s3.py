@@ -10,7 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from cayu._validation import (
-    copy_json_value,
+    copy_durable_json_object,
     require_clean_nonblank,
     require_nonblank,
     require_unicode_scalar_text,
@@ -110,7 +110,7 @@ class S3ArtifactStore(ArtifactStore):
             session_id=session_id,
             agent_name=agent_name,
             environment_name=environment_name,
-            metadata=copy_json_value(metadata or {}, "metadata"),
+            metadata=copy_durable_json_object(metadata or {}, "metadata"),
         )
         content_key = self._artifact_key(artifact.id, "content")
         metadata_key = self._artifact_key(artifact.id, "metadata.json")

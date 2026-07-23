@@ -13,7 +13,12 @@ from pydantic import (
     model_validator,
 )
 
-from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu._validation import (
+    copy_durable_json_value,
+    require_durable_clean_nonblank,
+    require_durable_nonblank,
+    require_durable_text,
+)
 from cayu.artifacts.attachments import FileAttachment
 
 
@@ -25,7 +30,7 @@ class MessageRole(StrEnum):
 
 
 class TextPart(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     type: Literal["text"] = "text"
     text: str
@@ -37,7 +42,7 @@ class TextPart(BaseModel):
 
 
 class ToolCallPart(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     type: Literal["tool_call"] = "tool_call"
     tool_call_id: str
@@ -47,7 +52,7 @@ class ToolCallPart(BaseModel):
     @field_validator("arguments", mode="before")
     @classmethod
     def copy_arguments(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "arguments")
+        return copy_durable_json_value(value, "arguments")
 
     @field_validator("tool_call_id", "tool_name")
     @classmethod
@@ -56,7 +61,7 @@ class ToolCallPart(BaseModel):
 
 
 class ToolResultPart(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     type: Literal["tool_result"] = "tool_result"
     tool_call_id: str
@@ -69,7 +74,12 @@ class ToolResultPart(BaseModel):
     @field_validator("structured", "artifacts", mode="before")
     @classmethod
     def copy_result_data(cls, value, info):
-        return copy_json_value(value, info.field_name)
+        return copy_durable_json_value(value, info.field_name)
+
+    @field_validator("content")
+    @classmethod
+    def validate_content(cls, value: str) -> str:
+        return require_durable_text(value, "content")
 
     @field_validator("tool_call_id", "tool_name")
     @classmethod
@@ -78,7 +88,7 @@ class ToolResultPart(BaseModel):
 
 
 class ProviderStatePart(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     type: Literal["provider_state"] = "provider_state"
     provider: str
@@ -92,7 +102,7 @@ class ProviderStatePart(BaseModel):
     @field_validator("state", mode="before")
     @classmethod
     def copy_state(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "state")
+        return copy_durable_json_value(value, "state")
 
 
 class ThinkingPart(BaseModel):
@@ -104,7 +114,7 @@ class ThinkingPart(BaseModel):
     needed to send the block back to the provider on a later turn.
     """
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     type: Literal["thinking"] = "thinking"
     text: str = ""
@@ -113,7 +123,12 @@ class ThinkingPart(BaseModel):
     @field_validator("provider_state", mode="before")
     @classmethod
     def copy_provider_state(cls, value):
-        return copy_json_value(value, "provider_state")
+        return copy_durable_json_value(value, "provider_state")
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        return require_durable_text(value, "text")
 
 
 class FilePart(BaseModel):
@@ -125,7 +140,7 @@ class FilePart(BaseModel):
     request, exactly like tool-result attachments.
     """
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     type: Literal["file"] = "file"
     attachment: dict[str, Any]
@@ -133,7 +148,7 @@ class FilePart(BaseModel):
     @field_validator("attachment", mode="before")
     @classmethod
     def validate_attachment(cls, value):
-        copied = copy_json_value(value, "attachment")
+        copied = copy_durable_json_value(value, "attachment")
         if type(copied) is not dict:
             raise ValueError("`attachment` must be a file attachment object.")
         return FileAttachment.model_validate(copied).model_dump(mode="json")
@@ -170,7 +185,7 @@ class Message(BaseModel):
     storage/trust boundaries, and `copy.deepcopy` isolates as well.
     """
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     role: MessageRole
     content: tuple[
@@ -381,8 +396,8 @@ def copy_message_part(
 
 
 def _require_nonblank(name: str, value: str) -> str:
-    return require_nonblank(value, name)
+    return require_durable_nonblank(value, name)
 
 
 def _require_clean_nonblank(name: str, value: str) -> str:
-    return require_clean_nonblank(value, name)
+    return require_durable_clean_nonblank(value, name)

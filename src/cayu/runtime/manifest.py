@@ -252,7 +252,7 @@ def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> App
             model_patterns=tuple(sorted(registration.model_patterns)),
             is_default=name == app._default_provider_name,
             implementation=_type_name(registration.provider),
-            usage_dialect=str(registration.provider.usage_dialect),
+            usage_dialect=str(registration.usage_dialect),
             supports_native_structured_output=bool(
                 registration.provider.supports_native_structured_output
             ),

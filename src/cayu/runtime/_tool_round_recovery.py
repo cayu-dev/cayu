@@ -5,7 +5,11 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import (
+    copy_durable_json_value,
+    require_clean_nonblank,
+    require_durable_text,
+)
 from cayu.core.events import Event, EventType
 from cayu.core.tools import ToolResult
 from cayu.runtime import _resume_ledger as resume_ledger
@@ -36,7 +40,7 @@ _TOOL_ROUND_TERMINAL_EVENT_TYPES = frozenset(
 class PendingToolRound(BaseModel):
     """Durable checkpoint state for an ordinary tool round in progress."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     round_id: str = Field(default_factory=lambda: str(uuid4()))
     agent_name: str
@@ -48,7 +52,10 @@ class PendingToolRound(BaseModel):
     @field_validator("round_id", "agent_name")
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_clean_nonblank(
+            require_durable_text(value, info.field_name),
+            info.field_name,
+        )
 
     @field_validator("environment_name", "task_id")
     @classmethod
@@ -59,7 +66,10 @@ class PendingToolRound(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        return require_clean_nonblank(value, info.field_name)
+        return require_clean_nonblank(
+            require_durable_text(value, info.field_name),
+            info.field_name,
+        )
 
     @field_validator("tool_calls")
     @classmethod
@@ -86,7 +96,7 @@ def pending_tool_round_from_checkpoint(
 ) -> PendingToolRound | None:
     if checkpoint is None:
         return None
-    copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
+    copied_checkpoint = copy_durable_json_value(checkpoint, "checkpoint")
     value = copied_checkpoint.get(PENDING_TOOL_ROUND_CHECKPOINT_KEY)
     if value is None:
         return None
@@ -106,7 +116,9 @@ def checkpoint_with_pending_tool_round(
     structured_output: StructuredOutputSpec | None,
     redactor: SecretRedactor | None = None,
 ) -> tuple[dict[str, Any], PendingToolRound]:
-    copied_checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+    copied_checkpoint = (
+        {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
+    )
     if pending_tool_round_from_checkpoint(copied_checkpoint) is not None:
         raise RuntimeError("Session already has a pending tool round.")
 
@@ -128,7 +140,9 @@ def checkpoint_with_pending_tool_round(
 def checkpoint_without_pending_tool_round(
     checkpoint: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    copied_checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+    copied_checkpoint = (
+        {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
+    )
     copied_checkpoint.pop(PENDING_TOOL_ROUND_CHECKPOINT_KEY, None)
     return copied_checkpoint
 
@@ -150,14 +164,14 @@ def pending_tool_call_records(
             PendingToolCallApproval(
                 tool_call_id=tool_call.id,
                 tool_name=tool_call.name,
-                arguments=copy_json_value(tool_call.arguments, "arguments"),
+                arguments=copy_durable_json_value(tool_call.arguments, "arguments"),
                 policy_decision=policy_result.decision.value if policy_result is not None else None,
                 reason=resume_ledger.policy_reason_for_pending_tool_call(
                     policy_result,
                     redactor=redactor,
                 ),
                 metadata=(
-                    copy_json_value(policy_result.metadata, "metadata")
+                    copy_durable_json_value(policy_result.metadata, "metadata")
                     if policy_result is not None
                     else {}
                 ),
@@ -173,7 +187,7 @@ def pending_round_tool_calls(
         runtime_records.ToolCallRequest(
             id=call.tool_call_id,
             name=call.tool_name,
-            arguments=copy_json_value(call.arguments, "arguments"),
+            arguments=copy_durable_json_value(call.arguments, "arguments"),
         )
         for call in pending_round.tool_calls
     ]

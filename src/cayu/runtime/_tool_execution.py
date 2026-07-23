@@ -3,12 +3,86 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from dataclasses import dataclass
 from typing import Any
 
-from cayu._validation import copy_json_value
+from cayu._validation import (
+    FrozenJsonDict,
+    copy_durable_json_object,
+    copy_json_value,
+    freeze_json_value,
+    thaw_json_value,
+)
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime.tool_policy import ToolPolicyResult
+
+_OUTCOME_CONSTRUCTION_TOKEN = object()
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class ToolExecutionOutcome:
+    """Runtime-owned result plus terminal controls a tool cannot supply.
+
+    Tools are accepted only when they return an exact ``ToolResult``. This
+    envelope is created after execution by this module and carries control
+    evidence separately, so a forged result or hook cannot clear replay and
+    reconciliation semantics.
+    """
+
+    result: ToolResult
+    _terminal_payload: FrozenJsonDict
+
+    def __init__(
+        self,
+        result: ToolResult,
+        terminal_payload: dict[str, Any],
+        *,
+        _token: object,
+    ) -> None:
+        if _token is not _OUTCOME_CONSTRUCTION_TOKEN:
+            raise TypeError("ToolExecutionOutcome is runtime-owned.")
+        validated_result = tool_results.normalize_tool_result(
+            tool_results.validate_tool_result(result)
+        )
+        copied_payload = copy_durable_json_object(
+            terminal_payload,
+            "tool_execution_terminal_payload",
+        )
+        frozen_payload = freeze_json_value(copied_payload)
+        if type(frozen_payload) is not FrozenJsonDict:
+            raise AssertionError("Frozen terminal tool payload must be an object.")
+        object.__setattr__(self, "result", validated_result)
+        object.__setattr__(self, "_terminal_payload", frozen_payload)
+
+    @property
+    def allows_hook_modification(self) -> bool:
+        return not self.publish_before_hooks
+
+    @property
+    def publish_before_hooks(self) -> bool:
+        """Whether authoritative terminal evidence must precede observational hooks."""
+
+        return bool(self._terminal_payload) and (
+            self._terminal_payload.get("tool_effect") != ToolEffect.NONE.value
+        )
+
+    def terminal_payload_fields(self) -> dict[str, Any]:
+        fields = thaw_json_value(self._terminal_payload)
+        if type(fields) is not dict:
+            raise AssertionError("Terminal tool payload must thaw to an object.")
+        return copy_durable_json_object(fields, "tool_execution_terminal_payload")
+
+
+def _execution_outcome(
+    result: ToolResult,
+    terminal_payload: dict[str, Any] | None = None,
+) -> ToolExecutionOutcome:
+    return ToolExecutionOutcome(
+        result,
+        terminal_payload or {},
+        _token=_OUTCOME_CONSTRUCTION_TOKEN,
+    )
 
 
 def tool_idempotency_key(
@@ -36,38 +110,96 @@ def tool_idempotency_key(
 async def run_tool(
     *,
     tool: Tool,
+    effect: ToolEffect,
     ctx: ToolContext,
     arguments: dict[str, Any],
     timeout_seconds: float | None = None,
-) -> ToolResult:
+) -> ToolExecutionOutcome:
     timer: asyncio.Timeout | None = None
+    if type(effect) is not ToolEffect:
+        raise TypeError("effect must be a ToolEffect.")
     try:
         if timeout_seconds is None:
-            result = await tool.run(ctx, arguments)
+            raw_result = await tool.run(ctx, arguments)
         else:
             async with asyncio.timeout(timeout_seconds) as timer:
-                result = await tool.run(ctx, arguments)
-        if type(result) is not ToolResult:
-            ctx._discard_policy_denials_for(tool)
-            return ToolResult(
-                content=(
-                    "Tool returned invalid result type: "
-                    f"{type(result).__name__}. Expected ToolResult."
-                ),
-                is_error=True,
-            )
-        return tool_results.normalize_tool_result(tool_results.validate_tool_result(result))
+                raw_result = await tool.run(ctx, arguments)
     except TimeoutError as exc:
         ctx._discard_policy_denials_for(tool)
         if timer is not None and timer.expired():
-            return ToolResult(
-                content=f"Tool call timed out after {timeout_seconds} seconds.",
-                is_error=True,
+            result, controls = tool_results.terminal_failure_result(
+                terminal_outcome="tool_execution_timeout",
+                effect=effect,
+                message=f"Tool call timed out after {timeout_seconds} seconds.",
             )
-        return ToolResult(content=tool_results.exception_message(exc), is_error=True)
+            return _execution_outcome(result, controls)
+        diagnostic = tool_results.exception_diagnostic(
+            exc,
+            empty_message="tool execution failed",
+            nonportable_message="Tool execution failed with a non-portable diagnostic.",
+        )
+        result, controls = tool_results.terminal_failure_result(
+            terminal_outcome="tool_execution_error",
+            effect=effect,
+            message=diagnostic.message,
+            diagnostic=diagnostic,
+        )
+        return _execution_outcome(result, controls)
     except Exception as exc:
         ctx._discard_policy_denials_for(tool)
-        return ToolResult(content=tool_results.exception_message(exc), is_error=True)
+        diagnostic = tool_results.exception_diagnostic(
+            exc,
+            empty_message="tool execution failed",
+            nonportable_message="Tool execution failed with a non-portable diagnostic.",
+        )
+        result, controls = tool_results.terminal_failure_result(
+            terminal_outcome="tool_execution_error",
+            effect=effect,
+            message=diagnostic.message,
+            diagnostic=diagnostic,
+        )
+        return _execution_outcome(result, controls)
+
+    if type(raw_result) is not ToolResult:
+        ctx._discard_policy_denials_for(tool)
+        result, controls = tool_results.terminal_failure_result(
+            terminal_outcome="invalid_tool_output",
+            effect=effect,
+            message=(
+                "Tool returned invalid result type: "
+                f"{_safe_type_name(raw_result)}. Expected ToolResult."
+            ),
+            raw_evidence=tool_results.raw_tool_result_evidence(raw_result),
+        )
+        return _execution_outcome(result, controls)
+    try:
+        validated_result = tool_results.normalize_tool_result(
+            tool_results.validate_tool_result(raw_result)
+        )
+    except Exception as exc:
+        ctx._discard_policy_denials_for(tool)
+        diagnostic = tool_results.exception_diagnostic(
+            exc,
+            empty_message="tool result validation failed",
+            nonportable_message="Tool returned a non-portable result after execution.",
+        )
+        result, controls = tool_results.terminal_failure_result(
+            terminal_outcome="invalid_tool_output",
+            effect=effect,
+            message=diagnostic.message,
+            raw_evidence=tool_results.raw_tool_result_evidence(raw_result),
+            diagnostic=diagnostic,
+        )
+        return _execution_outcome(result, controls)
+    return _execution_outcome(validated_result)
+
+
+def _safe_type_name(value: Any) -> str:
+    try:
+        name = type.__getattribute__(type(value), "__name__")
+    except Exception:
+        return "unknown"
+    return name if type(name) is str and name.isidentifier() else "unknown"
 
 
 def policy_denial_reason(policy_result: ToolPolicyResult) -> str:

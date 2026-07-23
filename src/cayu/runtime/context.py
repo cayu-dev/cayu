@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 from uuid import uuid4
@@ -24,11 +25,18 @@ from pydantic import (
 
 from cayu._task_wait import consume_pending_task_cancellation
 from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
+    DurableValueError,
+    copy_durable_json_object,
+    copy_durable_json_value,
     copy_json_value,
     copy_label_map,
     require_clean_nonblank,
-    require_durable_json_text,
+    require_durable_clean_nonblank,
+    require_durable_nonblank,
+    require_durable_text,
     require_nonblank,
+    safe_durable_value_error_details,
 )
 from cayu.artifacts import (
     RESOLVED_FILE_ATTACHMENTS_OPTION,
@@ -59,12 +67,19 @@ from cayu.providers.base import (
     ModelProvider,
     ModelProviderError,
     ModelRequest,
+    ModelStreamEvent,
     ModelStreamEventType,
-    copy_model_stream_event,
+    UsageDialect,
+    copy_usage_dialect,
 )
+from cayu.runtime._completion_projection import portable_model_completion_projection
 from cayu.runtime._model_errors import (
+    ProviderExceptionControl,
+    copy_provider_exception_control,
+    copy_provider_hook_error_control,
     detach_billing_identity_cancellation,
     model_provider_error_from_payload,
+    nonportable_model_provider_error,
     resolve_completion_billing_identity,
     resolve_request_billing_identity,
 )
@@ -1029,12 +1044,29 @@ def sanitize_context_compaction_telemetry(
         if billing_identity is not None:
             payload["billing_identity"] = billing_identity.model_dump(mode="json")
         raw_usage, invalid_raw_usage = _compaction_raw_usage(source.get("usage"))
-        invalid_usage = invalid_metrics or invalid_raw_usage
+        usage_metrics_rejected = source.get("usage_metrics_rejected")
+        rejected_usage_evidence: dict[str, Any] | None = None
+        invalid_rejected_usage = False
+        if usage_metrics_rejected is True:
+            rejected_usage_evidence, invalid_rejected_usage = _compaction_raw_usage(
+                source.get("rejected_usage_evidence")
+            )
+        invalid_usage = (
+            invalid_metrics
+            or invalid_raw_usage
+            or invalid_rejected_usage
+            or usage_metrics_rejected is True
+            or ("usage_metrics_rejected" in source and type(usage_metrics_rejected) is not bool)
+        )
         if invalid_usage:
             metrics = None
             raw_usage = None
         if raw_usage is not None:
             payload["usage"] = raw_usage
+        if usage_metrics_rejected is True:
+            payload["usage_metrics_rejected"] = True
+            if rejected_usage_evidence is not None:
+                payload["rejected_usage_evidence"] = rejected_usage_evidence
         if metrics is not None:
             serialized_metrics = metrics.model_dump()
             serialized_metrics.pop("billing_identity", None)
@@ -1909,7 +1941,7 @@ class CompactionRequest(BaseModel):
     runtime request shape available to cache-aware compactors.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     session: Session
     agent: AgentSpec
@@ -1941,45 +1973,106 @@ class CompactionRequest(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
     @field_validator("existing_summary")
     @classmethod
     def validate_optional_summary(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, "existing_summary")
+        return require_durable_nonblank(value, "existing_summary")
 
     @field_validator("instructions")
     @classmethod
     def validate_optional_instructions(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, "instructions")
+        return require_durable_nonblank(value, "instructions")
 
 
 class CompactionPrompt(BaseModel):
     """A custom compaction prompt with explicit source coverage."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     prompt: str
-    covered_message_count: StrictInt = Field(ge=1)
+    covered_message_count: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
 
     @field_validator("prompt")
     @classmethod
     def validate_prompt(cls, value: str) -> str:
-        return require_nonblank(value, "prompt")
+        return require_durable_nonblank(value, "prompt")
 
 
 CompactionPromptBuilder = Callable[[CompactionRequest], CompactionPrompt]
+
+_COMPACTION_PROMPT_FIELDS = frozenset({"prompt", "covered_message_count"})
+_COMPACTION_RESULT_FIELDS = frozenset(
+    {
+        "summary",
+        "covered_message_count",
+        "represented_existing_summary_sha256",
+        "source_chunk_count",
+        "source_chunk_mode",
+        "bounded_input",
+        "progress_exhausted",
+        "progress_key",
+        "metadata",
+        "model_completed_payloads",
+    }
+)
+
+
+def _exact_compaction_model_fields(
+    value: object,
+    *,
+    expected_type: type[BaseModel],
+    expected_fields: frozenset[str],
+    error_message: str,
+) -> dict[str, Any]:
+    """Read an exact Pydantic model without hostile mapping-key lookup."""
+
+    if type(value) is not expected_type:
+        raise TypeError(error_message)
+    try:
+        raw_fields = object.__getattribute__(value, "__dict__")
+    except BaseException:
+        raise TypeError(error_message) from None
+    if type(raw_fields) is not dict:
+        raise TypeError(error_message)
+    fields: dict[str, Any] = {}
+    for key, field_value in raw_fields.items():
+        if type(key) is not str or key not in expected_fields:
+            raise TypeError(error_message)
+        fields[key] = field_value
+    if fields.keys() != expected_fields:
+        raise TypeError(error_message)
+    return fields
+
+
+def _detach_compaction_prompt(value: object) -> CompactionPrompt:
+    """Revalidate an extension-owned prompt without retaining its object graph."""
+
+    error_message = (
+        "Custom compaction prompt builders must return CompactionPrompt "
+        "with explicit source coverage."
+    )
+    fields = _exact_compaction_model_fields(
+        value,
+        expected_type=CompactionPrompt,
+        expected_fields=_COMPACTION_PROMPT_FIELDS,
+        error_message=error_message,
+    )
+    return CompactionPrompt(
+        prompt=fields["prompt"],
+        covered_message_count=fields["covered_message_count"],
+    )
 
 
 def _validate_compaction_summary(value: str) -> str:
     """Validate summary text against the complete durable checkpoint boundary."""
 
-    value = require_nonblank(value, "summary")
-    return require_durable_json_text(value, "summary")
+    return require_durable_nonblank(value, "summary")
 
 
 def _compaction_summary_sha256(summary: str) -> str:
@@ -2005,12 +2098,16 @@ class CompactionResult(BaseModel):
     Cayu removes the correlation field before emitting public events.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     summary: str
-    covered_message_count: StrictInt = Field(ge=0)
+    covered_message_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     represented_existing_summary_sha256: str | None = None
-    source_chunk_count: StrictInt = Field(default=1, ge=0)
+    source_chunk_count: StrictInt = Field(
+        default=1,
+        ge=0,
+        le=MAX_DURABLE_JSON_INTEGER,
+    )
     source_chunk_mode: str = "single_request"
     bounded_input: StrictBool = False
     progress_exhausted: StrictBool = False
@@ -2076,14 +2173,51 @@ class CompactionResult(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        copied = copy_json_value(value, "metadata")
-        return require_durable_json_text(copied, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
     @field_validator("model_completed_payloads", mode="before")
     @classmethod
     def copy_model_completed_payloads(cls, value: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        copied = copy_json_value(value, "model_completed_payloads")
-        return require_durable_json_text(copied, "model_completed_payloads")
+        return copy_durable_json_value(value, "model_completed_payloads")
+
+
+def _snapshot_compaction_result(value: object) -> dict[str, Any]:
+    """Snapshot raw fields and copy completion evidence before full validation."""
+
+    error_message = "Context compactors must return CompactionResult."
+    fields = _exact_compaction_model_fields(
+        value,
+        expected_type=CompactionResult,
+        expected_fields=_COMPACTION_RESULT_FIELDS,
+        error_message=error_message,
+    )
+    payloads = copy_durable_json_value(
+        fields["model_completed_payloads"],
+        "model_completed_payloads",
+    )
+    if type(payloads) is not list or any(type(payload) is not dict for payload in payloads):
+        raise TypeError("CompactionResult.model_completed_payloads must be a list of objects.")
+    fields["model_completed_payloads"] = payloads
+    return fields
+
+
+def _detach_compaction_result(
+    fields: dict[str, Any],
+) -> CompactionResult:
+    """Revalidate an extension-owned result without retaining its object graph."""
+
+    return CompactionResult(
+        summary=fields["summary"],
+        covered_message_count=fields["covered_message_count"],
+        represented_existing_summary_sha256=fields["represented_existing_summary_sha256"],
+        source_chunk_count=fields["source_chunk_count"],
+        source_chunk_mode=fields["source_chunk_mode"],
+        bounded_input=fields["bounded_input"],
+        progress_exhausted=fields["progress_exhausted"],
+        progress_key=fields["progress_key"],
+        metadata=fields["metadata"],
+        model_completed_payloads=fields["model_completed_payloads"],
+    )
 
 
 class ContextCompactor(ABC):
@@ -2169,8 +2303,9 @@ _AUTOMATIC_COMPACTION_RUNNER: ContextVar[_AutomaticCompactionRunner | None] = Co
 
 _AutomaticCompactionDispatchRunner = Callable[
     [
-        ModelProvider,
         str,
+        str,
+        UsageDialect,
         BillingIdentity | None,
         Callable[[], Awaitable[tuple[str, dict[str, Any]]]],
     ],
@@ -2336,6 +2471,60 @@ _DIGEST_SECTION_JOINER = "\n\n"
 _DIGEST_ZERO_COVERAGE_SUMMARY = "No source history was compacted."
 
 
+@dataclass(frozen=True, slots=True)
+class _CompactionProviderSnapshot:
+    provider_name: str
+    pricing_provider_name: str
+    usage_dialect: UsageDialect
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelCompactorInvocationIdentity:
+    owner_id: int
+    provider: ModelProvider
+    provider_snapshot: _CompactionProviderSnapshot
+    model: str
+    compactor_name: str
+    system_prompt: str
+    options: dict[str, Any]
+    retry_policy: RetryPolicy
+    max_input_chars: int | None
+    max_hierarchy_calls: int
+
+
+_MODEL_COMPACTOR_INVOCATION_IDENTITY: ContextVar[_ModelCompactorInvocationIdentity | None] = (
+    ContextVar(
+        "model_compactor_invocation_identity",
+        default=None,
+    )
+)
+
+
+def _compaction_provider_snapshot(
+    provider: ModelProvider,
+    *,
+    usage_dialect: UsageDialect | None = None,
+) -> _CompactionProviderSnapshot:
+    provider_name = require_durable_clean_nonblank(provider.name, "provider.name")
+    billing_provider_name = provider.billing_provider_name
+    pricing_provider_name = (
+        provider_name
+        if billing_provider_name is None
+        else require_durable_clean_nonblank(
+            billing_provider_name,
+            "provider.billing_provider_name",
+        )
+    )
+    return _CompactionProviderSnapshot(
+        provider_name=provider_name,
+        pricing_provider_name=pricing_provider_name,
+        usage_dialect=copy_usage_dialect(
+            provider.usage_dialect if usage_dialect is None else usage_dialect,
+            "provider.usage_dialect",
+        ),
+    )
+
+
 class ModelCompactor(ContextCompactor):
     """Provider-backed compactor that asks a model to summarize older context."""
 
@@ -2353,6 +2542,8 @@ class ModelCompactor(ContextCompactor):
         max_hierarchy_calls: int = 64,
         prompt_builder: CompactionPromptBuilder | None = None,
         retry_policy: RetryPolicy | None = None,
+        _usage_dialect: UsageDialect | None = None,
+        _provider_snapshot: _CompactionProviderSnapshot | None = None,
     ) -> None:
         if not isinstance(provider, ModelProvider):
             raise TypeError("provider must be a ModelProvider.")
@@ -2365,8 +2556,38 @@ class ModelCompactor(ContextCompactor):
             raise TypeError("max_hierarchy_calls must be an integer.")
         if max_hierarchy_calls < 2:
             raise ValueError("max_hierarchy_calls must be at least 2.")
+        if _provider_snapshot is not None and type(_provider_snapshot) is not (
+            _CompactionProviderSnapshot
+        ):
+            raise TypeError("_provider_snapshot must be a _CompactionProviderSnapshot.")
         self.provider = provider
-        self.model = require_clean_nonblank(model, "model")
+        self._provider_snapshot = (
+            _compaction_provider_snapshot(provider, usage_dialect=_usage_dialect)
+            if _provider_snapshot is None
+            else _CompactionProviderSnapshot(
+                provider_name=require_durable_clean_nonblank(
+                    _provider_snapshot.provider_name,
+                    "provider.name",
+                ),
+                pricing_provider_name=require_durable_clean_nonblank(
+                    _provider_snapshot.pricing_provider_name,
+                    "provider.billing_provider_name",
+                ),
+                usage_dialect=copy_usage_dialect(
+                    _provider_snapshot.usage_dialect,
+                    "provider.usage_dialect",
+                ),
+            )
+        )
+        self._usage_dialect = copy_usage_dialect(
+            self._provider_snapshot.usage_dialect,
+            "provider.usage_dialect",
+        )
+        self._compactor_name = require_durable_clean_nonblank(
+            type(self).__name__,
+            "compactor",
+        )
+        self.model = require_durable_clean_nonblank(model, "model")
         self.system_prompt = require_nonblank(system_prompt, "system_prompt")
         self.options = copy_json_value({} if options is None else options, "options")
         self.max_input_chars = max_input_chars
@@ -2378,7 +2599,8 @@ class ModelCompactor(ContextCompactor):
         self.retry_policy = copy_retry_policy(retry_policy)
 
     def provider_budget_identity(self, session: Session) -> tuple[str, str]:
-        return self.provider.billing_provider_name or self.provider.name, self.model
+        del session
+        return self._provider_snapshot.pricing_provider_name, self.model
 
     def _uses_runtime_provider_dispatch_runner_for_request(
         self,
@@ -2401,6 +2623,10 @@ class ModelCompactor(ContextCompactor):
         return all(
             (
                 implementation.compact is ModelCompactor.compact,
+                implementation._capture_invocation_identity
+                is ModelCompactor._capture_invocation_identity,
+                implementation._compact_with_invocation_identity
+                is ModelCompactor._compact_with_invocation_identity,
                 implementation._compact_prompt_once is ModelCompactor._compact_prompt_once,
                 implementation._compact_oversized_atomic_unit
                 is ModelCompactor._compact_oversized_atomic_unit,
@@ -2408,17 +2634,83 @@ class ModelCompactor(ContextCompactor):
         )
 
     async def compact(self, request: CompactionRequest) -> CompactionResult:
-        if self.prompt_builder is None or self.prompt_builder is default_compaction_prompt:
+        identity = self._capture_invocation_identity()
+        token = _MODEL_COMPACTOR_INVOCATION_IDENTITY.set(identity)
+        del identity
+        try:
+            return await self._compact_with_invocation_identity(request)
+        finally:
+            _MODEL_COMPACTOR_INVOCATION_IDENTITY.reset(token)
+
+    def _capture_invocation_identity(self) -> _ModelCompactorInvocationIdentity:
+        provider_snapshot = self._provider_snapshot
+        if type(provider_snapshot) is not _CompactionProviderSnapshot:
+            raise TypeError("_provider_snapshot must be a _CompactionProviderSnapshot.")
+        detached_snapshot = _CompactionProviderSnapshot(
+            provider_name=require_durable_clean_nonblank(
+                provider_snapshot.provider_name,
+                "provider.name",
+            ),
+            pricing_provider_name=require_durable_clean_nonblank(
+                provider_snapshot.pricing_provider_name,
+                "provider.billing_provider_name",
+            ),
+            usage_dialect=copy_usage_dialect(
+                provider_snapshot.usage_dialect,
+                "provider.usage_dialect",
+            ),
+        )
+        provider = self.provider
+        if not isinstance(provider, ModelProvider):
+            raise TypeError("provider must be a ModelProvider.")
+        max_input_chars = self.max_input_chars
+        if max_input_chars is not None and (
+            type(max_input_chars) is not int or max_input_chars < 1000
+        ):
+            raise ValueError("max_input_chars must be None or an integer of at least 1000.")
+        max_hierarchy_calls = self.max_hierarchy_calls
+        if type(max_hierarchy_calls) is not int or max_hierarchy_calls < 2:
+            raise ValueError("max_hierarchy_calls must be an integer of at least 2.")
+        return _ModelCompactorInvocationIdentity(
+            owner_id=id(self),
+            provider=provider,
+            provider_snapshot=detached_snapshot,
+            model=require_durable_clean_nonblank(self.model, "model"),
+            compactor_name=require_durable_clean_nonblank(
+                self._compactor_name,
+                "compactor",
+            ),
+            system_prompt=require_durable_nonblank(self.system_prompt, "system_prompt"),
+            options=copy_durable_json_object(self.options, "options"),
+            retry_policy=copy_retry_policy(self.retry_policy),
+            max_input_chars=max_input_chars,
+            max_hierarchy_calls=max_hierarchy_calls,
+        )
+
+    def _current_invocation_identity(self) -> _ModelCompactorInvocationIdentity:
+        identity = _MODEL_COMPACTOR_INVOCATION_IDENTITY.get()
+        if identity is None or identity.owner_id != id(self):
+            return self._capture_invocation_identity()
+        return identity
+
+    async def _compact_with_invocation_identity(
+        self,
+        request: CompactionRequest,
+    ) -> CompactionResult:
+        identity = self._current_invocation_identity()
+        max_input_chars = identity.max_input_chars
+        max_hierarchy_calls = identity.max_hierarchy_calls
+        del identity
+        prompt_builder = self.prompt_builder
+        if prompt_builder is None or prompt_builder is default_compaction_prompt:
             bounded_prompt, input_truncated, covered_message_count = (
                 _bounded_default_compaction_prompt(
                     request,
-                    max_chars=self.max_input_chars,
+                    max_chars=max_input_chars,
                 )
             )
             if bounded_prompt is None:
-                with _compaction_dispatch_counter_scope(
-                    self.max_hierarchy_calls
-                ) as dispatch_counter:
+                with _compaction_dispatch_counter_scope(max_hierarchy_calls) as dispatch_counter:
                     result = await self._compact_oversized_atomic_unit(request)
                 metadata = copy_json_value(result.metadata, "metadata")
                 metadata["hierarchy_dispatch_count"] = dispatch_counter.count
@@ -2434,12 +2726,7 @@ class ModelCompactor(ContextCompactor):
                     deep=True,
                 )
         else:
-            custom_prompt = self.prompt_builder(request)
-            if not isinstance(custom_prompt, CompactionPrompt):
-                raise TypeError(
-                    "Custom compaction prompt builders must return CompactionPrompt "
-                    "with explicit source coverage."
-                )
+            custom_prompt = _detach_compaction_prompt(prompt_builder(request))
             user_prompt = custom_prompt.prompt
             if request.existing_summary is not None:
                 user_prompt = (
@@ -2458,7 +2745,7 @@ class ModelCompactor(ContextCompactor):
             )
             bounded_prompt, input_truncated = _bounded_prompt_text(
                 user_prompt,
-                max_chars=self.max_input_chars,
+                max_chars=max_input_chars,
             )
             if input_truncated:
                 raise ValueError(
@@ -2469,7 +2756,7 @@ class ModelCompactor(ContextCompactor):
             covered_message_count=covered_message_count,
             metadata={
                 "input_truncated": input_truncated,
-                "max_input_chars": self.max_input_chars,
+                "max_input_chars": max_input_chars,
             },
         )
         return result.model_copy(
@@ -2493,30 +2780,66 @@ class ModelCompactor(ContextCompactor):
         covered_message_count: int,
         metadata: dict[str, Any],
     ) -> CompactionResult:
+        identity = self._current_invocation_identity()
+        provider = identity.provider
+        model = identity.model
+        compactor_name = identity.compactor_name
+        retry_policy = identity.retry_policy
+        provider_name = identity.provider_snapshot.provider_name
+        pricing_provider_name = identity.provider_snapshot.pricing_provider_name
+        usage_dialect = identity.provider_snapshot.usage_dialect
+        system_prompt = identity.system_prompt
+        options = identity.options
+        del identity
         completion_ledger = _COMPACTION_COMPLETION_LEDGER.get()
         first_completion_index = (
             0 if completion_ledger is None else len(completion_ledger.completed_payloads)
         )
         model_request = ModelRequest(
-            model=self.model,
+            model=model,
             messages=[
-                Message.text(MessageRole.SYSTEM, self.system_prompt),
+                Message.text(MessageRole.SYSTEM, system_prompt),
                 Message.text(MessageRole.USER, user_prompt),
             ],
             tools=[],
-            options=self.options,
+            options=options,
         )
+        terminal_observation_error: ModelProviderError | None = None
+        terminal_value_error: DurableValueError | None = None
         try:
-            summary, completed_metadata, completion_payloads = await _run_compaction_model(
-                provider=self.provider,
-                model_request=model_request,
-                retry_policy=self.retry_policy,
-                compactor=type(self).__name__,
-                observe_completion=_compaction_completion_observer(
-                    provider=self.provider,
-                    model=self.model,
-                    compactor=type(self).__name__,
-                ),
+            try:
+                summary, completed_metadata, completion_payloads = await _run_compaction_model(
+                    provider=provider,
+                    provider_name=provider_name,
+                    pricing_provider_name=pricing_provider_name,
+                    model_request=model_request,
+                    retry_policy=retry_policy,
+                    compactor=compactor_name,
+                    usage_dialect=usage_dialect,
+                    observe_completion=_compaction_completion_observer(
+                        provider_name=pricing_provider_name,
+                        model=model,
+                        compactor=compactor_name,
+                        usage_dialect=usage_dialect,
+                    ),
+                )
+            finally:
+                del provider
+        except _CompactionCompletionObservationError as exc:
+            terminal_observation_error = _record_compaction_completion_observation_failure(
+                exc,
+                provider_name=pricing_provider_name,
+                model=model,
+                compactor=compactor_name,
+                usage_dialect=usage_dialect,
+            )
+        except _CompactionCompletionValueError as exc:
+            terminal_value_error = _record_invalid_compaction_completion(
+                exc,
+                provider_name=pricing_provider_name,
+                model=model,
+                compactor=compactor_name,
+                usage_dialect=usage_dialect,
             )
         except _CompactionToolCallError as exc:
             # A terminal completion is real provider spend even though the tool-call
@@ -2527,9 +2850,10 @@ class ModelCompactor(ContextCompactor):
                     [
                         _rejected_compaction_tool_call_payload(
                             error=exc,
-                            provider=self.provider,
-                            model=self.model,
-                            compactor=type(self).__name__,
+                            provider_name=pricing_provider_name,
+                            model=model,
+                            compactor=compactor_name,
+                            usage_dialect=usage_dialect,
                         )
                     ]
                 )
@@ -2538,13 +2862,26 @@ class ModelCompactor(ContextCompactor):
                 first_completion_index,
             )
             raise
+        if terminal_observation_error is not None:
+            await _publish_compaction_ledger_since(
+                completion_ledger,
+                first_completion_index,
+            )
+            raise terminal_observation_error from None
+        if terminal_value_error is not None:
+            await _publish_compaction_ledger_since(
+                completion_ledger,
+                first_completion_index,
+            )
+            raise terminal_value_error from None
         try:
             result = _provider_compaction_result(
                 summary=summary,
                 completed_metadata=completed_metadata,
-                provider=self.provider,
-                model=self.model,
-                compactor=type(self).__name__,
+                provider_name=pricing_provider_name,
+                model=model,
+                compactor=compactor_name,
+                usage_dialect=usage_dialect,
                 metadata={
                     **copy_json_value(metadata, "metadata"),
                 },
@@ -2569,7 +2906,14 @@ class ModelCompactor(ContextCompactor):
         self,
         request: CompactionRequest,
     ) -> CompactionResult:
-        if self.max_input_chars is None:
+        identity = self._current_invocation_identity()
+        max_input_chars = identity.max_input_chars
+        max_hierarchy_calls = identity.max_hierarchy_calls
+        compactor_name = identity.compactor_name
+        provider_name = identity.provider_snapshot.provider_name
+        model = identity.model
+        del identity
+        if max_input_chars is None:
             raise RuntimeError("Unbounded compaction unexpectedly required hierarchy.")
         atomic_counts = _compaction_atomic_prefix_counts(request.messages)
         if not atomic_counts:
@@ -2580,7 +2924,7 @@ class ModelCompactor(ContextCompactor):
         merge_prompt_prefix = _hierarchy_merge_prompt_prefix(request.instructions)
         source_fragments = _split_hierarchy_text(
             source,
-            max_chars=self.max_input_chars,
+            max_chars=max_input_chars,
             prompt_prefix=source_prompt_prefix,
         )
         merge_required = request.existing_summary is not None or len(source_fragments) > 1
@@ -2590,7 +2934,7 @@ class ModelCompactor(ContextCompactor):
             # can be represented alongside the instructions.
             _split_hierarchy_items(
                 ["x"],
-                max_chars=self.max_input_chars,
+                max_chars=max_input_chars,
                 prompt_prefix=merge_prompt_prefix,
             )
         minimum_merge_calls = 0
@@ -2602,12 +2946,12 @@ class ModelCompactor(ContextCompactor):
             while len(optimistic_items) > 1:
                 expanded_items = _split_hierarchy_items(
                     optimistic_items,
-                    max_chars=self.max_input_chars,
+                    max_chars=max_input_chars,
                     prompt_prefix=merge_prompt_prefix,
                 )
                 merge_groups = _pack_hierarchy_items(
                     expanded_items,
-                    max_chars=self.max_input_chars,
+                    max_chars=max_input_chars,
                     prompt_prefix=merge_prompt_prefix,
                 )
                 minimum_merge_calls += len(merge_groups)
@@ -2617,10 +2961,10 @@ class ModelCompactor(ContextCompactor):
                 # can return. Simulating every later level with that optimistic
                 # output computes a true lower bound for the complete tree.
                 optimistic_items = ["x"] * len(merge_groups)
-                if len(source_fragments) + minimum_merge_calls > self.max_hierarchy_calls:
+                if len(source_fragments) + minimum_merge_calls > max_hierarchy_calls:
                     break
         minimum_calls = len(source_fragments) + minimum_merge_calls
-        if minimum_calls > self.max_hierarchy_calls:
+        if minimum_calls > max_hierarchy_calls:
             raise ValueError(
                 "Oversized compaction source exceeds max_hierarchy_calls before dispatch."
             )
@@ -2639,7 +2983,7 @@ class ModelCompactor(ContextCompactor):
                 covered_message_count=0,
                 metadata={
                     "input_truncated": True,
-                    "max_input_chars": self.max_input_chars,
+                    "max_input_chars": max_input_chars,
                     "hierarchy_phase": "source",
                 },
             )
@@ -2654,17 +2998,17 @@ class ModelCompactor(ContextCompactor):
             current_measure = (len(items), sum(len(item) for item in items))
             expanded_items = _split_hierarchy_items(
                 items,
-                max_chars=self.max_input_chars,
+                max_chars=max_input_chars,
                 prompt_prefix=merge_prompt_prefix,
             )
             groups = _pack_hierarchy_items(
                 expanded_items,
-                max_chars=self.max_input_chars,
+                max_chars=max_input_chars,
                 prompt_prefix=merge_prompt_prefix,
             )
             next_items: list[str] = []
             for group in groups:
-                if dispatch_count >= self.max_hierarchy_calls:
+                if dispatch_count >= max_hierarchy_calls:
                     raise ValueError("Oversized compaction source exceeded max_hierarchy_calls.")
                 dispatch_count += 1
                 merged = await self._compact_prompt_once(
@@ -2675,7 +3019,7 @@ class ModelCompactor(ContextCompactor):
                     covered_message_count=0,
                     metadata={
                         "input_truncated": True,
-                        "max_input_chars": self.max_input_chars,
+                        "max_input_chars": max_input_chars,
                         "hierarchy_phase": "merge",
                     },
                 )
@@ -2694,11 +3038,11 @@ class ModelCompactor(ContextCompactor):
             source_chunk_mode="hierarchical_atomic_unit",
             bounded_input=True,
             metadata={
-                "compactor": type(self).__name__,
-                "provider": self.provider.name,
-                "model": self.model,
+                "compactor": compactor_name,
+                "provider": provider_name,
+                "model": model,
                 "input_truncated": True,
-                "max_input_chars": self.max_input_chars,
+                "max_input_chars": max_input_chars,
                 "hierarchy_dispatch_count": dispatch_count,
             },
             model_completed_payloads=completed_payloads,
@@ -2723,6 +3067,77 @@ class _CompactionToolCallError(RuntimeError):
             None
             if completed_metadata is None
             else copy_json_value(completed_metadata, "completed_metadata")
+        )
+
+
+class _CompactionCompletionValueError(RuntimeError):
+    """A completed provider call carried non-portable auxiliary metadata."""
+
+    def __init__(
+        self,
+        *,
+        error: DurableValueError,
+        completed_metadata: dict[str, Any],
+        rejected_usage_payload: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(str(error))
+        self.error = error
+        self.completed_metadata = copy_durable_json_object(
+            completed_metadata,
+            "completed_metadata",
+        )
+        self.rejected_usage_payload = (
+            None
+            if rejected_usage_payload is None
+            else copy_durable_json_object(
+                rejected_usage_payload,
+                "rejected_usage_payload",
+            )
+        )
+
+
+class _CompactionAccountingUsageError(RuntimeError):
+    """Normalized compaction counters exceeded the portable value contract."""
+
+    def __init__(self, *, payload: dict[str, Any]) -> None:
+        error = DurableValueError("integer_out_of_range", "usage_metrics")
+        super().__init__(str(error))
+        self.error = error
+        self.payload = copy_durable_json_object(payload, "model_completed_payload")
+
+
+class _CompactionCompletionObservationError(RuntimeError):
+    """A terminal completion could not finish billing/ledger observation."""
+
+    def __init__(
+        self,
+        *,
+        error: ModelProviderError,
+        completed_metadata: dict[str, Any],
+    ) -> None:
+        super().__init__(str(error))
+        self.error = error
+        self.completed_metadata = copy_durable_json_object(
+            completed_metadata,
+            "completed_metadata",
+        )
+
+
+class _ProviderDispatchFailed(RuntimeError):
+    """A detached provider failure crossing the instrumented dispatch runner."""
+
+    def __init__(
+        self,
+        control: ProviderExceptionControl,
+        *,
+        completed_metadata: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(control.message)
+        self.control = control
+        self.completed_metadata = (
+            None
+            if completed_metadata is None
+            else copy_durable_json_object(completed_metadata, "completed_metadata")
         )
 
 
@@ -2780,7 +3195,7 @@ class _CompactionCompletionLedger:
         self.indices_by_attempt_id: dict[str, int] = {}
 
     def upsert(self, payload: dict[str, Any]) -> dict[str, Any]:
-        identified = copy_json_value(payload, "model_completed_payload")
+        identified = copy_durable_json_object(payload, "model_completed_payload")
         attempt_id = identified.get(_COMPACTION_ATTEMPT_ID_KEY)
         if type(attempt_id) is not str or attempt_id not in self.indices_by_attempt_id:
             attempt_id = uuid4().hex
@@ -2789,57 +3204,95 @@ class _CompactionCompletionLedger:
             self.completed_payloads.append(identified)
         else:
             self.completed_payloads[self.indices_by_attempt_id[attempt_id]] = identified
-        return copy_json_value(identified, "model_completed_payload")
+        return copy_durable_json_object(identified, "model_completed_payload")
 
     def merge_returned_payloads(
         self,
         payloads: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
+        copied_payloads = copy_durable_json_value(payloads, "model_completed_payloads")
+        if type(copied_payloads) is not list or any(
+            type(payload) is not dict for payload in copied_payloads
+        ):
+            raise TypeError("CompactionResult.model_completed_payloads must be a list of objects.")
+
+        candidate_payloads = copy_durable_json_value(
+            self.completed_payloads,
+            "model_completed_payloads",
+        )
+        candidate_indices = dict(self.indices_by_attempt_id)
         returned_payloads: list[dict[str, Any]] = []
-        for payload in payloads:
-            identified = copy_json_value(payload, "model_completed_payload")
+        returned_ids_seen: set[str] = set()
+        for identified in copied_payloads:
             attempt_id = identified.get(_COMPACTION_ATTEMPT_ID_KEY)
-            if type(attempt_id) is not str or attempt_id not in self.indices_by_attempt_id:
-                attempt_id = uuid4().hex
-                identified[_COMPACTION_ATTEMPT_ID_KEY] = attempt_id
+            if type(attempt_id) is str and attempt_id in candidate_indices:
+                if attempt_id in returned_ids_seen:
+                    raise ValueError(
+                        "CompactionResult.model_completed_payloads contains a duplicate "
+                        "runtime attempt identity."
+                    )
+                anchored = candidate_payloads[candidate_indices[attempt_id]]
+                if identified != anchored:
+                    raise ValueError(
+                        "CompactionResult cannot rewrite runtime-owned completion evidence."
+                    )
+                identified = copy_durable_json_object(
+                    anchored,
+                    "model_completed_payload",
+                )
             else:
-                self.completed_payloads[self.indices_by_attempt_id[attempt_id]] = identified
+                attempt_id = uuid4().hex
+                while attempt_id in candidate_indices or attempt_id in returned_ids_seen:
+                    attempt_id = uuid4().hex
+                identified[_COMPACTION_ATTEMPT_ID_KEY] = attempt_id
+            returned_ids_seen.add(attempt_id)
             returned_payloads.append(identified)
 
         # The returned list can supply calls that a wrapping compactor observed before
-        # an inner provider-backed compactor registered itself. Insert those payloads
-        # relative to the nearest returned payload already anchored in the ledger,
-        # while retaining observed calls omitted by the wrapper.
-        ordered_ids = [payload[_COMPACTION_ATTEMPT_ID_KEY] for payload in self.completed_payloads]
-        returned_ids = [payload[_COMPACTION_ATTEMPT_ID_KEY] for payload in returned_payloads]
-        returned_by_id = {
-            payload[_COMPACTION_ATTEMPT_ID_KEY]: payload for payload in returned_payloads
-        }
-        for returned_index, attempt_id in enumerate(returned_ids):
-            if attempt_id in ordered_ids:
+        # an inner provider-backed compactor registered itself. Bucket those payloads
+        # around runtime-anchored calls, then rebuild once. This preserves omitted
+        # runtime observations and keeps merging linear in the ledger size.
+        before_anchors: dict[int, list[dict[str, Any]]] = {}
+        after_anchors: dict[int, list[dict[str, Any]]] = {}
+        pending: list[dict[str, Any]] = []
+        previous_anchor: int | None = None
+        for payload in returned_payloads:
+            attempt_id = payload[_COMPACTION_ATTEMPT_ID_KEY]
+            anchor = candidate_indices.get(attempt_id)
+            if anchor is None:
+                pending.append(payload)
                 continue
-            previous_id = next(
-                (item for item in reversed(returned_ids[:returned_index]) if item in ordered_ids),
-                None,
-            )
-            next_id = next(
-                (item for item in returned_ids[returned_index + 1 :] if item in ordered_ids),
-                None,
-            )
-            if previous_id is not None:
-                insert_at = ordered_ids.index(previous_id) + 1
-            elif next_id is not None:
-                insert_at = ordered_ids.index(next_id)
+            if previous_anchor is not None and anchor <= previous_anchor:
+                raise ValueError(
+                    "CompactionResult cannot reorder runtime-owned completion evidence."
+                )
+            if previous_anchor is None:
+                before_anchors[anchor] = pending
             else:
-                insert_at = len(ordered_ids)
-            ordered_ids.insert(insert_at, attempt_id)
-            self.completed_payloads.insert(insert_at, returned_by_id[attempt_id])
+                after_anchors[previous_anchor] = pending
+            pending = []
+            previous_anchor = anchor
+        if previous_anchor is None:
+            trailing = pending
+        else:
+            after_anchors[previous_anchor] = pending
+            trailing = []
 
-        self.indices_by_attempt_id = {
+        merged_payloads: list[dict[str, Any]] = []
+        for index, payload in enumerate(candidate_payloads):
+            merged_payloads.extend(before_anchors.get(index, ()))
+            merged_payloads.append(payload)
+            merged_payloads.extend(after_anchors.get(index, ()))
+        merged_payloads.extend(trailing)
+        candidate_payloads = merged_payloads
+
+        candidate_indices = {
             payload[_COMPACTION_ATTEMPT_ID_KEY]: index
-            for index, payload in enumerate(self.completed_payloads)
+            for index, payload in enumerate(candidate_payloads)
         }
-        return copy_json_value(self.completed_payloads, "model_completed_payloads")
+        self.completed_payloads = candidate_payloads
+        self.indices_by_attempt_id = candidate_indices
+        return copy_durable_json_value(candidate_payloads, "model_completed_payloads")
 
 
 _COMPACTION_COMPLETION_LEDGER: ContextVar[_CompactionCompletionLedger | None] = ContextVar(
@@ -2854,7 +3307,7 @@ def _record_compaction_model_completed_payloads(
 
     ledger = _COMPACTION_COMPLETION_LEDGER.get()
     if ledger is None:
-        public_payloads = copy_json_value(payloads, "model_completed_payloads")
+        public_payloads = copy_durable_json_value(payloads, "model_completed_payloads")
         for payload in public_payloads:
             payload.pop(_COMPACTION_ATTEMPT_ID_KEY, None)
         return public_payloads
@@ -2867,7 +3320,7 @@ async def _publish_compaction_completion_payloads(
     publisher = _COMPACTION_COMPLETION_PUBLISHER.get()
     if publisher is None or not payloads:
         return
-    await publisher(copy_json_value(payloads, "model_completed_payloads"))
+    await publisher(copy_durable_json_value(payloads, "model_completed_payloads"))
 
 
 async def _publish_compaction_ledger_since(
@@ -2880,7 +3333,7 @@ async def _publish_compaction_ledger_since(
 
 
 def _public_compaction_model_completed_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    public_payload = copy_json_value(payload, "model_completed_payload")
+    public_payload = copy_durable_json_object(payload, "model_completed_payload")
     public_payload.pop(_COMPACTION_ATTEMPT_ID_KEY, None)
     return public_payload
 
@@ -2889,6 +3342,18 @@ class _PromptCacheCompactionMode(StrEnum):
     EXACT = "exact"
     BOUNDED = "bounded"
     FALLBACK = "fallback"
+
+
+@dataclass(frozen=True, slots=True)
+class _PromptCacheCompactorInvocationIdentity:
+    provider: ModelProvider
+    provider_snapshot: _CompactionProviderSnapshot
+    model: str | None
+    compactor_name: str
+    compaction_instruction: str
+    options: dict[str, Any]
+    retry_policy: RetryPolicy
+    fallback: ContextCompactor
 
 
 def _prompt_cache_compaction_mode(
@@ -2904,9 +3369,10 @@ def _prompt_cache_compaction_mode(
     if any(
         (
             compactor.model not in {None, request.session.model},
-            compactor.provider.name != request.session.provider_name,
+            compactor._provider_snapshot.provider_name != request.session.provider_name,
             request.context_usage.last_provider_name is not None
-            and request.context_usage.last_provider_name != compactor.provider.name,
+            and request.context_usage.last_provider_name
+            != compactor._provider_snapshot.provider_name,
             request.context_usage.last_requested_model is not None
             and request.context_usage.last_requested_model != request.session.model,
             request.pressure_overhead.structured_output_instruction is not None,
@@ -2914,7 +3380,7 @@ def _prompt_cache_compaction_mode(
     ):
         return _PromptCacheCompactionMode.BOUNDED
     if (
-        request.context_usage.last_provider_name == compactor.provider.name
+        request.context_usage.last_provider_name == compactor._provider_snapshot.provider_name
         and request.context_usage.last_requested_model == request.session.model
         and request.build_cache_prefix_request is not None
     ):
@@ -2961,8 +3427,17 @@ class PromptCacheCompactor(ContextCompactor):
         if not isinstance(provider, ModelProvider):
             raise TypeError("provider must be a ModelProvider.")
         if model is not None:
-            model = require_clean_nonblank(model, "model")
+            model = require_durable_clean_nonblank(model, "model")
         self.provider = provider
+        self._provider_snapshot = _compaction_provider_snapshot(provider)
+        self._usage_dialect = copy_usage_dialect(
+            self._provider_snapshot.usage_dialect,
+            "provider.usage_dialect",
+        )
+        self._compactor_name = require_durable_clean_nonblank(
+            type(self).__name__,
+            "compactor",
+        )
         self.model = model
         self.compaction_instruction = (
             compaction_instruction
@@ -2980,12 +3455,12 @@ class PromptCacheCompactor(ContextCompactor):
             raise TypeError("fallback_compactor must be a ContextCompactor.")
 
     def provider_budget_identity(self, session: Session) -> tuple[str, str]:
-        if self.provider.name != session.provider_name and self.model is None:
+        if self._provider_snapshot.provider_name != session.provider_name and self.model is None:
             raise ValueError(
                 "model is required when the compactor provider differs from the session provider."
             )
         return (
-            self.provider.billing_provider_name or self.provider.name,
+            self._provider_snapshot.pricing_provider_name,
             self.model if self.model is not None else session.model,
         )
 
@@ -2993,30 +3468,30 @@ class PromptCacheCompactor(ContextCompactor):
         self,
         request: CompactionRequest,
     ) -> tuple[str, str] | None:
-        provider_differs = self.provider.name != request.session.provider_name
+        provider_differs = self._provider_snapshot.provider_name != request.session.provider_name
         bounded_model = self.model if self.model is not None else request.session.model
         if request.existing_summary is not None or request.force_bounded_compaction:
-            return self.provider.billing_provider_name or self.provider.name, bounded_model
+            return self._provider_snapshot.pricing_provider_name, bounded_model
         if provider_differs:
             if self.model is None:
                 raise ValueError(
                     "model is required when the compactor provider differs from "
                     "the session provider."
                 )
-            return self.provider.billing_provider_name or self.provider.name, bounded_model
+            return self._provider_snapshot.pricing_provider_name, bounded_model
 
         cached_request = request.cache_prefix_request
         if cached_request is None:
             if self.model is not None and self.model != request.session.model:
-                return self.provider.billing_provider_name or self.provider.name, self.model
+                return self._provider_snapshot.pricing_provider_name, self.model
             return self._fallback._provider_budget_identity_for_request(request)
         cached_model = cached_request.model
         if cached_model != request.session.model:
-            return self.provider.billing_provider_name or self.provider.name, bounded_model
+            return self._provider_snapshot.pricing_provider_name, bounded_model
         if self.model is not None and self.model != cached_model:
-            return self.provider.billing_provider_name or self.provider.name, self.model
+            return self._provider_snapshot.pricing_provider_name, self.model
         return (
-            self.provider.billing_provider_name or self.provider.name,
+            self._provider_snapshot.pricing_provider_name,
             self.model if self.model is not None else cached_model,
         )
 
@@ -3024,9 +3499,13 @@ class PromptCacheCompactor(ContextCompactor):
         self,
         request: CompactionRequest,
     ) -> bool:
-        if type(self).compact is not PromptCacheCompactor.compact:
+        if (
+            type(self).compact is not PromptCacheCompactor.compact
+            or type(self)._capture_invocation_identity
+            is not PromptCacheCompactor._capture_invocation_identity
+        ):
             return False
-        provider_differs = self.provider.name != request.session.provider_name
+        provider_differs = self._provider_snapshot.provider_name != request.session.provider_name
         if request.existing_summary is not None or request.force_bounded_compaction:
             return type(self)._compact_bounded is PromptCacheCompactor._compact_bounded
         if provider_differs:
@@ -3052,6 +3531,8 @@ class PromptCacheCompactor(ContextCompactor):
     def _uses_runtime_provider_dispatch_runner_for_forced_compaction(self) -> bool:
         return (
             type(self).compact is PromptCacheCompactor.compact
+            and type(self)._capture_invocation_identity
+            is PromptCacheCompactor._capture_invocation_identity
             and type(self)._compact_bounded is PromptCacheCompactor._compact_bounded
         )
 
@@ -3079,7 +3560,7 @@ class PromptCacheCompactor(ContextCompactor):
         return self._progress_key()
 
     def _bounded_input_for_request(self, request: CompactionRequest) -> bool | None:
-        provider_differs = self.provider.name != request.session.provider_name
+        provider_differs = self._provider_snapshot.provider_name != request.session.provider_name
         if request.existing_summary is not None or request.force_bounded_compaction:
             return True
         if provider_differs:
@@ -3099,43 +3580,116 @@ class PromptCacheCompactor(ContextCompactor):
         # provider overflow, so boundedness is not knowable before execution.
         return None
 
+    def _capture_invocation_identity(self) -> _PromptCacheCompactorInvocationIdentity:
+        provider = self.provider
+        if not isinstance(provider, ModelProvider):
+            raise TypeError("provider must be a ModelProvider.")
+        provider_snapshot = self._provider_snapshot
+        if type(provider_snapshot) is not _CompactionProviderSnapshot:
+            raise TypeError("_provider_snapshot must be a _CompactionProviderSnapshot.")
+        model = self.model
+        if model is not None:
+            model = require_durable_clean_nonblank(model, "model")
+        fallback = self._fallback
+        if not isinstance(fallback, ContextCompactor):
+            raise TypeError("fallback_compactor must be a ContextCompactor.")
+        return _PromptCacheCompactorInvocationIdentity(
+            provider=provider,
+            provider_snapshot=_CompactionProviderSnapshot(
+                provider_name=require_durable_clean_nonblank(
+                    provider_snapshot.provider_name,
+                    "provider.name",
+                ),
+                pricing_provider_name=require_durable_clean_nonblank(
+                    provider_snapshot.pricing_provider_name,
+                    "provider.billing_provider_name",
+                ),
+                usage_dialect=copy_usage_dialect(
+                    provider_snapshot.usage_dialect,
+                    "provider.usage_dialect",
+                ),
+            ),
+            model=model,
+            compactor_name=require_durable_clean_nonblank(
+                self._compactor_name,
+                "compactor",
+            ),
+            compaction_instruction=require_durable_nonblank(
+                self.compaction_instruction,
+                "compaction_instruction",
+            ),
+            options=copy_durable_json_object(self.options, "options"),
+            retry_policy=copy_retry_policy(self.retry_policy),
+            fallback=fallback,
+        )
+
     async def compact(self, request: CompactionRequest) -> CompactionResult:
-        provider_differs = self.provider.name != request.session.provider_name
-        if provider_differs and self.model is None:
+        identity = self._capture_invocation_identity()
+        provider_snapshot = identity.provider_snapshot
+        provider_differs = provider_snapshot.provider_name != request.session.provider_name
+        if provider_differs and identity.model is None:
             raise ValueError(
                 "model is required when the compactor provider differs from the session provider."
             )
-        bounded_model = self.model if self.model is not None else request.session.model
+        bounded_model = identity.model if identity.model is not None else request.session.model
 
         if request.existing_summary is not None:
-            return await self._compact_bounded(request, model=bounded_model)
+            return await self._compact_bounded(
+                request,
+                model=bounded_model,
+                identity=identity,
+            )
 
         if request.force_bounded_compaction:
-            return await self._compact_bounded(request, model=bounded_model)
+            return await self._compact_bounded(
+                request,
+                model=bounded_model,
+                identity=identity,
+            )
 
         if provider_differs:
-            return await self._compact_bounded(request, model=bounded_model)
+            return await self._compact_bounded(
+                request,
+                model=bounded_model,
+                identity=identity,
+            )
 
         cached_request = request.cache_prefix_request
         if cached_request is None:
-            if self.model is not None and self.model != request.session.model:
-                return await self._compact_bounded(request, model=self.model)
-            return await self._fallback.compact(request)
+            if identity.model is not None and identity.model != request.session.model:
+                return await self._compact_bounded(
+                    request,
+                    model=identity.model,
+                    identity=identity,
+                )
+            return await identity.fallback.compact(request)
         cached_model = cached_request.model
         if cached_model != request.session.model:
-            return await self._compact_bounded(request, model=bounded_model)
-        if self.model is not None and self.model != cached_model:
-            return await self._compact_bounded(request, model=self.model)
-        model = self.model if self.model is not None else cached_model
-        model = require_clean_nonblank(model, "model")
+            return await self._compact_bounded(
+                request,
+                model=bounded_model,
+                identity=identity,
+            )
+        if identity.model is not None and identity.model != cached_model:
+            return await self._compact_bounded(
+                request,
+                model=identity.model,
+                identity=identity,
+            )
+        model = identity.model if identity.model is not None else cached_model
+        model = require_durable_clean_nonblank(model, "model")
         if _has_structured_output_tool(cached_request.tools):
-            return await self._compact_bounded(request, model=model)
+            return await self._compact_bounded(
+                request,
+                model=model,
+                identity=identity,
+            )
 
         compaction_messages = [copy_message(message) for message in cached_request.messages]
         tools = copy_json_value(cached_request.tools, "cache_prefix_request.tools")
         base_options = cached_request.options
-        compaction_messages.append(Message.text(MessageRole.USER, self.compaction_instruction))
-        options = _merged_json_options(base_options, self.options)
+        compaction_messages.append(Message.text(MessageRole.USER, identity.compaction_instruction))
+        options = _merged_json_options(base_options, identity.options)
         if "structured_output" in options:
             options["structured_output"] = None
 
@@ -3146,17 +3700,43 @@ class PromptCacheCompactor(ContextCompactor):
             options=options,
         )
 
+        terminal_observation_error: ModelProviderError | None = None
+        terminal_value_error: DurableValueError | None = None
+        completion_ledger = _COMPACTION_COMPLETION_LEDGER.get()
+        first_completion_index = (
+            0 if completion_ledger is None else len(completion_ledger.completed_payloads)
+        )
         try:
             summary, completed_metadata, completion_payloads = await _run_compaction_model(
-                provider=self.provider,
+                provider=identity.provider,
+                provider_name=provider_snapshot.provider_name,
+                pricing_provider_name=provider_snapshot.pricing_provider_name,
                 model_request=model_request,
-                retry_policy=self.retry_policy,
-                compactor=type(self).__name__,
+                retry_policy=identity.retry_policy,
+                compactor=identity.compactor_name,
+                usage_dialect=provider_snapshot.usage_dialect,
                 observe_completion=_compaction_completion_observer(
-                    provider=self.provider,
+                    provider_name=provider_snapshot.pricing_provider_name,
                     model=model,
-                    compactor=type(self).__name__,
+                    compactor=identity.compactor_name,
+                    usage_dialect=provider_snapshot.usage_dialect,
                 ),
+            )
+        except _CompactionCompletionObservationError as exc:
+            terminal_observation_error = _record_compaction_completion_observation_failure(
+                exc,
+                provider_name=provider_snapshot.pricing_provider_name,
+                model=model,
+                compactor=identity.compactor_name,
+                usage_dialect=provider_snapshot.usage_dialect,
+            )
+        except _CompactionCompletionValueError as exc:
+            terminal_value_error = _record_invalid_compaction_completion(
+                exc,
+                provider_name=provider_snapshot.pricing_provider_name,
+                model=model,
+                compactor=identity.compactor_name,
+                usage_dialect=provider_snapshot.usage_dialect,
             )
         except _CompactionToolCallError as exc:
             if getattr(exc, "_cayu_compaction_budget_settlement_failed", False):
@@ -3173,15 +3753,17 @@ class PromptCacheCompactor(ContextCompactor):
             ):
                 recorded_tool_call = _rejected_compaction_tool_call_payload(
                     error=exc,
-                    provider=self.provider,
+                    provider_name=provider_snapshot.pricing_provider_name,
                     model=model,
-                    compactor=type(self).__name__,
+                    compactor=identity.compactor_name,
+                    usage_dialect=provider_snapshot.usage_dialect,
                 )
             return await self._compact_bounded_after_exact_failure(
                 request,
                 model=model,
                 exact_attempt="rejected_tool_call",
                 exact_attempt_payload=recorded_tool_call,
+                identity=identity,
             )
         except ModelContextOverflowError as exc:
             if getattr(exc, "_cayu_compaction_budget_settlement_failed", False):
@@ -3198,32 +3780,38 @@ class PromptCacheCompactor(ContextCompactor):
             ):
                 recorded_overflow = _context_overflow_compaction_payload(
                     error=exc,
-                    provider=self.provider,
+                    provider_name=provider_snapshot.pricing_provider_name,
                     model=model,
-                    compactor=type(self).__name__,
+                    compactor=identity.compactor_name,
+                    usage_dialect=provider_snapshot.usage_dialect,
                 )
             return await self._compact_bounded_after_exact_failure(
                 request,
                 model=model,
                 exact_attempt="context_overflow",
                 exact_attempt_payload=recorded_overflow,
+                identity=identity,
             )
-        completion_ledger = _COMPACTION_COMPLETION_LEDGER.get()
-        first_completion_index = max(
-            0,
-            (
-                len(completion_ledger.completed_payloads) - len(completion_payloads)
-                if completion_ledger is not None
-                else 0
-            ),
-        )
+        if terminal_observation_error is not None:
+            await _publish_compaction_ledger_since(
+                completion_ledger,
+                first_completion_index,
+            )
+            raise terminal_observation_error from None
+        if terminal_value_error is not None:
+            await _publish_compaction_ledger_since(
+                completion_ledger,
+                first_completion_index,
+            )
+            raise terminal_value_error from None
         try:
             result = _provider_compaction_result(
                 summary=summary,
                 completed_metadata=completed_metadata,
-                provider=self.provider,
+                provider_name=provider_snapshot.pricing_provider_name,
                 model=model,
-                compactor=type(self).__name__,
+                compactor=identity.compactor_name,
+                usage_dialect=provider_snapshot.usage_dialect,
                 metadata={
                     "prompt_cache_compaction": True,
                     "context_message_count": len(request.context_messages),
@@ -3260,6 +3848,7 @@ class PromptCacheCompactor(ContextCompactor):
         model: str,
         exact_attempt: str,
         exact_attempt_payload: dict[str, Any],
+        identity: _PromptCacheCompactorInvocationIdentity,
     ) -> CompactionResult:
         # Record this known-earlier failed attempt before the bounded call so a
         # later bounded failure is emitted in provider-call order.
@@ -3267,7 +3856,11 @@ class PromptCacheCompactor(ContextCompactor):
             [exact_attempt_payload]
         )[0]
         await _publish_compaction_completion_payloads([exact_attempt_payload])
-        bounded_result = await self._compact_bounded(request, model=model)
+        bounded_result = await self._compact_bounded(
+            request,
+            model=model,
+            identity=identity,
+        )
         bounded_metadata = copy_json_value(bounded_result.metadata, "bounded_metadata")
         bounded_metadata["prompt_cache_exact_attempt"] = exact_attempt
         return CompactionResult(
@@ -3291,20 +3884,22 @@ class PromptCacheCompactor(ContextCompactor):
         request: CompactionRequest,
         *,
         model: str,
+        identity: _PromptCacheCompactorInvocationIdentity,
     ) -> CompactionResult:
         incremental_options = _merged_json_options(
             request.agent.provider_options,
-            self.options,
+            identity.options,
         )
         incremental_options.pop(RESOLVED_FILE_ATTACHMENTS_OPTION, None)
         if "structured_output" in incremental_options:
             incremental_options["structured_output"] = None
         incremental_compactor = ModelCompactor(
-            provider=self.provider,
-            model=require_clean_nonblank(model, "model"),
-            system_prompt=self.compaction_instruction,
+            provider=identity.provider,
+            model=require_durable_clean_nonblank(model, "model"),
+            system_prompt=identity.compaction_instruction,
             options=incremental_options,
-            retry_policy=self.retry_policy,
+            retry_policy=identity.retry_policy,
+            _provider_snapshot=identity.provider_snapshot,
         )
         return await incremental_compactor.compact(request)
 
@@ -3326,47 +3921,160 @@ def _has_structured_output_tool(tools: list[dict[str, Any]]) -> bool:
 
 def _compaction_completion_observer(
     *,
-    provider: ModelProvider,
+    provider_name: str,
     model: str,
     compactor: str,
+    usage_dialect: UsageDialect,
 ) -> Callable[[dict[str, Any]], dict[str, Any]]:
-    provider_name = _compaction_billing_provider_name(provider)
+    provider_name = require_durable_clean_nonblank(
+        provider_name,
+        "provider.billing_provider_name",
+    )
 
     def observe(completed_metadata: dict[str, Any]) -> dict[str, Any]:
         observed_metadata = copy_json_value(completed_metadata, "completed_metadata")
         # This correlation key is runtime-owned; provider metadata cannot select or
         # overwrite another compaction attempt's ledger entry.
         observed_metadata.pop(_COMPACTION_ATTEMPT_ID_KEY, None)
-        payload = _compaction_model_completed_payload(
-            completed_payload=observed_metadata,
-            provider_name=provider_name,
-            fallback_model=model,
-            compactor=compactor,
-            usage_dialect=provider.usage_dialect,
-        )
-        durable_payload = _durable_compaction_completion_evidence(
-            payload,
-            provider_name=provider_name,
-            fallback_model=model,
-            compactor=compactor,
-        )
+        accounting_usage_error: _CompactionAccountingUsageError | None = None
+        try:
+            payload = _compaction_model_completed_payload(
+                completed_payload=observed_metadata,
+                provider_name=provider_name,
+                fallback_model=model,
+                compactor=compactor,
+                usage_dialect=usage_dialect,
+            )
+        except _CompactionAccountingUsageError as exc:
+            accounting_usage_error = exc
+            durable_payload = exc.payload
+        else:
+            durable_payload = _durable_compaction_completion_evidence(
+                payload,
+                provider_name=provider_name,
+                fallback_model=model,
+                compactor=compactor,
+            )
         registered_payload = _record_compaction_model_completed_payloads([durable_payload])[0]
         attempt_id = registered_payload.get(_COMPACTION_ATTEMPT_ID_KEY)
         if type(attempt_id) is str:
             observed_metadata[_COMPACTION_ATTEMPT_ID_KEY] = attempt_id
+        if accounting_usage_error is not None:
+            raise _CompactionCompletionValueError(
+                error=accounting_usage_error.error,
+                completed_metadata=observed_metadata,
+                rejected_usage_payload=registered_payload,
+            )
         return observed_metadata
 
     return observe
 
 
+def _completion_metadata_with_billing_identity(
+    completed_metadata: dict[str, Any],
+    identity: BillingIdentity | None,
+) -> dict[str, Any]:
+    """Attach only a runtime-resolved identity to detached completion facts."""
+
+    observed_metadata = copy_durable_json_object(
+        completed_metadata,
+        "completed_metadata",
+    )
+    strip_provider_billing_identity(observed_metadata)
+    if identity is not None:
+        observed_metadata["billing_identity"] = identity.model_dump(mode="json")
+    return copy_durable_json_object(observed_metadata, "completed_metadata")
+
+
+def _observe_terminal_compaction_evidence(
+    observe_completion: Callable[[dict[str, Any]], dict[str, Any]],
+    completed_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Best-effort ledger publication after provider completion is terminal."""
+
+    detached = copy_durable_json_object(completed_metadata, "completed_metadata")
+    try:
+        return observe_completion(detached)
+    except _CompactionCompletionValueError:
+        # Usage overflow is an authoritative terminal classification, not a
+        # best-effort observer failure. Preserve its registered attempt id and
+        # let the caller publish exactly that rejected completion.
+        raise
+    except Exception:
+        # The caller propagates a separately detached authoritative failure.
+        # Retain the portable facts for outer telemetry publication without
+        # attaching this potentially provider-owned exception as context.
+        return copy_durable_json_object(completed_metadata, "completed_metadata")
+
+
+def _safe_compaction_durable_value_error(error: DurableValueError) -> DurableValueError:
+    """Rebuild a public/mutable validation error without its caller label."""
+
+    code, path = safe_durable_value_error_details(error)
+    return DurableValueError(code, "provider stream value", path=path)
+
+
+def _compaction_provider_failure_control(
+    error: Exception,
+    *,
+    fallback_provider: str,
+) -> ProviderExceptionControl:
+    """Detach one provider exception without retaining extension-owned state."""
+
+    if isinstance(error, DurableValueError):
+        safe_error = _safe_compaction_durable_value_error(error)
+        return ProviderExceptionControl(
+            message=str(safe_error),
+            error_type=type(safe_error).__name__,
+            cause=safe_error,
+        )
+    try:
+        return copy_provider_exception_control(error)
+    except DurableValueError as portability_error:
+        safe_error, _ = nonportable_model_provider_error(
+            portability_error,
+            fallback_provider=fallback_provider,
+        )
+        return ProviderExceptionControl(
+            message=str(safe_error),
+            error_type=type(safe_error).__name__,
+            cause=safe_error,
+        )
+
+
+def _detach_compaction_model_request(request: ModelRequest) -> ModelRequest:
+    """Revalidate and detach one request before exposing it to a provider."""
+
+    if type(request) is not ModelRequest:
+        raise TypeError("request must be a ModelRequest.")
+    return ModelRequest(
+        model=request.model,
+        messages=request.messages,
+        tools=request.tools,
+        options=request.options,
+    )
+
+
 async def _run_compaction_model(
     *,
     provider: ModelProvider,
+    provider_name: str,
+    pricing_provider_name: str,
     model_request: ModelRequest,
     retry_policy: RetryPolicy,
     compactor: str,
+    usage_dialect: UsageDialect,
     observe_completion: Callable[[dict[str, Any]], dict[str, Any]],
 ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+    # Keep this validated template private. Provider hooks and each stream
+    # attempt receive independent copies so mutation cannot alter a later
+    # dispatch or the logical model used for accounting.
+    provider_name = require_durable_clean_nonblank(provider_name, "provider.name")
+    pricing_provider_name = require_durable_clean_nonblank(
+        pricing_provider_name,
+        "provider.billing_provider_name",
+    )
+    request_template = _detach_compaction_model_request(model_request)
     runtime_dispatch_boundary = _DEFER_BILLING_IDENTITY_CANCELLATION.get()
     billing_identity: BillingIdentity | None = None
     billing_cancellation: asyncio.CancelledError | None = None
@@ -3374,8 +4082,8 @@ async def _run_compaction_model(
     try:
         billing_identity = await resolve_request_billing_identity(
             provider,
-            model_request,
-            provider_name=provider.name,
+            _detach_compaction_model_request(request_template),
+            provider_name=provider_name,
         )
     except asyncio.CancelledError as exc:
         billing_cancellation = detach_billing_identity_cancellation(exc)
@@ -3396,19 +4104,76 @@ async def _run_compaction_model(
     def observe_completion_with_billing_identity(
         completed_metadata: dict[str, Any],
     ) -> dict[str, Any]:
-        observed_metadata = copy_json_value(completed_metadata, "completed_metadata")
-        completed_identity = resolve_completion_billing_identity(
-            provider,
-            billing_identity,
-            observed_metadata,
-            provider_name=provider.name,
+        provider_metadata = copy_durable_json_object(
+            completed_metadata,
+            "completed_metadata",
         )
-        # Billing identity is runtime-owned. Providers may report facts used by the
-        # hook above, but cannot inject an identity through their raw payload.
-        observed_metadata.pop("billing_identity", None)
-        if completed_identity is not None:
-            observed_metadata["billing_identity"] = completed_identity.model_dump(mode="json")
-        return observe_completion(observed_metadata)
+        strip_provider_billing_identity(provider_metadata)
+        best_known_metadata = _completion_metadata_with_billing_identity(
+            provider_metadata,
+            billing_identity,
+        )
+        hook_error: ModelProviderError | None = None
+        try:
+            completed_identity = resolve_completion_billing_identity(
+                provider,
+                billing_identity,
+                copy_durable_json_object(
+                    provider_metadata,
+                    "completed_metadata",
+                ),
+                provider_name=provider_name,
+            )
+        except ModelProviderError as exc:
+            hook_error = exc
+        if hook_error is not None:
+            # A provider completion is terminal even when identity enrichment
+            # fails. Register the already-known request identity and usage
+            # before propagating the detached hook failure so reservation
+            # settlement sees this dispatch exactly once.
+            observed_metadata = _observe_terminal_compaction_evidence(
+                observe_completion,
+                best_known_metadata,
+            )
+            raise _CompactionCompletionObservationError(
+                error=hook_error,
+                completed_metadata=observed_metadata,
+            ) from None
+
+        observed_metadata = _completion_metadata_with_billing_identity(
+            provider_metadata,
+            completed_identity,
+        )
+        observer_error: ModelProviderError | None = None
+        try:
+            return observe_completion(observed_metadata)
+        except _CompactionCompletionValueError:
+            # This is a runtime-owned terminal classification produced after
+            # the provider completed, not a failure of the observer hook.
+            raise
+        except Exception as exc:
+            observer_error, _ = copy_provider_hook_error_control(
+                exc,
+                fallback_provider=provider_name,
+                generic_error_code="completion_observation_failed",
+            )
+        fallback_metadata = observed_metadata
+        if "usage" in fallback_metadata:
+            fallback_metadata = portable_model_completion_projection(
+                fallback_metadata,
+                provider_name=provider_name,
+                requested_model=request_template.model,
+                usage_dialect=usage_dialect,
+            )
+        fallback_metadata = _observe_terminal_compaction_evidence(
+            observe_completion,
+            fallback_metadata,
+        )
+        assert observer_error is not None
+        raise _CompactionCompletionObservationError(
+            error=observer_error,
+            completed_metadata=fallback_metadata,
+        ) from None
 
     dispatch_started = False
     dispatch_cancellation_requests = 0
@@ -3421,11 +4186,30 @@ async def _run_compaction_model(
         current_task = asyncio.current_task()
         dispatch_cancellation_requests = 0 if current_task is None else current_task.cancelling()
         dispatch_started = True
-        return await _stream_compaction_model(
-            provider=provider,
-            model_request=model_request,
-            observe_completion=observe_completion_with_billing_identity,
-        )
+        provider_failure: ProviderExceptionControl | None = None
+        try:
+            return await _stream_compaction_model(
+                provider=provider,
+                provider_name=provider_name,
+                model_request=_detach_compaction_model_request(request_template),
+                usage_dialect=usage_dialect,
+                observe_completion=observe_completion_with_billing_identity,
+            )
+        except (
+            _CompactionCompletionValueError,
+            _CompactionCompletionObservationError,
+            _CompactionToolCallError,
+            _ProviderDispatchFailed,
+        ):
+            raise
+        except Exception as exc:
+            provider_failure = _compaction_provider_failure_control(
+                exc,
+                fallback_provider=provider_name,
+            )
+        if provider_failure is None:  # pragma: no cover - every Exception is captured above
+            raise RuntimeError("Provider dispatch lost its failure state.")
+        raise _ProviderDispatchFailed(provider_failure) from None
 
     existing_ledger = _COMPACTION_COMPLETION_LEDGER.get()
     owns_ledger = existing_ledger is None
@@ -3438,6 +4222,7 @@ async def _run_compaction_model(
     )
     try:
         attempt = 1
+        terminal_dispatch_error: BaseException | None = None
         while True:
             dispatch_started = False
             attempt_completion_index = len(completion_ledger.completed_payloads)
@@ -3448,12 +4233,13 @@ async def _run_compaction_model(
                     summary, completed_metadata = await dispatch()
                 else:
                     summary, completed_metadata = await run_dispatch(
-                        provider,
-                        model_request.model,
+                        pricing_provider_name,
+                        request_template.model,
+                        usage_dialect,
                         billing_identity,
                         dispatch,
                     )
-                completion_payloads = copy_json_value(
+                completion_payloads = copy_durable_json_value(
                     completion_ledger.completed_payloads[first_completion_index:],
                     "model_completed_payloads",
                 )
@@ -3464,51 +4250,75 @@ async def _run_compaction_model(
                     ]
                 return summary, completed_metadata, completion_payloads
             except BaseException as exc:
+                if isinstance(
+                    exc,
+                    (
+                        _CompactionCompletionValueError,
+                        _CompactionCompletionObservationError,
+                    ),
+                ):
+                    # These terminal classifications already own any completion
+                    # evidence in the ledger. Their caller annotates and publishes
+                    # that exact record before deciding whether fallback is safe.
+                    del provider
+                    raise
+
+                provider_failure = exc.control if isinstance(exc, _ProviderDispatchFailed) else None
+                failure = provider_failure.cause if provider_failure is not None else exc
+                failure_type = (
+                    provider_failure.error_type
+                    if provider_failure is not None
+                    else type(failure).__name__
+                )
                 attempt_payloads = completion_ledger.completed_payloads[attempt_completion_index:]
                 if attempt_payloads:
                     finalized_attempt_payloads: list[dict[str, Any]] = []
                     for payload in attempt_payloads:
-                        failed_payload = copy_json_value(
+                        failed_payload = copy_durable_json_object(
                             payload,
                             "model_completed_payload",
                         )
-                        if isinstance(exc, ModelContextOverflowError):
+                        if isinstance(failure, ModelContextOverflowError):
                             failed_payload.update(
                                 _context_overflow_compaction_payload(
-                                    error=exc,
-                                    provider=provider,
-                                    model=model_request.model,
+                                    error=failure,
+                                    provider_name=pricing_provider_name,
+                                    model=request_template.model,
                                     compactor=compactor,
+                                    usage_dialect=usage_dialect,
                                 )
                             )
                             if "usage" in failed_payload or "usage_metrics" in failed_payload:
                                 failed_payload.pop("usage_unavailable_reason", None)
-                        elif isinstance(exc, _CompactionToolCallError):
-                            failed_payload["compaction_outcome"] = "rejected_tool_call"
-                            failed_payload["error_type"] = type(exc).__name__
-                        elif isinstance(exc, asyncio.CancelledError):
+                        elif isinstance(failure, asyncio.CancelledError):
                             failed_payload["compaction_outcome"] = "cancelled_after_completion"
-                            failed_payload["error_type"] = type(exc).__name__
+                            failed_payload["error_type"] = failure_type
+                        elif isinstance(failure, _CompactionToolCallError):
+                            failed_payload["compaction_outcome"] = "rejected_tool_call"
+                            failed_payload["error_type"] = failure_type
                         else:
                             failed_payload["compaction_outcome"] = "provider_error_after_completion"
-                            failed_payload["error_type"] = type(exc).__name__
+                            failed_payload["error_type"] = failure_type
                         finalized_attempt_payloads.extend(
                             _record_compaction_model_completed_payloads([failed_payload])
                         )
                 elif dispatch_started:
                     failed_attempt_payload = (
                         _context_overflow_compaction_payload(
-                            error=exc,
-                            provider=provider,
-                            model=model_request.model,
+                            error=failure,
+                            provider_name=pricing_provider_name,
+                            model=request_template.model,
                             compactor=compactor,
+                            usage_dialect=usage_dialect,
                         )
-                        if isinstance(exc, ModelContextOverflowError)
+                        if isinstance(failure, ModelContextOverflowError)
                         else _failed_compaction_provider_attempt_payload(
-                            error=exc,
-                            provider=provider,
-                            model=model_request.model,
+                            error=failure,
+                            error_type=failure_type,
+                            provider_name=pricing_provider_name,
+                            model=request_template.model,
                             compactor=compactor,
+                            usage_dialect=usage_dialect,
                         )
                     )
                     finalized_attempt_payloads = _record_compaction_model_completed_payloads(
@@ -3517,7 +4327,7 @@ async def _run_compaction_model(
                 else:
                     finalized_attempt_payloads = []
                 if finalized_attempt_payloads:
-                    if isinstance(exc, asyncio.CancelledError):
+                    if isinstance(failure, asyncio.CancelledError):
                         current_task = asyncio.current_task()
                         current_requests = 0 if current_task is None else current_task.cancelling()
                         if current_requests > dispatch_cancellation_requests:
@@ -3525,68 +4335,84 @@ async def _run_compaction_model(
                             # authoritative. Preserve older handled requests while
                             # normalizing only the new signal before publication.
                             consume_pending_task_cancellation(
-                                exc,
+                                failure,
                                 preserve_requests=dispatch_cancellation_requests,
                             )
                     try:
                         await _publish_compaction_completion_payloads(finalized_attempt_payloads)
                     except asyncio.CancelledError as publication_cancellation:
-                        exc.add_note(
+                        failure.add_note(
                             "Compaction provider failure evidence publication was interrupted "
                             "by cancellation; publication diagnostics are attached to the "
                             "cancellation."
                         )
-                        if isinstance(exc, asyncio.CancelledError):
+                        if isinstance(failure, asyncio.CancelledError):
                             # The publisher redelivers the caller cancellation
                             # after durable cleanup. Do not let that duplicate
                             # signal overwrite the original cancellation's
                             # authoritative settlement/provider cause.
-                            public_cancellation = detach_billing_identity_cancellation(exc)
+                            public_cancellation = detach_billing_identity_cancellation(failure)
                             if public_cancellation is not None:
                                 if runtime_dispatch_boundary:
                                     del provider
-                                    raise exc from exc.__cause__
+                                    raise failure from failure.__cause__
                                 del provider
                                 raise public_cancellation from None
                             del provider
-                            raise exc from exc.__cause__
+                            raise failure from failure.__cause__
                         del provider
-                        raise publication_cancellation from exc
+                        raise publication_cancellation from failure
                     except Exception as publication_error:
-                        if isinstance(exc, ModelProviderError):
-                            exc.retryable = False
-                        exc.add_note(
+                        if isinstance(failure, ModelProviderError):
+                            failure.retryable = False
+                        failure.add_note(
                             "Compaction provider failure evidence publication also failed: "
                             f"{type(publication_error).__name__}: {publication_error}"
                         )
                         del provider
-                        raise exc from publication_error
-                if isinstance(exc, asyncio.CancelledError):
-                    billing_dispatch_cancellation = detach_billing_identity_cancellation(exc)
+                        raise failure from publication_error
+
+                if isinstance(failure, asyncio.CancelledError):
+                    billing_dispatch_cancellation = detach_billing_identity_cancellation(failure)
                     if billing_dispatch_cancellation is not None and runtime_dispatch_boundary:
                         del provider
                         raise
                 if billing_dispatch_cancellation is None:
-                    if not isinstance(exc, ModelProviderError):
+                    if provider_failure is None:
                         del provider
                         raise
+                    if exc.__dict__.get("_cayu_compaction_budget_settlement_failed") is True:
+                        failure.__dict__["_cayu_compaction_budget_settlement_failed"] = True
+                        if isinstance(failure, ModelProviderError):
+                            failure.retryable = False
+                        terminal_dispatch_error = failure
+                        break
+                    provider_error = failure if isinstance(failure, ModelProviderError) else None
                     decision = retry_decision(
                         policy=retry_policy,
                         attempt=attempt,
-                        error=str(exc),
-                        status_code=exc.status_code,
-                        retryable=exc.retryable,
-                        retry_after_s=exc.retry_after_s,
+                        error=provider_failure.message,
+                        status_code=(
+                            None if provider_error is None else provider_error.status_code
+                        ),
+                        retryable=(None if provider_error is None else provider_error.retryable),
+                        retry_after_s=(
+                            None if provider_error is None else provider_error.retry_after_s
+                        ),
                     )
                     if not decision.retry or decision.next_attempt is None:
-                        del provider
-                        raise
+                        terminal_dispatch_error = failure
+                        break
                     if decision.delay_seconds > 0:
                         await asyncio.sleep(decision.delay_seconds)
                     attempt = decision.next_attempt
             if billing_dispatch_cancellation is not None:
                 del provider
                 raise billing_dispatch_cancellation
+        if terminal_dispatch_error is not None:
+            del provider
+            raise terminal_dispatch_error from None
+        raise RuntimeError("Compaction dispatch exited without a result.")
     finally:
         if completion_ledger_token is not None:
             _COMPACTION_COMPLETION_LEDGER.reset(completion_ledger_token)
@@ -3595,16 +4421,20 @@ async def _run_compaction_model(
 async def _stream_compaction_model(
     *,
     provider: ModelProvider,
+    provider_name: str,
     model_request: ModelRequest,
+    usage_dialect: UsageDialect,
     observe_completion: Callable[[dict[str, Any]], dict[str, Any]],
 ) -> tuple[str, dict[str, Any]]:
-    provider_name = require_clean_nonblank(provider.name, "provider.name")
+    provider_name = require_durable_clean_nonblank(provider_name, "provider.name")
     text_parts: list[str] = []
     completed_payload: dict[str, Any] | None = None
     tool_call_seen = False
+    tool_call_failure: _CompactionToolCallError | None = None
+    completed_dispatch_failure: _ProviderDispatchFailed | None = None
     try:
         async for raw_event in provider.stream(model_request):
-            event = copy_model_stream_event(raw_event)
+            event = _copy_compaction_stream_event_for_accounting(raw_event)
             if completed_payload is not None:
                 raise RuntimeError(
                     f"Compaction provider emitted event after completed: {event.type}"
@@ -3627,7 +4457,35 @@ async def _stream_compaction_model(
                     str(event.payload.get("error") or "Compaction model provider error")
                 )
             elif event.type == ModelStreamEventType.COMPLETED:
-                completed_payload = observe_completion(_provider_completed_metadata(event.payload))
+                try:
+                    portable_payload = copy_durable_json_object(event.payload, "payload")
+                except DurableValueError as exc:
+                    safe_payload = portable_model_completion_projection(
+                        event.payload,
+                        provider_name=provider_name,
+                        requested_model=model_request.model,
+                        usage_dialect=usage_dialect,
+                    )
+                    safe_completed_metadata = _provider_completed_metadata(
+                        safe_payload,
+                        preserve_usage_metrics=True,
+                        preserve_usage_failure=True,
+                    )
+                    try:
+                        completed_payload = observe_completion(safe_completed_metadata)
+                    except _CompactionCompletionObservationError as observation_failure:
+                        # The portability failure is authoritative once a
+                        # terminal completion has been observed. In particular,
+                        # a failing completion-billing hook must not redispatch
+                        # the model and erase this attempt's known spend.
+                        completed_payload = observation_failure.completed_metadata
+                    raise _CompactionCompletionValueError(
+                        error=exc,
+                        completed_metadata=completed_payload,
+                    ) from None
+                completed_payload = observe_completion(
+                    _provider_completed_metadata(portable_payload)
+                )
             else:
                 raise RuntimeError(f"Compaction provider emitted unsupported event: {event.type}")
     except asyncio.CancelledError as exc:
@@ -3639,15 +4497,34 @@ async def _stream_compaction_model(
         raise
     except Exception as exc:
         del provider
+        if isinstance(
+            exc,
+            (_CompactionCompletionValueError, _CompactionCompletionObservationError),
+        ):
+            # Failures discovered only after a terminal completion are
+            # authoritative. A prior tool-call event must not reinterpret them
+            # as a protocol fallback eligible for another provider dispatch.
+            raise
         if tool_call_seen:
             completed_metadata = None if completed_payload is None else completed_payload
-            raise _CompactionToolCallError(completed_metadata=completed_metadata) from exc
-        if completed_payload is not None:
-            exc.__dict__["completed_metadata"] = copy_json_value(
-                completed_payload,
-                "completed_metadata",
+            tool_call_failure = _CompactionToolCallError(
+                completed_metadata=completed_metadata,
             )
-        raise
+        elif completed_payload is not None:
+            completed_dispatch_failure = _ProviderDispatchFailed(
+                _compaction_provider_failure_control(
+                    exc,
+                    fallback_provider=provider_name,
+                ),
+                completed_metadata=completed_payload,
+            )
+        else:
+            raise
+
+    if tool_call_failure is not None:
+        raise tool_call_failure from None
+    if completed_dispatch_failure is not None:
+        raise completed_dispatch_failure from None
 
     if completed_payload is None:
         if tool_call_seen:
@@ -3659,17 +4536,62 @@ async def _stream_compaction_model(
     return "".join(text_parts), completed_metadata
 
 
+def _copy_compaction_stream_event_for_accounting(value: object) -> ModelStreamEvent:
+    """Detach an ephemeral provider event without discarding terminal usage.
+
+    Compaction validates its final summary and projects completion metadata to
+    a portable accounting record before persistence. Strict per-event copying
+    here would abort on an unrelated malformed completion field before that
+    safe projection can retain provider-reported spend.
+    """
+
+    if type(value) is not ModelStreamEvent:
+        raise TypeError("Model providers must yield ModelStreamEvent instances.")
+    if type(value.type) is not ModelStreamEventType:
+        raise ValueError("Model provider stream event type must be a ModelStreamEventType.")
+    if type(value.delta) is not str:
+        raise ValueError("Model provider stream event delta must be a string.")
+    if type(value.payload) is not dict:
+        raise ValueError("Model provider stream event payload must be an object.")
+    if value.type != ModelStreamEventType.COMPLETED and value.completion is not None:
+        raise ValueError("Only completed model stream events can include completion metadata.")
+    if value.type == ModelStreamEventType.COMPLETED:
+        # Completion metadata needs the accounting-aware projection below so a
+        # malformed auxiliary field cannot erase provider-reported spend.
+        delta = value.delta
+        payload = dict(value.payload)
+    elif value.type == ModelStreamEventType.ERROR:
+        # Error payloads are control data: retry classification and externally
+        # visible failure events must never be derived from a value that cannot
+        # cross the durable boundary. There is no completion usage to retain.
+        delta = require_durable_text(value.delta, "delta")
+        payload = copy_durable_json_object(value.payload, "payload")
+    else:
+        delta = value.delta
+        payload = copy_json_value(value.payload, "payload")
+    return ModelStreamEvent.model_construct(
+        type=value.type,
+        delta=delta,
+        payload=payload,
+        completion=None,
+    )
+
+
 def _provider_compaction_result(
     *,
     summary: str,
     completed_metadata: dict[str, Any],
-    provider: ModelProvider,
+    provider_name: str,
     model: str,
     compactor: str,
+    usage_dialect: UsageDialect,
     metadata: dict[str, Any],
     covered_message_count: int,
 ) -> CompactionResult:
-    provider_name = _compaction_billing_provider_name(provider)
+    provider_name = require_durable_clean_nonblank(
+        provider_name,
+        "provider.billing_provider_name",
+    )
     # Build attributable evidence before validating the summary so completed spend
     # survives an unusable-text failure.
     model_completed_payload = _compaction_model_completed_payload(
@@ -3677,7 +4599,7 @@ def _provider_compaction_result(
         provider_name=provider_name,
         fallback_model=model,
         compactor=compactor,
-        usage_dialect=provider.usage_dialect,
+        usage_dialect=usage_dialect,
     )
     ledger_payload = _durable_compaction_completion_evidence(
         model_completed_payload,
@@ -3699,7 +4621,19 @@ def _provider_compaction_result(
         invalid_summary_payload["compaction_outcome"] = "invalid_summary"
         _record_compaction_model_completed_payloads([invalid_summary_payload])
         raise
-    public_completed_metadata = copy_json_value(completed_metadata, "completed_metadata")
+    try:
+        public_completed_metadata = copy_durable_json_object(
+            completed_metadata,
+            "completed_metadata",
+        )
+    except DurableValueError:
+        invalid_metadata_payload = copy_json_value(
+            registered_payload,
+            "model_completed_payload",
+        )
+        invalid_metadata_payload["compaction_outcome"] = "invalid_completion_metadata"
+        _record_compaction_model_completed_payloads([invalid_metadata_payload])
+        raise
     public_completed_metadata.pop(_COMPACTION_ATTEMPT_ID_KEY, None)
     return CompactionResult(
         summary=validated_summary,
@@ -3715,20 +4649,125 @@ def _provider_compaction_result(
     )
 
 
+def _record_compaction_completion_observation_failure(
+    failure: _CompactionCompletionObservationError,
+    *,
+    provider_name: str,
+    model: str,
+    compactor: str,
+    usage_dialect: UsageDialect,
+) -> ModelProviderError:
+    """Publish best-known terminal spend before propagating a safe hook error."""
+
+    provider_name = require_durable_clean_nonblank(
+        provider_name,
+        "provider.billing_provider_name",
+    )
+    model_completed_payload = _compaction_model_completed_payload(
+        completed_payload=failure.completed_metadata,
+        provider_name=provider_name,
+        fallback_model=model,
+        compactor=compactor,
+        usage_dialect=usage_dialect,
+    )
+    durable_payload = _durable_compaction_completion_evidence(
+        model_completed_payload,
+        provider_name=provider_name,
+        fallback_model=model,
+        compactor=compactor,
+    )
+    durable_payload["compaction_outcome"] = "completion_observation_failed"
+    _record_compaction_model_completed_payloads([durable_payload])
+    if failure.__dict__.get("_cayu_compaction_budget_settlement_failed") is True:
+        failure.error.__dict__["_cayu_compaction_budget_settlement_failed"] = True
+        failure.error.retryable = False
+    return failure.error
+
+
+def _record_invalid_compaction_completion(
+    failure: _CompactionCompletionValueError,
+    *,
+    provider_name: str,
+    model: str,
+    compactor: str,
+    usage_dialect: UsageDialect,
+) -> DurableValueError:
+    """Publish safe terminal spend before propagating a completion value error."""
+
+    provider_name = require_durable_clean_nonblank(
+        provider_name,
+        "provider.billing_provider_name",
+    )
+    if failure.rejected_usage_payload is not None:
+        durable_payload = copy_durable_json_object(
+            failure.rejected_usage_payload,
+            "model_completed_payload",
+        )
+    else:
+        model_completed_payload = _compaction_model_completed_payload(
+            completed_payload=failure.completed_metadata,
+            provider_name=provider_name,
+            fallback_model=model,
+            compactor=compactor,
+            usage_dialect=usage_dialect,
+        )
+        durable_payload = _durable_compaction_completion_evidence(
+            model_completed_payload,
+            provider_name=provider_name,
+            fallback_model=model,
+            compactor=compactor,
+            force_projection=True,
+        )
+    if (
+        "usage" not in durable_payload
+        and "usage_metrics" not in durable_payload
+        and "usage_unavailable_reason" not in durable_payload
+    ):
+        durable_payload["usage_unavailable_reason"] = "invalid compaction usage telemetry"
+    durable_payload["compaction_outcome"] = "invalid_completion_metadata"
+    _record_compaction_model_completed_payloads([durable_payload])
+    return failure.error
+
+
+def _rejected_compaction_usage_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Build portable terminal evidence when normalized counters overflow."""
+
+    rejected = copy_json_value(payload, "model_completed_payload")
+    raw_usage = rejected.pop("usage", None)
+    rejected.pop("usage_metrics", None)
+    if raw_usage is not None:
+        rejected["rejected_usage_evidence"] = copy_durable_json_value(
+            raw_usage,
+            "rejected_usage_evidence",
+        )
+    rejected["usage_metrics_rejected"] = True
+    return copy_durable_json_object(rejected, "model_completed_payload")
+
+
 def _durable_compaction_completion_evidence(
     payload: dict[str, Any],
     *,
     provider_name: str,
     fallback_model: str,
     compactor: str,
+    force_projection: bool = False,
 ) -> dict[str, Any]:
     """Retain full durable metadata or a safe normalized accounting projection."""
 
     copied = copy_json_value(payload, "model_completed_payload")
+    try:
+        portable = copy_durable_json_object(copied, "model_completed_payload")
+    except DurableValueError:
+        portable = None
+    if portable is not None and not force_projection:
+        return portable
+
     resolved_model = copied.get("model")
     try:
-        resolved_model = require_nonblank(resolved_model, "model")
-        require_durable_json_text(resolved_model, "model")
+        resolved_model = require_nonblank(
+            require_durable_text(resolved_model, "model"),
+            "model",
+        )
     except ValueError:
         resolved_model = fallback_model
     fallback_fields: dict[str, Any] = {
@@ -3741,13 +4780,35 @@ def _durable_compaction_completion_evidence(
     attempt_id = copied.get(_COMPACTION_ATTEMPT_ID_KEY)
     if type(attempt_id) is str:
         try:
-            require_durable_json_text(attempt_id, _COMPACTION_ATTEMPT_ID_KEY)
+            attempt_id = require_durable_nonblank(
+                attempt_id,
+                _COMPACTION_ATTEMPT_ID_KEY,
+            )
         except ValueError:
             pass
         else:
             fallback_fields[_COMPACTION_ATTEMPT_ID_KEY] = attempt_id
+    source = copied
+    if force_projection:
+        projection_fields = (
+            "usage",
+            "usage_metrics",
+            "billing_identity",
+            "usage_normalization_failed",
+            "usage_unavailable_reason",
+            "usage_metrics_rejected",
+            "rejected_usage_evidence",
+        )
+        source = {key: copied[key] for key in projection_fields if key in copied}
+        # Forced projection intentionally drops provider-owned auxiliary
+        # metadata, but runtime identity must remain attached even when the
+        # retained accounting subset is already portable. In particular, the
+        # attempt id makes this terminal rewrite replace the ledger entry
+        # recorded by the completion observer instead of appending a duplicate.
+        for key, value in fallback_fields.items():
+            source.setdefault(key, value)
     return durable_model_completed_payload(
-        copied,
+        source,
         fallback_fields=fallback_fields,
         unavailable_reason="invalid compaction usage telemetry",
     )
@@ -3756,18 +4817,22 @@ def _durable_compaction_completion_evidence(
 def _rejected_compaction_tool_call_payload(
     *,
     error: _CompactionToolCallError,
-    provider: ModelProvider,
+    provider_name: str,
     model: str,
     compactor: str,
+    usage_dialect: UsageDialect,
 ) -> dict[str, Any]:
-    provider_name = _compaction_billing_provider_name(provider)
+    provider_name = require_durable_clean_nonblank(
+        provider_name,
+        "provider.billing_provider_name",
+    )
     completed_metadata = {} if error.completed_metadata is None else error.completed_metadata
     payload = _compaction_model_completed_payload(
         completed_payload=completed_metadata,
         provider_name=provider_name,
         fallback_model=model,
         compactor=compactor,
-        usage_dialect=provider.usage_dialect,
+        usage_dialect=usage_dialect,
     )
     payload = _durable_compaction_completion_evidence(
         payload,
@@ -3786,19 +4851,24 @@ def _rejected_compaction_tool_call_payload(
 def _failed_compaction_provider_attempt_payload(
     *,
     error: BaseException,
-    provider: ModelProvider,
+    error_type: str,
+    provider_name: str,
     model: str,
     compactor: str,
+    usage_dialect: UsageDialect,
 ) -> dict[str, Any]:
     """Represent a dispatched attempt whose provider usage is unknowable."""
 
-    provider_name = _compaction_billing_provider_name(provider)
+    provider_name = require_durable_clean_nonblank(
+        provider_name,
+        "provider.billing_provider_name",
+    )
     payload = _compaction_model_completed_payload(
         completed_payload={},
         provider_name=provider_name,
         fallback_model=model,
         compactor=compactor,
-        usage_dialect=provider.usage_dialect,
+        usage_dialect=usage_dialect,
     )
     payload = _durable_compaction_completion_evidence(
         payload,
@@ -3821,7 +4891,7 @@ def _failed_compaction_provider_attempt_payload(
     payload.update(
         {
             "compaction_outcome": outcome,
-            "error_type": type(error).__name__,
+            "error_type": require_durable_text(error_type, "error_type"),
             "usage_unavailable_reason": unavailable_reason,
         }
     )
@@ -3831,17 +4901,21 @@ def _failed_compaction_provider_attempt_payload(
 def _context_overflow_compaction_payload(
     *,
     error: ModelContextOverflowError,
-    provider: ModelProvider,
+    provider_name: str,
     model: str,
     compactor: str,
+    usage_dialect: UsageDialect,
 ) -> dict[str, Any]:
-    provider_name = _compaction_billing_provider_name(provider)
+    provider_name = require_durable_clean_nonblank(
+        provider_name,
+        "provider.billing_provider_name",
+    )
     payload = _compaction_model_completed_payload(
         completed_payload={},
         provider_name=provider_name,
         fallback_model=model,
         compactor=compactor,
-        usage_dialect=provider.usage_dialect,
+        usage_dialect=usage_dialect,
     )
     payload.update(error.error_payload_fields())
     payload.update(
@@ -3855,13 +4929,6 @@ def _context_overflow_compaction_payload(
         }
     )
     return payload
-
-
-def _compaction_billing_provider_name(provider: ModelProvider) -> str:
-    return require_clean_nonblank(
-        provider.billing_provider_name or provider.name,
-        "provider.billing_provider_name",
-    )
 
 
 class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
@@ -4050,14 +5117,14 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                 try:
 
                     async def execute_compaction() -> CompactionResult:
-                        compaction_result = await self.compactor.compact(compaction_request)
-                        completion_ledger.merge_returned_payloads(
-                            compaction_result.model_completed_payloads,
-                        )
-                        return compaction_result
+                        extension_result = await self.compactor.compact(compaction_request)
+                        result_fields = _snapshot_compaction_result(extension_result)
+                        returned_payloads = result_fields["model_completed_payloads"]
+                        completion_ledger.merge_returned_payloads(returned_payloads)
+                        return _detach_compaction_result(result_fields)
 
                     def completed_payloads_snapshot() -> list[dict[str, Any]]:
-                        return copy_json_value(
+                        return copy_durable_json_value(
                             completion_ledger.completed_payloads,
                             "model_completed_payloads",
                         )
@@ -4073,6 +5140,7 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                             execute_compaction,
                             completed_payloads_snapshot,
                         )
+                    result = _detach_compaction_result(_snapshot_compaction_result(result))
                     completed_payloads = completed_payloads_snapshot()
                     covered_message_count = result.covered_message_count
                     _validate_compaction_result_coverage(
@@ -5027,12 +6095,25 @@ def _message_part_digest(
     raise TypeError("Unsupported message part.")
 
 
-def _provider_completed_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+def _provider_completed_metadata(
+    payload: dict[str, Any],
+    *,
+    preserve_usage_metrics: bool = False,
+    preserve_usage_failure: bool = False,
+) -> dict[str, Any]:
     copied = copy_json_value(payload, "completed")
     if type(copied) is not dict:
         raise ValueError("Provider completed payload must be an object.")
     copied.pop("provider_state", None)
     strip_provider_billing_identity(copied)
+    normalization_failed = copied.pop("usage_normalization_failed", None)
+    copied.pop("usage_unavailable_reason", None)
+    if not preserve_usage_metrics and copied.get("usage") is not None:
+        copied.pop("usage_metrics", None)
+    copied.pop("usage_metrics_rejected", None)
+    copied.pop("rejected_usage_evidence", None)
+    if preserve_usage_failure and normalization_failed is True:
+        copied["usage_normalization_failed"] = True
     return copied
 
 
@@ -5067,29 +6148,47 @@ def _compaction_model_completed_payload(
     has_raw_usage = payload.get("usage") is not None
     if has_raw_usage:
         payload.pop("usage_metrics", None)
-    payload.pop("usage_normalization_failed", None)
+    usage_normalization_failed = payload.pop("usage_normalization_failed", None) is True
+    payload.pop("usage_unavailable_reason", None)
+    payload.pop("usage_metrics_rejected", None)
+    payload.pop("rejected_usage_evidence", None)
     raw_billing_identity = payload.get("billing_identity")
     billing_identity = (
         BillingIdentity.model_validate(raw_billing_identity)
         if type(raw_billing_identity) is dict
         else None
     )
-    usage_metrics = usage_metrics_payload(
-        normalize_usage_metrics(
-            provider_name=provider_name,
-            model=resolved_model,
-            requested_model=fallback_model,
-            raw_usage=payload.get("usage"),
-            usage_dialect=usage_dialect,
-            billing_identity=billing_identity,
+    try:
+        usage_metrics = usage_metrics_payload(
+            normalize_usage_metrics(
+                provider_name=provider_name,
+                model=resolved_model,
+                requested_model=fallback_model,
+                raw_usage=payload.get("usage"),
+                usage_dialect=usage_dialect,
+                billing_identity=billing_identity,
+            )
         )
-    )
+    except (TypeError, ValueError):
+        # Runtime-derived totals and cache aggregates can exceed the portable
+        # int64 range even when every provider counter is independently valid.
+        raise _CompactionAccountingUsageError(
+            payload=_rejected_compaction_usage_payload(payload)
+        ) from None
     if usage_metrics is not None:
         # The event-level identity is the only durable authority. Readers attach
         # it to parsed usage after validating the completion payload.
         usage_metrics.pop("billing_identity", None)
-        payload["usage_metrics"] = usage_metrics
-    elif has_raw_usage:
+        try:
+            payload["usage_metrics"] = copy_durable_json_object(
+                usage_metrics,
+                "usage_metrics",
+            )
+        except DurableValueError:
+            raise _CompactionAccountingUsageError(
+                payload=_rejected_compaction_usage_payload(payload)
+            ) from None
+    elif has_raw_usage or usage_normalization_failed:
         payload["usage_normalization_failed"] = True
     return payload
 

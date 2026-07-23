@@ -11,7 +11,13 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
+    require_durable_nonblank,
+)
+from cayu._validation import (
+    require_durable_clean_nonblank as require_clean_nonblank,
+)
 from cayu.runtime.sessions import EventQuery, EventRecord, copy_event_query
 
 EVENT_WATCHER_QUERY_PAGE_LIMIT = 5000
@@ -25,18 +31,20 @@ class EventWatcherDeliveryStatus(StrEnum):
 
 
 class EventWatcherState(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     watcher_name: str
-    cursor_sequence: StrictInt = Field(default=0, ge=0)
+    cursor_sequence: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
     pending_event_id: str | None = None
-    pending_event_sequence: StrictInt | None = Field(default=None, ge=1)
-    pending_attempt: StrictInt = Field(default=0, ge=0)
+    pending_event_sequence: StrictInt | None = Field(
+        default=None, ge=1, le=MAX_DURABLE_JSON_INTEGER
+    )
+    pending_attempt: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
     pending_claim_id: str | None = None
     delivery_status: EventWatcherDeliveryStatus | None = None
     lease_expires_at: datetime | None = None
     last_error: str | None = None
-    dead_lettered_count: StrictInt = Field(default=0, ge=0)
+    dead_lettered_count: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     @field_validator("watcher_name", "pending_event_id", "pending_claim_id", "last_error")
@@ -45,9 +53,7 @@ class EventWatcherState(BaseModel):
         if value is None:
             return None
         if info.field_name == "last_error":
-            if not value.strip():
-                raise ValueError("last_error cannot be blank.")
-            return value
+            return require_durable_nonblank(value, "last_error")
         return require_clean_nonblank(value, info.field_name)
 
     @field_validator("lease_expires_at", "updated_at")
@@ -61,12 +67,12 @@ class EventWatcherState(BaseModel):
 
 
 class EventWatcherClaim(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     watcher_name: str
     event_id: str
-    event_sequence: StrictInt = Field(ge=1)
-    attempt: StrictInt = Field(ge=1)
+    event_sequence: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    attempt: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
     claim_id: str = Field(default_factory=lambda: str(uuid4()))
     lease_expires_at: datetime
 
@@ -84,14 +90,14 @@ class EventWatcherClaim(BaseModel):
 
 
 class EventWatcherDelivery(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     watcher_name: str
     event_id: str
-    event_sequence: StrictInt = Field(ge=1)
+    event_sequence: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
     status: EventWatcherDeliveryStatus
-    attempt: StrictInt = Field(ge=1)
-    cursor_sequence: StrictInt = Field(ge=0)
+    attempt: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    cursor_sequence: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     error: str | None = None
 
     @field_validator("watcher_name", "event_id", "error")
@@ -100,9 +106,7 @@ class EventWatcherDelivery(BaseModel):
         if value is None:
             return None
         if info.field_name == "error":
-            if not value.strip():
-                raise ValueError("error cannot be blank.")
-            return value
+            return require_durable_nonblank(value, "error")
         return require_clean_nonblank(value, info.field_name)
 
 
@@ -116,12 +120,12 @@ class EventWatcherDeadLetter(BaseModel):
     event a handler can be re-dispatched against.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     watcher_name: str
     event_id: str
-    event_sequence: StrictInt = Field(ge=1)
-    attempts: StrictInt = Field(ge=1)
+    event_sequence: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    attempts: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
     error: str
     dead_lettered_at: datetime
     resolved_at: datetime | None = None
@@ -134,9 +138,7 @@ class EventWatcherDeadLetter(BaseModel):
     @field_validator("error")
     @classmethod
     def validate_error(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("error cannot be blank.")
-        return value
+        return require_durable_nonblank(value, "error")
 
     @field_validator("dead_lettered_at", "resolved_at")
     @classmethod
@@ -149,11 +151,11 @@ class EventWatcherDeadLetter(BaseModel):
 
 
 class EventWatcherContext(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     watcher_name: str
     record: EventRecord
-    attempt: StrictInt = Field(ge=1)
+    attempt: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
 
     @field_validator("watcher_name")
     @classmethod
@@ -163,9 +165,7 @@ class EventWatcherContext(BaseModel):
     @field_validator("record")
     @classmethod
     def copy_record(cls, value: EventRecord) -> EventRecord:
-        if type(value) is not EventRecord:
-            raise TypeError("record must be an EventRecord.")
-        return EventRecord(sequence=value.sequence, event=value.event)
+        return copy_event_watcher_record(value)
 
 
 EventWatcherHandler = Callable[[EventWatcherContext], Awaitable[None] | None]
@@ -200,7 +200,7 @@ class EventWatcher:
 
 
 class EventWatcherRunResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     watcher_name: str
     deliveries: list[EventWatcherDelivery] = Field(default_factory=list)
@@ -317,7 +317,7 @@ class InMemoryEventWatcherStore(EventWatcherStore):
         lease_seconds: float,
     ) -> EventWatcherClaim | None:
         watcher_name = require_clean_nonblank(watcher_name, "watcher_name")
-        record = _copy_event_record(record)
+        record = copy_event_watcher_record(record)
         lease_seconds = _validate_lease_seconds(lease_seconds)
         now = self._clock()
         async with self._lock:
@@ -363,7 +363,7 @@ class InMemoryEventWatcherStore(EventWatcherStore):
             return claim.model_copy(deep=True)
 
     async def mark_success(self, claim: EventWatcherClaim) -> EventWatcherDelivery:
-        claim = _copy_claim(claim)
+        claim = copy_event_watcher_claim(claim)
         now = self._clock()
         async with self._lock:
             state = _matching_claim_state(self._states.get(claim.watcher_name), claim)
@@ -395,7 +395,7 @@ class InMemoryEventWatcherStore(EventWatcherStore):
         error: str,
         max_attempts: int,
     ) -> EventWatcherDelivery:
-        claim = _copy_claim(claim)
+        claim = copy_event_watcher_claim(claim)
         error = _clean_error(error)
         max_attempts = _validate_max_attempts(max_attempts)
         now = self._clock()
@@ -519,20 +519,28 @@ def event_query_after_cursor(
     )
 
 
+def copy_event_watcher_record(record: EventRecord) -> EventRecord:
+    if type(record) is not EventRecord:
+        raise TypeError("record must be an EventRecord.")
+    return EventRecord(sequence=record.sequence, event=record.event)
+
+
 def copy_event_watcher_state(state: EventWatcherState) -> EventWatcherState:
     if type(state) is not EventWatcherState:
         raise TypeError("state must be an EventWatcherState.")
-    return state.model_copy(deep=True)
+    return EventWatcherState.model_validate(state.model_dump(mode="python"))
 
 
 def copy_event_watcher_claim(claim: EventWatcherClaim) -> EventWatcherClaim:
-    return _copy_claim(claim)
+    if type(claim) is not EventWatcherClaim:
+        raise TypeError("claim must be an EventWatcherClaim.")
+    return EventWatcherClaim.model_validate(claim.model_dump(mode="python"))
 
 
 def copy_event_watcher_delivery(delivery: EventWatcherDelivery) -> EventWatcherDelivery:
     if type(delivery) is not EventWatcherDelivery:
         raise TypeError("delivery must be an EventWatcherDelivery.")
-    return delivery.model_copy(deep=True)
+    return EventWatcherDelivery.model_validate(delivery.model_dump(mode="python"))
 
 
 def copy_event_watcher_dead_letter(
@@ -540,7 +548,7 @@ def copy_event_watcher_dead_letter(
 ) -> EventWatcherDeadLetter:
     if type(dead_letter) is not EventWatcherDeadLetter:
         raise TypeError("dead_letter must be an EventWatcherDeadLetter.")
-    return dead_letter.model_copy(deep=True)
+    return EventWatcherDeadLetter.model_validate(dead_letter.model_dump(mode="python"))
 
 
 def event_watcher_error_payload(error: BaseException) -> str:
@@ -548,18 +556,6 @@ def event_watcher_error_payload(error: BaseException) -> str:
     if message:
         return message
     return type(error).__name__
-
-
-def _copy_event_record(record: EventRecord) -> EventRecord:
-    if type(record) is not EventRecord:
-        raise TypeError("record must be an EventRecord.")
-    return EventRecord(sequence=record.sequence, event=record.event)
-
-
-def _copy_claim(claim: EventWatcherClaim) -> EventWatcherClaim:
-    if type(claim) is not EventWatcherClaim:
-        raise TypeError("claim must be an EventWatcherClaim.")
-    return claim.model_copy(deep=True)
 
 
 def _matching_claim_state(
@@ -655,6 +651,4 @@ def _validate_max_attempts(value: int) -> int:
 
 
 def _clean_error(value: str) -> str:
-    if type(value) is not str or not value.strip():
-        raise ValueError("error must be a non-empty string.")
-    return copy_json_value(value, "error")
+    return require_durable_nonblank(value, "error")

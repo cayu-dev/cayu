@@ -450,8 +450,8 @@ def test_session_show_summarizes_oversized_state_without_printing_content(
     assert payload["events"]["event_count"] == 3
     assert payload["events"]["largest_payload_bytes"] >= 20_000
     assert payload["activity"]["model_calls"] == 2
-    assert payload["activity"]["model_calls_with_usage"] == 1
-    assert payload["usage"]["input_tokens"] == 100
+    assert payload["activity"]["model_calls_with_usage"] == 2
+    assert payload["usage"]["input_tokens"] == 101
     assert payload["usage"]["cached_input_tokens"] == 80
     assert payload["budget"]["cost_state"] == "unknown"
     assert payload["budget"]["amount"] is None

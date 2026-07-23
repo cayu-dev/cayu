@@ -23,7 +23,18 @@ from cayu._task_wait import (
     consume_pending_task_cancellation,
     unexpected_child_cancellation_error,
 )
-from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu._validation import (
+    DurableValueError,
+    copy_durable_json_object,
+    copy_durable_json_value,
+    copy_json_value,
+    extract_durable_value_error,
+    require_clean_nonblank,
+    require_durable_clean_nonblank,
+    require_durable_text,
+    require_nonblank,
+    safe_durable_value_error_details,
+)
 from cayu.artifacts import (
     RESOLVED_FILE_ATTACHMENTS_OPTION,
     FileAttachment,
@@ -53,21 +64,27 @@ from cayu.providers import (
     InputTokenCountResult,
     ModelCompletion,
     ModelContextOverflowError,
+    ModelFinishReason,
     ModelProvider,
     ModelProviderError,
     ModelRequest,
     ModelStreamEvent,
     ModelStreamEventType,
+    UsageDialect,
     copy_input_token_count_result,
     copy_model_context_pressure_profile,
     copy_model_stream_event,
     normalize_model_completion,
 )
+from cayu.providers.base import copy_model_completion
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _transcript as transcript_helpers
+from cayu.runtime._completion_projection import portable_model_completion_projection
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._model_errors import (
+    copy_provider_exception_control,
     model_provider_error_from_payload,
+    nonportable_model_provider_error,
     resolve_completion_billing_identity,
     resolve_request_billing_identity,
 )
@@ -187,6 +204,15 @@ class ModelAttemptFailed(Exception):
 class _ContextCountObservation:
     result: InputTokenCountResult
     observation_id: str
+
+
+@dataclass(frozen=True)
+class _ModelStreamBoundaryValue:
+    event: ModelStreamEvent
+    completion_error: DurableValueError | None = None
+    accounting_usage_metrics: dict[str, Any] | None = None
+    accounting_usage_rejected: bool = False
+    usage_normalization_failed: bool = False
 
 
 @dataclass(frozen=True)
@@ -502,11 +528,16 @@ class ModelStepExecutor:
             if reservation_failure is not None:
                 raise BudgetDispatchReservationFailed(reservation_failure)
 
+            # Never hand the retry template to provider-controlled code. Each
+            # attempt gets a fully detached, revalidated request so provider
+            # mutation cannot corrupt a later attempt.
+            attempt_model_request = _detach_model_request(model_request)
+
             (
                 context_pressure_observation,
                 context_pressure_event,
             ) = await self._observe_context_pressure(
-                model_request=model_request,
+                model_request=attempt_model_request,
                 session=session,
                 registered_agent=registered_agent,
                 registered_provider=registered_provider,
@@ -519,7 +550,7 @@ class ModelStepExecutor:
                 yield context_pressure_event, None
             context_count_observation, context_count_event = await self._observe_context_count(
                 provider=provider,
-                model_request=model_request,
+                model_request=attempt_model_request,
                 session=session,
                 registered_agent=registered_agent,
                 registered_provider=registered_provider,
@@ -550,7 +581,7 @@ class ModelStepExecutor:
             )
             attempt_events = self._run_once(
                 provider=provider,
-                model_request=model_request,
+                model_request=attempt_model_request,
                 session=session,
                 registered_agent=registered_agent,
                 registered_provider=registered_provider,
@@ -769,6 +800,25 @@ class ModelStepExecutor:
                 )
             )
         except Exception as exc:
+            portability_failure = extract_durable_value_error(exc)
+            provider_failure = None
+            if portability_failure is None:
+                try:
+                    provider_failure = copy_provider_exception_control(exc)
+                except DurableValueError as portability_error:
+                    portability_failure = portability_error
+            if portability_failure is not None:
+                provider_error, durable_diagnostics = nonportable_model_provider_error(
+                    portability_failure,
+                    fallback_provider=registered_provider.name,
+                )
+                error_message = str(provider_error)
+                error_type = type(provider_error).__name__
+            else:
+                assert provider_failure is not None
+                durable_diagnostics = {}
+                error_message = provider_failure.message
+                error_type = provider_failure.error_type
             event = await self._event_writer.emit(
                 Event(
                     type=EventType.CONTEXT_COUNT_FAILED,
@@ -777,8 +827,9 @@ class ModelStepExecutor:
                     environment_name=environment_name,
                     payload={
                         **base_payload,
-                        "error": str(exc),
-                        "error_type": type(exc).__name__,
+                        "error": error_message,
+                        "error_type": error_type,
+                        **durable_diagnostics,
                     },
                 )
             )
@@ -850,10 +901,18 @@ class ModelStepExecutor:
         await before_provider_dispatch()
         provider_events: AsyncIterator[ModelStreamEvent] | None = None
         provider_exhausted = False
+        durable_stream_failure: ModelAttemptFailed | None = None
+        provider_control_failure: ModelProviderError | None = None
         try:
             provider_events = provider.stream(model_request)
             async for raw_stream_event in provider_events:
-                stream_event = _validate_stream_event(raw_stream_event)
+                boundary_value = _validate_stream_event(
+                    raw_stream_event,
+                    provider_name=registered_provider.name,
+                    requested_model=session.model,
+                    usage_dialect=registered_provider.usage_dialect,
+                )
+                stream_event = boundary_value.event
                 await interrupt_poll.raise_if_interrupted()
                 if model_completed:
                     message = f"Model provider emitted event after completed: {stream_event.type}"
@@ -887,43 +946,51 @@ class ModelStepExecutor:
                         # but an empty readable delta should not reach consumers.
                         continue
                 elif stream_event.type == ModelStreamEventType.COMPLETED:
-                    try:
-                        billing_identity = resolve_completion_billing_identity(
-                            provider,
-                            billing_identity,
-                            stream_event.payload,
-                            provider_name=registered_provider.name,
+                    completion_terminal_error: ModelProviderError | None = None
+                    completion_diagnostics: dict[str, Any] = {}
+                    if boundary_value.completion_error is not None:
+                        code, path = safe_durable_value_error_details(
+                            boundary_value.completion_error
                         )
-                    except ModelProviderError as provider_error:
-                        error_payload = {
-                            "error": str(provider_error),
-                            "error_type": type(provider_error).__name__,
-                            "stage": "billing_identity_for_completion",
-                            **provider_error.error_payload_fields(),
+                        completion_terminal_error = ModelProviderError(
+                            "Model provider emitted a non-portable completion value.",
+                            provider=registered_provider.name,
+                            error_type="DurableValueError",
+                            error_code="invalid_model_completion_value",
+                            retryable=False,
+                        )
+                        completion_diagnostics = {
+                            "completion_outcome": "invalid_metadata",
+                            "completion_error": {
+                                "error": str(completion_terminal_error),
+                                "error_type": type(completion_terminal_error).__name__,
+                                "durable_value_error_code": code,
+                                "durable_value_path": path,
+                                **completion_terminal_error.error_payload_fields(),
+                            },
                         }
-                        yield (
-                            await self._event_writer.emit(
-                                Event(
-                                    type=EventType.MODEL_ERROR,
-                                    session_id=session.id,
-                                    agent_name=registered_agent.spec.name,
-                                    environment_name=environment_name,
-                                    payload=_retry_attempt_payload(
-                                        error_payload,
-                                        step=step,
-                                        attempt=attempt,
-                                        max_attempts=max_attempts,
-                                    ),
-                                )
-                            ),
-                            None,
-                        )
-                        raise ModelAttemptFailed(
-                            message=str(provider_error),
-                            payload=error_payload,
-                            emitted_error_event=True,
-                            cause=provider_error,
-                        ) from provider_error
+                    else:
+                        try:
+                            billing_identity = resolve_completion_billing_identity(
+                                provider,
+                                billing_identity,
+                                copy_durable_json_object(
+                                    stream_event.payload,
+                                    "completed_payload",
+                                ),
+                                provider_name=registered_provider.name,
+                            )
+                        except ModelProviderError as exc:
+                            completion_terminal_error = exc
+                            completion_diagnostics = {
+                                "completion_outcome": "billing_identity_resolution_failed",
+                                "completion_error": {
+                                    "error": str(completion_terminal_error),
+                                    "error_type": type(completion_terminal_error).__name__,
+                                    "stage": "billing_identity_for_completion",
+                                    **completion_terminal_error.error_payload_fields(),
+                                },
+                            }
                     model_completed = True
                     completed_stream_event = stream_event
                     provider_state_parts = transcript_helpers.provider_state_parts(
@@ -956,10 +1023,17 @@ class ModelStepExecutor:
                             transcript_cursor_before_request
                             + (1 if assistant_message is not None else 0)
                         ),
-                        usage_dialect=registered_provider.provider.usage_dialect,
+                        usage_dialect=registered_provider.usage_dialect,
                         billing_identity=billing_identity,
+                        accounting_usage_metrics=boundary_value.accounting_usage_metrics,
+                        accounting_usage_rejected=boundary_value.accounting_usage_rejected,
+                        usage_normalization_failed=(boundary_value.usage_normalization_failed),
+                        completion_diagnostics=completion_diagnostics,
                     )
                     yield await self._event_writer.emit(event), None
+                    if completion_terminal_error is not None:
+                        provider_control_failure = completion_terminal_error
+                        break
                     continue
 
                 if stream_event.type == ModelStreamEventType.ERROR:
@@ -982,7 +1056,7 @@ class ModelStepExecutor:
                     step=step,
                     attempt=attempt,
                     max_attempts=max_attempts,
-                    usage_dialect=registered_provider.provider.usage_dialect,
+                    usage_dialect=registered_provider.usage_dialect,
                 )
                 emitted_event = await self._event_writer.emit(event)
                 if stream_event.type == ModelStreamEventType.ERROR:
@@ -1000,26 +1074,98 @@ class ModelStepExecutor:
                         cause=provider_error or RuntimeError(message),
                     )
                 yield emitted_event, None
-            provider_exhausted = True
+            else:
+                provider_exhausted = True
         except SessionInterruptedByRequest:
             raise
         except asyncio.CancelledError:
             raise
         except ModelAttemptFailed:
             raise
-        except ModelContextOverflowError:
-            raise
         except Exception as exc:
-            raise ModelAttemptFailed(
-                message=str(exc),
-                payload={"error": str(exc), "error_type": type(exc).__name__},
-                emitted_error_event=False,
-                cause=exc,
-            ) from exc
+            provider_failure = None
+            durable_error = extract_durable_value_error(exc)
+            invalid_provider_error = False
+            if isinstance(exc, ModelProviderError) or durable_error is None:
+                try:
+                    provider_failure = copy_provider_exception_control(exc)
+                except DurableValueError as portability_error:
+                    durable_error = portability_error
+                    invalid_provider_error = True
+            if provider_failure is not None:
+                if isinstance(provider_failure.cause, ModelContextOverflowError):
+                    provider_control_failure = provider_failure.cause
+                else:
+                    durable_stream_failure = ModelAttemptFailed(
+                        message=provider_failure.message,
+                        payload={
+                            "error": provider_failure.message,
+                            "error_type": provider_failure.error_type,
+                        },
+                        emitted_error_event=False,
+                        cause=provider_failure.cause,
+                    )
+            elif durable_error is not None:
+                if invalid_provider_error:
+                    provider_error, durable_diagnostics = nonportable_model_provider_error(
+                        durable_error,
+                        fallback_provider=registered_provider.name,
+                    )
+                else:
+                    durable_error_code, durable_error_path = safe_durable_value_error_details(
+                        durable_error
+                    )
+                    provider_error = ModelProviderError(
+                        "Model provider emitted a non-portable stream value.",
+                        provider=registered_provider.name,
+                        error_type="DurableValueError",
+                        error_code="invalid_model_stream_value",
+                        retryable=False,
+                    )
+                    durable_diagnostics = {
+                        "durable_value_error_code": durable_error_code,
+                        "durable_value_path": durable_error_path,
+                    }
+                error_payload = {
+                    "error": str(provider_error),
+                    "error_type": type(provider_error).__name__,
+                    "stage": "model_stream_validation",
+                    **durable_diagnostics,
+                    **provider_error.error_payload_fields(),
+                }
+                durable_stream_failure = ModelAttemptFailed(
+                    message=str(provider_error),
+                    payload=error_payload,
+                    emitted_error_event=True,
+                    cause=provider_error,
+                )
+                yield (
+                    await self._event_writer.emit(
+                        Event(
+                            type=EventType.MODEL_ERROR,
+                            session_id=session.id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=environment_name,
+                            payload=_retry_attempt_payload(
+                                error_payload,
+                                step=step,
+                                attempt=attempt,
+                                max_attempts=max_attempts,
+                            ),
+                        )
+                    ),
+                    None,
+                )
+            else:  # pragma: no cover - every Exception has a control or durable failure
+                raise RuntimeError("Provider exception handling lost its failure state.") from None
         finally:
             if provider_events is not None and not provider_exhausted:
                 await _close_async_iterator(provider_events)
 
+        if provider_control_failure is not None:
+            raise provider_control_failure from None
+        if durable_stream_failure is not None:
+            raise durable_stream_failure from None
         if not model_completed:
             message = "Model provider stream ended without a completed event."
             raise ModelAttemptFailed(
@@ -1316,7 +1462,7 @@ class ModelStepRun:
         try:
             billing_identity = await resolve_request_billing_identity(
                 self._provider,
-                model_request,
+                _detach_model_request(model_request),
                 provider_name=self._registered_provider.name,
             )
         except asyncio.CancelledError:
@@ -3019,10 +3165,14 @@ class ModelStepRun:
                 "ContextCompactor.provider_budget_identity must return a "
                 "(provider_name, model) tuple or None."
             )
-        require_clean_nonblank(identity[0], "compactor_provider_name")
-        require_clean_nonblank(identity[1], "compactor_model")
-        pricing_provider_name = identity[0]
-        declared_model = identity[1]
+        pricing_provider_name = require_durable_clean_nonblank(
+            identity[0],
+            "compactor_provider_name",
+        )
+        declared_model = require_durable_clean_nonblank(
+            identity[1],
+            "compactor_model",
+        )
         contextual_limits = tuple(
             limit
             for limit in strict_contextual_candidates
@@ -3057,11 +3207,29 @@ class ModelStepRun:
         )
 
         async def run_provider_dispatch(
-            actual_provider: ModelProvider,
+            actual_pricing_provider_name: str,
             actual_model: str,
+            actual_usage_dialect: UsageDialect,
             billing_identity: BillingIdentity | None,
             dispatch: Callable[[], Awaitable[tuple[str, dict[str, Any]]]],
         ) -> tuple[str, dict[str, Any]]:
+            del actual_usage_dialect
+            actual_pricing_provider_name = require_durable_clean_nonblank(
+                actual_pricing_provider_name,
+                "compactor_provider_name",
+            )
+            actual_model = require_durable_clean_nonblank(
+                actual_model,
+                "compactor_model",
+            )
+            if actual_pricing_provider_name != pricing_provider_name:
+                raise RuntimeError(
+                    "Compaction dispatch provider identity differs from its admitted identity."
+                )
+            if actual_model != declared_model:
+                raise RuntimeError(
+                    "Compaction dispatch model identity differs from its admitted identity."
+                )
             before_count = len(completed_payloads())
 
             def completion_events(payloads: list[dict[str, Any]]) -> list[Event]:
@@ -3085,10 +3253,6 @@ class ModelStepRun:
             def completed_events() -> list[Event]:
                 return completion_events(completed_payloads()[before_count:])
 
-            actual_pricing_provider_name = require_clean_nonblank(
-                actual_provider.billing_provider_name or actual_provider.name,
-                "compactor_provider_name",
-            )
             billing_identity_state = resolved_billing_identity(billing_identity)
             budget_evaluation = await self._limit_gate.evaluate_budget(
                 BudgetPolicy(limits=dispatch_policy_limits),
@@ -3560,13 +3724,134 @@ def _same_file_attachment_ref(left: FileAttachment, right: FileAttachment) -> bo
     return left.model_dump(mode="json") == right.model_dump(mode="json")
 
 
-def _validate_stream_event(value: object) -> ModelStreamEvent:
+def _validate_stream_event(
+    value: object,
+    *,
+    provider_name: str,
+    requested_model: str,
+    usage_dialect: str | None,
+) -> _ModelStreamBoundaryValue:
     if type(value) is not ModelStreamEvent:
         raise TypeError("Model providers must yield ModelStreamEvent instances.")
-    return copy_model_stream_event(value)
+    if type(value.type) is not ModelStreamEventType:
+        raise ValueError("Model provider stream event type must be a ModelStreamEventType.")
+    if value.type != ModelStreamEventType.COMPLETED:
+        return _ModelStreamBoundaryValue(event=copy_model_stream_event(value))
+    if type(value.delta) is not str:
+        raise ValueError("Model provider stream event delta must be a string.")
+    if type(value.payload) is not dict:
+        raise ValueError("Model provider stream event payload must be an object.")
+
+    completion_error: DurableValueError | None = None
+    try:
+        delta = require_durable_text(value.delta, "delta")
+    except DurableValueError as exc:
+        completion_error = exc
+        delta = ""
+    payload_was_projected = False
+    try:
+        payload = copy_durable_json_object(value.payload, "payload")
+    except DurableValueError as exc:
+        if completion_error is None:
+            completion_error = exc
+        payload_was_projected = True
+        payload = portable_model_completion_projection(
+            value.payload,
+            provider_name=provider_name,
+            requested_model=requested_model,
+            usage_dialect=usage_dialect,
+        )
+    usage_normalization_failed = (
+        payload_was_projected and payload.pop("usage_normalization_failed", None) is True
+    )
+    payload.pop("usage_unavailable_reason", None)
+
+    # Raw usage makes runtime normalization authoritative. Preserve the legacy
+    # normalized-only provider path when no raw payload exists, but never let a
+    # provider-supplied projection override contradictory raw counters.
+    has_raw_usage = payload.get("usage") is not None
+    accounting_usage_metrics = payload.pop("usage_metrics", None)
+    accounting_usage_rejected = False
+    if has_raw_usage or type(accounting_usage_metrics) is not dict:
+        accounting_usage_metrics = None
+    if accounting_usage_metrics is None:
+        resolved_model = _payload_model(payload, fallback=requested_model)
+        try:
+            projected_metrics = usage_metrics_payload(
+                normalize_usage_metrics(
+                    provider_name=provider_name,
+                    model=resolved_model,
+                    requested_model=requested_model,
+                    raw_usage=payload.get("usage"),
+                    usage_dialect=usage_dialect,
+                )
+            )
+        except (TypeError, ValueError):
+            # Normalization can combine independently valid counters into a
+            # total or cache aggregate beyond the durable int64 domain. The
+            # provider call has completed, so retain its raw portable usage
+            # as rejection evidence and terminalize this attempt.
+            if completion_error is None:
+                completion_error = DurableValueError(
+                    "integer_out_of_range",
+                    "usage_metrics",
+                )
+            accounting_usage_rejected = True
+            projected_metrics = None
+        if projected_metrics is not None:
+            try:
+                accounting_usage_metrics = copy_durable_json_object(
+                    projected_metrics,
+                    "usage_metrics",
+                )
+            except DurableValueError as exc:
+                # Derived counters can exceed the portable integer range even
+                # when each raw counter is independently valid. Completion has
+                # already happened, so fence the attempt as terminal while
+                # retaining the portable raw usage evidence; never redispatch.
+                if completion_error is None:
+                    completion_error = exc
+                accounting_usage_rejected = True
+
+    try:
+        completion = copy_model_completion(value.completion)
+    except (TypeError, ValueError) as exc:
+        if completion_error is None:
+            completion_error = extract_durable_value_error(exc) or DurableValueError(
+                "invalid_json_type",
+                "completion",
+            )
+        completion = None
+    if completion is None:
+        try:
+            completion = normalize_model_completion(payload)
+        except (TypeError, ValueError) as exc:
+            if completion_error is None:
+                completion_error = extract_durable_value_error(exc) or DurableValueError(
+                    "invalid_json_type",
+                    "completion",
+                )
+            completion = ModelCompletion(finish_reason=ModelFinishReason.UNKNOWN)
+
+    return _ModelStreamBoundaryValue(
+        event=ModelStreamEvent.model_construct(
+            type=ModelStreamEventType.COMPLETED,
+            delta=delta,
+            payload=payload,
+            completion=completion,
+        ),
+        completion_error=completion_error,
+        accounting_usage_metrics=accounting_usage_metrics,
+        accounting_usage_rejected=accounting_usage_rejected,
+        usage_normalization_failed=usage_normalization_failed,
+    )
 
 
 def _copy_model_request_for_counting(request: ModelRequest) -> ModelRequest:
+    return _detach_model_request(request)
+
+
+def _detach_model_request(request: ModelRequest) -> ModelRequest:
     if type(request) is not ModelRequest:
         raise TypeError("request must be a ModelRequest.")
     return ModelRequest(
@@ -3720,6 +4005,10 @@ def _model_stream_event_to_runtime_event(
     transcript_cursor_after_completion: int | None = None,
     usage_dialect: str | None = None,
     billing_identity: BillingIdentity | None = None,
+    accounting_usage_metrics: dict[str, Any] | None = None,
+    accounting_usage_rejected: bool = False,
+    usage_normalization_failed: bool = False,
+    completion_diagnostics: dict[str, Any] | None = None,
 ) -> Event:
     if type(stream_event) is not ModelStreamEvent:
         raise TypeError("Model stream events must be ModelStreamEvent instances.")
@@ -3735,10 +4024,21 @@ def _model_stream_event_to_runtime_event(
         # marker are runtime-owned accounting evidence. Providers that expose
         # only the established normalized-usage payload retain compatibility.
         has_raw_usage = payload.get("usage") is not None
-        if has_raw_usage:
-            payload.pop("usage_metrics", None)
+        payload.pop("usage_metrics", None)
         payload.pop("usage_normalization_failed", None)
+        payload.pop("usage_unavailable_reason", None)
+        payload.pop("usage_metrics_rejected", None)
+        payload.pop("rejected_usage_evidence", None)
+        if accounting_usage_rejected:
+            rejected_usage = payload.pop("usage", None)
+            if rejected_usage is not None:
+                payload["rejected_usage_evidence"] = copy_durable_json_value(
+                    rejected_usage,
+                    "rejected_usage_evidence",
+                )
+            payload["usage_metrics_rejected"] = True
         resolved_model = _payload_model(payload, fallback=session.model)
+        payload["model"] = resolved_model
         payload["requested_model"] = session.model
         if provider_name is None:
             payload.pop("provider_name", None)
@@ -3763,14 +4063,20 @@ def _model_stream_event_to_runtime_event(
         payload["completion"] = completion_payload
         if classification is not None:
             payload["step_classification"] = classification
-        metrics = usage_metrics_payload(
-            normalize_usage_metrics(
-                provider_name=provider_name,
-                model=resolved_model,
-                requested_model=session.model,
-                raw_usage=payload.get("usage"),
-                usage_dialect=usage_dialect,
-                billing_identity=billing_identity,
+        metrics = (
+            copy_durable_json_object(accounting_usage_metrics, "usage_metrics")
+            if accounting_usage_metrics is not None
+            else None
+            if accounting_usage_rejected
+            else usage_metrics_payload(
+                normalize_usage_metrics(
+                    provider_name=provider_name,
+                    model=resolved_model,
+                    requested_model=session.model,
+                    raw_usage=payload.get("usage"),
+                    usage_dialect=usage_dialect,
+                    billing_identity=billing_identity,
+                )
             )
         )
         if metrics is not None:
@@ -3779,7 +4085,7 @@ def _model_stream_event_to_runtime_event(
             # accounting evidence when normalized usage is unavailable.
             metrics.pop("billing_identity", None)
             payload["usage_metrics"] = metrics
-        elif has_raw_usage:
+        elif (has_raw_usage and not accounting_usage_rejected) or usage_normalization_failed:
             payload["usage_normalization_failed"] = True
         if context_pressure_estimate is not None:
             payload["context_pressure"] = {
@@ -3798,6 +4104,13 @@ def _model_stream_event_to_runtime_event(
             }
         if transcript_cursor_after_completion is not None:
             payload["transcript_cursor"] = transcript_cursor_after_completion
+        if completion_diagnostics:
+            payload.update(
+                copy_durable_json_object(
+                    completion_diagnostics,
+                    "completion_diagnostics",
+                )
+            )
         event_type = EventType.MODEL_COMPLETED
     elif stream_event.type == ModelStreamEventType.ERROR:
         event_type = EventType.MODEL_ERROR

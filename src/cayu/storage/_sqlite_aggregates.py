@@ -23,9 +23,9 @@ from cayu.runtime.aggregates import (
     UsagePricingInput,
     UsageRollupStoreResult,
     aggregate_identity_value,
+    build_aggregate_usage_metrics,
 )
 from cayu.runtime.sessions import UsageRollupQuery
-from cayu.runtime.usage import CacheUsageMetrics, UsageMetrics
 from cayu.storage._session_store_sql import SessionQuerySqlPlan
 
 _RESULT_SQL = """
@@ -650,20 +650,18 @@ def _totals_from_row(row: sqlite3.Row) -> UsageAggregateTotals:
         model_steps=_row_int(row, "model_steps"),
         model_steps_with_usage=_row_int(row, "model_steps_with_usage"),
         tool_calls=_row_int(row, "tool_calls"),
-        usage=UsageMetrics(
+        usage=build_aggregate_usage_metrics(
             input_tokens=_row_int(row, "input_tokens"),
             output_tokens=_row_int(row, "output_tokens"),
             total_tokens=_row_int(row, "total_tokens"),
             reasoning_output_tokens=_row_int(row, "reasoning_output_tokens"),
-            cache=CacheUsageMetrics(
-                read_tokens=_row_int(row, "cache_read_tokens"),
-                write_tokens=_row_int(row, "cache_write_tokens"),
-                write_5m_tokens=_row_int(row, "cache_write_5m_tokens"),
-                write_1h_tokens=_row_int(row, "cache_write_1h_tokens"),
-                write_unknown_ttl_tokens=_row_int(row, "cache_write_unknown_ttl_tokens"),
-                cached_input_tokens=_row_int(row, "cached_input_tokens"),
-                uncached_input_tokens=_row_int(row, "uncached_input_tokens"),
-            ),
+            cache_read_tokens=_row_int(row, "cache_read_tokens"),
+            cache_write_tokens=_row_int(row, "cache_write_tokens"),
+            cache_write_5m_tokens=_row_int(row, "cache_write_5m_tokens"),
+            cache_write_1h_tokens=_row_int(row, "cache_write_1h_tokens"),
+            cache_write_unknown_ttl_tokens=_row_int(row, "cache_write_unknown_ttl_tokens"),
+            cached_input_tokens=_row_int(row, "cached_input_tokens"),
+            uncached_input_tokens=_row_int(row, "uncached_input_tokens"),
         ),
     )
 

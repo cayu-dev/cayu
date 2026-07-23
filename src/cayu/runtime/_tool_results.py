@@ -1,13 +1,117 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from copy import deepcopy
+from dataclasses import dataclass
+from itertools import islice
 from typing import Any
 
-from cayu._validation import copy_json_value
+from cayu._validation import (
+    DurableValueError,
+    FrozenJsonDict,
+    FrozenJsonList,
+    compact_json_utf8_size,
+    copy_durable_json_value,
+    extract_durable_value_error,
+    json_utf8_size_within_limit,
+    require_durable_text,
+    safe_durable_value_error_details,
+)
 from cayu.core.events import Event
-from cayu.core.tools import ToolResult
+from cayu.core.tools import ToolEffect, ToolResult
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.vaults import SecretRedactor
+
+_MAX_DIAGNOSTIC_UTF8_BYTES = 4 * 1024
+_MAX_DIAGNOSTIC_TYPE_UTF8_BYTES = 128
+_MAX_PORTABLE_EVIDENCE_UTF8_BYTES = 12 * 1024
+_MAX_PORTABLE_EVIDENCE_DEPTH = 16
+_MAX_PORTABLE_EVIDENCE_NODES = 256
+_MAX_PRIORITY_KEY_SCAN = 4 * 1024
+_TRUNCATION_MARKER = "\u2026[truncated]"
+_OMITTED = object()
+_NO_EVIDENCE = object()
+_PRIORITY_EVIDENCE_KEYS = (
+    "receipt_id",
+    "receiptId",
+    "receipt",
+    "confirmation_id",
+    "confirmationId",
+    "transaction_id",
+    "transactionId",
+    "transaction",
+    "idempotency_key",
+    "idempotencyKey",
+    "request_id",
+    "requestId",
+    "operation_id",
+    "operationId",
+    "tool_effect",
+    "effect",
+    "outcome",
+    "status",
+)
+_TERMINAL_OUTCOMES = frozenset(
+    {
+        "invalid_tool_output",
+        "tool_execution_error",
+        "tool_execution_timeout",
+    }
+)
+_RUNTIME_TERMINAL_CONTROL_FIELDS = frozenset(
+    {
+        "terminal_outcome",
+        "tool_effect",
+        "outcome_unknown",
+        "manual_reconciliation_required",
+        "durable_value_error_code",
+        "durable_value_error_path",
+    }
+)
+_RUNTIME_TOOL_EVENT_LINKAGE_FIELDS = frozenset(
+    {
+        "approval_id",
+        "idempotency_key",
+        "input_id",
+        "tool_call_id",
+        "tool_name",
+        "tool_round_id",
+    }
+)
+_TOOL_EFFECT_VALUES = frozenset(effect.value for effect in ToolEffect)
+
+
+@dataclass(frozen=True, slots=True)
+class ExceptionDiagnostic:
+    """Bounded, portable exception evidence for durable observability records."""
+
+    message: str
+    error_type: str
+    durable_value_error_code: str | None = None
+    durable_value_error_path: str | None = None
+
+    def payload_fields(self) -> dict[str, Any]:
+        fields: dict[str, Any] = {
+            "error": self.message,
+            "error_type": self.error_type,
+        }
+        if self.durable_value_error_code is not None:
+            fields["durable_value_error_code"] = self.durable_value_error_code
+            fields["durable_value_error_path"] = self.durable_value_error_path
+        return fields
+
+
+@dataclass(frozen=True, slots=True)
+class _PortableEvidence:
+    value: Any
+    included: bool
+    incomplete: bool
+
+
+@dataclass(slots=True)
+class _SalvageState:
+    remaining_nodes: int = _MAX_PORTABLE_EVIDENCE_NODES
+    incomplete: bool = False
 
 
 def normalize_tool_result(result: ToolResult) -> ToolResult:
@@ -21,8 +125,8 @@ def validate_tool_result(result: ToolResult) -> ToolResult:
         raise TypeError("Tool results must be ToolResult instances.")
     return ToolResult(
         content=result.content,
-        structured=copy_json_value(result.structured, "structured"),
-        artifacts=copy_json_value(result.artifacts, "artifacts"),
+        structured=copy_durable_json_value(result.structured, "structured"),
+        artifacts=copy_durable_json_value(result.artifacts, "artifacts"),
         is_error=result.is_error,
     )
 
@@ -50,14 +154,128 @@ def redact_tool_result_event(
 ) -> tuple[Event, ToolResult]:
     """Redact a terminal event payload and keep its result field synchronized."""
 
-    redacted_result = redact_tool_result(result, redactor)
+    if not isinstance(redactor, SecretRedactor):
+        raise TypeError("redactor must be a SecretRedactor.")
+    terminal_controls = _runtime_terminal_controls(event.payload)
     if not redactor.has_values:
-        return event, redacted_result
-    payload = redactor.redact_json(event.payload)
+        return event, redact_tool_result(result, redactor)
+    result_to_redact = _tool_result_without_terminal_controls(
+        result,
+        terminal_controls=terminal_controls,
+    )
+    redacted_result = (
+        _redact_terminal_result(result_to_redact, redactor)
+        if terminal_controls
+        else redact_tool_result(result_to_redact, redactor)
+    )
+    linkage_fields = _runtime_tool_event_linkage_fields(event.payload)
+    payload_to_redact = {
+        key: value
+        for key, value in event.payload.items()
+        if key != "result"
+        and key not in linkage_fields
+        and not (terminal_controls and key in _RUNTIME_TERMINAL_CONTROL_FIELDS)
+    }
+    payload = redactor.redact_json(payload_to_redact)
     if type(payload) is not dict:
         raise AssertionError("Event payload redaction returned non-object payload.")
+    payload.update(linkage_fields)
+    if terminal_controls:
+        structured = dict(redacted_result.structured or {})
+        structured.update(terminal_controls)
+        redacted_result = ToolResult(
+            content=redacted_result.content,
+            structured=structured,
+            artifacts=redacted_result.artifacts,
+            is_error=redacted_result.is_error,
+        )
+        payload.update(terminal_controls)
     payload["result"] = redacted_result.model_dump()
     return event.model_copy(update={"payload": payload}), redacted_result
+
+
+def _runtime_tool_event_linkage_fields(payload: dict[str, Any]) -> dict[str, str]:
+    """Validate runtime-owned identities before exempting them from redaction."""
+
+    linkage: dict[str, str] = {}
+    for key in _RUNTIME_TOOL_EVENT_LINKAGE_FIELDS:
+        if key not in payload:
+            continue
+        value = require_durable_text(payload[key], key)
+        if not value.strip():
+            raise ValueError(f"Runtime tool event `{key}` cannot be blank.")
+        linkage[key] = value
+    return linkage
+
+
+def _runtime_terminal_controls(payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate runtime controls before exempting them from secret redaction."""
+
+    if "terminal_outcome" not in payload:
+        return {}
+    terminal_outcome = payload.get("terminal_outcome")
+    tool_effect = payload.get("tool_effect")
+    outcome_unknown = payload.get("outcome_unknown")
+    manual_reconciliation_required = payload.get("manual_reconciliation_required")
+    if type(terminal_outcome) is not str or terminal_outcome not in _TERMINAL_OUTCOMES:
+        raise ValueError("Invalid runtime terminal_outcome control.")
+    if type(tool_effect) is not str or tool_effect not in _TOOL_EFFECT_VALUES:
+        raise ValueError("Invalid runtime tool_effect control.")
+    if type(outcome_unknown) is not bool:
+        raise TypeError("Runtime outcome_unknown control must be a boolean.")
+    if type(manual_reconciliation_required) is not bool:
+        raise TypeError("Runtime manual_reconciliation_required control must be a boolean.")
+    if outcome_unknown != (tool_effect != ToolEffect.NONE.value):
+        raise ValueError("Runtime outcome_unknown control conflicts with tool_effect.")
+    if manual_reconciliation_required != (tool_effect == ToolEffect.EXTERNAL.value):
+        raise ValueError(
+            "Runtime manual_reconciliation_required control conflicts with tool_effect."
+        )
+    controls: dict[str, Any] = {
+        "terminal_outcome": terminal_outcome,
+        "tool_effect": tool_effect,
+        "outcome_unknown": outcome_unknown,
+        "manual_reconciliation_required": manual_reconciliation_required,
+    }
+    code_present = "durable_value_error_code" in payload
+    path_present = "durable_value_error_path" in payload
+    if code_present is not path_present:
+        raise ValueError("Runtime durable-value error controls must be paired.")
+    if code_present:
+        code = payload["durable_value_error_code"]
+        path = payload["durable_value_error_path"]
+        if type(code) is not str or type(path) is not str:
+            raise TypeError("Runtime durable-value error controls must be strings.")
+        try:
+            trusted_error = DurableValueError(code, "tool_result", path=path)
+        except Exception as exc:
+            raise ValueError("Invalid runtime durable-value error controls.") from exc
+        safe_code, safe_path = safe_durable_value_error_details(trusted_error)
+        if (safe_code, safe_path) != (code, path):
+            raise ValueError("Invalid runtime durable-value error controls.")
+        controls["durable_value_error_code"] = safe_code
+        controls["durable_value_error_path"] = safe_path
+    return controls
+
+
+def _tool_result_without_terminal_controls(
+    result: ToolResult,
+    *,
+    terminal_controls: dict[str, Any],
+) -> ToolResult:
+    if not terminal_controls or result.structured is None:
+        return result
+    structured = {
+        key: value
+        for key, value in result.structured.items()
+        if key not in _RUNTIME_TERMINAL_CONTROL_FIELDS
+    }
+    return ToolResult(
+        content=result.content,
+        structured=structured,
+        artifacts=result.artifacts,
+        is_error=result.is_error,
+    )
 
 
 def redact_tool_call_outcomes(
@@ -80,8 +298,427 @@ def tool_result_from_payload(payload: dict[str, Any]) -> ToolResult:
     return normalize_tool_result(validate_tool_result(ToolResult(**deepcopy(payload))))
 
 
+def exception_diagnostic(
+    exc: Exception,
+    *,
+    empty_message: str = "operation failed",
+    nonportable_message: str = "Operation failed with a non-portable diagnostic.",
+) -> ExceptionDiagnostic:
+    """Render an exception without letting rejected values enter another boundary.
+
+    Durable-value failures are read through their structured, bounded fields. Other
+    exception text is accepted only after it satisfies the durable text contract.
+    """
+
+    error_type = _safe_exception_type_name(exc)
+    durable_error = extract_durable_value_error(exc)
+    if durable_error is not None:
+        code, path = safe_durable_value_error_details(durable_error)
+        return ExceptionDiagnostic(
+            message=_bound_diagnostic_text(nonportable_message),
+            error_type=error_type,
+            durable_value_error_code=code,
+            durable_value_error_path=path,
+        )
+    try:
+        rendered = str(exc).strip()
+    except BaseException:
+        rendered = ""
+    if rendered:
+        try:
+            require_durable_text(rendered, "error")
+        except BaseException as validation_error:
+            durable_error = extract_durable_value_error(validation_error)
+            code = path = None
+            if durable_error is not None:
+                code, path = safe_durable_value_error_details(durable_error)
+            return ExceptionDiagnostic(
+                message=_bound_diagnostic_text(nonportable_message),
+                error_type=error_type,
+                durable_value_error_code=code,
+                durable_value_error_path=path,
+            )
+        message = rendered
+    else:
+        message = f"{error_type}: {empty_message}"
+    return ExceptionDiagnostic(
+        message=_bound_diagnostic_text(message),
+        error_type=error_type,
+    )
+
+
+def redact_exception_diagnostic(
+    diagnostic: ExceptionDiagnostic,
+    redactor: SecretRedactor,
+) -> ExceptionDiagnostic:
+    if not isinstance(redactor, SecretRedactor):
+        raise TypeError("redactor must be a SecretRedactor.")
+    return ExceptionDiagnostic(
+        message=_bound_diagnostic_text(redactor.redact_text(diagnostic.message)),
+        error_type=diagnostic.error_type,
+        durable_value_error_code=diagnostic.durable_value_error_code,
+        durable_value_error_path=diagnostic.durable_value_error_path,
+    )
+
+
 def exception_message(exc: Exception) -> str:
-    message = str(exc).strip()
-    if message:
-        return message
-    return f"{type(exc).__name__}: tool execution failed"
+    """Backward-compatible safe message used by ordinary tool failures."""
+
+    return exception_diagnostic(exc, empty_message="tool execution failed").message
+
+
+def terminal_failure_result(
+    *,
+    terminal_outcome: str,
+    effect: ToolEffect,
+    message: str,
+    raw_evidence: Any = _NO_EVIDENCE,
+    diagnostic: ExceptionDiagnostic | None = None,
+) -> tuple[ToolResult, dict[str, Any]]:
+    """Build the runtime-owned terminal result for a post-dispatch failure.
+
+    The control fields are deliberately separate from the tool-supplied value.
+    Valid siblings from a malformed return value are retained as bounded evidence;
+    invalid leaves and custom container implementations are never invoked.
+    """
+
+    terminal_outcome = require_durable_text(terminal_outcome, "terminal_outcome")
+    message = _bound_diagnostic_text(require_durable_text(message, "message"))
+    outcome_unknown = effect is not ToolEffect.NONE
+    manual_reconciliation_required = effect is ToolEffect.EXTERNAL
+    controls: dict[str, Any] = {
+        "terminal_outcome": terminal_outcome,
+        "tool_effect": effect.value,
+        "outcome_unknown": outcome_unknown,
+        "manual_reconciliation_required": manual_reconciliation_required,
+    }
+    structured = dict(controls)
+    if diagnostic is not None and diagnostic.durable_value_error_code is not None:
+        controls["durable_value_error_code"] = diagnostic.durable_value_error_code
+        controls["durable_value_error_path"] = diagnostic.durable_value_error_path
+        structured["durable_value_error_code"] = diagnostic.durable_value_error_code
+        structured["durable_value_error_path"] = diagnostic.durable_value_error_path
+    if raw_evidence is not _NO_EVIDENCE:
+        evidence = portable_result_evidence(raw_evidence)
+        if evidence.included:
+            structured["portable_result_evidence"] = evidence.value
+        structured["portable_result_evidence_incomplete"] = evidence.incomplete
+    result = ToolResult(content=message, structured=structured, is_error=True)
+    return result, copy_durable_json_value(controls, "terminal_tool_controls")
+
+
+def raw_tool_result_evidence(value: Any) -> Any:
+    """Expose exact ToolResult fields without invoking forged model serializers."""
+
+    if type(value) is not ToolResult:
+        return {"returned_value": value}
+    try:
+        fields = object.__getattribute__(value, "__dict__")
+    except BaseException:
+        return {}
+    if type(fields) is not dict:
+        return {}
+    recognized = ("structured", "content", "artifacts", "is_error")
+    evidence: dict[str, Any] = {}
+    for index, (name, field_value) in enumerate(fields.items()):
+        if index >= _MAX_PRIORITY_KEY_SCAN or len(evidence) == len(recognized):
+            break
+        if type(name) is str and name in recognized:
+            evidence[name] = field_value
+    return evidence
+
+
+def portable_result_evidence(value: Any) -> _PortableEvidence:
+    """Project portable siblings from an untrusted result under fixed limits."""
+
+    state = _SalvageState()
+    try:
+        salvaged = _salvage_portable_value(
+            value,
+            max_bytes=_MAX_PORTABLE_EVIDENCE_UTF8_BYTES,
+            depth=0,
+            active_container_ids=set(),
+            state=state,
+        )
+    except BaseException:
+        return _PortableEvidence(value=None, included=False, incomplete=True)
+    if salvaged is _OMITTED:
+        return _PortableEvidence(value=None, included=False, incomplete=True)
+    if not json_utf8_size_within_limit(
+        salvaged,
+        _MAX_PORTABLE_EVIDENCE_UTF8_BYTES,
+        ensure_ascii=False,
+    ):
+        # The recursive accounting is exact for ordinary JSON values. Keep this
+        # defensive fail-closed guard at the final durable boundary.
+        return _PortableEvidence(value=None, included=False, incomplete=True)
+    return _PortableEvidence(value=salvaged, included=True, incomplete=state.incomplete)
+
+
+def _salvage_portable_value(
+    value: Any,
+    *,
+    max_bytes: int,
+    depth: int,
+    active_container_ids: set[int],
+    state: _SalvageState,
+) -> Any:
+    if state.remaining_nodes <= 0 or max_bytes <= 0:
+        state.incomplete = True
+        return _OMITTED
+    state.remaining_nodes -= 1
+
+    value_type = type(value)
+    if value is None or value_type in {bool, int, float}:
+        try:
+            copied = copy_durable_json_value(value, "tool_result_evidence")
+        except Exception:
+            state.incomplete = True
+            return _OMITTED
+        if compact_json_utf8_size(copied) > max_bytes:
+            state.incomplete = True
+            return _OMITTED
+        return copied
+    if value_type is str:
+        try:
+            require_durable_text(value, "tool_result_evidence")
+        except Exception:
+            state.incomplete = True
+            return _OMITTED
+        if json_utf8_size_within_limit(value, max_bytes, ensure_ascii=False):
+            return value
+        state.incomplete = True
+        bounded = _truncate_json_string(value, max_bytes)
+        return bounded if bounded is not None else _OMITTED
+
+    if value_type not in {dict, list, FrozenJsonDict, FrozenJsonList}:
+        state.incomplete = True
+        return _OMITTED
+    if depth >= _MAX_PORTABLE_EVIDENCE_DEPTH:
+        state.incomplete = True
+        return _OMITTED
+    container_id = id(value)
+    if container_id in active_container_ids:
+        state.incomplete = True
+        return _OMITTED
+    active_container_ids.add(container_id)
+    try:
+        if value_type in {dict, FrozenJsonDict}:
+            return _salvage_portable_object(
+                value,
+                max_bytes=max_bytes,
+                depth=depth,
+                active_container_ids=active_container_ids,
+                state=state,
+            )
+        return _salvage_portable_array(
+            value,
+            max_bytes=max_bytes,
+            depth=depth,
+            active_container_ids=active_container_ids,
+            state=state,
+        )
+    finally:
+        active_container_ids.remove(container_id)
+
+
+def _salvage_portable_object(
+    value: dict[Any, Any] | FrozenJsonDict,
+    *,
+    max_bytes: int,
+    depth: int,
+    active_container_ids: set[int],
+    state: _SalvageState,
+) -> Any:
+    if max_bytes < 2:
+        state.incomplete = True
+        return _OMITTED
+    result: dict[str, Any] = {}
+    used_bytes = 2
+    for key, child_value in _prioritized_object_items(value, state=state):
+        if state.remaining_nodes <= 0:
+            state.incomplete = True
+            break
+        if type(key) is not str:
+            state.incomplete = True
+            continue
+        try:
+            require_durable_text(key, "tool_result_evidence key")
+        except Exception:
+            state.incomplete = True
+            continue
+        remaining_for_key = max_bytes - used_bytes - 1 - (1 if result else 0)
+        if remaining_for_key <= 0:
+            state.incomplete = True
+            break
+        if not json_utf8_size_within_limit(key, remaining_for_key, ensure_ascii=False):
+            state.incomplete = True
+            continue
+        key_bytes = compact_json_utf8_size(key)
+        entry_overhead = key_bytes + 1 + (1 if result else 0)
+        child_budget = max_bytes - used_bytes - entry_overhead
+        if child_budget <= 0:
+            state.incomplete = True
+            break
+        child = _salvage_portable_value(
+            child_value,
+            max_bytes=child_budget,
+            depth=depth + 1,
+            active_container_ids=active_container_ids,
+            state=state,
+        )
+        if child is _OMITTED:
+            continue
+        child_bytes = compact_json_utf8_size(child)
+        result[key] = child
+        used_bytes += entry_overhead + child_bytes
+    return result
+
+
+def _prioritized_object_items(
+    value: dict[Any, Any] | FrozenJsonDict,
+    *,
+    state: _SalvageState,
+) -> Iterator[tuple[Any, Any]]:
+    """Yield reconciliation identifiers first, then ordinary insertion order."""
+
+    if len(value) > _MAX_PRIORITY_KEY_SCAN:
+        state.incomplete = True
+    # Never use mapping lookup here: even an exact dict can invoke a hostile
+    # str-subclass key's equality method on a hash collision. Scan a bounded
+    # prefix once and retain only exact-string reconciliation fields.
+    scanned = list(islice(value.items(), _MAX_PRIORITY_KEY_SCAN))
+    found = {
+        key: child_value
+        for key, child_value in scanned
+        if type(key) is str and key in _PRIORITY_EVIDENCE_KEYS
+    }
+    for key in _PRIORITY_EVIDENCE_KEYS:
+        if key in found:
+            yield key, found[key]
+    for key, child_value in scanned:
+        if type(key) is str and key in found:
+            continue
+        yield key, child_value
+
+
+def _salvage_portable_array(
+    value: list[Any] | FrozenJsonList,
+    *,
+    max_bytes: int,
+    depth: int,
+    active_container_ids: set[int],
+    state: _SalvageState,
+) -> Any:
+    if max_bytes < 2:
+        state.incomplete = True
+        return _OMITTED
+    result: list[Any] = []
+    used_bytes = 2
+    for child_value in value:
+        if state.remaining_nodes <= 0:
+            state.incomplete = True
+            break
+        entry_overhead = 1 if result else 0
+        child_budget = max_bytes - used_bytes - entry_overhead
+        if child_budget <= 0:
+            state.incomplete = True
+            break
+        child = _salvage_portable_value(
+            child_value,
+            max_bytes=child_budget,
+            depth=depth + 1,
+            active_container_ids=active_container_ids,
+            state=state,
+        )
+        if child is _OMITTED:
+            continue
+        child_bytes = compact_json_utf8_size(child)
+        result.append(child)
+        used_bytes += entry_overhead + child_bytes
+    return result
+
+
+def _truncate_json_string(value: str, max_bytes: int) -> str | None:
+    marker_size = compact_json_utf8_size(_TRUNCATION_MARKER) - 2
+    available = max_bytes - 2 - marker_size
+    if available < 0:
+        return None
+    characters: list[str] = []
+    used_bytes = 0
+    for character in value:
+        character_bytes = _json_string_character_size(character)
+        if used_bytes + character_bytes > available:
+            break
+        characters.append(character)
+        used_bytes += character_bytes
+    return "".join(characters) + _TRUNCATION_MARKER
+
+
+def _json_string_character_size(character: str) -> int:
+    codepoint = ord(character)
+    if character in {'"', "\\"} or character in "\b\f\n\r\t":
+        return 2
+    if codepoint < 0x20:
+        return 6
+    return len(character.encode("utf-8"))
+
+
+def _safe_exception_type_name(exc: Exception) -> str:
+    try:
+        name = type.__getattribute__(type(exc), "__name__")
+    except BaseException:
+        name = "Exception"
+    if type(name) is not str:
+        name = "Exception"
+    try:
+        require_durable_text(name, "error_type")
+    except BaseException:
+        name = "Exception"
+    return _bound_utf8_text(name, _MAX_DIAGNOSTIC_TYPE_UTF8_BYTES)
+
+
+def _redact_terminal_result(result: ToolResult, redactor: SecretRedactor) -> ToolResult:
+    """Redact terminal evidence while preserving runtime-owned wrapper keys and bounds."""
+
+    structured = dict(result.structured or {})
+    raw_evidence = structured.pop("portable_result_evidence", _NO_EVIDENCE)
+    evidence_was_incomplete = structured.pop("portable_result_evidence_incomplete", False)
+    redacted_structured = redactor.redact_json(structured)
+    if type(redacted_structured) is not dict:
+        raise AssertionError("Terminal tool result redaction returned non-object structured data.")
+    if raw_evidence is not _NO_EVIDENCE:
+        evidence = portable_result_evidence(redactor.redact_json(raw_evidence))
+        if evidence.included:
+            redacted_structured["portable_result_evidence"] = evidence.value
+        redacted_structured["portable_result_evidence_incomplete"] = (
+            bool(evidence_was_incomplete) or evidence.incomplete
+        )
+    elif evidence_was_incomplete:
+        redacted_structured["portable_result_evidence_incomplete"] = True
+    return ToolResult(
+        content=_bound_diagnostic_text(redactor.redact_text(result.content)),
+        structured=redacted_structured,
+        artifacts=redactor.redact_json(result.artifacts),
+        is_error=result.is_error,
+    )
+
+
+def _bound_diagnostic_text(value: str) -> str:
+    return _bound_utf8_text(value, _MAX_DIAGNOSTIC_UTF8_BYTES)
+
+
+def _bound_utf8_text(value: str, max_bytes: int) -> str:
+    used_bytes = 0
+    characters: list[str] = []
+    for character in value:
+        character_bytes = len(character.encode("utf-8"))
+        if used_bytes + character_bytes > max_bytes:
+            marker_bytes = len(_TRUNCATION_MARKER.encode("utf-8"))
+            while characters and used_bytes + marker_bytes > max_bytes:
+                removed = characters.pop()
+                used_bytes -= len(removed.encode("utf-8"))
+            return "".join(characters) + _TRUNCATION_MARKER
+        characters.append(character)
+        used_bytes += character_bytes
+    return value

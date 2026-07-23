@@ -12,6 +12,7 @@ import pytest
 from pydantic import ValidationError
 
 import cayu.runtime._session_engine as session_engine_module
+from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.providers import (
     ModelProvider,
@@ -1331,17 +1332,26 @@ def test_compact_session_invalid_usage_fails_closed_on_next_strict_budget_check(
         await store.append_transcript_messages(created.id, transcript)
         completed = await store.update_status(created.id, SessionStatus.COMPLETED)
 
-        for index in range(2):
-            with pytest.raises(RuntimeError, match="budget limit reached"):
-                async for _event in app.compact_session(
-                    CompactSessionRequest(
-                        session_id=created.id,
-                        idempotency_key=f"invalid-usage-{index}",
-                        expected_run_epoch=completed.run_epoch,
-                        expected_transcript_cursor=len(transcript),
-                    )
-                ):
-                    pass
+        with pytest.raises(ContextBuildError, match="integer_out_of_range"):
+            async for _event in app.compact_session(
+                CompactSessionRequest(
+                    session_id=created.id,
+                    idempotency_key="invalid-usage-first",
+                    expected_run_epoch=completed.run_epoch,
+                    expected_transcript_cursor=len(transcript),
+                )
+            ):
+                pass
+        with pytest.raises(RuntimeError, match="budget limit reached"):
+            async for _event in app.compact_session(
+                CompactSessionRequest(
+                    session_id=created.id,
+                    idempotency_key="invalid-usage-second",
+                    expected_run_epoch=completed.run_epoch,
+                    expected_transcript_cursor=len(transcript),
+                )
+            ):
+                pass
 
         assert provider.calls == 1
         completions = [
@@ -7222,10 +7232,19 @@ def test_compact_session_failure_after_completion_reconciles_actual_usage() -> N
     asyncio.run(run())
 
 
-def test_compact_session_uses_canonical_billing_provider_without_identity() -> None:
+def test_compact_session_uses_frozen_canonical_billing_provider_without_identity() -> None:
     class GatewayProvider(UsageCompactionProvider):
         name = "gateway"
         billing_provider_name = "billco"
+
+        async def billing_identity_for_request(
+            self,
+            request: ModelRequest,
+        ) -> BillingIdentity | None:
+            assert request.model == "summary-model"
+            self.name = "poisoned\x00provider"
+            self.billing_provider_name = "poisoned\ud800billing"
+            return None
 
     async def run() -> None:
         provider = GatewayProvider()
@@ -7300,6 +7319,8 @@ def test_compact_session_uses_canonical_billing_provider_without_identity() -> N
         assert completion.payload["usage_metrics"]["provider_name"] == "billco"
         assert reserved.payload["provider_name"] == "billco"
         assert reconciled.payload["actual_amount"] == "0.000012"
+        assert provider.name == "poisoned\x00provider"
+        assert provider.billing_provider_name == "poisoned\ud800billing"
 
     asyncio.run(run())
 
@@ -7614,7 +7635,7 @@ def test_compact_session_rejects_completion_billing_identity_rewrite() -> None:
         with pytest.raises(
             ContextBuildError,
             match="Model provider billing identity resolution failed",
-        ):
+        ) as exc_info:
             async for event in app.compact_session(
                 CompactSessionRequest(
                     session_id=created.id,
@@ -7626,17 +7647,32 @@ def test_compact_session_rejects_completion_billing_identity_rewrite() -> None:
                 events.append(event)
 
         assert provider.calls == 1
-        completion_events = [event for event in events if event.type == EventType.MODEL_COMPLETED]
-        assert len(completion_events) == 1
-        assert "billing_identity" not in completion_events[0].payload
-        assert "usage" not in completion_events[0].payload
-        assert completion_events[0].payload["compaction_outcome"] == "provider_error"
-        assert completion_events[0].payload["usage_unavailable_reason"] == (
-            "compaction provider dispatch failed without completion usage"
-        )
-        assert completion_events[0].payload["purpose"] == "context_compaction"
-        assert events[-1].type == EventType.CONTEXT_COMPACTION_FAILED
+        assert [event.type for event in events] == [
+            EventType.CONTEXT_COMPACTION_STARTED,
+            EventType.MODEL_COMPLETED,
+            EventType.CONTEXT_COMPACTION_FAILED,
+        ]
+        completion = events[1]
+        assert completion.payload["billing_identity"] == identity.model_dump(mode="json")
+        assert completion.payload["usage_metrics"]["input_tokens"] == 8
+        assert completion.payload["usage_metrics"]["output_tokens"] == 2
+        assert completion.payload["usage_metrics"]["total_tokens"] == 10
+        assert completion.payload["compaction_outcome"] == "completion_observation_failed"
+        assert "compaction_attempt_id" not in completion.payload
+        failed = events[-1]
+        assert failed.payload["error_type"] == type(exc_info.value).__name__
+        assert "error" not in failed.payload
+        assert exc_info.value.cause is not None
+        assert "Model provider billing identity resolution failed" in str(exc_info.value)
+        assert "Model provider billing identity resolution failed" in str(exc_info.value.cause)
         assert await store.load_transcript(created.id) == transcript
+        stored = await store.load_events(created.id)
+        assert [event.id for event in stored if event.id == completion.id] == [completion.id]
+        usage = await app.get_session_usage(created.id)
+        assert usage.model_steps == 1
+        assert usage.usage.input_tokens == 8
+        assert usage.usage.output_tokens == 2
+        assert usage.usage.total_tokens == 10
 
     asyncio.run(run())
 
@@ -8183,6 +8219,126 @@ def test_compact_session_reconciles_reservations_and_replays_budget_events() -> 
         reconciled = first[4]
         assert reconciled.payload["actual_amount"] == "0.000012"
         assert reconciled.payload["operation_id"]
+
+    asyncio.run(run())
+
+
+def test_compact_session_settles_usage_overflow_at_reserved_amount_once() -> None:
+    class OverflowUsageCompactionProvider(ModelProvider):
+        name = "compaction-provider"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream(self, request: ModelRequest):
+            self.calls += 1
+            yield ModelStreamEvent.text_delta("provider summary")
+            yield ModelStreamEvent.completed(
+                {
+                    "model": request.model,
+                    "usage": {
+                        "input_tokens": MAX_DURABLE_JSON_INTEGER,
+                        "output_tokens": MAX_DURABLE_JSON_INTEGER,
+                    },
+                }
+            )
+
+    async def run() -> None:
+        pricing = PriceBook(
+            prices=(
+                ModelPrice.fixed(
+                    provider_name="compaction-provider",
+                    model="summary-model",
+                    input_per_million=Decimal("1"),
+                    output_per_million=Decimal("1"),
+                ),
+            )
+        )
+        provider = OverflowUsageCompactionProvider()
+        ledger = InMemoryBudgetLedger(reservation_ttl_seconds=60)
+        store = InMemorySessionStore()
+        app = CayuApp(
+            session_store=store,
+            budget_ledger=ledger,
+            budget_policy=BudgetPolicy(
+                limits=(
+                    BudgetLimit(
+                        scope="app",
+                        max_estimated_cost=Decimal("1"),
+                        pricing=pricing,
+                        reservation=BudgetReservation(
+                            max_input_tokens=10,
+                            max_output_tokens=10,
+                        ),
+                    ),
+                )
+            ),
+            enable_logging=False,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(provider=provider, model="summary-model"),
+                max_user_turns=1,
+            ),
+        )
+        created = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_compact_usage_overflow_reconcile",
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        transcript = [
+            Message.text("user", "old request"),
+            Message.text("assistant", "old answer"),
+            Message.text("user", "current request"),
+        ]
+        await store.append_transcript_messages(created.id, transcript)
+        completed = await store.update_status(created.id, SessionStatus.COMPLETED)
+
+        request = CompactSessionRequest(
+            session_id=created.id,
+            idempotency_key="compact-usage-overflow-reconcile",
+            expected_run_epoch=completed.run_epoch,
+            expected_transcript_cursor=len(transcript),
+        )
+        first: list[Event] = []
+        with pytest.raises(ContextBuildError, match="integer_out_of_range"):
+            async for event in app.compact_session(request):
+                first.append(event)
+        replay = [event async for event in app.compact_session(request)]
+
+        events = [
+            record.event
+            for record in await store.query_events(EventQuery(session_id=created.id, limit=100))
+        ]
+        reservations = [event for event in events if event.type == EventType.BUDGET_RESERVED]
+        completions = [
+            event
+            for event in events
+            if event.type == EventType.MODEL_COMPLETED
+            and event.payload.get("purpose") == "context_compaction"
+        ]
+        reconciliations = [event for event in events if event.type == EventType.BUDGET_RECONCILED]
+
+        assert provider.calls == 1
+        assert [event.id for event in replay] == [event.id for event in first]
+        assert len(reservations) == 1
+        assert len(completions) == 1
+        assert completions[0].payload["usage_metrics_rejected"] is True
+        assert "usage" not in completions[0].payload
+        assert "usage_metrics" not in completions[0].payload
+        assert len(reconciliations) == 1
+        assert reconciliations[0].payload["actual_amount"] == "0.00002"
+        record = next(iter(ledger._records.values()))
+        assert record.status == "reconciled"
+        assert record.actual_amount == Decimal("0.00002")
+        assert record.reason == (
+            "compaction completed without priced usage; charged reserved amount"
+        )
+        assert not await ledger.heartbeat(reservation_id=reservations[0].payload["reservation_id"])
 
     asyncio.run(run())
 

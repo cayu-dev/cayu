@@ -5,7 +5,11 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs this at runtime.
 
-from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu._validation import (
+    copy_durable_json_value,
+    require_durable_clean_nonblank,
+    require_durable_nonblank,
+)
 from cayu.core.thinking import ThinkingConfig
 from cayu.runtime.approvals import (
     PendingToolCallApproval,
@@ -31,7 +35,11 @@ class UserInputResponse(BaseModel):
     user-input checkpoint. Passing an explicit value overrides it for the resumed run.
     """
 
-    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        arbitrary_types_allowed=True,
+        hide_input_in_errors=True,
+    )
 
     session_id: str
     input_id: str
@@ -54,17 +62,17 @@ class UserInputResponse(BaseModel):
     @field_validator("session_id", "input_id")
     @classmethod
     def validate_nonblank_ids(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("answer")
     @classmethod
     def validate_answer(cls, value: str, info) -> str:
-        return require_nonblank(value, info.field_name)
+        return require_durable_nonblank(value, info.field_name)
 
     @field_validator("structured", "artifacts", "metadata", mode="before")
     @classmethod
     def copy_json_fields(cls, value, info):
-        return copy_json_value(value, info.field_name)
+        return copy_durable_json_value(value, info.field_name)
 
     @field_validator("resolved_by")
     @classmethod
@@ -108,7 +116,7 @@ class PendingUserInput(BaseModel):
     are optional so checkpoints written before this state existed still load.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     input_id: str
     tool_call_id: str
@@ -131,12 +139,12 @@ class PendingUserInput(BaseModel):
     @field_validator("input_id", "tool_call_id", "tool_name", "agent_name")
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("question")
     @classmethod
     def validate_question(cls, value: str, info) -> str:
-        return require_nonblank(value, info.field_name)
+        return require_durable_nonblank(value, info.field_name)
 
     @field_validator("environment_name", "workspace_id", "task_id")
     @classmethod
@@ -147,17 +155,17 @@ class PendingUserInput(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("options")
     @classmethod
     def validate_options(cls, value: list[str], info) -> list[str]:
-        return [require_nonblank(option, "option") for option in value]
+        return [require_durable_nonblank(option, "option") for option in value]
 
     @field_validator("arguments", mode="before")
     @classmethod
     def copy_arguments(cls, value: dict[str, Any], info) -> dict[str, Any]:
-        return copy_json_value(value, info.field_name)
+        return copy_durable_json_value(value, info.field_name)
 
     @field_validator("structured_output")
     @classmethod
@@ -207,9 +215,9 @@ def copy_user_input_response(response: UserInputResponse) -> UserInputResponse:
         session_id=response.session_id,
         input_id=response.input_id,
         answer=response.answer,
-        structured=copy_json_value(response.structured, "structured"),
-        artifacts=copy_json_value(response.artifacts, "artifacts"),
-        metadata=copy_json_value(response.metadata, "metadata"),
+        structured=copy_durable_json_value(response.structured, "structured"),
+        artifacts=copy_durable_json_value(response.artifacts, "artifacts"),
+        metadata=copy_durable_json_value(response.metadata, "metadata"),
         resolved_by=copy_resolution_actor(response.resolved_by),
         max_steps=response.max_steps,
         limits=copy_run_limits(response.limits) if response.limits is not None else None,
@@ -234,7 +242,7 @@ def copy_pending_user_input(pending: PendingUserInput) -> PendingUserInput:
         tool_name=pending.tool_name,
         question=pending.question,
         options=list(pending.options),
-        arguments=copy_json_value(pending.arguments, "arguments"),
+        arguments=copy_durable_json_value(pending.arguments, "arguments"),
         agent_name=pending.agent_name,
         environment_name=pending.environment_name,
         workspace_id=pending.workspace_id,
@@ -260,7 +268,7 @@ def pending_user_input_from_checkpoint(
 ) -> PendingUserInput | None:
     if checkpoint is None:
         return None
-    copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
+    copied_checkpoint = copy_durable_json_value(checkpoint, "checkpoint")
     value = copied_checkpoint.get(PENDING_USER_INPUT_CHECKPOINT_KEY)
     if value is None:
         return None
@@ -282,7 +290,11 @@ class UserInputRecoveryRequest(BaseModel):
     "inherit the original run's configuration" from the pending checkpoint.
     """
 
-    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        arbitrary_types_allowed=True,
+        hide_input_in_errors=True,
+    )
 
     session_id: str
     input_id: str
@@ -309,7 +321,7 @@ class UserInputRecoveryRequest(BaseModel):
     @field_validator("session_id", "input_id", "tool_call_id")
     @classmethod
     def validate_nonblank_ids(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("resolved_by")
     @classmethod
@@ -319,19 +331,19 @@ class UserInputRecoveryRequest(BaseModel):
     @field_validator("answer", "message")
     @classmethod
     def validate_nonblank_text(cls, value: str, info) -> str:
-        return require_nonblank(value, info.field_name)
+        return require_durable_nonblank(value, info.field_name)
 
     @field_validator("reason")
     @classmethod
     def validate_optional_reason(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, info.field_name)
+        return require_durable_nonblank(value, info.field_name)
 
     @field_validator("structured", "artifacts", "metadata", mode="before")
     @classmethod
     def copy_json_fields(cls, value, info):
-        return copy_json_value(value, info.field_name)
+        return copy_durable_json_value(value, info.field_name)
 
     @field_validator("structured_output")
     @classmethod
@@ -373,10 +385,10 @@ def copy_user_input_recovery_request(
         tool_call_id=request.tool_call_id,
         outcome=request.outcome,
         message=request.message,
-        structured=copy_json_value(request.structured, "structured"),
-        artifacts=copy_json_value(request.artifacts, "artifacts"),
+        structured=copy_durable_json_value(request.structured, "structured"),
+        artifacts=copy_durable_json_value(request.artifacts, "artifacts"),
         reason=request.reason,
-        metadata=copy_json_value(request.metadata, "metadata"),
+        metadata=copy_durable_json_value(request.metadata, "metadata"),
         resolved_by=copy_resolution_actor(request.resolved_by),
         max_steps=request.max_steps,
         limits=copy_run_limits(request.limits) if request.limits is not None else None,

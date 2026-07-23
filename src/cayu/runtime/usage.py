@@ -7,9 +7,11 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
+    copy_durable_json_object,
+    copy_durable_json_value,
     copy_json_value,
-    require_clean_nonblank,
-    require_durable_json_text,
+    require_durable_clean_nonblank,
 )
 from cayu.core.billing import BillingIdentity
 from cayu.core.events import Event, EventType
@@ -37,23 +39,36 @@ def is_conversational_model_completion_payload(payload: dict[str, Any]) -> bool:
 class CacheUsageMetrics(BaseModel):
     """Provider-neutral cache token counters for one model step."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
-    read_tokens: StrictInt = Field(default=0, ge=0)
-    write_tokens: StrictInt = Field(default=0, ge=0)
-    write_5m_tokens: StrictInt = Field(default=0, ge=0, exclude_if=lambda value: value == 0)
-    write_1h_tokens: StrictInt = Field(default=0, ge=0, exclude_if=lambda value: value == 0)
-    write_unknown_ttl_tokens: StrictInt = Field(
-        default=0, ge=0, exclude_if=lambda value: value == 0
+    read_tokens: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    write_tokens: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    write_5m_tokens: StrictInt = Field(
+        default=0,
+        ge=0,
+        le=MAX_DURABLE_JSON_INTEGER,
+        exclude_if=lambda value: value == 0,
     )
-    cached_input_tokens: StrictInt = Field(default=0, ge=0)
-    uncached_input_tokens: StrictInt = Field(default=0, ge=0)
+    write_1h_tokens: StrictInt = Field(
+        default=0,
+        ge=0,
+        le=MAX_DURABLE_JSON_INTEGER,
+        exclude_if=lambda value: value == 0,
+    )
+    write_unknown_ttl_tokens: StrictInt = Field(
+        default=0,
+        ge=0,
+        le=MAX_DURABLE_JSON_INTEGER,
+        exclude_if=lambda value: value == 0,
+    )
+    cached_input_tokens: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    uncached_input_tokens: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
 
 
 class UsageMetrics(BaseModel):
     """Provider-neutral token counters for one model step."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     provider_name: str | None = None
     requested_model: str | None = None
@@ -61,10 +76,14 @@ class UsageMetrics(BaseModel):
     billing_identity: BillingIdentity | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
-    input_tokens: StrictInt = Field(default=0, ge=0)
-    output_tokens: StrictInt = Field(default=0, ge=0)
-    total_tokens: StrictInt = Field(default=0, ge=0)
-    reasoning_output_tokens: StrictInt = Field(default=0, ge=0)
+    input_tokens: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    output_tokens: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    total_tokens: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    reasoning_output_tokens: StrictInt = Field(
+        default=0,
+        ge=0,
+        le=MAX_DURABLE_JSON_INTEGER,
+    )
     cache: CacheUsageMetrics = Field(default_factory=CacheUsageMetrics)
 
     @field_validator("provider_name", "requested_model", "model")
@@ -72,17 +91,17 @@ class UsageMetrics(BaseModel):
     def validate_optional_nonblank(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
 
 class SessionUsageSummary(BaseModel):
     """Usage totals derived from durable session events."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     session_id: str
-    model_steps: StrictInt = Field(default=0, ge=0)
-    tool_calls: StrictInt = Field(default=0, ge=0)
+    model_steps: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    tool_calls: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
     provider_names: list[str] = Field(default_factory=list)
     models: list[str] = Field(default_factory=list)
     usage: UsageMetrics = Field(default_factory=UsageMetrics)
@@ -90,32 +109,32 @@ class SessionUsageSummary(BaseModel):
     @field_validator("session_id")
     @classmethod
     def validate_session_id(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("provider_names", "models", mode="before")
     @classmethod
     def copy_string_lists(cls, value: list[str], info) -> list[str]:
-        copied = copy_json_value(value, info.field_name)
+        copied = copy_durable_json_value(value, info.field_name)
         if type(copied) is not list:
             raise ValueError(f"{info.field_name} must be a list.")
         result: list[str] = []
         for index, item in enumerate(copied):
             if type(item) is not str:
                 raise ValueError(f"{info.field_name}[{index}] must be a string.")
-            result.append(require_clean_nonblank(item, f"{info.field_name}[{index}]"))
+            result.append(require_durable_clean_nonblank(item, f"{info.field_name}[{index}]"))
         return result
 
 
 class CausalBudgetUsageSummary(BaseModel):
     """Usage totals for all sessions sharing one causal budget id."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     causal_budget_id: str
     session_ids: list[str] = Field(default_factory=list)
-    session_count: StrictInt = Field(default=0, ge=0)
-    model_steps: StrictInt = Field(default=0, ge=0)
-    tool_calls: StrictInt = Field(default=0, ge=0)
+    session_count: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    model_steps: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    tool_calls: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
     provider_names: list[str] = Field(default_factory=list)
     models: list[str] = Field(default_factory=list)
     usage: UsageMetrics = Field(default_factory=UsageMetrics)
@@ -124,19 +143,19 @@ class CausalBudgetUsageSummary(BaseModel):
     @field_validator("causal_budget_id")
     @classmethod
     def validate_causal_budget_id(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("session_ids", "provider_names", "models", mode="before")
     @classmethod
     def copy_string_lists(cls, value: list[str], info) -> list[str]:
-        copied = copy_json_value(value, info.field_name)
+        copied = copy_durable_json_value(value, info.field_name)
         if type(copied) is not list:
             raise ValueError(f"{info.field_name} must be a list.")
         result: list[str] = []
         for index, item in enumerate(copied):
             if type(item) is not str:
                 raise ValueError(f"{info.field_name}[{index}] must be a string.")
-            result.append(require_clean_nonblank(item, f"{info.field_name}[{index}]"))
+            result.append(require_durable_clean_nonblank(item, f"{info.field_name}[{index}]"))
         return result
 
 
@@ -396,33 +415,37 @@ def durable_model_completed_payload(
     """Project provider completion metadata onto the cross-store JSON boundary.
 
     Provider payloads normally remain equivalent JSON. When one top-level field
-    contains text that a supported durable store cannot represent, retain every
-    independently durable non-derived field plus the caller's runtime-owned
-    identity fallback. Usage fails closed whenever raw or normalized evidence
-    crosses a lossy persistence boundary.
+    contains a value that a supported durable store cannot represent, retain
+    every independently portable non-derived field plus the caller's
+    runtime-owned identity fallback. Usage fails closed whenever raw or
+    normalized evidence crosses a lossy persistence boundary.
     """
 
     copied = copy_json_value(payload, "model_completed_payload")
     try:
-        require_durable_json_text(copied, "model_completed_payload")
+        portable = copy_durable_json_object(copied, "model_completed_payload")
     except ValueError:
         projected: dict[str, Any] = {}
         for key, value in copied.items():
-            candidate = {key: value}
             try:
-                require_durable_json_text(candidate, f"model_completed_payload.{key}")
+                candidate = copy_durable_json_object(
+                    {key: value},
+                    f"model_completed_payload.{key}",
+                )
             except ValueError:
                 continue
-            projected[key] = value
+            projected[key] = candidate[key]
 
         runtime_fields = copy_json_value(fallback_fields, "fallback_fields")
         for key, value in runtime_fields.items():
-            candidate = {key: value}
             try:
-                require_durable_json_text(candidate, f"fallback_fields.{key}")
+                candidate = copy_durable_json_object(
+                    {key: value},
+                    f"fallback_fields.{key}",
+                )
             except ValueError:
                 continue
-            projected.setdefault(key, value)
+            projected.setdefault(key, candidate[key])
 
         lost_raw_usage = "usage" in copied and "usage" not in projected
         lost_billing_identity = "billing_identity" in copied and "billing_identity" not in projected
@@ -447,13 +470,17 @@ def durable_model_completed_payload(
             or lost_all_usage
         ):
             projected["usage_normalization_failed"] = True
-            projected["usage_unavailable_reason"] = require_clean_nonblank(
+            projected["usage_unavailable_reason"] = require_durable_clean_nonblank(
                 unavailable_reason,
                 "unavailable_reason",
             )
-        require_durable_json_text(projected, "model_completed_payload")
-        return projected
-    return copied
+        return copy_durable_json_object(projected, "model_completed_payload")
+    if portable.get("usage_normalization_failed") is True:
+        portable["usage_unavailable_reason"] = require_durable_clean_nonblank(
+            unavailable_reason,
+            "unavailable_reason",
+        )
+    return portable
 
 
 def strip_provider_billing_identity(payload: dict[str, Any]) -> None:
@@ -475,19 +502,6 @@ USAGE_BEARING_EVENT_TYPES: tuple[EventType, ...] = (
     EventType.MODEL_COMPLETED,
     EventType.TOOL_CALL_STARTED,
 )
-
-
-def project_usage_inspection_event(event: Event) -> Event:
-    """Retain only the bounded fields consumed by session usage inspection."""
-    payload: dict[str, Any] = {}
-    if event.type == EventType.MODEL_COMPLETED:
-        try:
-            metrics = usage_metrics_from_event_payload(event.payload)
-        except (TypeError, ValueError):
-            metrics = None
-        if metrics is not None:
-            payload["usage_metrics"] = metrics.model_dump(mode="json")
-    return event.model_copy(update={"payload": payload})
 
 
 def session_usage_summary(session_id: str, events: list[Event]) -> SessionUsageSummary:
@@ -547,7 +561,7 @@ def causal_budget_usage_summary(
     session_ids: list[str],
     events: list[Event],
 ) -> CausalBudgetUsageSummary:
-    causal_budget_id = require_clean_nonblank(causal_budget_id, "causal_budget_id")
+    causal_budget_id = require_durable_clean_nonblank(causal_budget_id, "causal_budget_id")
     session_ids = _copy_string_list(session_ids, "session_ids")
     known_session_ids = set(session_ids)
     filtered_events = [event for event in events if event.session_id in known_session_ids]
@@ -584,7 +598,7 @@ def usage_metrics_from_event_payload(payload: dict[str, Any]) -> UsageMetrics | 
         return None
     metrics = payload.get("usage_metrics")
     if type(metrics) is dict:
-        parsed = UsageMetrics(**copy_json_value(metrics, "usage_metrics"))
+        parsed = UsageMetrics(**copy_durable_json_value(metrics, "usage_metrics"))
         if event_identity is None:
             return parsed
         if parsed.billing_identity is not None and parsed.billing_identity != event_identity:
@@ -622,14 +636,14 @@ def _add_usage(left: UsageMetrics, right: UsageMetrics) -> UsageMetrics:
 
 
 def _copy_string_list(value: list[str], field_name: str) -> list[str]:
-    copied = copy_json_value(value, field_name)
+    copied = copy_durable_json_value(value, field_name)
     if type(copied) is not list:
         raise ValueError(f"{field_name} must be a list.")
     result: list[str] = []
     for index, item in enumerate(copied):
         if type(item) is not str:
             raise ValueError(f"{field_name}[{index}] must be a string.")
-        result.append(require_clean_nonblank(item, f"{field_name}[{index}]"))
+        result.append(require_durable_clean_nonblank(item, f"{field_name}[{index}]"))
     return result
 
 

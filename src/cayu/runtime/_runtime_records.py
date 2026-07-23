@@ -14,7 +14,7 @@ from cayu.environments import (
     EnvironmentSpec,
     ExecutionRequirements,
 )
-from cayu.providers import ModelProvider
+from cayu.providers import ModelProvider, UsageDialect
 from cayu.runtime.context import ContextPolicy
 from cayu.runtime.hooks import RuntimeHook
 from cayu.runtime.tool_policy import ToolPolicy, ToolPolicyResult
@@ -60,6 +60,7 @@ class RegisteredProvider:
     model_patterns: tuple[str, ...] = ()
     registration_source: str | None = None
     registration_symbol: str | None = None
+    usage_dialect: UsageDialect = UsageDialect.AUTO
 
 
 @dataclass(frozen=True)

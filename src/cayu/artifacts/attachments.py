@@ -7,7 +7,13 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
+    copy_durable_json_object,
+    require_clean_nonblank,
+    require_durable_text,
+    require_nonblank,
+)
 from cayu.artifacts._images import decode_verified_image_format
 from cayu.artifacts.base import ArtifactReadResult
 
@@ -46,7 +52,7 @@ class FileAttachment(BaseModel):
     immediately before a provider request.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     type: str = FILE_ATTACHMENT_TYPE
     artifact_id: str
@@ -66,12 +72,18 @@ class FileAttachment(BaseModel):
     @field_validator("artifact_id", "content_type")
     @classmethod
     def validate_clean_fields(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_clean_nonblank(
+            require_durable_text(value, info.field_name),
+            info.field_name,
+        )
 
     @field_validator("filename")
     @classmethod
     def validate_filename(cls, value: str, info) -> str:
-        return require_nonblank(value, info.field_name)
+        return require_nonblank(
+            require_durable_text(value, info.field_name),
+            info.field_name,
+        )
 
     @field_validator("size_bytes")
     @classmethod
@@ -80,12 +92,14 @@ class FileAttachment(BaseModel):
             raise ValueError(f"`{info.field_name}` must be an integer.")
         if value <= 0:
             raise ValueError(f"`{info.field_name}` must be greater than zero.")
+        if value > MAX_DURABLE_JSON_INTEGER:
+            raise ValueError(f"`{info.field_name}` must fit in a signed 64-bit integer.")
         return value
 
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
     @model_validator(mode="after")
     def validate_kind_content_type(self) -> FileAttachment:
@@ -99,7 +113,7 @@ class FileAttachment(BaseModel):
 class ResolvedFileAttachment(BaseModel):
     """Provider-request-only attachment bytes encoded for JSON transport."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     artifact_id: str
     kind: FileAttachmentKind
@@ -111,17 +125,23 @@ class ResolvedFileAttachment(BaseModel):
     @field_validator("artifact_id", "content_type")
     @classmethod
     def validate_clean_fields(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_clean_nonblank(
+            require_durable_text(value, info.field_name),
+            info.field_name,
+        )
 
     @field_validator("filename", "data_base64")
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
-        return require_nonblank(value, info.field_name)
+        return require_nonblank(
+            require_durable_text(value, info.field_name),
+            info.field_name,
+        )
 
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
     @model_validator(mode="after")
     def validate_kind_content_type(self) -> ResolvedFileAttachment:

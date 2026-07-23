@@ -13,9 +13,13 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs this at runtime.
 
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import (
+    copy_durable_json_value,
+    require_clean_nonblank,
+    require_durable_clean_nonblank,
+)
 from cayu.core.events import Event, EventType
-from cayu.core.messages import Message, copy_message
+from cayu.core.messages import Message, detach_message
 from cayu.core.thinking import ThinkingConfig
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
@@ -42,7 +46,11 @@ class DispatchStatus(StrEnum):
 
 
 class DispatchRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        arbitrary_types_allowed=True,
+        hide_input_in_errors=True,
+    )
 
     session_id: str
     messages: list[Message]
@@ -64,7 +72,7 @@ class DispatchRequest(BaseModel):
     @field_validator("messages")
     @classmethod
     def copy_messages(cls, value):
-        copied_messages = [copy_message(message) for message in value]
+        copied_messages = [detach_message(message) for message in value]
         if not copied_messages:
             raise ValueError("DispatchRequest messages cannot be empty.")
         return copied_messages
@@ -72,7 +80,7 @@ class DispatchRequest(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_request_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_value(value, "metadata")
 
     @field_validator("structured_output")
     @classmethod
@@ -101,11 +109,11 @@ class DispatchRequest(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
 
 class DispatchHandle(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     dispatch_id: str
     session_id: str
@@ -117,7 +125,7 @@ class DispatchHandle(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_handle_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_value(value, "metadata")
 
     @field_validator("dispatch_id", "session_id", "backend", "task_id")
     @classmethod
@@ -128,7 +136,7 @@ class DispatchHandle(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
 
 class DispatchRuntime(Protocol):
@@ -488,11 +496,11 @@ def copy_dispatch_request(request: DispatchRequest) -> DispatchRequest:
         raise TypeError("Dispatch requires a DispatchRequest.")
     return DispatchRequest(
         session_id=request.session_id,
-        messages=[copy_message(message) for message in request.messages],
+        messages=[detach_message(message) for message in request.messages],
         dispatch_id=request.dispatch_id,
         task_id=request.task_id,
         model=request.model,
-        metadata=copy_json_value(request.metadata, "metadata"),
+        metadata=copy_durable_json_value(request.metadata, "metadata"),
         max_steps=request.max_steps,
         limits=copy_run_limits(request.limits),
         budget_limits=copy_request_budget_limits(request.budget_limits),
@@ -512,7 +520,7 @@ def copy_dispatch_handle(handle: DispatchHandle) -> DispatchHandle:
         task_id=handle.task_id,
         backend=handle.backend,
         status=handle.status,
-        metadata=copy_json_value(handle.metadata, "metadata"),
+        metadata=copy_durable_json_value(handle.metadata, "metadata"),
     )
 
 

@@ -49,6 +49,7 @@ from cayu.core.tools import (
     _POLICY_DENIAL_TRUNCATION_MARKER,
     Tool,
     ToolContext,
+    ToolEffect,
     ToolResult,
     ToolSpec,
     _bound_policy_denial_text,
@@ -257,6 +258,28 @@ class FakeProvider(ModelProvider):
         if batch_index >= len(self.event_batches):
             raise AssertionError(f"No fake provider event batch for request {batch_index}")
         for event in self.event_batches[batch_index]:
+            yield event
+
+
+class UsageDialectMutatingProvider(FakeProvider):
+    usage_dialect = UsageDialect.ANTHROPIC
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.usage_dialect = UsageDialect.GENERIC
+        async for event in super().stream(request):
+            yield event
+
+
+class CompactionIdentityMutatingProvider(FakeProvider):
+    name = "gateway"
+    billing_provider_name = "billco"
+    usage_dialect = UsageDialect.ANTHROPIC
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.name = "poisoned\x00provider"
+        self.billing_provider_name = "poisoned\ud800billing"
+        self.usage_dialect = UsageDialect.GENERIC
+        async for event in super().stream(request):
             yield event
 
 
@@ -2955,7 +2978,10 @@ def test_cayu_app_rejects_invalid_proxy_authorization_metadata_before_delegation
 
     tool_events = [event for event in events if event.type == EventType.TOOL_CALL_FAILED]
     assert len(tool_events) == 1
-    assert "`metadata` must be a JSON object" in tool_events[0].payload["result"]["content"]
+    assert tool_events[0].payload["result"]["content"] == (
+        "Tool execution failed with a non-portable diagnostic."
+    )
+    assert tool_events[0].payload["durable_value_error_code"] == "invalid_json_object"
     assert EventType.CREDENTIAL_PROXY_CHECKED not in [event.type for event in events]
 
 
@@ -10359,11 +10385,17 @@ def test_cayu_app_rejects_completion_billing_identity_rewrite_without_budget() -
     )
 
     assert len(provider.requests) == 1
-    assert EventType.MODEL_COMPLETED not in [event.type for event in events]
-    error = next(event for event in events if event.type == EventType.MODEL_ERROR)
-    assert error.payload["error"] == "Model provider billing identity resolution failed"
-    assert error.payload["provider_error_code"] == "billing_identity_resolution_failed"
+    completed = next(event for event in events if event.type == EventType.MODEL_COMPLETED)
+    assert completed.payload["completion_outcome"] == "billing_identity_resolution_failed"
+    assert completed.payload["usage_metrics"]["total_tokens"] == 2
+    assert completed.payload["billing_identity"] == requested_identity.model_dump(mode="json")
+    assert (
+        completed.payload["completion_error"]["error"]
+        == "Model provider billing identity resolution failed"
+    )
+    assert EventType.MODEL_ERROR not in [event.type for event in events]
     assert events[-1].type == EventType.SESSION_FAILED
+    assert events[-1].payload["error"] == "Model provider billing identity resolution failed"
 
 
 def test_cayu_app_rechecks_request_budget_after_resolving_bedrock_identity() -> None:
@@ -10770,12 +10802,21 @@ def test_cayu_app_drops_custom_billing_hook_credentials(
 
     retained = json.dumps([event.model_dump(mode="json") for event in events], sort_keys=True)
     assert canary not in retained
-    model_error = next(event for event in events if event.type == EventType.MODEL_ERROR)
-    assert model_error.payload["stage"] == f"billing_identity_for_{stage}"
-    assert model_error.payload["error"] == "Model provider billing identity resolution failed"
-    assert model_error.payload["provider"] == "fake"
-    assert model_error.payload["provider_error_type"] == "BillingIdentityResolutionError"
-    assert model_error.payload["provider_error_code"] == "billing_identity_resolution_failed"
+    if stage == "request":
+        model_error = next(event for event in events if event.type == EventType.MODEL_ERROR)
+        error_payload = model_error.payload
+    else:
+        completed = next(event for event in events if event.type == EventType.MODEL_COMPLETED)
+        assert completed.payload["completion_outcome"] == "billing_identity_resolution_failed"
+        assert completed.payload["usage_metrics"]["input_tokens"] == 1
+        assert completed.payload["usage_metrics"]["output_tokens"] == 0
+        assert EventType.MODEL_ERROR not in {event.type for event in events}
+        error_payload = completed.payload["completion_error"]
+    assert error_payload["stage"] == f"billing_identity_for_{stage}"
+    assert error_payload["error"] == "Model provider billing identity resolution failed"
+    assert error_payload["provider"] == "fake"
+    assert error_payload["provider_error_type"] == "BillingIdentityResolutionError"
+    assert error_payload["provider_error_code"] == "billing_identity_resolution_failed"
     assert events[-1].type == EventType.SESSION_FAILED
 
 
@@ -30847,7 +30888,7 @@ def test_model_compactor_reports_model_completed_payload_with_usage_metrics():
 class FlakyCompactionProvider(ModelProvider):
     name = "flaky"
 
-    def __init__(self, *, failures: int, error: ModelProviderError) -> None:
+    def __init__(self, *, failures: int, error: Exception) -> None:
         self.failures = failures
         self.error = error
         self.requests: list[ModelRequest] = []
@@ -36521,6 +36562,7 @@ def test_compaction_telemetry_rejects_conflicting_identity_with_empty_metrics():
         {"usage_metrics": {"input_tokens": -1}},
         {"usage_metrics": {"input_tokens": True}},
         {"usage_metrics": {"cache": {"read_tokens": "1"}}},
+        {"usage_metrics_rejected": True},
         {"usage": {"input_tokens": 2**63}},
         {
             "usage": {
@@ -40846,18 +40888,44 @@ def test_cayu_app_inserts_returned_only_completion_before_anchored_inner_call():
     assert [event.id for event in budget_events] == [event.id for event in completed_events]
 
 
-def test_cayu_app_retains_safe_usage_when_completion_metadata_is_not_durable():
+@pytest.mark.parametrize(
+    ("invalid_value", "invalid_location", "expected_error_code"),
+    [
+        ("timeout\x00workload-secret-value", "top-level", "nul_character"),
+        (float("nan"), "top-level", "non_finite_number"),
+        ("timeout\x00workload-secret-value", "usage", "nul_character"),
+        ("timeout\x00workload-secret-value", "model-and-usage", "nul_character"),
+    ],
+    ids=["nul", "nan", "nested-usage-aux", "invalid-model-and-nested-usage-aux"],
+)
+def test_cayu_app_retains_only_authoritative_usage_when_completion_metadata_is_not_durable(
+    invalid_value: object,
+    invalid_location: str,
+    expected_error_code: str,
+):
     store = InMemorySessionStore()
     budget_store = InMemoryBudgetStore()
+    secret_key = "workload-secret-key"
+    usage = {"input_tokens": 30, "output_tokens": 4}
+    payload: dict[str, Any] = {
+        "model": "summary-model",
+        "usage": usage,
+    }
+    if invalid_location == "usage":
+        usage[secret_key] = invalid_value
+    elif invalid_location == "model-and-usage":
+        payload["model"] = invalid_value
+        usage[secret_key] = invalid_value
+    else:
+        payload[secret_key] = invalid_value
     compactor_provider = FakeProvider(
         [
             ModelStreamEvent.text_delta("valid summary"),
-            ModelStreamEvent.completed(
-                {
-                    "model": "summary-model",
-                    "usage": {"input_tokens": 30, "output_tokens": 4},
-                    "provider_note": "invalid\x00metadata",
-                }
+            ModelStreamEvent.model_construct(
+                type=ModelStreamEventType.COMPLETED,
+                delta="",
+                payload=payload,
+                completion=None,
             ),
         ]
     )
@@ -40903,16 +40971,37 @@ def test_cayu_app_retains_safe_usage_when_completion_metadata_is_not_durable():
     assert completed.payload["provider_name"] == "fake"
     assert completed.payload["requested_model"] == "summary-model"
     assert completed.payload["model"] == "summary-model"
-    assert completed.payload["usage_metrics"]["input_tokens"] == 30
-    assert completed.payload["usage_metrics"]["output_tokens"] == 4
-    assert completed.payload["usage"] == {"input_tokens": 30, "output_tokens": 4}
+    if invalid_location == "top-level":
+        assert completed.payload["usage_metrics"]["input_tokens"] == 30
+        assert completed.payload["usage_metrics"]["output_tokens"] == 4
+        assert completed.payload["usage"] == {"input_tokens": 30, "output_tokens": 4}
+        assert "usage_normalization_failed" not in completed.payload
+    else:
+        assert "usage" not in completed.payload
+        assert "usage_metrics" not in completed.payload
+        assert completed.payload["usage_normalization_failed"] is True
+        assert completed.payload["usage_unavailable_reason"] == (
+            "invalid compaction usage telemetry"
+        )
     assert "provider_note" not in completed.payload
+    assert completed.payload["compaction_outcome"] == "invalid_completion_metadata"
+    assert secret_key not in completed.payload
     assert "compaction_attempt_id" not in completed.payload
-    assert events[3].payload["error_type"] == "ValidationError"
+    assert events[3].payload["error_type"] == "DurableValueError"
+    assert "error" not in events[3].payload
+    assert f"code={expected_error_code}" in events[-1].payload["error"]
+    rendered = json.dumps(
+        [event.model_dump(mode="json") for event in events],
+        allow_nan=False,
+    )
+    assert secret_key not in rendered
+    assert "timeout" not in rendered
+    assert "workload-secret-value" not in rendered
+    assert len(compactor_provider.requests) == 1
     assert runtime_provider.requests == []
     usage = asyncio.run(app.get_session_usage("sess_unsafe_compaction_metadata"))
     assert usage.model_steps == 1
-    assert usage.usage.total_tokens == 34
+    assert usage.usage.total_tokens == (34 if invalid_location == "top-level" else 0)
     budget_events = asyncio.run(
         budget_store.load_events_for_budget(
             scope="app",
@@ -40924,17 +41013,24 @@ def test_cayu_app_retains_safe_usage_when_completion_metadata_is_not_durable():
 
 
 @pytest.mark.parametrize(
-    ("summary_events", "expected_error"),
+    ("summary_events", "expected_error", "expected_error_type"),
     [
-        ([], "`summary` cannot be blank."),
-        ([ModelStreamEvent.text_delta(" \n\t")], "`summary` cannot be blank."),
+        ([], "`summary` cannot be blank.", "ValueError"),
+        (
+            [ModelStreamEvent.text_delta(" \n\t")],
+            "`summary` cannot be blank.",
+            "ValueError",
+        ),
         (
             [ModelStreamEvent.text_delta("invalid\x00summary")],
-            "`summary` must not contain NUL characters.",
+            "`summary` must not contain NUL characters. [code=nul_character; path=$]",
+            "DurableValueError",
         ),
         (
             [ModelStreamEvent.text_delta("invalid\ud800summary")],
-            "`summary` must not contain Unicode surrogate code points.",
+            "`summary` must not contain Unicode surrogate code points. "
+            "[code=unicode_surrogate; path=$]",
+            "DurableValueError",
         ),
     ],
     ids=["blank", "whitespace", "nul", "surrogate"],
@@ -40942,6 +41038,7 @@ def test_cayu_app_retains_safe_usage_when_completion_metadata_is_not_durable():
 def test_cayu_app_counts_completed_compaction_with_invalid_summary(
     summary_events: list[ModelStreamEvent],
     expected_error: str,
+    expected_error_type: str,
 ):
     store = InMemorySessionStore()
     budget_store = InMemoryBudgetStore()
@@ -41023,14 +41120,13 @@ def test_cayu_app_counts_completed_compaction_with_invalid_summary(
             "uncached_input_tokens": 100,
         },
     }
-    assert events[3].payload["error_type"] == "ValueError"
+    assert events[3].payload["error_type"] == expected_error_type
     assert "error" not in events[3].payload
-    assert events[3].payload["error_type"] == "ValueError"
     assert events[4].payload["step_count"] == 1
     assert events[4].payload["token_usage"]["input_tokens"] == 100
     assert events[5].payload == {
         "error": expected_error,
-        "error_type": "ValueError",
+        "error_type": expected_error_type,
     }
     assert runtime_provider.requests == []
     assert asyncio.run(store.load_checkpoint("sess_invalid_compaction_summary")) is None
@@ -43255,13 +43351,18 @@ def test_cayu_app_returns_clear_tool_failure_for_invalid_constructed_result():
     ]
     assert events[4].payload["result"]["is_error"] is True
     assert events[4].payload["result"]["content"] == (
-        "`structured` must contain JSON-compatible values."
+        "Tool returned a non-portable result after execution."
     )
+    assert events[4].payload["terminal_outcome"] == "invalid_tool_output"
+    assert events[4].payload["tool_effect"] == "external"
+    assert events[4].payload["outcome_unknown"] is True
+    assert events[4].payload["manual_reconciliation_required"] is True
+    assert events[4].payload["result"]["structured"]["tool_effect"] == "external"
 
     tool_result_part = provider.requests[1].messages[-1].content[0]
     assert tool_result_part.type == "tool_result"
     assert tool_result_part.is_error is True
-    assert tool_result_part.content == ("`structured` must contain JSON-compatible values.")
+    assert tool_result_part.content == "Tool returned a non-portable result after execution."
     assert session is not None
     assert session.status == SessionStatus.COMPLETED
 
@@ -43806,13 +43907,14 @@ def test_cayu_app_rejects_custom_tool_call_argument_containers():
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
+        EventType.MODEL_ERROR,
         EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
-    assert events[-1].payload["error_type"] == "ValueError"
-    assert events[-1].payload["error"] == (
-        "`payload.arguments` must contain JSON-compatible values."
-    )
+    assert events[2].payload["durable_value_error_code"] == "invalid_json_type"
+    assert events[2].payload["durable_value_path"] == "$/#1"
+    assert events[-1].payload["error_type"] == "ModelProviderError"
+    assert events[-1].payload["error"] == ("Model provider emitted a non-portable stream value.")
 
 
 @pytest.mark.parametrize(
@@ -49394,15 +49496,17 @@ def test_run_tool_does_not_mislabel_tool_raised_timeout_error():
         async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
             raise TimeoutError("upstream service timed out")
 
-    result = asyncio.run(
+    outcome = asyncio.run(
         run_tool(
             tool=TimeoutRaisingTool(),
+            effect=ToolEffect.EXTERNAL,
             ctx=ToolContext(session_id="sess_tool_raised_timeout"),
             arguments={},
             timeout_seconds=5,
         )
     )
 
+    result = outcome.result
     assert result.is_error is True
     assert "upstream service timed out" in result.content
     assert "timed out after" not in result.content

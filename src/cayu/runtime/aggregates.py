@@ -18,13 +18,13 @@ from pydantic import (
     StrictBool,
     StrictInt,
     ValidationInfo,
-    field_serializer,
     field_validator,
     model_validator,
 )
 
 from cayu._validation import json_utf8_size_within_limit, require_clean_nonblank
 from cayu.core.billing import BillingIdentity
+from cayu.core.events import Event, EventType
 from cayu.runtime.usage import CacheUsageMetrics, UsageMetrics
 
 
@@ -155,6 +155,44 @@ class AggregateUsageMetrics(BaseModel):
     cache: AggregateCacheUsageMetrics
 
 
+def build_aggregate_usage_metrics(
+    *,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    total_tokens: int = 0,
+    reasoning_output_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    cache_write_5m_tokens: int = 0,
+    cache_write_1h_tokens: int = 0,
+    cache_write_unknown_ttl_tokens: int = 0,
+    cached_input_tokens: int = 0,
+    uncached_input_tokens: int = 0,
+) -> AggregateUsageMetrics:
+    """Build identity-free aggregate counters without weakening step metrics.
+
+    Individual model-step counters use the portable signed-64-bit contract.
+    Exact totals may legitimately exceed that range, so aggregate projections
+    use their own validated public type and serialize counters as decimal strings.
+    """
+
+    return AggregateUsageMetrics(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        reasoning_output_tokens=reasoning_output_tokens,
+        cache=AggregateCacheUsageMetrics(
+            read_tokens=cache_read_tokens,
+            write_tokens=cache_write_tokens,
+            write_5m_tokens=cache_write_5m_tokens,
+            write_1h_tokens=cache_write_1h_tokens,
+            write_unknown_ttl_tokens=cache_write_unknown_ttl_tokens,
+            cached_input_tokens=cached_input_tokens,
+            uncached_input_tokens=uncached_input_tokens,
+        ),
+    )
+
+
 class UsageAggregateTotals(BaseModel):
     """Identity-free activity and token totals for one aggregate scope."""
 
@@ -164,74 +202,7 @@ class UsageAggregateTotals(BaseModel):
     model_steps: AggregateCount = Field(ge=0)
     model_steps_with_usage: AggregateCount = Field(ge=0)
     tool_calls: AggregateCount = Field(ge=0)
-    usage: UsageMetrics
-
-    @field_serializer("usage", when_used="json")
-    def serialize_usage(self, value: UsageMetrics) -> AggregateUsageMetrics:
-        return AggregateUsageMetrics(
-            input_tokens=value.input_tokens,
-            output_tokens=value.output_tokens,
-            total_tokens=value.total_tokens,
-            reasoning_output_tokens=value.reasoning_output_tokens,
-            cache=AggregateCacheUsageMetrics(
-                read_tokens=value.cache.read_tokens,
-                write_tokens=value.cache.write_tokens,
-                write_5m_tokens=value.cache.write_5m_tokens,
-                write_1h_tokens=value.cache.write_1h_tokens,
-                write_unknown_ttl_tokens=value.cache.write_unknown_ttl_tokens,
-                cached_input_tokens=value.cache.cached_input_tokens,
-                uncached_input_tokens=value.cache.uncached_input_tokens,
-            ),
-        )
-
-    @field_validator(
-        "usage",
-        mode="before",
-        json_schema_input_type=AggregateUsageMetrics,
-    )
-    @classmethod
-    def deserialize_usage(cls, value: object, info: ValidationInfo) -> object:
-        """Parse the aggregate-only JSON projection back into runtime usage metrics."""
-
-        if info.mode != "json" or type(value) is not dict:
-            return value
-        usage = dict(value)
-        for field_name in (
-            "input_tokens",
-            "output_tokens",
-            "total_tokens",
-            "reasoning_output_tokens",
-        ):
-            if field_name in usage:
-                usage[field_name] = _aggregate_count_from_json(usage[field_name])
-        raw_cache = usage.get("cache")
-        if type(raw_cache) is dict:
-            cache = dict(raw_cache)
-            for field_name in (
-                "read_tokens",
-                "write_tokens",
-                "write_5m_tokens",
-                "write_1h_tokens",
-                "write_unknown_ttl_tokens",
-                "cached_input_tokens",
-                "uncached_input_tokens",
-            ):
-                if field_name in cache:
-                    cache[field_name] = _aggregate_count_from_json(cache[field_name])
-            usage["cache"] = cache
-        return usage
-
-    @field_validator("usage")
-    @classmethod
-    def require_identity_free_usage(cls, value: UsageMetrics) -> UsageMetrics:
-        if (
-            value.provider_name is not None
-            or value.requested_model is not None
-            or value.model is not None
-            or value.billing_identity is not None
-        ):
-            raise ValueError("Aggregate usage totals cannot carry one model identity.")
-        return value.model_copy(deep=True)
+    usage: AggregateUsageMetrics
 
     @model_validator(mode="after")
     def validate_reported_steps(self) -> UsageAggregateTotals:
@@ -240,26 +211,27 @@ class UsageAggregateTotals(BaseModel):
         return self
 
 
-def add_aggregate_usage(left: UsageMetrics, right: UsageMetrics) -> UsageMetrics:
+def add_aggregate_usage(
+    left: AggregateUsageMetrics,
+    right: AggregateUsageMetrics | UsageMetrics,
+) -> AggregateUsageMetrics:
     """Add token counters while deliberately discarding per-step identity fields."""
 
-    return UsageMetrics(
+    return build_aggregate_usage_metrics(
         input_tokens=left.input_tokens + right.input_tokens,
         output_tokens=left.output_tokens + right.output_tokens,
         total_tokens=left.total_tokens + right.total_tokens,
         reasoning_output_tokens=(left.reasoning_output_tokens + right.reasoning_output_tokens),
-        cache=CacheUsageMetrics(
-            read_tokens=left.cache.read_tokens + right.cache.read_tokens,
-            write_tokens=left.cache.write_tokens + right.cache.write_tokens,
-            write_5m_tokens=left.cache.write_5m_tokens + right.cache.write_5m_tokens,
-            write_1h_tokens=left.cache.write_1h_tokens + right.cache.write_1h_tokens,
-            write_unknown_ttl_tokens=(
-                left.cache.write_unknown_ttl_tokens + right.cache.write_unknown_ttl_tokens
-            ),
-            cached_input_tokens=(left.cache.cached_input_tokens + right.cache.cached_input_tokens),
-            uncached_input_tokens=(
-                left.cache.uncached_input_tokens + right.cache.uncached_input_tokens
-            ),
+        cache_read_tokens=left.cache.read_tokens + right.cache.read_tokens,
+        cache_write_tokens=left.cache.write_tokens + right.cache.write_tokens,
+        cache_write_5m_tokens=left.cache.write_5m_tokens + right.cache.write_5m_tokens,
+        cache_write_1h_tokens=left.cache.write_1h_tokens + right.cache.write_1h_tokens,
+        cache_write_unknown_ttl_tokens=(
+            left.cache.write_unknown_ttl_tokens + right.cache.write_unknown_ttl_tokens
+        ),
+        cached_input_tokens=(left.cache.cached_input_tokens + right.cache.cached_input_tokens),
+        uncached_input_tokens=(
+            left.cache.uncached_input_tokens + right.cache.uncached_input_tokens
         ),
     )
 
@@ -300,6 +272,25 @@ def aggregate_usage_metrics_from_event_payload(
             uncached_input_tokens=_aggregate_counter(raw_cache.get("uncached_input_tokens")),
         ),
     )
+
+
+def project_aggregate_usage_inspection_event(
+    event: Event,
+) -> tuple[Event, UsageMetrics | None]:
+    """Return the bounded event projection and metrics consumed by inspection.
+
+    Parsing happens before projection with the same tolerant contract as native
+    rollups: malformed optional identity and counter fields become unknown or
+    zero without discarding otherwise valid counters.
+    """
+
+    metrics = (
+        aggregate_usage_metrics_from_event_payload(event.payload)
+        if event.type == EventType.MODEL_COMPLETED
+        else None
+    )
+    payload = {"usage_metrics": metrics.model_dump(mode="json")} if metrics is not None else {}
+    return event.model_copy(update={"payload": payload}), metrics
 
 
 def pricing_usage_metrics_from_event_payload(

@@ -3,17 +3,37 @@ from __future__ import annotations
 import asyncio
 import errno
 import inspect
+import math
 import pickle
 import sys
 import time
+from decimal import Decimal, localcontext
 from types import SimpleNamespace
 
 import pytest
 from pydantic import SecretStr, TypeAdapter, ValidationError
 
+import cayu
 import cayu.artifacts.local as artifact_local_module
 import cayu.runners._subprocess as runner_subprocess_module
-from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
+    MAX_DURABLE_JSON_NESTING,
+    MIN_DURABLE_JSON_INTEGER,
+    DurableValueError,
+    canonical_durable_json_bytes,
+    copy_durable_json_object,
+    copy_durable_json_value,
+    copy_json_object,
+    copy_json_value,
+    extract_durable_value_error,
+    require_clean_nonblank,
+    require_durable_json_text,
+    require_durable_text,
+    require_nonblank,
+    safe_durable_value_error_details,
+    validate_json_value,
+)
 from cayu.artifacts import (
     ArtifactListResult,
     ArtifactMetadata,
@@ -39,6 +59,7 @@ from cayu.core import (
     MessageRole,
     ProviderStatePart,
     TextPart,
+    ThinkingPart,
     ToolCallPart,
     ToolResultPart,
     WorkflowSpec,
@@ -58,18 +79,26 @@ from cayu.core.tools import (
 from cayu.environments import Environment, EnvironmentSpec
 from cayu.mcp import McpServerSpec
 from cayu.providers import (
+    InputTokenCountConfidence,
+    InputTokenCountMethod,
+    InputTokenCountResult,
     ModelContextOverflowError,
     ModelProviderError,
     ModelRequest,
     ModelStreamEvent,
+    ModelStreamEventType,
+    copy_input_token_count_result,
+    copy_model_stream_event,
 )
 from cayu.runners import ExecCommand, ExecResult, LocalRunner
 from cayu.runtime import (
+    BusinessApprovalRouting,
     DispatchHandle,
     DispatchRequest,
     DispatchStatus,
     InMemoryEventSink,
     LoopPolicy,
+    ResolutionActor,
     ResumeRequest,
     RetryPolicy,
     RetryReason,
@@ -85,8 +114,15 @@ from cayu.runtime import (
     ToolPolicyDecision,
     ToolPolicyRequest,
     ToolPolicyResult,
+    ToolRoundRecoveryRequest,
+    UsageMetrics,
+    UserInputResponse,
+    copy_dispatch_request,
     retry_decision,
 )
+from cayu.runtime._model_errors import copy_provider_hook_error_control
+from cayu.runtime.approvals import copy_resolution_actor
+from cayu.runtime.structured_output import validate_structured_output_text
 from cayu.storage import KnowledgeEntry, KnowledgeHit
 from cayu.storage.memory import copy_knowledge_entry
 from cayu.vaults import (
@@ -595,9 +631,13 @@ def test_provider_runner_storage_and_secret_models_own_mutable_inputs():
             tool_name="echo",
             structured={"bad": value},
         ),
-        lambda value: ModelStreamEvent.tool_call(
-            name="echo",
-            arguments={"bad": value},
+        lambda value: copy_model_stream_event(
+            ModelStreamEvent.model_construct(
+                type=ModelStreamEventType.TOOL_CALL,
+                delta="",
+                payload={"name": "echo", "arguments": {"bad": value}},
+                completion=None,
+            )
         ),
         lambda value: ModelRequest(
             model="fake-model",
@@ -646,6 +686,15 @@ def test_json_boundary_fields_reject_circular_references():
     with pytest.raises(ValueError, match="circular references"):
         copy_json_value(cyclic_list, "payload")
 
+    with pytest.raises(DurableValueError) as durable_dict_error:
+        copy_durable_json_value(cyclic_dict, "payload")
+
+    with pytest.raises(DurableValueError) as durable_list_error:
+        copy_durable_json_value(cyclic_list, "payload")
+
+    assert durable_dict_error.value.code == "circular_reference"
+    assert durable_list_error.value.code == "circular_reference"
+
     with pytest.raises(ValidationError, match="circular references"):
         Event(
             type=EventType.SESSION_STARTED,
@@ -679,6 +728,648 @@ def test_json_boundary_fields_do_not_preserve_python_aliases():
 
     assert event.payload["second"] == {"value": "original"}
     assert event.payload["first"] is not event.payload["second"]
+
+
+def test_durable_json_contract_accepts_portable_values_and_owns_its_copy():
+    shared = {"unicode": "🙂 e\u0301\n\x01"}
+    payload = {
+        "minimum": MIN_DURABLE_JSON_INTEGER,
+        "maximum": MAX_DURABLE_JSON_INTEGER,
+        "negative_zero": -0.0,
+        "first": shared,
+        "second": shared,
+    }
+
+    copied = copy_durable_json_object(payload, "payload")
+    shared["unicode"] = "mutated"
+    copied["first"]["unicode"] = "changed"
+
+    assert copied["minimum"] == -(2**63)
+    assert copied["maximum"] == 2**63 - 1
+    assert copied["negative_zero"] == 0
+    assert type(copied["negative_zero"]) is int
+    assert copied["first"] == {"unicode": "changed"}
+    assert copied["second"] == {"unicode": "🙂 e\u0301\n\x01"}
+    assert copied["first"] is not copied["second"]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected", "expected_type"),
+    [
+        (-0.0, 0, int),
+        (0.0, 0, int),
+        (1.0, 1, int),
+        (float(MIN_DURABLE_JSON_INTEGER), MIN_DURABLE_JSON_INTEGER, int),
+        (float(2**62), 2**62, int),
+        (1e18, 1_000_000_000_000_000_000, int),
+        (1e-7, 1e-7, float),
+    ],
+    ids=[
+        "negative-zero",
+        "positive-zero",
+        "ordinary-integral",
+        "int64-minimum",
+        "large-power-of-two",
+        "exponent-integral",
+        "fractional",
+    ],
+)
+def test_durable_json_contract_has_one_backend_stable_number_representation(
+    value,
+    expected,
+    expected_type,
+):
+    copied = copy_durable_json_value(value, "payload")
+
+    assert copied == expected
+    assert type(copied) is expected_type
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        (-0.0, 0.0),
+        (1e18, 1_000_000_000_000_000_000),
+        (1e-7, 0.0000001),
+    ],
+    ids=["signed-zero", "integral-exponent", "small-exponent"],
+)
+def test_canonical_durable_json_normalizes_backend_numeric_spellings(left, right):
+    left_encoded = canonical_durable_json_bytes({"number": left}, "payload")
+    right_encoded = canonical_durable_json_bytes({"number": right}, "payload")
+
+    assert left_encoded == right_encoded
+
+
+def test_canonical_durable_json_is_independent_of_decimal_context():
+    values = ({"number": 1.234}, {"number": 1.199})
+    expected = [canonical_durable_json_bytes(value, "payload") for value in values]
+
+    with localcontext() as context:
+        context.prec = 2
+        actual = [canonical_durable_json_bytes(value, "payload") for value in values]
+
+    assert actual == expected
+    assert actual[0] != actual[1]
+
+
+@pytest.mark.parametrize("value", [float(2**63), 1e20])
+def test_durable_json_rejects_integral_float_that_reloads_outside_int64(value):
+    with pytest.raises(DurableValueError) as raised:
+        copy_durable_json_value({"number": value}, "payload")
+
+    assert raised.value.code == "integral_float_out_of_range"
+    assert raised.value.path == "$/#0"
+
+
+def test_input_token_count_rejects_values_outside_durable_integer_range():
+    with pytest.raises(ValidationError):
+        InputTokenCountResult(
+            input_tokens=MAX_DURABLE_JSON_INTEGER + 1,
+            method=InputTokenCountMethod.OFFICIAL,
+            confidence=InputTokenCountConfidence.HIGH,
+        )
+
+    forged = InputTokenCountResult.model_construct(
+        input_tokens=MAX_DURABLE_JSON_INTEGER + 1,
+        method=InputTokenCountMethod.OFFICIAL,
+        confidence=InputTokenCountConfidence.HIGH,
+        components={},
+        metadata={},
+    )
+    with pytest.raises(ValidationError):
+        copy_input_token_count_result(forged)
+
+
+def test_provider_hook_error_snapshot_does_not_publish_forged_diagnostics():
+    error = DurableValueError(
+        "nul_character",
+        "workload-secret-field",
+        path="$/#0",
+    )
+    error.code = "workload-secret-code"
+    error.path = "$/workload-secret-path"
+
+    copied, diagnostics = copy_provider_hook_error_control(
+        error,
+        fallback_provider="fake",
+        generic_error_code="billing_identity_resolution_failed",
+    )
+
+    assert str(copied) == "Model provider emitted a non-portable error value."
+    assert copied.retryable is False
+    assert diagnostics == {
+        "durable_value_error_code": "invalid_json_type",
+        "durable_value_path": "$",
+    }
+    rendered = repr((copied, diagnostics))
+    assert "workload-secret-field" not in rendered
+    assert "workload-secret-code" not in rendered
+    assert "workload-secret-path" not in rendered
+
+
+@pytest.mark.parametrize(
+    ("value", "code"),
+    [
+        ("bad\x00text", "nul_character"),
+        ("bad\ud800text", "unicode_surrogate"),
+        (float("nan"), "non_finite_number"),
+        (float("inf"), "non_finite_number"),
+        (float("-inf"), "non_finite_number"),
+        (MAX_DURABLE_JSON_INTEGER + 1, "integer_out_of_range"),
+        (MIN_DURABLE_JSON_INTEGER - 1, "integer_out_of_range"),
+        (Decimal("1.25"), "invalid_json_type"),
+        (b"bytes", "invalid_json_type"),
+        (("tuple",), "invalid_json_type"),
+    ],
+)
+def test_durable_json_contract_has_stable_typed_failures(value, code):
+    with pytest.raises(DurableValueError) as raised:
+        copy_durable_json_value({"bad": value}, "payload")
+
+    assert raised.value.code == code
+    assert raised.value.field_name == "payload"
+    assert raised.value.path == "$/#0"
+    assert len(str(raised.value)) < 1024
+    assert str(raised.value).isascii()
+
+
+@pytest.mark.parametrize(
+    ("value", "code"),
+    [
+        ({1: "value"}, "invalid_json_key"),
+        ({"bad\x00key": "value"}, "nul_character"),
+        ({"bad\udfffkey": "value"}, "unicode_surrogate"),
+    ],
+)
+def test_durable_json_contract_validates_object_keys_without_echoing_them(value, code):
+    raw_key = next(iter(value))
+
+    with pytest.raises(DurableValueError) as raised:
+        copy_durable_json_value(value, "payload")
+
+    assert raised.value.code == code
+    assert raised.value.path == "$/#0/key"
+    assert str(raw_key) not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda value: Event(
+            type=EventType.SESSION_STARTED,
+            session_id="sess_1",
+            payload={"bad": value},
+        ),
+        lambda value: ToolCallPart(
+            tool_call_id="call_1",
+            tool_name="echo",
+            arguments={"bad": value},
+        ),
+        lambda value: ToolResult(content="ok", structured={"bad": value}),
+        lambda value: ToolResultPart(
+            tool_call_id="call_1",
+            tool_name="echo",
+            structured={"bad": value},
+        ),
+        lambda value: copy_model_stream_event(
+            ModelStreamEvent.model_construct(
+                type=ModelStreamEventType.TOOL_CALL,
+                delta="",
+                payload={"name": "echo", "arguments": {"bad": value}},
+                completion=None,
+            )
+        ),
+        lambda value: ModelRequest(
+            model="fake-model",
+            messages=[Message.text("user", "start")],
+            tools=[{"bad": value}],
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("value", "code"),
+    [
+        ("bad\x00text", "nul_character"),
+        ("bad\ud800text", "unicode_surrogate"),
+        (float("nan"), "non_finite_number"),
+        (MAX_DURABLE_JSON_INTEGER + 1, "integer_out_of_range"),
+    ],
+)
+def test_core_durable_json_producers_reject_nonportable_nested_values(
+    factory,
+    value,
+    code,
+):
+    with pytest.raises(ValueError, match=rf"code={code}"):
+        factory(value)
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda value: DispatchRequest(
+            session_id="sess_1",
+            messages=[Message.text("user", "continue")],
+            metadata={"nested": {"bad": value}},
+        ),
+        lambda value: ToolApprovalRequest(
+            session_id="sess_1",
+            approval_id="approval_1",
+            decision="approve",
+            metadata={"nested": {"bad": value}},
+        ),
+        lambda value: ToolApprovalRecoveryRequest(
+            session_id="sess_1",
+            approval_id="approval_1",
+            tool_call_id="call_1",
+            outcome="completed",
+            message="completed",
+            structured={"nested": {"bad": value}},
+        ),
+        lambda value: UserInputResponse(
+            session_id="sess_1",
+            input_id="input_1",
+            answer="answer",
+            metadata={"nested": {"bad": value}},
+        ),
+        lambda value: ToolRoundRecoveryRequest(
+            session_id="sess_1",
+            round_id="round_1",
+            tool_call_id="call_1",
+            outcome="completed",
+            message="completed",
+            metadata={"nested": {"bad": value}},
+        ),
+        lambda value: ResolutionActor(
+            subject="operator_1",
+            claims={"nested": {"bad": value}},
+        ),
+        lambda value: BusinessApprovalRouting(
+            required_tier="manager",
+            chain=("manager",),
+            metadata={"nested": {"bad": value}},
+        ),
+        lambda value: StructuredOutputSpec(
+            json_schema={
+                "type": "object",
+                "x-cayu-portability-probe": {"nested": {"bad": value}},
+            }
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("value", "code"),
+    [
+        ("bad\x00text", "nul_character"),
+        ("bad\ud800text", "unicode_surrogate"),
+        (float("nan"), "non_finite_number"),
+        (MAX_DURABLE_JSON_INTEGER + 1, "integer_out_of_range"),
+    ],
+)
+def test_durable_runtime_checkpoint_and_recovery_producers_reject_nonportable_values(
+    factory,
+    value,
+    code,
+):
+    with pytest.raises(ValidationError) as raised:
+        factory(value)
+
+    durable_error = extract_durable_value_error(raised.value)
+    assert durable_error is not None
+    assert durable_error.code == code
+
+
+def test_runtime_request_copies_revalidate_mutated_messages_and_approval_claims():
+    dispatch = DispatchRequest(
+        session_id="sess_1",
+        messages=[
+            Message.tool_call(
+                tool_call_id="call_1",
+                tool_name="echo",
+                arguments={"safe": True},
+            )
+        ],
+    )
+    dispatch_part = dispatch.messages[0].content[0]
+    assert isinstance(dispatch_part, ToolCallPart)
+    dispatch_part.arguments["bad"] = float("nan")
+
+    with pytest.raises(ValidationError) as invalid_dispatch:
+        copy_dispatch_request(dispatch)
+    dispatch_error = extract_durable_value_error(invalid_dispatch.value)
+    assert dispatch_error is not None
+    assert dispatch_error.code == "non_finite_number"
+
+    actor = ResolutionActor(
+        subject="operator_1",
+        claims={"nested": {"safe": True}},
+    )
+    actor.claims["nested"]["bad"] = "value\ud800"
+
+    with pytest.raises((DurableValueError, ValidationError)) as invalid_actor:
+        copy_resolution_actor(actor)
+    actor_error = extract_durable_value_error(invalid_actor.value)
+    assert actor_error is not None
+    assert actor_error.code == "unicode_surrogate"
+
+
+def test_usage_metrics_reject_token_counts_outside_the_durable_integer_range():
+    UsageMetrics(total_tokens=MAX_DURABLE_JSON_INTEGER)
+
+    with pytest.raises(ValidationError):
+        UsageMetrics(total_tokens=MAX_DURABLE_JSON_INTEGER + 1)
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda value: ToolResult(content=value),
+        lambda value: ToolResultPart(
+            tool_call_id="call_1",
+            tool_name="echo",
+            content=value,
+        ),
+        lambda value: ThinkingPart(text=value),
+        lambda value: copy_model_stream_event(ModelStreamEvent.text_delta(value)),
+        lambda value: ToolSpec(name="echo", description=value),
+    ],
+)
+def test_allowed_empty_core_text_is_portable(factory):
+    factory("")
+    factory("ordinary 🙂 e\u0301\ntext")
+
+    with pytest.raises(ValueError, match="code=nul_character"):
+        factory("bad\x00text")
+
+    with pytest.raises(ValueError, match="code=unicode_surrogate"):
+        factory("bad\ud800text")
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda value: TextPart(text=value),
+        lambda value: Event(
+            type=EventType.SESSION_STARTED,
+            session_id=value,
+        ),
+        lambda value: ModelRequest(
+            model=value,
+            messages=[Message.text("user", "start")],
+        ),
+    ],
+)
+def test_nonblank_core_text_is_portable(factory):
+    with pytest.raises(ValueError, match="code=nul_character"):
+        factory("bad\x00text")
+
+    with pytest.raises(ValueError, match="code=unicode_surrogate"):
+        factory("bad\ud800text")
+
+
+def _nested_durable_value(depth: int, kind: str):
+    value = "leaf"
+    for index in range(depth):
+        if kind == "list" or (kind == "alternating" and index % 2 == 0):
+            value = [value]
+        else:
+            value = {"item": value}
+    return value
+
+
+@pytest.mark.parametrize("kind", ["list", "dict", "alternating"])
+def test_durable_json_contract_has_an_explicit_nesting_limit(kind):
+    accepted = _nested_durable_value(MAX_DURABLE_JSON_NESTING, kind)
+    rejected = _nested_durable_value(MAX_DURABLE_JSON_NESTING + 1, kind)
+
+    assert copy_durable_json_value(accepted, "payload") == accepted
+    with pytest.raises(DurableValueError) as raised:
+        copy_durable_json_value(rejected, "payload")
+
+    assert raised.value.code == "nesting_too_deep"
+    assert len(raised.value.path) <= 512
+
+
+def test_durable_json_contract_bounds_safe_diagnostics():
+    invalid_key = "workload-secret-" + "s" * 1000 + "\x00"
+    field_name = "payload\n\ud800" + "x" * 1000
+
+    with pytest.raises(DurableValueError) as raised:
+        copy_durable_json_value({invalid_key: "value"}, field_name)
+
+    message = str(raised.value)
+    assert invalid_key not in message
+    assert "\n" not in message
+    assert "\ud800" not in message
+    assert message.isascii()
+    assert len(message) < 1024
+    assert len(raised.value.field_name) <= 128
+    assert len(raised.value.path) <= 512
+
+
+def test_legacy_json_helpers_keep_their_previous_contract():
+    negative_zero = -0.0
+    payload = {
+        "nul": "legacy\x00text",
+        "surrogate": "legacy\ud800text",
+        "large": MAX_DURABLE_JSON_INTEGER + 1,
+        "negative_zero": negative_zero,
+    }
+
+    copied = copy_json_value(payload, "payload")
+
+    assert copied == payload
+    assert math.copysign(1.0, copied["negative_zero"]) == -1.0
+    assert copy_json_object(payload, "payload") == payload
+    assert validate_json_value(payload, "payload") is None
+    assert require_durable_json_text(MAX_DURABLE_JSON_INTEGER + 1, "payload") == (
+        MAX_DURABLE_JSON_INTEGER + 1
+    )
+
+    with pytest.raises(ValueError, match="NUL"):
+        require_durable_json_text("legacy\x00text", "payload")
+
+    assert require_durable_text("ordinary", "content") == "ordinary"
+
+    with pytest.raises(DurableValueError) as object_error:
+        copy_durable_json_object([], "payload")
+    assert object_error.value.code == "invalid_json_object"
+
+
+def test_durable_value_error_is_public_and_pickle_safe():
+    with pytest.raises(DurableValueError) as raised:
+        require_durable_text("bad\x00text", "content")
+
+    restored = pickle.loads(pickle.dumps(raised.value))
+
+    assert cayu.DurableValueError is DurableValueError
+    assert cayu.extract_durable_value_error is extract_durable_value_error
+    assert type(restored) is DurableValueError
+    assert restored.code == raised.value.code
+    assert restored.field_name == raised.value.field_name
+    assert restored.path == raised.value.path
+    assert str(restored) == str(raised.value)
+
+
+def test_extract_durable_value_error_handles_direct_and_pydantic_failures():
+    secret = "timeout\x00workload-secret-value"
+
+    with pytest.raises(DurableValueError) as direct:
+        require_durable_text(secret, "content")
+    assert extract_durable_value_error(direct.value) is direct.value
+
+    with pytest.raises(ValidationError) as wrapped:
+        Event(
+            type=EventType.SESSION_STARTED,
+            session_id="sess_1",
+            payload={"secret": secret},
+        )
+
+    extracted = extract_durable_value_error(wrapped.value)
+    assert extracted is not None
+    assert extracted.code == "nul_character"
+    assert extracted.field_name == "payload"
+    assert "timeout" not in str(wrapped.value)
+    assert "workload-secret" not in str(wrapped.value)
+    assert extract_durable_value_error(RuntimeError("ordinary failure")) is None
+
+
+def test_durable_value_error_details_reject_forged_or_mutated_diagnostics():
+    error = DurableValueError(
+        "nul_character",
+        "payload",
+        path="$/workload-secret-path",
+    )
+    assert safe_durable_value_error_details(error) == ("nul_character", "$")
+
+    error.code = "workload-secret-code"
+    error.path = "$/0/workload-secret-path"
+    assert safe_durable_value_error_details(error) == ("invalid_json_type", "$")
+
+    error.code = "unicode_surrogate"
+    error.path = "$/#12/key/3"
+    assert safe_durable_value_error_details(error) == (
+        "unicode_surrogate",
+        "$/#12/key/3",
+    )
+
+
+def test_durable_value_error_sanitizer_never_reads_subclass_accessors():
+    secret = "workload-secret-durable-error-accessor"
+
+    class HostileDurableValueError(DurableValueError):
+        def __init__(self) -> None:
+            object.__setattr__(self, "_armed", False)
+            super().__init__("nul_character", "provider value", path="$/#0")
+            object.__setattr__(self, "_armed", True)
+
+        def __getattribute__(self, name: str):
+            if name in {"code", "path"} and object.__getattribute__(self, "_armed"):
+                raise RuntimeError(secret)
+            return object.__getattribute__(self, name)
+
+    hostile = HostileDurableValueError()
+    extracted = extract_durable_value_error(hostile)
+
+    assert type(extracted) is DurableValueError
+    assert extracted is not hostile
+    assert safe_durable_value_error_details(hostile) == ("invalid_json_type", "$")
+    assert safe_durable_value_error_details(extracted) == ("invalid_json_type", "$")
+
+    malformed = DurableValueError.__new__(DurableValueError)
+    ValueError.__init__(malformed)
+    assert safe_durable_value_error_details(malformed) == ("invalid_json_type", "$")
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda value: Message.text("user", value),
+        lambda value: ToolResult(content=value),
+        lambda value: ToolSpec(name="echo", description=value),
+        lambda value: Event(
+            type=EventType.SESSION_STARTED,
+            session_id="sess_1",
+            payload={"secret": value},
+        ),
+        lambda value: ModelRequest(
+            model="fake-model",
+            messages=[Message.text("user", "safe")],
+            options={"secret": value},
+        ),
+    ],
+)
+def test_durable_producer_validation_errors_hide_rejected_inputs(factory):
+    secret = "timeout\x00workload-secret-value"
+
+    with pytest.raises(ValidationError) as raised:
+        factory(secret)
+
+    rendered = str(raised.value)
+    assert "timeout" not in rendered
+    assert "workload-secret" not in rendered
+    assert "input_value" not in rendered
+
+
+def test_model_request_detaches_and_revalidates_message_payloads():
+    message = Message.tool_call(
+        tool_call_id="call_1",
+        tool_name="echo",
+        arguments={"nested": {"value": "original"}},
+    )
+    request = ModelRequest(model="fake-model", messages=[message])
+
+    message.content[0].arguments["nested"]["value"] = "mutated"
+
+    assert request.messages[0].content[0].arguments == {"nested": {"value": "original"}}
+    assert request.messages[0] is not message
+
+    invalid = "timeout\x00workload-secret-value"
+    message.content[0].arguments["nested"]["value"] = invalid
+    with pytest.raises(ValidationError) as mutated_error:
+        ModelRequest(model="fake-model", messages=[message])
+    assert "timeout" not in str(mutated_error.value)
+    assert "workload-secret" not in str(mutated_error.value)
+
+    bypassed_part = ToolCallPart.model_construct(
+        tool_call_id="call_1",
+        tool_name="echo",
+        arguments={"secret": invalid},
+    )
+    bypassed_message = Message.model_construct(
+        role=MessageRole.ASSISTANT,
+        content=(bypassed_part,),
+    )
+    with pytest.raises(ValidationError) as bypass_error:
+        ModelRequest(model="fake-model", messages=[bypassed_message])
+    assert "timeout" not in str(bypass_error.value)
+    assert "workload-secret" not in str(bypass_error.value)
+
+
+def test_run_requests_detach_and_revalidate_message_payloads():
+    message = Message.tool_call(
+        tool_call_id="call_1",
+        tool_name="echo",
+        arguments={"nested": {"value": "original"}},
+    )
+    request = RunRequest(agent_name="assistant", messages=[message])
+
+    message.content[0].arguments["nested"]["value"] = "mutated"
+
+    assert request.messages[0].content[0].arguments == {"nested": {"value": "original"}}
+    assert request.messages[0] is not message
+
+    invalid = "timeout\x00workload-secret-value"
+    request.messages[0].content[0].arguments["nested"]["value"] = invalid
+    for factory in (
+        lambda: RunRequest(agent_name="assistant", messages=request.messages),
+        lambda: ResumeRequest(session_id="sess_1", messages=request.messages),
+    ):
+        with pytest.raises(ValidationError) as raised:
+            factory()
+        assert extract_durable_value_error(raised.value) is not None
+        assert "workload-secret" not in str(raised.value)
 
 
 def test_nonblank_helper_rejects_string_subclasses_before_strip():
@@ -1414,6 +2105,83 @@ def test_structured_output_spec_validates_json_schema_and_options():
 
     with pytest.raises(ValidationError):
         StructuredOutputSpec(json_schema=schema, strategy="unknown")
+
+
+@pytest.mark.parametrize(
+    ("literal", "expected"),
+    [
+        (str(MIN_DURABLE_JSON_INTEGER), MIN_DURABLE_JSON_INTEGER),
+        (str(MAX_DURABLE_JSON_INTEGER), MAX_DURABLE_JSON_INTEGER),
+    ],
+    ids=["minimum", "maximum"],
+)
+def test_structured_output_text_accepts_signed_int64_boundaries(literal, expected):
+    validation = validate_structured_output_text(
+        literal,
+        StructuredOutputSpec(json_schema={"type": "integer"}),
+    )
+
+    assert validation.valid is True
+    assert validation.output == expected
+    assert type(validation.output) is int
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        str(MIN_DURABLE_JSON_INTEGER - 1),
+        str(MAX_DURABLE_JSON_INTEGER + 1),
+        "9" * 5000,
+        "-" + "9" * 5000,
+        "NaN",
+        "Infinity",
+        "-Infinity",
+        '{"secret-key":"secret-a","secret-key":"secret-b"}',
+        '{"nested":{"secret-key":"secret-a","secret-key":"secret-b"}}',
+        '{"value":"\x00"}',
+        '{"value":"\ud800"}',
+        r'{"value":"\u0000"}',
+        r'{"value":"\ud800"}',
+        '{"secret-key":',
+    ],
+    ids=[
+        "below-minimum",
+        "above-maximum",
+        "huge-positive",
+        "huge-negative",
+        "nan",
+        "positive-infinity",
+        "negative-infinity",
+        "duplicate-top-level",
+        "duplicate-nested",
+        "raw-nul",
+        "raw-surrogate",
+        "escaped-nul",
+        "escaped-surrogate",
+        "invalid-syntax",
+    ],
+)
+def test_structured_output_text_maps_nonportable_json_to_bounded_validation(text):
+    validation = validate_structured_output_text(
+        text,
+        StructuredOutputSpec(json_schema={}),
+    )
+
+    assert validation.valid is False
+    assert validation.output is None
+    assert [error.model_dump() for error in validation.errors] == [
+        {
+            "path": "$",
+            "message": "Final assistant output is not valid portable JSON.",
+            "schema_path": "$",
+        }
+    ]
+    rendered = validation.errors[0].message
+    assert len(rendered) < 100
+    assert "secret-key" not in rendered
+    assert "secret-a" not in rendered
+    assert "secret-b" not in rendered
+    assert "digit" not in rendered.lower()
 
 
 def test_run_and_resume_requests_copy_structured_output_spec():
@@ -2590,6 +3358,18 @@ def test_local_artifact_store_puts_reads_lists_and_deletes_artifacts(tmp_path):
 
     store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
 
+    with pytest.raises(DurableValueError) as invalid_metadata:
+        asyncio.run(
+            store.put_bytes(
+                b"must-not-be-written",
+                filename="invalid.txt",
+                session_id="sess_1",
+                metadata={"nested": {"bad": float("nan")}},
+            )
+        )
+    assert invalid_metadata.value.code == "non_finite_number"
+    assert list(store.root.iterdir()) == []
+
     session_artifact = asyncio.run(
         store.put_bytes(
             b"invoice text",
@@ -2948,7 +3728,7 @@ def test_artifact_result_types_validate_boundary_values():
         content_type="text/plain",
         size_bytes=3,
         session_id="sess_1",
-        metadata={"nested": {"items": [1]}},
+        metadata={"nested": {"items": [1], "integral_float": 1.0, "zero": -0.0}},
     )
     read_result = ArtifactReadResult(
         metadata=artifact,
@@ -2972,7 +3752,11 @@ def test_artifact_result_types_validate_boundary_values():
         list.append(artifact.metadata["nested"]["items"], 2)
     with pytest.raises(TypeError, match="cannot be mutated"):
         artifact.metadata._data = {}  # type: ignore[attr-defined]
-    assert artifact.model_dump(mode="json")["metadata"] == {"nested": {"items": [1]}}
+    assert artifact.model_dump(mode="json")["metadata"] == {
+        "nested": {"items": [1], "integral_float": 1, "zero": 0}
+    }
+    assert type(artifact.metadata["nested"]["integral_float"]) is int
+    assert type(artifact.metadata["nested"]["zero"]) is int
 
     default_metadata = ArtifactMetadata(
         id="art_default",
@@ -3056,6 +3840,23 @@ def test_artifact_result_types_validate_boundary_values():
                 session_id="sess_1",
                 metadata=metadata,
             )
+
+    for metadata, code in (
+        ({"nested": {"bad": "value\x00"}}, "nul_character"),
+        ({"nested": {"bad": float("inf")}}, "non_finite_number"),
+        ({"nested": {"bad": MAX_DURABLE_JSON_INTEGER + 1}}, "integer_out_of_range"),
+    ):
+        with pytest.raises(ValidationError) as invalid_metadata:
+            ArtifactMetadata(
+                id="art_1",
+                filename="a.txt",
+                size_bytes=0,
+                session_id="sess_1",
+                metadata=metadata,
+            )
+        durable_error = extract_durable_value_error(invalid_metadata.value)
+        assert durable_error is not None
+        assert durable_error.code == code
 
     for content_type in ("text/pläin", "text/\ud800"):
         with pytest.raises(ValueError, match="printable ASCII"):
@@ -3160,7 +3961,7 @@ def test_file_attachment_contracts_are_json_safe_references():
         filename="invoice.png",
         content_type="image/png",
         size_bytes=123,
-        metadata={"source": "upload"},
+        metadata={"source": "upload", "integral_float": 1.0, "zero": -0.0},
     )
     attachment = file_attachment_from_payload(payload)
     resolved = ResolvedFileAttachment(
@@ -3178,10 +3979,12 @@ def test_file_attachment_contracts_are_json_safe_references():
         "filename": "invoice.png",
         "content_type": "image/png",
         "size_bytes": 123,
-        "metadata": {"source": "upload"},
+        "metadata": {"source": "upload", "integral_float": 1, "zero": 0},
     }
     assert attachment is not None
     assert attachment.artifact_id == "art_1"
+    assert type(attachment.metadata["integral_float"]) is int
+    assert type(attachment.metadata["zero"]) is int
     assert resolved.kind == FileAttachmentKind.IMAGE
     assert file_attachment_from_payload({"type": "other"}) is None
 
@@ -3239,6 +4042,25 @@ def test_file_attachment_contracts_are_json_safe_references():
             size_bytes=123,
             metadata={"bad": object()},
         )
+
+    for invalid_metadata, code in (
+        ({"bad": "value\x00"}, "nul_character"),
+        ({"bad": "value\ud800"}, "unicode_surrogate"),
+        ({"bad": float("nan")}, "non_finite_number"),
+        ({"bad": MAX_DURABLE_JSON_INTEGER + 1}, "integer_out_of_range"),
+    ):
+        with pytest.raises(ValidationError) as invalid_attachment:
+            FileAttachment(
+                artifact_id="art_1",
+                kind=FileAttachmentKind.IMAGE,
+                filename="invoice.png",
+                content_type="image/png",
+                size_bytes=123,
+                metadata=invalid_metadata,
+            )
+        durable_error = extract_durable_value_error(invalid_attachment.value)
+        assert durable_error is not None
+        assert durable_error.code == code
 
 
 def test_workspace_result_types_validate_boundary_values():

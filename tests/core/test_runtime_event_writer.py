@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+import cayu.runtime._event_writer as event_writer_module
 from cayu.core import Event, EventType, Message
 from cayu.runtime import (
     CayuApp,
@@ -18,7 +19,11 @@ from cayu.runtime import (
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime.budgets import BudgetWindow, InMemoryBudgetStore
 from cayu.runtime.event_sinks import EventSink
-from cayu.runtime.sessions import EventQuery, EventRecord
+from cayu.runtime.sessions import (
+    PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES,
+    EventQuery,
+    EventRecord,
+)
 
 
 class _RecordingSink(EventSink):
@@ -32,6 +37,41 @@ class _RecordingSink(EventSink):
 class _FailingSink(EventSink):
     async def emit(self, event: Event) -> None:
         raise RuntimeError("sink unavailable")
+
+
+class _NonPortableFailingSink(EventSink):
+    def __init__(self, message: str) -> None:
+        self._message = message
+
+    async def emit(self, event: Event) -> None:
+        raise RuntimeError(self._message)
+
+
+class _HostileExceptionMeta(type):
+    def __getattribute__(cls, name: str):
+        if name == "__name__":
+            raise AssertionError("exception metaclass name must not execute")
+        return super().__getattribute__(name)
+
+
+class _HostileSinkError(RuntimeError, metaclass=_HostileExceptionMeta):
+    def __str__(self) -> str:
+        raise AssertionError("exception string conversion must not execute")
+
+    def __getattribute__(self, name: str):
+        if name == "__notes__":
+            raise AssertionError("exception notes lookup must not execute")
+        return super().__getattribute__(name)
+
+    def add_note(self, note: str) -> None:
+        del note
+        raise AssertionError("exception add_note override must not execute")
+
+
+class _HostileFailingSink(EventSink):
+    async def emit(self, event: Event) -> None:
+        del event
+        raise _HostileSinkError()
 
 
 class _FlakySink(EventSink):
@@ -874,6 +914,131 @@ def test_sink_failure_is_durable_and_does_not_block_later_sink() -> None:
         "event_type": EventType.SESSION_STARTED,
     }
     assert [event.type for event in recorded] == [EventType.SESSION_STARTED]
+
+
+@pytest.mark.parametrize("message", ["sink\x00secret", "sink \ud800 secret"])
+def test_nonportable_sink_failure_is_safely_recorded_after_the_external_boundary(
+    message: str,
+) -> None:
+    async def scenario():
+        store = await _session_store("writer_nonportable_sink_failure")
+        writer = RuntimeEventWriter(
+            session_store=store,
+            budget_store=InMemoryBudgetStore(),
+            event_sinks=[_NonPortableFailingSink(message)],
+        )
+        emitted = await writer.emit(
+            Event(
+                type=EventType.SESSION_STARTED,
+                session_id="writer_nonportable_sink_failure",
+            )
+        )
+        delivery = await store.get_persisted_event_side_effect_delivery(
+            session_id=emitted.session_id,
+            event_id=emitted.id,
+        )
+        events = await store.load_events(emitted.session_id)
+        return delivery, events
+
+    delivery, events = asyncio.run(scenario())
+
+    assert delivery is not None
+    assert delivery.status is PersistedEventSideEffectStatus.FAILED
+    assert delivery.last_error == (
+        "RuntimeError: Persisted event side effect failed with non-portable error details."
+    )
+    assert len(delivery.last_error.encode("utf-8")) <= (PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES)
+    diagnostic = next(event for event in events if event.type == EventType.RUNTIME_SINK_FAILED)
+    assert diagnostic.payload["error"] == (
+        "Persisted event side effect failed with non-portable error details."
+    )
+
+
+def test_hostile_sink_exception_cannot_wedge_failure_bookkeeping() -> None:
+    async def scenario():
+        store = await _session_store("writer_hostile_sink_failure")
+        writer = RuntimeEventWriter(
+            session_store=store,
+            budget_store=InMemoryBudgetStore(),
+            event_sinks=[_HostileFailingSink()],
+        )
+        emitted = await writer.emit(
+            Event(
+                type=EventType.SESSION_STARTED,
+                session_id="writer_hostile_sink_failure",
+            )
+        )
+        delivery = await store.get_persisted_event_side_effect_delivery(
+            session_id=emitted.session_id,
+            event_id=emitted.id,
+        )
+        events = await store.load_events(emitted.session_id)
+        return delivery, events
+
+    delivery, events = asyncio.run(scenario())
+
+    assert delivery is not None
+    assert delivery.status is PersistedEventSideEffectStatus.FAILED
+    assert delivery.attempts == 1
+    assert delivery.last_error == (
+        "_HostileSinkError: Persisted event side effect failed with non-portable error details."
+    )
+    diagnostic = next(event for event in events if event.type == EventType.RUNTIME_SINK_FAILED)
+    assert diagnostic.payload["error_type"] == "_HostileSinkError"
+    assert diagnostic.payload["error"] == (
+        "Persisted event side effect failed with non-portable error details."
+    )
+
+
+def test_overlong_sink_failure_is_bounded_before_failure_bookkeeping() -> None:
+    async def scenario():
+        store = await _session_store("writer_overlong_sink_failure")
+        writer = RuntimeEventWriter(
+            session_store=store,
+            budget_store=InMemoryBudgetStore(),
+            event_sinks=[_NonPortableFailingSink("x" * 10_000)],
+        )
+        emitted = await writer.emit(
+            Event(
+                type=EventType.SESSION_STARTED,
+                session_id="writer_overlong_sink_failure",
+            )
+        )
+        return await store.get_persisted_event_side_effect_delivery(
+            session_id=emitted.session_id,
+            event_id=emitted.id,
+        )
+
+    delivery = asyncio.run(scenario())
+
+    assert delivery is not None
+    assert delivery.status is PersistedEventSideEffectStatus.FAILED
+    assert delivery.last_error is not None
+    assert delivery.last_error.endswith("... [truncated]")
+    assert len(delivery.last_error.encode("utf-8")) == PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES
+
+
+def test_sink_failure_and_exception_note_aggregation_have_fixed_work_bounds() -> None:
+    class CountingError(RuntimeError):
+        render_calls = 0
+
+        def __str__(self) -> str:
+            type(self).render_calls += 1
+            return "sink unavailable"
+
+    failures = [CountingError() for _ in range(20)]
+
+    summary = event_writer_module._failure_summary(failures)
+
+    assert CountingError.render_calls == 16
+    assert summary.endswith("4 additional failures omitted")
+
+    error = RuntimeError("primary")
+    error.__notes__ = [f"note {index}" for index in range(20)]
+    summary = event_writer_module._exception_summary(error)
+    assert "note 15" in summary
+    assert "note 16" not in summary
+    assert summary.endswith("4 additional notes omitted")
 
 
 def test_failed_sink_delivery_is_recovered_and_closed(monkeypatch) -> None:

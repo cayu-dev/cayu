@@ -19,7 +19,12 @@ from pydantic import (
     model_validator,
 )
 
-from cayu._validation import require_clean_nonblank
+from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
+)
+from cayu._validation import (
+    require_durable_clean_nonblank as require_clean_nonblank,
+)
 from cayu.core.billing import (
     UNRESOLVED_BILLING_IDENTITY,
     BillingIdentity,
@@ -69,11 +74,11 @@ _BUDGET_INSPECTION_EVENT_TYPES = frozenset(
 class SessionBudgetInspection(BaseModel):
     """Availability of durable budget and price-ledger evidence."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
-    event_count: StrictInt = Field(ge=0)
-    reservation_count: StrictInt = Field(ge=0)
-    reconciliation_count: StrictInt = Field(ge=0)
+    event_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    reservation_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    reconciliation_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     cost_state: Literal["unknown", "unpriced", "partial", "mixed_currency", "priced"]
     amount: str | None = None
     currency: str | None = None
@@ -382,10 +387,10 @@ def project_budget_inspection_event(event: Event) -> Event:
 class BudgetWindow(BaseModel):
     """Time window used when selecting events for budget accounting."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     kind: BudgetWindowKind = "all_time"
-    duration_seconds: StrictInt | None = Field(default=None, ge=1)
+    duration_seconds: StrictInt | None = Field(default=None, ge=1, le=MAX_DURABLE_JSON_INTEGER)
     period: BudgetCalendarPeriod | None = None
     timezone: str | None = None
 
@@ -471,12 +476,12 @@ class BudgetWindow(BaseModel):
 class BudgetReservation(BaseModel):
     """Conservative per-model-step reservation configured by the app."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
-    max_input_tokens: StrictInt = Field(ge=0)
-    max_output_tokens: StrictInt = Field(ge=0)
-    max_cache_read_input_tokens: StrictInt = Field(default=0, ge=0)
-    max_cache_write_input_tokens: StrictInt = Field(default=0, ge=0)
+    max_input_tokens: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    max_output_tokens: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    max_cache_read_input_tokens: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    max_cache_write_input_tokens: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
 
     @model_validator(mode="after")
     def validate_nonzero_reservation(self) -> BudgetReservation:
@@ -494,7 +499,7 @@ class BudgetReservation(BaseModel):
 class BudgetLimit(BaseModel):
     """Estimated-cost budget that applies across one durable runtime scope."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     scope: BudgetScope = "session"
     max_estimated_cost: Decimal = Field(gt=0)
@@ -555,7 +560,7 @@ class BudgetLimit(BaseModel):
 class BudgetPolicy(BaseModel):
     """App-level budget policy applied automatically by the runtime."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
 
@@ -595,7 +600,7 @@ class BudgetPolicy(BaseModel):
 class BudgetCheck(BaseModel):
     """Result of evaluating one budget limit."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     scope: BudgetScope
     key: str | None = None
@@ -604,8 +609,8 @@ class BudgetCheck(BaseModel):
     maximum: Decimal = Field(gt=0)
     actual: Decimal = Field(ge=0)
     action: BudgetAction = "interrupt"
-    model_steps: StrictInt = Field(ge=0)
-    unpriced_model_steps: StrictInt = Field(ge=0)
+    model_steps: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    unpriced_model_steps: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     limit_reached: StrictBool
     message: str
     cost_summary: SessionCostSummary
@@ -638,7 +643,7 @@ class BudgetCheck(BaseModel):
 class BudgetReservationRecord(BaseModel):
     """One reserved budget amount for a model step."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     reservation_id: str = Field(default_factory=lambda: f"bres_{uuid4().hex}")
     scope: BudgetScope
@@ -704,7 +709,7 @@ class BudgetReservationRecord(BaseModel):
 class BudgetReservationResult(BaseModel):
     """Result of attempting to reserve budget before a model step."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     accepted: StrictBool
     scope: BudgetScope
@@ -747,7 +752,7 @@ class BudgetReservationResult(BaseModel):
 class BudgetReconciliation(BaseModel):
     """Result of reconciling a reservation after the model step completes."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     reservation_id: str
     status: BudgetReservationStatus
@@ -762,7 +767,9 @@ class BudgetReconciliation(BaseModel):
     pricing_provenance: Provenance | None = None
     pricing_effective_from: date | None = None
     pricing_effective_through: date | None = None
-    pricing_tier_max_input_tokens: StrictInt | None = Field(default=None, gt=0)
+    pricing_tier_max_input_tokens: StrictInt | None = Field(
+        default=None, gt=0, le=MAX_DURABLE_JSON_INTEGER
+    )
 
     @field_validator("reservation_id")
     @classmethod
@@ -1034,6 +1041,11 @@ class InMemoryBudgetLedger(BudgetLedger):
         model: str,
         billing_identity: BillingIdentity | None = None,
     ) -> BudgetReservationResult:
+        limit = copy_budget_limit(limit)
+        session_id = require_clean_nonblank(session_id, "session_id")
+        agent_name = require_clean_nonblank(agent_name, "agent_name")
+        provider_name = require_clean_nonblank(provider_name, "provider_name")
+        model = require_clean_nonblank(model, "model")
         async with self._lock:
             now = self._clock()
             request = _budget_reservation_amount(
@@ -1217,7 +1229,7 @@ def copy_budget_window(value: BudgetWindow | Mapping[str, Any] | str | None) -> 
     if value is None:
         return BudgetWindow.all_time()
     if type(value) is BudgetWindow:
-        return value.model_copy(deep=True)
+        return BudgetWindow.model_validate(value.model_dump(mode="python"))
     if isinstance(value, str):
         return _budget_window_from_string(value)
     if isinstance(value, Mapping):

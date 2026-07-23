@@ -18,6 +18,7 @@ from cayu import (
     EventType,
     LocalArtifactStore,
     Message,
+    ModelCompactor,
     PromptCacheCompactor,
     ResumeRequest,
     RetryPolicy,
@@ -567,6 +568,47 @@ def test_prompt_cache_compactor_degrades_when_exact_tool_call_stream_fails(
     assert "usage_metrics" not in result.model_completed_payloads[0]
 
 
+def test_model_compactor_detaches_provider_failure_after_tool_call() -> None:
+    secret = "transport\x00workload-secret-value"
+
+    class SecretToolFailureProvider(ModelProvider):
+        name = "secret-tool-failure"
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            del request
+            yield ModelStreamEvent.tool_call(
+                id="call_1",
+                name="inspect_report",
+                arguments={},
+            )
+            raise RuntimeError(secret)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        asyncio.run(
+            ModelCompactor(
+                provider=SecretToolFailureProvider(),
+                model="summary-model",
+            ).compact(
+                CompactionRequest(
+                    session=Session(
+                        id="model-compactor-secret-tool-failure",
+                        agent_name="assistant",
+                        provider_name="secret-tool-failure",
+                        model="summary-model",
+                    ),
+                    agent=AgentSpec(name="assistant", model="summary-model"),
+                    messages=[Message.text("user", "old request")],
+                )
+            )
+        )
+
+    failure = exc_info.value
+    assert type(failure).__name__ == "_CompactionToolCallError"
+    assert failure.__cause__ is None
+    assert failure.__context__ is None
+    assert "workload-secret-value" not in repr(failure)
+
+
 def test_prompt_cache_compactor_preserves_bounded_provider_error_after_tool_degradation() -> None:
     provider = ToolThenBoundedProviderErrorProvider()
     cached_request = ModelRequest(
@@ -601,11 +643,13 @@ def test_prompt_cache_compactor_preserves_bounded_provider_error_after_tool_degr
 
     assert len(provider.requests) == 2
     assert provider.requests[1].tools == []
-    assert exc_info.value is provider.bounded_error
-    assert exc_info.value.status_code == 503
-    assert exc_info.value.error_code == "service_unavailable"
-    assert exc_info.value.retryable is False
-    assert exc_info.value.retry_after_s == 2.5
+    detached = exc_info.value
+    assert detached is not provider.bounded_error
+    assert str(detached) == str(provider.bounded_error)
+    assert detached.error_payload_fields() == provider.bounded_error.error_payload_fields()
+    assert detached.response_body is None
+    assert detached.__cause__ is None
+    assert detached.__suppress_context__ is True
 
 
 def test_prompt_cache_compaction_failure_telemetry_is_invocation_scoped() -> None:
@@ -662,7 +706,14 @@ def test_prompt_cache_compaction_failure_telemetry_is_invocation_scoped() -> Non
             )
         )
 
-    assert exact_failure.value.cause is provider.bounded_error
+    assert len(provider.requests) == 2
+    exact_cause = exact_failure.value.cause
+    assert isinstance(exact_cause, ModelProviderError)
+    assert exact_cause is not provider.bounded_error
+    assert str(exact_cause) == str(provider.bounded_error)
+    assert exact_cause.error_payload_fields() == provider.bounded_error.error_payload_fields()
+    assert exact_cause.__cause__ is None
+    assert exact_cause.__suppress_context__ is True
     assert [telemetry.event_type for telemetry in exact_failure.value.compaction_telemetry] == [
         EventType.CONTEXT_COMPACTION_STARTED,
         EventType.MODEL_COMPLETED,
@@ -678,6 +729,12 @@ def test_prompt_cache_compaction_failure_telemetry_is_invocation_scoped() -> Non
         "rejected_tool_call",
         "provider_error",
     ]
+    exact_completion = exact_attempts[0]
+    assert exact_completion.payload["compaction_outcome"] == "rejected_tool_call"
+    assert exact_completion.payload["usage_unavailable_reason"] == (
+        "compaction tool-call attempt ended without provider completion usage"
+    )
+    assert "usage_metrics" not in exact_completion.payload
 
     with pytest.raises(ContextBuildError) as bounded_only_failure:
         asyncio.run(
@@ -688,7 +745,13 @@ def test_prompt_cache_compaction_failure_telemetry_is_invocation_scoped() -> Non
         )
 
     assert len(provider.requests) == 3
-    assert bounded_only_failure.value.cause is provider.bounded_error
+    bounded_cause = bounded_only_failure.value.cause
+    assert isinstance(bounded_cause, ModelProviderError)
+    assert bounded_cause is not provider.bounded_error
+    assert str(bounded_cause) == str(provider.bounded_error)
+    assert bounded_cause.error_payload_fields() == provider.bounded_error.error_payload_fields()
+    assert bounded_cause.__cause__ is None
+    assert bounded_cause.__context__ is None
     assert [
         telemetry.event_type for telemetry in bounded_only_failure.value.compaction_telemetry
     ] == [

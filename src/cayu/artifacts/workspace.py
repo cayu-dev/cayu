@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any
 
-from cayu._validation import copy_json_value, require_nonblank
+from cayu._validation import copy_durable_json_object, require_nonblank
 from cayu.artifacts.base import (
     ArtifactMetadata,
     ArtifactScope,
@@ -163,7 +163,7 @@ def _workspace_artifact_metadata(
     truncated: bool,
     total_bytes: int,
 ) -> dict[str, Any]:
-    copied = copy_json_value(metadata or {}, "metadata")
+    copied = copy_durable_json_object(metadata or {}, "metadata")
     copied.setdefault("source", "workspace")
     copied["source_workspace_id"] = workspace_id
     copied["source_workspace_path"] = workspace_path

@@ -10,7 +10,16 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
-from cayu._validation import copy_json_object, require_clean_nonblank, require_nonblank
+from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
+    copy_durable_json_object,
+)
+from cayu._validation import (
+    require_durable_clean_nonblank as require_clean_nonblank,
+)
+from cayu._validation import (
+    require_durable_nonblank as require_nonblank,
+)
 from cayu.runtime.aggregates import EXACT_AGGREGATE, AggregateAccuracy, AggregateCount
 
 
@@ -41,7 +50,7 @@ class Task(BaseModel):
     single-agent durable job.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     id: str = Field(default_factory=lambda: str(uuid4()))
     type: str
@@ -67,7 +76,7 @@ class Task(BaseModel):
     @field_validator("input", "metadata", mode="before")
     @classmethod
     def copy_json_object(cls, value: dict[str, Any], info) -> dict[str, Any]:
-        return copy_json_object(value, info.field_name)
+        return copy_durable_json_object(value, info.field_name)
 
     @field_validator("status_payload", "result", "error", mode="before")
     @classmethod
@@ -78,7 +87,7 @@ class Task(BaseModel):
     ) -> dict[str, Any] | None:
         if value is None:
             return None
-        return copy_json_object(value, info.field_name)
+        return copy_durable_json_object(value, info.field_name)
 
     @field_validator("id", "type")
     @classmethod
@@ -108,7 +117,7 @@ class Task(BaseModel):
 
 
 class TaskCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     task_id: str | None = None
     type: str
@@ -123,7 +132,7 @@ class TaskCreate(BaseModel):
     @field_validator("input", "metadata", mode="before")
     @classmethod
     def copy_json_object(cls, value: dict[str, Any], info) -> dict[str, Any]:
-        return copy_json_object(value, info.field_name)
+        return copy_durable_json_object(value, info.field_name)
 
     @field_validator("type")
     @classmethod
@@ -152,7 +161,7 @@ class TaskCreate(BaseModel):
 
 
 class TaskQuery(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     q: str | None = None
     status: TaskStatus | None = None
@@ -161,7 +170,7 @@ class TaskQuery(BaseModel):
     parent_task_id: str | None = None
     assigned_agent_name: str | None = None
     limit: StrictInt = Field(default=100, ge=1, le=1000)
-    offset: StrictInt = Field(default=0, ge=0)
+    offset: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
     order_by: TaskOrder = TaskOrder.UPDATED_AT_DESC
 
     @field_validator("q", "type", "session_id", "parent_task_id", "assigned_agent_name")
@@ -179,7 +188,7 @@ class TaskQuery(BaseModel):
 class TaskAggregateFilter(BaseModel):
     """Current task attributes that may scope a store-native aggregate."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     type: str | None = None
     session_id: str | None = None
@@ -511,7 +520,7 @@ class InMemoryTaskStore(TaskStore):
         self, task_id: str, result: dict[str, Any], *, worker_id: str | None = None
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
-        result = copy_json_object(result, "result")
+        result = copy_durable_json_object(result, "result")
         async with self._lock:
             return self._finish_task(
                 task_id,
@@ -525,7 +534,7 @@ class InMemoryTaskStore(TaskStore):
         self, task_id: str, error: dict[str, Any], *, worker_id: str | None = None
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
-        error = copy_json_object(error, "error")
+        error = copy_durable_json_object(error, "error")
         async with self._lock:
             return self._finish_task(
                 task_id,
@@ -541,7 +550,7 @@ class InMemoryTaskStore(TaskStore):
         error: dict[str, Any] | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
-        copied_error = None if error is None else copy_json_object(error, "error")
+        copied_error = None if error is None else copy_durable_json_object(error, "error")
         async with self._lock:
             return self._finish_task(
                 task_id,
@@ -848,12 +857,12 @@ def copy_task(task: Task) -> Task:
         status_payload=(
             None
             if task.status_payload is None
-            else copy_json_object(task.status_payload, "status_payload")
+            else copy_durable_json_object(task.status_payload, "status_payload")
         ),
-        input=copy_json_object(task.input, "input"),
-        result=None if task.result is None else copy_json_object(task.result, "result"),
-        error=None if task.error is None else copy_json_object(task.error, "error"),
-        metadata=copy_json_object(task.metadata, "metadata"),
+        input=copy_durable_json_object(task.input, "input"),
+        result=(None if task.result is None else copy_durable_json_object(task.result, "result")),
+        error=None if task.error is None else copy_durable_json_object(task.error, "error"),
+        metadata=copy_durable_json_object(task.metadata, "metadata"),
         created_at=task.created_at,
         updated_at=task.updated_at,
         started_at=task.started_at,
@@ -872,8 +881,8 @@ def copy_task_create(request: TaskCreate) -> TaskCreate:
         session_id=request.session_id,
         parent_task_id=request.parent_task_id,
         assigned_agent_name=request.assigned_agent_name,
-        input=copy_json_object(request.input, "input"),
-        metadata=copy_json_object(request.metadata, "metadata"),
+        input=copy_durable_json_object(request.input, "input"),
+        metadata=copy_durable_json_object(request.metadata, "metadata"),
     )
 
 
@@ -926,8 +935,8 @@ def _task_from_create(request: TaskCreate) -> Task:
         session_id=request.session_id,
         parent_task_id=request.parent_task_id,
         assigned_agent_name=request.assigned_agent_name,
-        input=copy_json_object(request.input, "input"),
-        metadata=copy_json_object(request.metadata, "metadata"),
+        input=copy_durable_json_object(request.input, "input"),
+        metadata=copy_durable_json_object(request.metadata, "metadata"),
         created_at=now,
         updated_at=now,
     )
@@ -1118,7 +1127,7 @@ def _copy_optional_status_reason(value: str | None) -> str | None:
 def _copy_optional_status_payload(value: dict[str, Any] | None) -> dict[str, Any] | None:
     if value is None:
         return None
-    return copy_json_object(value, "payload")
+    return copy_durable_json_object(value, "payload")
 
 
 _TERMINAL_TASK_STATUSES = {

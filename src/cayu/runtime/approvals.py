@@ -7,7 +7,11 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs this at runtime.
 
-from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu._validation import (
+    copy_durable_json_value,
+    require_durable_clean_nonblank,
+    require_durable_nonblank,
+)
 from cayu.core.events import Event, EventType
 from cayu.core.thinking import ThinkingConfig
 from cayu.runtime.budgets import BudgetLimit, copy_budget_limits, copy_request_budget_limits
@@ -55,7 +59,7 @@ class ResolutionActor(BaseModel):
     caller-claimed free-form data; this model is the provenance field.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     subject: str
     tenant: str | None = None
@@ -67,12 +71,12 @@ class ResolutionActor(BaseModel):
     def validate_nonblank_strings(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("claims", mode="before")
     @classmethod
     def copy_claims(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "claims")
+        return copy_durable_json_value(value, "claims")
 
     @model_validator(mode="after")
     def validate_reserved_subject(self) -> ResolutionActor:
@@ -96,7 +100,7 @@ def copy_resolution_actor(actor: ResolutionActor | None) -> ResolutionActor | No
         subject=actor.subject,
         tenant=actor.tenant,
         source=actor.source,
-        claims=copy_json_value(actor.claims, "claims"),
+        claims=copy_durable_json_value(actor.claims, "claims"),
     )
 
 
@@ -132,7 +136,11 @@ class ToolApprovalRequest(BaseModel):
     overrides the persisted configuration for the resumed run.
     """
 
-    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        arbitrary_types_allowed=True,
+        hide_input_in_errors=True,
+    )
 
     session_id: str
     approval_id: str
@@ -154,19 +162,19 @@ class ToolApprovalRequest(BaseModel):
     @field_validator("session_id", "approval_id")
     @classmethod
     def validate_nonblank_ids(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("reason")
     @classmethod
     def validate_optional_reason(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, info.field_name)
+        return require_durable_nonblank(value, info.field_name)
 
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_value(value, "metadata")
 
     @field_validator("resolved_by")
     @classmethod
@@ -210,7 +218,11 @@ class ToolApprovalRecoveryRequest(BaseModel):
     overrides the persisted configuration for the resumed run.
     """
 
-    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        arbitrary_types_allowed=True,
+        hide_input_in_errors=True,
+    )
 
     session_id: str
     approval_id: str
@@ -236,12 +248,12 @@ class ToolApprovalRecoveryRequest(BaseModel):
     @field_validator("session_id", "approval_id", "tool_call_id")
     @classmethod
     def validate_nonblank_ids(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("message")
     @classmethod
     def validate_message(cls, value: str, info) -> str:
-        return require_nonblank(value, info.field_name)
+        return require_durable_nonblank(value, info.field_name)
 
     @field_validator("reason")
     @classmethod
@@ -252,12 +264,12 @@ class ToolApprovalRecoveryRequest(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, info.field_name)
+        return require_durable_nonblank(value, info.field_name)
 
     @field_validator("structured", "artifacts", "metadata", mode="before")
     @classmethod
     def copy_json_fields(cls, value, info):
-        return copy_json_value(value, info.field_name)
+        return copy_durable_json_value(value, info.field_name)
 
     @field_validator("resolved_by")
     @classmethod
@@ -295,7 +307,7 @@ class ToolApprovalRecoveryRequest(BaseModel):
 class PendingToolCallApproval(BaseModel):
     """One tool call captured inside a pending approval round."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     tool_call_id: str
     tool_name: str
@@ -310,7 +322,7 @@ class PendingToolCallApproval(BaseModel):
     @field_validator("tool_call_id", "tool_name")
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("active_taint_labels", mode="before")
     @classmethod
@@ -319,7 +331,7 @@ class PendingToolCallApproval(BaseModel):
             return []
         if not isinstance(value, list):
             raise TypeError("active_taint_labels must be a list of strings.")
-        return [require_clean_nonblank(item, "active_taint_labels") for item in value]
+        return [require_durable_clean_nonblank(item, "active_taint_labels") for item in value]
 
     @field_validator("policy_decision", "reason")
     @classmethod
@@ -331,13 +343,13 @@ class PendingToolCallApproval(BaseModel):
         if value is None:
             return None
         if info.field_name == "reason":
-            return require_nonblank(value, info.field_name)
-        return require_clean_nonblank(value, info.field_name)
+            return require_durable_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("arguments", "metadata", mode="before")
     @classmethod
     def copy_json_fields(cls, value: dict[str, Any], info) -> dict[str, Any]:
-        return copy_json_value(value, info.field_name)
+        return copy_durable_json_value(value, info.field_name)
 
 
 class PendingToolApproval(BaseModel):
@@ -352,7 +364,7 @@ class PendingToolApproval(BaseModel):
     be re-supplied on the resolution request when needed.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     approval_id: str
     tool_call_id: str
@@ -407,7 +419,7 @@ class PendingToolApproval(BaseModel):
     @field_validator("approval_id", "tool_call_id", "tool_name", "agent_name")
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("environment_name", "workspace_id", "task_id", "reason")
     @classmethod
@@ -419,13 +431,13 @@ class PendingToolApproval(BaseModel):
         if value is None:
             return None
         if info.field_name == "reason":
-            return require_nonblank(value, info.field_name)
-        return require_clean_nonblank(value, info.field_name)
+            return require_durable_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("arguments", "metadata", mode="before")
     @classmethod
     def copy_json_fields(cls, value: dict[str, Any], info) -> dict[str, Any]:
-        return copy_json_value(value, info.field_name)
+        return copy_durable_json_value(value, info.field_name)
 
     @field_validator("structured_output")
     @classmethod
@@ -475,7 +487,7 @@ def _copy_approval_resume_fields(
 
     return {
         "reason": request.reason,
-        "metadata": copy_json_value(request.metadata, "metadata"),
+        "metadata": copy_durable_json_value(request.metadata, "metadata"),
         "resolved_by": copy_resolution_actor(request.resolved_by),
         "max_steps": request.max_steps,
         "limits": copy_run_limits(request.limits) if request.limits is not None else None,
@@ -516,8 +528,8 @@ def copy_tool_approval_recovery_request(
         tool_call_id=request.tool_call_id,
         outcome=request.outcome,
         message=request.message,
-        structured=copy_json_value(request.structured, "structured"),
-        artifacts=copy_json_value(request.artifacts, "artifacts"),
+        structured=copy_durable_json_value(request.structured, "structured"),
+        artifacts=copy_durable_json_value(request.artifacts, "artifacts"),
         **_copy_approval_resume_fields(request),
     )
 
@@ -529,13 +541,13 @@ def copy_pending_tool_approval(approval: PendingToolApproval) -> PendingToolAppr
         approval_id=approval.approval_id,
         tool_call_id=approval.tool_call_id,
         tool_name=approval.tool_name,
-        arguments=copy_json_value(approval.arguments, "arguments"),
+        arguments=copy_durable_json_value(approval.arguments, "arguments"),
         agent_name=approval.agent_name,
         environment_name=approval.environment_name,
         workspace_id=approval.workspace_id,
         task_id=approval.task_id,
         reason=approval.reason,
-        metadata=copy_json_value(approval.metadata, "metadata"),
+        metadata=copy_durable_json_value(approval.metadata, "metadata"),
         tool_calls=[copy_pending_tool_call_approval(call) for call in approval.tool_calls],
         structured_output=copy_structured_output_spec(approval.structured_output),
         thinking=approval.thinking,
@@ -559,9 +571,9 @@ def copy_pending_tool_call_approval(
     return PendingToolCallApproval(
         tool_call_id=call.tool_call_id,
         tool_name=call.tool_name,
-        arguments=copy_json_value(call.arguments, "arguments"),
+        arguments=copy_durable_json_value(call.arguments, "arguments"),
         policy_decision=call.policy_decision,
         reason=call.reason,
-        metadata=copy_json_value(call.metadata, "metadata"),
+        metadata=copy_durable_json_value(call.metadata, "metadata"),
         active_taint_labels=list(call.active_taint_labels),
     )

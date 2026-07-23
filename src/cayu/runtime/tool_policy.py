@@ -10,7 +10,13 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu._validation import (
+    copy_durable_json_value,
+    require_clean_nonblank,
+    require_durable_clean_nonblank,
+    require_durable_nonblank,
+    require_nonblank,
+)
 from cayu.core.agents import AgentSpec
 from cayu.core.tools import ToolEffect
 from cayu.runtime.sessions import Session
@@ -36,7 +42,7 @@ TOOL_POLICY_REAUTHORIZATION_METADATA_KEY = "cayu:tool_policy_reauthorization"
 class ToolPolicyRequest(BaseModel):
     """Input passed to a tool policy before a registered tool executes."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     session: Session
     agent: AgentSpec
@@ -51,7 +57,7 @@ class ToolPolicyRequest(BaseModel):
     @field_validator("tool_name", "tool_call_id")
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("environment_name", "workspace_id")
     @classmethod
@@ -62,12 +68,12 @@ class ToolPolicyRequest(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("arguments", "metadata", mode="before")
     @classmethod
     def copy_json_fields(cls, value: dict[str, Any], info) -> dict[str, Any]:
-        return copy_json_value(value, info.field_name)
+        return copy_durable_json_value(value, info.field_name)
 
 
 class ToolPolicyResult(BaseModel):
@@ -80,7 +86,7 @@ class ToolPolicyResult(BaseModel):
     expires.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     decision: ToolPolicyDecision
     reason: str | None = None
@@ -96,12 +102,12 @@ class ToolPolicyResult(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, info.field_name)
+        return require_durable_nonblank(value, info.field_name)
 
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_value(value, "metadata")
 
     @field_validator("approval_expires_in_seconds", mode="before")
     @classmethod
@@ -387,7 +393,7 @@ class ParameterConstrainedToolPolicy(ToolPolicy):
                     "rule_index": index,
                 }
                 metadata.update(
-                    copy_json_value(
+                    copy_durable_json_value(
                         rule.violation_metadata(request.arguments),
                         "violation_metadata",
                     )
@@ -496,7 +502,7 @@ def metadata_with_taint_labels(
     metadata: Mapping[str, Any],
     labels: Iterable[str],
 ) -> dict[str, Any]:
-    copied = copy_json_value(dict(metadata), "metadata")
+    copied = copy_durable_json_value(dict(metadata), "metadata")
     copied[TAINT_LABELS_METADATA_KEY] = sorted(
         _copy_taint_labels(labels, "labels", allow_any=False)
     )

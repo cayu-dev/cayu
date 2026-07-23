@@ -32,16 +32,20 @@ from pydantic import (
 from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs this at runtime.
 
 from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
     JsonUtf8SizeCounter,
     compact_json_utf8_size,
-    copy_json_object,
-    copy_json_value,
+    copy_durable_json_object,
+    copy_durable_json_value,
     copy_label_map,
     json_utf8_size_within_limit,
-    require_clean_nonblank,
     require_durable_json_text,
-    require_nonblank,
-    require_unicode_scalar_text,
+)
+from cayu._validation import (
+    require_durable_clean_nonblank as require_clean_nonblank,
+)
+from cayu._validation import (
+    require_durable_nonblank as require_nonblank,
 )
 from cayu.core.events import Event, EventType, copy_event
 from cayu.core.messages import Message, MessageRole, ThinkingPart, copy_message, detach_message
@@ -51,6 +55,7 @@ from cayu.runtime.aggregates import (
     AggregateAccuracy,
     AggregateAccuracyKind,
     AggregateCount,
+    AggregateUsageMetrics,
     BoundedUsagePricingInputAccumulator,
     UsageAggregateBreakdown,
     UsageAggregateGroup,
@@ -59,7 +64,9 @@ from cayu.runtime.aggregates import (
     UsageRollupStoreResult,
     add_aggregate_usage,
     aggregate_usage_metrics_from_event_payload,
+    build_aggregate_usage_metrics,
     normalize_aggregate_event_timestamp,
+    project_aggregate_usage_inspection_event,
 )
 from cayu.runtime.approvals import (
     ResolutionActor,
@@ -78,13 +85,7 @@ from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.runtime.structured_output import StructuredOutputSpec, copy_structured_output_spec
-from cayu.runtime.usage import (
-    SessionUsageSummary,
-    UsageMetrics,
-    count_model_steps_with_usage,
-    project_usage_inspection_event,
-    session_usage_summary,
-)
+from cayu.runtime.usage import UsageMetrics
 
 
 class SessionStatusConflict(ValueError):
@@ -101,6 +102,51 @@ class SessionRunFenced(RuntimeError):
 
 class PersistedEventSideEffectClaimLost(RuntimeError):
     """A side-effect acknowledgement lost ownership to a replacement claim."""
+
+
+PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES = 4096
+_NONPORTABLE_PERSISTED_EVENT_SIDE_EFFECT_ERROR = (
+    "Persisted event side effect failed with non-portable error details."
+)
+_TRUNCATED_PERSISTED_EVENT_SIDE_EFFECT_ERROR_SUFFIX = "... [truncated]"
+
+
+def validate_persisted_event_side_effect_error(
+    value: str,
+    field_name: str = "error",
+) -> str:
+    """Validate a portable, bounded side-effect failure description."""
+
+    value = require_nonblank(value, field_name)
+    if len(value.encode("utf-8")) > PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES:
+        raise ValueError(
+            f"`{field_name}` must not exceed "
+            f"{PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES} UTF-8 bytes."
+        )
+    return value
+
+
+def portable_persisted_event_side_effect_error(value: object) -> str:
+    """Project untrusted exception text into the durable handoff contract."""
+
+    if type(value) is not str:
+        return _NONPORTABLE_PERSISTED_EVENT_SIDE_EFFECT_ERROR
+    try:
+        value = require_nonblank(value, "error")
+    except ValueError:
+        return _NONPORTABLE_PERSISTED_EVENT_SIDE_EFFECT_ERROR
+
+    encoded = value.encode("utf-8")
+    if len(encoded) <= PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES:
+        return value
+
+    suffix = _TRUNCATED_PERSISTED_EVENT_SIDE_EFFECT_ERROR_SUFFIX
+    prefix = encoded[: PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES - len(suffix.encode("utf-8"))]
+    while True:
+        try:
+            return prefix.decode("utf-8") + suffix
+        except UnicodeDecodeError:
+            prefix = prefix[:-1]
 
 
 class SessionQueuedMessagesPending(RuntimeError):
@@ -214,10 +260,7 @@ def is_runtime_owned_session_metadata_key(key: str) -> bool:
 def copy_session_user_metadata(replacement: dict[str, Any]) -> dict[str, Any]:
     """Validate and detach a complete user-authored metadata replacement."""
 
-    copied_replacement = copy_json_value(replacement, "metadata")
-    if type(copied_replacement) is not dict:
-        raise TypeError("Session metadata must be an object.")
-    require_durable_json_text(copied_replacement, "metadata")
+    copied_replacement = copy_durable_json_object(replacement, "metadata")
     for key in copied_replacement:
         if is_runtime_owned_session_metadata_key(key):
             raise ValueError(
@@ -244,7 +287,7 @@ def replace_session_user_metadata(
     if any(is_runtime_owned_session_metadata_key(key) for key in replacement):
         raise ValueError("Session user metadata replacement contains a runtime-owned key.")
     runtime_metadata = {
-        key: copy_json_value(value, f"current_metadata.{key}")
+        key: copy_durable_json_value(value, "current_metadata")
         for key, value in current.items()
         if is_runtime_owned_session_metadata_key(key)
     }
@@ -269,7 +312,11 @@ class SessionDebugState(StrEnum):
 
 
 class RunRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        arbitrary_types_allowed=True,
+        hide_input_in_errors=True,
+    )
 
     agent_name: str
     messages: list[Message]
@@ -305,12 +352,12 @@ class RunRequest(BaseModel):
     @field_validator("messages")
     @classmethod
     def copy_messages(cls, value):
-        return [copy_message(message) for message in value]
+        return [detach_message(message) for message in value]
 
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_request_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
     @field_validator("labels", mode="before")
     @classmethod
@@ -368,7 +415,11 @@ class RunRequest(BaseModel):
 
 
 class ResumeRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        arbitrary_types_allowed=True,
+        hide_input_in_errors=True,
+    )
 
     session_id: str
     messages: list[Message]
@@ -388,7 +439,7 @@ class ResumeRequest(BaseModel):
     @field_validator("messages")
     @classmethod
     def copy_messages(cls, value):
-        copied_messages = [copy_message(message) for message in value]
+        copied_messages = [detach_message(message) for message in value]
         if not copied_messages:
             raise ValueError("ResumeRequest messages cannot be empty.")
         return copied_messages
@@ -396,7 +447,7 @@ class ResumeRequest(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_request_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
     @field_validator("structured_output")
     @classmethod
@@ -431,12 +482,12 @@ class ResumeRequest(BaseModel):
 class CompactSessionRequest(BaseModel):
     """Request an explicit, application-owned compaction of durable session context."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     session_id: str
     idempotency_key: str = Field(max_length=256)
-    expected_run_epoch: StrictInt = Field(ge=0)
-    expected_transcript_cursor: StrictInt = Field(ge=0)
+    expected_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    expected_transcript_cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     reason: Literal["application_requested"] = "application_requested"
     instructions: str | None = Field(default=None, max_length=4096)
     limits: RunLimits = Field(default_factory=RunLimits)
@@ -446,11 +497,7 @@ class CompactSessionRequest(BaseModel):
     @field_validator("session_id", "idempotency_key")
     @classmethod
     def validate_required_strings(cls, value: str, info) -> str:
-        value = require_clean_nonblank(value, info.field_name)
-        value = require_unicode_scalar_text(value, info.field_name)
-        if "\x00" in value:
-            raise ValueError(f"`{info.field_name}` must not contain NUL characters.")
-        return value
+        return require_clean_nonblank(value, info.field_name)
 
     @field_validator("instructions")
     @classmethod
@@ -491,7 +538,7 @@ class CompactSessionRequest(BaseModel):
 class EnqueueSessionMessageRequest(BaseModel):
     """Submit durable user steering for an active session."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     session_id: str
     idempotency_key: str = Field(max_length=256)
@@ -508,7 +555,6 @@ class EnqueueSessionMessageRequest(BaseModel):
     @classmethod
     def validate_content(cls, value: str) -> str:
         value = require_nonblank(value, "content")
-        require_durable_json_text(value, "content")
         if len(value.encode("utf-8")) > SESSION_MESSAGE_CONTENT_MAX_BYTES:
             raise ValueError(
                 "content exceeds the maximum encoded size of "
@@ -538,7 +584,7 @@ class EnqueueSessionMessageRequest(BaseModel):
 class SessionQueuedMessage(BaseModel):
     """One durable queued user message and its delivery state."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     queue_id: str
     session_id: str
@@ -546,14 +592,16 @@ class SessionQueuedMessage(BaseModel):
     content: str
     delivery_mode: SessionMessageDeliveryMode
     status: SessionMessageQueueStatus
-    ordering_key: StrictInt = Field(ge=1)
-    accepted_run_epoch: StrictInt = Field(ge=0)
-    accepted_transcript_cursor: StrictInt = Field(ge=0)
+    ordering_key: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    accepted_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    accepted_transcript_cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     accepted_event_id: str
     accepted_at: datetime
     requested_by: ResolutionActor | None = None
-    delivered_run_epoch: StrictInt | None = Field(default=None, ge=0)
-    delivered_transcript_cursor: StrictInt | None = Field(default=None, ge=0)
+    delivered_run_epoch: StrictInt | None = Field(default=None, ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    delivered_transcript_cursor: StrictInt | None = Field(
+        default=None, ge=0, le=MAX_DURABLE_JSON_INTEGER
+    )
     delivered_event_id: str | None = None
     delivered_at: datetime | None = None
 
@@ -606,7 +654,7 @@ class SessionMessageDeliveryBatch(BaseModel):
 
     messages: tuple[SessionQueuedMessage, ...] = Field(default_factory=tuple)
     events: tuple[Event, ...] = Field(default_factory=tuple)
-    eligible_through: StrictInt = Field(ge=0)
+    eligible_through: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     has_more: StrictBool = False
 
     @field_validator("messages", mode="before")
@@ -631,7 +679,7 @@ class InterruptSessionRequest(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_request_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
     @field_validator("session_id")
     @classmethod
@@ -659,7 +707,7 @@ class ForkSessionRequest(BaseModel):
     agent_name: str | None = None
     model: str | None = None
     environment_name: str | None = None
-    transcript_cursor: StrictInt | None = Field(default=None, ge=0)
+    transcript_cursor: StrictInt | None = Field(default=None, ge=0, le=MAX_DURABLE_JSON_INTEGER)
     copy_checkpoint: StrictBool = True
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -683,7 +731,7 @@ class ForkSessionRequest(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_request_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
 
 class SessionIdentity(BaseModel):
@@ -712,7 +760,7 @@ class SessionIdentity(BaseModel):
 
 
 class Session(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     # SessionStore implementations may set this from RunRequest.session_id.
     id: str = Field(default_factory=lambda: str(uuid4()))
@@ -728,7 +776,7 @@ class Session(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     last_activity_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    run_epoch: StrictInt = Field(default=0, ge=0)
+    run_epoch: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
     labels: dict[str, str] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -748,7 +796,7 @@ class Session(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
     @field_validator("labels", mode="before")
     @classmethod
@@ -938,7 +986,7 @@ CheckpointTransform = Callable[
 class SessionOperationPublication(BaseModel):
     """One atomic checkpoint/event publication plus terminal operation records."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     checkpoint: dict[str, Any]
     operation_records: dict[str, dict[str, Any]] = Field(default_factory=dict)
@@ -946,7 +994,7 @@ class SessionOperationPublication(BaseModel):
     @field_validator("checkpoint", mode="before")
     @classmethod
     def copy_checkpoint(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_object(value, "checkpoint")
+        return copy_durable_json_object(value, "checkpoint")
 
     @field_validator("operation_records", mode="before")
     @classmethod
@@ -954,7 +1002,7 @@ class SessionOperationPublication(BaseModel):
         cls,
         value: dict[str, dict[str, Any]],
     ) -> dict[str, dict[str, Any]]:
-        copied = copy_json_object(value, "operation_records")
+        copied = copy_durable_json_object(value, "operation_records")
         for key, record in copied.items():
             require_clean_nonblank(key, "operation_records key")
             if type(record) is not dict:
@@ -1109,7 +1157,7 @@ def copy_label_selector_requirements(
 
 
 class SessionQuery(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     q: str | None = None
     status: SessionStatus | None = None
@@ -1124,7 +1172,7 @@ class SessionQuery(BaseModel):
     labels: dict[str, str] = Field(default_factory=dict)
     label_selectors: tuple[LabelSelectorRequirement, ...] = Field(default_factory=tuple)
     limit: StrictInt = Field(default=100, ge=1, le=1000)
-    offset: StrictInt = Field(default=0, ge=0)
+    offset: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
     cursor: str | None = None
     include_total_count: StrictBool = False
     order_by: SessionOrder = SessionOrder.UPDATED_AT_DESC
@@ -1191,7 +1239,7 @@ MAX_AGGREGATE_LABEL_SELECTOR_VALUES = 100
 class SessionAggregateFilter(BaseModel):
     """Current session attributes that may scope a store-native aggregate."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     agent_name: str | None = None
     provider_name: str | None = None
@@ -1320,7 +1368,7 @@ class UsageRollupQuery(BaseModel):
 class EventRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    sequence: StrictInt = Field(ge=1)
+    sequence: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
     event: Event
 
     @field_validator("event")
@@ -1342,9 +1390,9 @@ class PersistedEventSideEffectClaim(BaseModel):
 
     session_id: str
     event_id: str
-    event_sequence: StrictInt = Field(ge=1)
+    event_sequence: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
     event: Event
-    attempt: StrictInt = Field(ge=1)
+    attempt: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
     claim_id: str = Field(default_factory=lambda: str(uuid4()))
     lease_expires_at: datetime
 
@@ -1367,13 +1415,13 @@ class PersistedEventSideEffectClaim(BaseModel):
 
 
 class PersistedEventSideEffectDelivery(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     session_id: str
     event_id: str
-    event_sequence: StrictInt = Field(ge=1)
+    event_sequence: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
     status: PersistedEventSideEffectStatus
-    attempts: StrictInt = Field(default=0, ge=0)
+    attempts: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
     claim_id: str | None = None
     lease_expires_at: datetime | None = None
     next_attempt_at: datetime | None = None
@@ -1386,9 +1434,10 @@ class PersistedEventSideEffectDelivery(BaseModel):
         if value is None:
             return None
         if info.field_name == "last_error":
-            if not value.strip():
-                raise ValueError("last_error cannot be blank.")
-            return value
+            # Stores validate every new write strictly. Normalize legacy rows on
+            # reconstruction so an older unbounded diagnostic cannot wedge the
+            # side-effect recovery queue after an upgrade.
+            return portable_persisted_event_side_effect_error(value)
         return require_clean_nonblank(value, info.field_name)
 
     @field_validator("lease_expires_at", "next_attempt_at", "updated_at")
@@ -1404,7 +1453,7 @@ class PersistedEventSideEffectDelivery(BaseModel):
 class PendingActionQuery(BaseModel):
     """Bounded query for durable control-plane actions blocking a session."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     session_id: str | None = None
     kind: PendingActionKind | None = None
@@ -1566,7 +1615,7 @@ class PendingActionRecord(BaseModel):
     def copy_arguments(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
         if value is None:
             return None
-        return copy_json_value(value, "arguments")
+        return copy_durable_json_object(value, "arguments")
 
 
 class PendingActionIssue(BaseModel):
@@ -1657,8 +1706,8 @@ class PendingActionListResult(BaseModel):
     issues: list[PendingActionIssue] = Field(default_factory=list)
     next_cursor: str | None = None
     has_more: StrictBool = False
-    total_count: StrictInt | None = Field(default=None, ge=0)
-    inspected_candidate_count: StrictInt = Field(default=0, ge=0)
+    total_count: StrictInt | None = Field(default=None, ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    inspected_candidate_count: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
 
 
 def enforce_pending_action_result_size(
@@ -1676,7 +1725,7 @@ class EventSummary(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     session_id: str
-    total_events: StrictInt = Field(ge=0)
+    total_events: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     counts_by_type: dict[str, StrictInt] = Field(default_factory=dict)
     latest_event: EventRecord | None = None
 
@@ -1691,9 +1740,9 @@ class SerializedRecordSummary(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    record_count: StrictInt = Field(ge=0)
-    total_bytes: StrictInt = Field(ge=0)
-    largest_record_bytes: StrictInt = Field(ge=0)
+    record_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    total_bytes: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    largest_record_bytes: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
 
 
 class SessionInspectionIdentity(BaseModel):
@@ -1714,10 +1763,41 @@ class SessionInspectionIdentity(BaseModel):
     created_at: datetime
     updated_at: datetime
     last_activity_at: datetime
-    run_epoch: StrictInt = Field(ge=0)
+    run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     labels: dict[str, str] = Field(default_factory=dict)
-    label_count: StrictInt = Field(ge=0)
+    label_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     labels_truncated: StrictBool = False
+
+
+class SessionInspectionUsageSummary(BaseModel):
+    """Lossless usage totals for bounded operator inspection."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    session_id: str
+    model_steps: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    tool_calls: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    provider_names: list[str] = Field(default_factory=list)
+    models: list[str] = Field(default_factory=list)
+    usage: AggregateUsageMetrics = Field(default_factory=build_aggregate_usage_metrics)
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("provider_names", "models", mode="before")
+    @classmethod
+    def copy_string_lists(cls, value: list[str], info) -> list[str]:
+        copied = copy_durable_json_value(value, info.field_name)
+        if type(copied) is not list:
+            raise ValueError(f"{info.field_name} must be a list.")
+        result: list[str] = []
+        for index, item in enumerate(copied):
+            if type(item) is not str:
+                raise ValueError(f"{info.field_name}[{index}] must be a string.")
+            result.append(require_clean_nonblank(item, f"{info.field_name}[{index}]"))
+        return result
 
 
 class SessionInspectionSummary(BaseModel):
@@ -1728,17 +1808,17 @@ class SessionInspectionSummary(BaseModel):
     session: SessionInspectionIdentity
     transcript: SerializedRecordSummary
     events: SerializedRecordSummary
-    usage: SessionUsageSummary
-    model_calls: StrictInt = Field(ge=0)
-    model_calls_with_usage: StrictInt = Field(ge=0)
-    tool_calls: StrictInt = Field(ge=0)
-    pending_action_count: StrictInt = Field(ge=0)
+    usage: SessionInspectionUsageSummary
+    model_calls: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    model_calls_with_usage: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    tool_calls: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    pending_action_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     pending_action_kinds: tuple[PendingActionKind, ...] = ()
-    pending_action_issue_count: StrictInt = Field(ge=0)
-    queued_message_count: StrictInt = Field(ge=0)
-    delivered_message_count: StrictInt = Field(ge=0)
-    outstanding_message_count: StrictInt = Field(ge=0)
-    operation_event_count: StrictInt = Field(ge=0)
+    pending_action_issue_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    queued_message_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    delivered_message_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    outstanding_message_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    operation_event_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     terminal_failure_state: Literal["none", "failed", "interrupted"]
     budget: SessionBudgetInspection
 
@@ -1796,14 +1876,14 @@ class SessionOutcome(BaseModel):
     @field_validator("details", mode="before")
     @classmethod
     def copy_details(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "details")
+        return copy_durable_json_object(value, "details")
 
     @field_validator("retry", mode="before")
     @classmethod
     def copy_retry(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
         if value is None:
             return None
-        return copy_json_value(value, "retry")
+        return copy_durable_json_object(value, "retry")
 
 
 class IncompleteSessionRecoveryAction(StrEnum):
@@ -1843,7 +1923,7 @@ class IncompleteSessionRecoveryRequest(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
 
 class IncompleteSessionsRecoveryRequest(BaseModel):
@@ -1901,7 +1981,7 @@ class IncompleteSessionsRecoveryRequest(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
 
 class IncompleteSessionRecoveryResult(BaseModel):
@@ -1928,7 +2008,7 @@ class IncompleteSessionRecoveryResult(BaseModel):
 
 
 class EventQuery(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     session_id: str | None = None
     session_ids: tuple[str, ...] = Field(default_factory=tuple)
@@ -1943,8 +2023,8 @@ class EventQuery(BaseModel):
     tool_name: str | None = None
     since: datetime | None = None
     until: datetime | None = None
-    after_sequence: StrictInt | None = Field(default=None, ge=0)
-    before_sequence: StrictInt | None = Field(default=None, ge=1)
+    after_sequence: StrictInt | None = Field(default=None, ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    before_sequence: StrictInt | None = Field(default=None, ge=1, le=MAX_DURABLE_JSON_INTEGER)
     limit: StrictInt = Field(default=100, ge=1, le=5000)
     order_by: EventOrder = EventOrder.SEQUENCE_ASC
 
@@ -2045,7 +2125,7 @@ class EventQuery(BaseModel):
 class TranscriptRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    index: StrictInt = Field(ge=0)
+    index: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     message: Message
 
     @field_validator("message")
@@ -2058,7 +2138,7 @@ class TranscriptPage(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     records: list[TranscriptRecord] = Field(default_factory=list)
-    total_records: StrictInt = Field(ge=0)
+    total_records: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
 
 
 class SessionListResult(BaseModel):
@@ -2069,15 +2149,15 @@ class SessionListResult(BaseModel):
     sessions: list[Session] = Field(default_factory=list)
     next_cursor: str | None = None
     # None unless the query opted in via include_total_count (COUNT is expensive at scale).
-    total_count: StrictInt | None = Field(default=None, ge=0)
+    total_count: StrictInt | None = Field(default=None, ge=0, le=MAX_DURABLE_JSON_INTEGER)
 
 
 class TranscriptQuery(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     session_id: str
     role: MessageRole | str | None = None
-    offset: StrictInt = Field(default=0, ge=0)
+    offset: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
     limit: StrictInt = Field(default=100, ge=1, le=5000)
     # When False, ThinkingPart content is stripped from the returned messages. This is a
     # content view, not a record filter: `total_records` stays the role-matched total, a
@@ -2416,7 +2496,7 @@ class SessionStore(ABC):
         event_count = 0
         event_total_bytes = 0
         event_largest_bytes = 0
-        usage_events: list[Event] = []
+        usage_accumulator = _SessionInspectionUsageAccumulator()
         budget_events: list[Event] = []
         retained_event_bytes = 0
         queued_message_count = 0
@@ -2446,12 +2526,12 @@ class SessionStore(ABC):
                 event_largest_bytes = max(event_largest_bytes, payload_bytes)
                 event = record.event
                 if event.type in {EventType.MODEL_COMPLETED, EventType.TOOL_CALL_STARTED}:
-                    usage_event = project_usage_inspection_event(event)
+                    usage_event, usage_metrics = project_aggregate_usage_inspection_event(event)
                     retained_event_bytes = _retain_session_inspection_event(
                         retained_event_bytes,
                         usage_event,
                     )
-                    usage_events.append(usage_event)
+                    usage_accumulator.add(event.type, usage_metrics)
                 if is_budget_inspection_event(event):
                     budget_event = project_budget_inspection_event(event)
                     retained_event_bytes = _retain_session_inspection_event(
@@ -2495,8 +2575,7 @@ class SessionStore(ABC):
         pending = await self.query_pending_actions(
             PendingActionQuery(session_id=session_id, limit=200)
         )
-        usage = session_usage_summary(session_id, usage_events)
-        model_calls_with_usage = count_model_steps_with_usage(usage_events)
+        usage, model_calls_with_usage = usage_accumulator.result(session_id)
         budget = session_budget_inspection(budget_events)
         return SessionInspectionSummary(
             session=identity,
@@ -2884,7 +2963,10 @@ class InMemorySessionStore(SessionStore):
                     None if source_checkpoint is None else deepcopy(source_checkpoint),
                 )
                 if copied_checkpoint is not None:
-                    copied_checkpoint = copy_json_value(copied_checkpoint, "checkpoint")
+                    copied_checkpoint = copy_durable_json_object(
+                        copied_checkpoint,
+                        "checkpoint",
+                    )
 
             self._sessions[fork.id] = fork.model_copy(deep=True)
             self._events[fork.id] = []
@@ -3141,7 +3223,7 @@ class InMemorySessionStore(SessionStore):
                 None if current_checkpoint is None else deepcopy(current_checkpoint),
             )
             if transformed_checkpoint is not None:
-                transformed_checkpoint = copy_json_value(
+                transformed_checkpoint = copy_durable_json_object(
                     transformed_checkpoint,
                     "checkpoint",
                 )
@@ -3257,7 +3339,7 @@ class InMemorySessionStore(SessionStore):
             )
             if transformed is None:
                 raise ValueError("Fenced checkpoint transform must return a checkpoint.")
-            transformed = copy_json_value(transformed, "checkpoint")
+            transformed = copy_durable_json_object(transformed, "checkpoint")
             fenced = session.model_copy(
                 update={
                     "run_epoch": session.run_epoch + 1,
@@ -3476,8 +3558,7 @@ class InMemorySessionStore(SessionStore):
         retry_delay_seconds: float,
     ) -> PersistedEventSideEffectDelivery:
         claim = PersistedEventSideEffectClaim.model_validate(claim)
-        if type(error) is not str or not error.strip():
-            raise ValueError("error must be a non-empty string.")
+        error = validate_persisted_event_side_effect_error(error)
         if type(max_attempts) is not int or max_attempts < 1:
             raise ValueError("max_attempts must be an integer greater than or equal to 1.")
         if (
@@ -3838,7 +3919,7 @@ class InMemorySessionStore(SessionStore):
             )
             if transformed is None:
                 raise ValueError("Checkpoint transform must return a checkpoint.")
-            copied_checkpoint = copy_json_value(transformed, "checkpoint")
+            copied_checkpoint = copy_durable_json_object(transformed, "checkpoint")
             updated = self._append_events_unlocked(session, copied_events)
             self._store_checkpoint_unlocked(session_id, copied_checkpoint)
             self._sessions[session_id] = updated
@@ -3855,7 +3936,7 @@ class InMemorySessionStore(SessionStore):
             if session_id not in self._sessions:
                 raise KeyError(f"Session not found: {session_id}")
             record = self._session_operation_records.get(session_id, {}).get(idempotency_key)
-            return None if record is None else copy_json_value(record, "session_operation")
+            return None if record is None else copy_durable_json_object(record, "session_operation")
 
     async def publish_session_operation(
         self,
@@ -3955,14 +4036,17 @@ class InMemorySessionStore(SessionStore):
                 None if current_checkpoint is None else deepcopy(current_checkpoint),
                 None
                 if current_record is None
-                else copy_json_value(current_record, "session_operation"),
+                else copy_durable_json_object(current_record, "session_operation"),
             )
             if type(publication) is not SessionOperationPublication:
                 raise TypeError(
                     "Session operation transform must return a SessionOperationPublication."
                 )
-            copied_checkpoint = copy_json_value(publication.checkpoint, "checkpoint")
-            copied_records = copy_json_value(
+            copied_checkpoint = copy_durable_json_object(
+                publication.checkpoint,
+                "checkpoint",
+            )
+            copied_records = copy_durable_json_object(
                 publication.operation_records,
                 "operation_records",
             )
@@ -4429,7 +4513,7 @@ class InMemorySessionStore(SessionStore):
             )
             if transformed is None:
                 raise ValueError("Checkpoint transform must return a checkpoint.")
-            copied_checkpoint = copy_json_value(transformed, "checkpoint")
+            copied_checkpoint = copy_durable_json_object(transformed, "checkpoint")
             if copied_messages:
                 self._transcripts[session_id].extend(copied_messages)
             self._store_checkpoint_unlocked(session_id, copied_checkpoint)
@@ -4484,7 +4568,7 @@ class InMemorySessionStore(SessionStore):
             _assert_session_run_epoch(session_id, session)
             self._store_checkpoint_unlocked(
                 session_id,
-                copy_json_value(state, "checkpoint"),
+                copy_durable_json_object(state, "checkpoint"),
             )
             self._sessions[session_id] = session.model_copy(
                 update={"last_activity_at": datetime.now(UTC)}
@@ -4512,7 +4596,7 @@ class InMemorySessionStore(SessionStore):
                 return
             self._store_checkpoint_unlocked(
                 session_id,
-                copy_json_value(transformed, "checkpoint"),
+                copy_durable_json_object(transformed, "checkpoint"),
             )
             self._sessions[session_id] = session.model_copy(
                 update={"last_activity_at": datetime.now(UTC)}
@@ -4715,7 +4799,7 @@ def _copy_payload_fields(payload: dict[str, Any], fields: tuple[str, ...]) -> di
     copied: dict[str, Any] = {}
     for field in fields:
         if field in payload and payload[field] is not None:
-            copied[field] = copy_json_value(payload[field], field)
+            copied[field] = copy_durable_json_value(payload[field], field)
     return copied
 
 
@@ -4742,7 +4826,7 @@ _OUTCOME_EVENT_TYPE_BY_STATUS = {
 def copy_transcript_messages(messages: list[Message]) -> list[Message]:
     if type(messages) is not list:
         raise TypeError("Transcript messages must be a list.")
-    return [copy_message(message) for message in messages]
+    return [detach_message(message) for message in messages]
 
 
 def _detach_transcript_messages(messages: list[Message]) -> list[Message]:
@@ -4759,7 +4843,7 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         raise ValueError("RunRequest messages must be a list.")
     return RunRequest(
         agent_name=request.agent_name,
-        messages=[copy_message(message) for message in messages],
+        messages=[detach_message(message) for message in messages],
         session_id=request.session_id,
         parent_session_id=request.parent_session_id,
         causal_budget_id=request.causal_budget_id,
@@ -4769,7 +4853,7 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         model=request.model,
         environment_name=request.environment_name,
         labels=copy_label_map(request.labels, "labels"),
-        metadata=copy_json_value(request.metadata, "metadata"),
+        metadata=copy_durable_json_object(request.metadata, "metadata"),
         max_steps=request.max_steps,
         limits=copy_run_limits(request.limits),
         budget_limits=copy_request_budget_limits(request.budget_limits),
@@ -4788,9 +4872,9 @@ def copy_resume_request(request: ResumeRequest) -> ResumeRequest:
         raise ValueError("ResumeRequest messages must be a list.")
     return ResumeRequest(
         session_id=request.session_id,
-        messages=[copy_message(message) for message in messages],
+        messages=[detach_message(message) for message in messages],
         model=request.model,
-        metadata=copy_json_value(request.metadata, "metadata"),
+        metadata=copy_durable_json_object(request.metadata, "metadata"),
         max_steps=request.max_steps,
         limits=copy_run_limits(request.limits),
         budget_limits=copy_request_budget_limits(request.budget_limits),
@@ -4837,7 +4921,7 @@ def copy_interrupt_session_request(request: InterruptSessionRequest) -> Interrup
     return InterruptSessionRequest(
         session_id=request.session_id,
         reason=request.reason,
-        metadata=copy_json_value(request.metadata, "metadata"),
+        metadata=copy_durable_json_object(request.metadata, "metadata"),
         requested_by=copy_resolution_actor(request.requested_by),
     )
 
@@ -4851,7 +4935,7 @@ def copy_incomplete_session_recovery_request(
         session_id=request.session_id,
         inactive_before=request.inactive_before,
         reason=request.reason,
-        metadata=copy_json_value(request.metadata, "metadata"),
+        metadata=copy_durable_json_object(request.metadata, "metadata"),
     )
 
 
@@ -4867,7 +4951,7 @@ def copy_incomplete_sessions_recovery_request(
         limit=request.limit,
         inactive_before=request.inactive_before,
         reason=request.reason,
-        metadata=copy_json_value(request.metadata, "metadata"),
+        metadata=copy_durable_json_object(request.metadata, "metadata"),
     )
 
 
@@ -4882,7 +4966,7 @@ def copy_fork_session_request(request: ForkSessionRequest) -> ForkSessionRequest
         environment_name=request.environment_name,
         transcript_cursor=request.transcript_cursor,
         copy_checkpoint=request.copy_checkpoint,
-        metadata=copy_json_value(request.metadata, "metadata"),
+        metadata=copy_durable_json_object(request.metadata, "metadata"),
     )
 
 
@@ -4905,7 +4989,7 @@ def copy_session(session: Session) -> Session:
         last_activity_at=session.last_activity_at,
         run_epoch=session.run_epoch,
         labels=copy_label_map(session.labels, "labels"),
-        metadata=copy_json_value(session.metadata, "metadata"),
+        metadata=copy_durable_json_object(session.metadata, "metadata"),
     )
 
 
@@ -5177,7 +5261,7 @@ class _UsageAccumulator:
     session_count: int = 0
     model_steps: int = 0
     model_steps_with_usage: int = 0
-    usage: UsageMetrics = dataclass_field(default_factory=UsageMetrics)
+    usage: AggregateUsageMetrics = dataclass_field(default_factory=build_aggregate_usage_metrics)
 
     def add(self, metrics: UsageMetrics | None) -> None:
         self.model_steps += 1
@@ -5193,6 +5277,50 @@ class _UsageAccumulator:
             model_steps_with_usage=self.model_steps_with_usage,
             tool_calls=tool_calls,
             usage=self.usage,
+        )
+
+
+@dataclass
+class _SessionInspectionUsageAccumulator:
+    """Single-pass inspection fold with native aggregate usage semantics."""
+
+    totals: _UsageAccumulator = dataclass_field(default_factory=_UsageAccumulator)
+    provider_names: list[str] = dataclass_field(default_factory=list)
+    models: list[str] = dataclass_field(default_factory=list)
+    _provider_names_seen: set[str] = dataclass_field(default_factory=set)
+    _models_seen: set[str] = dataclass_field(default_factory=set)
+    tool_calls: int = 0
+
+    def add(self, event_type: str, metrics: UsageMetrics | None) -> None:
+        if event_type == EventType.TOOL_CALL_STARTED:
+            self.tool_calls += 1
+            return
+        if event_type != EventType.MODEL_COMPLETED:
+            return
+        self.totals.add(metrics)
+        if metrics is None:
+            return
+        if (
+            metrics.provider_name is not None
+            and metrics.provider_name not in self._provider_names_seen
+        ):
+            self._provider_names_seen.add(metrics.provider_name)
+            self.provider_names.append(metrics.provider_name)
+        if metrics.model is not None and metrics.model not in self._models_seen:
+            self._models_seen.add(metrics.model)
+            self.models.append(metrics.model)
+
+    def result(self, session_id: str) -> tuple[SessionInspectionUsageSummary, int]:
+        return (
+            SessionInspectionUsageSummary(
+                session_id=session_id,
+                model_steps=self.totals.model_steps,
+                tool_calls=self.tool_calls,
+                provider_names=self.provider_names,
+                models=self.models,
+                usage=self.totals.usage,
+            ),
+            self.totals.model_steps_with_usage,
         )
 
 

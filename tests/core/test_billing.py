@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
+from pydantic import ValidationError
 
 from cayu import (
     BillingIdentity,
@@ -21,8 +22,9 @@ from cayu import (
     PricingContextSelector,
     ResolvedBillingIdentity,
     estimate_session_cost,
+    extract_durable_value_error,
 )
-from cayu.core.billing import completed_billing_identity
+from cayu.core.billing import completed_billing_identity, copy_billing_identity
 
 
 def _identity(*, contexts: tuple[PricingContext, ...]) -> BillingIdentity:
@@ -47,6 +49,41 @@ def test_billing_identity_is_deeply_immutable() -> None:
         nested["plan"] = "standard"  # type: ignore[index]
     with pytest.raises(TypeError, match="cannot be mutated"):
         identity.pricing_contexts[0].dimensions["zone"] = "south"  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        {"amount": float("nan")},
+        {"route": "invalid\x00route"},
+        {"route": "invalid\ud800route"},
+        {"tokens": 2**63},
+    ],
+)
+def test_billing_identity_rejects_non_portable_evidence(evidence: dict[str, object]) -> None:
+    with pytest.raises(ValidationError) as raised:
+        BillingIdentity(
+            provider_name="commercial-cloud",
+            resource_id="opaque-resource-1",
+            request_evidence=evidence,
+        )
+
+    assert extract_durable_value_error(raised.value) is not None
+
+
+def test_copy_billing_identity_revalidates_forged_evidence() -> None:
+    forged = BillingIdentity.model_construct(
+        provider_name="commercial-cloud",
+        resource_id="opaque-resource-1",
+        request_evidence={"amount": float("nan")},
+        completion_evidence={},
+        pricing_contexts=(),
+    )
+
+    with pytest.raises(ValidationError) as raised:
+        copy_billing_identity(forged)
+
+    assert extract_durable_value_error(raised.value) is not None
 
 
 def test_pricing_context_selector_is_deeply_immutable() -> None:

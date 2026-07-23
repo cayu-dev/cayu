@@ -18,6 +18,8 @@ from cayu.runtime.aggregates import (
     MAX_AGGREGATE_USAGE_COUNTER,
     AggregateAccuracy,
     AggregateAccuracyKind,
+    AggregateCacheUsageMetrics,
+    AggregateUsageMetrics,
     BoundedUsagePricingInputAccumulator,
     UsageAggregateBreakdown,
     UsageAggregateRemainder,
@@ -30,6 +32,7 @@ from cayu.runtime.aggregates import (
 )
 from cayu.runtime.costs import ModelPrice, PriceBook
 from cayu.runtime.sessions import (
+    EventRecord,
     InMemorySessionStore,
     RunRequest,
     SessionAggregateFilter,
@@ -40,7 +43,7 @@ from cayu.runtime.sessions import (
     UsageRollupQuery,
 )
 from cayu.runtime.tasks import InMemoryTaskStore, TaskAggregateFilter, TaskCreate
-from cayu.runtime.usage import CacheUsageMetrics, UsageMetrics
+from cayu.runtime.usage import UsageMetrics
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 
 
@@ -773,28 +776,77 @@ def test_sqlite_usage_rollup_sums_past_signed_64_bit_without_overflow(tmp_path) 
     asyncio.run(run())
 
 
-def test_aggregate_usage_rejects_per_event_counters_above_shared_limit(tmp_path) -> None:
-    async def run() -> None:
-        stores = (
-            InMemorySessionStore(),
-            SQLiteSessionStore(tmp_path / "oversized-counter.sqlite"),
+def test_event_rejects_per_event_counters_above_shared_limit() -> None:
+    with pytest.raises(ValidationError, match="code=integer_out_of_range"):
+        _model_event(
+            event_id="oversized-counter",
+            session_id="oversized-counter",
+            timestamp=datetime(2026, 7, 1, tzinfo=UTC),
+            provider_name="provider",
+            model="model",
+            input_tokens=MAX_AGGREGATE_USAGE_COUNTER + 1,
+            output_tokens=0,
         )
+
+
+def test_aggregate_usage_rejects_legacy_oversized_persisted_counters(tmp_path) -> None:
+    async def run() -> None:
+        memory_store = InMemorySessionStore()
+        sqlite_store = SQLiteSessionStore(tmp_path / "oversized-counter.sqlite")
+        stores = (memory_store, sqlite_store)
         start = datetime(2026, 7, 1, tzinfo=UTC)
+        oversized_payload = {
+            "usage_metrics": {
+                "input_tokens": MAX_AGGREGATE_USAGE_COUNTER + 1,
+                "output_tokens": 0,
+                "total_tokens": MAX_AGGREGATE_USAGE_COUNTER + 1,
+                "provider_name": "provider",
+                "model": "model",
+            }
+        }
         for store_index, store in enumerate(stores):
             session_id = f"oversized-counter-{store_index}"
             await store.create(_request(session_id), identity=_identity())
-            await store.append_event(
-                session_id,
-                _model_event(
-                    event_id="oversized-counter",
-                    session_id=session_id,
-                    timestamp=start,
-                    provider_name="provider",
-                    model="model",
-                    input_tokens=MAX_AGGREGATE_USAGE_COUNTER + 1,
-                    output_tokens=0,
-                ),
+
+        legacy_event = Event.model_construct(
+            id="oversized-counter",
+            type=EventType.MODEL_COMPLETED,
+            session_id="oversized-counter-0",
+            timestamp=start,
+            agent_name=None,
+            environment_name=None,
+            workflow_name=None,
+            tool_name=None,
+            payload=oversized_payload,
+        )
+        async with memory_store._lock:
+            memory_store._session_event_records["oversized-counter-0"].append(
+                EventRecord.model_construct(sequence=1, event=legacy_event)
             )
+
+        def insert_legacy_sqlite_event(connection) -> None:
+            with connection:
+                connection.execute(
+                    """
+                    INSERT INTO cayu_events (
+                        session_id,
+                        event_id,
+                        event_type,
+                        timestamp,
+                        payload_json
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "oversized-counter-1",
+                        "oversized-counter",
+                        str(EventType.MODEL_COMPLETED),
+                        start.isoformat(),
+                        json.dumps(oversized_payload),
+                    ),
+                )
+
+        await sqlite_store._run_write(insert_legacy_sqlite_event)
 
         query = UsageRollupQuery(
             start_at=start,
@@ -806,7 +858,7 @@ def test_aggregate_usage_rejects_per_event_counters_above_shared_limit(tmp_path)
         assert results[0].totals.model_steps_with_usage == 1
         assert results[0].totals.usage.input_tokens == 0
         assert results[0].pricing_inputs[0].metrics is None
-        await stores[1].close()
+        await sqlite_store.close()
 
     asyncio.run(run())
 
@@ -1064,18 +1116,18 @@ def test_nested_aggregate_usage_counters_are_decimal_strings_in_json_schema(
 
 
 def test_public_aggregate_models_round_trip_their_exact_json_counters() -> None:
-    exact_count = 2**53 + 1
+    exact_count = 2**63 + 1
     totals = UsageAggregateTotals(
         session_count=exact_count,
         model_steps=exact_count,
         model_steps_with_usage=exact_count,
         tool_calls=exact_count,
-        usage=UsageMetrics(
+        usage=AggregateUsageMetrics(
             input_tokens=exact_count,
             output_tokens=exact_count,
             total_tokens=exact_count * 2,
             reasoning_output_tokens=exact_count,
-            cache=CacheUsageMetrics(
+            cache=AggregateCacheUsageMetrics(
                 read_tokens=exact_count,
                 write_tokens=exact_count,
                 write_5m_tokens=exact_count,
@@ -1112,6 +1164,13 @@ def test_public_aggregate_models_round_trip_their_exact_json_counters() -> None:
 
         assert restored == value
         assert f'"{exact_count}"' in payload
+
+    dumped = totals.model_dump(mode="python")
+    assert UsageAggregateTotals.model_validate(dumped) == totals
+    assert isinstance(totals.usage, AggregateUsageMetrics)
+
+    with pytest.raises(ValidationError):
+        UsageMetrics(input_tokens=exact_count)
 
 
 @pytest.mark.parametrize(
@@ -1828,15 +1887,6 @@ def test_postgres_aggregates_match_in_memory_reference(postgres_dsn: str) -> Non
                         timestamp=start + timedelta(hours=12, minutes=1),
                         payload={"usage_metrics": {}},
                     ),
-                    _model_event(
-                        event_id="oversized-counter",
-                        session_id=session_id,
-                        timestamp=start + timedelta(hours=14),
-                        provider_name="provider",
-                        model="model",
-                        input_tokens=MAX_AGGREGATE_USAGE_COUNTER + 1,
-                        output_tokens=0,
-                    ),
                     _unclean_bedrock_evidence_event(
                         event_id="unclean-bounded-evidence",
                         session_id=session_id,
@@ -1844,6 +1894,79 @@ def test_postgres_aggregates_match_in_memory_reference(postgres_dsn: str) -> Non
                     ),
                 ],
             )
+
+        # New producer boundaries reject this counter before persistence. Seed
+        # one legacy row below the public APIs so aggregate readers remain
+        # defensive and equivalent for databases created by older releases.
+        oversized_timestamp = start + timedelta(hours=14)
+        oversized_payload = {
+            "usage_metrics": {
+                "input_tokens": MAX_AGGREGATE_USAGE_COUNTER + 1,
+                "output_tokens": 0,
+                "total_tokens": MAX_AGGREGATE_USAGE_COUNTER + 1,
+                "provider_name": "provider",
+                "model": "model",
+            }
+        }
+        memory_edge_session_id = f"memory-pg-{suffix}-aggregate-edge"
+        memory_legacy_event = Event.model_construct(
+            id="oversized-counter",
+            type=EventType.MODEL_COMPLETED,
+            session_id=memory_edge_session_id,
+            timestamp=oversized_timestamp,
+            agent_name=None,
+            environment_name=None,
+            workflow_name=None,
+            tool_name=None,
+            payload=oversized_payload,
+        )
+        async with memory_sessions._lock:
+            memory_sessions._session_event_records[memory_edge_session_id].append(
+                EventRecord.model_construct(
+                    sequence=memory_sessions._next_event_sequence,
+                    event=memory_legacy_event,
+                )
+            )
+            memory_sessions._next_event_sequence += 1
+
+        from psycopg import AsyncConnection
+
+        postgres_edge_session_id = f"postgres-{suffix}-aggregate-edge"
+        postgres_legacy_event = {
+            "type": str(EventType.MODEL_COMPLETED),
+            "session_id": postgres_edge_session_id,
+            "id": "oversized-counter",
+            "timestamp": oversized_timestamp.isoformat(),
+            "agent_name": None,
+            "environment_name": None,
+            "workflow_name": None,
+            "tool_name": None,
+            "payload": oversized_payload,
+        }
+        legacy_connection = await AsyncConnection.connect(postgres_dsn)
+        try:
+            async with legacy_connection.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    INSERT INTO cayu_events (
+                        session_id, session_order, event_id, event_type, timestamp,
+                        payload, event
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)
+                    """,
+                    (
+                        postgres_edge_session_id,
+                        7,
+                        "oversized-counter",
+                        str(EventType.MODEL_COMPLETED),
+                        oversized_timestamp,
+                        json.dumps(oversized_payload),
+                        json.dumps(postgres_legacy_event),
+                    ),
+                )
+            await legacy_connection.commit()
+        finally:
+            await legacy_connection.close()
         edge_filter = SessionAggregateFilter(labels={"test-scope": edge_label})
         canonical_query = UsageRollupQuery(
             start_at=start + timedelta(hours=10),
@@ -1894,8 +2017,6 @@ def test_postgres_aggregates_match_in_memory_reference(postgres_dsn: str) -> Non
         assert unclean_metrics is not None
         assert unclean_metrics.billing_identity is not None
         assert unclean_metrics.billing_identity.request_evidence == {}
-
-        from psycopg import AsyncConnection
 
         from cayu.runtime.sessions import session_query_from_aggregate_filter
         from cayu.storage import _postgres_aggregates, _session_store_sql

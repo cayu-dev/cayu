@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
+from contextlib import suppress
+from itertools import islice
 
 from cayu.core.events import Event, EventType
 from cayu.runtime.budgets import BudgetStore
@@ -13,10 +15,13 @@ from cayu.runtime.sessions import (
     PersistedEventSideEffectDelivery,
     PersistedEventSideEffectStatus,
     SessionStore,
+    portable_persisted_event_side_effect_error,
 )
 
 _PERSISTED_SIDE_EFFECT_MAX_ATTEMPTS = 3
 _PERSISTED_SIDE_EFFECT_RETRY_DELAY_SECONDS = 30.0
+_MAX_AGGREGATED_FAILURES = 16
+_MAX_EXCEPTION_NOTES = 16
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +156,7 @@ class RuntimeEventWriter:
                     claim.session_id,
                     claim.event_id,
                     claim.event.type,
-                    type(exc).__name__,
+                    _object_type_name(exc),
                 )
                 continue
             if delivered:
@@ -169,17 +174,18 @@ class RuntimeEventWriter:
             try:
                 await self._mark_claim_failed(
                     claim,
-                    error=f"{type(exc).__name__}: {exc}",
+                    error=_exception_summary(exc),
                 )
             except Exception as bookkeeping_exc:
-                exc.add_note(
+                _add_exception_note(
+                    exc,
                     "Persisted event side-effect failure bookkeeping also failed: "
-                    f"{type(bookkeeping_exc).__name__}: {bookkeeping_exc}"
+                    f"{_exception_summary(bookkeeping_exc)}",
                 )
             raise
         sink_failures = await self._emit_to_sinks(event)
         if sink_failures:
-            failure_summary = "; ".join(_exception_summary(failure) for failure in sink_failures)
+            failure_summary = _failure_summary(sink_failures)
             try:
                 await self._mark_claim_failed(
                     claim,
@@ -187,14 +193,16 @@ class RuntimeEventWriter:
                 )
             except Exception as bookkeeping_exc:
                 primary_failure = sink_failures[0]
-                primary_failure.add_note(
+                _add_exception_note(
+                    primary_failure,
                     "Persisted event side-effect failure bookkeeping also failed: "
-                    f"{type(bookkeeping_exc).__name__}: {bookkeeping_exc}"
+                    f"{_exception_summary(bookkeeping_exc)}",
                 )
                 if len(sink_failures) > 1:
-                    primary_failure.add_note(
+                    _add_exception_note(
+                        primary_failure,
                         "Additional persisted event sink failures: "
-                        + "; ".join(_exception_summary(failure) for failure in sink_failures[1:])
+                        + _failure_summary(sink_failures, start=1),
                     )
                 raise primary_failure from bookkeeping_exc
             return event, False
@@ -210,7 +218,7 @@ class RuntimeEventWriter:
                 claim.session_id,
                 claim.event_id,
                 claim.event.type,
-                type(exc).__name__,
+                _object_type_name(exc),
                 exc_info=True,
             )
             return event, False
@@ -259,7 +267,7 @@ class RuntimeEventWriter:
         try:
             delivery = await self._session_store.mark_persisted_event_side_effect_failed(
                 claim,
-                error=error,
+                error=portable_persisted_event_side_effect_error(error),
                 max_attempts=_PERSISTED_SIDE_EFFECT_MAX_ATTEMPTS,
                 retry_delay_seconds=_PERSISTED_SIDE_EFFECT_RETRY_DELAY_SECONDS,
             )
@@ -292,24 +300,74 @@ class RuntimeEventWriter:
                             agent_name=event.agent_name,
                             environment_name=event.environment_name,
                             payload={
-                                "sink": type(sink).__name__,
-                                "error": str(exc),
-                                "error_type": type(exc).__name__,
+                                "sink": _object_type_name(sink),
+                                "error": _exception_message(exc),
+                                "error_type": _object_type_name(exc),
                                 "event_id": event.id,
                                 "event_type": str(event.type),
                             },
                         ),
                     )
                 except Exception as diagnostic_exc:
-                    exc.add_note(
+                    _add_exception_note(
+                        exc,
                         "runtime.sink.failed persistence failed: "
-                        f"{type(diagnostic_exc).__name__}: {diagnostic_exc}"
+                        f"{_exception_summary(diagnostic_exc)}",
                     )
                 failures.append(exc)
         return failures
 
 
 def _exception_summary(exc: Exception) -> str:
-    parts = [f"{type(exc).__name__}: {exc}"]
-    parts.extend(getattr(exc, "__notes__", ()))
-    return "; ".join(parts)
+    parts = [f"{_object_type_name(exc)}: {_exception_message(exc)}"]
+    try:
+        notes = object.__getattribute__(exc, "__notes__")
+    except BaseException:
+        notes = ()
+    if type(notes) is list:
+        parts.extend(
+            portable_persisted_event_side_effect_error(note)
+            for note in islice(notes, _MAX_EXCEPTION_NOTES)
+        )
+        if len(notes) > _MAX_EXCEPTION_NOTES:
+            parts.append(f"{len(notes) - _MAX_EXCEPTION_NOTES} additional notes omitted")
+    return portable_persisted_event_side_effect_error("; ".join(parts))
+
+
+def _failure_summary(failures: list[Exception], *, start: int = 0) -> str:
+    """Bound diagnostic aggregation independently of configured sink count."""
+
+    parts = [
+        _exception_summary(failure)
+        for failure in islice(failures, start, start + _MAX_AGGREGATED_FAILURES)
+    ]
+    omitted = len(failures) - start - len(parts)
+    if omitted > 0:
+        parts.append(f"{omitted} additional failures omitted")
+    return portable_persisted_event_side_effect_error("; ".join(parts))
+
+
+def _exception_message(exc: Exception) -> str:
+    try:
+        message = str(exc)
+    except BaseException:
+        message = None
+    return portable_persisted_event_side_effect_error(message)
+
+
+def _object_type_name(value: object) -> str:
+    """Return a portable type name without invoking an extension metaclass."""
+
+    try:
+        name = type.__getattribute__(type(value), "__name__")
+    except BaseException:
+        name = None
+    return portable_persisted_event_side_effect_error(name)
+
+
+def _add_exception_note(exc: BaseException, note: str) -> None:
+    """Attach optional diagnostics without relying on extension overrides."""
+
+    portable_note = portable_persisted_event_side_effect_error(note)
+    with suppress(BaseException):
+        BaseException.add_note(exc, portable_note)

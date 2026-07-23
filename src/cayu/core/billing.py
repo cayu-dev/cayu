@@ -13,41 +13,32 @@ from pydantic import (
 )
 
 from cayu._validation import (
-    copy_json_value,
+    copy_durable_json_object,
     freeze_json_value,
-    require_clean_nonblank,
-    require_durable_json_text,
+    require_durable_clean_nonblank,
     thaw_json_value,
 )
-
-
-def _require_durable_identity_text(value: str, field_name: str) -> str:
-    value = require_clean_nonblank(value, field_name)
-    require_durable_json_text(value, field_name)
-    return value
 
 
 class PricingContext(BaseModel):
     """One exact set of commercial dimensions that may price a dispatch."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     dimensions: Mapping[str, str]
 
     @field_validator("dimensions", mode="before")
     @classmethod
     def validate_dimensions_input(cls, value: Any) -> dict[str, str]:
-        copied = copy_json_value(value, "dimensions")
-        if type(copied) is not dict:
-            raise ValueError("dimensions must be an object.")
+        copied = copy_durable_json_object(value, "dimensions")
         if not copied:
             raise ValueError("dimensions must not be empty.")
         result: dict[str, str] = {}
         for key, item in copied.items():
-            clean_key = _require_durable_identity_text(key, "dimension name")
+            clean_key = require_durable_clean_nonblank(key, "dimension name")
             if type(item) is not str:
                 raise ValueError(f"Pricing dimension {clean_key!r} must be a string.")
-            result[clean_key] = _require_durable_identity_text(
+            result[clean_key] = require_durable_clean_nonblank(
                 item,
                 f"dimensions.{clean_key}",
             )
@@ -74,7 +65,7 @@ class BillingIdentity(BaseModel):
     pricing outcomes established before dispatch.
     """
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     provider_name: str
     resource_id: str
@@ -85,16 +76,12 @@ class BillingIdentity(BaseModel):
     @field_validator("provider_name", "resource_id")
     @classmethod
     def validate_identity_text(cls, value: str, info) -> str:
-        return _require_durable_identity_text(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("request_evidence", "completion_evidence", mode="before")
     @classmethod
     def validate_evidence_input(cls, value: Any, info) -> dict[str, Any]:
-        copied = copy_json_value(value, info.field_name)
-        if type(copied) is not dict:
-            raise ValueError(f"{info.field_name} must be an object.")
-        require_durable_json_text(copied, info.field_name)
-        return copied
+        return copy_durable_json_object(value, info.field_name)
 
     @field_validator("request_evidence", "completion_evidence")
     @classmethod
@@ -148,9 +135,23 @@ def copy_billing_identity(identity: BillingIdentity | None) -> BillingIdentity |
 
     if identity is None:
         return None
-    if not isinstance(identity, BillingIdentity):
+    if type(identity) is not BillingIdentity:
         raise TypeError("Provider billing identity must be a BillingIdentity or None.")
-    return BillingIdentity.model_validate(identity.model_dump(mode="json"))
+    return BillingIdentity(
+        provider_name=identity.provider_name,
+        resource_id=identity.resource_id,
+        request_evidence=identity.request_evidence,
+        completion_evidence=identity.completion_evidence,
+        pricing_contexts=tuple(
+            _copy_pricing_context(context) for context in identity.pricing_contexts
+        ),
+    )
+
+
+def _copy_pricing_context(context: PricingContext) -> PricingContext:
+    if type(context) is not PricingContext:
+        raise TypeError("Billing pricing contexts must be PricingContext instances.")
+    return PricingContext(dimensions=context.dimensions)
 
 
 def resolved_billing_identity(identity: BillingIdentity | None) -> ResolvedBillingIdentity:

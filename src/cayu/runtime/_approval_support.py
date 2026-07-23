@@ -5,7 +5,7 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import Any, NamedTuple
 
-from cayu._validation import copy_json_value
+from cayu._validation import copy_durable_json_value
 from cayu.core.events import Event, EventType
 from cayu.core.tools import ToolResult
 from cayu.runtime import _resume_ledger as resume_ledger
@@ -48,7 +48,7 @@ async def checkpoint_without_pending_approval(
 ) -> dict[str, Any]:
     """Copy a session checkpoint without its pending approval marker."""
     checkpoint = await session_store.load_checkpoint(session_id)
-    copied = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+    copied = {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
     copied.pop(PENDING_TOOL_APPROVAL_CHECKPOINT_KEY, None)
     return copied
 
@@ -154,7 +154,7 @@ def checkpoint_for_fork(
 ) -> dict[str, Any] | None:
     if checkpoint is None:
         return None
-    copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
+    copied_checkpoint = copy_durable_json_value(checkpoint, "checkpoint")
     pending_approval = pending_approval_from_checkpoint(copied_checkpoint)
     if pending_approval is None:
         return copied_checkpoint
@@ -444,7 +444,7 @@ def pending_approval_from_checkpoint(
 ) -> PendingToolApproval | None:
     if checkpoint is None:
         return None
-    copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
+    copied_checkpoint = copy_durable_json_value(checkpoint, "checkpoint")
     value = copied_checkpoint.get(PENDING_TOOL_APPROVAL_CHECKPOINT_KEY)
     if value is None:
         return None
@@ -470,14 +470,14 @@ def pending_tool_call_approvals(
             PendingToolCallApproval(
                 tool_call_id=tool_call.id,
                 tool_name=tool_call.name,
-                arguments=copy_json_value(tool_call.arguments, "arguments"),
+                arguments=copy_durable_json_value(tool_call.arguments, "arguments"),
                 policy_decision=policy_result.decision.value if policy_result is not None else None,
                 reason=resume_ledger.policy_reason_for_pending_tool_call(
                     policy_result,
                     redactor=redactor,
                 ),
                 metadata=(
-                    copy_json_value(policy_result.metadata, "metadata")
+                    copy_durable_json_value(policy_result.metadata, "metadata")
                     if policy_result is not None
                     else {}
                 ),

@@ -8,7 +8,10 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import (
+    copy_durable_json_value,
+    require_durable_clean_nonblank,
+)
 
 _CUSTOM_EVENT_TYPE_RE = re.compile(r"^custom\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$")
 EVENT_ID_MAX_CHARS = 512
@@ -130,7 +133,7 @@ class Event(BaseModel):
     persistent sessions, webhooks, and hosted-platform adapters.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     # `EventType` is a StrEnum. A known type validates back to the enum member here, but an event
     # deserialized from JSON elsewhere (webhook / SSE / JSONL, or `payload["type"]`) carries a plain
@@ -149,12 +152,12 @@ class Event(BaseModel):
     @field_validator("payload", mode="before")
     @classmethod
     def copy_payload(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "payload")
+        return copy_durable_json_value(value, "payload")
 
     @field_validator("session_id", "id")
     @classmethod
     def validate_nonblank_ids(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("agent_name", "environment_name", "workflow_name", "tool_name")
     @classmethod
@@ -165,7 +168,7 @@ class Event(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("type")
     @classmethod
@@ -198,5 +201,5 @@ def copy_event(event: Event) -> Event:
         environment_name=event.environment_name,
         workflow_name=event.workflow_name,
         tool_name=event.tool_name,
-        payload=copy_json_value(event.payload, "payload"),
+        payload=copy_durable_json_value(event.payload, "payload"),
     )

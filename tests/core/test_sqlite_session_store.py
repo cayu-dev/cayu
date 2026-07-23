@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from cayu import SQLiteSessionStore, SQLiteTaskStore
+from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.providers import (
     ModelProvider,
@@ -24,10 +25,12 @@ from cayu.runtime import (
     Session,
     SessionAggregateFilter,
     SessionIdentity,
+    SessionInspectionSummary,
     SessionQuery,
     SessionStatus,
     UsageRollupQuery,
 )
+from cayu.runtime.aggregates import AggregateUsageMetrics
 from cayu.runtime.pending_actions import pending_action_lookup_key
 from cayu.runtime.sessions import PendingActionQuery
 from cayu.storage import _sqlite_support as sqlite_support
@@ -155,9 +158,21 @@ def test_session_inspection_summary_conforms_to_native_event_and_usage_aggregate
                     timestamp=timestamp,
                     payload={
                         "usage_metrics": {
-                            "input_tokens": 5,
+                            "input_tokens": MAX_DURABLE_JSON_INTEGER,
+                            "output_tokens": 0,
+                            "total_tokens": MAX_DURABLE_JSON_INTEGER,
+                        }
+                    },
+                ),
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id="sess_inspection_conformance",
+                    timestamp=timestamp + timedelta(milliseconds=500),
+                    payload={
+                        "usage_metrics": {
+                            "input_tokens": 1,
                             "output_tokens": 2,
-                            "total_tokens": 7,
+                            "total_tokens": 3,
                         }
                     },
                 ),
@@ -189,7 +204,17 @@ def test_session_inspection_summary_conforms_to_native_event_and_usage_aggregate
             assert inspection.model_calls == usage.totals.model_steps
             assert inspection.tool_calls == usage.totals.tool_calls
             assert inspection.model_calls_with_usage == usage.totals.model_steps_with_usage
+            assert isinstance(inspection.usage.usage, AggregateUsageMetrics)
             assert inspection.usage.usage == usage.totals.usage
+            assert inspection.usage.usage.input_tokens == MAX_DURABLE_JSON_INTEGER + 1
+            assert (
+                SessionInspectionSummary.model_validate(inspection.model_dump(mode="python"))
+                == inspection
+            )
+            assert (
+                SessionInspectionSummary.model_validate_json(inspection.model_dump_json())
+                == inspection
+            )
         finally:
             await store.close()
 

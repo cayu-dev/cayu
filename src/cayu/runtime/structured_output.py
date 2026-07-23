@@ -8,10 +8,21 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationInfo, field_validator
 
-from cayu._validation import copy_json_value, escape_json_pointer_segment, require_clean_nonblank
+from cayu._validation import (
+    DurableValueError,
+    copy_durable_json_value,
+    durable_json_object_from_pairs,
+    escape_json_pointer_segment,
+    parse_durable_json_integer_literal,
+    reject_nonportable_json_constant,
+    require_durable_clean_nonblank,
+    require_durable_text,
+)
 from cayu.providers import ModelProvider
 
 STRUCTURED_OUTPUT_TOOL_NAME = "__cayu_submit_structured_output"
+_STRUCTURED_OUTPUT_TEXT_FIELD = "structured output"
+_INVALID_PORTABLE_JSON_MESSAGE = "Final assistant output is not valid portable JSON."
 
 
 class StructuredOutputStrategy(StrEnum):
@@ -34,7 +45,7 @@ class NativeStructuredOutputUnsupported(ValueError):
 class StructuredOutputSpec(BaseModel):
     """Provider-neutral JSON structured output requirement."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     json_schema: dict[str, Any]
     name: str | None = None
@@ -49,12 +60,12 @@ class StructuredOutputSpec(BaseModel):
             return value
         if not isinstance(value, str):
             raise ValueError("Structured output strategy must be a string.")
-        return StructuredOutputStrategy(require_clean_nonblank(value, "strategy"))
+        return StructuredOutputStrategy(require_durable_clean_nonblank(value, "strategy"))
 
     @field_validator("json_schema", mode="before")
     @classmethod
     def copy_and_validate_json_schema(cls, value: dict[str, Any]) -> dict[str, Any]:
-        copied = copy_json_value(value, "json_schema")
+        copied = copy_durable_json_value(value, "json_schema")
         if type(copied) is not dict:
             raise ValueError("Structured output JSON Schema must be an object.")
         try:
@@ -73,19 +84,24 @@ class StructuredOutputSpec(BaseModel):
         if value is None:
             return None
         field_name = info.field_name or "value"
-        return require_clean_nonblank(value, field_name)
+        return require_durable_clean_nonblank(value, field_name)
 
 
 class StructuredOutputError(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     path: str
     message: str
     schema_path: str
 
+    @field_validator("path", "message", "schema_path")
+    @classmethod
+    def validate_durable_text(cls, value: str, info: ValidationInfo) -> str:
+        return require_durable_text(value, info.field_name or "value")
+
 
 class StructuredOutputValidation(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     valid: bool
     output: Any | None = None
@@ -96,7 +112,7 @@ class StructuredOutputValidation(BaseModel):
     def copy_output(cls, value: Any) -> Any:
         if value is None:
             return None
-        return copy_json_value(value, "output")
+        return copy_durable_json_value(value, "output")
 
 
 def _require_native_structured_output_support(
@@ -114,7 +130,7 @@ def _require_native_structured_output_support(
             f"Native structured output is not supported by provider: {provider_name}"
         )
     provider.preflight_native_structured_output_schema(
-        copy_json_value(structured_output.json_schema, "json_schema")
+        copy_durable_json_value(structured_output.json_schema, "json_schema")
     )
 
 
@@ -126,7 +142,7 @@ def copy_structured_output_spec(
     if type(spec) is not StructuredOutputSpec:
         raise TypeError("Structured output spec must be a StructuredOutputSpec instance.")
     return StructuredOutputSpec(
-        json_schema=copy_json_value(spec.json_schema, "json_schema"),
+        json_schema=copy_durable_json_value(spec.json_schema, "json_schema"),
         name=spec.name,
         max_retries=spec.max_retries,
         repair_prompt=spec.repair_prompt,
@@ -143,7 +159,10 @@ def validate_structured_output_text(
     if type(spec) is not StructuredOutputSpec:
         raise TypeError("Structured output spec must be a StructuredOutputSpec instance.")
 
-    stripped = text.strip()
+    try:
+        stripped = require_durable_text(text, _STRUCTURED_OUTPUT_TEXT_FIELD).strip()
+    except DurableValueError:
+        return _invalid_portable_json_validation()
     if not stripped:
         return StructuredOutputValidation(
             valid=False,
@@ -156,20 +175,42 @@ def validate_structured_output_text(
             ],
         )
     try:
-        output = json.loads(stripped)
-    except json.JSONDecodeError as exc:
-        return StructuredOutputValidation(
-            valid=False,
-            errors=[
-                StructuredOutputError(
-                    path="$",
-                    message=f"Final assistant output is not valid JSON: {exc.msg}.",
-                    schema_path="$",
-                )
-            ],
+        output = json.loads(
+            stripped,
+            parse_constant=_reject_structured_output_json_constant,
+            parse_int=_parse_structured_output_json_integer,
+            object_pairs_hook=_reject_structured_output_duplicate_keys,
         )
+        return validate_structured_output_value(output, spec)
+    except (DurableValueError, json.JSONDecodeError, RecursionError):
+        return _invalid_portable_json_validation()
 
-    return validate_structured_output_value(output, spec)
+
+def _parse_structured_output_json_integer(value: str) -> int:
+    return parse_durable_json_integer_literal(value, _STRUCTURED_OUTPUT_TEXT_FIELD)
+
+
+def _reject_structured_output_json_constant(value: str) -> None:
+    reject_nonportable_json_constant(value, _STRUCTURED_OUTPUT_TEXT_FIELD)
+
+
+def _reject_structured_output_duplicate_keys(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    return durable_json_object_from_pairs(pairs, _STRUCTURED_OUTPUT_TEXT_FIELD)
+
+
+def _invalid_portable_json_validation() -> StructuredOutputValidation:
+    return StructuredOutputValidation(
+        valid=False,
+        errors=[
+            StructuredOutputError(
+                path="$",
+                message=_INVALID_PORTABLE_JSON_MESSAGE,
+                schema_path="$",
+            )
+        ],
+    )
 
 
 def validate_structured_output_value(
@@ -178,7 +219,7 @@ def validate_structured_output_value(
 ) -> StructuredOutputValidation:
     if type(spec) is not StructuredOutputSpec:
         raise TypeError("Structured output spec must be a StructuredOutputSpec instance.")
-    copied_output = copy_json_value(output, "output")
+    copied_output = copy_durable_json_value(output, "output")
     validator = Draft202012Validator(spec.json_schema)
     errors = sorted(
         validator.iter_errors(copied_output),
@@ -259,7 +300,7 @@ def structured_output_tool_spec(spec: StructuredOutputSpec) -> dict[str, Any]:
         "input_schema": {
             "type": "object",
             "properties": {
-                "output": copy_json_value(spec.json_schema, "json_schema"),
+                "output": copy_durable_json_value(spec.json_schema, "json_schema"),
             },
             "required": ["output"],
             "additionalProperties": False,
@@ -313,7 +354,7 @@ def structured_output_spec_payload(spec: StructuredOutputSpec) -> dict[str, Any]
     )
     return {
         "name": spec.name,
-        "schema": copy_json_value(spec.json_schema, "json_schema"),
+        "schema": copy_durable_json_value(spec.json_schema, "json_schema"),
         "max_retries": spec.max_retries,
         "repair_prompt": spec.repair_prompt,
         "strategy": strategy,
