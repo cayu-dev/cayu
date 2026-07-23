@@ -15,9 +15,15 @@ import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
+from hashlib import sha256
 from typing import Any, cast
 from uuid import uuid4
 
+from cayu._exception_groups import (
+    add_exception_note_safely,
+    exception_tree_contains,
+    iter_exception_tree,
+)
 from cayu._task_wait import (
     await_shielded_task_outcome,
     consume_pending_task_cancellation,
@@ -25,6 +31,7 @@ from cayu._task_wait import (
 )
 from cayu._validation import (
     DurableValueError,
+    canonical_durable_json_bytes,
     copy_durable_json_object,
     copy_durable_json_value,
     copy_json_value,
@@ -48,7 +55,7 @@ from cayu.core.billing import (
     BillingIdentity,
     resolved_billing_identity,
 )
-from cayu.core.events import Event, EventType
+from cayu.core.events import Event, EventType, copy_event
 from cayu.core.messages import (
     FilePart,
     Message,
@@ -56,6 +63,7 @@ from cayu.core.messages import (
     ProviderStatePart,
     ToolCallPart,
     ToolResultPart,
+    detach_message,
 )
 from cayu.core.thinking import ThinkingConfig, thinking_config_payload
 from cayu.providers import (
@@ -175,10 +183,17 @@ from cayu.runtime.sessions import (
     CheckpointTransform,
     EventOrder,
     EventQuery,
+    ModelCompletionStage,
+    ModelCompletionStageAbandonmentResult,
+    ModelCompletionStageRequest,
+    ModelCompletionStageResult,
+    RuntimePublicationResult,
     Session,
+    SessionStatus,
     SessionStore,
 )
 from cayu.runtime.structured_output import (
+    STRUCTURED_OUTPUT_TOOL_NAME,
     StructuredOutputSpec,
     StructuredOutputStrategy,
     require_secret_free_json_schema_keys,
@@ -200,7 +215,12 @@ logger = logging.getLogger(__name__)
 
 
 class ModelAttemptFailed(Exception):
-    """A single provider attempt failed after zero or more streamed events."""
+    """A single provider attempt failed after zero or more streamed events.
+
+    ``completion_observed`` is set only by the durable publication path. Once a
+    valid completed frame has crossed that boundary, a later transport/control
+    error is terminal and cannot authorize another provider dispatch.
+    """
 
     def __init__(
         self,
@@ -209,12 +229,517 @@ class ModelAttemptFailed(Exception):
         payload: dict[str, Any],
         emitted_error_event: bool,
         cause: Exception | None = None,
+        completion_observed: bool = False,
     ) -> None:
         self.message = require_nonblank(message, "message")
         self.payload = copy_json_value(payload, "payload")
         self.emitted_error_event = emitted_error_event
         self.cause = cause
+        self.completion_observed = completion_observed
         super().__init__(self.message)
+
+
+def _copy_model_completion_stage(stage: ModelCompletionStage) -> ModelCompletionStage:
+    if type(stage) is not ModelCompletionStage:
+        raise TypeError("Model completion dispatch requires a ModelCompletionStage.")
+    return stage.model_copy(deep=True)
+
+
+def _copy_model_completion_stage_result(
+    result: ModelCompletionStageResult,
+) -> ModelCompletionStageResult:
+    if type(result) is not ModelCompletionStageResult:
+        raise TypeError("Model completion publication requires a ModelCompletionStageResult.")
+    return result.model_copy(deep=True)
+
+
+def _copy_runtime_publication_result(
+    result: RuntimePublicationResult,
+) -> RuntimePublicationResult:
+    if type(result) is not RuntimePublicationResult:
+        raise TypeError("Model completion publication requires a RuntimePublicationResult.")
+    return result.model_copy(deep=True)
+
+
+def _copy_assistant_step_result(result: AssistantStepResult) -> AssistantStepResult:
+    if type(result) is not AssistantStepResult:
+        raise TypeError("Model completion publication requires an AssistantStepResult.")
+    completion = copy_model_completion(result.completion)
+    if completion is None:  # pragma: no cover - AssistantStepResult requires a completion
+        raise RuntimeError("Assistant step result lost its completion metadata.")
+    return AssistantStepResult(
+        session_id=result.session_id,
+        step=result.step,
+        model_step_id=result.model_step_id,
+        model_attempt_id=result.model_attempt_id,
+        tool_round_identity=(
+            None
+            if result.tool_round_identity is None
+            else copy_tool_round_identity(result.tool_round_identity)
+        ),
+        assistant_message=(
+            None if result.assistant_message is None else detach_message(result.assistant_message)
+        ),
+        tool_calls=[
+            runtime_records.ToolCallRequest(
+                id=call.id,
+                name=call.name,
+                arguments=copy_durable_json_object(
+                    call.arguments,
+                    "tool_call_arguments",
+                ),
+            )
+            for call in result.tool_calls
+        ],
+        completion=completion,
+        text_content=result.text_content,
+        has_user_visible_content=result.has_user_visible_content,
+        provider_state_count=result.provider_state_count,
+        thinking_count=result.thinking_count,
+    )
+
+
+def _durable_assistant_step_result(
+    result: AssistantStepResult,
+    *,
+    redactor: SecretRedactor,
+) -> AssistantStepResult:
+    """Project one assistant result across the durable publication boundary."""
+
+    copied = _copy_assistant_step_result(result)
+    if copied.assistant_message is None:
+        if copied.tool_calls:
+            raise ValueError("Assistant tool calls require an assistant message.")
+        return copied
+    assistant_message = redact_message_for_boundary(
+        copied.assistant_message,
+        redactor=redactor,
+        field_name="assistant_message",
+    )
+    tool_calls = [
+        runtime_records.ToolCallRequest(
+            id=call.id,
+            name=call.name,
+            arguments=redactor.redact_json_values(call.arguments),
+        )
+        for call in copied.tool_calls
+    ]
+    text_content = assistant_text_content(assistant_message)
+    return AssistantStepResult(
+        session_id=copied.session_id,
+        step=copied.step,
+        model_step_id=copied.model_step_id,
+        model_attempt_id=copied.model_attempt_id,
+        tool_round_identity=copied.tool_round_identity,
+        assistant_message=assistant_message,
+        tool_calls=tool_calls,
+        completion=copied.completion,
+        text_content=text_content,
+        has_user_visible_content=bool(text_content.strip()),
+        provider_state_count=provider_state_count(assistant_message),
+        thinking_count=thinking_count(assistant_message),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ModelCompletionDispatch:
+    """Detached proof that one exact provider dispatch was durably prepared."""
+
+    stage: ModelCompletionStage
+    request_fingerprint: str
+
+    def __post_init__(self) -> None:
+        stage = _copy_model_completion_stage(self.stage)
+        request_fingerprint = require_durable_clean_nonblank(
+            self.request_fingerprint,
+            "request_fingerprint",
+        )
+        if len(request_fingerprint) != 64 or any(
+            character not in "0123456789abcdef" for character in request_fingerprint
+        ):
+            raise ValueError("request_fingerprint must be a lowercase SHA-256 digest.")
+        if stage.state != "in_flight":
+            raise ValueError("A provider dispatch requires an in-flight completion stage.")
+        if stage.intent.get("request_fingerprint") != request_fingerprint:
+            raise ValueError("Completion-stage intent does not match its request fingerprint.")
+        object.__setattr__(self, "stage", stage)
+        object.__setattr__(self, "request_fingerprint", request_fingerprint)
+
+    @property
+    def stage_id(self) -> str:
+        return self.stage.stage_id
+
+    @property
+    def logical_step_id(self) -> str:
+        return self.stage.logical_step_id
+
+    @property
+    def dispatch_ordinal(self) -> int:
+        return self.stage.dispatch_ordinal
+
+    @property
+    def reservation_ids(self) -> tuple[str, ...]:
+        return self.stage.reservation_ids
+
+    @property
+    def intent(self) -> dict[str, Any]:
+        return copy_durable_json_object(self.stage.intent, "model_completion_intent")
+
+
+@dataclass(frozen=True, slots=True)
+class ModelCompletionPublicationRequest:
+    """Immutable, detached terminal material handed to the session owner."""
+
+    dispatch: ModelCompletionDispatch
+    assistant_step_result: AssistantStepResult | None
+    completion_event: Event
+    authoritative_assistant_message: Message | None
+
+    def __post_init__(self) -> None:
+        if type(self.dispatch) is not ModelCompletionDispatch:
+            raise TypeError("dispatch must be a ModelCompletionDispatch.")
+        dispatch = ModelCompletionDispatch(
+            stage=self.dispatch.stage,
+            request_fingerprint=self.dispatch.request_fingerprint,
+        )
+        result = (
+            None
+            if self.assistant_step_result is None
+            else _copy_assistant_step_result(self.assistant_step_result)
+        )
+        event = copy_event(self.completion_event)
+        assistant_message = (
+            None
+            if self.authoritative_assistant_message is None
+            else detach_message(self.authoritative_assistant_message)
+        )
+        if result is not None and result.session_id != dispatch.stage.session_id:
+            raise ValueError("Assistant result session does not match its completion stage.")
+        if event.session_id != dispatch.stage.session_id:
+            raise ValueError("Completion event session does not match its completion stage.")
+        if event.type != EventType.MODEL_COMPLETED:
+            raise ValueError("Completion publication requires a model.completed event.")
+        if assistant_message is not None:
+            if result is None:
+                raise ValueError(
+                    "An authoritative assistant message requires an assistant step result."
+                )
+            if assistant_message != result.assistant_message:
+                raise ValueError(
+                    "Authoritative assistant message does not match the detached step result."
+                )
+        object.__setattr__(self, "dispatch", dispatch)
+        object.__setattr__(self, "assistant_step_result", result)
+        object.__setattr__(self, "completion_event", event)
+        object.__setattr__(self, "authoritative_assistant_message", assistant_message)
+
+
+@dataclass(frozen=True, slots=True)
+class ModelCompletionPublicationResult:
+    """Durable terminal-stage and atomic-promotion acknowledgements."""
+
+    completion: ModelCompletionStageResult
+    publication: RuntimePublicationResult
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "completion",
+            _copy_model_completion_stage_result(self.completion),
+        )
+        object.__setattr__(
+            self,
+            "publication",
+            _copy_runtime_publication_result(self.publication),
+        )
+
+
+ModelCompletionPublisher = Callable[
+    [ModelCompletionPublicationRequest],
+    Awaitable[ModelCompletionPublicationResult],
+]
+
+
+class ModelCompletionDispatchNotAuthorized(RuntimeError):
+    """A prior or ambiguous preparation must never cause another provider call."""
+
+    def __init__(
+        self,
+        *,
+        stage: ModelCompletionStage,
+        request_fingerprint: str,
+    ) -> None:
+        self.stage = _copy_model_completion_stage(stage)
+        self.request_fingerprint = require_durable_clean_nonblank(
+            request_fingerprint,
+            "request_fingerprint",
+        )
+        super().__init__(
+            "Model completion dispatch was not authorized because its durable "
+            f"stage already exists: {stage.stage_id}."
+        )
+
+
+def _model_step_logical_id(
+    *,
+    session_id: str,
+    source_transcript_cursor: int,
+) -> str:
+    identity = canonical_durable_json_bytes(
+        {
+            "schema_version": 1,
+            "purpose": "assistant-turn",
+            "session_id": session_id,
+            "source_transcript_cursor": source_transcript_cursor,
+        },
+        "model_step_identity",
+    )
+    return f"model-step:v1:{sha256(identity).hexdigest()}"
+
+
+def _model_request_fingerprint(
+    *,
+    provider_name: str,
+    model_request: ModelRequest,
+) -> str:
+    material = canonical_durable_json_bytes(
+        {
+            "schema_version": 1,
+            "provider_name": provider_name,
+            "request": model_request.model_dump(mode="json"),
+        },
+        "model_request_fingerprint",
+    )
+    return sha256(material).hexdigest()
+
+
+def _model_completion_stage_intent(
+    *,
+    model_attempt_identity: ModelAttemptIdentity,
+    provider_name: str,
+    requested_model: str,
+    source_transcript_cursor: int,
+    request_fingerprint: str,
+) -> dict[str, Any]:
+    model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
+    return {
+        "schema_version": 1,
+        "purpose": "assistant-turn",
+        **model_attempt_identity.payload(),
+        "logical_step_id": model_attempt_identity.model_step_id,
+        "provider_name": provider_name,
+        "requested_model": requested_model,
+        "source_transcript_cursor": source_transcript_cursor,
+        "request_fingerprint": request_fingerprint,
+    }
+
+
+def _non_turn_model_completion_event(
+    event: Event,
+    *,
+    failure: BaseException,
+    transcript_cursor: int,
+) -> Event:
+    payload = copy_durable_json_object(event.payload, "model_completion_payload")
+    if _model_completion_cancellation(failure) is not None:
+        reason = "model stream was cancelled before terminal validation completed"
+    elif isinstance(failure, SessionInterruptedByRequest):
+        reason = "session interruption won before terminal validation completed"
+    elif isinstance(failure, ModelAttemptFailed):
+        reason = "provider emitted an invalid event after model completion"
+    else:
+        reason = "model completion failed terminal validation"
+    payload["step_classification"] = {
+        "type": "failed",
+        "reason": reason,
+    }
+    payload["transcript_cursor"] = transcript_cursor
+    return Event(
+        type=event.type,
+        session_id=event.session_id,
+        id=event.id,
+        timestamp=event.timestamp,
+        agent_name=event.agent_name,
+        environment_name=event.environment_name,
+        workflow_name=event.workflow_name,
+        tool_name=event.tool_name,
+        payload=payload,
+    )
+
+
+def _validate_model_completion_publication_result(
+    request: ModelCompletionPublicationRequest,
+    result: ModelCompletionPublicationResult,
+) -> None:
+    if type(result) is not ModelCompletionPublicationResult:
+        raise TypeError("Model completion publisher must return ModelCompletionPublicationResult.")
+    detached_result = ModelCompletionPublicationResult(
+        completion=result.completion,
+        publication=result.publication,
+    )
+    prepared = request.dispatch.stage
+    completed = detached_result.completion.stage
+    for field_name in (
+        "session_id",
+        "stage_id",
+        "logical_step_id",
+        "dispatch_ordinal",
+        "purpose",
+        "intent",
+        "reservation_ids",
+        "preparation_request_digest",
+        "preparation_digest",
+        "source_status",
+        "source_run_epoch",
+        "source_transcript_cursor",
+        "prepared_at",
+    ):
+        if getattr(completed, field_name) != getattr(prepared, field_name):
+            raise RuntimeError(
+                "Model completion publisher acknowledged a different prepared "
+                f"stage field: {field_name}."
+            )
+    if completed.state != "completed" or completed.publication is None:
+        raise RuntimeError("Model completion publisher did not return a terminal stage.")
+
+    publication_request = completed.publication
+    expected_messages = (
+        ()
+        if request.authoritative_assistant_message is None
+        else (request.authoritative_assistant_message,)
+    )
+    if publication_request.publication_id != request.dispatch.logical_step_id:
+        raise RuntimeError("Model completion publication acknowledged a different logical step.")
+    if publication_request.kind != "model-step":
+        raise RuntimeError("Model completion publication has the wrong publication kind.")
+    if publication_request.intent != request.dispatch.intent:
+        raise RuntimeError("Model completion publication changed the prepared dispatch intent.")
+    if publication_request.transcript_messages != expected_messages:
+        raise RuntimeError("Model completion publication changed the authoritative assistant turn.")
+    if publication_request.events != (request.completion_event,):
+        raise RuntimeError("Model completion publication changed its completion event.")
+
+    promoted = detached_result.publication
+    receipt = promoted.receipt
+    if promoted.session.id != prepared.session_id:
+        raise RuntimeError("Model completion publication returned a different session.")
+    if receipt.session_id != prepared.session_id:
+        raise RuntimeError("Model completion receipt belongs to a different session.")
+    if receipt.publication_id != request.dispatch.logical_step_id:
+        raise RuntimeError("Model completion receipt belongs to a different logical step.")
+    if receipt.kind != "model-step":
+        raise RuntimeError("Model completion receipt has the wrong publication kind.")
+    if receipt.appended_event_ids != (request.completion_event.id,):
+        raise RuntimeError("Model completion receipt does not bind the exact completion event.")
+    if receipt.transcript_start_cursor != prepared.source_transcript_cursor:
+        raise RuntimeError("Model completion publication started at a different transcript cursor.")
+    if receipt.transcript_end_cursor != (
+        prepared.source_transcript_cursor + len(expected_messages)
+    ):
+        raise RuntimeError("Model completion publication ended at a different transcript cursor.")
+
+
+async def _publish_model_completion(
+    publisher: ModelCompletionPublisher,
+    request: ModelCompletionPublicationRequest,
+    *,
+    terminal_failure: BaseException | None,
+) -> None:
+    expected_request = request
+    callback_request = ModelCompletionPublicationRequest(
+        dispatch=request.dispatch,
+        assistant_step_result=request.assistant_step_result,
+        completion_event=request.completion_event,
+        authoritative_assistant_message=request.authoritative_assistant_message,
+    )
+    publication_cancellation = _model_completion_cancellation(terminal_failure)
+    if publication_cancellation is not None:
+        assert terminal_failure is not None
+
+        async def publish() -> ModelCompletionPublicationResult:
+            return await publisher(callback_request)
+
+        publication_task = asyncio.create_task(publish())
+        outcome = await await_shielded_task_outcome(
+            publication_task,
+            cancellation=publication_cancellation,
+        )
+        if outcome.error is not None:
+            callback_error = outcome.error
+            if isinstance(callback_error, asyncio.CancelledError):
+                callback_error = unexpected_child_cancellation_error(
+                    callback_error,
+                    operation="model completion publication",
+                )
+            add_exception_note_safely(
+                terminal_failure,
+                "Model completion publication also failed while preserving cancellation: "
+                f"{type(callback_error).__name__}: {callback_error}",
+            )
+        elif outcome.result is None:
+            add_exception_note_safely(
+                terminal_failure,
+                (
+                    "Model completion publication returned no acknowledgement while preserving "
+                    "cancellation."
+                ),
+            )
+        else:
+            try:
+                _validate_model_completion_publication_result(
+                    expected_request,
+                    outcome.result,
+                )
+            except BaseException as validation_error:
+                add_exception_note_safely(
+                    terminal_failure,
+                    (
+                        "Model completion publication acknowledgement was invalid while "
+                        "preserving cancellation: "
+                        f"{type(validation_error).__name__}: {validation_error}"
+                    ),
+                )
+        raise terminal_failure
+
+    try:
+        result = await publisher(callback_request)
+        _validate_model_completion_publication_result(expected_request, result)
+    except BaseException as publication_error:
+        if terminal_failure is not None:
+            publication_error.add_note(
+                "The provider stream had already reached a terminal failure after emitting "
+                "completion evidence."
+            )
+        raise
+
+
+def _model_completion_cancellation(
+    failure: BaseException | None,
+) -> asyncio.CancelledError | None:
+    if isinstance(failure, asyncio.CancelledError):
+        return failure
+    if not isinstance(failure, BaseExceptionGroup):
+        return None
+    return next(
+        (
+            candidate
+            for candidate in iter_exception_tree(failure)
+            if isinstance(candidate, asyncio.CancelledError)
+        ),
+        None,
+    )
+
+
+def _combine_post_completion_failures(
+    current: BaseException | None,
+    subsequent: BaseException,
+) -> BaseException:
+    if current is None or current is subsequent:
+        return subsequent
+    return BaseExceptionGroup(
+        "Model provider iteration and iterator cleanup both failed after completion.",
+        [current, subsequent],
+    )
 
 
 @dataclass(frozen=True)
@@ -504,6 +1029,7 @@ class ModelStepExecutor:
         run_started_at: float,
         turn_usage_tracker: SessionUsageTracker | None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None,
+        model_completion_publisher: ModelCompletionPublisher | None = None,
     ) -> ModelStepRun:
         return ModelStepRun(
             self,
@@ -524,6 +1050,7 @@ class ModelStepExecutor:
             run_started_at=run_started_at,
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
+            model_completion_publisher=model_completion_publisher,
         )
 
     async def build_request(
@@ -729,6 +1256,12 @@ class ModelStepExecutor:
         before_provider_dispatch: Callable[[ModelAttemptIdentity], Awaitable[None]],
         record_model_attempt_identity: Callable[[ModelAttemptIdentity], None],
         billing_identity: BillingIdentity | None = None,
+        prepare_model_completion_dispatch: Callable[
+            [ModelRequest],
+            Awaitable[ModelCompletionDispatch],
+        ]
+        | None = None,
+        model_completion_publisher: ModelCompletionPublisher | None = None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         retry_policy = copy_retry_policy(retry_policy)
         model_step_identity = copy_model_step_identity(model_step_identity)
@@ -846,15 +1379,16 @@ class ModelStepExecutor:
                 max_attempts=retry_policy.max_attempts,
                 model_attempt_identity=model_attempt_identity,
                 transcript_cursor_before_request=transcript_cursor_before_request,
+                record_model_completion=record_model_completion,
                 before_provider_dispatch=before_provider_dispatch,
                 billing_identity=billing_identity,
+                prepare_model_completion_dispatch=prepare_model_completion_dispatch,
+                model_completion_publisher=model_completion_publisher,
             )
             try:
                 result: AssistantStepResult | None = None
                 async for event, step_result in attempt_events:
                     if event is not None:
-                        if event.type == EventType.MODEL_COMPLETED:
-                            record_model_completion(event)
                         yield event, None
                         if (
                             event.type == EventType.MODEL_COMPLETED
@@ -1132,8 +1666,15 @@ class ModelStepExecutor:
         max_attempts: int,
         model_attempt_identity: ModelAttemptIdentity,
         transcript_cursor_before_request: int,
+        record_model_completion: Callable[[Event], None],
         before_provider_dispatch: Callable[[ModelAttemptIdentity], Awaitable[None]],
         billing_identity: BillingIdentity | None,
+        prepare_model_completion_dispatch: Callable[
+            [ModelRequest],
+            Awaitable[ModelCompletionDispatch],
+        ]
+        | None,
+        model_completion_publisher: ModelCompletionPublisher | None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         assistant_parts: list[
             transcript_helpers.AssistantTextPart
@@ -1150,6 +1691,8 @@ class ModelStepExecutor:
         provider_state_parts: list[ProviderStatePart] = []
         completed_stream_event: ModelStreamEvent | None = None
         step_result: AssistantStepResult | None = None
+        completion_event: Event | None = None
+        completion_dispatch: ModelCompletionDispatch | None = None
         model_completed = False
         profile = copy_model_context_pressure_profile(
             registered_provider.provider.context_pressure_profile
@@ -1162,14 +1705,22 @@ class ModelStepExecutor:
             tool_schema_chars_per_token=profile.tool_schema_chars_per_token,
         )
         interrupt_poll = self._session_control.stream_interrupt_poll(session.id)
+        if (prepare_model_completion_dispatch is None) != (model_completion_publisher is None):
+            raise RuntimeError(
+                "Model completion staging and publication must be configured together."
+            )
         # This is the accounting boundary: after the callback returns, the next
         # expression enters provider-controlled code and billable work may occur.
         model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
-        await before_provider_dispatch(model_attempt_identity)
+        if prepare_model_completion_dispatch is None:
+            await before_provider_dispatch(model_attempt_identity)
+        else:
+            completion_dispatch = await prepare_model_completion_dispatch(model_request)
         provider_events: AsyncIterator[ModelStreamEvent] | None = None
         provider_exhausted = False
         durable_stream_failure: ModelAttemptFailed | None = None
         provider_control_failure: ModelProviderError | None = None
+        post_completion_failure: BaseException | None = None
         try:
             provider_events = provider.stream(model_request)
             async for raw_stream_event in provider_events:
@@ -1188,6 +1739,7 @@ class ModelStepExecutor:
                         payload={"error": message, "error_type": "RuntimeError"},
                         emitted_error_event=False,
                         cause=RuntimeError(message),
+                        completion_observed=model_completion_publisher is not None,
                     )
 
                 if stream_event.type == ModelStreamEventType.TOOL_CALL:
@@ -1299,7 +1851,7 @@ class ModelStepExecutor:
                             completion=_stream_event_completion(completed_stream_event),
                         )
                         classification = classify_assistant_step(step_result)
-                    event = _model_stream_event_to_runtime_event(
+                    completion_event = _model_stream_event_to_runtime_event(
                         stream_event,
                         session=session,
                         registered_agent=registered_agent,
@@ -1327,7 +1879,9 @@ class ModelStepExecutor:
                         usage_normalization_failed=(boundary_value.usage_normalization_failed),
                         completion_diagnostics=completion_diagnostics,
                     )
-                    yield await self._event_writer.emit(event), None
+                    if model_completion_publisher is None:
+                        record_model_completion(completion_event)
+                        yield await self._event_writer.emit(completion_event), None
                     if completion_terminal_error is not None:
                         provider_control_failure = completion_terminal_error
                         break
@@ -1374,12 +1928,26 @@ class ModelStepExecutor:
                 yield emitted_event, None
             else:
                 provider_exhausted = True
-        except SessionInterruptedByRequest:
-            raise
-        except asyncio.CancelledError:
-            raise
-        except ModelAttemptFailed:
-            raise
+        except SessionInterruptedByRequest as exc:
+            if model_completion_publisher is None or not model_completed:
+                raise
+            post_completion_failure = exc
+        except asyncio.CancelledError as exc:
+            if model_completion_publisher is None or not model_completed:
+                raise
+            post_completion_failure = exc
+        except BaseExceptionGroup as exc:
+            if (
+                model_completion_publisher is None
+                or not model_completed
+                or not exception_tree_contains(exc, asyncio.CancelledError)
+            ):
+                raise
+            post_completion_failure = exc
+        except ModelAttemptFailed as exc:
+            if model_completion_publisher is None or not model_completed:
+                raise
+            durable_stream_failure = exc
         except Exception as exc:
             provider_failure = None
             durable_error = extract_durable_value_error(exc)
@@ -1402,6 +1970,9 @@ class ModelStepExecutor:
                         },
                         emitted_error_event=False,
                         cause=provider_failure.cause,
+                        completion_observed=(
+                            model_completion_publisher is not None and model_completed
+                        ),
                     )
             elif durable_error is not None:
                 if invalid_provider_error:
@@ -1434,32 +2005,122 @@ class ModelStepExecutor:
                 durable_stream_failure = ModelAttemptFailed(
                     message=str(provider_error),
                     payload=error_payload,
-                    emitted_error_event=True,
-                    cause=provider_error,
-                )
-                yield (
-                    await self._event_writer.emit(
-                        Event(
-                            type=EventType.MODEL_ERROR,
-                            session_id=session.id,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            payload=_retry_attempt_payload(
-                                error_payload,
-                                step=step,
-                                attempt=attempt,
-                                max_attempts=max_attempts,
-                                model_attempt_identity=model_attempt_identity,
-                            ),
-                        )
+                    emitted_error_event=not (
+                        model_completion_publisher is not None and model_completed
                     ),
-                    None,
+                    cause=provider_error,
+                    completion_observed=(
+                        model_completion_publisher is not None and model_completed
+                    ),
                 )
+                if model_completion_publisher is None or not model_completed:
+                    yield (
+                        await self._event_writer.emit(
+                            Event(
+                                type=EventType.MODEL_ERROR,
+                                session_id=session.id,
+                                agent_name=registered_agent.spec.name,
+                                environment_name=environment_name,
+                                payload=_retry_attempt_payload(
+                                    error_payload,
+                                    step=step,
+                                    attempt=attempt,
+                                    max_attempts=max_attempts,
+                                    model_attempt_identity=model_attempt_identity,
+                                ),
+                            )
+                        ),
+                        None,
+                    )
             else:  # pragma: no cover - every Exception has a control or durable failure
                 raise RuntimeError("Provider exception handling lost its failure state.") from None
         finally:
             if provider_events is not None and not provider_exhausted:
-                await _close_async_iterator(provider_events)
+                try:
+                    await _close_async_iterator(provider_events)
+                except asyncio.CancelledError as exc:
+                    if model_completion_publisher is None or not model_completed:
+                        raise
+                    post_completion_failure = _combine_post_completion_failures(
+                        post_completion_failure,
+                        exc,
+                    )
+                except BaseExceptionGroup as exc:
+                    if (
+                        model_completion_publisher is None
+                        or not model_completed
+                        or not exception_tree_contains(exc, asyncio.CancelledError)
+                    ):
+                        raise
+                    post_completion_failure = _combine_post_completion_failures(
+                        post_completion_failure,
+                        exc,
+                    )
+
+        if model_completed and model_completion_publisher is not None:
+            if completed_stream_event is None:
+                raise RuntimeError("Model provider completed without completion metadata.")
+            if completion_event is None:
+                raise RuntimeError("Model provider completed without a completion event.")
+            if completion_dispatch is None:
+                raise RuntimeError("Model provider completed without a prepared dispatch.")
+
+            terminal_failure: BaseException | None = (
+                post_completion_failure or provider_control_failure or durable_stream_failure
+            )
+            if terminal_failure is None:
+                try:
+                    await self._session_control.raise_if_interrupted(session.id)
+                except (SessionInterruptedByRequest, asyncio.CancelledError) as exc:
+                    terminal_failure = exc
+
+            durable_step_result = None
+            if step_result is not None:
+                try:
+                    durable_step_result = _durable_assistant_step_result(
+                        step_result,
+                        redactor=self._secret_redactor,
+                    )
+                except (TypeError, ValueError):
+                    if terminal_failure is None:
+                        terminal_failure = ModelProviderError(
+                            "Model provider emitted assistant output that cannot cross "
+                            "the durable publication boundary.",
+                            provider=registered_provider.name,
+                            error_type="DurableBoundaryError",
+                            error_code="invalid_model_completion_transcript",
+                            retryable=False,
+                        )
+            authoritative_assistant_message = (
+                durable_step_result.assistant_message
+                if durable_step_result is not None and terminal_failure is None
+                else None
+            )
+            publication_event = (
+                completion_event
+                if terminal_failure is None
+                else _non_turn_model_completion_event(
+                    completion_event,
+                    failure=terminal_failure,
+                    transcript_cursor=completion_dispatch.stage.source_transcript_cursor,
+                )
+            )
+            publication_event = self._event_writer.prepare(publication_event)
+            record_model_completion(publication_event)
+            publication_request = ModelCompletionPublicationRequest(
+                dispatch=completion_dispatch,
+                assistant_step_result=durable_step_result,
+                completion_event=publication_event,
+                authoritative_assistant_message=authoritative_assistant_message,
+            )
+            await _publish_model_completion(
+                model_completion_publisher,
+                publication_request,
+                terminal_failure=terminal_failure,
+            )
+            yield copy_event(publication_event), None
+            if terminal_failure is not None:
+                raise terminal_failure
 
         if type(provider_control_failure) is ModelContextOverflowError:
             yield (
@@ -1481,6 +2142,8 @@ class ModelStepExecutor:
             raise provider_control_failure from None
         if durable_stream_failure is not None:
             raise durable_stream_failure from None
+        if post_completion_failure is not None:
+            raise post_completion_failure
         if not model_completed:
             message = "Model provider stream ended without a completed event."
             raise ModelAttemptFailed(
@@ -1527,6 +2190,7 @@ class ModelStepRun:
         run_started_at: float,
         turn_usage_tracker: SessionUsageTracker | None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None,
+        model_completion_publisher: ModelCompletionPublisher | None = None,
     ) -> None:
         self._executor = executor
         self._provider = provider
@@ -1549,6 +2213,7 @@ class ModelStepRun:
         self._reservation_identity_guard = (
             self._executor._run_limit_controller.reservation_identity_guard()
         )
+        self._model_completion_publisher = model_completion_publisher
         contextual_limits = (
             *budget_limits_for_session(
                 policy=self._budget_policy,
@@ -1565,6 +2230,97 @@ class ModelStepRun:
             )
             for limit in contextual_limits
         )
+
+    async def _abandon_pre_dispatch_model_stage(
+        self,
+        stage: ModelCompletionStage,
+        *,
+        authoritative_failure: BaseException,
+    ) -> None:
+        """Clear one provably undispatched stage without losing its root failure."""
+
+        async def abandon_once() -> ModelCompletionStageAbandonmentResult:
+            return await self._executor._session_store.abandon_model_completion_stage(
+                self._session.id,
+                stage_id=stage.stage_id,
+                preparation_digest=stage.preparation_digest,
+                expected_run_epoch=self._session.run_epoch,
+            )
+
+        async def abandon_with_exact_replay() -> ModelCompletionStageAbandonmentResult:
+            try:
+                return await abandon_once()
+            except (Exception, asyncio.CancelledError) as first_error:
+                try:
+                    return await abandon_once()
+                except (Exception, asyncio.CancelledError) as replay_error:
+                    replay_error.add_note(
+                        "Exact model-completion stage abandonment replay also failed after "
+                        f"{type(first_error).__name__}: {first_error}"
+                    )
+                    raise replay_error from first_error
+
+        abandonment_task = asyncio.create_task(abandon_with_exact_replay())
+        outcome = await await_shielded_task_outcome(
+            abandonment_task,
+            cancellation=(
+                authoritative_failure
+                if isinstance(authoritative_failure, asyncio.CancelledError)
+                else None
+            ),
+        )
+        abandonment_error = outcome.error
+        if isinstance(abandonment_error, asyncio.CancelledError):
+            abandonment_error = unexpected_child_cancellation_error(
+                abandonment_error,
+                operation="Pre-dispatch model-completion stage abandonment",
+            )
+        if abandonment_error is None:
+            result = outcome.result
+            try:
+                if type(result) is not ModelCompletionStageAbandonmentResult:
+                    raise TypeError(
+                        "Model-completion stage abandonment returned an invalid result."
+                    )
+                abandonment = result.abandonment
+                for field_name in (
+                    "session_id",
+                    "stage_id",
+                    "logical_step_id",
+                    "dispatch_ordinal",
+                    "purpose",
+                    "preparation_request_digest",
+                    "preparation_digest",
+                    "source_status",
+                    "source_run_epoch",
+                    "source_transcript_cursor",
+                ):
+                    if getattr(abandonment, field_name) != getattr(stage, field_name):
+                        raise RuntimeError(
+                            "Model-completion stage abandonment acknowledged a different "
+                            f"prepared stage field: {field_name}."
+                        )
+            except BaseException as validation_error:
+                abandonment_error = validation_error
+        if abandonment_error is not None:
+            authoritative_failure.add_note(
+                "Pre-dispatch model-completion stage abandonment also failed: "
+                f"{type(abandonment_error).__name__}: {abandonment_error}"
+            )
+        if outcome.cancellation is not None and not isinstance(
+            authoritative_failure, asyncio.CancelledError
+        ):
+            cancellation = outcome.cancellation
+            cancellation.add_note(
+                "Cancellation arrived while abandoning a model-completion stage after "
+                f"{type(authoritative_failure).__name__}: {authoritative_failure}"
+            )
+            if abandonment_error is not None:
+                cancellation.add_note(
+                    "Model-completion stage abandonment also failed: "
+                    f"{type(abandonment_error).__name__}: {abandonment_error}"
+                )
+            raise cancellation from authoritative_failure
 
     async def execute(
         self,
@@ -1992,6 +2748,86 @@ class ModelStepRun:
                 model_attempt_identity=model_attempt_identity,
             )
 
+        # `messages` is the full reconstructed transcript, not the compacted
+        # provider context. The store verifies this proposed cursor atomically
+        # during stage preparation, so any in-memory/durable drift fails before
+        # provider-controlled code runs.
+        source_transcript_cursor = len(messages)
+        logical_step_id = model_step_identity.model_step_id
+        next_dispatch_ordinal = 0
+
+        async def prepare_model_completion_dispatch(
+            attempt_model_request: ModelRequest,
+        ) -> ModelCompletionDispatch:
+            nonlocal next_dispatch_ordinal
+            request_fingerprint = _model_request_fingerprint(
+                provider_name=self._registered_provider.name,
+                model_request=attempt_model_request,
+            )
+            dispatch_ordinal = next_dispatch_ordinal
+            stage_id = f"{logical_step_id}:dispatch:{dispatch_ordinal}"
+            async with lifecycle.reservation_transition_lock:
+                pending_reservations = lifecycle.pending_reservations
+                pending_model_attempt_identity = lifecycle.pending_model_attempt_identity
+                if pending_reservations is None or pending_model_attempt_identity is None:
+                    raise RuntimeError("Model completion stage has no pending budget reservations.")
+                if pending_model_attempt_identity.model_step_id != logical_step_id:
+                    raise RuntimeError(
+                        "Model completion stage attempt belongs to a different model step."
+                    )
+                intent = _model_completion_stage_intent(
+                    model_attempt_identity=pending_model_attempt_identity,
+                    provider_name=self._registered_provider.name,
+                    requested_model=attempt_model_request.model,
+                    source_transcript_cursor=source_transcript_cursor,
+                    request_fingerprint=request_fingerprint,
+                )
+                prepared = await self._executor._session_store.prepare_model_completion_stage(
+                    self._session.id,
+                    request=ModelCompletionStageRequest(
+                        stage_id=stage_id,
+                        logical_step_id=logical_step_id,
+                        dispatch_ordinal=dispatch_ordinal,
+                        purpose="assistant-turn",
+                        intent=intent,
+                        reservation_ids=tuple(
+                            reservation.record.reservation_id
+                            for reservation in pending_reservations
+                        ),
+                    ),
+                    expected_statuses={SessionStatus.RUNNING},
+                    expected_run_epoch=self._session.run_epoch,
+                    expected_transcript_cursor=source_transcript_cursor,
+                )
+                if not prepared.dispatch_authorized:
+                    raise ModelCompletionDispatchNotAuthorized(
+                        stage=prepared.stage,
+                        request_fingerprint=request_fingerprint,
+                    )
+                try:
+                    # Preparation may itself be a remote database round trip. Renew
+                    # after it commits so a lease cannot expire in the new gap
+                    # between durable staging and provider-controlled code.
+                    if budget_reservations and controller.reservation_ttl_seconds is not None:
+                        await controller.renew_reservations(budget_reservations)
+                    dispatch = ModelCompletionDispatch(
+                        stage=prepared.stage,
+                        request_fingerprint=request_fingerprint,
+                    )
+                    lifecycle.mark_provider_dispatch(pending_model_attempt_identity)
+                except BaseException as authoritative_exc:
+                    await self._abandon_pre_dispatch_model_stage(
+                        prepared.stage,
+                        authoritative_failure=authoritative_exc,
+                    )
+                    if isinstance(authoritative_exc, BudgetReservationLeaseLost):
+                        raise BudgetReservationLeaseLostBeforeModelDispatch(
+                            "Budget reservation lease was lost before model dispatch."
+                        ) from authoritative_exc
+                    raise
+                next_dispatch_ordinal += 1
+                return dispatch
+
         flow_outcome: ModelStepFlowOutcome | None = None
         model_step_events = self._run_with_context_overflow_recovery(
             provider=self._provider,
@@ -2006,6 +2842,12 @@ class ModelStepRun:
             prepare_provider_dispatch=prepare_provider_dispatch,
             before_provider_dispatch=before_provider_dispatch,
             billing_identity=billing_identity,
+            prepare_model_completion_dispatch=(
+                prepare_model_completion_dispatch
+                if self._model_completion_publisher is not None
+                else None
+            ),
+            model_completion_publisher=self._model_completion_publisher,
         )
         guarded_events = controller.model_step_events_with_heartbeat(
             model_step_events,
@@ -2161,6 +3003,12 @@ class ModelStepRun:
         ],
         before_provider_dispatch: Callable[[ModelAttemptIdentity], Awaitable[None]],
         billing_identity: BillingIdentity | None,
+        prepare_model_completion_dispatch: Callable[
+            [ModelRequest],
+            Awaitable[ModelCompletionDispatch],
+        ]
+        | None,
+        model_completion_publisher: ModelCompletionPublisher | None,
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
         model_step_identity = copy_model_step_identity(model_step_identity)
         initial_model_attempt_identity = copy_model_attempt_identity(initial_model_attempt_identity)
@@ -2200,6 +3048,8 @@ class ModelStepRun:
                 before_provider_dispatch=before_provider_dispatch,
                 record_model_attempt_identity=record_model_attempt_identity,
                 billing_identity=billing_identity,
+                prepare_model_completion_dispatch=prepare_model_completion_dispatch,
+                model_completion_publisher=model_completion_publisher,
             )
 
         attempt_events = run_attempt(
@@ -4845,6 +5695,12 @@ def _typed_retry_fields(
     exc: ModelAttemptFailed,
 ) -> tuple[int | None, bool | None, float | None]:
     cause = exc.cause
+    if exc.completion_observed:
+        # A valid completed frame is the authoritative terminal attempt. A
+        # later transport/control failure cannot authorize another provider
+        # charge for the same logical step.
+        status_code = cause.status_code if isinstance(cause, ModelProviderError) else None
+        return status_code, False, None
     if isinstance(cause, ModelProviderError):
         return cause.status_code, cause.retryable, cause.retry_after_s
     status_code = exc.payload.get("status_code")
@@ -4944,5 +5800,15 @@ async def _close_async_iterator(iterator: AsyncIterator[Any]) -> None:
     if close is not None:
         # Iterator disposal runs while a more authoritative provider, budget,
         # cancellation, or GeneratorExit outcome is already propagating.
-        with contextlib.suppress(Exception):
+        try:
             await close()
+        except ExceptionGroup:
+            # Ordinary cleanup failures remain secondary to the outcome that
+            # caused iterator disposal.
+            pass
+        except BaseExceptionGroup:
+            # A mixed group also carries a fatal signal such as cancellation.
+            # Preserve the complete group for the caller to classify.
+            raise
+        except Exception:
+            pass

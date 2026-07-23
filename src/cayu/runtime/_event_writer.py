@@ -11,6 +11,7 @@ from cayu.core.tools import _POLICY_DENIAL_TRUNCATION_MARKER
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime.budgets import BudgetStore
 from cayu.runtime.event_sinks import EventSink
+from cayu.runtime.model_steps import StepClassificationType
 from cayu.runtime.sessions import (
     EventQuery,
     PersistedEventSideEffectClaim,
@@ -26,6 +27,7 @@ _PERSISTED_SIDE_EFFECT_MAX_ATTEMPTS = 3
 _PERSISTED_SIDE_EFFECT_RETRY_DELAY_SECONDS = 30.0
 _MAX_AGGREGATED_FAILURES = 16
 _MAX_EXCEPTION_NOTES = 16
+_MODEL_STEP_CLASSIFICATION_TYPES = frozenset(item.value for item in StepClassificationType)
 _EVENT_CONTROL_STRING_FIELDS = frozenset(
     {
         "action",
@@ -60,6 +62,7 @@ _EVENT_CONTROL_STRING_FIELDS = frozenset(
         "session_id",
         "source",
         "status",
+        "step_classification",
         "strategy",
         "terminal_outcome",
         "task_id",
@@ -544,6 +547,18 @@ def prepare_runtime_event(
         preserve_string_fields=control_fields,
     )
     redacted_payload.update(runtime_controls)
+    if event.type == EventType.MODEL_COMPLETED:
+        classification = event.payload.get("step_classification")
+        redacted_classification = redacted_payload.get("step_classification")
+        classification_type = classification.get("type") if type(classification) is dict else None
+        if (
+            type(redacted_classification) is dict
+            and type(classification_type) is str
+            and classification_type in _MODEL_STEP_CLASSIFICATION_TYPES
+        ):
+            # The discriminator is runtime-owned protocol state. Other nested
+            # strings, including the explanatory reason, remain redacted.
+            redacted_classification["type"] = classification_type
     terminal_controls = {
         key: value
         for key, value in runtime_controls.items()
