@@ -12,7 +12,11 @@ This module instead ships a small Python program into the guest via
 every path component below the workspace root is opened with ``O_NOFOLLOW``
 relative to the previous component's file descriptor (``openat`` semantics),
 so no symlink below the root is ever followed regardless of how the tree
-mutates concurrently.
+mutates concurrently. Within one traversal, an opened descriptor authorizes
+that inode, not its current pathname: moving the inode later cannot redirect
+that traversal through a replacement symlink. Operations with multiple passes
+start each later traversal from the pinned root and reject a replacement
+symlink there.
 
 Residual trust
 --------------
@@ -23,11 +27,12 @@ Residual trust
   root components are resolved normally. Containment is enforced strictly
   below the root.
 - A co-resident guest process with sufficient privileges can still read or
-  modify workspace files directly, bind-mount over the root, or replace the
-  ``python3`` interpreter. The sandbox boundary — not this guard — remains
-  the security boundary between guest and host; the guard only keeps
-  workspace API operations from being redirected outside the root by
-  guest-controlled symlinks.
+  modify or relocate workspace files directly, bind-mount over the root, or
+  replace the ``python3`` interpreter. The sandbox boundary — not this guard
+  — remains the security boundary between guest and host; the guard only
+  keeps workspace API operations from being redirected through
+  guest-controlled symlinks. It does not enforce continuous pathname
+  membership for an inode after that inode has been safely opened.
 - Guarded operations run as the runner's default exec user, not as any
   workspace-level filesystem API user override.
 """
@@ -49,32 +54,88 @@ _STATUS_OK = "ok"
 _STATUS_ENOENT = "enoent"
 _STATUS_ESCAPE = "escape"
 _STATUS_NOTFILE = "notfile"
+_STATUS_NOTDIR = "notdir"
 _STATUS_ISDIR = "isdir"
+_STATUS_HARDLINK = "hardlink"
+_STATUS_UNSUPPORTED = "unsupported"
 
 _READ_OUTPUT_HEADROOM_BYTES = 4096
 
+
 # The program below runs inside the guest. It communicates over a tiny
 # protocol: exit code 0 with a first stdout line of "ok[ <size>]", "enoent",
-# "escape", "notfile", or "isdir"; any non-zero exit is an operational error
-# whose detail is on stderr. Read payloads are base64 on stdout after the
-# status line; write payloads are base64 on stdin.
-GUEST_GUARD_PROGRAM = """
-import base64
+# "escape", "notfile", "notdir", "isdir", "hardlink", or "unsupported"; any
+# non-zero exit is an operational error whose detail is on stderr. Read
+# payloads are base64 on stdout after the status line; write payloads are
+# base64 on stdin.
+GUEST_DESCRIPTOR_GUARD_SOURCE = r"""
 import errno
 import os
 import stat
 import sys
 
+
+class GuardPathError(Exception):
+    def __init__(self, status):
+        self.status = status
+        super().__init__(status)
+
+
 ESCAPE_ERRNOS = (errno.ELOOP, errno.EMLINK)
 MISSING_ERRNOS = (errno.ENOENT, errno.ENOTDIR)
 OPEN_BASE_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-DIR_FLAGS = OPEN_BASE_FLAGS | os.O_NOFOLLOW | os.O_DIRECTORY
+NONBLOCK_FLAG = getattr(os, "O_NONBLOCK", 0)
+# Preserve the established remote-adapter creation policy by default. Programs
+# with different native semantics, such as RunnerWorkspace, may override these
+# globals before invoking the shared guard functions.
+GUARDED_DIRECTORY_CREATE_MODE = 0o755
+GUARDED_FILE_CREATE_MODE = 0o644
+if hasattr(os, "O_PATH"):
+    SEARCH_BASE_FLAGS = os.O_PATH | getattr(os, "O_CLOEXEC", 0)
+elif hasattr(os, "O_SEARCH"):
+    SEARCH_BASE_FLAGS = os.O_SEARCH | getattr(os, "O_CLOEXEC", 0)
+elif sys.platform == "darwin":
+    # CPython does not expose Darwin's O_SEARCH even though the kernel supports it.
+    SEARCH_BASE_FLAGS = 0x40000000 | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+else:
+    SEARCH_BASE_FLAGS = OPEN_BASE_FLAGS
 
 
-def finish(status):
-    print(status)
-    sys.stdout.flush()
-    sys.exit(0)
+def require_descriptor_guard_support():
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise GuardPathError("unsupported")
+    supports_dir_fd = getattr(os, "supports_dir_fd", ())
+    supports_follow_symlinks = getattr(os, "supports_follow_symlinks", ())
+    required_dir_fd = (os.open, os.mkdir, os.stat, os.unlink)
+    if any(operation not in supports_dir_fd for operation in required_dir_fd):
+        raise GuardPathError("unsupported")
+    if os.stat not in supports_follow_symlinks or not hasattr(os, "ftruncate"):
+        raise GuardPathError("unsupported")
+
+
+def guarded_parts(rel_path):
+    if not isinstance(rel_path, str) or not rel_path or "\x00" in rel_path:
+        raise GuardPathError("escape")
+    if rel_path.startswith("/"):
+        raise GuardPathError("escape")
+    raw_parts = rel_path.split("/")
+    if ".." in raw_parts:
+        raise GuardPathError("escape")
+    parts = [part for part in raw_parts if part not in ("", ".")]
+    if not parts:
+        raise GuardPathError("escape")
+    return parts
+
+
+def open_guard_root(root, readable=False):
+    require_descriptor_guard_support()
+    try:
+        base_flags = OPEN_BASE_FLAGS if readable else SEARCH_BASE_FLAGS
+        return os.open(root, base_flags | os.O_DIRECTORY)
+    except OSError as exc:
+        if exc.errno in MISSING_ERRNOS:
+            raise GuardPathError("enoent") from exc
+        raise
 
 
 def classify_missing(name, dir_fd):
@@ -86,91 +147,231 @@ def classify_missing(name, dir_fd):
         return "enoent"
     if stat.S_ISLNK(info.st_mode):
         return "escape"
-    return "enoent"
+    return "notdir"
 
 
-def open_component(name, dir_fd, create):
+def open_guarded_directory(name, dir_fd, create, readable=False):
+    base_flags = OPEN_BASE_FLAGS if readable else SEARCH_BASE_FLAGS
+    flags = base_flags | os.O_NOFOLLOW | os.O_DIRECTORY
     try:
-        return os.open(name, DIR_FLAGS, dir_fd=dir_fd)
+        opened_fd = os.open(name, flags, dir_fd=dir_fd)
+        # CAYU_TEST_BARRIER_AFTER_DIRECTORY_OPEN
+        return opened_fd
     except OSError as exc:
         if exc.errno in ESCAPE_ERRNOS:
-            finish("escape")
+            raise GuardPathError("escape") from exc
         if exc.errno == errno.ENOENT and create:
             try:
-                os.mkdir(name, mode=0o755, dir_fd=dir_fd)
+                os.mkdir(
+                    name,
+                    mode=GUARDED_DIRECTORY_CREATE_MODE,
+                    dir_fd=dir_fd,
+                )
             except FileExistsError:
                 pass
-            return open_component(name, dir_fd, False)
+            return open_guarded_directory(name, dir_fd, False, readable)
         if exc.errno in MISSING_ERRNOS:
             # Some kernels report ENOTDIR (not ELOOP) for O_NOFOLLOW|O_DIRECTORY
             # on a symlink component; distinguish it from a truly missing path.
-            finish(classify_missing(name, dir_fd))
+            raise GuardPathError(classify_missing(name, dir_fd)) from exc
         raise
 
 
-def read_leaf(name, dir_fd, limit):
+def open_guarded_parent(root_fd, parts, create):
+    current_fd = os.dup(root_fd)
     try:
-        fd = os.open(name, OPEN_BASE_FLAGS | os.O_NOFOLLOW, dir_fd=dir_fd)
+        for name in parts[:-1]:
+            next_fd = open_guarded_directory(name, current_fd, create)
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd, parts[-1]
+    except BaseException:
+        os.close(current_fd)
+        raise
+
+
+def guarded_lstat(name, dir_fd):
+    try:
+        return os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError as exc:
+        if exc.errno in MISSING_ERRNOS:
+            raise GuardPathError("enoent") from exc
+        raise
+
+
+def open_guarded_regular(name, dir_fd):
+    try:
+        before = guarded_lstat(name, dir_fd)
+    except GuardPathError:
+        raise
+    if stat.S_ISLNK(before.st_mode):
+        raise GuardPathError("escape")
+    if not stat.S_ISREG(before.st_mode):
+        raise GuardPathError("notfile")
+    try:
+        fd = os.open(
+            name,
+            OPEN_BASE_FLAGS | NONBLOCK_FLAG | os.O_NOFOLLOW,
+            dir_fd=dir_fd,
+        )
     except OSError as exc:
         if exc.errno in ESCAPE_ERRNOS:
-            finish("escape")
+            raise GuardPathError("escape") from exc
         if exc.errno in MISSING_ERRNOS:
-            finish("enoent")
+            raise GuardPathError(classify_missing(name, dir_fd)) from exc
         raise
     info = os.fstat(fd)
     if not stat.S_ISREG(info.st_mode):
-        finish("notfile")
-    chunks = []
-    remaining = limit
-    while remaining > 0:
-        chunk = os.read(fd, min(remaining, 1 << 16))
-        if not chunk:
-            break
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    print("ok " + str(info.st_size))
-    sys.stdout.write(base64.b64encode(b"".join(chunks)).decode("ascii"))
-    sys.stdout.flush()
+        os.close(fd)
+        raise GuardPathError("notfile")
+    return fd, info
 
 
-def write_leaf(name, dir_fd):
-    payload = base64.b64decode(sys.stdin.read(), validate=True)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
-    flags |= getattr(os, "O_CLOEXEC", 0)
+def inspect_guarded_write_target(name, dir_fd):
     try:
-        fd = os.open(name, flags, mode=0o644, dir_fd=dir_fd)
+        before = guarded_lstat(name, dir_fd)
+    except GuardPathError as exc:
+        if exc.status != "enoent":
+            raise
+        return None
+    if stat.S_ISLNK(before.st_mode):
+        raise GuardPathError("escape")
+    if not stat.S_ISREG(before.st_mode):
+        raise GuardPathError("isdir")
+    flags = os.O_WRONLY | NONBLOCK_FLAG | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(name, flags, dir_fd=dir_fd)
     except OSError as exc:
         if exc.errno in ESCAPE_ERRNOS:
-            finish("escape")
+            raise GuardPathError("escape") from exc
         if exc.errno in MISSING_ERRNOS:
-            finish("enoent")
+            raise GuardPathError(classify_missing(name, dir_fd)) from exc
         if exc.errno == errno.EISDIR:
-            finish("isdir")
+            raise GuardPathError("isdir") from exc
         raise
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        os.close(fd)
+        raise GuardPathError("isdir")
+    if info.st_nlink != 1:
+        os.close(fd)
+        raise GuardPathError("hardlink")
+    os.close(fd)
+    return stat.S_IMODE(info.st_mode) & 0o777
+
+
+def open_guarded_regular_for_write(name, dir_fd):
+    # CAYU_TEST_BARRIER_BEFORE_WRITE_TARGET_OPEN
+    flags = (
+        os.O_WRONLY
+        | NONBLOCK_FLAG
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    for _ in range(128):
+        try:
+            before = guarded_lstat(name, dir_fd)
+        except GuardPathError as exc:
+            if exc.status != "enoent":
+                raise
+            try:
+                # O_EXCL makes the absence decision and creation one kernel
+                # operation. The selected mode remains filtered by the guest
+                # process's umask.
+                fd = os.open(
+                    name,
+                    flags | os.O_CREAT | os.O_EXCL,
+                    GUARDED_FILE_CREATE_MODE,
+                    dir_fd=dir_fd,
+                )
+            except FileExistsError:
+                continue
+            except OSError as open_exc:
+                if open_exc.errno in ESCAPE_ERRNOS:
+                    raise GuardPathError("escape") from open_exc
+                if open_exc.errno in (errno.EISDIR, errno.ENXIO):
+                    raise GuardPathError("isdir") from open_exc
+                raise
+        else:
+            if stat.S_ISLNK(before.st_mode):
+                raise GuardPathError("escape")
+            if not stat.S_ISREG(before.st_mode):
+                raise GuardPathError("isdir")
+            try:
+                fd = os.open(name, flags, dir_fd=dir_fd)
+            except OSError as open_exc:
+                if open_exc.errno in MISSING_ERRNOS:
+                    continue
+                if open_exc.errno in ESCAPE_ERRNOS:
+                    raise GuardPathError("escape") from open_exc
+                if open_exc.errno in (errno.EISDIR, errno.ENXIO):
+                    raise GuardPathError("isdir") from open_exc
+                raise
+
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            os.close(fd)
+            raise GuardPathError("isdir")
+        if info.st_nlink != 1:
+            os.close(fd)
+            raise GuardPathError("hardlink")
+        # CAYU_TEST_BARRIER_AFTER_WRITE_TARGET_OPEN
+        return fd
+    raise OSError("workspace write target changed too often")
+
+
+def write_guarded_regular(name, dir_fd, chunks):
+    fd = open_guarded_regular_for_write(name, dir_fd)
+    try:
+        os.ftruncate(fd, 0)
+        # CAYU_TEST_AFTER_WRITE_TRUNCATE
+        for payload in chunks:
+            write_all(fd, payload)
+    finally:
+        os.close(fd)
+
+
+def write_all(fd, payload):
     view = memoryview(payload)
     while view:
-        view = view[os.write(fd, view):]
-    finish("ok")
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("guarded file write made no progress")
+        view = view[written:]
 
 
-def delete_leaf(name, dir_fd):
+def delete_guarded_regular(name, dir_fd):
     try:
-        info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-    except OSError as exc:
-        if exc.errno in MISSING_ERRNOS:
-            finish("enoent")
+        before = guarded_lstat(name, dir_fd)
+    except GuardPathError as exc:
+        if exc.status == "enoent":
+            return False
         raise
-    if stat.S_ISLNK(info.st_mode):
-        finish("escape")
-    if not stat.S_ISREG(info.st_mode):
-        finish("isdir")
+    if stat.S_ISLNK(before.st_mode):
+        raise GuardPathError("escape")
+    if not stat.S_ISREG(before.st_mode):
+        raise GuardPathError("isdir")
     try:
         os.unlink(name, dir_fd=dir_fd)
     except OSError as exc:
         if exc.errno in MISSING_ERRNOS:
-            finish("enoent")
+            return False
         raise
-    finish("ok")
+    return True
+"""
+
+
+GUEST_GUARD_PROGRAM = (
+    GUEST_DESCRIPTOR_GUARD_SOURCE
+    + r"""
+import base64
+import sys
+
+
+def finish(status):
+    print(status)
+    sys.stdout.flush()
+    sys.exit(0)
 
 
 def main():
@@ -178,31 +379,48 @@ def main():
     root = sys.argv[2]
     rel_path = sys.argv[3]
     limit = int(sys.argv[4]) if len(sys.argv) > 4 else 0
-    parts = [part for part in rel_path.split("/") if part not in ("", ".")]
-    if not parts or ".." in parts:
-        finish("escape")
+    root_fd = None
+    parent_fd = None
+    leaf_fd = None
     try:
-        dir_fd = os.open(root, OPEN_BASE_FLAGS | os.O_DIRECTORY)
-    except OSError as exc:
-        if exc.errno in MISSING_ERRNOS:
-            finish("enoent")
-        raise
-    for name in parts[:-1]:
-        next_fd = open_component(name, dir_fd, mode == "write")
-        os.close(dir_fd)
-        dir_fd = next_fd
-    if mode == "read":
-        read_leaf(parts[-1], dir_fd, limit)
-    elif mode == "write":
-        write_leaf(parts[-1], dir_fd)
-    elif mode == "delete":
-        delete_leaf(parts[-1], dir_fd)
-    else:
+        parts = guarded_parts(rel_path)
+        root_fd = open_guard_root(root)
+        parent_fd, leaf_name = open_guarded_parent(root_fd, parts, mode == "write")
+        if mode == "read":
+            leaf_fd, info = open_guarded_regular(leaf_name, parent_fd)
+            chunks = []
+            remaining = limit
+            while remaining > 0:
+                chunk = os.read(leaf_fd, min(remaining, 1 << 16))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            print("ok " + str(info.st_size))
+            sys.stdout.write(base64.b64encode(b"".join(chunks)).decode("ascii"))
+            sys.stdout.flush()
+            return
+        if mode == "write":
+            payload = base64.b64decode(sys.stdin.read(), validate=True)
+            write_guarded_regular(leaf_name, parent_fd, (payload,))
+            finish("ok")
+        if mode == "delete":
+            finish("ok" if delete_guarded_regular(leaf_name, parent_fd) else "enoent")
         raise SystemExit("unknown guard mode: " + mode)
+    except GuardPathError as exc:
+        finish(exc.status)
+    finally:
+        for fd in (leaf_fd, parent_fd, root_fd):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
 
 main()
 """
+)
 
 
 async def guard_read(
@@ -230,7 +448,7 @@ async def guard_read(
     status, payload = _guard_status(
         result, mode="read", backend=backend, original_path=original_path
     )
-    if status in {_STATUS_ENOENT, _STATUS_NOTFILE}:
+    if status in {_STATUS_ENOENT, _STATUS_NOTFILE, _STATUS_NOTDIR}:
         raise FileNotFoundError(f"Workspace file not found: {original_path}")
     _raise_common_status(status, mode="read", backend=backend, original_path=original_path)
     total_bytes = _parse_ok_size(status, backend=backend, original_path=original_path)
@@ -253,7 +471,7 @@ async def guard_write(
     backend: str,
     timeout_s: int | None = None,
 ) -> None:
-    """Atomically resolve-and-write a contained file, creating parent directories."""
+    """Resolve a contained file and write through its guarded descriptor."""
 
     result = await _exec_guard(
         runner,
@@ -266,7 +484,7 @@ async def guard_write(
     status, _ = _guard_status(result, mode="write", backend=backend, original_path=original_path)
     if status == _STATUS_OK:
         return
-    if status == _STATUS_ENOENT:
+    if status in {_STATUS_ENOENT, _STATUS_NOTDIR}:
         raise FileNotFoundError(f"Workspace path not found: {original_path}")
     if status == _STATUS_ISDIR:
         raise IsADirectoryError(f"Workspace path is not a file: {original_path}")
@@ -287,7 +505,7 @@ async def guard_delete(
 
     result = await _exec_guard(runner, "delete", root, rel_path, timeout_s=timeout_s)
     status, _ = _guard_status(result, mode="delete", backend=backend, original_path=original_path)
-    if status in {_STATUS_OK, _STATUS_ENOENT}:
+    if status in {_STATUS_OK, _STATUS_ENOENT, _STATUS_NOTDIR}:
         return
     if status == _STATUS_ISDIR:
         raise IsADirectoryError(f"Workspace path is not a file: {original_path}")
@@ -340,6 +558,12 @@ def _guard_status(
 def _raise_common_status(status: str, *, mode: str, backend: str, original_path: str) -> None:
     if status == _STATUS_ESCAPE:
         raise ValueError("Workspace path escapes the workspace root.")
+    if status == _STATUS_HARDLINK:
+        raise ValueError(f"Workspace file has multiple hard links: {original_path}")
+    if status == _STATUS_UNSUPPORTED:
+        raise RuntimeError(
+            f"{backend} workspace requires POSIX descriptor-relative filesystem primitives."
+        )
     if status == _STATUS_OK or status.startswith(f"{_STATUS_OK} "):
         return
     raise RuntimeError(

@@ -2801,11 +2801,40 @@ Microsandbox's native filesystem API. Its `root` defaults to `/workspace`,
 matching `MicrosandboxRunner`.
 
 `RunnerWorkspace` is the generic fallback for runners that do not have a native
-filesystem adapter. It uses small Python helper programs executed through the
-runner for read/write/list operations. This keeps the workspace contract
-portable across custom runners, but the runner image must provide Python 3, or
-`RunnerWorkspace(..., python_executable=...)` must point to an equivalent Python
-executable available inside the runner.
+filesystem adapter. It uses a Python guard executed through the runner for
+read, write, delete, list, and bulk-tar operations. The guard pins the trusted,
+operator-configured workspace root once per operation, then opens every
+guest-controlled component relative to the preceding directory descriptor with
+`O_NOFOLLOW`. Concurrent pathname replacement therefore cannot redirect an
+operation through a symlink outside the pinned root. A successfully opened
+descriptor authorizes that inode rather than continuously enforcing its current
+pathname for the current traversal: if another process later relocates the
+inode, that traversal continues through the descriptor without following the
+replacement name. Multi-pass operations start each later traversal from the
+pinned root and reject a replacement symlink. This guard is not a privilege
+boundary against a guest process that can directly relocate workspace objects.
+Writes open the final leaf with `O_NOFOLLOW` relative to its pinned parent.
+Existing targets must be regular files with one link and are truncated and
+written through that validated descriptor, which naturally preserves their
+ordinary permission bits. Missing targets are created with `O_EXCL` using the
+conventional `0666` mode filtered by the guest process's umask. Absence/create
+races retry a bounded number of times. Once the guard opens a regular,
+single-link inode without following a symlink, that inode is authoritative for
+the traversal even if it replaced an earlier regular target. Content
+replacement is not atomic: an I/O failure, cancellation, or
+guest-process termination after truncation can leave partial content, matching
+ordinary direct-write behavior. A link or relocation after the descriptor is
+opened does not revoke that descriptor capability. Deletion only unlinks the
+workspace name. Tar imports validate archive members,
+their complete content streams, and existing destination constraints before the
+first mutation, then reread and write one member at a time with bounded memory.
+The import is not transactional across either a file or the complete archive;
+a later I/O failure or concurrent destination change can leave a partial
+current member and earlier members applied. The runner image must provide
+Python 3, or `RunnerWorkspace(..., python_executable=...)` must point to an
+equivalent Python executable with POSIX directory-relative filesystem
+primitives. Guests without those primitives fail closed; there is no path-based
+fallback.
 
 `RunnerWorkspace.list()` caps its serialized guest response at 1 MiB. If the
 requested sorted paths do not fit, it returns the largest sorted prefix that
@@ -2826,16 +2855,19 @@ The deterministic conformance registry in
 built-in adapter through the public `Workspace` interface. It covers portable
 round trips, raw path and symlink escape rejection, bounded reads, immutable
 result shapes, glob semantics, deterministic listing limits, resource identity, and
-declared adapter extensions. Its E2B and Microsandbox fixtures bridge the real
-guest guard and native filesystem seams to one host-backed directory, but they
-do not claim a real sandbox boundary. The opt-in E2B and Microsandbox workspace
-checks in `scripts/nightly_verification.py` reuse the portable round-trip and
-path-safety scenarios against live sandboxes.
+declared adapter extensions. Registrations also declare whether they provide
+descriptor-relative containment against symlink replacement by a hostile
+co-resident process; supported claims require an adversarial scenario probe.
+Its E2B and Microsandbox fixtures bridge
+the real guest guard and native filesystem seams to one host-backed directory,
+but they do not claim a real sandbox boundary. The opt-in E2B and Microsandbox
+workspace checks in `scripts/nightly_verification.py` reuse the portable
+round-trip and path-safety scenarios against live sandboxes.
 When exporting a new built-in workspace adapter, add its deterministic factory
 to that registry, declare stable or indeterminate resource identity and any
-adapter extensions with bounded skip reasons, and bind the portable live
-scenarios to a provider-specific live check when the adapter crosses an
-external sandbox boundary.
+adapter extensions and descriptor-containment support with bounded skip
+reasons, and bind the portable live scenarios to a provider-specific live check
+when the adapter crosses an external sandbox boundary.
 
 ## ArtifactStore
 

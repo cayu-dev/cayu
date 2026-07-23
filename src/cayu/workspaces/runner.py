@@ -8,6 +8,7 @@ from typing import Any
 
 from cayu._validation import require_clean_nonblank, require_nonblank
 from cayu.runners import DEFAULT_EXEC_OUTPUT_LIMIT_BYTES, ExecCommand, LocalRunner, Runner
+from cayu.workspaces._guest_guard import GUEST_DESCRIPTOR_GUARD_SOURCE
 from cayu.workspaces._tar import tar_archive_size_bound
 from cayu.workspaces.base import (
     BoundedTarReader,
@@ -28,12 +29,23 @@ DEFAULT_RUNNER_WORKSPACE_LIST_LIMIT = 500
 RUNNER_WORKSPACE_SCRIPT_OUTPUT_OVERHEAD_BYTES = 4096
 RUNNER_WORKSPACE_LIST_PAYLOAD_LIMIT_BYTES = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES
 
-_READ_SCRIPT = r"""
+_RUNNER_WORKSPACE_PROGRAM = (
+    GUEST_DESCRIPTOR_GUARD_SOURCE
+    + r"""
 import base64
+import io
 import json
-import os
-import pathlib
+import re
 import sys
+import tarfile
+
+# Match RunnerWorkspace's historical pathlib creation behavior: missing
+# directories and files start from the conventional permissive modes, then the
+# guest process's umask determines their effective permissions.
+GUARDED_DIRECTORY_CREATE_MODE = 0o777
+GUARDED_FILE_CREATE_MODE = 0o666
+
+# CAYU_TEST_BOUNDED_TAR_MEMBER_READS
 
 
 def fail(error_type, message):
@@ -41,163 +53,156 @@ def fail(error_type, message):
     sys.exit(1)
 
 
-try:
-    rel_path = sys.argv[1]
-    max_bytes_raw = sys.argv[2]
-    max_bytes = None if max_bytes_raw == "" else int(max_bytes_raw)
-    root = pathlib.Path.cwd().resolve()
-    candidate = pathlib.Path(rel_path)
-    if candidate.is_absolute() or ".." in candidate.parts:
-        fail("invalid_path", "Workspace paths must stay inside the workspace.")
-    target = (root / candidate).resolve()
+def close_fd(fd):
+    if fd is None:
+        return
     try:
-        target.relative_to(root)
-    except ValueError:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def fail_guard(exc, path=None):
+    if exc.status == "escape":
         fail("invalid_path", "Workspace path escapes the workspace root.")
-    if not target.is_file():
-        fail("not_found", f"Workspace file not found: {rel_path}")
-    total_bytes = target.stat().st_size
-    if max_bytes is None:
-        content = target.read_bytes()
-    else:
-        with target.open("rb") as file:
-            content = file.read(max_bytes)
-    print(json.dumps({
-        "ok": True,
-        "content_base64": base64.b64encode(content).decode("ascii"),
-        "total_bytes": total_bytes,
-    }))
-except Exception as exc:
-    fail("workspace_error", str(exc))
-"""
-
-_WRITE_SCRIPT = r"""
-import base64
-import json
-import pathlib
-import sys
+    if exc.status == "hardlink":
+        fail("invalid_path", f"Workspace file has multiple hard links: {path}")
+    if exc.status == "unsupported":
+        fail(
+            "workspace_error",
+            "Runner workspace requires POSIX descriptor-relative filesystem primitives.",
+        )
+    if exc.status in ("enoent", "notdir"):
+        fail("not_found", f"Workspace file not found: {path}")
+    if exc.status in ("notfile", "isdir"):
+        fail("not_file", f"Workspace path is not a file: {path}")
+    fail("workspace_error", f"Unexpected workspace guard status: {exc.status}")
 
 
-def fail(error_type, message):
-    print(json.dumps({"ok": False, "error_type": error_type, "message": message}))
-    sys.exit(1)
+def open_path(root_fd, rel_path, create=False):
+    parts = guarded_parts(rel_path)
+    return open_guarded_parent(root_fd, parts, create)
 
 
-try:
+def read_operation(root_fd):
+    rel_path = sys.argv[2]
+    limit = int(sys.argv[3])
+    parent_fd = None
+    leaf_fd = None
+    try:
+        parent_fd, leaf_name = open_path(root_fd, rel_path)
+        leaf_fd, info = open_guarded_regular(leaf_name, parent_fd)
+        chunks = []
+        remaining = limit
+        while remaining > 0:
+            chunk = os.read(leaf_fd, min(remaining, 1 << 16))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        content = b"".join(chunks)
+        print(json.dumps({
+            "ok": True,
+            "content_base64": base64.b64encode(content).decode("ascii"),
+            "total_bytes": max(info.st_size, len(content)),
+        }))
+    except GuardPathError as exc:
+        if exc.status == "notfile":
+            fail("not_found", f"Workspace file not found: {rel_path}")
+        fail_guard(exc, rel_path)
+    finally:
+        close_fd(leaf_fd)
+        close_fd(parent_fd)
+
+
+def write_operation(root_fd):
     payload = json.loads(sys.stdin.read())
     rel_path = payload["path"]
     content = base64.b64decode(payload["content_base64"], validate=True)
-    root = pathlib.Path.cwd().resolve()
-    candidate = pathlib.Path(rel_path)
-    if candidate.is_absolute() or ".." in candidate.parts:
-        fail("invalid_path", "Workspace paths must stay inside the workspace.")
-    target = root
-    for part in candidate.parts:
-        if part in {"", "."}:
-            continue
-        target = target / part
-        if target.is_symlink():
-            fail("invalid_path", "Workspace path escapes the workspace root.")
-    resolved = target.resolve(strict=False)
+    parent_fd = None
     try:
-        resolved.relative_to(root)
-    except ValueError:
-        fail("invalid_path", "Workspace path escapes the workspace root.")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(content)
-    print(json.dumps({"ok": True, "bytes": len(content)}))
-except Exception as exc:
-    fail("workspace_error", str(exc))
-"""
-
-_DELETE_SCRIPT = r"""
-import json
-import pathlib
-import sys
+        parent_fd, leaf_name = open_path(root_fd, rel_path, create=True)
+        write_guarded_regular(leaf_name, parent_fd, (content,))
+        print(json.dumps({"ok": True, "bytes": len(content)}))
+    except GuardPathError as exc:
+        fail_guard(exc, rel_path)
+    finally:
+        close_fd(parent_fd)
 
 
-def fail(error_type, message):
-    print(json.dumps({"ok": False, "error_type": error_type, "message": message}))
-    sys.exit(1)
-
-
-try:
-    rel_path = sys.argv[1]
-    root = pathlib.Path.cwd().resolve()
-    candidate = pathlib.Path(rel_path)
-    if candidate.is_absolute() or ".." in candidate.parts:
-        fail("invalid_path", "Workspace paths must stay inside the workspace.")
-    target = root
-    for part in candidate.parts:
-        if part in {"", "."}:
-            continue
-        target = target / part
-        if target.is_symlink():
-            fail("invalid_path", "Workspace path escapes the workspace root.")
-    resolved = target.resolve()
+def delete_operation(root_fd):
+    rel_path = sys.argv[2]
+    parent_fd = None
     try:
-        resolved.relative_to(root)
-    except ValueError:
-        fail("invalid_path", "Workspace path escapes the workspace root.")
-    if not target.exists():
-        print(json.dumps({"ok": True, "deleted": False}))
-    elif not target.is_file():
-        fail("not_file", f"Workspace path is not a file: {rel_path}")
-    else:
-        target.unlink()
-        print(json.dumps({"ok": True, "deleted": True}))
-except Exception as exc:
-    fail("workspace_error", str(exc))
-"""
-
-# The pattern regex is translated host-side by cayu.workspaces.base
-# translate_list_pattern so every backend shares one normative matcher
-# regardless of the guest Python version.
-_LIST_SCRIPT = r"""
-import json
-import pathlib
-import re
-import sys
+        parent_fd, leaf_name = open_path(root_fd, rel_path)
+        deleted = delete_guarded_regular(leaf_name, parent_fd)
+        print(json.dumps({"ok": True, "deleted": deleted}))
+    except GuardPathError as exc:
+        if exc.status in ("enoent", "notdir"):
+            print(json.dumps({"ok": True, "deleted": False}))
+            return
+        fail_guard(exc, rel_path)
+    finally:
+        close_fd(parent_fd)
 
 
-def fail(error_type, message):
-    print(json.dumps({"ok": False, "error_type": error_type, "message": message}))
-    sys.exit(1)
+def collect_files(dir_fd, prefix, pattern_regex, matches, ancestor_directories):
+    if os.listdir not in getattr(os, "supports_fd", ()):
+        raise GuardPathError("unsupported")
+    directory_info = os.fstat(dir_fd)
+    identity = (directory_info.st_dev, directory_info.st_ino)
+    # CAYU_TEST_DIRECTORY_IDENTITY_ALIAS
+    if identity in ancestor_directories:
+        return
+    ancestor_directories.add(identity)
+    try:
+        for name in os.listdir(dir_fd):
+            rel_path = name if not prefix else prefix + "/" + name
+            try:
+                entry = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            except OSError as exc:
+                if exc.errno in MISSING_ERRNOS:
+                    continue
+                raise
+            if stat.S_ISLNK(entry.st_mode):
+                continue
+            if stat.S_ISDIR(entry.st_mode):
+                try:
+                    child_fd = open_guarded_directory(name, dir_fd, False, True)
+                except GuardPathError as exc:
+                    if exc.status in ("enoent", "escape"):
+                        continue
+                    raise
+                try:
+                    collect_files(
+                        child_fd,
+                        rel_path,
+                        pattern_regex,
+                        matches,
+                        ancestor_directories,
+                    )
+                finally:
+                    close_fd(child_fd)
+                continue
+            if not stat.S_ISREG(entry.st_mode):
+                continue
+            # Listing is metadata-only: this directory-relative, no-follow
+            # stat is the atomic observation of the leaf. Opening the file
+            # would unnecessarily require content-read permission.
+            if pattern_regex.fullmatch(rel_path):
+                matches.append(rel_path)
+    finally:
+        ancestor_directories.remove(identity)
 
 
-try:
-    pattern_regex = re.compile(sys.argv[1])
-    limit_raw = sys.argv[2]
-    limit = None if limit_raw == "" else int(limit_raw)
-    payload_limit = int(sys.argv[3])
-    root = pathlib.Path.cwd().resolve()
+def list_operation(root_fd):
+    pattern_regex = re.compile(sys.argv[2])
+    limit = int(sys.argv[3])
+    payload_limit = int(sys.argv[4])
     matches = []
-    for path in root.rglob("*"):
-        try:
-            rel_parts = path.relative_to(root).parts
-        except ValueError:
-            continue
-        current = root
-        has_symlink = False
-        for part in rel_parts:
-            current = current / part
-            if current.is_symlink():
-                has_symlink = True
-                break
-        if has_symlink:
-            continue
-        resolved = path.resolve()
-        try:
-            resolved.relative_to(root)
-        except ValueError:
-            continue
-        if not resolved.is_file():
-            continue
-        rel_path = resolved.relative_to(root).as_posix()
-        if pattern_regex.fullmatch(rel_path):
-            matches.append(rel_path)
+    collect_files(root_fd, "", pattern_regex, matches, set())
     sorted_matches = sorted(matches)
-    paths = sorted_matches if limit is None else sorted_matches[:limit]
+    paths = sorted_matches[:limit]
     total_count = len(matches)
 
     def serialize(path_count):
@@ -219,47 +224,31 @@ try:
     if len(payload.encode("utf-8")) > payload_limit:
         fail("workspace_error", "Workspace list result exceeds its transfer limit.")
     sys.stdout.write(payload)
-except Exception as exc:
-    fail("workspace_error", str(exc))
-"""
 
 
-_READ_TAR_SCRIPT = r"""
-import base64
-import io
-import json
-import pathlib
-import sys
-import tarfile
-
-
-def fail(error_type, message):
-    print(json.dumps({"ok": False, "error_type": error_type, "message": message}))
-    sys.exit(1)
-
-
-try:
+def read_tar_operation(root_fd):
     payload = json.loads(sys.stdin.read())
     rel_paths = payload["paths"]
     max_file_bytes = payload["max_file_bytes"]
     max_total_bytes = payload["max_total_bytes"]
     max_archive_bytes = payload["max_archive_bytes"]
     archive_overhead_bytes = payload["archive_overhead_bytes"]
-    root = pathlib.Path.cwd().resolve()
-    files = []
+    preflight_files = []
     total_bytes = 0
     for rel_path in rel_paths:
-        candidate = pathlib.Path(rel_path)
-        if candidate.is_absolute() or ".." in candidate.parts:
-            fail("invalid_path", "Workspace paths must stay inside the workspace.")
-        target = (root / candidate).resolve()
+        parent_fd = None
+        leaf_fd = None
         try:
-            target.relative_to(root)
-        except ValueError:
-            fail("invalid_path", "Workspace path escapes the workspace root.")
-        if not target.is_file():
-            fail("not_found", f"Workspace file not found: {rel_path}")
-        size = target.stat().st_size
+            parent_fd, leaf_name = open_path(root_fd, rel_path)
+            leaf_fd, info = open_guarded_regular(leaf_name, parent_fd)
+        except GuardPathError as exc:
+            if exc.status == "notfile":
+                fail("not_found", f"Workspace file not found: {rel_path}")
+            fail_guard(exc, rel_path)
+        finally:
+            close_fd(leaf_fd)
+            close_fd(parent_fd)
+        size = info.st_size
         if max_file_bytes is not None and size > max_file_bytes:
             fail(
                 "workspace_error",
@@ -271,88 +260,186 @@ try:
                 "workspace_error",
                 f"Workspace files exceed max_total_bytes={max_total_bytes}.",
             )
-        files.append((rel_path, target, size))
+        preflight_files.append((rel_path, info.st_dev, info.st_ino, size))
     archive_size_bound = total_bytes + archive_overhead_bytes
     if max_archive_bytes is not None and archive_size_bound > max_archive_bytes:
         fail(
             "workspace_error",
             f"Workspace tar exceeds max_archive_bytes={max_archive_bytes}.",
         )
+
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w") as archive:
-        for rel_path, target, size in files:
-            info = tarfile.TarInfo(name=rel_path)
-            info.size = size
-            with target.open("rb") as file:
-                archive.addfile(info, file)
+        for rel_path, expected_dev, expected_ino, size in preflight_files:
+            parent_fd = None
+            leaf_fd = None
+            try:
+                parent_fd, leaf_name = open_path(root_fd, rel_path)
+                leaf_fd, current = open_guarded_regular(leaf_name, parent_fd)
+                if (
+                    current.st_dev != expected_dev
+                    or current.st_ino != expected_ino
+                    or current.st_size != size
+                ):
+                    fail(
+                        "workspace_error",
+                        f"Workspace file changed during archive preflight: {rel_path}",
+                    )
+                info = tarfile.TarInfo(name=rel_path)
+                info.size = size
+                with os.fdopen(leaf_fd, "rb") as file:
+                    leaf_fd = None
+                    archive.addfile(info, file)
+            except GuardPathError as exc:
+                if exc.status == "notfile":
+                    fail("not_found", f"Workspace file not found: {rel_path}")
+                fail_guard(exc, rel_path)
+            finally:
+                close_fd(leaf_fd)
+                close_fd(parent_fd)
     print(json.dumps({
         "ok": True,
         "tar_base64": base64.b64encode(buffer.getvalue()).decode("ascii"),
         "file_count": len(rel_paths),
         "total_bytes": total_bytes,
     }))
-except Exception as exc:
-    fail("workspace_error", str(exc))
-"""
-
-_WRITE_TAR_SCRIPT = r"""
-import base64
-import io
-import json
-import pathlib
-import sys
-import tarfile
 
 
-def fail(error_type, message):
-    print(json.dumps({"ok": False, "error_type": error_type, "message": message}))
-    sys.exit(1)
+def member_chunks(extracted):
+    while True:
+        chunk = extracted.read(1 << 16)
+        if not chunk:
+            return
+        yield chunk
 
 
-try:
+def validate_tar_member(member, member_paths, member_parent_paths):
+    if not member.isreg():
+        fail(
+            "invalid_path",
+            f"Workspace tar member must be a regular file: {member.name}",
+        )
+    try:
+        parts = tuple(guarded_parts(member.name))
+    except GuardPathError:
+        fail("invalid_path", "Workspace paths must stay inside the workspace.")
+    has_file_ancestor = any(
+        parts[:index] in member_paths for index in range(1, len(parts))
+    )
+    if parts in member_parent_paths or has_file_ancestor:
+        fail(
+            "invalid_path",
+            f"Workspace tar members have conflicting paths: {member.name}",
+        )
+    member_paths.add(parts)
+    member_parent_paths.update(parts[:index] for index in range(1, len(parts)))
+
+
+def preflight_tar_destination(root_fd, rel_path):
+    parent_fd = None
+    try:
+        parent_fd, leaf_name = open_path(root_fd, rel_path)
+        inspect_guarded_write_target(leaf_name, parent_fd)
+    except GuardPathError as exc:
+        if exc.status == "enoent":
+            return
+        fail_guard(exc, rel_path)
+    finally:
+        close_fd(parent_fd)
+
+
+def write_tar_operation(root_fd):
     payload = json.loads(sys.stdin.read())
     data = base64.b64decode(payload["tar_base64"], validate=True)
-    root = pathlib.Path.cwd().resolve()
-    written_files = 0
-    written_bytes = 0
+    member_paths = set()
+    member_parent_paths = set()
     with tarfile.open(fileobj=io.BytesIO(data), mode="r") as archive:
-        for member in archive.getmembers():
-            if not member.isreg():
-                fail(
-                    "invalid_path",
-                    f"Workspace tar member must be a regular file: {member.name}",
-                )
-            candidate = pathlib.Path(member.name)
-            if candidate.is_absolute() or ".." in candidate.parts:
-                fail("invalid_path", "Workspace paths must stay inside the workspace.")
-            target = root
-            for part in candidate.parts:
-                if part in {"", "."}:
-                    continue
-                target = target / part
-                if target.is_symlink():
-                    fail("invalid_path", "Workspace path escapes the workspace root.")
-            resolved = target.resolve(strict=False)
-            try:
-                resolved.relative_to(root)
-            except ValueError:
-                fail("invalid_path", "Workspace path escapes the workspace root.")
+        for member in archive:
+            validate_tar_member(member, member_paths, member_parent_paths)
             extracted = archive.extractfile(member)
             if extracted is None:
-                fail("workspace_error", f"Workspace tar member could not be read: {member.name}")
-            content = extracted.read()
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(content)
+                fail(
+                    "workspace_error",
+                    f"Workspace tar member could not be read: {member.name}",
+                )
+            try:
+                for _ in member_chunks(extracted):
+                    pass
+            finally:
+                extracted.close()
+            preflight_tar_destination(root_fd, member.name)
+
+    written_bytes = 0
+    written_files = 0
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r") as archive:
+        for member in archive:
+            extracted = archive.extractfile(member)
+            if extracted is None:
+                fail(
+                    "workspace_error",
+                    f"Workspace tar member could not be read: {member.name}",
+                )
+            parent_fd = None
+            try:
+                parent_fd, leaf_name = open_path(root_fd, member.name, create=True)
+                write_guarded_regular(
+                    leaf_name,
+                    parent_fd,
+                    member_chunks(extracted),
+                )
+            except GuardPathError as exc:
+                fail_guard(exc, member.name)
+            finally:
+                extracted.close()
+                close_fd(parent_fd)
             written_files += 1
-            written_bytes += len(content)
+            written_bytes += member.size
     print(json.dumps({"ok": True, "files": written_files, "bytes": written_bytes}))
-except Exception as exc:
-    fail("workspace_error", str(exc))
+
+
+def main():
+    operation = sys.argv[1]
+    root_fd = None
+    try:
+        root_fd = open_guard_root(".", operation == "list")
+        if operation == "read":
+            read_operation(root_fd)
+        elif operation == "write":
+            write_operation(root_fd)
+        elif operation == "delete":
+            delete_operation(root_fd)
+        elif operation == "list":
+            list_operation(root_fd)
+        elif operation == "read_tar":
+            read_tar_operation(root_fd)
+        elif operation == "write_tar":
+            write_tar_operation(root_fd)
+        else:
+            raise ValueError("Unknown runner workspace operation: " + operation)
+    except GuardPathError as exc:
+        fail_guard(exc)
+    except Exception as exc:
+        fail("workspace_error", str(exc))
+    finally:
+        close_fd(root_fd)
+
+
+main()
 """
+)
 
 
 class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
-    """Workspace implementation whose file operations execute through a runner."""
+    """Workspace whose descriptor-guarded file operations execute through a runner.
+
+    The configured ``cwd`` is trusted operator input. Each operation pins that
+    root and opens every guest-controlled component relative to the preceding
+    directory descriptor with ``O_NOFOLLOW``. Within one traversal, an opened
+    descriptor authorizes that inode even if another guest process later
+    relocates it. Multi-pass operations start each later traversal from the
+    pinned root and reject replacement symlinks. Guests without the required
+    POSIX descriptor-relative primitives fail closed.
+    """
 
     def __init__(
         self,
@@ -426,8 +513,8 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
             if max_bytes is None
             else _validate_required_limit(max_bytes, "max_bytes")
         )
-        result = await self._run_json_script(
-            _READ_SCRIPT,
+        result = await self._run_json_operation(
+            "read",
             path,
             str(limit),
             output_limit_bytes=_json_read_output_limit(limit),
@@ -450,16 +537,16 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
             "path": path,
             "content_base64": base64.b64encode(content).decode("ascii"),
         }
-        await self._run_json_script(
-            _WRITE_SCRIPT,
+        await self._run_json_operation(
+            "write",
             stdin=json.dumps(payload),
             output_limit_bytes=RUNNER_WORKSPACE_SCRIPT_OUTPUT_OVERHEAD_BYTES,
         )
 
     async def delete(self, path: str) -> None:
         path = _validate_relative_path(path)
-        await self._run_json_script(
-            _DELETE_SCRIPT,
+        await self._run_json_operation(
+            "delete",
             path,
             output_limit_bytes=RUNNER_WORKSPACE_SCRIPT_OUTPUT_OVERHEAD_BYTES,
         )
@@ -474,8 +561,8 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
         effective_limit = (
             self.default_list_limit if limit is None else _validate_required_limit(limit, "limit")
         )
-        result = await self._run_json_script(
-            _LIST_SCRIPT,
+        result = await self._run_json_operation(
+            "list",
             translate_list_pattern(pattern),
             str(effective_limit),
             str(RUNNER_WORKSPACE_LIST_PAYLOAD_LIMIT_BYTES),
@@ -537,8 +624,8 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
             if archive_limit is not None
             else tar_archive_size_bound(logical_size_bound, validated_paths)
         )
-        result = await self._run_json_script(
-            _READ_TAR_SCRIPT,
+        result = await self._run_json_operation(
+            "read_tar",
             stdin=json.dumps(payload),
             output_limit_bytes=_json_read_output_limit(raw_size_bound),
         )
@@ -551,28 +638,34 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
         """Write many workspace files in one runner exec from an uncompressed tar.
 
         Members must be regular files with workspace-relative paths; symlink,
-        absolute, and ``..`` members are rejected inside the guest before any
-        file is written through them.
+        absolute, and ``..`` members are rejected inside the guest. Every
+        member and its content is validated before the first file mutation.
         """
 
         if type(data) is not bytes:
             raise TypeError("Workspace tar content must be bytes.")
         payload = {"tar_base64": base64.b64encode(data).decode("ascii")}
-        await self._run_json_script(
-            _WRITE_TAR_SCRIPT,
+        await self._run_json_operation(
+            "write_tar",
             stdin=json.dumps(payload),
             output_limit_bytes=RUNNER_WORKSPACE_SCRIPT_OUTPUT_OVERHEAD_BYTES,
         )
 
-    async def _run_json_script(
+    async def _run_json_operation(
         self,
-        script: str,
+        operation: str,
         *args: str,
         stdin: str | None = None,
         output_limit_bytes: int,
     ) -> dict[str, Any]:
         exec_result = await self._runner.exec(
-            ExecCommand.process(self.python_executable, "-c", script, *args),
+            ExecCommand.process(
+                self.python_executable,
+                "-c",
+                _RUNNER_WORKSPACE_PROGRAM,
+                operation,
+                *args,
+            ),
             cwd=self.cwd,
             stdin=stdin,
             output_limit_bytes=output_limit_bytes,

@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from typing import Any, Literal, cast
 
 import pytest
-from guard_harness import make_local_guard_exec
+from guard_harness import instrument_directory_open_barrier, make_local_guard_exec
 from tests.workspaces.conformance import (
     WorkspaceCapabilities,
     WorkspaceCapabilityClaim,
@@ -29,6 +29,7 @@ from tests.workspaces.conformance import (
 )
 
 import cayu.workspaces as workspaces_module
+import cayu.workspaces.runner as runner_workspace_module
 from cayu.runners import E2BRunner, LocalRunner, MicrosandboxRunner
 from cayu.workspaces import (
     E2BWorkspace,
@@ -185,8 +186,71 @@ async def _runner_bulk_transfer_probe(harness: WorkspaceHarness) -> None:
         assert [member.name for member in tar.getmembers()] == ["bulk/a.txt"]
 
 
+async def _runner_descriptor_containment_probe(
+    harness: WorkspaceHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = cast("RunnerWorkspace", harness.workspace)
+    pivot = harness.root / "pivot"
+    pivot.mkdir()
+    (pivot / "file.txt").write_bytes(b"inside")
+    outside = harness.root.parent / "descriptor-containment-outside"
+    outside.mkdir()
+    outside_file = outside / "file.txt"
+    outside_file.write_bytes(b"outside")
+    # Exercise the exact capability boundary: relocate the already-authorized
+    # inode outside the root and replace its old name with a symlink to a
+    # distinct external target. The write may continue through the descriptor,
+    # but must never follow the replacement symlink.
+    held = harness.root.parent / "descriptor-containment-relocated"
+    ready = harness.root.parent / "descriptor-containment-ready"
+    release = harness.root.parent / "descriptor-containment-release"
+    monkeypatch.setattr(
+        runner_workspace_module,
+        "_RUNNER_WORKSPACE_PROGRAM",
+        instrument_directory_open_barrier(
+            runner_workspace_module._RUNNER_WORKSPACE_PROGRAM,
+            ready=ready,
+            release=release,
+        ),
+    )
+
+    operation = asyncio.create_task(workspace.write_bytes("pivot/file.txt", b"changed"))
+    try:
+        for _ in range(1000):
+            if ready.exists():
+                break
+            if operation.done():
+                await operation
+                raise AssertionError("Descriptor containment probe completed before its barrier.")
+            await asyncio.sleep(0.001)
+        else:
+            raise AssertionError("Descriptor containment probe did not reach its barrier.")
+        pivot.rename(held)
+        pivot.symlink_to(outside, target_is_directory=True)
+    finally:
+        release.write_text("release")
+    try:
+        await operation
+        assert outside_file.read_bytes() == b"outside"
+        assert (held / "file.txt").read_bytes() == b"changed"
+    finally:
+        if pivot.is_symlink():
+            pivot.unlink()
+        if held.exists():
+            held.rename(pivot)
+
+    assert (pivot / "file.txt").read_bytes() == b"changed"
+
+
 NOT_ON_WORKSPACE = WorkspaceCapabilityClaim.not_applicable(
     "Bulk tar transfer is an extension of RunnerWorkspace, not the Workspace interface."
+)
+TRUSTED_LOCAL_PATHS = WorkspaceCapabilityClaim.not_applicable(
+    "LocalWorkspace does not claim containment against a hostile co-resident host process."
+)
+NATIVE_LISTING_IS_ADVISORY = WorkspaceCapabilityClaim.not_applicable(
+    "The native adapter's listing transport is advisory rather than descriptor-pinned."
 )
 
 REGISTRATIONS = (
@@ -194,26 +258,31 @@ REGISTRATIONS = (
         "local",
         LocalWorkspace,
         _local_factory,
-        WorkspaceCapabilities("stable", NOT_ON_WORKSPACE),
+        WorkspaceCapabilities("stable", NOT_ON_WORKSPACE, TRUSTED_LOCAL_PATHS),
     ),
     WorkspaceConformanceRegistration(
         "runner",
         RunnerWorkspace,
         _runner_factory,
-        WorkspaceCapabilities("stable", WorkspaceCapabilityClaim.supported()),
+        WorkspaceCapabilities(
+            "stable",
+            WorkspaceCapabilityClaim.supported(),
+            WorkspaceCapabilityClaim.supported(),
+        ),
         bulk_transfer_probe=_runner_bulk_transfer_probe,
+        descriptor_containment_probe=_runner_descriptor_containment_probe,
     ),
     WorkspaceConformanceRegistration(
         "e2b",
         E2BWorkspace,
         _e2b_factory,
-        WorkspaceCapabilities("stable", NOT_ON_WORKSPACE),
+        WorkspaceCapabilities("stable", NOT_ON_WORKSPACE, NATIVE_LISTING_IS_ADVISORY),
     ),
     WorkspaceConformanceRegistration(
         "microsandbox",
         MicrosandboxWorkspace,
         _microsandbox_factory,
-        WorkspaceCapabilities("stable", NOT_ON_WORKSPACE),
+        WorkspaceCapabilities("stable", NOT_ON_WORKSPACE, NATIVE_LISTING_IS_ADVISORY),
     ),
 )
 
@@ -288,6 +357,9 @@ def test_workspace_resource_identity_and_capabilities(
         if registration.capabilities.bulk_transfer.state == "supported":
             assert registration.bulk_transfer_probe is not None
             await registration.bulk_transfer_probe(harness)
+        if registration.capabilities.descriptor_relative_containment.state == "supported":
+            assert registration.descriptor_containment_probe is not None
+            await registration.descriptor_containment_probe(harness, monkeypatch)
 
     _run_scenario(registration, tmp_path, monkeypatch, scenario)
 

@@ -6,7 +6,11 @@ from typing import Any
 
 from cayu._validation import require_clean_nonblank
 from cayu.runners import DEFAULT_E2B_CWD, E2BWorkspaceCapability, Runner
-from cayu.workspaces._guest_guard import guard_delete, guard_read, guard_write
+from cayu.workspaces._guest_guard import (
+    guard_delete,
+    guard_read,
+    guard_write,
+)
 from cayu.workspaces.base import (
     RunnerBoundWorkspace,
     WorkspaceListResult,

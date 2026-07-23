@@ -120,11 +120,15 @@ def _replace_runner_exec(workspace: E2BWorkspace, func: Any) -> None:
     runner.exec = func
 
 
-def _guard_workspace(tmp_path: Path) -> tuple[E2BWorkspace, Any]:
+def _guard_workspace(
+    tmp_path: Path,
+    *,
+    umask: int = -1,
+) -> tuple[E2BWorkspace, Any]:
     """Workspace rooted at tmp_path whose exec runs the real guard locally."""
 
     workspace, _ = _workspace(root=str(tmp_path))
-    fake_exec = make_local_guard_exec()
+    fake_exec = make_local_guard_exec(umask=umask)
     _replace_runner_exec(workspace, fake_exec)
     return workspace, fake_exec
 
@@ -140,6 +144,17 @@ def test_e2b_workspace_reads_and_writes_through_guest_guard(tmp_path: Path) -> N
     assert read_result.total_bytes == 6
     assert read_result.truncated is True
     assert all(command.argv[0] == GUEST_PYTHON for command in fake_exec.calls)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires a POSIX umask")
+def test_e2b_workspace_preserves_conservative_create_modes(tmp_path: Path) -> None:
+    workspace, _ = _guard_workspace(tmp_path, umask=0o000)
+
+    asyncio.run(workspace.write_bytes("notes/nested/a.txt", b"content"))
+
+    assert (tmp_path / "notes").stat().st_mode & 0o777 == 0o755
+    assert (tmp_path / "notes" / "nested").stat().st_mode & 0o777 == 0o755
+    assert (tmp_path / "notes" / "nested" / "a.txt").stat().st_mode & 0o777 == 0o644
 
 
 def test_e2b_workspace_read_missing_file_raises_not_found(tmp_path: Path) -> None:
@@ -216,6 +231,22 @@ def test_e2b_workspace_list_pattern_is_anchored() -> None:
     assert recursive.paths == ("notes/a.txt", "root.txt")
     assert recursive.total_count == 2
     assert recursive.truncated is False
+
+
+def test_e2b_workspace_lists_former_guarded_staging_names() -> None:
+    workspace, fs = _workspace()
+    fs.files["/home/user/workspace/visible.txt"] = b"visible"
+    fs.files["/home/user/workspace/.cayu-write-123-" + ("a" * 32)] = b"partial"
+    fs.files["/home/user/workspace/.cayu-write-not-internal"] = b"user"
+
+    result = asyncio.run(workspace.list("**/*"))
+
+    assert result.paths == (
+        ".cayu-write-123-" + ("a" * 32),
+        ".cayu-write-not-internal",
+        "visible.txt",
+    )
+    assert result.total_count == 3
 
 
 def test_e2b_workspace_list_marks_depth_boundary_incomplete() -> None:

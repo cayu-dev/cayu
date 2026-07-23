@@ -9,7 +9,11 @@ from cayu.runners import (
     MicrosandboxWorkspaceCapability,
     Runner,
 )
-from cayu.workspaces._guest_guard import guard_delete, guard_read, guard_write
+from cayu.workspaces._guest_guard import (
+    guard_delete,
+    guard_read,
+    guard_write,
+)
 from cayu.workspaces.base import (
     RunnerBoundWorkspace,
     WorkspaceListResult,
