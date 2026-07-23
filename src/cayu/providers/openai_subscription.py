@@ -25,10 +25,15 @@ from urllib.parse import urlencode
 import httpx
 
 from cayu._validation import require_clean_nonblank
+from cayu.providers._credential_boundary import (
+    detach_provider_call_traceback,
+    detach_provider_stream_traceback,
+)
 from cayu.providers._http import (
     aclose_transport,
     copy_headers,
-    exception_message,
+    credential_sanitization_values,
+    sanitize_provider_cancellation,
     validate_base_url,
 )
 from cayu.providers.base import (
@@ -36,8 +41,10 @@ from cayu.providers.base import (
     ModelContextOverflowError,
     ModelContextPressureProfile,
     ModelProvider,
+    ModelProviderError,
     ModelRequest,
     ModelStreamEvent,
+    ModelStreamEventType,
     UsageDialect,
 )
 from cayu.providers.openai import (
@@ -50,9 +57,23 @@ from cayu.providers.openai import (
     openai_stream_events,
     preflight_openai_native_structured_output_schema,
 )
+from cayu.vaults import SecretRedactor
 
 _AUTH_STORE_VERSION = 1
 _AUTH_PROVIDER_KEY = "openai_subscription"
+_SAFE_AUTH_STORE_ERRORS = frozenset(
+    {
+        "Cayu auth store must contain a JSON object.",
+        "Cayu auth store providers must be a JSON object.",
+        "Cayu auth-store parent is not a directory.",
+        "Could not read Cayu auth store.",
+        "OpenAI subscription credentials are invalid.",
+        "OpenAI subscription credentials must be a JSON object.",
+        "Refusing to read a symlinked Cayu auth store.",
+        "Refusing to use a symlinked Cayu auth-store directory.",
+        "Refusing to write a symlinked Cayu auth store.",
+    }
+)
 DEFAULT_OPENAI_SUBSCRIPTION_REFRESH_SKEW_SECONDS = 120.0
 DEFAULT_OPENAI_SUBSCRIPTION_BASE_URL = "https://chatgpt.com/backend-api/codex"
 DEFAULT_OPENAI_SUBSCRIPTION_OAUTH_ISSUER = "https://auth.openai.com"
@@ -89,7 +110,7 @@ class OpenAISubscriptionCredentials:
     access_token: str = field(repr=False)
     refresh_token: str = field(repr=False)
     expires_at: float
-    account_id: str | None = None
+    account_id: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -126,23 +147,35 @@ class OpenAISubscriptionAuthStore:
         self.path = Path(path) if path is not None else _default_auth_path()
 
     def load(self) -> OpenAISubscriptionCredentials | None:
-        self._validate_existing_parent()
-        if not self.path.exists() and not self.path.is_symlink():
-            return None
-        with self._exclusive_lock():
-            return self._load_credentials_unlocked()
+        sentinel = object()
+        result: OpenAISubscriptionCredentials | None | object = sentinel
+        failure_message: str | None = None
+        try:
+            self._validate_existing_parent()
+            if not self.path.exists() and not self.path.is_symlink():
+                result = None
+            else:
+                with self._exclusive_lock():
+                    result = self._load_credentials_unlocked()
+        except Exception as exc:
+            failure_message = _safe_auth_store_error_message(exc)
+        if result is sentinel:
+            raise ValueError(failure_message or "Could not access Cayu auth store.")
+        return result if isinstance(result, OpenAISubscriptionCredentials) else None
 
     def _load_credentials_unlocked(self) -> OpenAISubscriptionCredentials | None:
         if self.path.is_symlink():
-            raise ValueError(f"Refusing to read symlinked auth store: {self.path}")
+            raise ValueError("Refusing to read a symlinked Cayu auth store.")
         if not self.path.exists():
             return None
-        try:
+        read_failed = object()
+        decoded: Any = read_failed
+        with suppress(OSError, ValueError):
             decoded = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise ValueError(f"Could not read Cayu auth store {self.path}: {exc}") from exc
+        if decoded is read_failed:
+            raise ValueError("Could not read Cayu auth store.")
         if not isinstance(decoded, dict):
-            raise ValueError(f"Cayu auth store {self.path} must contain a JSON object.")
+            raise ValueError("Cayu auth store must contain a JSON object.")
         providers = decoded.get("providers")
         if not isinstance(providers, dict):
             return None
@@ -151,21 +184,29 @@ class OpenAISubscriptionAuthStore:
             return None
         if not isinstance(raw, dict):
             raise ValueError("OpenAI subscription credentials must be a JSON object.")
-        try:
-            return OpenAISubscriptionCredentials(
+        credentials: OpenAISubscriptionCredentials | None = None
+        with suppress(KeyError, TypeError, ValueError):
+            credentials = OpenAISubscriptionCredentials(
                 access_token=raw["access_token"],
                 refresh_token=raw["refresh_token"],
                 expires_at=raw["expires_at"],
                 account_id=raw.get("account_id"),
             )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError("OpenAI subscription credentials are invalid.") from exc
+        if credentials is None:
+            raise ValueError("OpenAI subscription credentials are invalid.")
+        return credentials
 
     def save(self, credentials: OpenAISubscriptionCredentials) -> None:
         if type(credentials) is not OpenAISubscriptionCredentials:
             raise TypeError("credentials must be OpenAISubscriptionCredentials.")
-        with self._exclusive_lock():
-            self._save_credentials_unlocked(credentials)
+        failure_message: str | None = None
+        try:
+            with self._exclusive_lock():
+                self._save_credentials_unlocked(credentials)
+        except Exception as exc:
+            failure_message = _safe_auth_store_error_message(exc)
+        if failure_message is not None:
+            raise ValueError(failure_message)
 
     def _save_credentials_unlocked(self, credentials: OpenAISubscriptionCredentials) -> None:
         document = self._load_document()
@@ -182,8 +223,16 @@ class OpenAISubscriptionAuthStore:
         self._write_document(document)
 
     def delete(self) -> bool:
-        with self._exclusive_lock():
-            return self._delete_unlocked()
+        result: bool | None = None
+        failure_message: str | None = None
+        try:
+            with self._exclusive_lock():
+                result = self._delete_unlocked()
+        except Exception as exc:
+            failure_message = _safe_auth_store_error_message(exc)
+        if result is None:
+            raise ValueError(failure_message or "Could not access Cayu auth store.")
+        return result
 
     def _delete_unlocked(self) -> bool:
         document = self._load_document()
@@ -206,15 +255,17 @@ class OpenAISubscriptionAuthStore:
 
     def _load_document(self) -> dict[str, Any]:
         if self.path.is_symlink():
-            raise ValueError(f"Refusing to write symlinked auth store: {self.path}")
+            raise ValueError("Refusing to write a symlinked Cayu auth store.")
         if not self.path.exists():
             return {"version": _AUTH_STORE_VERSION, "providers": {}}
-        try:
+        read_failed = object()
+        decoded: Any = read_failed
+        with suppress(OSError, ValueError):
             decoded = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise ValueError(f"Could not read Cayu auth store {self.path}: {exc}") from exc
+        if decoded is read_failed:
+            raise ValueError("Could not read Cayu auth store.")
         if not isinstance(decoded, dict):
-            raise ValueError(f"Cayu auth store {self.path} must contain a JSON object.")
+            raise ValueError("Cayu auth store must contain a JSON object.")
         return decoded
 
     def _write_document(self, document: dict[str, Any]) -> None:
@@ -253,9 +304,16 @@ class OpenAISubscriptionAuthStore:
 
     def _validate_existing_parent(self) -> None:
         if self.path.parent.is_symlink():
-            raise ValueError(f"Refusing to use symlinked auth store directory: {self.path.parent}")
+            raise ValueError("Refusing to use a symlinked Cayu auth-store directory.")
         if self.path.parent.exists() and not self.path.parent.is_dir():
-            raise ValueError(f"Cayu auth store directory is not a directory: {self.path.parent}")
+            raise ValueError("Cayu auth-store parent is not a directory.")
+
+
+def _safe_auth_store_error_message(exc: Exception) -> str:
+    message = str(exc)
+    if message in _SAFE_AUTH_STORE_ERRORS:
+        return message
+    return "Could not access Cayu auth store."
 
 
 class OpenAISubscriptionAuth:
@@ -285,26 +343,41 @@ class OpenAISubscriptionAuth:
         self._now = now
         self._refresh_lock = asyncio.Lock()
 
+    @detach_provider_call_traceback
     async def credentials(self) -> OpenAISubscriptionCredentials:
         # Store reads take the same cross-process lock as refresh rotation. Keep
         # that potentially network-length wait off Cayu's event-loop thread.
-        credentials = await asyncio.to_thread(self.store.load)
-        if credentials is None:
-            raise OpenAISubscriptionAuthError(
-                "OpenAI subscription login is missing. Run `cayu auth openai login`."
-            )
-        if credentials.expires_at > self._now() + self.refresh_skew_seconds:
-            return credentials
-        async with self._refresh_lock:
-            try:
-                return await asyncio.to_thread(self._refresh_credentials)
-            except OpenAISubscriptionAuthError:
-                raise
-            except Exception as exc:
+        credentials: OpenAISubscriptionCredentials | None = None
+        cancellation: asyncio.CancelledError | None = None
+        try:
+            credentials = await asyncio.to_thread(self.store.load)
+            if credentials is None:
                 raise OpenAISubscriptionAuthError(
-                    "OpenAI subscription login could not refresh. "
-                    "Run `cayu auth openai login` again."
-                ) from exc
+                    "OpenAI subscription login is missing. Run `cayu auth openai login`."
+                )
+            if credentials.expires_at > self._now() + self.refresh_skew_seconds:
+                return credentials
+            async with self._refresh_lock:
+                refreshed: OpenAISubscriptionCredentials | None = None
+                with suppress(Exception):
+                    refreshed = await asyncio.to_thread(self._refresh_credentials)
+                if refreshed is None:
+                    raise OpenAISubscriptionAuthError(
+                        "OpenAI subscription login could not refresh. "
+                        "Run `cayu auth openai login` again."
+                    )
+                return refreshed
+        except asyncio.CancelledError as exc:
+            cancellation = sanitize_provider_cancellation(
+                exc,
+                provider_label="OpenAI subscription",
+                credential_values=_subscription_credential_values(credentials),
+                safe_message="OpenAI subscription request cancelled.",
+            )
+        credentials = None
+        if cancellation is not None:
+            raise cancellation from None
+        raise AssertionError("subscription credential resolution did not return or fail")
 
     def _refresh_credentials(self) -> OpenAISubscriptionCredentials:
         # The path lock covers the complete rotating-token transaction, not just
@@ -384,7 +457,12 @@ class OpenAISubscriptionProvider(ModelProvider):
         del request
         return None
 
+    @detach_provider_stream_traceback
     async def stream(self, request: ModelRequest):
+        credentials: OpenAISubscriptionCredentials | None = None
+        cancellation: asyncio.CancelledError | None = None
+        overflow_failure: ModelContextOverflowError | None = None
+        error_event: ModelStreamEvent | None = None
         try:
             credentials = await self.auth.credentials()
             payload = build_openai_payload(request, stream=True, reasoning_state="inline")
@@ -397,13 +475,35 @@ class OpenAISubscriptionProvider(ModelProvider):
             )
             async for event in openai_stream_events(raw_events, reasoning_state="inline"):
                 yield event
-        except ModelContextOverflowError:
-            raise
-        except Exception as exc:
-            yield ModelStreamEvent.error(
-                exception_message(exc, provider_label="OpenAI subscription"),
-                cause=exc,
+        except asyncio.CancelledError as exc:
+            cancellation = sanitize_provider_cancellation(
+                exc,
+                provider_label="OpenAI subscription",
+                credential_values=credential_sanitization_values(
+                    *_subscription_credential_values(credentials),
+                    extra_headers=self.extra_headers,
+                ),
+                safe_message="OpenAI subscription request cancelled.",
             )
+        except ModelContextOverflowError as exc:
+            overflow_failure = _safe_subscription_context_overflow(
+                exc,
+                credentials,
+                extra_header_values=tuple(self.extra_headers.values()),
+            )
+        except Exception as exc:
+            error_event = _safe_subscription_error_event(
+                exc,
+                credentials,
+                extra_header_values=tuple(self.extra_headers.values()),
+            )
+        credentials = None
+        if cancellation is not None:
+            raise cancellation from None
+        if overflow_failure is not None:
+            raise overflow_failure from None
+        if error_event is not None:
+            yield error_event
 
     async def aclose(self) -> None:
         await aclose_transport(self.transport)
@@ -503,7 +603,8 @@ class HttpxOpenAISubscriptionOAuthTransport:
         )
 
     def _post_form(self, path: str, data: Mapping[str, str]) -> Mapping[str, Any]:
-        try:
+        response: httpx.Response | None = None
+        with suppress(httpx.RequestError):
             response = httpx.post(
                 f"{self.issuer}{path}",
                 data=dict(data),
@@ -513,8 +614,8 @@ class HttpxOpenAISubscriptionOAuthTransport:
                 },
                 timeout=self.timeout_s,
             )
-        except httpx.RequestError as exc:
-            raise OpenAISubscriptionAuthError("OpenAI OAuth request failed.") from exc
+        if response is None:
+            raise OpenAISubscriptionAuthError("OpenAI OAuth request failed.")
         return _oauth_response(response)
 
     def _post_json(
@@ -524,7 +625,8 @@ class HttpxOpenAISubscriptionOAuthTransport:
         *,
         pending_statuses: set[int] | None = None,
     ) -> Mapping[str, Any] | None:
-        try:
+        response: httpx.Response | None = None
+        with suppress(httpx.RequestError):
             response = httpx.post(
                 f"{self.issuer}{path}",
                 json=dict(data),
@@ -534,8 +636,8 @@ class HttpxOpenAISubscriptionOAuthTransport:
                 },
                 timeout=self.timeout_s,
             )
-        except httpx.RequestError as exc:
-            raise OpenAISubscriptionAuthError("OpenAI OAuth request failed.") from exc
+        if response is None:
+            raise OpenAISubscriptionAuthError("OpenAI OAuth request failed.")
         if pending_statuses is not None and response.status_code in pending_statuses:
             return None
         return _oauth_response(response)
@@ -647,27 +749,122 @@ def build_openai_subscription_authorize_url(
 
 def _oauth_response(response: httpx.Response) -> Mapping[str, Any]:
     if response.status_code < 200 or response.status_code >= 300:
-        detail = ""
-        try:
-            decoded_error = response.json()
-        except ValueError:
-            decoded_error = None
-        if isinstance(decoded_error, Mapping):
-            for key in ("error_description", "error"):
-                value = decoded_error.get(key)
-                if isinstance(value, str) and value.strip():
-                    detail = f": {value.strip()[:240]}"
-                    break
         raise OpenAISubscriptionAuthError(
-            f"OpenAI OAuth request failed with HTTP {response.status_code}{detail}."
+            f"OpenAI OAuth request failed with HTTP {response.status_code}."
         )
-    try:
+    parse_failed = object()
+    decoded: Any = parse_failed
+    with suppress(ValueError):
         decoded = response.json()
-    except ValueError as exc:
-        raise OpenAISubscriptionAuthError("OpenAI OAuth response was not valid JSON.") from exc
+    if decoded is parse_failed:
+        raise OpenAISubscriptionAuthError("OpenAI OAuth response was not valid JSON.")
     if not isinstance(decoded, Mapping):
         raise OpenAISubscriptionAuthError("OpenAI OAuth response must be a JSON object.")
     return decoded
+
+
+def _safe_subscription_error_event(
+    exc: Exception,
+    credentials: OpenAISubscriptionCredentials | None,
+    *,
+    extra_header_values: tuple[str, ...] = (),
+) -> ModelStreamEvent:
+    """Project a provider failure through an allowlisted, credential-safe shape."""
+
+    if isinstance(exc, OpenAISubscriptionAuthError):
+        message = "OpenAI subscription authentication failed. Run `cayu auth openai login` again."
+    else:
+        message = "OpenAI subscription provider failed."
+    payload: dict[str, Any] = {
+        "error": message,
+        "error_type": type(exc).__name__,
+    }
+    if isinstance(exc, ModelProviderError):
+        typed_fields = exc.error_payload_fields()
+        if credentials is not None:
+            typed_fields = _subscription_credential_redactor(
+                credentials,
+                extra_header_values=extra_header_values,
+            ).redact_json(typed_fields)
+        elif credentials is None:
+            typed_fields = {
+                key: value
+                for key, value in typed_fields.items()
+                if key in {"status_code", "retryable", "retry_after_s"}
+            }
+        payload.update(typed_fields)
+    else:
+        status_code = getattr(exc, "status_code", None)
+        if type(status_code) is int:
+            payload["status_code"] = status_code
+        retryable = getattr(exc, "retryable", None)
+        if type(retryable) is bool:
+            payload["retryable"] = retryable
+        retry_after_s = getattr(exc, "retry_after_s", None)
+        if type(retry_after_s) in {int, float}:
+            payload["retry_after_s"] = retry_after_s
+    return ModelStreamEvent(type=ModelStreamEventType.ERROR, payload=payload)
+
+
+def _safe_subscription_context_overflow(
+    exc: ModelContextOverflowError,
+    credentials: OpenAISubscriptionCredentials | None,
+    *,
+    extra_header_values: tuple[str, ...] = (),
+) -> ModelContextOverflowError:
+    message = "OpenAI subscription context window exceeded."
+    redactor = (
+        _subscription_credential_redactor(
+            credentials,
+            extra_header_values=extra_header_values,
+        )
+        if credentials is not None
+        else None
+    )
+    provider = _safe_subscription_error_field(exc.provider, redactor) or "openai"
+    return ModelContextOverflowError(
+        message,
+        provider=provider,
+        status_code=exc.status_code,
+        error_type=_safe_subscription_error_field(exc.error_type, redactor),
+        error_code=_safe_subscription_error_field(exc.error_code, redactor),
+        request_id=_safe_subscription_error_field(exc.request_id, redactor),
+    )
+
+
+def _safe_subscription_error_field(
+    value: str | None,
+    redactor: SecretRedactor | None,
+) -> str | None:
+    if value is None:
+        return None
+    if redactor is None:
+        return None
+    redacted = redactor.redact_text(value)
+    return value if redacted == value else None
+
+
+def _subscription_credential_redactor(
+    credentials: OpenAISubscriptionCredentials,
+    *,
+    extra_header_values: tuple[str, ...] = (),
+) -> SecretRedactor:
+    values = [credentials.access_token, credentials.refresh_token]
+    if credentials.account_id is not None:
+        values.append(credentials.account_id)
+    values.extend(extra_header_values)
+    return SecretRedactor(values)
+
+
+def _subscription_credential_values(
+    credentials: OpenAISubscriptionCredentials | None,
+) -> tuple[str, ...]:
+    if credentials is None:
+        return ()
+    values = [credentials.access_token, credentials.refresh_token]
+    if credentials.account_id is not None:
+        values.append(credentials.account_id)
+    return tuple(values)
 
 
 def _cayu_version() -> str:

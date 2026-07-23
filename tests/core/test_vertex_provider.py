@@ -5,6 +5,7 @@ from typing import Any
 
 import httpx
 import pytest
+from tests.provider_traceback_assertions import assert_cayu_traceback_does_not_retain
 
 from cayu import (
     AgentSpec,
@@ -259,7 +260,7 @@ async def test_vertex_provider_errors_on_empty_access_token() -> None:
     events = [event async for event in provider.stream(_request())]
 
     assert [event.type for event in events] == [ModelStreamEventType.ERROR]
-    assert "did not produce an access token" in events[0].payload["error"]
+    assert events[0].payload["error"] == "VertexError: Vertex provider failed"
     assert transport.calls == []  # never reached the POST
 
 
@@ -286,7 +287,7 @@ async def test_vertex_provider_wraps_api_error_as_single_event() -> None:
     events = [event async for event in provider.stream(_request())]
 
     assert [event.type for event in events] == [ModelStreamEventType.ERROR]
-    assert "429" in events[0].payload["error"]
+    assert events[0].payload["error"] == "VertexAPIError: Vertex provider failed"
     # Typed classification fields survive into the error event payload.
     assert events[0].payload["error_type"] == "VertexAPIError"
     assert events[0].payload["provider"] == "vertex"
@@ -309,9 +310,11 @@ async def test_vertex_provider_stream_propagates_context_overflow() -> None:
     with pytest.raises(ModelContextOverflowError) as exc_info:
         [event async for event in provider.stream(_request())]
 
-    # Overflow must escape as a typed exception (not an ERROR event) so
-    # runtime context-overflow recovery can shrink context and retry.
-    assert exc_info.value is overflow
+    # Overflow escapes as a fresh detached typed exception so runtime recovery
+    # can retry without retaining transport traceback locals containing headers.
+    assert exc_info.value is not overflow
+    assert isinstance(exc_info.value, VertexContextOverflowError)
+    assert exc_info.value.status_code == 400
     assert exc_info.value.retryable is False
 
 
@@ -708,7 +711,7 @@ async def test_vertex_provider_stream_error_event_uses_vertex_typed_errors() -> 
     events = [event async for event in provider.stream(_request())]
 
     assert [event.type for event in events] == [ModelStreamEventType.ERROR]
-    assert events[0].payload["error"] == "Vertex streaming error: Overloaded"
+    assert events[0].payload["error"] == "VertexAPIError: Vertex provider failed"
     assert events[0].payload["error_type"] == "VertexAPIError"
     assert events[0].payload["provider"] == "vertex"
     assert events[0].payload["provider_error_type"] == "overloaded_error"
@@ -762,6 +765,34 @@ async def test_vertex_provider_counts_input_tokens_with_official_endpoint() -> N
     assert call["payload"]["anthropic_version"] == "vertex-2023-10-16"
     assert "max_tokens" not in call["payload"]
     assert call["headers"]["Authorization"] == "Bearer fake-token"
+
+
+@pytest.mark.anyio
+async def test_vertex_token_count_failure_drops_access_token_and_exception_graph() -> None:
+    canary = "provider-vertex-token-canary-0123456789"
+
+    class CredentialFailingTransport(StreamingRecordingTransport):
+        async def count_message_tokens(self, **_kwargs: Any) -> Mapping[str, Any]:
+            error = RuntimeError(f"Authorization: Bearer {canary}")
+            error.headers = {"Authorization": f"Bearer {canary}"}
+            error.add_note(f"transport retained {canary}")
+            raise error
+
+    provider = _provider(
+        CredentialFailingTransport(),
+        credentials=FakeCredentials(token=canary),
+    )
+
+    with pytest.raises(VertexAPIError) as exc_info:
+        await provider.count_input_tokens(_request())
+
+    assert_cayu_traceback_does_not_retain(exc_info.value, provider)
+    retained = str(exc_info.value) + repr(exc_info.value) + repr(vars(exc_info.value))
+    assert canary not in retained
+    assert str(exc_info.value) == "RuntimeError: Vertex provider failed"
+    assert exc_info.value.response_body is None
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
 
 @pytest.mark.anyio

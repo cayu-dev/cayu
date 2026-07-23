@@ -35,8 +35,6 @@ from cayu.artifacts import (
 from cayu.core.agents import AgentSpec
 from cayu.core.billing import (
     BillingIdentity,
-    completed_billing_identity,
-    copy_billing_identity,
     resolved_billing_identity,
 )
 from cayu.core.events import Event, EventType
@@ -68,7 +66,11 @@ from cayu.providers import (
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime._event_writer import RuntimeEventWriter
-from cayu.runtime._model_errors import model_provider_error_from_payload
+from cayu.runtime._model_errors import (
+    model_provider_error_from_payload,
+    resolve_completion_billing_identity,
+    resolve_request_billing_identity,
+)
 from cayu.runtime._run_limits import (
     UNKNOWN_POST_DISPATCH_BUDGET_REASON,
     BudgetDispatchReservationFailed,
@@ -115,6 +117,7 @@ from cayu.runtime.context import (
     _automatic_compaction_runner_scope,
     _AutomaticCompactionRunner,
     _compaction_completion_publisher_scope,
+    _defer_billing_identity_cancellation_scope,
     context_build_termination_compaction_telemetry,
     copy_context_messages,
     estimate_context_pressure,
@@ -885,21 +888,13 @@ class ModelStepExecutor:
                         continue
                 elif stream_event.type == ModelStreamEventType.COMPLETED:
                     try:
-                        billing_identity = completed_billing_identity(
+                        billing_identity = resolve_completion_billing_identity(
+                            provider,
                             billing_identity,
-                            provider.billing_identity_for_completion(
-                                billing_identity,
-                                stream_event.payload,
-                            ),
+                            stream_event.payload,
+                            provider_name=registered_provider.name,
                         )
-                    except Exception as exc:
-                        provider_error = ModelProviderError(
-                            str(exc),
-                            provider=registered_provider.name,
-                            error_type=type(exc).__name__,
-                            error_code="billing_identity_resolution_failed",
-                            retryable=False,
-                        )
+                    except ModelProviderError as provider_error:
                         error_payload = {
                             "error": str(provider_error),
                             "error_type": type(provider_error).__name__,
@@ -928,7 +923,7 @@ class ModelStepExecutor:
                             payload=error_payload,
                             emitted_error_event=True,
                             cause=provider_error,
-                        ) from exc
+                        ) from provider_error
                     model_completed = True
                     completed_stream_event = stream_event
                     provider_state_parts = transcript_helpers.provider_state_parts(
@@ -1319,23 +1314,14 @@ class ModelStepRun:
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
         controller = self._executor._run_limit_controller
         try:
-            billing_identity = copy_billing_identity(
-                await self._provider.billing_identity_for_request(model_request)
+            billing_identity = await resolve_request_billing_identity(
+                self._provider,
+                model_request,
+                provider_name=self._registered_provider.name,
             )
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
-            provider_error = (
-                exc
-                if isinstance(exc, ModelProviderError)
-                else ModelProviderError(
-                    str(exc),
-                    provider=self._registered_provider.name,
-                    error_type=type(exc).__name__,
-                    error_code="billing_identity_resolution_failed",
-                    retryable=False,
-                )
-            )
+        except ModelProviderError as provider_error:
             payload = {
                 "error": str(provider_error),
                 "error_type": type(provider_error).__name__,
@@ -1359,9 +1345,7 @@ class ModelStepRun:
                 ),
                 None,
             )
-            if provider_error is exc:
-                raise
-            raise provider_error from exc
+            raise
         if billing_identity is not None or self._has_deferred_contextual_price():
             should_stop: bool | None = None
             gate_events = self._billing_identity_budget_gate(
@@ -3282,7 +3266,10 @@ async def _build_context(
     )
     if isinstance(context_policy, RuntimeManagedContextPolicy):
         checkpoint = await session_store.load_checkpoint(session.id)
-        with _automatic_compaction_runner_scope(run_compaction):
+        with (
+            _defer_billing_identity_cancellation_scope(),
+            _automatic_compaction_runner_scope(run_compaction),
+        ):
             result = await context_policy.build_with_checkpoint(
                 request,
                 checkpoint=checkpoint,

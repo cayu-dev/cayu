@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from math import inf, nan
 from typing import Any
@@ -15,6 +16,7 @@ from cayu.runners import (
     MicrosandboxRunner,
     MicrosandboxUnavailableError,
 )
+from cayu.testing import verify_provider_credential_isolation
 
 
 @dataclass
@@ -517,6 +519,67 @@ def test_microsandbox_runner_executes_process_with_explicit_env_and_bounds_outpu
         }
     ]
     assert "CAYU_SECRET_HOST_ENV" not in sandbox.exec_calls[0]["env"]
+
+
+def test_microsandbox_reconnect_passes_provider_credential_isolation_probe(
+    provider_credential_canaries,
+) -> None:
+    class ProbeSandbox(FakeSandbox):
+        async def exec_stream(self, cmd: str, args: list[str], **kwargs: Any) -> FakeHandle:
+            self.exec_calls.append({"cmd": cmd, "args": args, **kwargs})
+            payload = json.dumps(
+                {
+                    "environment": dict(kwargs.get("env", {})),
+                    "auth_paths": {},
+                    "auth_scan_complete": True,
+                    "provider_canary_matches": [],
+                    "detector_control_match": True,
+                },
+                sort_keys=True,
+            ).encode()
+            return FakeHandle(
+                [FakeEvent("stdout", payload), FakeEvent("exited", code=0)],
+                wait_result=(0, False),
+            )
+
+    async def run():
+        sandbox = ProbeSandbox("credential-probe")
+        FakeSandboxApi.existing = sandbox
+        runner = await MicrosandboxRunner.from_existing(
+            "credential-probe",
+            sandbox_module=FakeMicrosandboxModule,
+        )
+        evidence = await verify_provider_credential_isolation(
+            runner,
+            adapter="microsandbox",
+            scope="isolated_guest",
+            provider_canaries=provider_credential_canaries.values,
+            operational_env={
+                "CAYU_PROBE_VISIBLE": provider_credential_canaries.positive_env[
+                    "CAYU_PROBE_VISIBLE"
+                ]
+            },
+            workload_env={
+                "CAYU_WORKLOAD_TOKEN": provider_credential_canaries.positive_env[
+                    "CAYU_WORKLOAD_TOKEN"
+                ]
+            },
+            guest_cwd="/workspace",
+            guest_auth_search_paths={"mounted_workspace": "/workspace"},
+        )
+        return evidence, sandbox
+
+    evidence, sandbox = asyncio.run(run())
+
+    assert evidence.status == "verified"
+    assert "os.walk(root" in repr(sandbox.exec_calls[-1]["args"])
+    assert provider_credential_canaries.positive_env.items() <= (
+        sandbox.exec_calls[-1]["env"].items()
+    )
+    assert all(
+        value not in repr(sandbox.exec_calls)
+        for value in provider_credential_canaries.values.values()
+    )
     assert sandbox.ping_calls == 0
 
 

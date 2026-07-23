@@ -6,6 +6,7 @@ from typing import Any
 
 import httpx
 import pytest
+from tests.provider_traceback_assertions import assert_cayu_traceback_does_not_retain
 
 import cayu.providers.openai as openai_module
 from cayu import (
@@ -872,6 +873,41 @@ async def test_openai_provider_counts_input_tokens_with_official_endpoint() -> N
     assert "store" not in transport.count_calls[0]["payload"]
     assert "stream" not in transport.count_calls[0]["payload"]
     assert "include" not in transport.count_calls[0]["payload"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("operation", ["count", "embed"])
+async def test_openai_non_stream_failures_drop_provider_credential_and_exception_graph(
+    operation: str,
+) -> None:
+    canary = "provider-openai-key-canary-0123456789"
+
+    class CredentialFailingTransport(RecordingTransport):
+        async def create_response(self, **_kwargs: Any) -> Mapping[str, Any]:
+            error = RuntimeError(f"Authorization: Bearer {canary}")
+            error.headers = {"Authorization": f"Bearer {canary}"}
+            error.add_note(f"transport retained {canary}")
+            raise error
+
+    provider = OpenAIProvider(api_key=canary, transport=CredentialFailingTransport())
+
+    with pytest.raises(OpenAIAPIError) as exc_info:
+        if operation == "count":
+            await provider.count_input_tokens(
+                ModelRequest(model="gpt-test", messages=[Message.text("user", "Count this.")])
+            )
+        else:
+            await provider.embed_texts(
+                TextEmbeddingRequest(model="text-embedding-test", texts=["embed this"])
+            )
+
+    assert_cayu_traceback_does_not_retain(exc_info.value, provider)
+    retained = str(exc_info.value) + repr(exc_info.value) + repr(vars(exc_info.value))
+    assert canary not in retained
+    assert str(exc_info.value) == "RuntimeError: OpenAI provider failed"
+    assert exc_info.value.response_body is None
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
 
 def test_build_openai_token_count_payload_keeps_only_count_supported_fields() -> None:
@@ -2322,10 +2358,12 @@ async def test_openai_provider_stream_propagates_context_overflow() -> None:
     with pytest.raises(OpenAIContextOverflowError) as exc_info:
         [event async for event in provider.stream(request)]
 
-    # Overflow must escape as a typed exception (not an ERROR event) so
-    # runtime context-overflow recovery can shrink context and retry.
-    assert exc_info.value is overflow
+    # Overflow escapes as a fresh detached typed exception so runtime recovery
+    # can retry without retaining transport traceback locals containing headers.
+    assert exc_info.value is not overflow
     assert isinstance(exc_info.value, ModelContextOverflowError)
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.error_code == "context_length_exceeded"
     assert exc_info.value.retryable is False
 
 

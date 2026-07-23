@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from math import inf, nan
 from typing import Any
@@ -16,6 +17,7 @@ from cayu.runners import (
     ExecCommand,
     ExecResult,
 )
+from cayu.testing import verify_provider_credential_isolation
 
 
 @dataclass
@@ -404,6 +406,72 @@ def test_e2b_runner_from_existing_can_skip_default_cwd_setup() -> None:
 
     assert runner.sandbox_id == "e2b_existing"
     assert runner._sandbox.commands.calls == []
+
+
+def test_e2b_reconnect_passes_provider_credential_isolation_probe(
+    provider_credential_canaries,
+) -> None:
+    class ProbeCommands(FakeCommands):
+        async def run(self, cmd: str, **kwargs: Any) -> Any:
+            self.calls.append({"cmd": cmd, **kwargs})
+            if not kwargs.get("background"):
+                return FakeCommandResult()
+            stdout = kwargs.get("on_stdout")
+            assert stdout is not None
+            await stdout(
+                json.dumps(
+                    {
+                        "environment": dict(kwargs.get("envs", {})),
+                        "auth_paths": {},
+                        "auth_scan_complete": True,
+                        "provider_canary_matches": [],
+                        "detector_control_match": True,
+                    },
+                    sort_keys=True,
+                )
+            )
+            return FakeHandle(result=FakeCommandResult())
+
+    async def run():
+        reset_fake_e2b()
+        sandbox = FakeSandbox("e2b_credential_probe")
+        sandbox.commands = ProbeCommands()
+        FakeAsyncSandbox.next_sandbox = sandbox
+        runner = await E2BRunner.from_existing(
+            "e2b_credential_probe",
+            ensure_default_cwd=False,
+            e2b_module=FakeE2BModule,
+        )
+        evidence = await verify_provider_credential_isolation(
+            runner,
+            adapter="e2b",
+            scope="isolated_guest",
+            provider_canaries=provider_credential_canaries.values,
+            operational_env={
+                "CAYU_PROBE_VISIBLE": provider_credential_canaries.positive_env[
+                    "CAYU_PROBE_VISIBLE"
+                ]
+            },
+            workload_env={
+                "CAYU_WORKLOAD_TOKEN": provider_credential_canaries.positive_env[
+                    "CAYU_WORKLOAD_TOKEN"
+                ]
+            },
+            guest_auth_search_paths={"mounted_workspace": "/workspace"},
+        )
+        return evidence, sandbox
+
+    evidence, sandbox = asyncio.run(run())
+
+    assert evidence.status == "verified"
+    assert "os.walk(root" in sandbox.commands.calls[-1]["cmd"]
+    assert provider_credential_canaries.positive_env.items() <= (
+        sandbox.commands.calls[-1]["envs"].items()
+    )
+    assert all(
+        value not in repr(sandbox.commands.calls)
+        for value in provider_credential_canaries.values.values()
+    )
 
 
 def test_e2b_runner_hardened_handoff_seals_root_capability() -> None:

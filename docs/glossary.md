@@ -49,6 +49,14 @@ disambiguates them so a name never sends you down the wrong path.
 
 ## A few load-bearing terms
 
+- **Model-provider credential.** Host/control-process authority used by a
+  `ModelProvider` or its refresh transport to make model requests. It is
+  non-delegable by default; provider registration never makes it a runner,
+  tool, workspace, vault, or virtual-egress credential.
+- **Workload credential.** Authority deliberately granted to a tool, runner,
+  broker, or integration through Cayu's workload credential contracts. Its
+  `CredentialMode` determines whether the real value is agent-readable,
+  trusted-tool-only, or represented by a virtual credential.
 - **Workspace.** The mutable filesystem an agent's tools read and write during a run.
   Whether changes persist past the run depends on the `WorkspaceBinding` (e.g. a
   `SyncBinding` copies changes back; `GitRepositoryBinding` checks out a repo).

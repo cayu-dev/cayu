@@ -11,6 +11,8 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import httpx
+import pytest
+from tests.provider_traceback_assertions import assert_cayu_traceback_does_not_retain
 
 from cayu.providers.openai_subscription import (
     OPENAI_SUBSCRIPTION_OAUTH_CLIENT_ID,
@@ -65,7 +67,8 @@ def test_auth_store_rejects_symlinked_existing_parent_without_side_effects(
     try:
         OpenAISubscriptionAuthStore(auth_home / "auth.json").load()
     except ValueError as exc:
-        assert str(exc) == f"Refusing to use symlinked auth store directory: {auth_home}"
+        assert str(exc) == "Refusing to use a symlinked Cayu auth-store directory."
+        assert str(auth_home) not in repr(exc)
     else:
         raise AssertionError("symlinked auth store directory must fail validation")
 
@@ -84,7 +87,168 @@ def test_subscription_credentials_repr_redacts_tokens() -> None:
 
     assert "secret-access-token" not in rendered
     assert "secret-refresh-token" not in rendered
-    assert "acct-cayu" in rendered
+    assert "acct-cayu" not in rendered
+
+
+def test_oauth_error_projection_omits_untrusted_credential_shaped_detail(monkeypatch) -> None:
+    canaries = {
+        "access": "provider-access-canary-0123456789",
+        "refresh": "provider-refresh-canary-0123456789",
+        "account": "provider-account-canary-0123456789",
+        "header": "Bearer provider-header-canary-0123456789",
+    }
+
+    def fake_post(_url: str, **_kwargs: Any) -> httpx.Response:
+        return httpx.Response(
+            401,
+            json={
+                "error": "invalid_grant",
+                "error_description": " ".join(canaries.values()),
+            },
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    with pytest.raises(OpenAISubscriptionAuthError) as exc_info:
+        HttpxOpenAISubscriptionOAuthTransport().refresh(canaries["refresh"])
+
+    rendered = str(exc_info.value) + repr(exc_info.value)
+    assert rendered == (
+        "OpenAI OAuth request failed with HTTP 401."
+        "OpenAISubscriptionAuthError('OpenAI OAuth request failed with HTTP 401.')"
+    )
+    assert all(value not in rendered for value in canaries.values())
+
+
+def test_auth_store_parse_failure_omits_path_content_and_exception_graph(tmp_path: Path) -> None:
+    canary = "provider-auth-store-canary-0123456789"
+    auth_path = tmp_path / canary / "auth.json"
+    auth_path.parent.mkdir()
+    auth_path.write_text(f'{{"access_token":"{canary}"', encoding="utf-8")
+
+    with pytest.raises(ValueError) as exc_info:
+        OpenAISubscriptionAuthStore(auth_path).load()
+
+    retained = repr(exc_info.value) + repr(vars(exc_info.value))
+    assert str(exc_info.value) == "Could not read Cayu auth store."
+    assert canary not in retained
+    assert str(auth_path) not in retained
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+def test_auth_store_filesystem_failure_omits_private_path_and_exception_graph(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canary = "provider-auth-path-canary-0123456789"
+    auth_path = tmp_path / canary / "auth.json"
+    store = OpenAISubscriptionAuthStore(auth_path)
+
+    def fail_validation() -> None:
+        raise OSError(f"permission denied for {auth_path}")
+
+    monkeypatch.setattr(store, "_validate_existing_parent", fail_validation)
+
+    with pytest.raises(ValueError) as exc_info:
+        store.load()
+
+    retained = repr(exc_info.value) + repr(vars(exc_info.value))
+    assert str(exc_info.value) == "Could not access Cayu auth store."
+    assert canary not in retained
+    assert str(auth_path) not in retained
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+def test_subscription_refresh_failure_has_no_credential_bearing_cause(tmp_path: Path) -> None:
+    canary = "provider-refresh-canary-0123456789"
+    store = OpenAISubscriptionAuthStore(tmp_path / "auth.json")
+    store.save(
+        OpenAISubscriptionCredentials(
+            access_token="provider-access-canary-0123456789",
+            refresh_token=canary,
+            expires_at=1,
+        )
+    )
+
+    class LeakingRefreshTransport:
+        def refresh(self, refresh_token: str) -> dict[str, Any]:
+            raise RuntimeError(f"refresh failed for {refresh_token}")
+
+    auth = OpenAISubscriptionAuth(
+        store=store,
+        oauth_transport=LeakingRefreshTransport(),
+        now=lambda: 1_000,
+    )
+
+    with pytest.raises(OpenAISubscriptionAuthError) as exc_info:
+        asyncio.run(auth.credentials())
+
+    assert_cayu_traceback_does_not_retain(exc_info.value, auth)
+    retained = repr(exc_info.value) + repr(vars(exc_info.value))
+    assert canary not in retained
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+def test_subscription_refresh_lock_cancellation_drops_message_notes_and_metadata(
+    tmp_path: Path,
+) -> None:
+    canary = "provider-refresh-cancel-canary-0123456789"
+    store = OpenAISubscriptionAuthStore(tmp_path / "auth.json")
+    store.save(
+        OpenAISubscriptionCredentials(
+            access_token="provider-access-canary-0123456789",
+            refresh_token=canary,
+            expires_at=1,
+        )
+    )
+    auth = OpenAISubscriptionAuth(store=store, now=lambda: 1_000)
+
+    async def cancel_while_waiting_for_refresh_lock() -> asyncio.CancelledError:
+        await auth._refresh_lock.acquire()
+        task = asyncio.create_task(auth.credentials())
+        try:
+            await asyncio.sleep(0.01)
+            task.cancel(f"cancelled near {canary}")
+            with pytest.raises(asyncio.CancelledError) as exc_info:
+                await task
+            return exc_info.value
+        finally:
+            auth._refresh_lock.release()
+
+    error = asyncio.run(cancel_while_waiting_for_refresh_lock())
+
+    assert_cayu_traceback_does_not_retain(error, auth)
+    retained = repr(error) + repr(vars(error))
+    assert canary not in retained
+    assert error.args == ("OpenAI subscription request cancelled.",)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+@pytest.mark.parametrize("failure_kind", ["request", "invalid_json"])
+def test_oauth_transport_failures_drop_raw_exception_graph(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+) -> None:
+    canary = "provider-oauth-transport-canary-0123456789"
+
+    def fake_post(_url: str, **_kwargs: Any) -> httpx.Response:
+        if failure_kind == "request":
+            raise httpx.ConnectError(f"connect failed near {canary}")
+        return httpx.Response(200, text=f'{{"credential":"{canary}"')
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    with pytest.raises(OpenAISubscriptionAuthError) as exc_info:
+        HttpxOpenAISubscriptionOAuthTransport().refresh(canary)
+
+    retained = repr(exc_info.value) + repr(vars(exc_info.value))
+    assert canary not in retained
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
 
 def test_subscription_credentials_reject_non_finite_expiry() -> None:

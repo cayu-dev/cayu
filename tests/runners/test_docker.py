@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from typing import Any
 
 import pytest
 
+from cayu.runners._docker_cli import docker_cli_env
 from cayu.runners.base import ExecCommand, ExecResult
 from cayu.runners.docker import (
     DEFAULT_DOCKER_CWD,
@@ -15,6 +17,7 @@ from cayu.runners.docker import (
     _require_docker,
     _validate_mount_path,
 )
+from cayu.testing import verify_provider_credential_isolation
 from cayu.vaults import REDACTED_SECRET, SecretEnv, SecretRef, StaticVault
 
 
@@ -26,6 +29,163 @@ def test_require_docker_missing_raises(monkeypatch):
     monkeypatch.setattr("cayu.runners.docker.shutil.which", lambda _name: None)
     with pytest.raises(RuntimeError, match="docker CLI not found"):
         _require_docker(None)
+
+
+def test_docker_cli_helper_environment_is_operationally_allowlisted(monkeypatch):
+    provider_canaries = {
+        "OPENAI_API_KEY": "provider-openai-canary-0123456789",
+        "ANTHROPIC_API_KEY": "provider-anthropic-canary-0123456789",
+        "GEMINI_API_KEY": "provider-gemini-canary-0123456789",
+        "CAYU_HOME": "/tmp/provider-auth-store-canary-0123456789",
+        "OPENAI_AUTHORIZATION": "Bearer provider-header-canary-0123456789",
+    }
+    for name, value in provider_canaries.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin")
+    monkeypatch.setenv("DOCKER_HOST", "unix:///tmp/docker.sock")
+    monkeypatch.setenv("DOCKER_CONFIG", "/tmp/docker-config")
+    monkeypatch.setenv("SSL_CERT_FILE", "/tmp/ca.pem")
+    monkeypatch.setenv("HTTPS_PROXY", "http://trusted-proxy.test:8443")
+
+    helper_env = docker_cli_env()
+
+    assert helper_env["PATH"] == "/usr/local/bin:/usr/bin"
+    assert helper_env["DOCKER_HOST"] == "unix:///tmp/docker.sock"
+    assert helper_env["DOCKER_CONFIG"] == "/tmp/docker-config"
+    assert helper_env["SSL_CERT_FILE"] == "/tmp/ca.pem"
+    assert helper_env["HTTPS_PROXY"] == "http://trusted-proxy.test:8443"
+    assert set(provider_canaries).isdisjoint(helper_env)
+    assert all(value not in repr(helper_env) for value in provider_canaries.values())
+
+
+def test_docker_cli_helper_environment_accepts_explicit_trusted_grants(monkeypatch):
+    monkeypatch.setenv("AWS_PROFILE", "private-registry")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/run/registry/google.json")
+
+    helper_env = docker_cli_env(("AWS_PROFILE", "GOOGLE_APPLICATION_CREDENTIALS"))
+
+    assert helper_env["AWS_PROFILE"] == "private-registry"
+    assert helper_env["GOOGLE_APPLICATION_CREDENTIALS"] == "/run/registry/google.json"
+
+
+def test_docker_runner_forwards_only_explicit_docker_cli_grants(monkeypatch):
+    calls: list[dict[str, Any]] = []
+
+    async def fake_run_subprocess(command, **kwargs):
+        calls.append({"argv": command.argv, **kwargs})
+        return ExecResult()
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+    monkeypatch.setenv("AWS_PROFILE", "private-registry")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/run/registry/google.json")
+    runner = DockerRunner(
+        "credential-helper",
+        docker_path="/usr/bin/docker",
+        docker_cli_env_allowlist=("AWS_PROFILE",),
+    )
+
+    asyncio.run(runner.exec(ExecCommand.process("true")))
+
+    assert calls[0]["env"]["AWS_PROFILE"] == "private-registry"
+    assert "GOOGLE_APPLICATION_CREDENTIALS" not in calls[0]["env"]
+
+
+def test_docker_create_forwards_explicit_cli_grants_through_lifecycle(monkeypatch):
+    calls: list[dict[str, Any]] = []
+
+    async def fake_run_subprocess(command, **kwargs):
+        calls.append({"argv": command.argv, **kwargs})
+        return ExecResult()
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+    monkeypatch.setenv("AWS_PROFILE", "private-registry")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/run/registry/google.json")
+
+    async def run() -> DockerRunner:
+        runner = await DockerRunner.create(
+            "credential-helper",
+            docker_path="/usr/bin/docker",
+            setup_commands=("true",),
+            docker_cli_env_allowlist=("AWS_PROFILE",),
+        )
+        await runner.close()
+        return runner
+
+    runner = asyncio.run(run())
+
+    assert runner.docker_cli_env_allowlist == ("AWS_PROFILE",)
+    assert any(call["argv"][1] == "run" for call in calls)
+    assert any(call["argv"][1:3] == ["exec", "-u"] for call in calls)
+    assert calls[-1]["argv"][1:3] == ["rm", "-f"]
+    assert all(call["env"]["AWS_PROFILE"] == "private-registry" for call in calls)
+    assert all("GOOGLE_APPLICATION_CREDENTIALS" not in call["env"] for call in calls)
+
+
+def test_docker_runner_passes_provider_credential_isolation_probe(
+    monkeypatch,
+    provider_credential_canaries,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    async def fake_run_subprocess(command, **kwargs):
+        calls.append({"argv": command.argv, **kwargs})
+        env_file = command.argv[command.argv.index("--env-file") + 1]
+        environment = {}
+        with open(env_file, encoding="utf-8") as handle:
+            for line in handle:
+                name, value = line.rstrip("\n").split("=", 1)
+                environment[name] = value
+        calls[-1]["guest_env"] = environment
+        return ExecResult(
+            stdout=json.dumps(
+                {
+                    "environment": environment,
+                    "auth_paths": {},
+                    "auth_scan_complete": True,
+                    "provider_canary_matches": [],
+                    "detector_control_match": True,
+                },
+                sort_keys=True,
+            )
+        )
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+    workload_secret = "declared-workload-secret-0123456789"
+    runner = DockerRunner(
+        "credential-probe",
+        docker_path="/usr/bin/docker",
+        secret_env={"DECLARED_WORKLOAD_SECRET": SecretRef(name="workload_secret")},
+        secret_resolver=StaticVault({"workload_secret": workload_secret}),
+    )
+
+    evidence = asyncio.run(
+        verify_provider_credential_isolation(
+            runner,
+            adapter="docker",
+            scope="isolated_guest",
+            provider_canaries=provider_credential_canaries.values,
+            operational_env={
+                "CAYU_PROBE_VISIBLE": provider_credential_canaries.positive_env[
+                    "CAYU_PROBE_VISIBLE"
+                ]
+            },
+            workload_env={
+                "CAYU_WORKLOAD_TOKEN": provider_credential_canaries.positive_env[
+                    "CAYU_WORKLOAD_TOKEN"
+                ]
+            },
+            guest_cwd="/workspace",
+            guest_auth_search_paths={"mounted_workspace": "/workspace"},
+        )
+    )
+
+    assert evidence.status == "verified"
+    # RAW_ENV remains an explicit workload grant: the guest sees that declared
+    # value while none of the model-provider authority crosses the boundary.
+    assert calls[0]["guest_env"]["DECLARED_WORKLOAD_SECRET"] == workload_secret
+    assert "os.walk(root" in repr(calls[0]["argv"])
+    assert set(calls[0]["env"]).isdisjoint(provider_credential_canaries.host_env)
+    assert all(value not in repr(calls) for value in provider_credential_canaries.values.values())
 
 
 def test_runner_init_and_resolve_cwd():

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections.abc import AsyncIterator, Mapping
@@ -23,16 +24,20 @@ from cayu.core.messages import (
     ToolResultPart,
 )
 from cayu.providers._api_keys import resolve_api_key
+from cayu.providers._credential_boundary import detach_provider_stream_traceback
 from cayu.providers._http import (
     SharedAsyncClient,
     aclose_transport,
     copy_headers,
-    exception_message,
+    credential_safe_error_event,
+    credential_safe_provider_exception,
+    credential_sanitization_values,
     json_error_text,
     optional_error_string,
     response_json_object,
     safe_error_json,
     safe_error_response_text,
+    sanitize_provider_cancellation,
     stream_sse_json_events,
     truncate_error_text,
     validate_base_url,
@@ -307,10 +312,14 @@ class ChatCompletionsProvider(ModelProvider):
         """Close the transport's shared HTTP client, if it owns one."""
         await aclose_transport(self.transport)
 
+    @detach_provider_stream_traceback
     async def stream(
         self,
         request: ModelRequest,
     ) -> AsyncIterator[ModelStreamEvent]:
+        cancellation: asyncio.CancelledError | None = None
+        overflow_failure: ChatCompletionsContextOverflowError | None = None
+        error_event: ModelStreamEvent | None = None
         try:
             payload = build_chat_completions_payload(
                 request,
@@ -329,15 +338,50 @@ class ChatCompletionsProvider(ModelProvider):
             )
             async for event in chat_completions_stream_events(raw_events):
                 yield event
-        except ModelContextOverflowError:
+        except asyncio.CancelledError as exc:
+            cancellation = sanitize_provider_cancellation(
+                exc,
+                provider_label="Chat Completions",
+                credential_values=credential_sanitization_values(
+                    self.api_key,
+                    extra_headers=self.extra_headers,
+                ),
+            )
+        except ModelContextOverflowError as exc:
             # Overflow must reach runtime recovery as a typed exception; an
             # error event would flatten it into unrecoverable message text.
-            raise
-        except Exception as exc:
-            yield ModelStreamEvent.error(
-                exception_message(exc, provider_label="Chat Completions"),
-                cause=exc,
+            safe = credential_safe_provider_exception(
+                exc,
+                provider_label="Chat Completions",
+                provider_name="chat_completions",
+                credential_values=credential_sanitization_values(
+                    self.api_key,
+                    extra_headers=self.extra_headers,
+                ),
             )
+            overflow_failure = ChatCompletionsContextOverflowError(
+                str(safe),
+                status_code=safe.status_code,
+                error_type=safe.error_type,
+                error_code=safe.error_code,
+                request_id=safe.request_id,
+                response_body=None,
+            )
+        except Exception as exc:
+            error_event = credential_safe_error_event(
+                exc,
+                provider_label="Chat Completions",
+                credential_values=credential_sanitization_values(
+                    self.api_key,
+                    extra_headers=self.extra_headers,
+                ),
+            )
+        if cancellation is not None:
+            raise cancellation from None
+        if overflow_failure is not None:
+            raise overflow_failure from None
+        if error_event is not None:
+            yield error_event
 
     def _endpoint(self) -> str:
         # OpenAI-SDK convention: base_url already carries the version path, so

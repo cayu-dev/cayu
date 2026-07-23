@@ -1105,10 +1105,12 @@ async def test_provider_stream_propagates_context_overflow() -> None:
     with pytest.raises(ChatCompletionsContextOverflowError) as exc_info:
         [event async for event in provider.stream(request)]
 
-    # Overflow must escape as a typed exception (not an ERROR event) so
-    # runtime context-overflow recovery can shrink context and retry.
-    assert exc_info.value is overflow
+    # Overflow escapes as a fresh detached typed exception so runtime recovery
+    # can retry without retaining transport traceback locals containing headers.
+    assert exc_info.value is not overflow
     assert isinstance(exc_info.value, ModelContextOverflowError)
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.error_code == "context_length_exceeded"
     assert exc_info.value.retryable is False
 
 

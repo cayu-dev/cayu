@@ -27,7 +27,13 @@ from cayu.core.messages import (
     ToolCallPart,
     ToolResultPart,
 )
-from cayu.providers._http import exception_message
+from cayu.providers._credential_boundary import (
+    detach_provider_call_traceback,
+    detach_provider_stream_traceback,
+)
+from cayu.providers._http import (
+    sanitize_provider_cancellation,
+)
 from cayu.providers.base import (
     InputTokenCountConfidence,
     InputTokenCountMethod,
@@ -56,6 +62,30 @@ BedrockResourceType = Literal[
 BedrockProfileScope = Literal["global", "geographic"]
 _BEDROCK_RESOURCE_TYPES = frozenset(get_args(BedrockResourceType))
 _BEDROCK_PROFILE_SCOPES = frozenset(get_args(BedrockProfileScope))
+_SAFE_BEDROCK_STRUCTURED_FIELDS = frozenset(
+    {
+        "AccessDeniedException",
+        "ClientError",
+        "InternalServerException",
+        "ModelErrorException",
+        "ModelNotReadyException",
+        "ModelTimeoutException",
+        "ResourceNotFoundException",
+        "ServiceQuotaExceededException",
+        "ServiceUnavailableException",
+        "ThrottlingException",
+        "ValidationException",
+        "context_length_exceeded",
+        "internalServerException",
+        "invalid_request_error",
+        "modelStreamErrorException",
+        "rate_limit_error",
+        "rate_limit_exceeded",
+        "serviceUnavailableException",
+        "throttlingException",
+        "validationException",
+    }
+)
 
 
 def bedrock_billing_identity(
@@ -297,6 +327,7 @@ class BedrockProvider(ModelProvider):
             return
         await asyncio.to_thread(self._close_owned_client)
 
+    @detach_provider_call_traceback
     async def billing_identity_for_request(
         self,
         request: ModelRequest,
@@ -307,23 +338,44 @@ class BedrockProvider(ModelProvider):
         if type(options) is not dict:
             raise ValueError("ModelRequest.options['bedrock'] must be an object.")
         requested_tier = _requested_service_tier(options)
-        source_region = None
-        client = self._client
-        if client is not None:
-            meta = getattr(client, "meta", None)
-            source_region = _optional_clean_string(
-                getattr(meta, "region_name", None),
-                "client.meta.region_name",
+        source_region: str | None = None
+        client: Any = None
+        meta: Any = None
+        cancellation: asyncio.CancelledError | None = None
+        failure: BedrockError | ModelProviderError | None = None
+        try:
+            client = self._client
+            if client is not None:
+                meta = getattr(client, "meta", None)
+                source_region = _optional_clean_string(
+                    getattr(meta, "region_name", None),
+                    "client.meta.region_name",
+                )
+            if source_region is None:
+                source_region = self.region_name
+            if source_region is None:
+                client = await self._get_client()
+                meta = getattr(client, "meta", None)
+                source_region = _optional_clean_string(
+                    getattr(meta, "region_name", None),
+                    "client.meta.region_name",
+                )
+        except asyncio.CancelledError as exc:
+            cancellation = sanitize_provider_cancellation(
+                exc,
+                provider_label="Bedrock",
+                credential_values=(),
             )
-        if source_region is None:
-            source_region = self.region_name
-        if source_region is None:
-            client = await self._get_client()
-            meta = getattr(client, "meta", None)
-            source_region = _optional_clean_string(
-                getattr(meta, "region_name", None),
-                "client.meta.region_name",
-            )
+        except Exception as exc:
+            failure = _credential_safe_bedrock_error(_bedrock_error_from_exception(exc))
+        client = None
+        meta = None
+        if cancellation is not None:
+            source_region = None
+            raise cancellation from None
+        if failure is not None:
+            source_region = None
+            raise failure from None
         resource_type, profile_scope = _bedrock_resource_identity(request.model)
         return bedrock_billing_identity(
             invoked_model=request.model,
@@ -351,7 +403,12 @@ class BedrockProvider(ModelProvider):
             effective_service_tier=effective_tier,
         )
 
+    @detach_provider_stream_traceback
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        client: Any = None
+        cancellation: asyncio.CancelledError | None = None
+        overflow_failure: BedrockContextOverflowError | None = None
+        error_event: ModelStreamEvent | None = None
         try:
             payload = build_bedrock_converse_payload(request, default_max_tokens=self.max_tokens)
             client = await self._get_client()
@@ -363,17 +420,27 @@ class BedrockProvider(ModelProvider):
             )
             async for event in bedrock_converse_stream_events(raw_events):
                 yield event
-        except ModelContextOverflowError:
-            raise
-        except Exception as exc:
-            wrapped = _bedrock_error_from_exception(exc)
-            if isinstance(wrapped, ModelContextOverflowError):
-                raise wrapped from exc
-            yield ModelStreamEvent.error(
-                exception_message(wrapped, provider_label="Bedrock"),
-                cause=wrapped,
+        except asyncio.CancelledError as exc:
+            cancellation = sanitize_provider_cancellation(
+                exc,
+                provider_label="Bedrock",
+                credential_values=(),
             )
+        except Exception as exc:
+            safe = _credential_safe_bedrock_error(_bedrock_error_from_exception(exc))
+            if isinstance(safe, BedrockContextOverflowError):
+                overflow_failure = safe
+            else:
+                error_event = ModelStreamEvent.error(str(safe), cause=safe)
+        client = None
+        if cancellation is not None:
+            raise cancellation from None
+        if overflow_failure is not None:
+            raise overflow_failure from None
+        if error_event is not None:
+            yield error_event
 
+    @detach_provider_call_traceback
     async def count_input_tokens(self, request: ModelRequest) -> InputTokenCountResult | None:
         payload = build_bedrock_converse_payload(request, default_max_tokens=self.max_tokens)
         model_id = payload.pop("modelId")
@@ -382,6 +449,10 @@ class BedrockProvider(ModelProvider):
             for key in ("messages", "system", "toolConfig", "additionalModelRequestFields")
             if key in payload
         }
+        response: Mapping[str, Any] | None = None
+        client: Any = None
+        cancellation: asyncio.CancelledError | None = None
+        failure: BedrockError | ModelProviderError | None = None
         try:
             client = await self._get_client()
             response = await asyncio.to_thread(
@@ -389,10 +460,21 @@ class BedrockProvider(ModelProvider):
                 modelId=model_id,
                 input={"converse": count_input},
             )
+        except asyncio.CancelledError as exc:
+            cancellation = sanitize_provider_cancellation(
+                exc,
+                provider_label="Bedrock",
+                credential_values=(),
+            )
         except Exception as exc:
             if _is_count_tokens_unsupported(exc):
                 return None
-            raise _bedrock_error_from_exception(exc) from exc
+            failure = _credential_safe_bedrock_error(_bedrock_error_from_exception(exc))
+        client = None
+        if cancellation is not None:
+            raise cancellation from None
+        if failure is not None:
+            raise failure from None
         input_tokens = response.get("inputTokens") if isinstance(response, Mapping) else None
         if type(input_tokens) is not int or input_tokens < 0:
             raise BedrockProtocolError("Bedrock CountTokens returned invalid inputTokens.")
@@ -440,6 +522,60 @@ class BedrockProvider(ModelProvider):
             if callable(close):
                 close()
             self._client = None
+
+
+def _credential_safe_bedrock_error(
+    error: Exception,
+) -> BedrockError | ModelProviderError:
+    """Clone a Bedrock failure without retaining ambient AWS credential text.
+
+    Bedrock credentials are resolved by botocore and may refresh while a request
+    is active, so the adapter cannot maintain a complete value list to redact.
+    Preserve only numeric/boolean provider metadata and the concrete Cayu error
+    classification.  All provider-controlled strings are deliberately dropped.
+    """
+
+    source = error if isinstance(error, ModelProviderError) else None
+    common: dict[str, Any] = {
+        "status_code": source.status_code if source is not None else None,
+        "error_type": _safe_bedrock_structured_field(source.error_type)
+        if source is not None
+        else None,
+        "error_code": _safe_bedrock_structured_field(source.error_code)
+        if source is not None
+        else None,
+        "request_id": None,
+        "response_body": None,
+    }
+    if isinstance(error, ModelContextOverflowError):
+        return BedrockContextOverflowError(
+            "Bedrock model context window exceeded",
+            **common,
+        )
+    if isinstance(error, BedrockProtocolError):
+        return BedrockProtocolError("Bedrock provider protocol failure")
+    if isinstance(error, BedrockAPIError):
+        assert source is not None
+        return BedrockAPIError(
+            "Bedrock provider failed",
+            **common,
+            retryable=source.retryable,
+            retry_after_s=source.retry_after_s,
+        )
+    if isinstance(error, BedrockError):
+        return BedrockError("Bedrock provider failed")
+    return BedrockAPIError(
+        f"{type(error).__name__}: Bedrock provider failed",
+        **common,
+        retryable=source.retryable if source is not None else None,
+        retry_after_s=source.retry_after_s if source is not None else None,
+    )
+
+
+def _safe_bedrock_structured_field(value: str | None) -> str | None:
+    """Retain only explicitly recognized provider classification fields."""
+
+    return value if value in _SAFE_BEDROCK_STRUCTURED_FIELDS else None
 
 
 def build_bedrock_converse_payload(

@@ -6,14 +6,20 @@ from collections.abc import AsyncIterator, Mapping
 from typing import TYPE_CHECKING, Any, Protocol
 
 from cayu._validation import require_clean_nonblank
+from cayu.providers._credential_boundary import (
+    detach_provider_call_traceback,
+    detach_provider_stream_traceback,
+)
 from cayu.providers._http import (
     SharedAsyncClient,
     aclose_transport,
-    exception_message,
+    credential_safe_error_event,
+    credential_safe_provider_exception,
     json_error_text,
     optional_error_string,
     post_json,
     safe_error_response_text,
+    sanitize_provider_cancellation,
     stream_sse_json_events,
     truncate_error_text,
     validate_base_url,
@@ -308,10 +314,15 @@ class VertexProvider(ModelProvider):
         """Close the transport's shared HTTP client, if it owns one."""
         await aclose_transport(self.transport)
 
+    @detach_provider_stream_traceback
     async def stream(
         self,
         request: ModelRequest,
     ) -> AsyncIterator[ModelStreamEvent]:
+        token: str | None = None
+        cancellation: asyncio.CancelledError | None = None
+        overflow_failure: VertexContextOverflowError | None = None
+        error_event: ModelStreamEvent | None = None
         try:
             payload = build_anthropic_payload(
                 request,
@@ -350,16 +361,44 @@ class VertexProvider(ModelProvider):
                 )
                 async for event in events:
                     yield event
-        except ModelContextOverflowError:
+        except asyncio.CancelledError as exc:
+            cancellation = sanitize_provider_cancellation(
+                exc,
+                provider_label="Vertex",
+                credential_values=(token,) if token is not None else (),
+            )
+        except ModelContextOverflowError as exc:
             # Overflow must reach runtime recovery as a typed exception; an
             # error event would flatten it into unrecoverable message text.
-            raise
-        except Exception as exc:
-            yield ModelStreamEvent.error(
-                exception_message(exc, provider_label="Vertex"),
-                cause=exc,
+            safe = credential_safe_provider_exception(
+                exc,
+                provider_label="Vertex",
+                provider_name="vertex",
+                credential_values=(token,) if token is not None else (),
             )
+            overflow_failure = VertexContextOverflowError(
+                str(safe),
+                status_code=safe.status_code,
+                error_type=safe.error_type,
+                error_code=safe.error_code,
+                request_id=safe.request_id,
+                response_body=None,
+            )
+        except Exception as exc:
+            error_event = credential_safe_error_event(
+                exc,
+                provider_label="Vertex",
+                credential_values=(token,) if token is not None else (),
+            )
+        token = None
+        if cancellation is not None:
+            raise cancellation from None
+        if overflow_failure is not None:
+            raise overflow_failure from None
+        if error_event is not None:
+            yield error_event
 
+    @detach_provider_call_traceback
     async def count_input_tokens(
         self,
         request: ModelRequest,
@@ -379,13 +418,7 @@ class VertexProvider(ModelProvider):
             default_max_tokens=self.max_tokens,
         )
         payload["anthropic_version"] = self.anthropic_version
-        token = await self._access_token()
-        response = await count_transport(
-            url=self._endpoint("count-tokens"),
-            headers=self._request_headers(token),
-            payload=payload,
-            timeout_s=self.timeout_s,
-        )
+        response = await self._safe_count_message_tokens(count_transport, payload)
         return InputTokenCountResult(
             input_tokens=_vertex_input_tokens_from_count_response(response),
             method=InputTokenCountMethod.OFFICIAL,
@@ -395,6 +428,62 @@ class VertexProvider(ModelProvider):
                 "provider_billing_status": "not_documented",
             },
         )
+
+    async def _safe_count_message_tokens(
+        self,
+        count_transport: Any,
+        payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        token: str | None = None
+        cancellation: asyncio.CancelledError | None = None
+        failure: ModelProviderError | None = None
+        try:
+            token = await self._access_token()
+            return await count_transport(
+                url=self._endpoint("count-tokens"),
+                headers=self._request_headers(token),
+                payload=payload,
+                timeout_s=self.timeout_s,
+            )
+        except asyncio.CancelledError as exc:
+            cancellation = sanitize_provider_cancellation(
+                exc,
+                provider_label="Vertex",
+                credential_values=(token,) if token is not None else (),
+            )
+        except Exception as exc:
+            safe = credential_safe_provider_exception(
+                exc,
+                provider_label="Vertex",
+                provider_name="vertex",
+                credential_values=(token,) if token is not None else (),
+            )
+            if isinstance(safe, ModelContextOverflowError):
+                failure = VertexContextOverflowError(
+                    str(safe),
+                    status_code=safe.status_code,
+                    error_type=safe.error_type,
+                    error_code=safe.error_code,
+                    request_id=safe.request_id,
+                    response_body=None,
+                )
+            else:
+                failure = VertexAPIError(
+                    str(safe),
+                    status_code=safe.status_code,
+                    error_type=safe.error_type,
+                    error_code=safe.error_code,
+                    request_id=safe.request_id,
+                    retryable=safe.retryable,
+                    retry_after_s=safe.retry_after_s,
+                    response_body=None,
+                )
+        token = None
+        if cancellation is not None:
+            raise cancellation
+        if failure is None:  # pragma: no cover - the try branch returns
+            raise AssertionError("Vertex count failure was not captured")
+        raise failure
 
     def _endpoint(self, model: str, *, verb: str = "rawPredict") -> str:
         model = require_clean_nonblank(model, "model")

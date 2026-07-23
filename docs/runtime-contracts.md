@@ -2402,6 +2402,81 @@ path can currently be attempted, and live verification records an observed,
 time-bounded proof. None of these weaker facts may be reported as a stronger
 one.
 
+### Model-provider credentials and workload credentials
+
+Cayu separates two authority domains:
+
+- A **model-provider credential** authorizes Cayu's trusted host process to call
+  a `ModelProvider` or refresh that provider's authentication. API keys,
+  subscription OAuth access and refresh tokens, cloud-provider model
+  credentials, account identifiers, and provider authorization headers belong
+  here. This authority is non-delegable by default.
+- A **workload credential** is authority that the application deliberately
+  grants to a tool, runner, broker, or integration through `Vault`,
+  `SecretResolver`, `secret_env`, a trusted tool, or virtual egress. Its selected
+  `CredentialMode` states whether the workload possesses the real value.
+
+The invariant is `model-provider authority != workload authority`. Registering,
+selecting, or using a provider never implies workload delegation. Matching
+names, shared host environment variables, or a common auth-store location do
+not bridge these domains. An application may explicitly configure a separate
+workload credential, including one backed by the same external identity, but
+Cayu does not infer that grant.
+
+The supported provider path is narrowly host-side:
+
+```text
+host auth source
+  -> provider credential loader or refresh coordinator
+  -> ModelProvider request transport
+  -> provider Authorization boundary
+```
+
+Provider authority must not enter tool arguments or `ToolContext`, runner
+`env`/`secret_env`, workspace files or mounts, environment-factory or reconnect
+metadata, virtual credentials, manifests, task/session/event payloads, captured
+results, artifacts, logs, or public exceptions. Isolated runners construct
+guest environments and mounts from explicit inputs. Host-side runner helper
+subprocesses use operational allowlists rather than inheriting arbitrary parent
+environment values. Provider error projection is allowlisted and credential
+safe; redaction is defense in depth after the non-possession boundary, not a
+substitute for it.
+
+The Docker CLI receives a fixed operational allowlist by default. Applications
+whose private-registry or daemon credential helper needs other host variables
+may name them explicitly with `DockerRunner(...,
+docker_cli_env_allowlist=(...))` or the matching `create()` argument. This is a
+trusted host-side authority grant: the values are read from the host environment
+for Docker CLI operations, are never inferred from provider registration or
+model-controlled command input, and are never added to the guest environment.
+`DockerEgressAdapter` accepts the same argument and applies it to sidecar,
+network, and workload-runner Docker operations.
+
+`cayu.testing.verify_provider_credential_isolation(...)` is the deterministic
+deployment-readiness seam for this contract. It accepts trusted-only canaries,
+passes unrelated operational and intentional workload values as positive
+controls, and gives the guest only safe canary labels and one-way fingerprints.
+The guest compares each fingerprint and content-free canary length against
+complete environment values and same-length substrings before any runner result
+redaction, then returns only matching labels. This detects credentials embedded
+inside authorization headers or other longer values without sending the
+credential itself to the guest. A separate non-secret detector control makes a
+missing or non-executed detector fail closed, so post-execution redaction cannot
+turn possession into successful evidence. The probe recursively checks the
+actual guest home/current workspace plus
+caller-labeled mounted workspace roots for
+`auth.json` stores at arbitrary `CAYU_HOME`-compatible locations and common AWS
+and Google Cloud credential files, follows bounded directory symlinks with
+cycle detection, and inspects returned stdout, stderr, and artifacts. Callers use
+`guest_cwd` and `guest_auth_search_paths` to cover adapter-specific working
+directories and mount destinations; evidence retains only the safe search
+labels, canary labels, and exercised projections. An incomplete filesystem
+search fails closed, including a missing caller-declared root or an
+untraversable symlink, and auth-file contents are never opened.
+The guest must provide `python3`; inability to execute the probe or complete its
+bounded directory scan fails verification rather than producing partial
+evidence.
+
 `system_execution_mode` declares whether `exec_system()` intentionally shares
 the ordinary `exec()` lane (`shared`) or selects a separate control-plane lane
 (`separate`). Shared mode does not claim elevated privileges; it means that the
@@ -2434,7 +2509,14 @@ A cleanup artifact with `status="completed"` is a claim that the selected cleanu
 Cancellation re-raises the original `asyncio.CancelledError` with cleanup diagnostics attached. Timeout returns an honest partial `ExecResult`: captured output and total byte counts reflect what the runner actually observed, and a synthetic exit code must not replace a backend final snapshot when that snapshot can be fetched within the cleanup deadline. `close()` is bounded, idempotent, and terminal for execution.
 
 Remote runners may talk to a runner service inside EC2/ECS/Daytona/etc.
-`LocalRunner` is available for development and trusted local execution. It is not a sandbox. By default it inherits the parent process environment and overlays any explicit `env` values; set `inherit_env=False` when commands should only receive the explicit environment passed to the runner.
+`LocalRunner` is available for development and trusted local execution. It is
+not a sandbox. Its default `inherit_env=False` child environment contains only
+a small operational allowlist plus explicit `env` and deliberately configured
+workload credentials. `inherit_env=True` is an explicit trusted-user opt-in that
+copies the full parent environment and can expose provider credentials. Even in
+the default mode, local commands run as the host user and may read absolute
+paths permitted by the operating system, so Cayu reports only environment
+minimization—not provider-credential or filesystem isolation—for `LocalRunner`.
 
 `DockerRunner` is available for explicitly selected Docker container execution
 in trusted development, CI, conformance, and packaging workflows. A container

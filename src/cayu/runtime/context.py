@@ -39,8 +39,6 @@ from cayu.artifacts import (
 from cayu.core.agents import AgentSpec
 from cayu.core.billing import (
     BillingIdentity,
-    completed_billing_identity,
-    copy_billing_identity,
 )
 from cayu.core.events import EventType
 from cayu.core.messages import (
@@ -64,7 +62,12 @@ from cayu.providers.base import (
     ModelStreamEventType,
     copy_model_stream_event,
 )
-from cayu.runtime._model_errors import model_provider_error_from_payload
+from cayu.runtime._model_errors import (
+    detach_billing_identity_cancellation,
+    model_provider_error_from_payload,
+    resolve_completion_billing_identity,
+    resolve_request_billing_identity,
+)
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy, retry_decision
 from cayu.runtime.sessions import Session
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
@@ -2179,6 +2182,10 @@ _AUTOMATIC_COMPACTION_DISPATCH_RUNNER: ContextVar[_AutomaticCompactionDispatchRu
         default=None,
     )
 )
+_DEFER_BILLING_IDENTITY_CANCELLATION: ContextVar[bool] = ContextVar(
+    "defer_billing_identity_cancellation",
+    default=False,
+)
 
 
 @contextmanager
@@ -2201,6 +2208,17 @@ def _automatic_compaction_dispatch_runner_scope(
         yield
     finally:
         _AUTOMATIC_COMPACTION_DISPATCH_RUNNER.reset(token)
+
+
+@contextmanager
+def _defer_billing_identity_cancellation_scope() -> Iterator[None]:
+    """Keep private billing markers intact until a provider-free runtime boundary."""
+
+    token = _DEFER_BILLING_IDENTITY_CANCELLATION.set(True)
+    try:
+        yield
+    finally:
+        _DEFER_BILLING_IDENTITY_CANCELLATION.reset(token)
 
 
 class TranscriptDigestCompactor(ContextCompactor):
@@ -3349,45 +3367,42 @@ async def _run_compaction_model(
     compactor: str,
     observe_completion: Callable[[dict[str, Any]], dict[str, Any]],
 ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+    runtime_dispatch_boundary = _DEFER_BILLING_IDENTITY_CANCELLATION.get()
+    billing_identity: BillingIdentity | None = None
+    billing_cancellation: asyncio.CancelledError | None = None
+    billing_failure: ModelProviderError | None = None
     try:
-        billing_identity = copy_billing_identity(
-            await provider.billing_identity_for_request(model_request)
+        billing_identity = await resolve_request_billing_identity(
+            provider,
+            model_request,
+            provider_name=provider.name,
         )
-    except asyncio.CancelledError:
-        raise
-    except ModelProviderError:
-        raise
-    except Exception as exc:
-        raise ModelProviderError(
-            str(exc),
-            provider=provider.name,
-            error_type=type(exc).__name__,
-            error_code="billing_identity_resolution_failed",
-            retryable=False,
-        ) from exc
+    except asyncio.CancelledError as exc:
+        billing_cancellation = detach_billing_identity_cancellation(exc)
+        if billing_cancellation is None:
+            raise
+        if runtime_dispatch_boundary:
+            del provider
+            raise
+    except ModelProviderError as exc:
+        billing_failure = exc
+    if billing_cancellation is not None:
+        del provider
+        raise billing_cancellation
+    if billing_failure is not None:
+        del provider
+        raise billing_failure
 
     def observe_completion_with_billing_identity(
         completed_metadata: dict[str, Any],
     ) -> dict[str, Any]:
         observed_metadata = copy_json_value(completed_metadata, "completed_metadata")
-        try:
-            completed_identity = completed_billing_identity(
-                billing_identity,
-                provider.billing_identity_for_completion(
-                    billing_identity,
-                    observed_metadata,
-                ),
-            )
-        except ModelProviderError:
-            raise
-        except Exception as exc:
-            raise ModelProviderError(
-                str(exc),
-                provider=provider.name,
-                error_type=type(exc).__name__,
-                error_code="billing_identity_resolution_failed",
-                retryable=False,
-            ) from exc
+        completed_identity = resolve_completion_billing_identity(
+            provider,
+            billing_identity,
+            observed_metadata,
+            provider_name=provider.name,
+        )
         # Billing identity is runtime-owned. Providers may report facts used by the
         # hook above, but cannot inject an identity through their raw payload.
         observed_metadata.pop("billing_identity", None)
@@ -3426,6 +3441,7 @@ async def _run_compaction_model(
         while True:
             dispatch_started = False
             attempt_completion_index = len(completion_ledger.completed_payloads)
+            billing_dispatch_cancellation: asyncio.CancelledError | None = None
             try:
                 run_dispatch = _AUTOMATIC_COMPACTION_DISPATCH_RUNNER.get()
                 if run_dispatch is None:
@@ -3525,7 +3541,16 @@ async def _run_compaction_model(
                             # after durable cleanup. Do not let that duplicate
                             # signal overwrite the original cancellation's
                             # authoritative settlement/provider cause.
+                            public_cancellation = detach_billing_identity_cancellation(exc)
+                            if public_cancellation is not None:
+                                if runtime_dispatch_boundary:
+                                    del provider
+                                    raise exc from exc.__cause__
+                                del provider
+                                raise public_cancellation from None
+                            del provider
                             raise exc from exc.__cause__
+                        del provider
                         raise publication_cancellation from exc
                     except Exception as publication_error:
                         if isinstance(exc, ModelProviderError):
@@ -3534,22 +3559,34 @@ async def _run_compaction_model(
                             "Compaction provider failure evidence publication also failed: "
                             f"{type(publication_error).__name__}: {publication_error}"
                         )
+                        del provider
                         raise exc from publication_error
-                if not isinstance(exc, ModelProviderError):
-                    raise
-                decision = retry_decision(
-                    policy=retry_policy,
-                    attempt=attempt,
-                    error=str(exc),
-                    status_code=exc.status_code,
-                    retryable=exc.retryable,
-                    retry_after_s=exc.retry_after_s,
-                )
-                if not decision.retry or decision.next_attempt is None:
-                    raise
-                if decision.delay_seconds > 0:
-                    await asyncio.sleep(decision.delay_seconds)
-                attempt = decision.next_attempt
+                if isinstance(exc, asyncio.CancelledError):
+                    billing_dispatch_cancellation = detach_billing_identity_cancellation(exc)
+                    if billing_dispatch_cancellation is not None and runtime_dispatch_boundary:
+                        del provider
+                        raise
+                if billing_dispatch_cancellation is None:
+                    if not isinstance(exc, ModelProviderError):
+                        del provider
+                        raise
+                    decision = retry_decision(
+                        policy=retry_policy,
+                        attempt=attempt,
+                        error=str(exc),
+                        status_code=exc.status_code,
+                        retryable=exc.retryable,
+                        retry_after_s=exc.retry_after_s,
+                    )
+                    if not decision.retry or decision.next_attempt is None:
+                        del provider
+                        raise
+                    if decision.delay_seconds > 0:
+                        await asyncio.sleep(decision.delay_seconds)
+                    attempt = decision.next_attempt
+            if billing_dispatch_cancellation is not None:
+                del provider
+                raise billing_dispatch_cancellation
     finally:
         if completion_ledger_token is not None:
             _COMPACTION_COMPLETION_LEDGER.reset(completion_ledger_token)
@@ -3601,6 +3638,7 @@ async def _stream_compaction_model(
             )
         raise
     except Exception as exc:
+        del provider
         if tool_call_seen:
             completed_metadata = None if completed_payload is None else completed_payload
             raise _CompactionToolCallError(completed_metadata=completed_metadata) from exc

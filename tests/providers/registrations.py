@@ -1353,7 +1353,7 @@ _ERROR_FIELDS = {
     "status_code": 429,
     "error_type": "rate_limit_error",
     "error_code": "rate_limit_exceeded",
-    "request_id": "req-conformance",
+    "request_id": "123e4567-e89b-42d3-a456-426614174101",
     "retryable": True,
     "retry_after_s": 0.25,
 }
@@ -1361,7 +1361,7 @@ _OVERFLOW_FIELDS = {
     "status_code": 400,
     "error_type": "invalid_request_error",
     "error_code": "context_length_exceeded",
-    "request_id": "req-overflow",
+    "request_id": "123e4567-e89b-42d3-a456-426614174102",
 }
 
 
@@ -1452,6 +1452,7 @@ BEDROCK = ProviderConformanceRegistration(
         provider_cache_observation=CapabilityClaim.supported(),
     ),
     reports_model_identity=False,
+    projects_request_ids=False,
 )
 
 REGISTRATIONS = (

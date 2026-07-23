@@ -6,6 +6,7 @@ import json
 import math
 import threading
 import time
+import traceback
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -16,6 +17,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from pydantic import ValidationError
+from tests.provider_traceback_assertions import is_cayu_source_filename
 
 import cayu.runtime._environment_lifecycle as environment_lifecycle_module
 import cayu.runtime._model_step_executor as model_step_executor_module
@@ -65,6 +67,7 @@ from cayu.environments import (
     WorkspaceSnapshot,
 )
 from cayu.providers import (
+    BedrockProvider,
     ChatCompletionsProvider,
     InputTokenCountConfidence,
     InputTokenCountMethod,
@@ -198,6 +201,10 @@ from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime._binding_cleanup import (
     binding_cleanup_status,
     record_binding_cleanup_failure,
+)
+from cayu.runtime._model_errors import (
+    _BillingIdentityResolutionCancelled,
+    detach_billing_identity_cancellation_group,
 )
 from cayu.runtime._session_engine import _require_native_structured_output_support
 from cayu.runtime.context import (
@@ -10354,7 +10361,8 @@ def test_cayu_app_rejects_completion_billing_identity_rewrite_without_budget() -
     assert len(provider.requests) == 1
     assert EventType.MODEL_COMPLETED not in [event.type for event in events]
     error = next(event for event in events if event.type == EventType.MODEL_ERROR)
-    assert "conflicts with request identity" in error.payload["error"]
+    assert error.payload["error"] == "Model provider billing identity resolution failed"
+    assert error.payload["provider_error_code"] == "billing_identity_resolution_failed"
     assert events[-1].type == EventType.SESSION_FAILED
 
 
@@ -10695,6 +10703,186 @@ def test_cayu_app_records_billing_identity_resolution_failure_as_model_error() -
     assert model_error.payload["stage"] == "billing_identity_for_request"
     assert model_error.payload["provider_error_code"] == "billing_identity_resolution_failed"
     assert model_error.payload["retryable"] is False
+    assert events[-1].type == EventType.SESSION_FAILED
+
+
+@pytest.mark.parametrize("stage", ["request", "completion"])
+@pytest.mark.parametrize("typed", [False, True], ids=["plain", "typed"])
+def test_cayu_app_drops_custom_billing_hook_credentials(
+    stage: str,
+    typed: bool,
+) -> None:
+    canary = f"provider-custom-billing-{stage}-{typed}-canary-0123456789"
+
+    def credential_failure() -> Exception:
+        if typed:
+            error: Exception = ModelProviderError(
+                f"credential resolver failed near {canary}",
+                provider=canary,
+                status_code=401,
+                error_type=canary,
+                error_code=canary,
+                request_id=canary,
+                retryable=False,
+                response_body=canary,
+            )
+        else:
+            error = RuntimeError(f"credential resolver failed near {canary}")
+        error.headers = {"Authorization": canary}  # type: ignore[attr-defined]
+        error.add_note(f"resolver retained {canary}")
+        return error
+
+    class FailingBillingProvider(FakeProvider):
+        async def billing_identity_for_request(
+            self,
+            request: ModelRequest,
+        ) -> BillingIdentity | None:
+            if stage == "request":
+                raise credential_failure()
+            return None
+
+        def billing_identity_for_completion(
+            self,
+            identity: BillingIdentity | None,
+            payload: dict[str, Any],
+        ) -> BillingIdentity | None:
+            if stage == "completion":
+                raise credential_failure()
+            return identity
+
+    provider = FailingBillingProvider(
+        [ModelStreamEvent.completed({"usage": {"input_tokens": 1, "output_tokens": 0}})]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=f"sess_custom_billing_{stage}_{typed}",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    retained = json.dumps([event.model_dump(mode="json") for event in events], sort_keys=True)
+    assert canary not in retained
+    model_error = next(event for event in events if event.type == EventType.MODEL_ERROR)
+    assert model_error.payload["stage"] == f"billing_identity_for_{stage}"
+    assert model_error.payload["error"] == "Model provider billing identity resolution failed"
+    assert model_error.payload["provider"] == "fake"
+    assert model_error.payload["provider_error_type"] == "BillingIdentityResolutionError"
+    assert model_error.payload["provider_error_code"] == "billing_identity_resolution_failed"
+    assert events[-1].type == EventType.SESSION_FAILED
+
+
+@pytest.mark.parametrize("stage", ["request", "completion"])
+def test_cayu_app_drops_custom_billing_hook_cancellation_credentials(stage: str) -> None:
+    canary = f"provider-custom-billing-cancel-{stage}-canary-0123456789"
+
+    def credential_cancellation() -> asyncio.CancelledError:
+        cancellation = asyncio.CancelledError(f"cancelled near {canary}")
+        cancellation.headers = {"Authorization": canary}  # type: ignore[attr-defined]
+        cancellation.add_note(f"resolver retained {canary}")
+        return cancellation
+
+    class CancellingBillingProvider(FakeProvider):
+        def __repr__(self) -> str:
+            return f"CancellingBillingProvider(api_key={canary!r})"
+
+        async def billing_identity_for_request(
+            self,
+            request: ModelRequest,
+        ) -> BillingIdentity | None:
+            if stage == "request":
+                raise credential_cancellation()
+            return None
+
+        def billing_identity_for_completion(
+            self,
+            identity: BillingIdentity | None,
+            payload: dict[str, Any],
+        ) -> BillingIdentity | None:
+            if stage == "completion":
+                raise credential_cancellation()
+            return identity
+
+    provider = CancellingBillingProvider(
+        [ModelStreamEvent.completed({"usage": {"input_tokens": 1, "output_tokens": 0}})]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        asyncio.run(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=f"sess_custom_billing_cancel_{stage}",
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+
+    retained = str(exc_info.value) + repr(exc_info.value) + repr(vars(exc_info.value))
+    assert retained == (
+        "Model provider billing identity resolution cancelled"
+        "CancelledError('Model provider billing identity resolution cancelled'){}"
+    )
+    assert canary not in retained
+    captured = traceback.TracebackException.from_exception(
+        exc_info.value,
+        capture_locals=True,
+    )
+    cayu_frames = [frame for frame in captured.stack if is_cayu_source_filename(frame.filename)]
+    leaking_locals = [
+        (frame.name, name)
+        for frame in cayu_frames
+        for name, value in (frame.locals or {}).items()
+        if canary in value
+    ]
+    assert leaking_locals == []
+    assert all(not frame.name.startswith("billing_identity_for_") for frame in captured.stack)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+def test_cayu_app_never_persists_bedrock_credential_resolution_failure() -> None:
+    canary = "provider-bedrock-billing-canary-0123456789"
+
+    class FailingBillingProvider(BedrockProvider):
+        async def _get_client(self) -> Any:
+            error = RuntimeError(f"AWS credential resolution failed near {canary}")
+            error.headers = {"Authorization": canary}
+            error.add_note(f"resolver retained {canary}")
+            raise error
+
+    app = CayuApp(enable_logging=False)
+    app.register_provider(FailingBillingProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="anthropic.claude-test"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_bedrock_billing_credential_failure",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    retained = json.dumps([event.model_dump(mode="json") for event in events], sort_keys=True)
+    assert canary not in retained
+    model_error = next(event for event in events if event.type == EventType.MODEL_ERROR)
+    assert model_error.payload["stage"] == "billing_identity_for_request"
+    assert model_error.payload["error"] == "Model provider billing identity resolution failed"
+    assert model_error.payload["provider_error_code"] == "billing_identity_resolution_failed"
     assert events[-1].type == EventType.SESSION_FAILED
 
 
@@ -11385,6 +11573,423 @@ def test_automatic_compaction_request_budget_prices_compactor_model_before_dispa
     )
     assert EventType.MODEL_COMPLETED not in {event.type for event in events}
     assert events[-1].type == EventType.SESSION_INTERRUPTED
+
+
+@pytest.mark.parametrize("stage", ["request", "completion"])
+@pytest.mark.parametrize("typed", [False, True], ids=["plain", "typed"])
+def test_model_compactor_drops_custom_billing_hook_credentials(
+    stage: str,
+    typed: bool,
+) -> None:
+    canary = f"provider-compaction-billing-{stage}-{typed}-canary-0123456789"
+
+    def credential_failure() -> Exception:
+        if typed:
+            error: Exception = ModelProviderError(
+                f"credential resolver failed near {canary}",
+                provider=canary,
+                status_code=401,
+                error_type=canary,
+                error_code=canary,
+                request_id=canary,
+                retryable=False,
+                response_body=canary,
+            )
+        else:
+            error = RuntimeError(f"credential resolver failed near {canary}")
+        error.headers = {"Authorization": canary}  # type: ignore[attr-defined]
+        error.add_note(f"resolver retained {canary}")
+        return error
+
+    class FailingCompactionProvider(FakeProvider):
+        def __repr__(self) -> str:
+            return f"FailingCompactionProvider(api_key={canary!r})"
+
+        async def billing_identity_for_request(
+            self,
+            request: ModelRequest,
+        ) -> BillingIdentity | None:
+            if stage == "request":
+                raise credential_failure()
+            return None
+
+        def billing_identity_for_completion(
+            self,
+            identity: BillingIdentity | None,
+            payload: dict[str, Any],
+        ) -> BillingIdentity | None:
+            if stage == "completion":
+                raise credential_failure()
+            return identity
+
+    provider = FailingCompactionProvider(
+        [
+            ModelStreamEvent.text_delta("summary"),
+            ModelStreamEvent.completed({"usage": {"input_tokens": 1, "output_tokens": 1}}),
+        ]
+    )
+    compactor = ModelCompactor(provider=provider, model="summary-model")
+
+    with pytest.raises(ModelProviderError) as exc_info:
+        asyncio.run(
+            compactor.compact(
+                CompactionRequest(
+                    session=_test_session(),
+                    agent=AgentSpec(name="assistant", model="fake-model"),
+                    messages=[Message.text("user", "old request")],
+                )
+            )
+        )
+
+    retained = str(exc_info.value) + repr(exc_info.value) + repr(vars(exc_info.value))
+    assert canary not in retained
+    assert str(exc_info.value) == "Model provider billing identity resolution failed"
+    assert exc_info.value.provider == "fake"
+    assert exc_info.value.error_type == "BillingIdentityResolutionError"
+    assert exc_info.value.error_code == "billing_identity_resolution_failed"
+    captured = traceback.TracebackException.from_exception(
+        exc_info.value,
+        capture_locals=True,
+    )
+    cayu_frames = [frame for frame in captured.stack if is_cayu_source_filename(frame.filename)]
+    leaking_locals = [
+        (frame.name, name)
+        for frame in cayu_frames
+        for name, value in (frame.locals or {}).items()
+        if canary in value
+    ]
+    assert leaking_locals == []
+    assert all(not frame.name.startswith("billing_identity_for_") for frame in captured.stack)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+@pytest.mark.parametrize("stage", ["request", "completion"])
+def test_model_compactor_drops_custom_billing_hook_cancellation_credentials(
+    stage: str,
+) -> None:
+    canary = f"provider-compaction-billing-cancel-{stage}-canary-0123456789"
+
+    class CancellingCompactionProvider(FakeProvider):
+        def __repr__(self) -> str:
+            return f"CancellingCompactionProvider(api_key={canary!r})"
+
+        async def billing_identity_for_request(
+            self,
+            request: ModelRequest,
+        ) -> BillingIdentity | None:
+            if stage == "request":
+                raise asyncio.CancelledError(f"cancelled near {canary}")
+            return None
+
+        def billing_identity_for_completion(
+            self,
+            identity: BillingIdentity | None,
+            payload: dict[str, Any],
+        ) -> BillingIdentity | None:
+            if stage == "completion":
+                raise asyncio.CancelledError(f"cancelled near {canary}")
+            return identity
+
+    provider = CancellingCompactionProvider(
+        [
+            ModelStreamEvent.text_delta("summary"),
+            ModelStreamEvent.completed({"usage": {"input_tokens": 1, "output_tokens": 1}}),
+        ]
+    )
+
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        asyncio.run(
+            ModelCompactor(provider=provider, model="summary-model").compact(
+                CompactionRequest(
+                    session=_test_session(),
+                    agent=AgentSpec(name="assistant", model="fake-model"),
+                    messages=[Message.text("user", "old request")],
+                )
+            )
+        )
+
+    retained = str(exc_info.value) + repr(exc_info.value) + repr(vars(exc_info.value))
+    assert retained == (
+        "Model provider billing identity resolution cancelled"
+        "CancelledError('Model provider billing identity resolution cancelled'){}"
+    )
+    assert canary not in retained
+    captured = traceback.TracebackException.from_exception(
+        exc_info.value,
+        capture_locals=True,
+    )
+    cayu_frames = [frame for frame in captured.stack if is_cayu_source_filename(frame.filename)]
+    leaking_locals = [
+        (frame.name, name)
+        for frame in cayu_frames
+        for name, value in (frame.locals or {}).items()
+        if canary in value
+    ]
+    assert leaking_locals == []
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+@pytest.mark.parametrize("stage", ["request", "completion"])
+def test_cayu_app_drops_automatic_compaction_billing_cancellation_credentials(
+    stage: str,
+) -> None:
+    canary = f"automatic-compaction-billing-cancel-{stage}-canary-0123456789"
+
+    class CancellingAutomaticCompactionProvider(FakeProvider):
+        def __repr__(self) -> str:
+            return f"CancellingAutomaticCompactionProvider(api_key={canary!r})"
+
+        async def billing_identity_for_request(
+            self,
+            request: ModelRequest,
+        ) -> BillingIdentity | None:
+            if stage == "request":
+                raise asyncio.CancelledError(f"cancelled near {canary}")
+            return None
+
+        def billing_identity_for_completion(
+            self,
+            identity: BillingIdentity | None,
+            payload: dict[str, Any],
+        ) -> BillingIdentity | None:
+            if stage == "completion":
+                raise asyncio.CancelledError(f"cancelled near {canary}")
+            return identity
+
+    provider = CancellingAutomaticCompactionProvider(
+        [
+            ModelStreamEvent.text_delta("summary"),
+            ModelStreamEvent.completed({"usage": {"input_tokens": 1, "output_tokens": 1}}),
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(provider=provider, model="summary-model"),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        asyncio.run(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=f"sess_automatic_compaction_billing_cancel_{stage}",
+                    messages=[
+                        Message.text("user", "old"),
+                        Message.text("assistant", "old answer"),
+                        Message.text("user", "current"),
+                    ],
+                ),
+            )
+        )
+
+    retained = str(exc_info.value) + repr(exc_info.value) + repr(vars(exc_info.value))
+    assert retained == (
+        "Model provider billing identity resolution cancelled"
+        "CancelledError('Model provider billing identity resolution cancelled'){}"
+    )
+    assert canary not in retained
+    captured = traceback.TracebackException.from_exception(
+        exc_info.value,
+        capture_locals=True,
+    )
+    cayu_frames = [frame for frame in captured.stack if is_cayu_source_filename(frame.filename)]
+    leaking_locals = [
+        (frame.name, name)
+        for frame in cayu_frames
+        for name, value in (frame.locals or {}).items()
+        if canary in value
+    ]
+    assert leaking_locals == []
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+def test_cayu_app_detaches_grouped_compaction_billing_cancellation_credentials() -> None:
+    canary = "automatic-compaction-grouped-cancel-canary-0123456789"
+
+    class CancellingCompactionProvider(FakeProvider):
+        def __repr__(self) -> str:
+            return f"CancellingCompactionProvider(api_key={canary!r})"
+
+        async def billing_identity_for_request(
+            self,
+            request: ModelRequest,
+        ) -> BillingIdentity | None:
+            raise asyncio.CancelledError(f"cancelled near {canary}")
+
+    provider = CancellingCompactionProvider([])
+    binding = RecordingWorkspaceBinding(
+        fail_finalize=True,
+        finalize_error=RuntimeError(f"cleanup failed near {canary}"),
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(EnvironmentSpec(name="local"), binding=binding),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(provider=provider, model="summary-model"),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    with pytest.raises(BaseExceptionGroup) as exc_info:
+        asyncio.run(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_automatic_compaction_grouped_billing_cancel",
+                    messages=[
+                        Message.text("user", "old"),
+                        Message.text("assistant", "old answer"),
+                        Message.text("user", "current"),
+                    ],
+                ),
+            )
+        )
+
+    def traceback_frames(
+        captured: traceback.TracebackException,
+    ) -> list[traceback.FrameSummary]:
+        frames = list(captured.stack)
+        for child in captured.exceptions or ():
+            frames.extend(traceback_frames(child))
+        return frames
+
+    retained = str(exc_info.value) + repr(exc_info.value) + repr(vars(exc_info.value))
+    assert canary not in retained
+    captured = traceback.TracebackException.from_exception(
+        exc_info.value,
+        capture_locals=True,
+    )
+    frames = traceback_frames(captured)
+    leaking_locals = [
+        (frame.name, name)
+        for frame in frames
+        if is_cayu_source_filename(frame.filename)
+        for name, value in (frame.locals or {}).items()
+        if canary in value
+    ]
+    assert leaking_locals == []
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    flattened = list(exc_info.value.exceptions)
+    assert any(isinstance(error, asyncio.CancelledError) for error in flattened)
+    assert any(isinstance(error, RuntimeError) for error in flattened)
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+def test_cayu_app_detaches_billing_cancellation_before_fallible_interruption_checks(
+    grouped: bool,
+) -> None:
+    canary = f"billing-cancellation-transition-failure-{grouped}-canary-0123456789"
+
+    class CredentialBearingProvider(FakeProvider):
+        def __repr__(self) -> str:
+            return f"CredentialBearingProvider(api_key={canary!r})"
+
+    provider = CredentialBearingProvider([])
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def failing_session(**kwargs: Any):
+        del kwargs
+        cancellation = _BillingIdentityResolutionCancelled(f"cancelled near {canary}")
+        if grouped:
+
+            async def fail_load(_session_id: str) -> Session | None:
+                raise RuntimeError(f"store load failed near {canary}")
+
+            app.session_store.load = fail_load  # type: ignore[method-assign]
+            raise BaseExceptionGroup(
+                "credential-bearing group",
+                [cancellation, RuntimeError(f"cleanup failed near {canary}")],
+            )
+        raise cancellation
+        yield
+
+    app._session_engine._run_session = failing_session  # type: ignore[method-assign]
+
+    if not grouped:
+
+        async def fail_interrupt_requested(_session_id: str) -> bool:
+            raise RuntimeError(f"interrupt check failed near {canary}")
+
+        app._session_control.interrupt_requested = (  # type: ignore[method-assign]
+            fail_interrupt_requested
+        )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        asyncio.run(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=f"sess_billing_cancellation_transition_failure_{grouped}",
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+
+    assert str(exc_info.value).startswith(
+        "Session interruption state "
+        + ("load" if grouped else "check")
+        + " failed after provider billing cancellation"
+    )
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    captured = traceback.TracebackException.from_exception(
+        exc_info.value,
+        capture_locals=True,
+    )
+    cayu_frames = [frame for frame in captured.stack if is_cayu_source_filename(frame.filename)]
+    assert canary not in repr([(frame.name, frame.locals) for frame in cayu_frames])
+
+
+@pytest.mark.parametrize("signal_type", [KeyboardInterrupt, SystemExit, GeneratorExit])
+def test_detached_billing_cancellation_group_preserves_fatal_signal_types(
+    signal_type: type[BaseException],
+) -> None:
+    canary = f"concurrent-{signal_type.__name__}-canary-0123456789"
+    original = BaseExceptionGroup(
+        "outer group",
+        [
+            _BillingIdentityResolutionCancelled(f"cancelled near {canary}"),
+            BaseExceptionGroup(
+                "nested group",
+                [
+                    signal_type(f"fatal signal near {canary}"),
+                ],
+            ),
+        ],
+    )
+
+    detached = detach_billing_identity_cancellation_group(original)
+
+    assert detached is not None
+    assert isinstance(detached.exceptions[0], asyncio.CancelledError)
+    nested = detached.exceptions[1]
+    assert isinstance(nested, BaseExceptionGroup)
+    fatal = next(child for child in nested.exceptions if isinstance(child, signal_type))
+    assert canary not in (str(fatal) + repr(fatal) + repr(vars(fatal)))
+    assert fatal.__traceback__ is None
+    assert fatal.__cause__ is None
+    assert fatal.__context__ is None
 
 
 @pytest.mark.parametrize("limit_source", ["policy", "request"])

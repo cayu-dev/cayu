@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections.abc import AsyncIterator, Callable, Mapping
@@ -22,16 +23,23 @@ from cayu.core.messages import (
     ToolResultPart,
 )
 from cayu.providers._api_keys import resolve_api_key
+from cayu.providers._credential_boundary import (
+    detach_provider_call_traceback,
+    detach_provider_stream_traceback,
+)
 from cayu.providers._http import (
     SharedAsyncClient,
     aclose_transport,
     copy_headers,
-    exception_message,
+    credential_safe_error_event,
+    credential_safe_provider_exception,
+    credential_sanitization_values,
     json_error_text,
     optional_error_string,
     post_json,
     response_json_object,
     safe_error_response_text,
+    sanitize_provider_cancellation,
     stream_sse_json_events,
     truncate_error_text,
     validate_base_url,
@@ -114,6 +122,10 @@ class AnthropicAPIError(AnthropicError, ModelProviderError):
             retry_after_s=retry_after_s,
             response_body=response_body,
         )
+
+
+class _AnthropicCredentialProxyDeniedError(AnthropicAPIError):
+    """Internal marker whose public projection is fixed and content-free."""
 
 
 class AnthropicContextOverflowError(AnthropicAPIError, ModelContextOverflowError):
@@ -366,12 +378,19 @@ class AnthropicProvider(ModelProvider):
         """Close the transport's shared HTTP client, if it owns one."""
         await aclose_transport(self.transport)
 
+    @detach_provider_stream_traceback
     async def stream(
         self,
         request: ModelRequest,
     ) -> AsyncIterator[ModelStreamEvent]:
+        resolved_api_key = self.api_key
+        headers: dict[str, str] | None = None
+        cancellation: asyncio.CancelledError | None = None
+        overflow_failure: AnthropicContextOverflowError | None = None
+        error_event: ModelStreamEvent | None = None
         try:
-            headers = self._headers(await self._resolve_api_key())
+            resolved_api_key = await self._resolve_api_key()
+            headers = self._headers(resolved_api_key)
             policy = resolve_cache_policy(self.cache_policy, request.options)
             payload = build_anthropic_payload(
                 request,
@@ -401,16 +420,59 @@ class AnthropicProvider(ModelProvider):
                 )
                 async for event in anthropic_stream_events(raw_events):
                     yield event
-        except ModelContextOverflowError:
+        except asyncio.CancelledError as exc:
+            cancellation = sanitize_provider_cancellation(
+                exc,
+                provider_label="Anthropic",
+                credential_values=credential_sanitization_values(
+                    resolved_api_key,
+                    extra_headers=self.extra_headers,
+                ),
+            )
+        except ModelContextOverflowError as exc:
             # Overflow must reach runtime recovery as a typed exception; an
             # error event would flatten it into unrecoverable message text.
-            raise
-        except Exception as exc:
-            yield ModelStreamEvent.error(
-                exception_message(exc, provider_label="Anthropic"),
-                cause=exc,
+            safe = credential_safe_provider_exception(
+                exc,
+                provider_label="Anthropic",
+                provider_name="anthropic",
+                credential_values=credential_sanitization_values(
+                    resolved_api_key,
+                    extra_headers=self.extra_headers,
+                ),
             )
+            overflow_failure = AnthropicContextOverflowError(
+                str(safe),
+                status_code=safe.status_code,
+                error_type=safe.error_type,
+                error_code=safe.error_code,
+                request_id=safe.request_id,
+                response_body=None,
+            )
+        except Exception as exc:
+            error_event = credential_safe_error_event(
+                exc,
+                provider_label="Anthropic",
+                credential_values=credential_sanitization_values(
+                    resolved_api_key,
+                    extra_headers=self.extra_headers,
+                ),
+                unresolved_message=(
+                    "Anthropic credential use denied by credential proxy."
+                    if isinstance(exc, _AnthropicCredentialProxyDeniedError)
+                    else None
+                ),
+            )
+        resolved_api_key = None
+        headers = None
+        if cancellation is not None:
+            raise cancellation from None
+        if overflow_failure is not None:
+            raise overflow_failure from None
+        if error_event is not None:
+            yield error_event
 
+    @detach_provider_call_traceback
     async def count_input_tokens(
         self,
         request: ModelRequest,
@@ -421,12 +483,7 @@ class AnthropicProvider(ModelProvider):
             default_max_tokens=self.max_tokens,
             cache_policy=policy,
         )
-        response = await self.transport.count_message_tokens(
-            url=f"{self.base_url}/v1/messages/count_tokens",
-            headers=self._headers(await self._resolve_api_key()),
-            payload=payload,
-            timeout_s=self.timeout_s,
-        )
+        response = await self._safe_count_message_tokens(payload)
         return InputTokenCountResult(
             input_tokens=_anthropic_input_tokens_from_count_response(response),
             method=InputTokenCountMethod.OFFICIAL,
@@ -437,6 +494,72 @@ class AnthropicProvider(ModelProvider):
                 "provider_rate_limit": "separate_rpm_limit",
             },
         )
+
+    async def _safe_count_message_tokens(
+        self,
+        payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        resolved_api_key = self.api_key
+        cancellation: asyncio.CancelledError | None = None
+        failure: ModelProviderError | None = None
+        try:
+            resolved_api_key = await self._resolve_api_key()
+            return await self.transport.count_message_tokens(
+                url=f"{self.base_url}/v1/messages/count_tokens",
+                headers=self._headers(resolved_api_key),
+                payload=payload,
+                timeout_s=self.timeout_s,
+            )
+        except asyncio.CancelledError as exc:
+            cancellation = sanitize_provider_cancellation(
+                exc,
+                provider_label="Anthropic",
+                credential_values=credential_sanitization_values(
+                    resolved_api_key,
+                    extra_headers=self.extra_headers,
+                ),
+            )
+        except Exception as exc:
+            safe = credential_safe_provider_exception(
+                exc,
+                provider_label="Anthropic",
+                provider_name="anthropic",
+                credential_values=credential_sanitization_values(
+                    resolved_api_key,
+                    extra_headers=self.extra_headers,
+                ),
+                safe_message=(
+                    "Anthropic credential use denied by credential proxy."
+                    if isinstance(exc, _AnthropicCredentialProxyDeniedError)
+                    else None
+                ),
+            )
+            if isinstance(safe, ModelContextOverflowError):
+                failure = AnthropicContextOverflowError(
+                    str(safe),
+                    status_code=safe.status_code,
+                    error_type=safe.error_type,
+                    error_code=safe.error_code,
+                    request_id=safe.request_id,
+                    response_body=None,
+                )
+            else:
+                failure = AnthropicAPIError(
+                    str(safe),
+                    status_code=safe.status_code,
+                    error_type=safe.error_type,
+                    error_code=safe.error_code,
+                    request_id=safe.request_id,
+                    retryable=safe.retryable,
+                    retry_after_s=safe.retry_after_s,
+                    response_body=None,
+                )
+        resolved_api_key = None
+        if cancellation is not None:
+            raise cancellation
+        if failure is None:  # pragma: no cover - the try branch returns
+            raise AssertionError("Anthropic count failure was not captured")
+        raise failure
 
     async def _resolve_api_key(self) -> str:
         """Return the API key from the configured credential source.
@@ -456,7 +579,7 @@ class AnthropicProvider(ModelProvider):
             action="anthropic.messages",
         )
         if not authorization.allowed:
-            raise AnthropicAPIError(
+            raise _AnthropicCredentialProxyDeniedError(
                 "Anthropic credential use denied by credential proxy for "
                 f"{self.base_url}: {authorization.reason}",
                 retryable=False,

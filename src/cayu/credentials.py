@@ -4,7 +4,7 @@ from enum import StrEnum
 
 
 class CredentialMode(StrEnum):
-    """How a provider credential is delivered to sandboxed workload code.
+    """How a workload credential is delivered to sandboxed workload code.
 
     The mode is a security contract, not a convenience flag. It records whether
     the real secret can be read by the agent/app process, so operators and audit

@@ -41,6 +41,29 @@ app.register_provider(OpenAISubscriptionProvider(), default=True)
 app.register_agent(AgentSpec(name="assistant", model="gpt-5.4"))
 ```
 
+## Execution security boundary
+
+The subscription access token, refresh token, and account identifier are
+**model-provider credentials**. They remain in the trusted Cayu process and
+authorize only `OpenAISubscriptionProvider` requests. Registering this provider
+does not add those values to a `Vault`, `SecretResolver`, runner environment,
+tool context, workspace, virtual-egress grant, manifest, or artifact. Configure
+workload credentials separately and explicitly when an agent integration needs
+authority of its own.
+
+For untrusted model-authored commands, use an isolated remote runner with
+explicit guest environment and mount inputs, such as a hardened E2B or
+Microsandbox deployment that has passed Cayu's provider-credential isolation
+probe. Do not copy `~/.cayu/auth.json`, `CAYU_HOME`, your host home, or provider
+key variables into the sandbox or image.
+
+`LocalRunner` is for trusted local execution. Its default minimized child
+environment does not inherit arbitrary provider variables, but it is not a
+filesystem security boundary: the command still runs as your host user and may
+read paths that user can access. `LocalRunner(inherit_env=True)` explicitly
+copies the full host environment and can expose provider credentials. Never use
+that opt-in as an isolation claim for untrusted code.
+
 Model availability belongs to the user's subscription and may change. A model
 accepted by the OpenAI Platform API is not necessarily available through the
 subscription backend. Generated projects select `gpt-5.4` in subscription mode;

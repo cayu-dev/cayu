@@ -46,7 +46,7 @@ from cayu.environments import (
 )
 from cayu.environments.bindings import BoundWorkspace, WorkspaceBinding
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runners import LambdaMicroVMRunner
+from cayu.runners import LambdaMicroVMRunner, LocalRunner
 from cayu.runners.base import ExecCommand, ExecResult, Runner
 from cayu.runtime import CayuApp, InMemorySessionStore, RunRequest
 from cayu.runtime._environment_lifecycle import (
@@ -76,6 +76,7 @@ from cayu.runtime.egress import (
     VirtualEgressEnvironmentFactory,
     _await_cleanup_task,
 )
+from cayu.testing import verify_provider_credential_isolation
 
 REAL_SECRET = "sk_test_51FactoryRealSecret"
 POLICY_NAME = "provider-example"
@@ -491,6 +492,44 @@ class _FakeDockerRunner(Runner):
         self.closed = True
 
 
+class _ExecutingVirtualRunner(Runner):
+    """Hermetic subprocess runner that applies the factory's virtual env overlay."""
+
+    isolation = "lambda-microvm"
+
+    def __init__(self, root: Path, env_overlay: Mapping[str, str]) -> None:
+        self._local = LocalRunner(root, credential_mode=CredentialMode.VIRTUAL_EGRESS)
+        self._env_overlay = dict(env_overlay)
+        self.default_cwd = str(root)
+
+    async def exec(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = None,
+    ) -> ExecResult:
+        merged = {"HOME": str(self._local.root), **self._env_overlay}
+        for name, value in (env or {}).items():
+            if name in merged and merged[name] != value:
+                raise ValueError(f"Virtual runner env collision: {name}")
+            merged[name] = value
+        return await self._local.exec(
+            command,
+            cwd=cwd,
+            env=merged,
+            timeout_s=timeout_s,
+            stdin=stdin,
+            output_limit_bytes=output_limit_bytes,
+        )
+
+    async def close(self) -> None:
+        await self._local.close()
+
+
 def _credential_spec() -> VirtualCredentialSpec:
     return VirtualCredentialSpec(
         env_name="STRIPE_SECRET_KEY",
@@ -578,8 +617,8 @@ class _RecordingAdapter(SandboxEgressAdapter):
 class _LifecycleRecordingAdapter(_RecordingAdapter):
     supports_reconnect = True
 
-    def __init__(self) -> None:
-        super().__init__("lambda-microvm")
+    def __init__(self, *, runner_factory: Any = None) -> None:
+        super().__init__("lambda-microvm", runner_factory=runner_factory)
         self.finalize_calls: list[str | None] = []
 
     def reconnect_metadata(self, runner: Runner) -> dict[str, Any]:
@@ -1230,6 +1269,122 @@ def test_factory_resolves_adapter_from_registry_and_uses_adapter_runner() -> Non
     assert runner_request.runner_kind == "fake"
     assert runner_request.env_overlay["HTTPS_PROXY"] == "http://fake-egress:8080"
     assert runner_request.env_overlay["STRIPE_SECRET_KEY"].startswith("sk_test_cayu_vc_")
+
+
+def test_virtual_egress_factory_delegates_only_the_explicit_workload_capability(
+    provider_credential_canaries,
+) -> None:
+    adapter = _LifecycleRecordingAdapter()
+
+    async def run() -> tuple[Any, Any]:
+        result = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_provider_boundary",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        runner = result.environment.runner
+        assert runner is not None
+        await runner.close()
+        return result, adapter.captured["runner_request"]
+
+    result, runner_request = asyncio.run(run())
+
+    virtual_value = runner_request.env_overlay["STRIPE_SECRET_KEY"]
+    assert virtual_value.startswith("sk_test_cayu_vc_")
+    assert virtual_value != REAL_SECRET
+    projected = repr(
+        {
+            "runner_request": runner_request,
+            "result_metadata": result.metadata,
+            "reconnect_metadata": result.reconnect_metadata,
+            "runner_kwargs": adapter.captured["inner_runner"].kwargs,
+        }
+    )
+    assert REAL_SECRET not in projected
+    assert all(value not in projected for value in provider_credential_canaries.values.values())
+
+
+def test_virtual_egress_executes_provider_isolation_probe_on_create_and_reconnect(
+    provider_credential_canaries,
+    tmp_path: Path,
+) -> None:
+    guest_root = tmp_path / "virtual-egress-guest"
+    guest_root.mkdir()
+
+    async def runner_factory(request: Any) -> Runner:
+        return _ExecutingVirtualRunner(guest_root, request.env_overlay)
+
+    adapter = _LifecycleRecordingAdapter(runner_factory=runner_factory)
+
+    async def verify_result(result: Any) -> tuple[Any, str]:
+        runner = result.environment.runner
+        assert runner is not None
+        virtual_value = adapter.captured["runner_request"].env_overlay["STRIPE_SECRET_KEY"]
+        visible = await runner.exec(
+            ExecCommand.process(
+                "python3",
+                "-c",
+                "import os; print(os.environ['STRIPE_SECRET_KEY'])",
+            )
+        )
+        assert visible.stdout.strip() == virtual_value
+        evidence = await verify_provider_credential_isolation(
+            runner,
+            adapter="virtual_egress_lambda_microvm",
+            scope="isolated_guest",
+            provider_canaries=provider_credential_canaries.values,
+            operational_env={
+                "CAYU_PROBE_VISIBLE": provider_credential_canaries.positive_env[
+                    "CAYU_PROBE_VISIBLE"
+                ]
+            },
+            workload_env={"STRIPE_SECRET_KEY": virtual_value},
+            guest_cwd=str(guest_root),
+        )
+        await runner.close()
+        return evidence, virtual_value
+
+    async def run() -> tuple[Any, Any, str, str]:
+        created = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_virtual_create",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        created_evidence, created_virtual = await verify_result(created)
+        reconnected = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_virtual_create",
+                agent_name="agent",
+                environment_name="egress-env",
+                operation=EnvironmentFactoryOperation.RECONNECT,
+                reconnect_metadata=created.reconnect_metadata,
+            )
+        )
+        reconnect_evidence, reconnect_virtual = await verify_result(reconnected)
+        return (
+            created_evidence,
+            reconnect_evidence,
+            created_virtual,
+            reconnect_virtual,
+        )
+
+    created_evidence, reconnect_evidence, created_virtual, reconnect_virtual = asyncio.run(run())
+
+    assert created_evidence.status == "verified"
+    assert reconnect_evidence.status == "verified"
+    assert created_evidence.positive_controls == (
+        "CAYU_PROBE_VISIBLE",
+        "STRIPE_SECRET_KEY",
+    )
+    assert reconnect_evidence.positive_controls == created_evidence.positive_controls
+    assert created_virtual.startswith("sk_test_cayu_vc_")
+    assert reconnect_virtual.startswith("sk_test_cayu_vc_")
+    assert created_virtual != REAL_SECRET
+    assert reconnect_virtual != REAL_SECRET
 
 
 def test_factory_passes_and_returns_adapter_reconnect_metadata() -> None:

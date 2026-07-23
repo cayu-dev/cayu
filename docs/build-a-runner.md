@@ -181,6 +181,31 @@ resolved `env: dict[str, str]`.** Two rules follow:
   runner — that breaks the `Runner` contract and the substitutability the tool layer
   relies on.
 
+Keep model-provider credentials in a separate authority domain. Registering a
+`ModelProvider` must never populate runner `env`, `secret_env`, a workspace,
+mount, environment-factory request, or reconnect record. Provider credentials
+authorize the trusted Cayu process to call the model; workload credentials are
+separately and deliberately delivered through the existing credential modes.
+
+Apply the same rule to every runner helper subprocess. A local CLI or sidecar
+launcher used to create, reconnect, inspect, cancel, or clean up a sandbox must
+receive an explicit operational environment allowlist. Do not copy the whole
+parent environment merely because the helper itself is trusted. Creation and
+reconnect paths must also make mounts explicit: never mount `CAYU_HOME`, the
+host home, or a provider auth-store path by default.
+
+`DockerRunner` follows that rule with a fixed default Docker CLI allowlist.
+Private-registry credential helpers that need additional ambient host variables
+must opt in by name, for example
+`docker_cli_env_allowlist=("AWS_PROFILE",)`. These are trusted host-side grants:
+the values are read from the host environment for Docker CLI operations and are
+never added to the container command's environment. Do not populate this
+allowlist from model-controlled input. ECR, GCR, rootless-Docker, and desktop
+credential helpers may require different names, so grant only the variables
+required by the configured helper. Pass the same argument to
+`DockerEgressAdapter` when virtual egress creates or prepares the Docker
+workload.
+
 Also avoid baking long-lived secrets into the sandbox image or a persistent
 sandbox env, where they outlive the command and may be exfiltrated by sandboxed
 code. Modal's own guidance is explicit: never put secrets inside a sandbox. For
@@ -218,6 +243,21 @@ forwarded env), timeout → `timed_out=True`, and cancellation → `RunnerCancel
 The built-in tests are full worked examples: `tests/runners/test_microsandbox.py`,
 `tests/runners/test_e2b.py`.
 
+For a credential-boundary regression, use
+`cayu.testing.verify_provider_credential_isolation(...)`. Install unique host
+canaries for provider keys, auth-store tokens and paths, account identifiers,
+and authorization headers; pass unrelated operational values and an intentional
+workload credential as positive controls; then run the probe through create and
+supported reconnect paths. The verifier inspects raw results before redaction
+and emits only content-free evidence. Unit tests should inject fake SDKs so
+optional runner packages and live credentials are not required.
+
+The guest used by this verifier must provide `python3`. A missing interpreter is
+a failed verification, not evidence of credential isolation. The probe also
+fails closed when its bounded filesystem scan is incomplete; use declared,
+focused guest auth-search roots rather than scanning a populated dependency
+tree.
+
 ## Registration
 
 A runner attaches to an `Environment` (which validates
@@ -247,6 +287,9 @@ commands through your runner.
       (preserves partial output on timeout; avoids pipe deadlock).
 - [ ] Capture stderr separately; never raise on a non-zero exit — return it in `exit_code`.
 - [ ] Build the child env from the explicit `env` only — no host-env inheritance.
+- [ ] Give runner helper subprocesses an explicit operational env allowlist.
+- [ ] Mount no host home, `CAYU_HOME`, or provider auth-store path by default.
+- [ ] Exercise `verify_provider_credential_isolation` with positive controls.
 - [ ] Resolve secrets at the environment/vault boundary, not in the runner.
 - [ ] Resolve relative `cwd` beneath `default_cwd`; accept only contained
       canonical absolute values; reject outside/escaping paths.

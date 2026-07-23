@@ -5,6 +5,7 @@ from typing import Any
 
 import httpx
 import pytest
+from tests.provider_traceback_assertions import assert_cayu_traceback_does_not_retain
 
 from cayu import (
     RESOLVED_FILE_ATTACHMENTS_OPTION,
@@ -493,6 +494,38 @@ async def test_anthropic_provider_counts_input_tokens_with_official_endpoint() -
         "model": "claude-test",
         "messages": [{"role": "user", "content": [{"type": "text", "text": "Count this."}]}],
     }
+
+
+@pytest.mark.anyio
+async def test_anthropic_token_count_failure_drops_provider_credential_and_exception_graph() -> (
+    None
+):
+    canary = "provider-anthropic-key-canary-0123456789"
+
+    class CredentialFailingTransport(RecordingTransport):
+        async def count_message_tokens(self, **_kwargs: Any) -> Mapping[str, Any]:
+            error = RuntimeError(f"x-api-key: {canary}")
+            error.headers = {"x-api-key": canary}
+            error.add_note(f"transport retained {canary}")
+            raise error
+
+    provider = AnthropicProvider(
+        api_key=canary,
+        transport=CredentialFailingTransport([]),
+    )
+
+    with pytest.raises(AnthropicAPIError) as exc_info:
+        await provider.count_input_tokens(
+            ModelRequest(model="claude-test", messages=[Message.text("user", "Count this.")])
+        )
+
+    assert_cayu_traceback_does_not_retain(exc_info.value, provider)
+    retained = str(exc_info.value) + repr(exc_info.value) + repr(vars(exc_info.value))
+    assert canary not in retained
+    assert str(exc_info.value) == "RuntimeError: Anthropic provider failed"
+    assert exc_info.value.response_body is None
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
 
 @pytest.mark.anyio
@@ -1081,10 +1114,13 @@ async def test_anthropic_provider_stream_propagates_context_overflow() -> None:
     with pytest.raises(AnthropicContextOverflowError) as exc_info:
         [event async for event in provider.stream(request)]
 
-    # Overflow must escape as a typed exception (not an ERROR event) so
-    # runtime context-overflow recovery can shrink context and retry.
-    assert exc_info.value is overflow
+    # Overflow escapes as a fresh detached typed exception so runtime recovery
+    # can retry without retaining transport traceback locals containing headers.
+    assert exc_info.value is not overflow
     assert isinstance(exc_info.value, ModelContextOverflowError)
+    assert exc_info.value.status_code == 413
+    assert exc_info.value.error_type == "request_too_large"
+    assert exc_info.value.request_id == "req_overflow"
     assert exc_info.value.retryable is False
 
 
@@ -1112,7 +1148,7 @@ async def test_anthropic_provider_stream_emits_typed_api_error_payload() -> None
 
     assert [event.type for event in events] == [ModelStreamEventType.ERROR]
     assert events[0].payload == {
-        "error": "Anthropic API request failed with HTTP 429: rate limited",
+        "error": "AnthropicAPIError: Anthropic provider failed",
         "error_type": "AnthropicAPIError",
         "provider": "anthropic",
         "status_code": 429,
@@ -1508,7 +1544,7 @@ async def test_anthropic_provider_stream_error_event_yields_typed_error() -> Non
     emitted = [event async for event in provider.stream(request)]
 
     assert [event.type for event in emitted] == [ModelStreamEventType.ERROR]
-    assert emitted[0].payload["error"] == "Anthropic streaming error: Overloaded"
+    assert emitted[0].payload["error"] == "AnthropicAPIError: Anthropic provider failed"
     assert emitted[0].payload["error_type"] == "AnthropicAPIError"
     assert emitted[0].payload["provider"] == "anthropic"
     assert emitted[0].payload["provider_error_type"] == "overloaded_error"
@@ -1554,7 +1590,7 @@ async def test_anthropic_provider_stream_without_message_stop_is_protocol_error(
         ModelStreamEventType.TEXT_DELTA,
         ModelStreamEventType.ERROR,
     ]
-    assert "ended before message_stop" in emitted[1].payload["error"]
+    assert emitted[1].payload["error"] == ("AnthropicProtocolError: Anthropic provider failed")
     assert emitted[1].payload["error_type"] == "AnthropicProtocolError"
 
 

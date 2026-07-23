@@ -607,6 +607,13 @@ Virtual egress governs the **runner workload credential** — the value the
 workload can read from its env/files/`/proc`. Two adjacent things are
 deliberately *out of scope*:
 
+- **Model-provider credentials.** Keys or refreshable tokens used by Cayu's
+  trusted `ModelProvider` path are a separate, non-delegable authority domain.
+  Provider registration never mints a virtual workload credential or adds the
+  provider value to a grant. Applications must configure workload authority
+  explicitly even when both domains ultimately refer to the same external
+  service.
+
 - **MCP server secrets.** `McpServerSpec.secret_env`/`secret_headers` are
   resolved **host-side** — injected into the MCP *server* subprocess or the host
   HTTP client that talks to a remote MCP server — and are **never** placed in the

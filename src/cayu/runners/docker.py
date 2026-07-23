@@ -21,6 +21,7 @@ from cayu.runners._cleanup import (
     validate_cancel_timeout,
     validate_runner_cleanup_policy,
 )
+from cayu.runners._docker_cli import docker_cli_env, normalize_docker_cli_env_allowlist
 from cayu.runners._secrets import (
     merge_secret_env_values,
     normalize_runner_secret_env,
@@ -133,11 +134,15 @@ def _build_docker_exec_argv(
 
 
 async def _run_docker(
-    docker_path: str, args: list[str], *, timeout_s: int | None = None
+    docker_path: str,
+    args: list[str],
+    *,
+    docker_cli_env_allowlist: Sequence[str] = (),
+    timeout_s: int | None = None,
 ) -> ExecResult:
     return await run_subprocess(
         SubprocessCommand(argv=[docker_path, *args]),
-        env=copy_runner_env(None, inherit_env=True),
+        env=docker_cli_env(docker_cli_env_allowlist),
         timeout_s=timeout_s,
     )
 
@@ -201,16 +206,25 @@ def _kill_supervised_command_script(pid_file: str) -> str:
 
 
 class _DockerCommandHandle:
-    def __init__(self, *, docker_path: str, name: str, pid_file: str) -> None:
+    def __init__(
+        self,
+        *,
+        docker_path: str,
+        name: str,
+        pid_file: str,
+        docker_cli_env_allowlist: Sequence[str],
+    ) -> None:
         self.docker_path = docker_path
         self.name = name
         self.pid_file = pid_file
+        self.docker_cli_env_allowlist = tuple(docker_cli_env_allowlist)
 
     async def kill(self) -> bool:
         for _ in range(RUNNER_COMMAND_KILL_ATTEMPTS):
             result = await _run_docker(
                 self.docker_path,
                 ["exec", self.name, "sh", "-c", _kill_supervised_command_script(self.pid_file)],
+                docker_cli_env_allowlist=self.docker_cli_env_allowlist,
             )
             if result.exit_code == 0:
                 return True
@@ -226,6 +240,7 @@ class _DockerCommandHandle:
         probe = await _run_docker(
             self.docker_path,
             ["exec", self.name, "sh", "-c", f"test -f {shlex.quote(self.pid_file)}"],
+            docker_cli_env_allowlist=self.docker_cli_env_allowlist,
         )
         return probe.exit_code == 1
 
@@ -237,13 +252,16 @@ class DockerRunner(Runner):
     (microVM) to ``create`` for a hardened boundary; the default (``runc``) is a
     convenience tier for trusted development, CI, conformance, and packaging,
     **not** a security boundary. Cayu never selects it implicitly for untrusted
-    code. The host ``docker`` process
-    inherits the host environment (the CLI needs it); the containerized command
+    code. The host ``docker`` process receives only an explicit operational
+    allowlist; the containerized command
     receives only the explicit per-call ``env`` plus declared ``secret_env``,
     carried through a private ``--env-file`` so values are never in
     host-visible argv or the Docker CLI's own process environment. ``secret_env``
     entries are resolved through ``secret_resolver`` at exec time and redacted
-    from captured output.
+    from captured output. Private-registry credential helpers that need additional
+    host variables must receive their names explicitly through
+    ``docker_cli_env_allowlist``; those trusted grants reach only the host-side
+    Docker CLI and its helpers, never the container command.
     """
 
     isolation = "docker"
@@ -267,6 +285,7 @@ class DockerRunner(Runner):
         credential_mode: CredentialModeInput = CredentialMode.RAW_ENV,
         allow_raw_secret_env: bool = True,
         env_overlay: Mapping[str, str] | None = None,
+        docker_cli_env_allowlist: Sequence[str] = (),
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
         self.default_cwd = _validate_guest_cwd(default_cwd)
@@ -282,6 +301,7 @@ class DockerRunner(Runner):
         # Trusted egress overlay (proxy vars + CA trust). Applied last on every
         # exec so model-controlled env cannot unset the enforced egress path.
         self.env_overlay = dict(env_overlay) if env_overlay else {}
+        self.docker_cli_env_allowlist = normalize_docker_cli_env_allowlist(docker_cli_env_allowlist)
         self.cancel_timeout_s = validate_cancel_timeout(cancel_timeout_s)
         self.cancellation_cleanup = validate_runner_cleanup_policy(
             cancellation_cleanup, "cancellation_cleanup"
@@ -312,6 +332,7 @@ class DockerRunner(Runner):
         extra_hosts: Sequence[str] = (),
         env_overlay: Mapping[str, str] | None = None,
         ca_mount: tuple[str, str] | None = None,
+        docker_cli_env_allowlist: Sequence[str] = (),
     ) -> DockerRunner:
         """Start a long-lived container and return a runner bound to it.
 
@@ -327,6 +348,10 @@ class DockerRunner(Runner):
         adds ``--add-host`` entries, ``ca_mount`` bind-mounts a
         ``(host_path, guest_path)`` CA read-only, and ``env_overlay`` is applied to
         every exec's environment (after model env, so it cannot be unset).
+
+        ``docker_cli_env_allowlist`` explicitly grants named host environment
+        variables to the trusted Docker CLI and its credential helpers. It is for
+        registry or daemon authentication only and never enters the guest.
         """
         docker = _require_docker(docker_path)
         name = require_clean_nonblank(name, "name")
@@ -340,6 +365,7 @@ class DockerRunner(Runner):
             cancellation_cleanup, "cancellation_cleanup"
         )
         timeout_policy = validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
+        docker_cli_allowlist = normalize_docker_cli_env_allowlist(docker_cli_env_allowlist)
         if default_cwd is None:
             default_cwd = mount_path if mount_path is not None else DEFAULT_DOCKER_CWD
         default_cwd = _validate_guest_cwd(default_cwd)
@@ -352,7 +378,11 @@ class DockerRunner(Runner):
         )
         try:
             if replace:
-                await _run_docker(docker, ["rm", "-f", name])
+                await _run_docker(
+                    docker,
+                    ["rm", "-f", name],
+                    docker_cli_env_allowlist=docker_cli_allowlist,
+                )
             run_argv = ["run", "-d"]
             if runtime:
                 run_argv += ["--runtime", runtime]
@@ -370,7 +400,11 @@ class DockerRunner(Runner):
                     f"type=bind,source={ca_host},target={ca_guest},readonly",
                 ]
             run_argv += [image, "sleep", "infinity"]
-            started = await _run_docker(docker, run_argv)
+            started = await _run_docker(
+                docker,
+                run_argv,
+                docker_cli_env_allowlist=docker_cli_allowlist,
+            )
             if started.exit_code != 0:
                 raise RuntimeError(
                     f"docker run failed (exit {started.exit_code}): {started.stderr[:300]}"
@@ -390,6 +424,7 @@ class DockerRunner(Runner):
                         "-c",
                         f"mkdir -p {shlex.quote(default_cwd)}",
                     ],
+                    docker_cli_env_allowlist=docker_cli_allowlist,
                 )
                 if made.exit_code != 0:
                     raise RuntimeError(f"docker workspace mkdir failed: {made.stderr[:300]}")
@@ -404,11 +439,20 @@ class DockerRunner(Runner):
                     if setup_env_file is not None:
                         setup_argv += ["--env-file", setup_env_file]
                     setup_argv += [name, "sh", "-c", cmd]
-                    res = await _run_docker(docker, setup_argv, timeout_s=300)
+                    res = await _run_docker(
+                        docker,
+                        setup_argv,
+                        docker_cli_env_allowlist=docker_cli_allowlist,
+                        timeout_s=300,
+                    )
                 if res.exit_code != 0:
                     raise RuntimeError(f"docker setup command failed: {cmd!r}: {res.stderr[:300]}")
         except BaseException:
-            await _run_docker(docker, ["rm", "-f", name])
+            await _run_docker(
+                docker,
+                ["rm", "-f", name],
+                docker_cli_env_allowlist=docker_cli_allowlist,
+            )
             raise
         return cls(
             name,
@@ -423,6 +467,7 @@ class DockerRunner(Runner):
             credential_mode=mode,
             allow_raw_secret_env=allow_raw_secret_env,
             env_overlay=env_overlay,
+            docker_cli_env_allowlist=docker_cli_allowlist,
         )
 
     async def exec(
@@ -454,6 +499,7 @@ class DockerRunner(Runner):
             docker_path=self.docker_path,
             name=self.name,
             pid_file=pid_file,
+            docker_cli_env_allowlist=self.docker_cli_env_allowlist,
         )
         with runner_env_file(environment) as env_file:
             argv = _build_docker_exec_argv(
@@ -465,11 +511,11 @@ class DockerRunner(Runner):
                 has_stdin=stdin is not None,
                 pid_file=pid_file,
             )
-            # The host docker process runs with a pristine inherited env (PATH/HOME/
-            # DOCKER_HOST/docker config only). Container env values ride in --env-file,
+            # The trusted host docker process receives only the bounded operational
+            # allowlist. Container env values ride in --env-file,
             # never in the CLI's own environment, so a model-controlled env cannot hijack
             # the host CLI (e.g. by setting DOCKER_HOST to an attacker daemon).
-            host_env = copy_runner_env(None, inherit_env=True)
+            host_env = docker_cli_env(self.docker_cli_env_allowlist)
             try:
                 result = await run_subprocess(
                     SubprocessCommand(argv=argv),
@@ -520,7 +566,11 @@ class DockerRunner(Runner):
         return True
 
     async def _remove_container(self) -> None:
-        result = await _run_docker(self.docker_path, ["rm", "-f", self.name])
+        result = await _run_docker(
+            self.docker_path,
+            ["rm", "-f", self.name],
+            docker_cli_env_allowlist=self.docker_cli_env_allowlist,
+        )
         if result.exit_code != 0:
             raise RuntimeError(
                 f"docker rm failed for container '{self.name}' "
@@ -528,7 +578,11 @@ class DockerRunner(Runner):
             )
 
     async def _stop_container(self) -> None:
-        result = await _run_docker(self.docker_path, ["stop", self.name])
+        result = await _run_docker(
+            self.docker_path,
+            ["stop", self.name],
+            docker_cli_env_allowlist=self.docker_cli_env_allowlist,
+        )
         if result.exit_code != 0:
             raise RuntimeError(
                 f"docker stop failed for container '{self.name}' "

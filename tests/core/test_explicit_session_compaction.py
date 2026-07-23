@@ -7611,7 +7611,10 @@ def test_compact_session_rejects_completion_billing_identity_rewrite() -> None:
         completed = await store.update_status(created.id, SessionStatus.COMPLETED)
         events = []
 
-        with pytest.raises(ContextBuildError, match="conflicts with request identity"):
+        with pytest.raises(
+            ContextBuildError,
+            match="Model provider billing identity resolution failed",
+        ):
             async for event in app.compact_session(
                 CompactSessionRequest(
                     session_id=created.id,

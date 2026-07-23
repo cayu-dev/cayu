@@ -20,9 +20,12 @@ from cayu.vaults import SecretRef, StaticVault
 pytest.importorskip("cryptography")
 
 # Imported after importorskip: docker_adapter -> proxy_server -> cryptography.
+from cayu.egress.adapter import EgressBinding, VirtualEgressRunnerRequest
 from cayu.egress.docker_adapter import (
     GUEST_CA_PATH,
     DockerEgressAdapter,
+    _default_docker_exec,
+    _run_docker_stdout,
     resolve_proxy_bind_host,
 )
 
@@ -34,6 +37,113 @@ class _FakeDocker:
     async def __call__(self, argv: Sequence[str]) -> tuple[int, str]:
         self.calls.append(list(argv))
         return 0, ""
+
+
+@pytest.mark.parametrize("helper", [_default_docker_exec, _run_docker_stdout])
+def test_docker_egress_helpers_use_bounded_operational_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    helper,
+) -> None:
+    observed: dict[str, object] = {}
+    provider_canaries = {
+        "OPENAI_API_KEY": "provider-openai-canary-0123456789",
+        "ANTHROPIC_API_KEY": "provider-anthropic-canary-0123456789",
+        "CAYU_HOME": "/tmp/provider-auth-store-canary-0123456789",
+    }
+    for name, value in provider_canaries.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin")
+    monkeypatch.setenv("DOCKER_HOST", "unix:///tmp/docker.sock")
+    monkeypatch.setattr("cayu.egress.docker_adapter.shutil.which", lambda _name: "/docker")
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            return b"stdout", b"stderr"
+
+    async def fake_create_subprocess_exec(*argv, **kwargs):
+        observed.update(argv=argv, kwargs=kwargs)
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        "cayu.egress.docker_adapter.asyncio.create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+
+    asyncio.run(helper(["info"]))
+
+    environment = observed["kwargs"]["env"]
+    assert environment["PATH"] == "/usr/local/bin:/usr/bin"
+    assert environment["DOCKER_HOST"] == "unix:///tmp/docker.sock"
+    assert set(provider_canaries).isdisjoint(environment)
+    assert all(value not in repr(observed) for value in provider_canaries.values())
+
+
+@pytest.mark.parametrize("helper", [_default_docker_exec, _run_docker_stdout])
+def test_docker_egress_helpers_accept_explicit_trusted_grants(
+    monkeypatch: pytest.MonkeyPatch,
+    helper,
+) -> None:
+    observed: dict[str, object] = {}
+    monkeypatch.setenv("AWS_PROFILE", "private-registry")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/run/registry/google.json")
+    monkeypatch.setattr("cayu.egress.docker_adapter.shutil.which", lambda _name: "/docker")
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            return b"stdout", b"stderr"
+
+    async def fake_create_subprocess_exec(*argv, **kwargs):
+        observed.update(argv=argv, kwargs=kwargs)
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        "cayu.egress.docker_adapter.asyncio.create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+
+    asyncio.run(helper(["info"], docker_cli_env_allowlist=("AWS_PROFILE",)))
+
+    environment = observed["kwargs"]["env"]
+    assert environment["AWS_PROFILE"] == "private-registry"
+    assert "GOOGLE_APPLICATION_CREDENTIALS" not in environment
+
+
+def test_create_runner_forwards_explicit_docker_cli_grants(monkeypatch) -> None:
+    observed: dict[str, object] = {}
+    expected_runner = object()
+
+    class FakeDockerRunner:
+        @classmethod
+        async def create(cls, name: str, **kwargs):
+            observed.update(name=name, kwargs=kwargs)
+            return expected_runner
+
+    monkeypatch.setattr("cayu.egress.docker_adapter.DockerRunner", FakeDockerRunner)
+    adapter = DockerEgressAdapter(
+        docker_exec=_FakeDocker(),
+        proxy_host="127.0.0.1",
+        docker_cli_env_allowlist=("AWS_PROFILE",),
+    )
+    request = VirtualEgressRunnerRequest(
+        name="credential-helper",
+        runner_kind="docker",
+        image="private.example/cayu:latest",
+        binding=EgressBinding(runner_kind="docker", network="internal"),
+        env_overlay={},
+        ca_cert_host_path="/tmp/ca.pem",
+        guest_ca_path=GUEST_CA_PATH,
+        setup_commands=(),
+        egress_destinations=(),
+    )
+
+    runner = asyncio.run(adapter.create_runner(request))
+
+    assert runner is expected_runner
+    assert observed["kwargs"]["docker_cli_env_allowlist"] == ("AWS_PROFILE",)
 
 
 class _FlakyCleanupDocker(_FakeDocker):

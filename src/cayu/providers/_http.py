@@ -8,9 +8,10 @@ each adapter keeps only its provider-specific error classification and shaping.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -21,7 +22,13 @@ import httpx
 
 from cayu._validation import require_clean_nonblank, require_nonblank
 from cayu.providers._sse import SseIdleTimeoutError, aiter_sse_json_events
-from cayu.providers.base import ModelContextOverflowError
+from cayu.providers.base import (
+    ModelContextOverflowError,
+    ModelProviderError,
+    ModelStreamEvent,
+    ModelStreamEventType,
+)
+from cayu.vaults.redaction import SecretRedactor
 
 MAX_PROVIDER_ERROR_BODY_CHARS = 2_000
 _ApiErrorFromResponse = Callable[[httpx.Response, str, float | None], Exception]
@@ -437,11 +444,160 @@ def exception_message(exc: Exception, *, provider_label: str) -> str:
     return f"{type(exc).__name__}: {provider_label} provider failed"
 
 
+def credential_sanitization_values(
+    *credential_values: str | None,
+    extra_headers: Mapping[str, str] | None = None,
+) -> tuple[str, ...]:
+    """Return every request credential value that must be removed from failures.
+
+    Provider-specific ``extra_headers`` are caller-controlled and may carry an
+    authorization token under an arbitrary header name. Treat every non-empty
+    value as credential-bearing at the transport error boundary.
+    """
+
+    values = [
+        value
+        for value in (
+            *credential_values,
+            *((extra_headers or {}).values()),
+        )
+        if value
+    ]
+    return tuple(dict.fromkeys(values))
+
+
+def credential_safe_error_event(
+    exc: Exception,
+    *,
+    provider_label: str,
+    credential_values: Sequence[str],
+    unresolved_message: str | None = None,
+) -> ModelStreamEvent:
+    """Build a typed provider error event with known credentials removed.
+
+    Provider transports are an untrusted projection boundary: HTTP clients,
+    proxy implementations, and test doubles may include an authorization value
+    in their exception message or structured provider-error fields.  Keep the
+    useful typed classification produced by ``ModelStreamEvent.error`` while
+    redacting every known model-provider credential before the event can enter
+    runtime persistence or diagnostics.
+    """
+    safe_message = (
+        require_nonblank(unresolved_message, "unresolved_message")
+        if unresolved_message is not None
+        else f"{type(exc).__name__}: {provider_label} provider failed"
+    )
+    if not credential_values:
+        # Authentication may fail before a deferred credential resolver returns
+        # the value needed for comparison.  In that case no untrusted exception
+        # text or structured string field is safe to retain.
+        payload: dict[str, Any] = {
+            "error": safe_message,
+            "error_type": type(exc).__name__,
+        }
+        if isinstance(exc, ModelProviderError):
+            if type(exc.status_code) is int:
+                payload["status_code"] = exc.status_code
+            if type(exc.retryable) is bool:
+                payload["retryable"] = exc.retryable
+            if type(exc.retry_after_s) in {int, float}:
+                payload["retry_after_s"] = exc.retry_after_s
+        return ModelStreamEvent(type=ModelStreamEventType.ERROR, payload=payload)
+    event = ModelStreamEvent.error(
+        safe_message,
+        cause=exc,
+    )
+    redacted = SecretRedactor(credential_values).redact_json(event.payload)
+    if type(redacted) is not dict:  # pragma: no cover - SecretRedactor contract guard
+        raise AssertionError("provider error payload redaction returned a non-object")
+    return ModelStreamEvent(type=event.type, payload=redacted)
+
+
+def credential_safe_provider_exception(
+    exc: Exception,
+    *,
+    provider_label: str,
+    provider_name: str,
+    credential_values: Sequence[str],
+    safe_message: str | None = None,
+) -> ModelProviderError:
+    """Return a detached provider exception safe for public propagation."""
+
+    provider_label = require_clean_nonblank(provider_label, "provider_label")
+    provider_name = require_clean_nonblank(provider_name, "provider_name")
+    redactor = SecretRedactor(credential_values)
+    if safe_message is not None:
+        message = require_nonblank(safe_message, "safe_message")
+    elif isinstance(exc, ModelContextOverflowError):
+        message = f"{provider_label} model context window exceeded"
+    else:
+        message = f"{type(exc).__name__}: {provider_label} provider failed"
+
+    source = exc if isinstance(exc, ModelProviderError) else None
+    string_fields: dict[str, str | None] = {
+        "error_type": source.error_type if source is not None else None,
+        "error_code": source.error_code if source is not None else None,
+        "request_id": source.request_id if source is not None else None,
+    }
+    if redactor.has_values:
+        string_fields = {
+            name: redactor.redact_text(value) if value is not None else None
+            for name, value in string_fields.items()
+        }
+    else:
+        string_fields = {name: None for name in string_fields}
+
+    common: dict[str, Any] = {
+        "provider": provider_name,
+        "status_code": source.status_code if source is not None else None,
+        "error_type": string_fields["error_type"],
+        "error_code": string_fields["error_code"],
+        "request_id": string_fields["request_id"],
+        "response_body": None,
+    }
+    if isinstance(exc, ModelContextOverflowError):
+        return ModelContextOverflowError(message, **common)
+    return ModelProviderError(
+        message,
+        **common,
+        retryable=source.retryable if source is not None else None,
+        retry_after_s=source.retry_after_s if source is not None else None,
+    )
+
+
+def sanitize_provider_cancellation(
+    exc: asyncio.CancelledError,
+    *,
+    provider_label: str,
+    credential_values: Sequence[str],
+    safe_message: str | None = None,
+) -> asyncio.CancelledError:
+    """Return a fresh detached cancellation safe for public propagation."""
+
+    provider_label = require_clean_nonblank(provider_label, "provider_label")
+    del credential_values
+    had_artifacts = hasattr(exc, "artifacts")
+    message = (
+        require_nonblank(safe_message, "safe_message")
+        if safe_message is not None
+        else f"{provider_label} provider request cancelled"
+    )
+    safe = asyncio.CancelledError(message)
+    if had_artifacts:
+        vars(safe)["artifacts"] = []
+    safe.__cause__ = None
+    safe.__context__ = None
+    return safe
+
+
 __all__ = [
     "MAX_PROVIDER_ERROR_BODY_CHARS",
     "SharedAsyncClient",
     "aclose_transport",
     "copy_headers",
+    "credential_safe_error_event",
+    "credential_safe_provider_exception",
+    "credential_sanitization_values",
     "exception_message",
     "json_error_text",
     "new_async_client",
@@ -452,6 +608,7 @@ __all__ = [
     "safe_error_json",
     "safe_error_response_text",
     "safe_flat_error_json",
+    "sanitize_provider_cancellation",
     "stream_sse_json_events",
     "truncate_error_text",
     "validate_base_url",

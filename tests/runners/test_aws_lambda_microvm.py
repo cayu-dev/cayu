@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from cayu.runners import (
     LambdaMicroVMError,
     LambdaMicroVMProtocolError,
 )
+from cayu.testing import verify_provider_credential_isolation
 
 SUPERVISOR_PATH = (
     Path(__file__).resolve().parents[2]
@@ -514,6 +516,73 @@ async def test_lambda_microvm_runner_attaches_to_existing_microvm() -> None:
     assert runner.image_identifier == "arn:aws:lambda:us-west-2:123:microvm-image:cayu"
     assert runner.image_version == "7"
     assert transport.health_calls[0]["token"] == "token-123"
+
+
+@pytest.mark.anyio
+async def test_lambda_microvm_reconnect_passes_provider_credential_isolation_probe(
+    provider_credential_canaries,
+) -> None:
+    class ProbeEndpointTransport(FakeEndpointTransport):
+        async def get_command(self, **kwargs: Any) -> dict[str, Any]:
+            self.get_calls.append(dict(kwargs))
+            environment = self.start_calls[-1]["payload"]["env"]
+            stdout = json.dumps(
+                {
+                    "environment": environment,
+                    "auth_paths": {},
+                    "auth_scan_complete": True,
+                    "provider_canary_matches": [],
+                    "detector_control_match": True,
+                },
+                sort_keys=True,
+            ).encode()
+            return {
+                "command_id": kwargs["command_id"],
+                "state": "completed",
+                "exit_code": 0,
+                "timed_out": False,
+                "stdout_base64": base64.b64encode(stdout).decode("ascii"),
+                "stderr_base64": "",
+                "stdout_bytes": len(stdout),
+                "stderr_bytes": 0,
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+            }
+
+    client = FakeLambdaMicroVMClient()
+    transport = ProbeEndpointTransport()
+    runner = await LambdaMicroVMRunner.from_existing(
+        "mvm-123",
+        region_name="us-west-2",
+        client=client,
+        endpoint_transport=transport,
+        poll_interval_s=0,
+    )
+
+    evidence = await verify_provider_credential_isolation(
+        runner,
+        adapter="lambda_microvm",
+        scope="isolated_guest",
+        provider_canaries=provider_credential_canaries.values,
+        operational_env={
+            "CAYU_PROBE_VISIBLE": provider_credential_canaries.positive_env["CAYU_PROBE_VISIBLE"]
+        },
+        workload_env={
+            "CAYU_WORKLOAD_TOKEN": provider_credential_canaries.positive_env["CAYU_WORKLOAD_TOKEN"]
+        },
+        guest_cwd="/workspace",
+        guest_auth_search_paths={"mounted_workspace": "/workspace"},
+    )
+
+    assert evidence.status == "verified"
+    assert "os.walk(root" in repr(transport.start_calls[-1]["payload"])
+    assert provider_credential_canaries.positive_env.items() <= (
+        transport.start_calls[-1]["payload"]["env"].items()
+    )
+    assert all(
+        value not in repr(transport.start_calls)
+        for value in provider_credential_canaries.values.values()
+    )
 
 
 @pytest.mark.anyio

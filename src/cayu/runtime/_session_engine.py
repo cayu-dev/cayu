@@ -73,6 +73,10 @@ from cayu.runtime._interruption_coordinator import (
     interruption_cascade_suppressed,
     suppress_interruption_cascade,
 )
+from cayu.runtime._model_errors import (
+    detach_billing_identity_cancellation,
+    detach_billing_identity_cancellation_group,
+)
 from cayu.runtime._model_step_executor import (
     ModelStepBudgetEvaluationRequest,
     ModelStepBudgetReservationFailureRequest,
@@ -143,6 +147,7 @@ from cayu.runtime.context import (
     _automatic_compaction_dispatch_runner_scope,
     _compaction_completion_publisher_scope,
     _compaction_model_completed_payload,
+    _defer_billing_identity_cancellation_scope,
     _durable_compaction_completion_evidence,
     context_build_termination_compaction_telemetry,
     sanitize_context_compaction_telemetry,
@@ -2274,10 +2279,104 @@ class SessionEngine:
             session.id,
             session_stream,
         )
+        billing_identity_cancellation: asyncio.CancelledError | None = None
+        billing_identity_cancellation_group: BaseExceptionGroup | None = None
+        propagated_cancellation: asyncio.CancelledError | None = None
+        propagated_cancellation_group: BaseExceptionGroup | None = None
+        group_has_explicit_cancellation = False
         try:
             async for event in forwarded_stream:
                 yield event
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
+            billing_identity_cancellation = detach_billing_identity_cancellation(exc)
+            if billing_identity_cancellation is None:
+                propagated_cancellation = exc
+        except BaseExceptionGroup as exc:
+            # Lifecycle cleanup can aggregate a cancellation with its cleanup
+            # failure. Preserve the grouped signal while applying the same
+            # durable session interruption transition as a plain cancellation.
+            group_has_explicit_cancellation = (
+                binding_finalize_explicit_cancellation(exc) is not None
+            )
+            billing_identity_cancellation_group = detach_billing_identity_cancellation_group(exc)
+            if billing_identity_cancellation_group is None:
+                propagated_cancellation_group = exc
+        except GeneratorExit:
+            # The forwarding iterator owns closure of the inner run stream.
+            # Retain and close that layer so its finalizer cannot race a direct
+            # close of the same inner generator.
+            await _close_async_iterator(forwarded_stream)
+            raise
+
+        # A registered provider can retain live credentials in its repr. Drop it
+        # before any fallible interruption-store work and before raising a fresh
+        # provider-free cancellation.
+        del registered_provider
+
+        if billing_identity_cancellation is not None:
+            interruption_check_failed = False
+            try:
+                interruption_requested = await self._session_control.interrupt_requested(session.id)
+            except Exception:
+                interruption_check_failed = True
+                interruption_requested = False
+            if interruption_check_failed:
+                raise RuntimeError(
+                    "Session interruption state check failed after provider billing cancellation"
+                ) from None
+            if interruption_requested:
+                interruption_transition_failed = False
+                try:
+                    async for event in self._handle_session_interrupted(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=_environment_name(registered_environment),
+                    ):
+                        yield event
+                except Exception:
+                    interruption_transition_failed = True
+                if interruption_transition_failed:
+                    raise RuntimeError(
+                        "Session interruption transition failed after provider billing cancellation"
+                    ) from None
+                return
+            raise billing_identity_cancellation
+
+        if billing_identity_cancellation_group is not None:
+            persisted_session = None
+            if group_has_explicit_cancellation:
+                interruption_load_failed = False
+                try:
+                    persisted_session = await self.session_store.load(session.id)
+                except Exception:
+                    interruption_load_failed = True
+                if interruption_load_failed:
+                    raise RuntimeError(
+                        "Session interruption state load failed after provider billing cancellation"
+                    ) from None
+            if (
+                persisted_session is not None
+                and persisted_session.status in _INTERRUPTIBLE_SESSION_STATUSES
+            ):
+                interruption_transition_failed = False
+                try:
+                    async for event in self._handle_session_interrupted(
+                        session=persisted_session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=_environment_name(registered_environment),
+                    ):
+                        yield event
+                except Exception:
+                    interruption_transition_failed = True
+                if interruption_transition_failed:
+                    raise RuntimeError(
+                        "Session interruption transition failed after provider billing cancellation"
+                    ) from None
+            raise billing_identity_cancellation_group
+
+        if propagated_cancellation is not None:
             if await self._session_control.interrupt_requested(session.id):
                 async for event in self._handle_session_interrupted(
                     session=session,
@@ -2287,14 +2386,12 @@ class SessionEngine:
                 ):
                     yield event
                 return
-            raise
-        except BaseExceptionGroup as exc:
-            # Lifecycle cleanup can aggregate a cancellation with its cleanup
-            # failure. Preserve the grouped signal while applying the same
-            # durable session interruption transition as a plain cancellation.
+            raise propagated_cancellation
+
+        if propagated_cancellation_group is not None:
             persisted_session = await self.session_store.load(session.id)
             if (
-                binding_finalize_explicit_cancellation(exc) is not None
+                group_has_explicit_cancellation
                 and persisted_session is not None
                 and persisted_session.status in _INTERRUPTIBLE_SESSION_STATUSES
             ):
@@ -2305,14 +2402,7 @@ class SessionEngine:
                     environment_name=_environment_name(registered_environment),
                 ):
                     yield event
-                raise exc
-            raise
-        except GeneratorExit:
-            # The forwarding iterator owns closure of the inner run stream.
-            # Retain and close that layer so its finalizer cannot race a direct
-            # close of the same inner generator.
-            await _close_async_iterator(forwarded_stream)
-            raise
+            raise propagated_cancellation_group
 
     async def resume(self, request: ResumeRequest) -> AsyncGenerator[Event, None]:
         task_id = await self._linked_running_task_id(request.session_id)
@@ -2326,12 +2416,26 @@ class SessionEngine:
             request.session_id,
             session_stream,
         )
+        billing_identity_cancellation: asyncio.CancelledError | None = None
+        billing_identity_cancellation_group: BaseExceptionGroup | None = None
         try:
             async for event in forwarded_stream:
                 yield event
+        except asyncio.CancelledError as exc:
+            billing_identity_cancellation = detach_billing_identity_cancellation(exc)
+            if billing_identity_cancellation is None:
+                raise
+        except BaseExceptionGroup as exc:
+            billing_identity_cancellation_group = detach_billing_identity_cancellation_group(exc)
+            if billing_identity_cancellation_group is None:
+                raise
         except GeneratorExit:
             await _close_async_iterator(forwarded_stream)
             raise
+        if billing_identity_cancellation is not None:
+            raise billing_identity_cancellation
+        if billing_identity_cancellation_group is not None:
+            raise billing_identity_cancellation_group
 
     async def compact_session(
         self,
@@ -2342,12 +2446,26 @@ class SessionEngine:
             request.session_id,
             operation_stream,
         )
+        billing_identity_cancellation: asyncio.CancelledError | None = None
+        billing_identity_cancellation_group: BaseExceptionGroup | None = None
         try:
             async for event in forwarded_stream:
                 yield event
+        except asyncio.CancelledError as exc:
+            billing_identity_cancellation = detach_billing_identity_cancellation(exc)
+            if billing_identity_cancellation is None:
+                raise
+        except BaseExceptionGroup as exc:
+            billing_identity_cancellation_group = detach_billing_identity_cancellation_group(exc)
+            if billing_identity_cancellation_group is None:
+                raise
         except GeneratorExit:
             await _close_async_iterator(forwarded_stream)
             raise
+        if billing_identity_cancellation is not None:
+            raise billing_identity_cancellation
+        if billing_identity_cancellation_group is not None:
+            raise billing_identity_cancellation_group
 
     async def enqueue_session_message(
         self,
@@ -3468,7 +3586,10 @@ class SessionEngine:
                 return dispatch_result
 
             async def execute_compaction() -> ContextBuildResult:
-                with _compaction_completion_publisher_scope(publish_compaction_completions):
+                with (
+                    _compaction_completion_publisher_scope(publish_compaction_completions),
+                    _defer_billing_identity_cancellation_scope(),
+                ):
                     return await context_policy.build_with_checkpoint(
                         ContextRequest(
                             session=loaded_session,

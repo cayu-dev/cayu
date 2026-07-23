@@ -15,6 +15,16 @@ from cayu.runners.base import ExecResult
 # and hang forever, defeating the timeout guarantee.
 _DRAIN_AFTER_KILL_S = 2.0
 _TASKKILL_TIMEOUT_S = 2.0
+_TASKKILL_ENV_KEYS = (
+    "COMSPEC",
+    "PATH",
+    "PATHEXT",
+    "SYSTEMDRIVE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+)
 
 
 class SubprocessCommand:
@@ -380,6 +390,7 @@ async def _taskkill_tree(pid: int) -> bool:
                 ["taskkill", "/F", "/T", "/PID", str(pid)],
                 capture_output=True,
                 check=False,
+                env={name: os.environ[name] for name in _TASKKILL_ENV_KEYS if name in os.environ},
                 timeout=_TASKKILL_TIMEOUT_S,
             ),
             timeout=_TASKKILL_TIMEOUT_S,

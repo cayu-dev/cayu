@@ -127,6 +127,7 @@ class ProviderConformanceRegistration:
     capabilities: ProviderCapabilities
     error_provider: str | None = None
     reports_model_identity: bool = True
+    projects_request_ids: bool = True
 
     def __post_init__(self) -> None:
         if not self.name.strip():
@@ -137,6 +138,8 @@ class ProviderConformanceRegistration:
             raise ValueError("Provider conformance error provider must be nonblank.")
         if type(self.reports_model_identity) is not bool:
             raise TypeError("Provider conformance model-identity claim must be a boolean.")
+        if type(self.projects_request_ids) is not bool:
+            raise TypeError("Provider conformance request-id claim must be a boolean.")
 
     @property
     def expected_error_provider(self) -> str:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections.abc import AsyncIterator, Mapping
@@ -35,16 +36,23 @@ from cayu.embeddings import (
     copy_text_embedding_request,
 )
 from cayu.providers._api_keys import resolve_api_key
+from cayu.providers._credential_boundary import (
+    detach_provider_call_traceback,
+    detach_provider_stream_traceback,
+)
 from cayu.providers._http import (
     SharedAsyncClient,
     aclose_transport,
     copy_headers,
-    exception_message,
+    credential_safe_error_event,
+    credential_safe_provider_exception,
+    credential_sanitization_values,
     optional_error_string,
     post_json,
     response_json_object,
     safe_error_json,
     safe_error_response_text,
+    sanitize_provider_cancellation,
     stream_sse_json_events,
     truncate_error_text,
     validate_base_url,
@@ -333,10 +341,14 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         self.extra_headers = _copy_headers(extra_headers)
         self.reasoning_state = _validate_reasoning_state(reasoning_state)
 
+    @detach_provider_stream_traceback
     async def stream(
         self,
         request: ModelRequest,
     ) -> AsyncIterator[ModelStreamEvent]:
+        cancellation: asyncio.CancelledError | None = None
+        overflow_failure: OpenAIContextOverflowError | None = None
+        error_event: ModelStreamEvent | None = None
         try:
             payload = build_openai_payload(
                 request, stream=True, reasoning_state=self.reasoning_state
@@ -361,16 +373,52 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             )
             async for event in self._consume(recovery_payload):
                 yield event
-        except ModelContextOverflowError:
+        except asyncio.CancelledError as exc:
+            cancellation = sanitize_provider_cancellation(
+                exc,
+                provider_label="OpenAI",
+                credential_values=credential_sanitization_values(
+                    self.api_key,
+                    extra_headers=self.extra_headers,
+                ),
+            )
+        except ModelContextOverflowError as exc:
             # Overflow must reach runtime recovery as a typed exception; an
             # error event would flatten it into unrecoverable message text.
-            raise
-        except Exception as exc:
-            yield ModelStreamEvent.error(
-                exception_message(exc, provider_label="OpenAI"),
-                cause=exc,
+            safe = credential_safe_provider_exception(
+                exc,
+                provider_label="OpenAI",
+                provider_name="openai",
+                credential_values=credential_sanitization_values(
+                    self.api_key,
+                    extra_headers=self.extra_headers,
+                ),
             )
+            overflow_failure = OpenAIContextOverflowError(
+                str(safe),
+                status_code=safe.status_code,
+                error_type=safe.error_type,
+                error_code=safe.error_code,
+                request_id=safe.request_id,
+                response_body=None,
+            )
+        except Exception as exc:
+            error_event = credential_safe_error_event(
+                exc,
+                provider_label="OpenAI",
+                credential_values=credential_sanitization_values(
+                    self.api_key,
+                    extra_headers=self.extra_headers,
+                ),
+            )
+        if cancellation is not None:
+            raise cancellation from None
+        if overflow_failure is not None:
+            raise overflow_failure from None
+        if error_event is not None:
+            yield error_event
 
+    @detach_provider_call_traceback
     async def count_input_tokens(
         self,
         request: ModelRequest,
@@ -379,11 +427,9 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             request,
             reasoning_state=self.reasoning_state,
         )
-        response = await self.transport.create_response(
+        response = await self._safe_create_response(
             url=f"{self.base_url}/v1/responses/input_tokens",
-            headers=self._headers(),
             payload=payload,
-            timeout_s=self.timeout_s,
         )
         return InputTokenCountResult(
             input_tokens=_openai_input_tokens_from_count_response(response),
@@ -395,16 +441,78 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             },
         )
 
+    @detach_provider_call_traceback
     async def embed_texts(self, request: TextEmbeddingRequest) -> TextEmbeddingResult:
         embedding_request = copy_text_embedding_request(request)
         payload = build_openai_embedding_payload(embedding_request)
-        response = await self.transport.create_response(
+        response = await self._safe_create_response(
             url=f"{self.base_url}/v1/embeddings",
-            headers=self._headers(),
             payload=payload,
-            timeout_s=self.timeout_s,
         )
-        return openai_embedding_result(response, requested_count=len(embedding_request.texts))
+        return openai_embedding_result(
+            response,
+            requested_count=len(embedding_request.texts),
+        )
+
+    async def _safe_create_response(
+        self,
+        *,
+        url: str,
+        payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        cancellation: asyncio.CancelledError | None = None
+        failure: ModelProviderError | None = None
+        try:
+            return await self.transport.create_response(
+                url=url,
+                headers=self._headers(),
+                payload=payload,
+                timeout_s=self.timeout_s,
+            )
+        except asyncio.CancelledError as exc:
+            cancellation = sanitize_provider_cancellation(
+                exc,
+                provider_label="OpenAI",
+                credential_values=credential_sanitization_values(
+                    self.api_key,
+                    extra_headers=self.extra_headers,
+                ),
+            )
+        except Exception as exc:
+            safe = credential_safe_provider_exception(
+                exc,
+                provider_label="OpenAI",
+                provider_name="openai",
+                credential_values=credential_sanitization_values(
+                    self.api_key,
+                    extra_headers=self.extra_headers,
+                ),
+            )
+            if isinstance(safe, ModelContextOverflowError):
+                failure = OpenAIContextOverflowError(
+                    str(safe),
+                    status_code=safe.status_code,
+                    error_type=safe.error_type,
+                    error_code=safe.error_code,
+                    request_id=safe.request_id,
+                    response_body=None,
+                )
+            else:
+                failure = OpenAIAPIError(
+                    str(safe),
+                    status_code=safe.status_code,
+                    error_type=safe.error_type,
+                    error_code=safe.error_code,
+                    request_id=safe.request_id,
+                    retryable=safe.retryable,
+                    retry_after_s=safe.retry_after_s,
+                    response_body=None,
+                )
+        if cancellation is not None:
+            raise cancellation
+        if failure is None:  # pragma: no cover - the try branch returns
+            raise AssertionError("OpenAI response failure was not captured")
+        raise failure
 
     async def _consume(self, payload: dict[str, Any]) -> AsyncIterator[ModelStreamEvent]:
         raw_events = self.transport.stream_response_events(

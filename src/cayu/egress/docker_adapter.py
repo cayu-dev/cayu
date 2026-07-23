@@ -9,6 +9,7 @@ import shutil
 import tempfile
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 
 from cayu.credentials import CredentialMode
 from cayu.egress.adapter import (
@@ -29,6 +30,7 @@ from cayu.environments.admission import (
     ExecutionCapabilityClaim,
     ExecutionCapabilityEvidence,
 )
+from cayu.runners._docker_cli import docker_cli_env, normalize_docker_cli_env_allowlist
 from cayu.runners.base import Runner
 from cayu.runners.docker import DockerRunner
 
@@ -118,13 +120,18 @@ def _write_private(path: str, data: bytes, *, mode: int) -> None:
         handle.write(data)
 
 
-async def _default_docker_exec(argv: Sequence[str]) -> tuple[int, str]:
+async def _default_docker_exec(
+    argv: Sequence[str],
+    *,
+    docker_cli_env_allowlist: Sequence[str] = (),
+) -> tuple[int, str]:
     docker = shutil.which("docker")
     if not docker:
         raise UnsupportedEgressError("docker CLI not found; cannot enforce virtual egress.")
     process = await asyncio.create_subprocess_exec(
         docker,
         *argv,
+        env=docker_cli_env(docker_cli_env_allowlist),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -132,13 +139,18 @@ async def _default_docker_exec(argv: Sequence[str]) -> tuple[int, str]:
     return process.returncode or 0, stderr.decode("utf-8", "replace")
 
 
-async def _run_docker_stdout(argv: Sequence[str]) -> tuple[int, str]:
+async def _run_docker_stdout(
+    argv: Sequence[str],
+    *,
+    docker_cli_env_allowlist: Sequence[str] = (),
+) -> tuple[int, str]:
     docker = shutil.which("docker")
     if not docker:
         raise UnsupportedEgressError("docker CLI not found; cannot enforce virtual egress.")
     process = await asyncio.create_subprocess_exec(
         docker,
         *argv,
+        env=docker_cli_env(docker_cli_env_allowlist),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -261,16 +273,29 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         sidecar_image: str = _DEFAULT_SIDECAR_IMAGE,
         proxy_host: str | None = None,
         proxy_bind_host_resolver: Callable[[], Awaitable[str]] | None = None,
+        docker_cli_env_allowlist: Sequence[str] = (),
     ) -> None:
+        self._docker_cli_env_allowlist = normalize_docker_cli_env_allowlist(
+            docker_cli_env_allowlist
+        )
         self._loop = loop
-        self._docker_exec = docker_exec or _default_docker_exec
+        self._docker_exec = docker_exec or partial(
+            _default_docker_exec,
+            docker_cli_env_allowlist=self._docker_cli_env_allowlist,
+        )
         self._sidecar_image = sidecar_image
         # None => auto-resolve the narrowest reachable interface at prepare time
         # (loopback on Docker Desktop, bridge gateway on Linux). An explicit value
         # is used verbatim. The broker still requires a valid unguessable virtual
         # credential + destination/policy, so the listener is not usable on its own.
         self._proxy_host = proxy_host
-        self._proxy_bind_host_resolver = proxy_bind_host_resolver or resolve_proxy_bind_host
+        self._proxy_bind_host_resolver = proxy_bind_host_resolver or partial(
+            resolve_proxy_bind_host,
+            run=partial(
+                _run_docker_stdout,
+                docker_cli_env_allowlist=self._docker_cli_env_allowlist,
+            ),
+        )
 
     async def prepare(
         self,
@@ -435,6 +460,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             env_overlay=dict(request.env_overlay),
             ca_mount=(request.ca_cert_host_path, request.guest_ca_path),
             setup_commands=request.setup_commands,
+            docker_cli_env_allowlist=self._docker_cli_env_allowlist,
         )
 
     async def _run(self, argv: Sequence[str]) -> None:

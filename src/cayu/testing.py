@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
+import re
 import tempfile
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from enum import StrEnum
 from math import isfinite
 from typing import Any, Literal
@@ -15,6 +18,8 @@ from pydantic import BaseModel, ConfigDict, StrictBool, field_validator, model_v
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
 from cayu.core.tools import ToolContext, ToolEffect, ToolResult
+from cayu.runners.base import ExecCommand, Runner
+from cayu.runners.local import LocalRunner
 from cayu.runtime.app import CayuApp
 from cayu.workspaces import LocalWorkspace
 
@@ -24,6 +29,47 @@ _DEFAULT_MAX_FILE_BYTES = 16 * 1024 * 1024
 _DEFAULT_MAX_TOTAL_BYTES = 64 * 1024 * 1024
 _DEFAULT_TIMEOUT_SECONDS = 30.0
 _HASH_CHUNK_BYTES = 64 * 1024
+_PROVIDER_CREDENTIAL_PROBE_OUTPUT_LIMIT_BYTES = 1024 * 1024
+_PROVIDER_CREDENTIAL_DETECTOR_CONTROL_ENV = "CAYU_PROVIDER_CREDENTIAL_PROBE_DETECTOR_CONTROL"
+_PROVIDER_CREDENTIAL_DETECTOR_CONTROL_VALUE = "cayu-provider-credential-detector-control-0123456789"
+_PROVIDER_CREDENTIAL_PROJECTIONS = (
+    "artifacts",
+    "auth_paths",
+    "environment",
+    "stderr",
+    "stdout",
+)
+_PROVIDER_CREDENTIAL_AUTH_PATHS = (
+    "/root/.cayu/auth.json",
+    "/home/cayu/.cayu/auth.json",
+    "/home/user/.cayu/auth.json",
+    "/workspace/.cayu/auth.json",
+)
+_PROVIDER_CREDENTIAL_AUTH_SEARCH_LABELS = (
+    "current_working_directory",
+    "guest_home",
+    "workspace_root",
+)
+_PROVIDER_CREDENTIAL_AUTH_SCAN_MAX_DIRECTORIES = 10_000
+_PROVIDER_CREDENTIAL_ENV_NAMES = frozenset(
+    {
+        "ANTHROPIC_API_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_CONFIG_FILE",
+        "AWS_PROFILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "CAYU_HOME",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "OPENAI_API_KEY",
+        "OPENAI_AUTHORIZATION",
+    }
+)
+_ENVIRONMENT_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_EVIDENCE_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_.:-]*\Z")
 
 _BOUNDARY_NAME = "isolated_workspace"
 _BASE_UNOBSERVED_SYSTEMS = (
@@ -43,6 +89,622 @@ _LIMITATIONS = (
     "Work scheduled by the tool after run() returns is outside the before/after snapshot.",
     "No observed mutation is scoped evidence, not universal proof of purity.",
 )
+
+
+class ProviderCredentialIsolationViolation(RuntimeError):
+    """A provider credential canary was observed across the guest boundary.
+
+    The exception intentionally retains only the caller-defined canary label and
+    the projection where it was observed. The canary value is never stored in
+    the exception or included in its message.
+    """
+
+    def __init__(self, *, adapter: str, canary_label: str, projection: str) -> None:
+        self.adapter = require_clean_nonblank(adapter, "adapter")
+        self.canary_label = require_clean_nonblank(canary_label, "canary_label")
+        self.projection = require_clean_nonblank(projection, "projection")
+        super().__init__(
+            "Provider credential isolation verification failed: "
+            f"adapter={self.adapter}, canary={self.canary_label}, "
+            f"projection={self.projection}."
+        )
+
+
+class ProviderCredentialIsolationVerification(BaseModel):
+    """Content-free evidence from one provider-credential boundary probe."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["cayu.provider_credential_isolation.v1"] = (
+        "cayu.provider_credential_isolation.v1"
+    )
+    status: Literal["verified", "environment_minimized"]
+    adapter: str
+    scope: Literal["isolated_guest", "local_environment"]
+    canary_labels: tuple[str, ...]
+    auth_search_labels: tuple[str, ...] = ()
+    projections: tuple[
+        Literal["artifacts", "auth_paths", "environment", "stderr", "stdout"], ...
+    ] = _PROVIDER_CREDENTIAL_PROJECTIONS
+    positive_controls: tuple[str, ...]
+
+    @field_validator("adapter")
+    @classmethod
+    def validate_adapter(cls, value: str) -> str:
+        return require_clean_nonblank(value, "adapter")
+
+    @field_validator("canary_labels", "positive_controls")
+    @classmethod
+    def normalize_names(cls, value: tuple[str, ...], info) -> tuple[str, ...]:
+        names = tuple(require_clean_nonblank(item, info.field_name) for item in value)
+        if not names:
+            raise ValueError(f"{info.field_name} must not be empty")
+        if len(names) != len(set(names)):
+            raise ValueError(f"{info.field_name} entries must be unique")
+        return tuple(sorted(names))
+
+    @field_validator("auth_search_labels")
+    @classmethod
+    def normalize_optional_names(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        names = tuple(require_clean_nonblank(item, "auth_search_labels") for item in value)
+        if len(names) != len(set(names)):
+            raise ValueError("auth_search_labels entries must be unique")
+        return tuple(sorted(names))
+
+    @field_validator("projections")
+    @classmethod
+    def validate_projections(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if tuple(value) != _PROVIDER_CREDENTIAL_PROJECTIONS:
+            raise ValueError("projections must enumerate the complete probe boundary")
+        return tuple(value)
+
+    @model_validator(mode="after")
+    def validate_status_scope(self) -> ProviderCredentialIsolationVerification:
+        expected = "verified" if self.scope == "isolated_guest" else "environment_minimized"
+        if self.status != expected:
+            raise ValueError("status must match the verification scope")
+        if self.scope == "isolated_guest" and not self.auth_search_labels:
+            raise ValueError("isolated_guest evidence requires auth search labels")
+        if self.scope == "local_environment" and self.auth_search_labels:
+            raise ValueError("local_environment evidence cannot claim auth path searches")
+        return self
+
+
+@dataclass(frozen=True, slots=True)
+class _ProviderCredentialIsolationFailure:
+    kind: Literal["cancelled", "runtime_error", "type_error", "value_error", "violation"]
+    message: str = ""
+    adapter: str = ""
+    canary_label: str = ""
+    projection: str = ""
+
+
+async def verify_provider_credential_isolation(
+    runner: Runner,
+    *,
+    adapter: str,
+    scope: Literal["isolated_guest", "local_environment"],
+    provider_canaries: Mapping[str, str],
+    operational_env: Mapping[str, str],
+    workload_env: Mapping[str, str] | None = None,
+    guest_cwd: str | None = None,
+    guest_auth_search_paths: Mapping[str, str] | None = None,
+    timeout_s: int = 30,
+) -> ProviderCredentialIsolationVerification:
+    """Probe that provider credentials are absent from an execution boundary.
+
+    Provider canaries are comparison-only trusted inputs: they are never passed
+    to the runner. ``operational_env`` and ``workload_env`` are positive
+    controls which must be observable in the guest so an empty or broken probe
+    cannot produce a false success. Raw stdout, stderr, artifacts, the complete
+    guest environment, and the presence of Cayu auth files are inspected before
+    content-free evidence is returned. Auth-file contents are never read.
+
+    ``local_environment`` proves only default environment minimization. It does
+    not claim filesystem or process isolation for :class:`LocalRunner`.
+    """
+
+    outcome: ProviderCredentialIsolationVerification | _ProviderCredentialIsolationFailure
+    try:
+        outcome = await _verify_provider_credential_isolation(
+            runner,
+            adapter=adapter,
+            scope=scope,
+            provider_canaries=provider_canaries,
+            operational_env=operational_env,
+            workload_env=workload_env,
+            guest_cwd=guest_cwd,
+            guest_auth_search_paths=guest_auth_search_paths,
+            timeout_s=timeout_s,
+        )
+    except asyncio.CancelledError:
+        outcome = _ProviderCredentialIsolationFailure(kind="cancelled")
+    except ProviderCredentialIsolationViolation as exc:
+        outcome = _ProviderCredentialIsolationFailure(
+            kind="violation",
+            adapter=exc.adapter,
+            canary_label=exc.canary_label,
+            projection=exc.projection,
+        )
+    except TypeError as exc:
+        outcome = _ProviderCredentialIsolationFailure(
+            kind="type_error",
+            message=_safe_probe_failure_message(exc, provider_canaries),
+        )
+    except ValueError as exc:
+        outcome = _ProviderCredentialIsolationFailure(
+            kind="value_error",
+            message=_safe_probe_failure_message(exc, provider_canaries),
+        )
+    except RuntimeError as exc:
+        outcome = _ProviderCredentialIsolationFailure(
+            kind="runtime_error",
+            message=_safe_probe_failure_message(exc, provider_canaries),
+        )
+    except Exception:
+        outcome = _ProviderCredentialIsolationFailure(
+            kind="runtime_error",
+            message="provider credential isolation verification failed unexpectedly",
+        )
+
+    # The public traceback frame must not retain trusted values even when a
+    # capture-locals formatter walks it after a failed proof.
+    del (
+        runner,
+        adapter,
+        scope,
+        provider_canaries,
+        operational_env,
+        workload_env,
+        guest_cwd,
+        guest_auth_search_paths,
+        timeout_s,
+    )
+    return _resolve_provider_credential_isolation_outcome(outcome)
+
+
+async def _verify_provider_credential_isolation(
+    runner: Runner,
+    *,
+    adapter: str,
+    scope: Literal["isolated_guest", "local_environment"],
+    provider_canaries: Mapping[str, str],
+    operational_env: Mapping[str, str],
+    workload_env: Mapping[str, str] | None,
+    guest_cwd: str | None,
+    guest_auth_search_paths: Mapping[str, str] | None,
+    timeout_s: int,
+) -> ProviderCredentialIsolationVerification:
+    if not isinstance(runner, Runner):
+        raise TypeError("runner must implement Runner")
+    adapter = require_clean_nonblank(adapter, "adapter")
+    if scope not in {"isolated_guest", "local_environment"}:
+        raise ValueError("scope must be isolated_guest or local_environment")
+    if isinstance(runner, LocalRunner) and scope == "isolated_guest":
+        raise ValueError("LocalRunner cannot prove isolated_guest credential isolation")
+    canaries = _copy_secret_canaries(provider_canaries)
+    if any(canary in adapter for canary in canaries.values()):
+        raise ValueError("adapter must not contain provider credential canaries")
+    operational_controls = _copy_probe_environment(operational_env, "operational_env")
+    workload_controls = _copy_probe_environment(workload_env or {}, "workload_env")
+    auth_search_paths = _copy_guest_auth_search_paths(
+        guest_auth_search_paths or {},
+        canaries=canaries,
+    )
+    if scope == "local_environment" and auth_search_paths:
+        raise ValueError("local_environment cannot claim filesystem-level guest auth path searches")
+    if guest_cwd is not None:
+        guest_cwd = require_nonblank(guest_cwd, "guest_cwd")
+        if "\x00" in guest_cwd or "\n" in guest_cwd or "\r" in guest_cwd:
+            raise ValueError("guest_cwd must be a single filesystem path")
+        if any(canary in guest_cwd for canary in canaries.values()):
+            raise ValueError("guest_cwd must not contain provider credential canaries")
+    duplicate_controls = set(operational_controls).intersection(workload_controls)
+    if duplicate_controls:
+        raise ValueError("operational_env and workload_env names must be distinct")
+    controls = {**operational_controls, **workload_controls}
+    if _PROVIDER_CREDENTIAL_DETECTOR_CONTROL_ENV in controls:
+        raise ValueError(
+            "positive controls cannot use the reserved provider credential detector name"
+        )
+    if not controls:
+        raise ValueError("at least one positive control is required")
+    probe_environment = {
+        **controls,
+        _PROVIDER_CREDENTIAL_DETECTOR_CONTROL_ENV: (_PROVIDER_CREDENTIAL_DETECTOR_CONTROL_VALUE),
+    }
+    rendered_controls = _stable_probe_text(probe_environment)
+    if any(canary in rendered_controls for canary in canaries.values()):
+        raise ValueError("positive controls must not contain provider credential canaries")
+    if type(timeout_s) is not int:
+        raise TypeError("timeout_s must be an integer")
+    if timeout_s <= 0:
+        raise ValueError("timeout_s must be greater than zero")
+
+    result = None
+    cancellation: asyncio.CancelledError | None = None
+    try:
+        result = await runner.exec(
+            _provider_credential_probe_command(
+                inspect_auth_paths=scope == "isolated_guest",
+                auth_search_paths=tuple(auth_search_paths.values()),
+                canary_descriptors=tuple(
+                    (label, len(canary), hashlib.sha256(canary.encode()).hexdigest())
+                    for label, canary in canaries.items()
+                ),
+            ),
+            cwd=guest_cwd,
+            env=probe_environment,
+            timeout_s=timeout_s,
+            output_limit_bytes=_PROVIDER_CREDENTIAL_PROBE_OUTPUT_LIMIT_BYTES,
+        )
+    except asyncio.CancelledError as exc:
+        cancellation = _sanitize_probe_cancellation(exc, canaries)
+    except Exception:
+        pass
+    if cancellation is not None:
+        # Keep the public traceback frame content-free as well as the exception:
+        # capture-locals formatters must not recover trusted canary inputs.
+        del runner, provider_canaries, operational_env, workload_env, canaries, controls, result
+        raise cancellation
+    if result is None:
+        raise RuntimeError("provider credential isolation probe execution failed")
+
+    observed = _parse_provider_credential_probe(result.stdout)
+    environment = observed.get("environment")
+    auth_paths = observed.get("auth_paths")
+    auth_scan_complete = observed.get("auth_scan_complete")
+    canary_matches = observed.get("provider_canary_matches")
+    detector_control_match = observed.get("detector_control_match")
+    if isinstance(environment, Mapping):
+        _raise_on_provider_canary(
+            environment,
+            projection="environment",
+            adapter=adapter,
+            canaries=canaries,
+        )
+    if isinstance(auth_paths, Mapping):
+        _raise_on_provider_canary(
+            auth_paths,
+            projection="auth_paths",
+            adapter=adapter,
+            canaries=canaries,
+        )
+
+    _raise_on_provider_canary(
+        result.stdout,
+        projection="stdout",
+        adapter=adapter,
+        canaries=canaries,
+    )
+    _raise_on_provider_canary(
+        result.stderr,
+        projection="stderr",
+        adapter=adapter,
+        canaries=canaries,
+    )
+    _raise_on_provider_canary(
+        result.artifacts,
+        projection="artifacts",
+        adapter=adapter,
+        canaries=canaries,
+    )
+
+    if (
+        type(environment) is not dict
+        or type(auth_paths) is not dict
+        or type(auth_scan_complete) is not bool
+        or type(canary_matches) is not list
+        or any(type(label) is not str or label not in canaries for label in canary_matches)
+        or canary_matches != sorted(set(canary_matches))
+        or type(detector_control_match) is not bool
+    ):
+        raise RuntimeError("provider credential isolation probe returned malformed output")
+    if not detector_control_match:
+        raise RuntimeError(
+            "provider credential isolation detector positive control was not observed"
+        )
+    if canary_matches:
+        raise ProviderCredentialIsolationViolation(
+            adapter=adapter,
+            canary_label=sorted(canary_matches)[0],
+            projection="environment",
+        )
+    if scope == "isolated_guest" and not auth_scan_complete:
+        raise RuntimeError("provider credential isolation guest auth path scan was incomplete")
+    unexpected_provider_env = sorted(
+        name
+        for name in _PROVIDER_CREDENTIAL_ENV_NAMES.intersection(environment)
+        if name not in controls
+    )
+    if unexpected_provider_env:
+        raise RuntimeError(
+            "provider credential isolation probe observed an undeclared provider environment"
+        )
+    if scope == "isolated_guest" and auth_paths:
+        raise RuntimeError(
+            "provider credential isolation probe observed an unexpected guest auth path"
+        )
+
+    if (
+        result.exit_code != 0
+        or result.timed_out
+        or result.cancelled
+        or result.stdout_truncated
+        or result.stderr_truncated
+    ):
+        raise RuntimeError("provider credential isolation probe did not complete cleanly")
+
+    missing_controls = [name for name, value in controls.items() if environment.get(name) != value]
+    if missing_controls:
+        raise RuntimeError("provider credential isolation positive control was not observed")
+
+    return ProviderCredentialIsolationVerification(
+        status="verified" if scope == "isolated_guest" else "environment_minimized",
+        adapter=adapter,
+        scope=scope,
+        canary_labels=tuple(canaries),
+        auth_search_labels=(
+            tuple(
+                (
+                    *_PROVIDER_CREDENTIAL_AUTH_SEARCH_LABELS,
+                    *(("configured_working_directory",) if guest_cwd is not None else ()),
+                    *auth_search_paths,
+                )
+            )
+            if scope == "isolated_guest"
+            else ()
+        ),
+        positive_controls=tuple(controls),
+    )
+
+
+def _safe_probe_failure_message(
+    exc: Exception,
+    provider_canaries: object,
+) -> str:
+    message = str(exc)
+    if isinstance(provider_canaries, Mapping):
+        for raw_canary in provider_canaries.values():
+            if isinstance(raw_canary, str) and raw_canary:
+                message = message.replace(raw_canary, "[provider credential]")
+    return message or "provider credential isolation verification failed"
+
+
+def _resolve_provider_credential_isolation_outcome(
+    outcome: ProviderCredentialIsolationVerification | _ProviderCredentialIsolationFailure,
+) -> ProviderCredentialIsolationVerification:
+    if isinstance(outcome, ProviderCredentialIsolationVerification):
+        return outcome
+    if outcome.kind == "cancelled":
+        cancellation = asyncio.CancelledError("provider credential isolation probe cancelled")
+        vars(cancellation)["artifacts"] = []
+        raise cancellation from None
+    if outcome.kind == "violation":
+        raise ProviderCredentialIsolationViolation(
+            adapter=outcome.adapter,
+            canary_label=outcome.canary_label,
+            projection=outcome.projection,
+        ) from None
+    if outcome.kind == "type_error":
+        raise TypeError(outcome.message) from None
+    if outcome.kind == "value_error":
+        raise ValueError(outcome.message) from None
+    raise RuntimeError(outcome.message) from None
+
+
+def _copy_secret_canaries(value: Mapping[str, str]) -> dict[str, str]:
+    if not isinstance(value, Mapping):
+        raise TypeError("provider_canaries must be a mapping")
+    copied: dict[str, str] = {}
+    seen_values: set[str] = set()
+    for raw_label, raw_canary in value.items():
+        label = require_clean_nonblank(raw_label, "provider_canaries label")
+        if _EVIDENCE_NAME_PATTERN.fullmatch(label) is None:
+            raise ValueError("provider credential canary labels must be safe identifiers")
+        canary = require_nonblank(raw_canary, "provider_canaries value")
+        if len(canary) < 16:
+            raise ValueError("provider credential canaries must contain at least 16 characters")
+        if canary in seen_values:
+            raise ValueError("provider credential canary values must be unique")
+        copied[label] = canary
+        seen_values.add(canary)
+    if not copied:
+        raise ValueError("provider_canaries must not be empty")
+    if any(canary in label for label in copied for canary in copied.values()):
+        raise ValueError(
+            "provider credential canary labels must not contain provider credential canaries"
+        )
+    return dict(sorted(copied.items()))
+
+
+def _copy_probe_environment(value: Mapping[str, str], field_name: str) -> dict[str, str]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{field_name} must be a mapping")
+    copied: dict[str, str] = {}
+    for raw_name, raw_value in value.items():
+        name = require_clean_nonblank(raw_name, f"{field_name} name")
+        if _ENVIRONMENT_NAME_PATTERN.fullmatch(name) is None:
+            raise ValueError(f"{field_name} names must be portable environment names")
+        copied[name] = require_nonblank(raw_value, f"{field_name} value")
+    return copied
+
+
+def _copy_guest_auth_search_paths(
+    value: Mapping[str, str],
+    *,
+    canaries: Mapping[str, str],
+) -> dict[str, str]:
+    if not isinstance(value, Mapping):
+        raise TypeError("guest_auth_search_paths must be a mapping")
+    copied: dict[str, str] = {}
+    for raw_label, raw_path in value.items():
+        label = require_clean_nonblank(raw_label, "guest_auth_search_paths label")
+        if _EVIDENCE_NAME_PATTERN.fullmatch(label) is None:
+            raise ValueError("guest auth search labels must be safe identifiers")
+        path = require_nonblank(raw_path, f"guest_auth_search_paths.{label}")
+        if "\x00" in path or "\n" in path or "\r" in path:
+            raise ValueError("guest auth search paths must be single filesystem paths")
+        if any(canary in path for canary in canaries.values()):
+            raise ValueError(
+                "guest auth search paths must not contain provider credential canaries"
+            )
+        copied[label] = path
+    if len(copied.values()) != len(set(copied.values())):
+        raise ValueError("guest auth search paths must be unique")
+    return dict(sorted(copied.items()))
+
+
+def _provider_credential_probe_command(
+    *,
+    inspect_auth_paths: bool,
+    auth_search_paths: tuple[str, ...] = (),
+    canary_descriptors: tuple[tuple[str, int, str], ...],
+) -> ExecCommand:
+    auth_probe = "auth_paths={}\nauth_scan_complete=True\n"
+    if inspect_auth_paths:
+        auth_probe = (
+            f"paths={_PROVIDER_CREDENTIAL_AUTH_PATHS!r}\n"
+            f"configured_roots={auth_search_paths!r}\n"
+            "home=pathlib.Path.home()/'.cayu'/'auth.json'\n"
+            "workspace=pathlib.Path.cwd()/'.cayu'/'auth.json'\n"
+            "configured=os.environ.get('CAYU_HOME')\n"
+            "candidates=set(paths+(str(home),str(workspace)))\n"
+            "if configured: candidates.add(str(pathlib.Path(configured)/'auth.json'))\n"
+            "configured_root_paths={pathlib.Path(raw) for raw in configured_roots}\n"
+            "search_roots={pathlib.Path.home(),pathlib.Path.cwd(),pathlib.Path('/workspace')}\n"
+            "search_roots.update(configured_root_paths)\n"
+            "auth_scan_complete=True\n"
+            "scanned_directories=0\n"
+            "scanned_directory_ids=set()\n"
+            "def scan_error(_error):\n"
+            " global auth_scan_complete\n"
+            " auth_scan_complete=False\n"
+            "for root in sorted(search_roots,key=str):\n"
+            " candidates.add(str(root/'.cayu'/'auth.json'))\n"
+            " candidates.add(str(root/'.aws'/'credentials'))\n"
+            " candidates.add(str(root/'.aws'/'config'))\n"
+            " candidates.add(str(root/'.config'/'gcloud'/'application_default_credentials.json'))\n"
+            " try:\n"
+            "  root_is_dir=root.is_dir()\n"
+            " except OSError:\n"
+            "  auth_scan_complete=False\n"
+            "  continue\n"
+            " if not root_is_dir:\n"
+            "  if root in configured_root_paths: auth_scan_complete=False\n"
+            "  continue\n"
+            " for current,dirs,files in os.walk("
+            "root,topdown=True,onerror=scan_error,followlinks=True):\n"
+            "  scanned_directories+=1\n"
+            f"  if scanned_directories>{_PROVIDER_CREDENTIAL_AUTH_SCAN_MAX_DIRECTORIES}:\n"
+            "   auth_scan_complete=False\n"
+            "   dirs[:]=[]\n"
+            "   break\n"
+            "  current_path=pathlib.Path(current)\n"
+            "  try:\n"
+            "   current_stat=current_path.stat()\n"
+            "  except OSError:\n"
+            "   auth_scan_complete=False\n"
+            "   dirs[:]=[]\n"
+            "   continue\n"
+            "  current_id=(current_stat.st_dev,current_stat.st_ino)\n"
+            "  if current_id in scanned_directory_ids:\n"
+            "   dirs[:]=[]\n"
+            "   continue\n"
+            "  scanned_directory_ids.add(current_id)\n"
+            "  traversable_dirs=[]\n"
+            "  for name in sorted(dirs):\n"
+            "   child=current_path/name\n"
+            "   if child.is_symlink():\n"
+            "    try:\n"
+            "     if not child.resolve(strict=True).is_dir():\n"
+            "      auth_scan_complete=False\n"
+            "      continue\n"
+            "    except OSError:\n"
+            "     auth_scan_complete=False\n"
+            "     continue\n"
+            "   traversable_dirs.append(name)\n"
+            "  dirs[:]=traversable_dirs\n"
+            "  if 'auth.json' in files:\n"
+            "   candidates.add(str(current_path/'auth.json'))\n"
+            "  if current_path.name=='.aws':\n"
+            "   for name in ('credentials','config'):\n"
+            "    if name in files: candidates.add(str(current_path/name))\n"
+            "  if 'application_default_credentials.json' in files:\n"
+            "   candidates.add(str(current_path/'application_default_credentials.json'))\n"
+            "auth_paths={}\n"
+            "for raw in sorted(candidates):\n"
+            " try:\n"
+            "  if pathlib.Path(raw).is_file(): auth_paths[raw]='present'\n"
+            " except OSError:\n"
+            "  auth_paths[raw]='unreadable'\n"
+        )
+    script = (
+        "import hashlib,json,os,pathlib\n"
+        f"canary_descriptors={canary_descriptors!r}\n"
+        "environment=dict(os.environ)\n"
+        "provider_canary_matches=sorted("
+        "label for label,length,fingerprint in canary_descriptors "
+        "if any(hashlib.sha256(value[start:start+length].encode()).hexdigest()==fingerprint "
+        "for value in environment.values() "
+        "for start in range(max(0,len(value)-length+1))))\n"
+        "detector_control_match=("
+        "hashlib.sha256(environment.get("
+        f"{_PROVIDER_CREDENTIAL_DETECTOR_CONTROL_ENV!r},'').encode()).hexdigest()=="
+        f"{hashlib.sha256(_PROVIDER_CREDENTIAL_DETECTOR_CONTROL_VALUE.encode()).hexdigest()!r}"
+        ")\n"
+        f"{auth_probe}"
+        "print(json.dumps({'environment':environment,'auth_paths':auth_paths,"
+        "'auth_scan_complete':auth_scan_complete,"
+        "'provider_canary_matches':provider_canary_matches,"
+        "'detector_control_match':detector_control_match},sort_keys=True))\n"
+    )
+    return ExecCommand.process("python3", "-c", script)
+
+
+def _parse_provider_credential_probe(stdout: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(stdout)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return dict(parsed) if isinstance(parsed, Mapping) else {}
+
+
+def _stable_probe_text(value: object) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    except (TypeError, ValueError):
+        return repr(value)
+
+
+def _raise_on_provider_canary(
+    value: object,
+    *,
+    projection: str,
+    adapter: str,
+    canaries: Mapping[str, str],
+) -> None:
+    rendered = _stable_probe_text(value)
+    for label, canary in canaries.items():
+        if canary in rendered:
+            raise ProviderCredentialIsolationViolation(
+                adapter=adapter,
+                canary_label=label,
+                projection=projection,
+            )
+
+
+def _sanitize_probe_cancellation(
+    exc: asyncio.CancelledError,
+    canaries: Mapping[str, str],
+) -> asyncio.CancelledError:
+    del canaries
+    safe = asyncio.CancelledError("provider credential isolation probe cancelled")
+    if hasattr(exc, "artifacts"):
+        vars(safe)["artifacts"] = []
+    safe.__cause__ = None
+    safe.__context__ = None
+    return safe
 
 
 class ToolEffectVerificationStatus(StrEnum):
@@ -538,7 +1200,10 @@ def _compare_snapshots(
 
 
 __all__ = [
+    "ProviderCredentialIsolationVerification",
+    "ProviderCredentialIsolationViolation",
     "ToolEffectVerification",
     "ToolEffectVerificationStatus",
+    "verify_provider_credential_isolation",
     "verify_tool_effect",
 ]

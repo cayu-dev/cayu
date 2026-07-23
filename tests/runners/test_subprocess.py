@@ -186,12 +186,17 @@ def test_run_subprocess_times_out_and_returns_partial_output(tmp_path) -> None:
 
 def test_windows_taskkill_runs_off_event_loop_with_timeout(monkeypatch) -> None:
     observed: dict[str, object] = {}
+    monkeypatch.setenv("SYSTEMROOT", r"C:\Windows")
+    monkeypatch.setenv("PATH", r"C:\Windows\System32")
+    monkeypatch.setenv("OPENAI_API_KEY", "provider-canary-0123456789")
+    monkeypatch.setenv("CAYU_HOME", r"C:\provider-auth-canary")
 
-    def slow_taskkill(argv, *, capture_output, check, timeout):
+    def slow_taskkill(argv, *, capture_output, check, env, timeout):
         observed.update(
             argv=argv,
             capture_output=capture_output,
             check=check,
+            env=env,
             timeout=timeout,
         )
         time.sleep(0.05)
@@ -215,6 +220,10 @@ def test_windows_taskkill_runs_off_event_loop_with_timeout(monkeypatch) -> None:
         "argv": ["taskkill", "/F", "/T", "/PID", "123"],
         "capture_output": True,
         "check": False,
+        "env": {
+            "PATH": r"C:\Windows\System32",
+            "SYSTEMROOT": r"C:\Windows",
+        },
         "timeout": subprocess_module._TASKKILL_TIMEOUT_S,
     }
 

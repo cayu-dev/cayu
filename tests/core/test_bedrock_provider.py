@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import threading
+import traceback
 from collections.abc import Iterable
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from decimal import Decimal
@@ -10,6 +11,10 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from tests.provider_traceback_assertions import (
+    assert_cayu_traceback_does_not_retain,
+    is_cayu_source_filename,
+)
 
 import cayu.providers.bedrock as bedrock_module
 from cayu import (
@@ -29,6 +34,7 @@ from cayu.core.messages import FilePart, ProviderStatePart, TextPart, ThinkingPa
 from cayu.providers import (
     BedrockAPIError,
     BedrockContextOverflowError,
+    BedrockError,
     BedrockProvider,
     ModelRequest,
     ModelStreamEvent,
@@ -89,6 +95,63 @@ class FailingBedrockClient:
 
     def count_tokens(self, **kwargs: Any) -> dict[str, Any]:
         raise self.error
+
+
+def test_bedrock_stream_error_projection_drops_unresolved_credential_strings() -> None:
+    canaries = (
+        "opaque-provider-field-7f3a9c1e5b2d4f6a8c0e",
+        "opaque-message-value-1b3d5f7a9c2e4a6c8e0f",
+        "123e4567-e89b-42d3-a456-426614174099",
+    )
+    client = FailingBedrockClient(
+        FakeClientError(
+            code=canaries[0],
+            message=f"Authorization: Bearer {canaries[1]}",
+            status=403,
+            request_id=canaries[2],
+        )
+    )
+    provider = BedrockProvider(client=client)
+
+    events = collect(
+        provider,
+        ModelRequest(model="anthropic.claude-test", messages=[Message.text("user", "Hello")]),
+    )
+
+    retained = repr(events[0]) + events[0].model_dump_json()
+    assert all(canary not in retained for canary in canaries)
+    assert events[0].payload["error"] == "Bedrock provider failed"
+    assert events[0].payload["status_code"] == 403
+    assert "provider_error_code" not in events[0].payload
+    assert "request_id" not in events[0].payload
+
+
+def test_bedrock_count_error_drops_signer_credentials_and_raw_exception_graph() -> None:
+    canary = "provider-aws-session-canary-0123456789"
+    client = FailingBedrockClient(
+        FakeClientError(
+            code="AccessDeniedException",
+            message=f"request signed with {canary}",
+            status=403,
+            request_id=canary,
+        )
+    )
+    provider = BedrockProvider(client=client)
+    request = ModelRequest(
+        model="anthropic.claude-test",
+        messages=[Message.text("user", "Hello")],
+    )
+
+    with pytest.raises(BedrockAPIError) as exc_info:
+        asyncio.run(provider.count_input_tokens(request))
+
+    assert_cayu_traceback_does_not_retain(exc_info.value, provider)
+    retained = str(exc_info.value) + repr(exc_info.value) + repr(vars(exc_info.value))
+    assert canary not in retained
+    assert str(exc_info.value) == "Bedrock provider failed"
+    assert exc_info.value.response_body is None
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
 
 class BlockingBedrockStream:
@@ -231,6 +294,40 @@ def test_bedrock_billing_identity_uses_actual_client_region_and_service_tier() -
     assert identity.request_evidence["requested_service_tier"] == "reserved"
     assert completed is not None
     assert completed.completion_evidence["effective_service_tier"] == "default"
+
+
+def test_bedrock_billing_identity_drops_raw_credential_resolution_failure() -> None:
+    canary = "provider-bedrock-billing-canary-0123456789"
+
+    class FailingBillingProvider(BedrockProvider):
+        async def _get_client(self) -> Any:
+            error = RuntimeError(f"AWS credential resolution failed near {canary}")
+            error.headers = {"Authorization": canary}
+            error.add_note(f"resolver retained {canary}")
+            raise error
+
+    provider = FailingBillingProvider()
+    request = ModelRequest(
+        model="anthropic.claude-test",
+        messages=[Message.text("user", "hello")],
+    )
+
+    with pytest.raises(BedrockError) as exc_info:
+        asyncio.run(provider.billing_identity_for_request(request))
+
+    assert_cayu_traceback_does_not_retain(exc_info.value, provider)
+    retained = str(exc_info.value) + repr(exc_info.value) + repr(vars(exc_info.value))
+    assert retained == "Bedrock provider failedBedrockError('Bedrock provider failed'){}"
+    assert canary not in retained
+    captured = traceback.TracebackException.from_exception(
+        exc_info.value,
+        capture_locals=True,
+    )
+    cayu_frames = [frame for frame in captured.stack if is_cayu_source_filename(frame.filename)]
+    assert canary not in repr([(frame.name, frame.locals) for frame in cayu_frames])
+    assert all(frame.name != "_get_client" for frame in captured.stack)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
 
 @pytest.mark.parametrize(
@@ -575,7 +672,7 @@ def test_bedrock_provider_preserves_other_count_tokens_validation_errors() -> No
         messages=[Message.text("user", "Hello")],
     )
 
-    with pytest.raises(BedrockAPIError, match="tool configuration is invalid"):
+    with pytest.raises(BedrockAPIError, match="Bedrock provider failed"):
         asyncio.run(provider.count_input_tokens(request))
 
 
@@ -586,7 +683,7 @@ def test_bedrock_provider_preserves_typed_aws_error_fields() -> None:
                 code="ThrottlingException",
                 message="slow down",
                 status=429,
-                request_id="aws-request-1",
+                request_id="123e4567-e89b-42d3-a456-426614174001",
                 retry_after="2.5",
             )
         )
@@ -602,7 +699,7 @@ def test_bedrock_provider_preserves_typed_aws_error_fields() -> None:
     assert events[0].payload["provider"] == "bedrock"
     assert events[0].payload["status_code"] == 429
     assert events[0].payload["provider_error_code"] == "ThrottlingException"
-    assert events[0].payload["request_id"] == "aws-request-1"
+    assert "request_id" not in events[0].payload
     assert events[0].payload["retryable"] is True
     assert events[0].payload["retry_after_s"] == 2.5
 
@@ -614,7 +711,7 @@ def test_bedrock_provider_propagates_context_overflow_for_runtime_recovery() -> 
                 code="ValidationException",
                 message="Input exceeds the maximum context window",
                 status=400,
-                request_id="aws-request-2",
+                request_id="123e4567-e89b-42d3-a456-426614174002",
             )
         )
     )
@@ -629,7 +726,7 @@ def test_bedrock_provider_propagates_context_overflow_for_runtime_recovery() -> 
     try:
         asyncio.run(run())
     except BedrockContextOverflowError as exc:
-        assert exc.request_id == "aws-request-2"
+        assert exc.request_id is None
         assert exc.retryable is False
     else:
         raise AssertionError("Expected BedrockContextOverflowError")
@@ -660,7 +757,7 @@ def test_bedrock_provider_preserves_original_stream_error_status() -> None:
     assert events[0].payload["status_code"] == 529
     assert events[0].payload["provider_error_code"] == "modelStreamErrorException"
     assert events[0].payload["retryable"] is True
-    assert "upstream overloaded" in events[0].payload["error"]
+    assert events[0].payload["error"] == "Bedrock provider failed"
 
 
 def test_bedrock_provider_types_streamed_context_overflow_for_runtime_recovery() -> None:
@@ -845,6 +942,7 @@ def test_bedrock_provider_normalizes_documented_stop_reasons(
 
 @pytest.mark.anyio
 async def test_bedrock_provider_closes_blocking_sdk_stream_on_cancellation() -> None:
+    canary = "provider-bedrock-cancel-canary-0123456789"
     stream = BlockingBedrockStream()
     provider = BedrockProvider(client=BlockingBedrockClient(stream), stream_close_timeout_s=1)
     request = ModelRequest(model="anthropic.claude-test", messages=[Message.text("user", "Hello")])
@@ -856,11 +954,56 @@ async def test_bedrock_provider_closes_blocking_sdk_stream_on_cancellation() -> 
     task = asyncio.create_task(consume())
     started = await asyncio.to_thread(stream.started.wait, 1)
     assert started is True
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
+    task.cancel(f"cancelled near {canary}")
+    with pytest.raises(asyncio.CancelledError) as exc_info:
         await task
 
+    assert_cayu_traceback_does_not_retain(exc_info.value, provider)
     assert stream.closed is True
+    captured = traceback.TracebackException.from_exception(
+        exc_info.value,
+        capture_locals=True,
+    )
+    cayu_frames = [frame for frame in captured.stack if is_cayu_source_filename(frame.filename)]
+    assert canary not in repr([(frame.name, frame.locals) for frame in cayu_frames])
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+def test_bedrock_context_overflow_traceback_drops_raw_sdk_credential_locals() -> None:
+    canary = "provider-bedrock-overflow-canary-0123456789"
+    provider = BedrockProvider(
+        client=FailingBedrockClient(
+            FakeClientError(
+                code="ValidationException",
+                message=f"maximum context exceeded near {canary}",
+                status=400,
+                request_id=canary,
+            )
+        )
+    )
+
+    async def consume() -> None:
+        request = ModelRequest(
+            model="anthropic.claude-test",
+            messages=[Message.text("user", "Hello")],
+        )
+        async for _event in provider.stream(request):
+            pass
+
+    with pytest.raises(BedrockContextOverflowError) as exc_info:
+        asyncio.run(consume())
+
+    assert_cayu_traceback_does_not_retain(exc_info.value, provider)
+    captured = traceback.TracebackException.from_exception(
+        exc_info.value,
+        capture_locals=True,
+    )
+    cayu_frames = [frame for frame in captured.stack if is_cayu_source_filename(frame.filename)]
+    assert canary not in repr([(frame.name, frame.locals) for frame in cayu_frames])
+    assert all(frame.name != "converse_stream" for frame in captured.stack)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
 
 @pytest.mark.anyio
@@ -1009,7 +1152,7 @@ async def test_bedrock_provider_reports_idle_stream_timeout_and_closes_stream() 
 
     assert len(events) == 1
     assert events[0].type == ModelStreamEventType.ERROR
-    assert "produced no event for 0.01 seconds" in events[0].payload["error"]
+    assert events[0].payload["error"] == "Bedrock provider protocol failure"
     assert stream.closed is True
 
 
@@ -1033,4 +1176,4 @@ def test_bedrock_provider_reports_unfinished_tool_blocks() -> None:
 
     assert len(events) == 1
     assert events[0].type == ModelStreamEventType.ERROR
-    assert "unfinished tool blocks" in events[0].payload["error"]
+    assert events[0].payload["error"] == "Bedrock provider protocol failure"

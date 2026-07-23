@@ -375,6 +375,9 @@ def _assert_typed_error_contract(
     events: list[ModelStreamEvent],
 ) -> None:
     payload = events[0].payload if len(events) == 1 else {}
+    expected_request_id = (
+        "123e4567-e89b-42d3-a456-426614174101" if registration.projects_request_ids else None
+    )
     valid = (
         len(events) == 1
         and events[0].type == ModelStreamEventType.ERROR
@@ -383,7 +386,7 @@ def _assert_typed_error_contract(
         and payload.get("status_code") == 429
         and payload.get("provider_error_type") == "rate_limit_error"
         and payload.get("provider_error_code") == "rate_limit_exceeded"
-        and payload.get("request_id") == "req-conformance"
+        and payload.get("request_id") == expected_request_id
         and payload.get("retryable") is True
         and payload.get("retry_after_s") == 0.25
     )
@@ -900,7 +903,10 @@ async def test_provider_conformance_propagates_context_overflow_as_typed_excepti
     assert error.provider == registration.expected_error_provider
     assert error.status_code == 400
     assert error.error_code == "context_length_exceeded"
-    assert error.request_id == "req-overflow"
+    expected_request_id = (
+        "123e4567-e89b-42d3-a456-426614174102" if registration.projects_request_ids else None
+    )
+    assert error.request_id == expected_request_id
     assert error.retryable is False
 
 
