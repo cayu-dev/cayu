@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from cayu import (
     CayuApp,
@@ -17,6 +18,7 @@ from cayu import (
     RunRequest,
     SQLiteEventWatcherStore,
 )
+from cayu._validation import MAX_DURABLE_JSON_INTEGER, DurableValueError
 from cayu.runtime import InMemoryEventWatcherStore, InMemorySessionStore
 from cayu.runtime.event_watchers import (
     EventWatcherClaim,
@@ -127,6 +129,77 @@ async def _append_event(
     )
     await store.append_event(session_id, event)
     return event
+
+
+async def _assert_portable_event_watcher_store_text(store: EventWatcherStore) -> None:
+    for invalid_text, code in (
+        ("workload-secret-value\x00", "nul_character"),
+        ("workload-secret-value\ud800", "unicode_surrogate"),
+    ):
+        with pytest.raises(DurableValueError) as invalid_name:
+            await store.load_state(invalid_text)
+        assert invalid_name.value.code == code
+        assert "workload-secret-value" not in str(invalid_name.value)
+
+    record = EventRecord(
+        sequence=1,
+        event=Event(
+            id="portable-watcher-event",
+            type=EventType.SESSION_STARTED,
+            session_id="sess_portable_watcher",
+        ),
+    )
+    forged_record = record.model_copy(deep=True)
+    forged_record.sequence = MAX_DURABLE_JSON_INTEGER + 1
+    with pytest.raises(ValidationError):
+        await store.claim_event(
+            watcher_name="portable-watcher",
+            record=forged_record,
+            lease_seconds=60,
+        )
+    assert (await store.load_state("portable-watcher")).cursor_sequence == 0
+
+    claim = await store.claim_event(
+        watcher_name="portable-watcher",
+        record=record,
+        lease_seconds=60,
+    )
+    assert claim is not None
+    forged_claim = claim.model_copy(deep=True)
+    forged_claim.event_sequence = MAX_DURABLE_JSON_INTEGER + 1
+    with pytest.raises(ValidationError):
+        await store.mark_success(forged_claim)
+    assert (
+        await store.load_state("portable-watcher")
+    ).delivery_status is EventWatcherDeliveryStatus.LEASED
+
+    for invalid_text, code in (
+        ("workload-secret-value\x00", "nul_character"),
+        ("workload-secret-value\ud800", "unicode_surrogate"),
+    ):
+        with pytest.raises(DurableValueError) as invalid_error:
+            await store.mark_failure(claim, error=invalid_text, max_attempts=1)
+        assert invalid_error.value.code == code
+        assert "workload-secret-value" not in str(invalid_error.value)
+        state = await store.load_state("portable-watcher")
+        assert state.delivery_status is EventWatcherDeliveryStatus.LEASED
+
+    delivery = await store.mark_failure(claim, error="portable failure", max_attempts=1)
+    assert delivery.status is EventWatcherDeliveryStatus.DEAD_LETTERED
+
+
+def test_memory_and_sqlite_event_watcher_stores_reject_nonportable_text(tmp_path: Path) -> None:
+    async def run() -> None:
+        memory = InMemoryEventWatcherStore()
+        await _assert_portable_event_watcher_store_text(memory)
+
+        sqlite = SQLiteEventWatcherStore(tmp_path / "portable-watcher.sqlite")
+        try:
+            await _assert_portable_event_watcher_store_text(sqlite)
+        finally:
+            await sqlite.close()
+
+    asyncio.run(run())
 
 
 def test_event_watcher_handles_matching_events_once() -> None:
@@ -425,6 +498,25 @@ async def _drop_postgres_tables(dsn: str) -> None:
             for table in _POSTGRES_TABLES:
                 await cur.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
         await conn.commit()
+
+
+def test_postgres_event_watcher_store_rejects_nonportable_text(postgres_dsn: str) -> None:
+    async def run() -> None:
+        from cayu import PostgresEventWatcherStore
+
+        await _drop_postgres_tables(postgres_dsn)
+        store = PostgresEventWatcherStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+        )
+        try:
+            await _assert_portable_event_watcher_store_text(store)
+        finally:
+            await store.close()
+
+    asyncio.run(run())
 
 
 def test_postgres_event_watcher_store_persists_cursor(postgres_dsn: str) -> None:

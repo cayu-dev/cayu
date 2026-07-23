@@ -12,11 +12,17 @@ from typing import Any, TypedDict
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cayu._validation import (
+    copy_durable_json_object,
+    copy_durable_json_value,
     copy_json_value,
     copy_label_map,
-    require_clean_nonblank,
     require_finite,
-    require_nonblank,
+)
+from cayu._validation import (
+    require_durable_clean_nonblank as require_clean_nonblank,
+)
+from cayu._validation import (
+    require_durable_nonblank as require_nonblank,
 )
 from cayu.embeddings import TextEmbeddingProvider, TextEmbeddingRequest
 
@@ -24,6 +30,7 @@ DEFAULT_KNOWLEDGE_NAMESPACE = "default"
 DEFAULT_KNOWLEDGE_KIND = "fact"
 DEFAULT_KNOWLEDGE_LIMIT = 10
 DEFAULT_KNOWLEDGE_MAX_BYTES = 20_000
+MAX_KNOWLEDGE_CHUNK_INDEX = 2**31 - 1
 _SEARCH_TOKEN_RE = re.compile(r"\w+")
 
 BUILTIN_KNOWLEDGE_KINDS = (
@@ -101,7 +108,7 @@ class KnowledgeListGroup(StrEnum):
 class KnowledgeEntry(BaseModel):
     """Durable, source-attributed knowledge item."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     id: str
     text: str
@@ -131,7 +138,7 @@ class KnowledgeEntry(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
     @field_validator("labels", mode="before")
     @classmethod
@@ -167,14 +174,14 @@ class KnowledgeEntry(BaseModel):
     def copy_string_list(cls, value, info) -> list[str]:
         if value is None:
             return []
-        copied = copy_json_value(value, info.field_name)
+        copied = copy_durable_json_value(value, info.field_name)
         if type(copied) is not list:
             raise ValueError(f"`{info.field_name}` must be a list.")
         result: list[str] = []
         for index, item in enumerate(copied):
             if type(item) is not str:
                 raise ValueError(f"`{info.field_name}[{index}]` must be a string.")
-            result.append(require_clean_nonblank(item, f"{info.field_name}[{index}]"))
+            result.append(require_clean_nonblank(item, info.field_name))
         return _dedupe_strings(result)
 
     @field_validator("importance", "confidence", mode="before")
@@ -206,7 +213,7 @@ class KnowledgeEntry(BaseModel):
 
 
 class KnowledgeChunk(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     id: str
     entry_id: str
@@ -219,7 +226,7 @@ class KnowledgeChunk(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
     @field_validator("id", "entry_id")
     @classmethod
@@ -245,11 +252,15 @@ class KnowledgeChunk(BaseModel):
             raise ValueError(f"`{info.field_name}` must be an integer.")
         if value < 0:
             raise ValueError(f"`{info.field_name}` must be greater than or equal to 0.")
+        if value > MAX_KNOWLEDGE_CHUNK_INDEX:
+            raise ValueError(
+                f"`{info.field_name}` must be less than or equal to {MAX_KNOWLEDGE_CHUNK_INDEX}."
+            )
         return value
 
 
 class KnowledgeQuery(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     text: str | None = None
     any_terms: list[str] = Field(default_factory=list)
@@ -365,7 +376,7 @@ class KnowledgeQuery(BaseModel):
 
 
 class KnowledgeListQuery(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     namespace: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
@@ -1365,7 +1376,7 @@ def copy_knowledge_entry(entry: KnowledgeEntry) -> KnowledgeEntry:
         last_used_at=entry.last_used_at,
         expires_at=entry.expires_at,
         title=entry.title,
-        metadata=copy_json_value(entry.metadata, "metadata"),
+        metadata=copy_durable_json_object(entry.metadata, "metadata"),
     )
 
 
@@ -1379,7 +1390,7 @@ def copy_knowledge_chunk(chunk: KnowledgeChunk) -> KnowledgeChunk:
         chunk_index=chunk.chunk_index,
         content_hash=chunk.content_hash,
         source_uri=chunk.source_uri,
-        metadata=copy_json_value(chunk.metadata, "metadata"),
+        metadata=copy_durable_json_object(chunk.metadata, "metadata"),
     )
 
 

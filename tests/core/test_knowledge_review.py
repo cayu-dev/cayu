@@ -5,6 +5,7 @@ from typing import Any, cast
 
 import pytest
 
+from cayu._validation import DurableValueError
 from cayu.storage import (
     InMemoryKnowledgeStore,
     KnowledgeEntry,
@@ -21,6 +22,29 @@ class ScopeDriftKnowledgeStore(InMemoryKnowledgeStore):
         if entry is not None and entry.id == "pending_git":
             await self.put_entry(entry.model_copy(update={"labels": {"project": "other"}}))
         return entry
+
+
+@pytest.mark.parametrize(
+    ("invalid_text", "code"),
+    [
+        ("workload-secret-value\x00", "nul_character"),
+        ("workload-secret-value\ud800", "unicode_surrogate"),
+    ],
+)
+def test_review_workflow_rejects_nonportable_scope_and_entry_text(
+    invalid_text: str,
+    code: str,
+) -> None:
+    with pytest.raises(DurableValueError) as invalid_scope:
+        KnowledgeReviewWorkflow(InMemoryKnowledgeStore(), namespace=invalid_text)
+    assert invalid_scope.value.code == code
+    assert "workload-secret-value" not in str(invalid_scope.value)
+
+    workflow = KnowledgeReviewWorkflow(InMemoryKnowledgeStore())
+    with pytest.raises(DurableValueError) as invalid_entry:
+        asyncio.run(workflow.approve(invalid_text))
+    assert invalid_entry.value.code == code
+    assert "workload-secret-value" not in str(invalid_entry.value)
 
 
 def test_review_workflow_lists_pending_entries_in_scope() -> None:

@@ -9,9 +9,11 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cayu._validation import (
-    copy_json_value,
+    copy_durable_json_object,
+    copy_durable_json_value,
     copy_label_map,
     require_clean_nonblank,
+    require_durable_text,
     require_finite,
     require_nonblank,
 )
@@ -39,7 +41,7 @@ _MARKDOWN_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 class KnowledgeIndexRequest(BaseModel):
     """Request to deterministically index text into an entry and chunks."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     text: str
     entry_id: str | None = None
@@ -71,7 +73,10 @@ class KnowledgeIndexRequest(BaseModel):
     @field_validator("text")
     @classmethod
     def validate_text(cls, value: str, info) -> str:
-        return require_nonblank(value, info.field_name)
+        return require_nonblank(
+            require_durable_text(value, info.field_name),
+            info.field_name,
+        )
 
     @field_validator("labels", mode="before")
     @classmethod
@@ -81,12 +86,15 @@ class KnowledgeIndexRequest(BaseModel):
     @field_validator("metadata", "chunk_metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any], info) -> dict[str, Any]:
-        return copy_json_value(value, info.field_name)
+        return copy_durable_json_object(value, info.field_name)
 
     @field_validator("namespace", "kind", "created_by")
     @classmethod
     def validate_clean_nonblank_fields(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_clean_nonblank(
+            require_durable_text(value, info.field_name),
+            info.field_name,
+        )
 
     @field_validator(
         "entry_id",
@@ -100,21 +108,29 @@ class KnowledgeIndexRequest(BaseModel):
     def validate_optional_clean_nonblank_fields(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
-        return require_clean_nonblank(value, info.field_name)
+        return require_clean_nonblank(
+            require_durable_text(value, info.field_name),
+            info.field_name,
+        )
 
     @field_validator("aspects", "impact_targets", mode="before")
     @classmethod
     def copy_string_list(cls, value, info) -> list[str]:
         if value is None:
             return []
-        copied = copy_json_value(value, info.field_name)
+        copied = copy_durable_json_value(value, info.field_name)
         if type(copied) is not list:
             raise ValueError(f"`{info.field_name}` must be a list.")
         result: list[str] = []
         for index, item in enumerate(copied):
             if type(item) is not str:
                 raise ValueError(f"`{info.field_name}[{index}]` must be a string.")
-            result.append(require_clean_nonblank(item, f"{info.field_name}[{index}]"))
+            result.append(
+                require_clean_nonblank(
+                    require_durable_text(item, info.field_name),
+                    info.field_name,
+                )
+            )
         return list(dict.fromkeys(result))
 
     @field_validator("importance", "confidence", mode="before")
@@ -326,8 +342,8 @@ def copy_knowledge_index_request(request: KnowledgeIndexRequest) -> KnowledgeInd
         confidence=request.confidence,
         expires_at=request.expires_at,
         title=request.title,
-        metadata=copy_json_value(request.metadata, "metadata"),
-        chunk_metadata=copy_json_value(request.chunk_metadata, "chunk_metadata"),
+        metadata=copy_durable_json_object(request.metadata, "metadata"),
+        chunk_metadata=copy_durable_json_object(request.chunk_metadata, "chunk_metadata"),
         entry_text_max_bytes=request.entry_text_max_bytes,
         chunk_target_bytes=request.chunk_target_bytes,
         chunk_overlap_bytes=request.chunk_overlap_bytes,

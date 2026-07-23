@@ -12,6 +12,7 @@ from cayu.embeddings import (
     TextEmbeddingResult,
 )
 from cayu.storage import (
+    MAX_KNOWLEDGE_CHUNK_INDEX,
     KnowledgeChunk,
     KnowledgeEntry,
     KnowledgeListGroup,
@@ -131,6 +132,27 @@ def _run(dsn: str, coro_factory):
     return asyncio.run(runner())
 
 
+def test_postgres_knowledge_store_rejects_out_of_range_chunk_index_atomically(
+    postgres_dsn: str,
+) -> None:
+    async def ops(store):
+        entry = KnowledgeEntry(id="entry_chunk_index", text="memory")
+        chunk = KnowledgeChunk(
+            id="chunk_index",
+            entry_id=entry.id,
+            chunk_index=0,
+            text="chunk",
+        )
+        chunk.chunk_index = MAX_KNOWLEDGE_CHUNK_INDEX + 1
+
+        with pytest.raises(ValueError, match=str(MAX_KNOWLEDGE_CHUNK_INDEX)):
+            await store.put_entry_with_chunks(entry, [chunk])
+        assert await store.get_entry(entry.id) is None
+        assert await store.read_chunks(entry.id) == []
+
+    _run(postgres_dsn, ops)
+
+
 def test_postgres_knowledge_store_persists_entries_chunks_and_filters(postgres_dsn: str) -> None:
     async def ops(store):
         await store.put_entry_with_chunks(
@@ -146,6 +168,7 @@ def test_postgres_knowledge_store_persists_entries_chunks_and_filters(postgres_d
                 source_type="manual",
                 source_id="invoice_rules",
                 importance=0.8,
+                metadata={"numbers": {"ordinary": 1.0, "zero": -0.0, "fractional": 1e-7}},
                 created_at=datetime(2026, 1, 1, tzinfo=UTC),
                 updated_at=datetime(2026, 1, 1, tzinfo=UTC),
             ),
@@ -156,6 +179,7 @@ def test_postgres_knowledge_store_persists_entries_chunks_and_filters(postgres_d
                     chunk_index=0,
                     text="Invoice reminders require a PO number.",
                     source_uri="manual://invoice_rules",
+                    metadata={"numbers": {"ordinary": 1.0, "zero": -0.0, "fractional": 1e-7}},
                 )
             ],
         )
@@ -199,9 +223,18 @@ def test_postgres_knowledge_store_persists_entries_chunks_and_filters(postgres_d
     assert loaded.labels == {"project": "invoice_agent", "user": "alice"}
     assert loaded.aspects == ["finance"]
     assert loaded.impact_targets == ["finance.reminders"]
+    assert loaded.metadata["numbers"] == {"ordinary": 1, "zero": 0, "fractional": 1e-7}
+    assert type(loaded.metadata["numbers"]["ordinary"]) is int
+    assert type(loaded.metadata["numbers"]["zero"]) is int
+    assert type(loaded.metadata["numbers"]["fractional"]) is float
     assert [hit.entry.id for hit in result.hits] == ["invoice_warning"]
     assert result.hits[0].chunk is not None
     assert result.hits[0].chunk.id == "invoice_warning:0"
+    assert result.hits[0].chunk.metadata["numbers"] == {
+        "ordinary": 1,
+        "zero": 0,
+        "fractional": 1e-7,
+    }
     assert result.hits[0].score_kind == "postgres_full_text"
     assert result.total_hits_known == 1
     assert denied.hits == []

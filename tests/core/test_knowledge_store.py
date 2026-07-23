@@ -7,6 +7,7 @@ from typing import Any, cast
 import pytest
 from pydantic import ValidationError
 
+from cayu._validation import DurableValueError, extract_durable_value_error
 from cayu.embeddings import (
     TextEmbedding,
     TextEmbeddingProvider,
@@ -15,6 +16,7 @@ from cayu.embeddings import (
 )
 from cayu.storage import (
     BUILTIN_KNOWLEDGE_KINDS,
+    MAX_KNOWLEDGE_CHUNK_INDEX,
     InMemoryEmbeddingKnowledgeStore,
     InMemoryKnowledgeStore,
     KnowledgeActorType,
@@ -138,6 +140,130 @@ def test_knowledge_entry_rejects_invalid_identity_labels_and_scores() -> None:
             created_at=datetime(2026, 1, 2, tzinfo=UTC),
             updated_at=datetime(2026, 1, 1, tzinfo=UTC),
         )
+
+
+def test_knowledge_entry_and_chunk_enforce_portable_durable_values() -> None:
+    numbers = {
+        "ordinary": 1.0,
+        "negative_zero": -0.0,
+        "large": 1e18,
+        "fractional": 1e-7,
+    }
+    entry = KnowledgeEntry(id="entry_numbers", text="memory", metadata={"numbers": numbers})
+    chunk = KnowledgeChunk(
+        id="chunk_numbers",
+        entry_id=entry.id,
+        chunk_index=0,
+        text="chunk",
+        metadata={"numbers": numbers},
+    )
+    boundary_chunk = KnowledgeChunk(
+        id="chunk_boundary",
+        entry_id=entry.id,
+        chunk_index=MAX_KNOWLEDGE_CHUNK_INDEX,
+        text="chunk",
+    )
+    assert boundary_chunk.chunk_index == MAX_KNOWLEDGE_CHUNK_INDEX
+
+    with pytest.raises(ValidationError, match=str(MAX_KNOWLEDGE_CHUNK_INDEX)):
+        KnowledgeChunk(
+            id="chunk_out_of_range",
+            entry_id=entry.id,
+            chunk_index=MAX_KNOWLEDGE_CHUNK_INDEX + 1,
+            text="chunk",
+        )
+
+    for value in (entry.metadata["numbers"], chunk.metadata["numbers"]):
+        assert value == {
+            "ordinary": 1,
+            "negative_zero": 0,
+            "large": 1_000_000_000_000_000_000,
+            "fractional": 1e-7,
+        }
+        assert type(value["ordinary"]) is int
+        assert type(value["negative_zero"]) is int
+        assert type(value["large"]) is int
+        assert type(value["fractional"]) is float
+
+    for factory, code in (
+        (
+            lambda: KnowledgeEntry(
+                id="entry_invalid_metadata",
+                text="memory",
+                metadata={"bad": float("nan")},
+            ),
+            "non_finite_number",
+        ),
+        (
+            lambda: KnowledgeChunk(
+                id="chunk_invalid_metadata",
+                entry_id="entry_1",
+                chunk_index=0,
+                text="chunk",
+                metadata={"bad": "value\ud800"},
+            ),
+            "unicode_surrogate",
+        ),
+        (
+            lambda: KnowledgeEntry(id="entry_invalid_text", text="memory\x00value"),
+            "nul_character",
+        ),
+    ):
+        with pytest.raises(ValidationError) as invalid_value:
+            factory()
+        durable_error = extract_durable_value_error(invalid_value.value)
+        assert durable_error is not None
+        assert durable_error.code == code
+
+
+def test_in_memory_knowledge_store_revalidates_poisoned_chunk_batch_atomically() -> None:
+    async def run() -> None:
+        store = InMemoryKnowledgeStore()
+        entry = KnowledgeEntry(id="entry_poisoned_batch", text="memory")
+        valid_chunk = KnowledgeChunk(
+            id="chunk_valid",
+            entry_id=entry.id,
+            chunk_index=0,
+            text="valid",
+        )
+        poisoned_chunk = KnowledgeChunk(
+            id="chunk_poisoned",
+            entry_id=entry.id,
+            chunk_index=1,
+            text="poisoned",
+            metadata={"safe": True},
+        )
+        poisoned_chunk.metadata["bad"] = float("inf")
+
+        with pytest.raises((DurableValueError, ValidationError)) as invalid_batch:
+            await store.put_entry_with_chunks(entry, [valid_chunk, poisoned_chunk])
+        durable_error = extract_durable_value_error(invalid_batch.value)
+        assert durable_error is not None
+        assert durable_error.code == "non_finite_number"
+        assert await store.get_entry(entry.id) is None
+        assert await store.read_chunks(entry.id) == []
+
+    asyncio.run(run())
+
+
+def test_in_memory_knowledge_store_rejects_out_of_range_chunk_index_atomically() -> None:
+    async def run() -> None:
+        store = InMemoryKnowledgeStore()
+        entry = KnowledgeEntry(id="entry_chunk_index", text="memory")
+        chunk = KnowledgeChunk(
+            id="chunk_index",
+            entry_id=entry.id,
+            chunk_index=0,
+            text="chunk",
+        )
+        chunk.chunk_index = MAX_KNOWLEDGE_CHUNK_INDEX + 1
+
+        with pytest.raises(ValidationError, match=str(MAX_KNOWLEDGE_CHUNK_INDEX)):
+            await store.put_entry_with_chunks(entry, [chunk])
+        assert await store.get_entry(entry.id) is None
+        assert await store.read_chunks(entry.id) == []
+
+    asyncio.run(run())
 
 
 def test_knowledge_hit_owns_copies() -> None:

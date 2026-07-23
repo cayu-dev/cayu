@@ -5,8 +5,10 @@ format (ADR 0001 Phase 3). These helpers read only through the public
 ``SessionStore`` / ``TaskStore`` contract methods, so they work identically
 across the in-memory, SQLite, and Postgres backends.
 
-Each line is ``json.dumps(obj, ensure_ascii=False)`` plus a newline. Ordering
-is deterministic: records are exported oldest-first by creation time.
+Each record is validated against Cayu's portable durable-value contract before
+``json.dumps(..., ensure_ascii=False, allow_nan=False)`` writes the complete
+line. Ordering is deterministic: records are exported oldest-first by creation
+time.
 
 Session export pages with a **keyset cursor** rather than a live ``OFFSET``.
 An offset walk over a store that is being written concurrently silently skips
@@ -27,6 +29,14 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from cayu._validation import (
+    DurableValueError,
+    copy_durable_json_object,
+    durable_json_object_from_pairs,
+    parse_durable_json_integer_literal,
+    reject_nonportable_json_constant,
+    require_durable_text,
+)
 from cayu.core import Event, Message
 from cayu.runtime.sessions import (
     Session,
@@ -46,7 +56,8 @@ class _TextStream(Protocol):
 
 
 def _write_line(stream: _TextStream, obj: dict[str, Any]) -> None:
-    stream.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    portable = copy_durable_json_object(obj, "JSONL record")
+    stream.write(json.dumps(portable, ensure_ascii=False, allow_nan=False) + "\n")
 
 
 async def export_sessions(store: SessionStore, *, stream: _TextStream) -> int:
@@ -152,13 +163,34 @@ class ImportedSession:
 def _iter_json_lines(lines: Iterable[str]) -> Iterator[dict[str, Any]]:
     """Parse non-blank JSONL lines into objects, rejecting non-object lines."""
     for raw in lines:
+        if type(raw) is not str:
+            raise DurableValueError("invalid_text_type", "JSONL record")
+        raw = require_durable_text(raw, "JSONL record")
         stripped = raw.strip()
         if not stripped:
             continue
-        obj = json.loads(stripped)
-        if not isinstance(obj, dict):
-            raise ValueError("Each JSONL line must be a JSON object.")
-        yield obj
+        try:
+            obj = json.loads(
+                stripped,
+                parse_constant=_reject_nonportable_json_constant,
+                parse_int=_parse_portable_json_integer,
+                object_pairs_hook=_reject_duplicate_json_object_keys,
+            )
+        except RecursionError:
+            raise DurableValueError("nesting_too_deep", "JSONL record") from None
+        yield copy_durable_json_object(obj, "JSONL record")
+
+
+def _reject_nonportable_json_constant(value: str) -> None:
+    reject_nonportable_json_constant(value, "JSONL record")
+
+
+def _parse_portable_json_integer(value: str) -> int:
+    return parse_durable_json_integer_literal(value, "JSONL record")
+
+
+def _reject_duplicate_json_object_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    return durable_json_object_from_pairs(pairs, "JSONL record")
 
 
 def import_sessions(lines: Iterable[str]) -> Iterator[ImportedSession]:
@@ -175,11 +207,14 @@ def import_sessions(lines: Iterable[str]) -> Iterator[ImportedSession]:
         record_type = obj.get("type")
         if record_type != "session":
             raise ValueError(f"Expected a session record, got type={record_type!r}.")
+        checkpoint = obj.get("checkpoint")
+        if checkpoint is not None:
+            checkpoint = copy_durable_json_object(checkpoint, "checkpoint")
         yield ImportedSession(
             session=Session.model_validate(obj["session"]),
             events=[Event.model_validate(event) for event in obj.get("events", [])],
             transcript=[Message.model_validate(message) for message in obj.get("transcript", [])],
-            checkpoint=obj.get("checkpoint"),
+            checkpoint=checkpoint,
         )
 
 

@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Callable
 
 import pytest
+from pydantic import ValidationError
 
 from cayu import (
     InMemoryTaskStore,
@@ -13,6 +14,11 @@ from cayu import (
     TaskQuery,
     TaskStatus,
     TaskStore,
+)
+from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
+    DurableValueError,
+    extract_durable_value_error,
 )
 
 StoreFactory = Callable[[object], TaskStore]
@@ -302,6 +308,124 @@ def test_task_stores_reject_duplicate_tasks_and_invalid_payloads(
 
         with pytest.raises(ValueError, match="JSON object"):
             await store.fail_task("task_duplicate", ["not", "an", "object"])  # type: ignore[arg-type]
+
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_task_stores_revalidate_portable_values_before_atomic_mutation(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        poisoned_create = TaskCreate(
+            task_id="task_poisoned_create",
+            type="demo",
+            input={"safe": True},
+        )
+        poisoned_create.input["bad"] = float("nan")
+        with pytest.raises((DurableValueError, ValidationError)) as invalid_create:
+            await store.create_task(poisoned_create)
+        create_error = extract_durable_value_error(invalid_create.value)
+        assert create_error is not None
+        assert create_error.code == "non_finite_number"
+        assert await store.load_task("task_poisoned_create") is None
+
+        request = TaskCreate(
+            task_id="task_portable_numbers",
+            type="demo",
+            input={"numbers": {"safe": True}},
+            metadata={"numbers": {"safe": True}},
+        )
+        numbers = {
+            "ordinary": 1.0,
+            "negative_zero": -0.0,
+            "large": 1e18,
+            "fractional": 1e-7,
+        }
+        request.input["numbers"] = dict(numbers)
+        request.metadata["numbers"] = dict(numbers)
+        await store.create_task(request)
+
+        with pytest.raises(DurableValueError) as invalid_result:
+            await store.complete_task(
+                "task_portable_numbers",
+                {"bad": MAX_DURABLE_JSON_INTEGER + 1},
+            )
+        assert invalid_result.value.code == "integer_out_of_range"
+        pending = await store.load_task("task_portable_numbers")
+        assert pending is not None
+        assert pending.status is TaskStatus.PENDING
+
+        with pytest.raises(DurableValueError) as invalid_reason:
+            await store.pause_task("task_portable_numbers", reason="poisoned\x00reason")
+        assert invalid_reason.value.code == "nul_character"
+        pending = await store.load_task("task_portable_numbers")
+        assert pending is not None
+        assert pending.status is TaskStatus.PENDING
+
+        for invalid_text, code in (
+            ("workload-secret-value\x00", "nul_character"),
+            ("workload-secret-value\ud800", "unicode_surrogate"),
+        ):
+            with pytest.raises(DurableValueError) as invalid_session_id:
+                await store.start_task(
+                    "task_portable_numbers",
+                    session_id=invalid_text,
+                )
+            assert invalid_session_id.value.code == code
+            assert "workload-secret-value" not in str(invalid_session_id.value)
+
+            forged_query = TaskQuery(q="safe")
+            forged_query.q = invalid_text
+            with pytest.raises(ValidationError) as invalid_query:
+                await store.list_tasks(forged_query)
+            query_error = extract_durable_value_error(invalid_query.value)
+            assert query_error is not None
+            assert query_error.code == code
+            assert "workload-secret-value" not in str(invalid_query.value)
+
+            pending = await store.load_task("task_portable_numbers")
+            assert pending is not None
+            assert pending.status is TaskStatus.PENDING
+            assert pending.session_id is None
+
+        forged_query = TaskQuery()
+        forged_query.offset = MAX_DURABLE_JSON_INTEGER + 1
+        with pytest.raises(ValidationError):
+            await store.list_tasks(forged_query)
+        pending = await store.load_task("task_portable_numbers")
+        assert pending is not None
+        assert pending.status is TaskStatus.PENDING
+
+        completed = await store.complete_task(
+            "task_portable_numbers",
+            {"numbers": numbers},
+        )
+        assert completed.status is TaskStatus.COMPLETED
+
+        loaded = await store.load_task("task_portable_numbers")
+        assert loaded is not None
+        assert loaded.result is not None
+        for value in (
+            loaded.input["numbers"],
+            loaded.metadata["numbers"],
+            loaded.result["numbers"],
+        ):
+            assert value == {
+                "ordinary": 1,
+                "negative_zero": 0,
+                "large": 1_000_000_000_000_000_000,
+                "fractional": 1e-7,
+            }
+            assert type(value["ordinary"]) is int
+            assert type(value["negative_zero"]) is int
+            assert type(value["large"]) is int
+            assert type(value["fractional"]) is float
 
         await _close_store(store)
 

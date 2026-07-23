@@ -2402,22 +2402,26 @@
       "properties": {
         "max_cache_read_input_tokens": {
           "default": 0,
+          "maximum": 9.223372036854776e+18,
           "minimum": 0.0,
           "title": "Max Cache Read Input Tokens",
           "type": "integer"
         },
         "max_cache_write_input_tokens": {
           "default": 0,
+          "maximum": 9.223372036854776e+18,
           "minimum": 0.0,
           "title": "Max Cache Write Input Tokens",
           "type": "integer"
         },
         "max_input_tokens": {
+          "maximum": 9.223372036854776e+18,
           "minimum": 0.0,
           "title": "Max Input Tokens",
           "type": "integer"
         },
         "max_output_tokens": {
+          "maximum": 9.223372036854776e+18,
           "minimum": 0.0,
           "title": "Max Output Tokens",
           "type": "integer"
@@ -2437,6 +2441,7 @@
         "duration_seconds": {
           "anyOf": [
             {
+              "maximum": 9.223372036854776e+18,
               "minimum": 1.0,
               "type": "integer"
             },
@@ -2493,42 +2498,49 @@
       "properties": {
         "cached_input_tokens": {
           "default": 0,
+          "maximum": 9.223372036854776e+18,
           "minimum": 0.0,
           "title": "Cached Input Tokens",
           "type": "integer"
         },
         "read_tokens": {
           "default": 0,
+          "maximum": 9.223372036854776e+18,
           "minimum": 0.0,
           "title": "Read Tokens",
           "type": "integer"
         },
         "uncached_input_tokens": {
           "default": 0,
+          "maximum": 9.223372036854776e+18,
           "minimum": 0.0,
           "title": "Uncached Input Tokens",
           "type": "integer"
         },
         "write_1h_tokens": {
           "default": 0,
+          "maximum": 9.223372036854776e+18,
           "minimum": 0.0,
           "title": "Write 1H Tokens",
           "type": "integer"
         },
         "write_5m_tokens": {
           "default": 0,
+          "maximum": 9.223372036854776e+18,
           "minimum": 0.0,
           "title": "Write 5M Tokens",
           "type": "integer"
         },
         "write_tokens": {
           "default": 0,
+          "maximum": 9.223372036854776e+18,
           "minimum": 0.0,
           "title": "Write Tokens",
           "type": "integer"
         },
         "write_unknown_ttl_tokens": {
           "default": 0,
+          "maximum": 9.223372036854776e+18,
           "minimum": 0.0,
           "title": "Write Unknown Ttl Tokens",
           "type": "integer"
@@ -2684,6 +2696,7 @@
         },
         "model_steps": {
           "default": 0,
+          "maximum": 9.223372036854776e+18,
           "minimum": 0.0,
           "title": "Model Steps",
           "type": "integer"
@@ -2704,6 +2717,7 @@
         },
         "session_count": {
           "default": 0,
+          "maximum": 9.223372036854776e+18,
           "minimum": 0.0,
           "title": "Session Count",
           "type": "integer"
@@ -2724,6 +2738,7 @@
         },
         "tool_calls": {
           "default": 0,
+          "maximum": 9.223372036854776e+18,
           "minimum": 0.0,
           "title": "Tool Calls",
           "type": "integer"
@@ -5160,6 +5175,7 @@
       "properties": {
         "model_steps": {
           "default": 0,
+          "maximum": 9.223372036854776e+18,
           "minimum": 0.0,
           "title": "Model Steps",
           "type": "integer"
@@ -5184,6 +5200,7 @@
         },
         "tool_calls": {
           "default": 0,
+          "maximum": 9.223372036854776e+18,
           "minimum": 0.0,
           "title": "Tool Calls",
           "type": "integer"
@@ -7018,6 +7035,7 @@
         },
         "input_tokens": {
           "default": 0,
+          "maximum": 9.223372036854776e+18,
           "minimum": 0.0,
           "title": "Input Tokens",
           "type": "integer"
@@ -7035,6 +7053,7 @@
         },
         "output_tokens": {
           "default": 0,
+          "maximum": 9.223372036854776e+18,
           "minimum": 0.0,
           "title": "Output Tokens",
           "type": "integer"
@@ -7052,6 +7071,7 @@
         },
         "reasoning_output_tokens": {
           "default": 0,
+          "maximum": 9.223372036854776e+18,
           "minimum": 0.0,
           "title": "Reasoning Output Tokens",
           "type": "integer"
@@ -7069,6 +7089,7 @@
         },
         "total_tokens": {
           "default": 0,
+          "maximum": 9.223372036854776e+18,
           "minimum": 0.0,
           "title": "Total Tokens",
           "type": "integer"

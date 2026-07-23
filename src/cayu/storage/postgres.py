@@ -30,11 +30,14 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised only without 
 
 from cayu._validation import (
     JsonUtf8SizeCounter,
-    copy_json_object,
-    copy_json_value,
+    copy_durable_json_object,
+    copy_durable_json_value,
     copy_label_map,
-    require_clean_nonblank,
+    require_durable_nonblank,
     require_nonblank,
+)
+from cayu._validation import (
+    require_durable_clean_nonblank as require_clean_nonblank,
 )
 from cayu.core.billing import BillingIdentity
 from cayu.core.events import Event, EventType
@@ -60,6 +63,7 @@ from cayu.runtime.budgets import (
     _reservation_result,
     _validate_amount,
     _validate_reservation_ttl,
+    copy_budget_limit,
 )
 from cayu.runtime.event_watchers import (
     EventWatcherClaim,
@@ -68,6 +72,8 @@ from cayu.runtime.event_watchers import (
     EventWatcherDeliveryStatus,
     EventWatcherState,
     EventWatcherStore,
+    copy_event_watcher_claim,
+    copy_event_watcher_record,
 )
 from cayu.runtime.sessions import (
     DELETE_BLOCKED_SESSION_STATUSES,
@@ -148,6 +154,7 @@ from cayu.runtime.sessions import (
     session_next_cursor,
     session_outcome,
     session_query_from_aggregate_filter,
+    validate_persisted_event_side_effect_error,
 )
 from cayu.runtime.tasks import (
     Task,
@@ -1626,8 +1633,7 @@ class PostgresEventWatcherStore(_PostgresStoreBase, EventWatcherStore):
         lease_seconds: float,
     ) -> EventWatcherClaim | None:
         watcher_name = require_clean_nonblank(watcher_name, "watcher_name")
-        if type(record) is not EventRecord:
-            raise TypeError("record must be an EventRecord.")
+        record = copy_event_watcher_record(record)
         lease_seconds = _validate_positive_float(lease_seconds, "lease_seconds")
         await self._ensure_ready()
         now = datetime.now(UTC)
@@ -1677,8 +1683,7 @@ class PostgresEventWatcherStore(_PostgresStoreBase, EventWatcherStore):
             return claim
 
     async def mark_success(self, claim: EventWatcherClaim) -> EventWatcherDelivery:
-        if type(claim) is not EventWatcherClaim:
-            raise TypeError("claim must be an EventWatcherClaim.")
+        claim = copy_event_watcher_claim(claim)
         await self._ensure_ready()
         now = datetime.now(UTC)
         async with self._pool.connection() as conn, conn.cursor() as cur:
@@ -1712,8 +1717,7 @@ class PostgresEventWatcherStore(_PostgresStoreBase, EventWatcherStore):
         error: str,
         max_attempts: int,
     ) -> EventWatcherDelivery:
-        if type(claim) is not EventWatcherClaim:
-            raise TypeError("claim must be an EventWatcherClaim.")
+        claim = copy_event_watcher_claim(claim)
         error = _clean_error(error)
         if type(max_attempts) is not int or max_attempts < 1:
             raise ValueError("max_attempts must be an integer greater than or equal to 1.")
@@ -2052,8 +2056,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         model: str,
         billing_identity: BillingIdentity | None = None,
     ) -> BudgetReservationResult:
-        if type(limit) is not BudgetLimit:
-            raise TypeError("limit must be a BudgetLimit.")
+        limit = copy_budget_limit(limit)
         session_id = require_clean_nonblank(session_id, "session_id")
         agent_name = require_clean_nonblank(agent_name, "agent_name")
         provider_name = require_clean_nonblank(provider_name, "provider_name")
@@ -4130,7 +4133,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             created_at=now,
             updated_at=now,
             last_activity_at=now,
-            metadata=copy_json_value(request.metadata, "metadata"),
+            metadata=copy_durable_json_object(request.metadata, "metadata"),
             labels=request.labels,
         )
         if session.parent_session_id == session.id:
@@ -4226,7 +4229,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             await self._load_checkpoint(cur, source_session_id),
                         )
                         if copied_checkpoint is not None:
-                            copied_checkpoint = copy_json_value(copied_checkpoint, "checkpoint")
+                            copied_checkpoint = copy_durable_json_object(
+                                copied_checkpoint,
+                                "checkpoint",
+                            )
 
                     await cur.execute(
                         f"""
@@ -4614,7 +4620,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         await self._load_checkpoint(cur, session_id),
                     )
                     if transformed_checkpoint is not None:
-                        transformed_checkpoint = copy_json_value(
+                        transformed_checkpoint = copy_durable_json_object(
                             transformed_checkpoint, "checkpoint"
                         )
 
@@ -4785,7 +4791,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     )
                     if transformed is None:
                         raise ValueError("Fenced checkpoint transform must return a checkpoint.")
-                    transformed = copy_json_value(transformed, "checkpoint")
+                    transformed = copy_durable_json_object(transformed, "checkpoint")
                     await cur.execute(
                         "UPDATE cayu_sessions SET run_epoch = run_epoch + 1, "
                         "last_activity_at = %s WHERE id = %s",
@@ -5097,8 +5103,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         retry_delay_seconds: float,
     ) -> PersistedEventSideEffectDelivery:
         claim = PersistedEventSideEffectClaim.model_validate(claim)
-        if type(error) is not str or not error.strip():
-            raise ValueError("error must be a non-empty string.")
+        error = validate_persisted_event_side_effect_error(error)
         if type(max_attempts) is not int or max_attempts < 1:
             raise ValueError("max_attempts must be an integer greater than or equal to 1.")
         if (
@@ -5778,8 +5783,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 "Session operation transform must return a "
                                 "SessionOperationPublication."
                             )
-                        transformed = copy_json_value(publication.checkpoint, "checkpoint")
-                        operation_records = copy_json_value(
+                        transformed = copy_durable_json_object(
+                            publication.checkpoint,
+                            "checkpoint",
+                        )
+                        operation_records = copy_durable_json_object(
                             publication.operation_records,
                             "operation_records",
                         )
@@ -5788,7 +5796,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         transformed = checkpoint_transform(loaded, current_checkpoint)
                         if transformed is None:
                             raise ValueError("Checkpoint transform must return a checkpoint.")
-                        transformed = copy_json_value(transformed, "checkpoint")
+                        transformed = copy_durable_json_object(transformed, "checkpoint")
 
                     await cur.execute(
                         """
@@ -6521,7 +6529,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             if preflight_eligible_ids:
                 await cur.execute(source_size_sql, (preflight_eligible_ids,))
                 for row in await cur.fetchall():
-                    sequence_values = copy_json_value(row[3], "matched event sequences")
+                    sequence_values = copy_durable_json_value(
+                        row[3],
+                        "matched event sequences",
+                    )
                     if type(sequence_values) is not list or any(
                         type(sequence) is not int for sequence in sequence_values
                     ):
@@ -6586,7 +6597,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 for row in await cur.fetchall():
                     session_id = str(row[0])
                     records: list[EventRecord] = []
-                    pending_events = copy_json_value(row[2], "pending events")
+                    pending_events = copy_durable_json_value(row[2], "pending events")
                     if type(pending_events) is not list:
                         raise ValueError("Postgres pending events projection must be an array.")
                     for pending_event in pending_events:
@@ -6599,7 +6610,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             )
                         )
                     grouped[session_id] = (
-                        copy_json_value(_json_obj(row[1]), "checkpoint"),
+                        copy_durable_json_object(_json_obj(row[1]), "checkpoint"),
                         records,
                     )
 
@@ -6813,7 +6824,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     )
                     if transformed is None:
                         raise ValueError("Checkpoint transform must return a checkpoint.")
-                    transformed = copy_json_value(transformed, "checkpoint")
+                    transformed = copy_durable_json_object(transformed, "checkpoint")
                     await _touch_session_activity(cur, session_id, updated_at)
                     if copied_messages:
                         await cur.executemany(
@@ -6915,7 +6926,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         session_id = require_clean_nonblank(session_id, "session_id")
         if not isinstance(state, dict):
             raise ValueError("Checkpoint state must be a dictionary.")
-        copied = copy_json_value(state, "checkpoint")
+        copied = copy_durable_json_object(state, "checkpoint")
         updated_at = datetime.now(UTC)
         await self._ensure_ready()
         async with self._connection() as conn:
@@ -6948,7 +6959,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         await self._load_checkpoint(cur, session_id),
                     )
                     if transformed is not None:
-                        transformed = copy_json_value(transformed, "checkpoint")
+                        transformed = copy_durable_json_object(transformed, "checkpoint")
                         await _touch_session_activity(cur, session_id, updated_at)
                         await self._upsert_checkpoint(cur, session_id, transformed, updated_at)
                 await conn.commit()
@@ -7095,7 +7106,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         row = await cur.fetchone()
         if row is None:
             return None
-        return copy_json_value(_json_obj(row[0]), "checkpoint")
+        return copy_durable_json_object(_json_obj(row[0]), "checkpoint")
 
     async def _upsert_checkpoint(
         self,
@@ -7393,7 +7404,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         self, task_id: str, result: dict[str, Any], *, worker_id: str | None = None
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
-        result = copy_json_object(result, "result")
+        result = copy_durable_json_object(result, "result")
         return await self._finish_task(
             task_id, TaskStatus.COMPLETED, result=result, error=None, worker_id=worker_id
         )
@@ -7402,7 +7413,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         self, task_id: str, error: dict[str, Any], *, worker_id: str | None = None
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
-        error = copy_json_object(error, "error")
+        error = copy_durable_json_object(error, "error")
         return await self._finish_task(
             task_id, TaskStatus.FAILED, result=None, error=error, worker_id=worker_id
         )
@@ -7413,7 +7424,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         error: dict[str, Any] | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
-        copied_error = None if error is None else copy_json_object(error, "error")
+        copied_error = None if error is None else copy_durable_json_object(error, "error")
         return await self._finish_task(
             task_id, TaskStatus.CANCELLED, result=None, error=copied_error
         )
@@ -7966,7 +7977,12 @@ def _new_id() -> str:
 
 
 def _dumps(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
 
 
 def _checkpoint_row_values(
@@ -7976,6 +7992,7 @@ def _checkpoint_row_values(
 ) -> tuple[object, ...]:
     from cayu.runtime.pending_actions import pending_action_checkpoint_metrics
 
+    checkpoint = copy_durable_json_object(checkpoint, "checkpoint")
     source_bytes, tool_call_count, flags = pending_action_checkpoint_metrics(checkpoint)
     return (
         session_id,
@@ -8806,9 +8823,7 @@ def _validate_positive_float(value: float, field_name: str) -> float:
 
 
 def _clean_error(value: str) -> str:
-    if type(value) is not str or not value.strip():
-        raise ValueError("error must be a non-empty string.")
-    return value
+    return require_durable_nonblank(value, "error")
 
 
 # Lifecycle/terminal event-type strings used to derive a session outcome. Sourced from

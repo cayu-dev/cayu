@@ -8,7 +8,13 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 
-from cayu._validation import copy_label_map, require_clean_nonblank, require_nonblank
+from cayu._validation import (
+    copy_label_map,
+    require_nonblank,
+)
+from cayu._validation import (
+    require_durable_clean_nonblank as require_clean_nonblank,
+)
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 from cayu.storage.memory import (

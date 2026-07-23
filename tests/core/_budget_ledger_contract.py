@@ -7,6 +7,7 @@ from typing import Protocol
 
 import pytest
 
+from cayu._validation import DurableValueError
 from cayu.runtime import BudgetLedger, BudgetLimit
 
 
@@ -14,6 +15,55 @@ class MutableClock(Protocol):
     value: datetime
 
     def __call__(self) -> datetime: ...
+
+
+async def assert_portable_text_boundaries(
+    ledger: BudgetLedger,
+    limit: BudgetLimit,
+) -> None:
+    for invalid_text, code in (
+        ("workload-secret-value\x00", "nul_character"),
+        ("workload-secret-value\ud800", "unicode_surrogate"),
+    ):
+        with pytest.raises(DurableValueError) as invalid_reservation:
+            await ledger.reserve(
+                limit=limit,
+                session_id=invalid_text,
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+        assert invalid_reservation.value.code == code
+        assert "workload-secret-value" not in str(invalid_reservation.value)
+
+    reserved = await ledger.reserve(
+        limit=limit,
+        session_id="sess_portable_text",
+        agent_name="assistant",
+        provider_name="fake",
+        model="fake-model",
+    )
+    assert reserved.accepted is True
+    assert reserved.record is not None
+
+    for invalid_text, code in (
+        ("workload-secret-value\x00", "nul_character"),
+        ("workload-secret-value\ud800", "unicode_surrogate"),
+    ):
+        with pytest.raises(DurableValueError) as invalid_release:
+            await ledger.release(
+                reservation_id=reserved.record.reservation_id,
+                reason=invalid_text,
+            )
+        assert invalid_release.value.code == code
+        assert "workload-secret-value" not in str(invalid_release.value)
+        assert await ledger.heartbeat(reservation_id=reserved.record.reservation_id) is True
+
+    released = await ledger.release(
+        reservation_id=reserved.record.reservation_id,
+        reason="portable boundary verified",
+    )
+    assert released.status == "released"
 
 
 async def assert_idempotent_terminal_settlements(

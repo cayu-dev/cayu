@@ -793,8 +793,10 @@ def test_sse_event_frame_preflight_counts_ascii_del_escape() -> None:
     assert captured.value.actual_bytes is None
 
 
-def test_sse_event_frame_handles_lone_unicode_surrogates_safely() -> None:
-    event = Event(
+def test_sse_event_frame_handles_legacy_lone_unicode_surrogates_safely() -> None:
+    # New Event construction rejects this value. Keep the transport defensive
+    # for legacy rows and validation-bypassed custom integrations.
+    event = Event.model_construct(
         id="event_surrogate",
         type="custom.utf8",
         session_id="session_surrogate",

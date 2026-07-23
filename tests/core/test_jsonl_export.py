@@ -4,6 +4,14 @@ import asyncio
 import io
 import json
 
+import pytest
+
+import cayu.storage.jsonl_export as jsonl_export_module
+from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
+    MIN_DURABLE_JSON_INTEGER,
+    DurableValueError,
+)
 from cayu.core import Event, EventType, Message
 from cayu.runtime import (
     InMemorySessionStore,
@@ -336,3 +344,169 @@ def test_import_skips_blank_lines_and_rejects_wrong_type():
         assert "task record" in str(exc)
     else:  # pragma: no cover - defensive
         raise AssertionError("expected ValueError on wrong record type")
+
+
+@pytest.mark.parametrize(
+    ("line", "code"),
+    [
+        ('{"type":"task","task":{"metadata":{"bad":NaN}}}', "non_finite_number"),
+        (
+            f'{{"type":"task","task":{{"metadata":{{"bad":{MAX_DURABLE_JSON_INTEGER + 1}}}}}}}',
+            "integer_out_of_range",
+        ),
+        ('{"type":"task","task":{"metadata":{"bad":"value\\u0000"}}}', "nul_character"),
+        ('{"type":"task","task":{"metadata":{"bad":"value\\ud800"}}}', "unicode_surrogate"),
+        ('["not", "an", "object"]', "invalid_json_object"),
+    ],
+)
+def test_import_rejects_nonportable_json_before_typed_record_validation(line, code):
+    with pytest.raises(DurableValueError) as raised:
+        list(import_tasks([line]))
+
+    assert raised.value.code == code
+    assert raised.value.field_name == "JSONL record"
+
+
+@pytest.mark.parametrize(
+    ("literal", "expected"),
+    [
+        (str(MIN_DURABLE_JSON_INTEGER), MIN_DURABLE_JSON_INTEGER),
+        (str(MAX_DURABLE_JSON_INTEGER), MAX_DURABLE_JSON_INTEGER),
+    ],
+    ids=["minimum", "maximum"],
+)
+def test_import_json_parser_accepts_exact_signed_int64_boundaries(literal, expected):
+    records = list(jsonl_export_module._iter_json_lines([f'{{"value":{literal}}}']))
+
+    assert records == [{"value": expected}]
+    assert type(records[0]["value"]) is int
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        str(MIN_DURABLE_JSON_INTEGER - 1),
+        str(MAX_DURABLE_JSON_INTEGER + 1),
+        "9" * 5000,
+        "-" + "9" * 5000,
+    ],
+    ids=["below-minimum", "above-maximum", "huge-positive", "huge-negative"],
+)
+def test_import_json_parser_rejects_out_of_range_integers_with_typed_error(literal):
+    with pytest.raises(DurableValueError) as raised:
+        list(jsonl_export_module._iter_json_lines([f'{{"value":{literal}}}']))
+
+    assert raised.value.code == "integer_out_of_range"
+    assert raised.value.field_name == "JSONL record"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        '{"type":"task","secret-key":"secret-a","secret-key":"secret-b"}',
+        ('{"type":"task","task":{"nested":{"secret-key":"secret-a","secret-key":"secret-b"}}}'),
+    ],
+    ids=["top-level", "nested"],
+)
+def test_import_rejects_duplicate_keys_without_echoing_key_or_values(line):
+    with pytest.raises(DurableValueError) as raised:
+        list(import_tasks([line]))
+
+    assert raised.value.code == "duplicate_json_key"
+    rendered = str(raised.value)
+    assert "secret-key" not in rendered
+    assert "secret-a" not in rendered
+    assert "secret-b" not in rendered
+
+
+def test_import_rejects_non_string_lines_before_invoking_string_methods():
+    class HostileLine:
+        strip_called = False
+
+        def strip(self):
+            self.strip_called = True
+            raise AssertionError("strip must not be invoked")
+
+    hostile = HostileLine()
+
+    with pytest.raises(DurableValueError) as raised:
+        list(import_tasks([hostile]))  # type: ignore[list-item]
+
+    assert raised.value.code == "invalid_text_type"
+    assert hostile.strip_called is False
+
+
+@pytest.mark.parametrize(
+    ("line", "code"),
+    [
+        ('{"type":"task","workload-secret":"literal\x00value"}', "nul_character"),
+        ('{"type":"task","workload-secret":"literal\ud800value"}', "unicode_surrogate"),
+    ],
+)
+def test_import_rejects_nonportable_raw_line_text_before_json_parsing(line, code):
+    with pytest.raises(DurableValueError) as raised:
+        list(import_tasks([line]))
+
+    assert raised.value.code == code
+    rendered = str(raised.value)
+    assert "workload-secret" not in rendered
+    assert "literal" not in rendered
+
+
+def test_import_normalizes_parser_recursion_failure(monkeypatch):
+    def recurse(*args, **kwargs):
+        del args, kwargs
+        raise RecursionError("parser detail must not escape")
+
+    monkeypatch.setattr(jsonl_export_module.json, "loads", recurse)
+
+    with pytest.raises(DurableValueError) as raised:
+        list(import_tasks(['{"type":"task"}']))
+
+    assert raised.value.code == "nesting_too_deep"
+    assert raised.value.field_name == "JSONL record"
+    assert "parser detail" not in str(raised.value)
+
+
+def test_import_normalizes_json_number_representations_before_model_validation():
+    async def export_base_task() -> str:
+        store = InMemoryTaskStore()
+        await store.create_task(TaskCreate(task_id="task_numbers", type="process"))
+        stream = io.StringIO()
+        await export_tasks(store, stream=stream)
+        record = json.loads(stream.getvalue())
+        record["task"]["input"] = {
+            "ordinary": 1.0,
+            "negative_zero": -0.0,
+            "large": 1e18,
+            "fractional": 1e-7,
+        }
+        return json.dumps(record)
+
+    imported = list(import_tasks([asyncio.run(export_base_task())]))
+
+    assert len(imported) == 1
+    numbers = imported[0].input
+    assert numbers == {
+        "ordinary": 1,
+        "negative_zero": 0,
+        "large": 1_000_000_000_000_000_000,
+        "fractional": 1e-7,
+    }
+    assert type(numbers["ordinary"]) is int
+    assert type(numbers["negative_zero"]) is int
+    assert type(numbers["large"]) is int
+    assert type(numbers["fractional"]) is float
+
+
+def test_jsonl_writer_rejects_the_whole_record_before_writing_any_bytes():
+    stream = io.StringIO()
+
+    with pytest.raises(DurableValueError) as raised:
+        jsonl_export_module._write_line(
+            stream,
+            {"type": "task", "task": {"result": {"bad": float("nan")}}},
+        )
+
+    assert raised.value.code == "non_finite_number"
+    assert stream.getvalue() == ""

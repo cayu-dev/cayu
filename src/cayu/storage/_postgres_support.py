@@ -434,7 +434,12 @@ def task_order_sql(order_by: TaskOrder) -> str:
 def _dumps(value: Any) -> str:
     # JSONB columns accept a JSON-text string; we serialize explicitly so the
     # same json round-trip semantics as the SQLite store are preserved.
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
 
 
 def _loads(value: Any) -> Any:

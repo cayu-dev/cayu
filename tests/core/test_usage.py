@@ -6,7 +6,10 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
-from tests.core._budget_ledger_contract import assert_idempotent_terminal_settlements
+from tests.core._budget_ledger_contract import (
+    assert_idempotent_terminal_settlements,
+    assert_portable_text_boundaries,
+)
 
 from cayu.core import Event, EventType, Message
 from cayu.providers import (
@@ -1166,6 +1169,15 @@ def test_in_memory_budget_ledger_terminal_settlements_are_idempotent() -> None:
     )
 
 
+def test_in_memory_budget_ledger_rejects_nonportable_text() -> None:
+    asyncio.run(
+        assert_portable_text_boundaries(
+            InMemoryBudgetLedger(),
+            _reservation_budget_limit(max_cost="0.25"),
+        )
+    )
+
+
 def test_in_memory_budget_ledger_window_bounds_active_reservations() -> None:
     async def run():
         clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
@@ -1429,6 +1441,20 @@ def test_sqlite_budget_ledger_terminal_settlements_are_idempotent(tmp_path) -> N
                     window=BudgetWindow.rolling(seconds=60),
                 ),
                 clock=clock,
+            )
+        finally:
+            await ledger.close()
+
+    asyncio.run(run())
+
+
+def test_sqlite_budget_ledger_rejects_nonportable_text(tmp_path) -> None:
+    async def run() -> None:
+        ledger = SQLiteBudgetLedger(tmp_path / "budget-portable-text.sqlite")
+        try:
+            await assert_portable_text_boundaries(
+                ledger,
+                _reservation_budget_limit(max_cost="0.25"),
             )
         finally:
             await ledger.close()

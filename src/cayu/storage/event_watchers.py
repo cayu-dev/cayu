@@ -6,7 +6,13 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from cayu._validation import require_clean_nonblank, require_nonblank
+from cayu._validation import (
+    require_durable_clean_nonblank as require_clean_nonblank,
+)
+from cayu._validation import (
+    require_durable_nonblank,
+    require_nonblank,
+)
 from cayu.runtime.event_watchers import (
     EventWatcherClaim,
     EventWatcherDeadLetter,
@@ -14,6 +20,8 @@ from cayu.runtime.event_watchers import (
     EventWatcherDeliveryStatus,
     EventWatcherState,
     EventWatcherStore,
+    copy_event_watcher_claim,
+    copy_event_watcher_record,
 )
 from cayu.runtime.sessions import EventRecord
 from cayu.storage import migrations as schema
@@ -74,8 +82,7 @@ class SQLiteEventWatcherStore(EventWatcherStore):
         lease_seconds: float,
     ) -> EventWatcherClaim | None:
         watcher_name = require_clean_nonblank(watcher_name, "watcher_name")
-        if type(record) is not EventRecord:
-            raise TypeError("record must be an EventRecord.")
+        record = copy_event_watcher_record(record)
         lease_seconds = _validate_positive_float(lease_seconds, "lease_seconds")
         now = self._clock()
         async with self._lock:
@@ -128,8 +135,7 @@ class SQLiteEventWatcherStore(EventWatcherStore):
                 raise
 
     async def mark_success(self, claim: EventWatcherClaim) -> EventWatcherDelivery:
-        if type(claim) is not EventWatcherClaim:
-            raise TypeError("claim must be an EventWatcherClaim.")
+        claim = copy_event_watcher_claim(claim)
         now = self._clock()
         async with self._lock:
             try:
@@ -167,8 +173,7 @@ class SQLiteEventWatcherStore(EventWatcherStore):
         error: str,
         max_attempts: int,
     ) -> EventWatcherDelivery:
-        if type(claim) is not EventWatcherClaim:
-            raise TypeError("claim must be an EventWatcherClaim.")
+        claim = copy_event_watcher_claim(claim)
         error = _clean_error(error)
         if type(max_attempts) is not int or max_attempts < 1:
             raise ValueError("max_attempts must be an integer greater than or equal to 1.")
@@ -500,9 +505,7 @@ def _validate_positive_float(value: float, field_name: str) -> float:
 
 
 def _clean_error(value: str) -> str:
-    if type(value) is not str or not value.strip():
-        raise ValueError("error must be a non-empty string.")
-    return value
+    return require_durable_nonblank(value, "error")
 
 
 def _format_optional_datetime(value: datetime | None) -> str | None:

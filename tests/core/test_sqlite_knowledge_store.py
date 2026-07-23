@@ -5,8 +5,11 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from pydantic import ValidationError
 
+from cayu._validation import DurableValueError, extract_durable_value_error
 from cayu.storage import (
+    MAX_KNOWLEDGE_CHUNK_INDEX,
     KnowledgeChunk,
     KnowledgeEntry,
     KnowledgeListGroup,
@@ -27,6 +30,63 @@ async def _close(store) -> None:
         await close()
 
 
+def test_sqlite_knowledge_store_rejects_out_of_range_chunk_index_atomically(tmp_path) -> None:
+    async def run() -> None:
+        store = SQLiteKnowledgeStore(tmp_path / "chunk-index.sqlite")
+        try:
+            entry = KnowledgeEntry(id="entry_chunk_index", text="memory")
+            chunk = KnowledgeChunk(
+                id="chunk_index",
+                entry_id=entry.id,
+                chunk_index=0,
+                text="chunk",
+            )
+            chunk.chunk_index = MAX_KNOWLEDGE_CHUNK_INDEX + 1
+
+            with pytest.raises(ValidationError, match=str(MAX_KNOWLEDGE_CHUNK_INDEX)):
+                await store.put_entry_with_chunks(entry, [chunk])
+            assert await store.get_entry(entry.id) is None
+            assert await store.read_chunks(entry.id) == []
+        finally:
+            await _close(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("invalid_text", "code"),
+    [
+        ("workload-secret-value\x00", "nul_character"),
+        ("workload-secret-value\ud800", "unicode_surrogate"),
+    ],
+)
+def test_sqlite_knowledge_store_rejects_nonportable_lookup_text(
+    tmp_path,
+    invalid_text: str,
+    code: str,
+) -> None:
+    async def run() -> None:
+        store = SQLiteKnowledgeStore(tmp_path / "portable-knowledge.sqlite")
+        try:
+            with pytest.raises(DurableValueError) as invalid_id:
+                await store.get_entry(invalid_text)
+            assert invalid_id.value.code == code
+            assert "workload-secret-value" not in str(invalid_id.value)
+
+            query = KnowledgeQuery(namespace="safe", text="probe")
+            query.namespace = invalid_text
+            with pytest.raises(ValidationError) as invalid_query:
+                await store.search(query)
+            query_error = extract_durable_value_error(invalid_query.value)
+            assert query_error is not None
+            assert query_error.code == code
+            assert "workload-secret-value" not in str(invalid_query.value)
+        finally:
+            await _close(store)
+
+    asyncio.run(run())
+
+
 def test_sqlite_knowledge_store_persists_entries_chunks_and_filters(tmp_path) -> None:
     db_path = tmp_path / "knowledge.sqlite"
     store = SQLiteKnowledgeStore(db_path)
@@ -45,6 +105,7 @@ def test_sqlite_knowledge_store_persists_entries_chunks_and_filters(tmp_path) ->
                 source_type="manual",
                 source_id="invoice_rules",
                 importance=0.8,
+                metadata={"numbers": {"ordinary": 1.0, "zero": -0.0, "fractional": 1e-7}},
                 created_at=datetime(2026, 1, 1, tzinfo=UTC),
                 updated_at=datetime(2026, 1, 1, tzinfo=UTC),
             ),
@@ -55,6 +116,7 @@ def test_sqlite_knowledge_store_persists_entries_chunks_and_filters(tmp_path) ->
                     chunk_index=0,
                     text="Invoice reminders require a PO number.",
                     source_uri="manual://invoice_rules",
+                    metadata={"numbers": {"ordinary": 1.0, "zero": -0.0, "fractional": 1e-7}},
                 )
             ],
         )
@@ -105,9 +167,18 @@ def test_sqlite_knowledge_store_persists_entries_chunks_and_filters(tmp_path) ->
     assert loaded.labels == {"project": "invoice_agent", "user": "alice"}
     assert loaded.aspects == ["finance"]
     assert loaded.impact_targets == ["finance.reminders"]
+    assert loaded.metadata["numbers"] == {"ordinary": 1, "zero": 0, "fractional": 1e-7}
+    assert type(loaded.metadata["numbers"]["ordinary"]) is int
+    assert type(loaded.metadata["numbers"]["zero"]) is int
+    assert type(loaded.metadata["numbers"]["fractional"]) is float
     assert [hit.entry.id for hit in result.hits] == ["invoice_warning"]
     assert result.hits[0].chunk is not None
     assert result.hits[0].chunk.id == "invoice_warning:0"
+    assert result.hits[0].chunk.metadata["numbers"] == {
+        "ordinary": 1,
+        "zero": 0,
+        "fractional": 1e-7,
+    }
     assert result.hits[0].score_kind == "sqlite_fts5_bm25"
     assert result.total_hits_known == 1
     assert denied.hits == []

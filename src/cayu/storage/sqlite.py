@@ -13,11 +13,12 @@ from uuid import uuid4
 
 from cayu._validation import (
     JsonUtf8SizeCounter,
-    copy_json_object,
-    copy_json_value,
+    copy_durable_json_object,
     copy_label_map,
-    require_clean_nonblank,
     require_nonblank,
+)
+from cayu._validation import (
+    require_durable_clean_nonblank as require_clean_nonblank,
 )
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, MessageRole
@@ -102,6 +103,7 @@ from cayu.runtime.sessions import (
     session_next_cursor,
     session_outcome,
     session_query_from_aggregate_filter,
+    validate_persisted_event_side_effect_error,
 )
 from cayu.runtime.tasks import (
     Task,
@@ -299,7 +301,7 @@ def _load_checkpoint_state(
     ).fetchone()
     if row is None:
         return None
-    return copy_json_value(json.loads(row["state_json"]), "checkpoint")
+    return copy_durable_json_object(json.loads(row["state_json"]), "checkpoint")
 
 
 def _load_interruption_cascade_marker(
@@ -772,7 +774,7 @@ class SQLiteSessionStore(SessionStore):
                         self._load_checkpoint_unlocked(source_session_id),
                     )
                     if copied_checkpoint is not None:
-                        copied_checkpoint = copy_json_value(
+                        copied_checkpoint = copy_durable_json_object(
                             copied_checkpoint,
                             "checkpoint",
                         )
@@ -1196,7 +1198,7 @@ class SQLiteSessionStore(SessionStore):
                     self._load_checkpoint_unlocked(session_id),
                 )
                 if transformed_checkpoint is not None:
-                    transformed_checkpoint = copy_json_value(
+                    transformed_checkpoint = copy_durable_json_object(
                         transformed_checkpoint,
                         "checkpoint",
                     )
@@ -1329,7 +1331,7 @@ class SQLiteSessionStore(SessionStore):
                 )
                 if transformed is None:
                     raise ValueError("Fenced checkpoint transform must return a checkpoint.")
-                transformed = copy_json_value(transformed, "checkpoint")
+                transformed = copy_durable_json_object(transformed, "checkpoint")
                 self._connection.execute(
                     "UPDATE cayu_sessions SET run_epoch = run_epoch + 1, "
                     "last_activity_at = ? WHERE id = ?",
@@ -1647,8 +1649,7 @@ class SQLiteSessionStore(SessionStore):
         retry_delay_seconds: float,
     ) -> PersistedEventSideEffectDelivery:
         claim = PersistedEventSideEffectClaim.model_validate(claim)
-        if type(error) is not str or not error.strip():
-            raise ValueError("error must be a non-empty string.")
+        error = validate_persisted_event_side_effect_error(error)
         if type(max_attempts) is not int or max_attempts < 1:
             raise ValueError("max_attempts must be an integer greater than or equal to 1.")
         if (
@@ -2300,8 +2301,11 @@ class SQLiteSessionStore(SessionStore):
                         raise TypeError(
                             "Session operation transform must return a SessionOperationPublication."
                         )
-                    transformed = copy_json_value(publication.checkpoint, "checkpoint")
-                    operation_records = copy_json_value(
+                    transformed = copy_durable_json_object(
+                        publication.checkpoint,
+                        "checkpoint",
+                    )
+                    operation_records = copy_durable_json_object(
                         publication.operation_records,
                         "operation_records",
                     )
@@ -2310,7 +2314,7 @@ class SQLiteSessionStore(SessionStore):
                     transformed = checkpoint_transform(loaded, current_checkpoint)
                     if transformed is None:
                         raise ValueError("Checkpoint transform must return a checkpoint.")
-                    transformed = copy_json_value(transformed, "checkpoint")
+                    transformed = copy_durable_json_object(transformed, "checkpoint")
                 event_rows = []
                 for event in copied_events:
                     lookup_key, projection, projection_bytes = pending_action_event_storage_values(
@@ -3195,7 +3199,7 @@ class SQLiteSessionStore(SessionStore):
                                 )
                             )
                         grouped[session_id] = (
-                            copy_json_value(
+                            copy_durable_json_object(
                                 json.loads(row["pending_state_json"]),
                                 "checkpoint",
                             ),
@@ -3427,7 +3431,7 @@ class SQLiteSessionStore(SessionStore):
                 )
                 if transformed is None:
                     raise ValueError("Checkpoint transform must return a checkpoint.")
-                transformed = copy_json_value(transformed, "checkpoint")
+                transformed = copy_durable_json_object(transformed, "checkpoint")
                 _touch_session_activity(connection, session_id, updated_at)
                 if copied_messages:
                     connection.executemany(
@@ -3561,7 +3565,7 @@ class SQLiteSessionStore(SessionStore):
         session_id = require_clean_nonblank(session_id, "session_id")
         if not isinstance(state, dict):
             raise ValueError("Checkpoint state must be a dictionary.")
-        checkpoint = copy_json_value(state, "checkpoint")
+        checkpoint = copy_durable_json_object(state, "checkpoint")
         updated_at = datetime.now(UTC)
 
         def statement(connection: sqlite3.Connection) -> None:
@@ -3614,7 +3618,7 @@ class SQLiteSessionStore(SessionStore):
                     self._load_checkpoint_unlocked(session_id),
                 )
                 if transformed is not None:
-                    transformed = copy_json_value(transformed, "checkpoint")
+                    transformed = copy_durable_json_object(transformed, "checkpoint")
                     _touch_session_activity(connection, session_id, updated_at)
                     connection.execute(
                         """
@@ -3989,7 +3993,7 @@ class SQLiteTaskStore(TaskStore):
         self, task_id: str, result: dict[str, Any], *, worker_id: str | None = None
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
-        result = copy_json_object(result, "result")
+        result = copy_durable_json_object(result, "result")
         async with self._lock:
             return self._finish_task_unlocked(
                 task_id,
@@ -4003,7 +4007,7 @@ class SQLiteTaskStore(TaskStore):
         self, task_id: str, error: dict[str, Any], *, worker_id: str | None = None
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
-        error = copy_json_object(error, "error")
+        error = copy_durable_json_object(error, "error")
         async with self._lock:
             return self._finish_task_unlocked(
                 task_id,
@@ -4019,7 +4023,7 @@ class SQLiteTaskStore(TaskStore):
         error: dict[str, Any] | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
-        copied_error = None if error is None else copy_json_object(error, "error")
+        copied_error = None if error is None else copy_durable_json_object(error, "error")
         async with self._lock:
             return self._finish_task_unlocked(
                 task_id,

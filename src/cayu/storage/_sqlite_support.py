@@ -11,7 +11,7 @@ from typing import Any, cast
 from urllib.parse import quote
 from uuid import uuid4
 
-from cayu._validation import copy_json_value, copy_label_map
+from cayu._validation import copy_durable_json_object, copy_label_map
 from cayu.core.events import Event
 from cayu.runtime.sessions import (
     PENDING_ACTION_EVENT_TYPE_VALUES,
@@ -1163,7 +1163,7 @@ def session_from_request(request: RunRequest, *, identity: SessionIdentity) -> S
         created_at=now,
         updated_at=now,
         last_activity_at=now,
-        metadata=copy_json_value(request.metadata, "metadata"),
+        metadata=copy_durable_json_object(request.metadata, "metadata"),
         labels=copy_label_map(request.labels, "labels"),
     )
 
@@ -1313,7 +1313,12 @@ def parse_optional_datetime(value: str | None) -> datetime | None:
 
 
 def json_dumps(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
 
 
 def checkpoint_row_values(
@@ -1323,6 +1328,7 @@ def checkpoint_row_values(
 ) -> tuple[object, ...]:
     from cayu.runtime.pending_actions import pending_action_checkpoint_metrics
 
+    checkpoint = copy_durable_json_object(checkpoint, "checkpoint")
     source_bytes, tool_call_count, flags = pending_action_checkpoint_metrics(checkpoint)
     return (
         session_id,

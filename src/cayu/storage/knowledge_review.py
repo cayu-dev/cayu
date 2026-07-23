@@ -3,7 +3,12 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any, Protocol
 
-from cayu._validation import copy_label_map, require_clean_nonblank
+from cayu._validation import (
+    copy_label_map,
+)
+from cayu._validation import (
+    require_durable_clean_nonblank as require_clean_nonblank,
+)
 from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_LIMIT,
     DEFAULT_KNOWLEDGE_MAX_BYTES,

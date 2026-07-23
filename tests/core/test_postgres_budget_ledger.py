@@ -11,7 +11,10 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
-from tests.core._budget_ledger_contract import assert_idempotent_terminal_settlements
+from tests.core._budget_ledger_contract import (
+    assert_idempotent_terminal_settlements,
+    assert_portable_text_boundaries,
+)
 
 from cayu.runtime import (
     BudgetLimit,
@@ -173,6 +176,16 @@ def test_postgres_budget_ledger_terminal_settlements_are_idempotent(postgres_dsn
         )
 
     _run(postgres_dsn, ops, clock=clock)
+
+
+def test_postgres_budget_ledger_rejects_nonportable_text(postgres_dsn) -> None:
+    async def ops(ledger):
+        await assert_portable_text_boundaries(
+            ledger,
+            _reservation_budget_limit(max_cost="0.25"),
+        )
+
+    _run(postgres_dsn, ops)
 
 
 def test_postgres_budget_ledger_survives_ledger_restart(postgres_dsn) -> None:

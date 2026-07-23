@@ -8,7 +8,12 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
-from cayu._validation import require_clean_nonblank, require_nonblank
+from cayu._validation import (
+    require_durable_clean_nonblank as require_clean_nonblank,
+)
+from cayu._validation import (
+    require_nonblank,
+)
 from cayu.core.billing import BillingIdentity
 from cayu.runtime.budgets import (
     DEFAULT_RESERVATION_TTL_SECONDS,
@@ -28,6 +33,7 @@ from cayu.runtime.budgets import (
     _reservation_result,
     _validate_amount,
     _validate_reservation_ttl,
+    copy_budget_limit,
 )
 
 from . import _sqlite_support as sqlite_support
@@ -86,8 +92,7 @@ class SQLiteBudgetLedger(BudgetLedger):
         model: str,
         billing_identity: BillingIdentity | None = None,
     ) -> BudgetReservationResult:
-        if type(limit) is not BudgetLimit:
-            raise TypeError("limit must be a BudgetLimit.")
+        limit = copy_budget_limit(limit)
         session_id = require_clean_nonblank(session_id, "session_id")
         agent_name = require_clean_nonblank(agent_name, "agent_name")
         provider_name = require_clean_nonblank(provider_name, "provider_name")
