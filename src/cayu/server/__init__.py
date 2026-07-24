@@ -42,6 +42,7 @@ try:
     from fastapi import Request  # noqa: TC002 - FastAPI resolves endpoint annotations at runtime
     from starlette.responses import RedirectResponse
 
+    from cayu.server._diagnostics import dashboard_pricing_metadata
     from cayu.server.auth import AuthContext, AuthDependency, BasicAuth
     from cayu.server.config import (
         DEFAULT_EVENT_SIDE_EFFECT_STARTUP_TIMEOUT_SECONDS,
@@ -122,12 +123,6 @@ _ALLOWED_FASTAPI_OPTIONS = frozenset(
         "version",
     }
 )
-
-
-def _dashboard_pricing_configured(runtime_config: Mapping[str, Any]) -> bool:
-    """Return whether the resolved dashboard has a default pricing catalog."""
-
-    return runtime_config.get("priceBook") is not None
 
 
 def create_server(
@@ -246,6 +241,11 @@ def create_server(
     knowledge_store = app.knowledge_store
     control_plane_path = resolved_config.api.path
     if resolved_config.api.enabled:
+        pricing_metadata = (
+            dashboard_pricing_metadata(resolved_config.dashboard.runtime_config)
+            if resolved_config.dashboard.enabled
+            else None
+        )
         router = create_router(
             cayu_app=app,
             session_store=session_store,
@@ -258,10 +258,13 @@ def create_server(
             openapi_url=server.openapi_url,
             replay_idle_timeout_s=lifecycle.replay_idle_timeout_s,
             dashboard_configured=resolved_config.dashboard.enabled,
-            dashboard_pricing_configured=(
-                resolved_config.dashboard.enabled
-                and _dashboard_pricing_configured(resolved_config.dashboard.runtime_config)
+            dashboard_pricing_configured=pricing_metadata is not None,
+            deployment_name=resolved_config.deployment_name,
+            dashboard_access_authenticated=(
+                None if not resolved_config.dashboard.enabled else dashboard_auth is not None
             ),
+            docs_enabled=resolved_config.docs.enabled,
+            dashboard_pricing_metadata=pricing_metadata,
         )
         server.include_router(router)
 
@@ -398,6 +401,12 @@ def mount_cayu(
         dashboard_configured=dashboard,
         dashboard_pricing_configured=(
             prepared_dashboard is not None and prepared_dashboard[1].dashboard_pricing_configured
+        ),
+        deployment_name=None,
+        dashboard_access_authenticated=(auth is not None if dashboard else None),
+        docs_enabled=None,
+        dashboard_pricing_metadata=(
+            None if prepared_dashboard is None else prepared_dashboard[1].dashboard_pricing_metadata
         ),
     )
 

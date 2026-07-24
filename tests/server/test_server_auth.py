@@ -251,6 +251,7 @@ def test_protected_server_can_expose_generated_docs_explicitly() -> None:
         ("GET", "/api/knowledge/pending", None),
         ("GET", "/api/knowledge/pending/entry-1", None),
         ("GET", "/api/contract", None),
+        ("GET", "/api/system/diagnostics", None),
     ],
 )
 def test_auth_guards_read_and_contract_routes(
@@ -344,6 +345,7 @@ def test_authenticated_requests_reach_read_handlers() -> None:
     assert client.get("/api/sessions", headers=_AUTH_HEADERS).status_code == 200
     assert client.get("/api/tasks", headers=_AUTH_HEADERS).status_code == 200
     assert client.get("/api/contract", headers=_AUTH_HEADERS).status_code == 200
+    assert client.get("/api/system/diagnostics", headers=_AUTH_HEADERS).status_code == 200
 
     missing = client.get("/api/sessions/missing", headers=_AUTH_HEADERS)
     assert missing.status_code == 404

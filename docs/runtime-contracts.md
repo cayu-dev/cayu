@@ -1659,6 +1659,39 @@ authentication claims are deliberately excluded.
 Because the response may contain caller identity, it is returned with
 `Cache-Control: private, no-store`.
 
+The protected `GET /api/system/diagnostics` response is a separate, manually
+requested operator snapshot. It repeats the capability projection so the
+response is independently useful, and adds the resolved Cayu deployment name
+when the server owns one, API/dashboard access posture, dashboard and generated
+documentation state, Cayu and server-contract versions, bounded artifact-store
+registrations, and default pricing-catalog provenance. Embedded `mount_cayu(...)`
+installations report the host-owned deployment name and documentation state as
+unknown rather than inventing values. Catalog `generated_at` is opaque
+provenance: Cayu returns the validated value verbatim and does not interpret it
+as a timestamp or freshness guarantee.
+
+Artifact-store registrations expose only `sha256:` fingerprints of stable
+`ArtifactStore.id` values and the fixed `list`, `read`, `write`, and `delete`
+store contract. A fingerprint supports correlation across snapshots; it is not
+an authorization credential or a secrecy boundary for a guessable id. The
+response returns at most 64 registrations plus the exact total and a
+`truncated` marker. It never returns raw ids, which may be application-defined
+paths. Deployment identity is limited to 128 characters and pricing provenance
+fields to 256 characters; invalid or oversized optional values are omitted with
+an explicit status rather than truncated into a potentially different identity.
+All other text and collections inherit fixed contract bounds.
+
+System diagnostics deliberately perform no dependency I/O. Cayu does not yet
+have one stable, bounded liveness-probe contract shared by built-in and custom
+stores, so the endpoint does not infer health from private connections, execute
+synthetic reads, or treat an operational aggregate as a readiness probe.
+Consequently there are no probe timeouts, partial probe results, background
+polling, or server-side metric retention in this contract. `/api/health`
+remains the cheap unauthenticated liveness endpoint; system diagnostics uses the
+configured API authentication dependency and `Cache-Control: private,
+no-store`. Persisted event side-effect health is tracked separately and is not
+claimed by this snapshot.
+
 Authentication identity has the same explicit bound before it reaches this
 projection or durable operator provenance: `AuthContext.subject` and
 `AuthContext.tenant`, plus the `BasicAuth` `username`, `subject`, and `tenant`

@@ -761,9 +761,25 @@ def test_mount_cayu_accepts_explicit_open_or_authenticated_access() -> None:
         access=OpenAccess(),
         dashboard_config={"priceBook": default_price_book()},
     )
-    assert TestClient(open_server).get("/control/api/health").status_code == 200
-    open_contract = TestClient(open_server).get("/control/api/contract").json()
+    open_client = TestClient(open_server)
+    assert open_client.get("/control/api/health").status_code == 200
+    open_contract = open_client.get("/control/api/contract").json()
     assert open_contract["capabilities"]["surfaces"]["pricing"]["configured"] is True
+    open_diagnostics = open_client.get("/control/api/system/diagnostics").json()
+    assert open_diagnostics["deployment"] == {
+        "name": None,
+        "name_status": "not_provided",
+        "api_access": "open",
+        "dashboard_access": "open",
+        "dashboard_enabled": True,
+        "docs_enabled": None,
+    }
+    assert open_diagnostics["pricing_catalog"] == {
+        "configured": True,
+        "metadata_status": "available",
+        "price_book_version": default_price_book().price_book_version,
+        "generated_at": default_price_book().generated_at,
+    }
 
     protected_server = FastAPI()
     mount_cayu(
@@ -774,6 +790,7 @@ def test_mount_cayu_accepts_explicit_open_or_authenticated_access() -> None:
     )
     protected = TestClient(protected_server)
     assert protected.get("/control/api/sessions").status_code == 401
+    assert protected.get("/control/api/system/diagnostics").status_code == 401
     assert (
         protected.get(
             "/control/api/sessions",
@@ -781,6 +798,13 @@ def test_mount_cayu_accepts_explicit_open_or_authenticated_access() -> None:
         ).status_code
         == 200
     )
+    protected_diagnostics = protected.get(
+        "/control/api/system/diagnostics",
+        headers={"Authorization": "Bearer valid"},
+    )
+    assert protected_diagnostics.status_code == 200
+    assert protected_diagnostics.json()["deployment"]["api_access"] == "authenticated"
+    assert protected_diagnostics.json()["deployment"]["dashboard_access"] == "authenticated"
 
 
 def test_mount_cayu_rejects_an_unresolved_access_policy() -> None:

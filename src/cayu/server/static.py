@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException
 from starlette.responses import Response
 
+from cayu.server._diagnostics import dashboard_pricing_metadata
 from cayu.server.auth import AuthDependency, resolve_auth_context
 from cayu.server.config import normalize_dashboard_runtime_config
 
@@ -89,7 +90,13 @@ class DashboardStaticFiles(StaticFiles):
     def dashboard_pricing_configured(self) -> bool:
         """Whether the resolved browser configuration carries a default price book."""
 
-        return self._dashboard_config.get("priceBook") is not None
+        return self.dashboard_pricing_metadata is not None
+
+    @property
+    def dashboard_pricing_metadata(self) -> tuple[str, str] | None:
+        """Return only the resolved catalog version and opaque generation provenance."""
+
+        return dashboard_pricing_metadata(self._dashboard_config)
 
     async def get_response(self, path: str, scope: Scope):
         if _is_excluded_path(path, self._excluded_api_path):

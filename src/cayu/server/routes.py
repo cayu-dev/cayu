@@ -114,12 +114,14 @@ from cayu.runtime.usage import (
 )
 from cayu.runtime.user_input import UserInputRecoveryRequest, UserInputResponse
 from cayu.server._capabilities import inspect_control_plane_capabilities
+from cayu.server._diagnostics import inspect_system_diagnostics
 from cayu.server.auth import AuthContext, AuthDependency, server_auth_dependency
 from cayu.server.config import normalize_api_path
 from cayu.server.contracts import (
     AGGREGATE_ENDPOINT_RESPONSES,
     ARTIFACT_CONTENT_ENDPOINT_RESPONSES,
     ARTIFACT_ENDPOINT_ERROR_RESPONSES,
+    MAX_SYSTEM_ARTIFACT_STORE_REGISTRATIONS,
     PENDING_ACTION_ENDPOINT_RESPONSES,
     SERVER_API_PREFIX,
     STREAMING_ENDPOINT_RESPONSES,
@@ -146,6 +148,7 @@ from cayu.server.contracts import (
     SessionStateResponse,
     SessionSummaryResponse,
     SessionTranscriptResponse,
+    SystemDiagnosticsResponse,
     UsageBreakdownItem,
     UsageRollupRequest,
     UsageRollupResponse,
@@ -1850,6 +1853,10 @@ def create_router(
     replay_idle_timeout_s: float = 300.0,
     dashboard_configured: bool = False,
     dashboard_pricing_configured: bool = False,
+    deployment_name: str | None = None,
+    dashboard_access_authenticated: bool | None = None,
+    docs_enabled: bool | None = None,
+    dashboard_pricing_metadata: tuple[str, str] | None = None,
 ) -> APIRouter:
     """Create an APIRouter with standard cayu endpoints.
 
@@ -1875,6 +1882,16 @@ def create_router(
             price book.
         dashboard_configured: Whether the bundled dashboard is mounted. Its own
             configured access dependency remains authoritative.
+        deployment_name: Optional resolved server deployment identity. Embedded
+            mounts that do not own a ``ServerConfig`` leave it unset.
+        dashboard_access_authenticated: Whether the mounted dashboard has an
+            authentication dependency. Defaults to the API access posture when
+            the dashboard is configured.
+        docs_enabled: Whether Cayu owns enabled generated documentation routes.
+            Embedded mounts leave this unknown.
+        dashboard_pricing_metadata: Validated default catalog version and opaque
+            generation provenance. Values that exceed diagnostic bounds are
+            omitted from the response.
     """
 
     if (
@@ -1895,6 +1912,18 @@ def create_router(
         knowledge_configured=knowledge_store is not None,
         dashboard_pricing_configured=dashboard_pricing_configured,
         session_usage_aggregates_supported=session_store.supports_usage_aggregates,
+    )
+    if dashboard_access_authenticated is None and dashboard_configured:
+        dashboard_access_authenticated = auth is not None
+    diagnostics_snapshot = inspect_system_diagnostics(
+        capabilities=capability_snapshot,
+        deployment_name=deployment_name,
+        api_authenticated=auth is not None,
+        dashboard_authenticated=dashboard_access_authenticated,
+        dashboard_enabled=dashboard_configured,
+        docs_enabled=docs_enabled,
+        pricing_configured=dashboard_pricing_configured,
+        pricing_metadata=dashboard_pricing_metadata,
     )
 
     # Shared dependency list for control-plane routes. FastAPI treats an empty
@@ -1984,6 +2013,30 @@ def create_router(
                 auth_context,
                 artifacts_configured=cayu_app.has_registered_artifact_store(),
             ),
+        )
+
+    @router.get(
+        "/system/diagnostics",
+        response_model=SystemDiagnosticsResponse,
+        description=(
+            "Return bounded protected Cayu configuration and registration diagnostics. "
+            "This is an explicit operator snapshot, not readiness, infrastructure "
+            "monitoring, or an authorization token. It performs no dependency probes."
+        ),
+        openapi_extra={"x-cayu-auth-context": auth_context_openapi_schema},
+    )
+    async def get_system_diagnostics(
+        response: Response,
+        auth_context: AuthContext | None = optional_auth_context,
+    ):
+        response.headers["Cache-Control"] = "private, no-store"
+        fingerprints, total_count = cayu_app.artifact_store_registration_fingerprints(
+            limit=MAX_SYSTEM_ARTIFACT_STORE_REGISTRATIONS,
+        )
+        return diagnostics_snapshot.project(
+            auth_context,
+            artifact_store_fingerprints=fingerprints,
+            artifact_store_total_count=total_count,
         )
 
     @router.post(

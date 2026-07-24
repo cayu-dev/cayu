@@ -84,6 +84,12 @@ are a separate public FastAPI surface and are not wrapped in the access
 dependency, so enable `DocsConfig` only on a boundary where that exposure is
 intentional.
 
+The same API access policy guards `/api/contract` and
+`/api/system/diagnostics`. The latter is a bounded, probe-free snapshot of
+framework-owned deployment configuration and registrations; it is not a
+readiness endpoint or infrastructure monitor. Keep load balancer liveness
+checks on `/api/health`.
+
 `DashboardConfig.runtime_config` is serialized into the dashboard HTML and is
 therefore browser-visible. Use it only for non-secret client configuration;
 server credentials belong in the auth dependency or another trusted server-side

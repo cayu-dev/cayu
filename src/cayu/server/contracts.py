@@ -51,6 +51,9 @@ SERVER_API_PREFIX = "/api"
 SERVER_CONTRACT_VERSION = "2"
 SSE_CONTENT_TYPE = "text/event-stream"
 SSE_LAST_EVENT_ID_FORMAT = "session_id:event_id"
+MAX_SYSTEM_ARTIFACT_STORE_REGISTRATIONS = 64
+MAX_SYSTEM_DEPLOYMENT_NAME_CHARS = 128
+MAX_SYSTEM_PRICING_METADATA_CHARS = 256
 
 
 class ApiBaseModel(BaseModel):
@@ -59,6 +62,99 @@ class ApiBaseModel(BaseModel):
 
 class HealthResponse(ApiBaseModel):
     ok: StrictBool
+
+
+SystemAccessKind = Literal["open", "authenticated"]
+SystemDiagnosticTextStatus = Literal["available", "not_provided", "omitted"]
+
+
+class SystemDeploymentDiagnostics(ApiBaseModel):
+    """Bounded resolved server identity and effective access posture."""
+
+    name: str | None = Field(default=None, max_length=MAX_SYSTEM_DEPLOYMENT_NAME_CHARS)
+    name_status: SystemDiagnosticTextStatus
+    api_access: SystemAccessKind
+    dashboard_access: SystemAccessKind | None
+    dashboard_enabled: StrictBool
+    docs_enabled: StrictBool | None
+
+    @model_validator(mode="after")
+    def validate_availability(self) -> SystemDeploymentDiagnostics:
+        if self.name_status == "available" and self.name is None:
+            raise ValueError("Available deployment names require a value.")
+        if self.name_status != "available" and self.name is not None:
+            raise ValueError("Unavailable deployment names cannot include a value.")
+        if self.dashboard_enabled and self.dashboard_access is None:
+            raise ValueError("Enabled dashboards require an access posture.")
+        if not self.dashboard_enabled and self.dashboard_access is not None:
+            raise ValueError("Disabled dashboards cannot include an access posture.")
+        return self
+
+
+class SystemVersionDiagnostics(ApiBaseModel):
+    cayu: str | None = Field(max_length=128)
+    server_contract: str = Field(max_length=32)
+
+
+class ArtifactStoreDiagnostic(ApiBaseModel):
+    """Path-safe registration identity and the required ArtifactStore contract."""
+
+    fingerprint: str = Field(pattern=r"^sha256:[0-9a-f]{64}$", max_length=71)
+    store_contract_operations: tuple[
+        Literal["list"],
+        Literal["read"],
+        Literal["write"],
+        Literal["delete"],
+    ] = (
+        "list",
+        "read",
+        "write",
+        "delete",
+    )
+
+
+class ArtifactStoreDiagnostics(ApiBaseModel):
+    registrations: tuple[ArtifactStoreDiagnostic, ...] = Field(
+        max_length=MAX_SYSTEM_ARTIFACT_STORE_REGISTRATIONS
+    )
+    total_count: StrictInt = Field(ge=0)
+    truncated: StrictBool
+
+    @model_validator(mode="after")
+    def validate_count(self) -> ArtifactStoreDiagnostics:
+        if self.total_count < len(self.registrations):
+            raise ValueError("Artifact store total cannot be smaller than registrations.")
+        if self.truncated is not (self.total_count > len(self.registrations)):
+            raise ValueError("Artifact store truncation must match the returned count.")
+        return self
+
+
+class PricingCatalogDiagnostics(ApiBaseModel):
+    configured: StrictBool
+    metadata_status: Literal["available", "not_configured", "omitted"]
+    price_book_version: str | None = Field(
+        default=None,
+        max_length=MAX_SYSTEM_PRICING_METADATA_CHARS,
+    )
+    generated_at: str | None = Field(
+        default=None,
+        max_length=MAX_SYSTEM_PRICING_METADATA_CHARS,
+    )
+
+    @model_validator(mode="after")
+    def validate_metadata(self) -> PricingCatalogDiagnostics:
+        metadata_present = self.price_book_version is not None and self.generated_at is not None
+        if self.metadata_status == "available" and not metadata_present:
+            raise ValueError("Available pricing metadata requires both identity fields.")
+        if self.metadata_status != "available" and (
+            self.price_book_version is not None or self.generated_at is not None
+        ):
+            raise ValueError("Unavailable pricing metadata cannot include identity fields.")
+        if self.configured and self.metadata_status == "not_configured":
+            raise ValueError("Configured pricing cannot be marked not configured.")
+        if not self.configured and self.metadata_status != "not_configured":
+            raise ValueError("Unconfigured pricing must be marked not configured.")
+        return self
 
 
 class OperationalSnapshotRequest(ApiBaseModel):
@@ -529,6 +625,24 @@ class ServerContractResponse(ApiBaseModel):
     sse: SseContract = Field(default_factory=SseContract)
     client_generation: ClientGenerationContract = Field(default_factory=ClientGenerationContract)
     capabilities: ControlPlaneCapabilities
+
+
+class SystemDiagnosticsResponse(ApiBaseModel):
+    """Protected bounded Cayu configuration and registration diagnostics."""
+
+    observed_at: datetime
+    deployment: SystemDeploymentDiagnostics
+    versions: SystemVersionDiagnostics
+    capabilities: ControlPlaneCapabilities
+    artifact_stores: ArtifactStoreDiagnostics
+    pricing_catalog: PricingCatalogDiagnostics
+
+    @field_validator("observed_at")
+    @classmethod
+    def validate_observed_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("observed_at must be timezone-aware.")
+        return value.astimezone(UTC)
 
 
 class ApiEventRecord(ApiBaseModel):

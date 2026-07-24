@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # ruff: noqa: E402
 import json
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -281,6 +282,160 @@ def test_contract_reports_configured_optional_capabilities_and_redacted_actor(tm
     assert capabilities["mutations"]["knowledge_review"]["enabled"] is True
 
 
+def test_system_diagnostics_reports_bounded_protected_framework_state(tmp_path) -> None:
+    raw_store_id = str(tmp_path / "private-artifact-path")
+    artifact_store = LocalArtifactStore(
+        tmp_path / "artifacts",
+        store_id=raw_store_id,
+    )
+    app = CayuApp(
+        task_store=InMemoryTaskStore(),
+        knowledge_store=InMemoryKnowledgeStore(),
+    )
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="diagnostic-environment"),
+            artifact_store=artifact_store,
+        )
+    )
+    price_book = default_price_book()
+    auth_calls = 0
+
+    def authenticate(_request) -> AuthContext:
+        nonlocal auth_calls
+        auth_calls += 1
+        return AuthContext(
+            subject="operator-a",
+            tenant="tenant-a",
+            claims={"credential": "diagnostic-secret-must-not-appear"},
+        )
+
+    client = TestClient(
+        create_server(
+            app,
+            config=ServerConfig.protected(
+                authenticate,
+                deployment_name="production-eu",
+                dashboard=DashboardConfig(
+                    runtime_config={
+                        "priceBook": price_book,
+                        "privateToken": "dashboard-secret-must-not-appear",
+                    }
+                ),
+            ),
+        )
+    )
+
+    response = client.get("/api/system/diagnostics")
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "private, no-store"
+    assert auth_calls == 1
+    body = response.json()
+    assert body["deployment"] == {
+        "name": "production-eu",
+        "name_status": "available",
+        "api_access": "authenticated",
+        "dashboard_access": "authenticated",
+        "dashboard_enabled": True,
+        "docs_enabled": False,
+    }
+    assert body["versions"]["server_contract"] == "2"
+    assert body["versions"]["cayu"] == body["capabilities"]["cayu_version"]
+    assert body["capabilities"]["actor"] == {
+        "subject": "operator-a",
+        "tenant": "tenant-a",
+    }
+    assert body["artifact_stores"] == {
+        "registrations": [
+            {
+                "fingerprint": f"sha256:{sha256(raw_store_id.encode()).hexdigest()}",
+                "store_contract_operations": ["list", "read", "write", "delete"],
+            }
+        ],
+        "total_count": 1,
+        "truncated": False,
+    }
+    assert body["pricing_catalog"] == {
+        "configured": True,
+        "metadata_status": "available",
+        "price_book_version": price_book.price_book_version,
+        "generated_at": price_book.generated_at,
+    }
+    assert raw_store_id not in response.text
+    assert "diagnostic-secret-must-not-appear" not in response.text
+    assert "dashboard-secret-must-not-appear" not in response.text
+
+
+def test_system_diagnostics_bounds_dynamic_artifact_registrations(tmp_path) -> None:
+    app = CayuApp()
+    client = TestClient(create_server(app, config=ServerConfig.local_development()))
+
+    before = client.get("/api/system/diagnostics").json()
+    assert before["artifact_stores"] == {
+        "registrations": [],
+        "total_count": 0,
+        "truncated": False,
+    }
+    assert before["capabilities"]["surfaces"]["artifacts"]["configured"] is False
+
+    raw_store_ids = []
+    for index in range(65):
+        store_id = str(tmp_path / f"artifact-store-{index}")
+        raw_store_ids.append(store_id)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name=f"diagnostic-environment-{index}"),
+                artifact_store=LocalArtifactStore(
+                    tmp_path / f"artifacts-{index}",
+                    store_id=store_id,
+                ),
+            )
+        )
+
+    response = client.get("/api/system/diagnostics")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["artifact_stores"]["total_count"] == 65
+    assert len(body["artifact_stores"]["registrations"]) == 64
+    assert body["artifact_stores"]["truncated"] is True
+    assert body["capabilities"]["surfaces"]["artifacts"]["configured"] is True
+    assert body["artifact_stores"]["registrations"][0]["fingerprint"] == (
+        f"sha256:{sha256(raw_store_ids[0].encode()).hexdigest()}"
+    )
+    assert all(store_id not in response.text for store_id in raw_store_ids)
+
+
+def test_system_diagnostics_omits_oversized_optional_provenance() -> None:
+    price_book = default_price_book().model_dump(mode="json")
+    price_book["price_book_version"] = "v" * 257
+    client = TestClient(
+        create_server(
+            CayuApp(),
+            config=ServerConfig.local_development(
+                deployment_name="d" * 129,
+                dashboard=DashboardConfig(runtime_config={"priceBook": price_book}),
+            ),
+        )
+    )
+
+    response = client.get("/api/system/diagnostics")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["deployment"]["name"] is None
+    assert body["deployment"]["name_status"] == "omitted"
+    assert body["pricing_catalog"] == {
+        "configured": True,
+        "metadata_status": "omitted",
+        "price_book_version": None,
+        "generated_at": None,
+    }
+    assert "d" * 129 not in response.text
+    assert "v" * 257 not in response.text
+
+
 @pytest.mark.parametrize("registration_kind", ["concrete", "factory"])
 def test_contract_reflects_artifact_store_registered_after_server_construction(
     registration_kind: str,
@@ -401,6 +556,15 @@ def test_contract_reports_disabled_dashboard_without_inventing_pricing_availabil
         "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
     }
     assert surfaces["pricing"]["configured"] is False
+    diagnostics = client.get("/api/system/diagnostics").json()
+    assert diagnostics["deployment"]["dashboard_enabled"] is False
+    assert diagnostics["deployment"]["dashboard_access"] is None
+    assert diagnostics["pricing_catalog"] == {
+        "configured": False,
+        "metadata_status": "not_configured",
+        "price_book_version": None,
+        "generated_at": None,
+    }
 
 
 def test_contract_rejects_an_invalid_session_store_capability_declaration() -> None:

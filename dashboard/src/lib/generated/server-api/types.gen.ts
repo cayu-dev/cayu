@@ -1129,6 +1129,45 @@ export type ArtifactReadResponse = {
 export type ArtifactScope = 'session' | 'environment';
 
 /**
+ * ArtifactStoreDiagnostic
+ *
+ * Path-safe registration identity and the required ArtifactStore contract.
+ */
+export type ArtifactStoreDiagnostic = {
+    /**
+     * Fingerprint
+     */
+    fingerprint: string;
+    /**
+     * Store Contract Operations
+     */
+    store_contract_operations?: [
+        'list',
+        'read',
+        'write',
+        'delete'
+    ];
+};
+
+/**
+ * ArtifactStoreDiagnostics
+ */
+export type ArtifactStoreDiagnostics = {
+    /**
+     * Registrations
+     */
+    registrations: Array<ArtifactStoreDiagnostic>;
+    /**
+     * Total Count
+     */
+    total_count: number;
+    /**
+     * Truncated
+     */
+    truncated: boolean;
+};
+
+/**
  * ArtifactsResponse
  */
 export type ArtifactsResponse = {
@@ -2152,6 +2191,28 @@ export type PriceTier = {
 };
 
 /**
+ * PricingCatalogDiagnostics
+ */
+export type PricingCatalogDiagnostics = {
+    /**
+     * Configured
+     */
+    configured: boolean;
+    /**
+     * Generated At
+     */
+    generated_at?: string | null;
+    /**
+     * Metadata Status
+     */
+    metadata_status: 'available' | 'not_configured' | 'omitted';
+    /**
+     * Price Book Version
+     */
+    price_book_version?: string | null;
+};
+
+/**
  * PricingContext
  *
  * One exact set of commercial dimensions that may price a dispatch.
@@ -2941,6 +3002,69 @@ export type StructuredOutputSpec = {
  * StructuredOutputStrategy
  */
 export type StructuredOutputStrategy = 'tool' | 'native';
+
+/**
+ * SystemDeploymentDiagnostics
+ *
+ * Bounded resolved server identity and effective access posture.
+ */
+export type SystemDeploymentDiagnostics = {
+    /**
+     * Api Access
+     */
+    api_access: 'open' | 'authenticated';
+    /**
+     * Dashboard Access
+     */
+    dashboard_access: 'open' | 'authenticated' | null;
+    /**
+     * Dashboard Enabled
+     */
+    dashboard_enabled: boolean;
+    /**
+     * Docs Enabled
+     */
+    docs_enabled: boolean | null;
+    /**
+     * Name
+     */
+    name?: string | null;
+    /**
+     * Name Status
+     */
+    name_status: 'available' | 'not_provided' | 'omitted';
+};
+
+/**
+ * SystemDiagnosticsResponse
+ *
+ * Protected bounded Cayu configuration and registration diagnostics.
+ */
+export type SystemDiagnosticsResponse = {
+    artifact_stores: ArtifactStoreDiagnostics;
+    capabilities: ControlPlaneCapabilities;
+    deployment: SystemDeploymentDiagnostics;
+    /**
+     * Observed At
+     */
+    observed_at: string;
+    pricing_catalog: PricingCatalogDiagnostics;
+    versions: SystemVersionDiagnostics;
+};
+
+/**
+ * SystemVersionDiagnostics
+ */
+export type SystemVersionDiagnostics = {
+    /**
+     * Cayu
+     */
+    cayu: string | null;
+    /**
+     * Server Contract
+     */
+    server_contract: string;
+};
 
 /**
  * TaskAggregateFilter
@@ -5338,6 +5462,22 @@ export type GetSessionUsageApiSessionsSessionIdUsageGetResponses = {
 };
 
 export type GetSessionUsageApiSessionsSessionIdUsageGetResponse = GetSessionUsageApiSessionsSessionIdUsageGetResponses[keyof GetSessionUsageApiSessionsSessionIdUsageGetResponses];
+
+export type GetSystemDiagnosticsApiSystemDiagnosticsGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/system/diagnostics';
+};
+
+export type GetSystemDiagnosticsApiSystemDiagnosticsGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: SystemDiagnosticsResponse;
+};
+
+export type GetSystemDiagnosticsApiSystemDiagnosticsGetResponse = GetSystemDiagnosticsApiSystemDiagnosticsGetResponses[keyof GetSystemDiagnosticsApiSystemDiagnosticsGetResponses];
 
 export type ListTasksApiTasksGetData = {
     body?: never;

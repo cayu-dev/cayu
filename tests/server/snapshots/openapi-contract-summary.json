@@ -2141,6 +2141,82 @@
       "title": "ArtifactScope",
       "type": "string"
     },
+    "ArtifactStoreDiagnostic": {
+      "additionalProperties": false,
+      "description": "Path-safe registration identity and the required ArtifactStore contract.",
+      "properties": {
+        "fingerprint": {
+          "maxLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Fingerprint",
+          "type": "string"
+        },
+        "store_contract_operations": {
+          "default": [
+            "list",
+            "read",
+            "write",
+            "delete"
+          ],
+          "maxItems": 4,
+          "minItems": 4,
+          "prefixItems": [
+            {
+              "const": "list",
+              "type": "string"
+            },
+            {
+              "const": "read",
+              "type": "string"
+            },
+            {
+              "const": "write",
+              "type": "string"
+            },
+            {
+              "const": "delete",
+              "type": "string"
+            }
+          ],
+          "title": "Store Contract Operations",
+          "type": "array"
+        }
+      },
+      "required": [
+        "fingerprint"
+      ],
+      "title": "ArtifactStoreDiagnostic",
+      "type": "object"
+    },
+    "ArtifactStoreDiagnostics": {
+      "additionalProperties": false,
+      "properties": {
+        "registrations": {
+          "items": {
+            "$ref": "#/components/schemas/ArtifactStoreDiagnostic"
+          },
+          "maxItems": 64,
+          "title": "Registrations",
+          "type": "array"
+        },
+        "total_count": {
+          "minimum": 0.0,
+          "title": "Total Count",
+          "type": "integer"
+        },
+        "truncated": {
+          "title": "Truncated",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "registrations",
+        "total_count",
+        "truncated"
+      ],
+      "title": "ArtifactStoreDiagnostics",
+      "type": "object"
+    },
     "ArtifactsResponse": {
       "additionalProperties": false,
       "properties": {
@@ -4100,6 +4176,54 @@
       "title": "PriceTier",
       "type": "object"
     },
+    "PricingCatalogDiagnostics": {
+      "additionalProperties": false,
+      "properties": {
+        "configured": {
+          "title": "Configured",
+          "type": "boolean"
+        },
+        "generated_at": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Generated At"
+        },
+        "metadata_status": {
+          "enum": [
+            "available",
+            "not_configured",
+            "omitted"
+          ],
+          "title": "Metadata Status",
+          "type": "string"
+        },
+        "price_book_version": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Price Book Version"
+        }
+      },
+      "required": [
+        "configured",
+        "metadata_status"
+      ],
+      "title": "PricingCatalogDiagnostics",
+      "type": "object"
+    },
     "PricingContext": {
       "additionalProperties": false,
       "description": "One exact set of commercial dimensions that may price a dispatch.",
@@ -5478,6 +5602,144 @@
       ],
       "title": "StructuredOutputStrategy",
       "type": "string"
+    },
+    "SystemDeploymentDiagnostics": {
+      "additionalProperties": false,
+      "description": "Bounded resolved server identity and effective access posture.",
+      "properties": {
+        "api_access": {
+          "enum": [
+            "open",
+            "authenticated"
+          ],
+          "title": "Api Access",
+          "type": "string"
+        },
+        "dashboard_access": {
+          "anyOf": [
+            {
+              "enum": [
+                "open",
+                "authenticated"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Dashboard Access"
+        },
+        "dashboard_enabled": {
+          "title": "Dashboard Enabled",
+          "type": "boolean"
+        },
+        "docs_enabled": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Docs Enabled"
+        },
+        "name": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Name"
+        },
+        "name_status": {
+          "enum": [
+            "available",
+            "not_provided",
+            "omitted"
+          ],
+          "title": "Name Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name_status",
+        "api_access",
+        "dashboard_access",
+        "dashboard_enabled",
+        "docs_enabled"
+      ],
+      "title": "SystemDeploymentDiagnostics",
+      "type": "object"
+    },
+    "SystemDiagnosticsResponse": {
+      "additionalProperties": false,
+      "description": "Protected bounded Cayu configuration and registration diagnostics.",
+      "properties": {
+        "artifact_stores": {
+          "$ref": "#/components/schemas/ArtifactStoreDiagnostics"
+        },
+        "capabilities": {
+          "$ref": "#/components/schemas/ControlPlaneCapabilities"
+        },
+        "deployment": {
+          "$ref": "#/components/schemas/SystemDeploymentDiagnostics"
+        },
+        "observed_at": {
+          "format": "date-time",
+          "title": "Observed At",
+          "type": "string"
+        },
+        "pricing_catalog": {
+          "$ref": "#/components/schemas/PricingCatalogDiagnostics"
+        },
+        "versions": {
+          "$ref": "#/components/schemas/SystemVersionDiagnostics"
+        }
+      },
+      "required": [
+        "observed_at",
+        "deployment",
+        "versions",
+        "capabilities",
+        "artifact_stores",
+        "pricing_catalog"
+      ],
+      "title": "SystemDiagnosticsResponse",
+      "type": "object"
+    },
+    "SystemVersionDiagnostics": {
+      "additionalProperties": false,
+      "properties": {
+        "cayu": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Cayu"
+        },
+        "server_contract": {
+          "maxLength": 32,
+          "title": "Server Contract",
+          "type": "string"
+        }
+      },
+      "required": [
+        "cayu",
+        "server_contract"
+      ],
+      "title": "SystemVersionDiagnostics",
+      "type": "object"
     },
     "TaskAggregateFilter": {
       "additionalProperties": false,
@@ -9953,6 +10215,24 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/system/diagnostics": {
+      "get": {
+        "operation_id": "get_system_diagnostics_api_system_diagnostics_get",
+        "parameters": [],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/SystemDiagnosticsResponse"
               }
             }
           }
