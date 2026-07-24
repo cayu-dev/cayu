@@ -16,6 +16,8 @@ from cayu.providers.openai_subscription import (
     OpenAISubscriptionProvider,
 )
 
+_MISSING = object()
+
 
 class StaticSubscriptionAuth:
     async def credentials(self) -> OpenAISubscriptionCredentials:
@@ -28,9 +30,10 @@ class StaticSubscriptionAuth:
 
 
 class RecordingTransport:
-    def __init__(self) -> None:
+    def __init__(self, *, end_turn: object = _MISSING) -> None:
         self.calls: list[dict[str, Any]] = []
         self.closed = False
+        self.end_turn = end_turn
 
     async def stream_response_events(
         self,
@@ -51,15 +54,18 @@ class RecordingTransport:
             }
         )
         yield {"type": "response.output_text.delta", "delta": "hello"}
+        response = {
+            "id": "resp-subscription",
+            "model": "gpt-5.4",
+            "status": "completed",
+            "output": [],
+            "usage": {"input_tokens": 9, "output_tokens": 2, "total_tokens": 11},
+        }
+        if self.end_turn is not _MISSING:
+            response["end_turn"] = self.end_turn
         yield {
             "type": "response.completed",
-            "response": {
-                "id": "resp-subscription",
-                "model": "gpt-5.4",
-                "status": "completed",
-                "output": [],
-                "usage": {"input_tokens": 9, "output_tokens": 2, "total_tokens": 11},
-            },
+            "response": response,
         }
 
     async def create_response(
@@ -101,6 +107,68 @@ def test_subscription_provider_uses_codex_endpoint_with_honest_cayu_identity() -
     assert call["headers"]["user-agent"].startswith("cayu/")
     assert call["payload"]["store"] is False
     assert call["payload"]["stream"] is True
+
+
+def test_subscription_provider_preserves_codex_end_turn_false() -> None:
+    provider = OpenAISubscriptionProvider(
+        auth=StaticSubscriptionAuth(),
+        transport=RecordingTransport(end_turn=False),
+    )
+    request = ModelRequest(
+        model="gpt-5.4",
+        messages=[Message.text("user", "Continue until done")],
+    )
+
+    async def collect():
+        return [event async for event in provider.stream(request)]
+
+    events = asyncio.run(collect())
+
+    assert events[-1].completion is not None
+    assert events[-1].completion.end_turn is False
+
+
+@pytest.mark.parametrize("end_turn", [True, None])
+def test_subscription_provider_preserves_other_valid_codex_end_turn_values(
+    end_turn: bool | None,
+) -> None:
+    provider = OpenAISubscriptionProvider(
+        auth=StaticSubscriptionAuth(),
+        transport=RecordingTransport(end_turn=end_turn),
+    )
+    request = ModelRequest(
+        model="gpt-5.4",
+        messages=[Message.text("user", "Continue until done")],
+    )
+
+    async def collect():
+        return [event async for event in provider.stream(request)]
+
+    events = asyncio.run(collect())
+
+    assert events[-1].completion is not None
+    assert events[-1].completion.end_turn is end_turn
+
+
+@pytest.mark.parametrize("end_turn", ["false", 0, 1, [], {}])
+def test_subscription_provider_rejects_malformed_codex_end_turn(end_turn: object) -> None:
+    provider = OpenAISubscriptionProvider(
+        auth=StaticSubscriptionAuth(),
+        transport=RecordingTransport(end_turn=end_turn),
+    )
+    request = ModelRequest(
+        model="gpt-5.4",
+        messages=[Message.text("user", "Continue until done")],
+    )
+
+    async def collect():
+        return [event async for event in provider.stream(request)]
+
+    events = asyncio.run(collect())
+
+    assert events[-1].type == ModelStreamEventType.ERROR
+    assert events[-1].payload["error"] == "OpenAI subscription provider failed."
+    assert events[-1].payload["error_type"] == "OpenAIProtocolError"
 
 
 def test_subscription_provider_declares_remote_token_counting_unavailable() -> None:

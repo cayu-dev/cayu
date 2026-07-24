@@ -1081,7 +1081,21 @@ def _openai_completion_from_response(
         finish_reason=finish_reason,
         raw_finish_reason=raw_finish_reason,
         status=status,
+        end_turn=_openai_end_turn(response, status=status),
     )
+
+
+def _openai_end_turn(
+    response: Mapping[str, Any],
+    *,
+    status: str | None,
+) -> bool | None:
+    value = response.get("end_turn")
+    if value is None:
+        return None
+    if type(value) is not bool:
+        raise OpenAIProtocolError("OpenAI response end_turn must be a boolean or null.")
+    return value if status == "completed" else None
 
 
 def _openai_raw_finish_reason(response: Mapping[str, Any]) -> str | None:

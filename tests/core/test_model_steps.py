@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from cayu.core import Message, MessageRole, ProviderStatePart, TextPart
 from cayu.providers import (
     ModelCompletion,
@@ -19,6 +22,7 @@ from cayu.runtime.model_steps import (
 def _step_result(
     *,
     finish_reason: ModelFinishReason = ModelFinishReason.STOP,
+    end_turn: bool | None = None,
     message: Message | None = None,
     tool_calls: list[ToolCallRequest] | None = None,
 ) -> AssistantStepResult:
@@ -32,7 +36,7 @@ def _step_result(
         step=1,
         assistant_message=message,
         tool_calls=[] if tool_calls is None else tool_calls,
-        completion=ModelCompletion(finish_reason=finish_reason),
+        completion=ModelCompletion(finish_reason=finish_reason, end_turn=end_turn),
         text_content=text_content,
         has_user_visible_content=bool(text_content.strip()),
         provider_state_count=provider_state_count,
@@ -55,6 +59,16 @@ def test_normalize_model_completion_maps_common_provider_reasons() -> None:
         == ModelFinishReason.LENGTH
     )
     assert normalize_model_completion({"status": "failed"}).finish_reason == ModelFinishReason.ERROR
+    assert normalize_model_completion({"end_turn": None}).end_turn is None
+
+
+@pytest.mark.parametrize("end_turn", ["false", 0, 1, [], {}])
+def test_normalize_model_completion_rejects_malformed_end_turn(end_turn: object) -> None:
+    with pytest.raises(ValueError, match="end_turn.*must be a boolean"):
+        normalize_model_completion({"finish_reason": "stop", "end_turn": end_turn})
+
+    with pytest.raises(ValidationError, match="end_turn.*must be a boolean"):
+        ModelCompletion(finish_reason=ModelFinishReason.STOP, end_turn=end_turn)
 
 
 def test_model_stream_event_normalizes_direct_completed_construction() -> None:
@@ -71,6 +85,7 @@ def test_model_stream_event_normalizes_direct_completed_construction() -> None:
 def test_classify_assistant_step_continues_for_tool_calls() -> None:
     result = _step_result(
         finish_reason=ModelFinishReason.STOP,
+        end_turn=True,
         message=Message.text("assistant", "I will call a tool."),
         tool_calls=[ToolCallRequest(id="call_1", name="echo", arguments={})],
     )
@@ -78,6 +93,18 @@ def test_classify_assistant_step_continues_for_tool_calls() -> None:
     classification = classify_assistant_step(result)
 
     assert classification.type == StepClassificationType.CONTINUE
+
+
+def test_classify_assistant_step_continues_when_provider_does_not_end_turn() -> None:
+    result = _step_result(
+        end_turn=False,
+        message=Message.text("assistant", "I will continue."),
+    )
+
+    classification = classify_assistant_step(result)
+
+    assert classification.type == StepClassificationType.CONTINUE
+    assert classification.reason == "provider requested another model step"
 
 
 def test_classify_assistant_step_final_for_visible_text() -> None:
@@ -93,6 +120,7 @@ def test_classify_assistant_step_length_and_filter_stop_before_final() -> None:
         classify_assistant_step(
             _step_result(
                 finish_reason=ModelFinishReason.LENGTH,
+                end_turn=False,
                 message=Message.text("assistant", "partial"),
             )
         ).type

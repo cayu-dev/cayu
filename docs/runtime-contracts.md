@@ -1228,7 +1228,8 @@ durable `model.completed` event and also include normalized completion metadata:
   "completion": {
     "finish_reason": "stop",
     "raw_finish_reason": "end_turn",
-    "status": "completed"
+    "status": "completed",
+    "end_turn": false
   }
 }
 ```
@@ -1238,12 +1239,25 @@ values are `stop`, `tool_calls`, `length`, `content_filter`, `error`, and
 `unknown`. `raw_finish_reason` and `status` preserve the provider-facing values
 when they exist.
 
+`completion.end_turn` is optional provider-neutral turn-control evidence. A
+strict boolean `false` means the completed response is non-terminal, so the
+runtime durably appends its assistant message and requests another model step
+inside the same active turn. `true` permits the ordinary terminal path when no
+tool call or stronger runtime condition requires continuation. Missing or null
+keeps the existing provider-neutral behavior. Non-boolean values are protocol
+errors. Abnormal completion reasons (`error`, `length`, and `content_filter`)
+take precedence over continuation, and OpenAI `response.incomplete` events do
+not apply `end_turn`. Tool calls continue regardless of this field, and all
+ordinary step, budget, interruption, cancellation, and recovery bounds still
+apply.
+
 The runtime also classifies the assembled assistant step and stores that in
 `model.completed.step_classification`. The classifier is based on the assistant
 message, tool calls, provider state, and normalized completion metadata. Current
 types are:
 
-- `continue`: the assistant requested tool calls.
+- `continue`: the assistant requested tool calls or the provider explicitly
+  requested another model step.
 - `final`: the assistant produced user-visible content and no tool calls.
 - `length`: the provider stopped because an output limit was reached.
 - `filtered`: the provider stopped because content was filtered.
@@ -1253,10 +1267,10 @@ types are:
 - `invalid`: the step had no visible content, tool calls, or provider state.
 
 This classification is observability and policy input. The default runtime loop
-still continues on tool calls and stops when there are no tool calls. Repair
-policies, structured-output retry, length continuation, and goal/task gates
-should build on this typed step outcome instead of parsing raw provider payloads
-or guessing from transcript shape.
+continues on tool calls and on `end_turn=false`; otherwise it retains the
+existing no-tool terminal behavior. Repair policies, structured-output retry,
+length continuation, and goal/task gates should build on this typed step outcome
+instead of parsing raw provider payloads or guessing from transcript shape.
 
 ## Before-Stop Loop Policies
 
@@ -1984,7 +1998,9 @@ Providers that require opaque response items for stateless continuation may retu
 the ChatGPT Codex backend after `cayu auth openai login`. It refreshes the
 user's OAuth credentials from a private local store, identifies requests as
 Cayu, and deliberately stops at upstream rejection rather than adopting a
-first-party Codex identity. The backend exposes no documented input-token
+first-party Codex identity. Codex `end_turn` continuation signals are validated
+and honored inside the current run without synthetic user messages. The backend
+exposes no documented input-token
 counting or embeddings endpoint, so `count_input_tokens(...)` returns `None`
 and the provider does not implement `TextEmbeddingProvider`. Its provider name
 is `openai_subscription`; subscription usage is intentionally unpriced because

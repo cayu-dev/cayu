@@ -69,6 +69,12 @@ accepted by the OpenAI Platform API is not necessarily available through the
 subscription backend. Generated projects select `gpt-5.4` in subscription mode;
 set `CAYU_MODEL` if the account offers a different model.
 
+The adapter honors Codex's typed `end_turn` completion signal. When Codex
+completes a response with `end_turn=false`, Cayu durably records that model step
+and any visible commentary, then requests the next model step inside the same
+run and interaction. It does not add a synthetic user message. Normal Cayu
+step, budget, interruption, cancellation, and recovery limits remain in force.
+
 ## Support and policy boundary
 
 This is not an OpenAI API key and does not turn a ChatGPT subscription into

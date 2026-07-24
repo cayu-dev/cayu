@@ -3753,11 +3753,14 @@ def _model_stream_event_to_runtime_event(
         if billing_identity is not None:
             payload["billing_identity"] = billing_identity.model_dump(mode="json")
         completion = _stream_event_completion(stream_event)
-        payload["completion"] = {
+        completion_payload: dict[str, str | bool | None] = {
             "finish_reason": completion.finish_reason.value,
             "raw_finish_reason": completion.raw_finish_reason,
             "status": completion.status,
         }
+        if completion.end_turn is not None:
+            completion_payload["end_turn"] = completion.end_turn
+        payload["completion"] = completion_payload
         if classification is not None:
             payload["step_classification"] = classification
         metrics = usage_metrics_payload(

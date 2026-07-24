@@ -275,6 +275,7 @@ class ModelCompletion(BaseModel):
     finish_reason: ModelFinishReason
     raw_finish_reason: str | None = None
     status: str | None = None
+    end_turn: bool | None = None
 
     @field_validator("finish_reason", mode="before")
     @classmethod
@@ -291,6 +292,13 @@ class ModelCompletion(BaseModel):
         if value is None:
             return None
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("end_turn", mode="before")
+    @classmethod
+    def validate_end_turn(cls, value: object) -> bool | None:
+        if value is None or type(value) is bool:
+            return value
+        raise ValueError("`end_turn` must be a boolean or null.")
 
 
 class ModelRequest(BaseModel):
@@ -464,6 +472,7 @@ def copy_model_completion(completion: ModelCompletion | None) -> ModelCompletion
         finish_reason=completion.finish_reason,
         raw_finish_reason=completion.raw_finish_reason,
         status=completion.status,
+        end_turn=completion.end_turn,
     )
 
 
@@ -499,6 +508,7 @@ def normalize_model_completion(payload: dict[str, Any]) -> ModelCompletion:
         finish_reason=finish_reason,
         raw_finish_reason=raw_finish_reason,
         status=status,
+        end_turn=_optional_payload_boolean(payload, "end_turn"),
     )
 
 
@@ -569,6 +579,15 @@ def _optional_payload_string(payload: dict[str, Any], key: str) -> str | None:
     if type(value) is not str:
         raise ValueError(f"Model completed payload `{key}` must be a string.")
     return require_clean_nonblank(value, key)
+
+
+def _optional_payload_boolean(payload: dict[str, Any], key: str) -> bool | None:
+    if key not in payload or payload[key] is None:
+        return None
+    value = payload[key]
+    if type(value) is not bool:
+        raise ValueError(f"Model completed payload `{key}` must be a boolean.")
+    return value
 
 
 class ModelProvider(ABC):

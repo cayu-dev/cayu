@@ -829,18 +829,59 @@ async def test_openai_provider_emits_text_and_completed_events() -> None:
 
     events = [event async for event in provider.stream(request)]
 
+    assert events[-1].completion is not None
+    assert events[-1].completion.end_turn is None
     assert [event.type for event in events] == [
         ModelStreamEventType.TEXT_DELTA,
         ModelStreamEventType.COMPLETED,
     ]
     assert events[0].delta == "hello"
     assert events[1].payload["status"] == "completed"
-    assert events[1].completion is not None
     assert events[1].completion.finish_reason == ModelFinishReason.STOP
     assert transport.calls[0]["url"] == "https://api.openai.com/v1/responses"
     assert transport.calls[0]["headers"]["authorization"] == "Bearer test-key"
     assert transport.calls[0]["payload"]["store"] is False
     assert transport.calls[0]["payload"]["stream"] is True
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("end_turn", [True, False])
+async def test_openai_stream_events_preserves_end_turn(end_turn: bool) -> None:
+    async def raw_events():
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_turn_control",
+                "model": "gpt-test",
+                "status": "completed",
+                "end_turn": end_turn,
+                "output": [],
+            },
+        }
+
+    events = [event async for event in openai_stream_events(raw_events())]
+
+    assert events[-1].completion is not None
+    assert events[-1].completion.end_turn is end_turn
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("end_turn", ["false", 0, 1, [], {}])
+async def test_openai_stream_events_rejects_malformed_end_turn(end_turn: object) -> None:
+    async def raw_events():
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_turn_control",
+                "model": "gpt-test",
+                "status": "completed",
+                "end_turn": end_turn,
+                "output": [],
+            },
+        }
+
+    with pytest.raises(OpenAIProtocolError, match="end_turn must be a boolean"):
+        [event async for event in openai_stream_events(raw_events())]
 
 
 @pytest.mark.anyio
@@ -1508,6 +1549,22 @@ def test_openai_response_events_rejects_malformed_function_call() -> None:
         )
 
 
+@pytest.mark.parametrize("end_turn", [True, False, None])
+def test_openai_response_events_preserves_end_turn(end_turn: bool | None) -> None:
+    events = openai_response_events(
+        {
+            "id": "resp_turn_control",
+            "model": "gpt-test",
+            "status": "completed",
+            "end_turn": end_turn,
+            "output": [],
+        }
+    )
+
+    assert events[-1].completion is not None
+    assert events[-1].completion.end_turn is end_turn
+
+
 def test_openai_response_events_sanitizes_response_error() -> None:
     with pytest.raises(OpenAIProtocolError) as exc_info:
         openai_response_events(
@@ -1595,6 +1652,28 @@ async def test_openai_stream_events_emits_incomplete_terminal_response() -> None
     assert events[1].completion is not None
     assert events[1].completion.finish_reason == ModelFinishReason.LENGTH
     assert events[1].completion.raw_finish_reason == "max_output_tokens"
+
+
+@pytest.mark.anyio
+async def test_openai_incomplete_response_does_not_apply_end_turn_false() -> None:
+    async def raw_events():
+        yield {
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp_incomplete_turn_control",
+                "model": "gpt-test",
+                "status": "incomplete",
+                "end_turn": False,
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [],
+            },
+        }
+
+    events = [event async for event in openai_stream_events(raw_events())]
+
+    assert events[-1].completion is not None
+    assert events[-1].completion.finish_reason == ModelFinishReason.LENGTH
+    assert events[-1].completion.end_turn is None
 
 
 @pytest.mark.anyio

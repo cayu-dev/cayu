@@ -177,6 +177,7 @@ from cayu.runtime.model_steps import (
     AssistantStepResult,
     StepClassification,
     classify_assistant_step,
+    completion_requests_follow_up,
 )
 from cayu.runtime.retry_policy import (
     RetryPolicy,
@@ -6434,6 +6435,11 @@ class SessionEngine:
                     yield event
                 if budget_evaluation.check is not None:
                     return
+
+                if not tool_calls and completion_requests_follow_up(
+                    assistant_step_result.completion
+                ):
+                    continue
 
                 if (
                     structured_output is not None

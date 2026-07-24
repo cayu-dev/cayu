@@ -24987,6 +24987,64 @@ def test_cayu_app_recover_incomplete_session_interrupts_abandoned_running_sessio
     }
 
 
+def test_cayu_app_recovery_does_not_complete_abandoned_end_turn_false_step():
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store)
+    app.register_provider(FakeProvider([]), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def setup_and_recover():
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_abandoned_end_turn_false",
+                messages=[Message.text("user", "start")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status("sess_abandoned_end_turn_false", SessionStatus.RUNNING)
+        await store.append_transcript_messages(
+            "sess_abandoned_end_turn_false",
+            [Message.text("assistant", "I am still working.")],
+        )
+        await store.append_event(
+            "sess_abandoned_end_turn_false",
+            Event(
+                type=EventType.MODEL_COMPLETED,
+                session_id="sess_abandoned_end_turn_false",
+                agent_name="assistant",
+                payload={
+                    "completion": {
+                        "finish_reason": "stop",
+                        "raw_finish_reason": None,
+                        "status": "completed",
+                        "end_turn": False,
+                    },
+                    "step_classification": {
+                        "type": "continue",
+                        "reason": "provider requested another model step",
+                    },
+                },
+            ),
+        )
+        return await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id="sess_abandoned_end_turn_false",
+                reason="worker restart",
+            )
+        )
+
+    result = asyncio.run(setup_and_recover())
+    session = asyncio.run(store.load("sess_abandoned_end_turn_false"))
+    transcript = asyncio.run(store.load_transcript("sess_abandoned_end_turn_false"))
+
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTED
+    assert result.actions == (IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,)
+    assert [message.role for message in transcript] == ["assistant"]
+    assert transcript[-1].content[0].text == "I am still working."
+
+
 def test_cayu_app_recover_incomplete_session_skips_terminal_without_registered_agent():
     store = InMemorySessionStore()
     app = CayuApp(session_store=store)
@@ -43639,6 +43697,40 @@ def test_cayu_app_fails_session_when_max_steps_exceeded():
     assert session.status == SessionStatus.FAILED
 
 
+def test_cayu_app_bounds_repeated_end_turn_false_by_max_steps():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("Still working."),
+                ModelStreamEvent.completed({"finish_reason": "stop", "end_turn": False}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_end_turn_false_max_steps",
+                messages=[Message.text("user", "loop")],
+                max_steps=1,
+            ),
+        )
+    )
+    session = asyncio.run(store.load("sess_end_turn_false_max_steps"))
+
+    assert len(provider.requests) == 1
+    assert events[-1].type == EventType.SESSION_FAILED
+    assert events[-1].payload["error"] == "Maximum model steps exceeded: 1"
+    assert session is not None
+    assert session.status == SessionStatus.FAILED
+
+
 def test_cayu_app_records_failed_session_for_invalid_tool_call_payload():
     store = InMemorySessionStore()
     provider = FakeProvider(
@@ -44262,6 +44354,142 @@ def test_cayu_app_records_model_step_classification_for_length_finish():
         "status": "incomplete",
     }
     assert model_completed.payload["step_classification"]["type"] == "length"
+
+
+def test_cayu_app_does_not_continue_length_completion_with_end_turn_false():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("partial"),
+                ModelStreamEvent.completed(
+                    {
+                        "status": "incomplete",
+                        "incomplete_details": {"reason": "max_output_tokens"},
+                        "end_turn": False,
+                    }
+                ),
+            ],
+            [
+                ModelStreamEvent.text_delta("must not run"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_length_end_turn_false",
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+    )
+
+    assert len(provider.requests) == 1
+    completed = [event for event in events if event.type == EventType.MODEL_COMPLETED]
+    assert completed[0].payload["step_classification"]["type"] == "length"
+
+
+def test_cayu_app_continues_same_turn_when_provider_sets_end_turn_false():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("I am still working."),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "stop",
+                        "end_turn": False,
+                        "provider_state": [
+                            {
+                                "provider": "openai",
+                                "state": {"type": "response_ref", "id": "resp_working"},
+                            }
+                        ],
+                    }
+                ),
+            ],
+            [
+                ModelStreamEvent.text_delta("Done."),
+                ModelStreamEvent.completed({"finish_reason": "stop", "end_turn": True}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_end_turn_false",
+                messages=[Message.text("user", "Do all the work")],
+            ),
+        )
+    )
+    transcript = asyncio.run(store.load_transcript("sess_end_turn_false"))
+
+    assert len(provider.requests) == 2
+    assert [message.role for message in provider.requests[1].messages] == [
+        "user",
+        "assistant",
+    ]
+    assert [message.role for message in transcript] == ["user", "assistant", "assistant"]
+    assert transcript[1].content[0].text == "I am still working."
+    assert isinstance(transcript[1].content[1], ProviderStatePart)
+    assert transcript[1].content[1].state == {
+        "type": "response_ref",
+        "id": "resp_working",
+    }
+    assert isinstance(provider.requests[1].messages[1].content[1], ProviderStatePart)
+    completed = [event for event in events if event.type == EventType.MODEL_COMPLETED]
+    assert completed[0].payload["completion"]["end_turn"] is False
+    assert completed[0].payload["step_classification"] == {
+        "type": "continue",
+        "reason": "provider requested another model step",
+    }
+    assert completed[1].payload["completion"]["end_turn"] is True
+    assert events[-1].type == EventType.SESSION_COMPLETED
+
+
+def test_cayu_app_continues_end_turn_false_without_visible_text():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [ModelStreamEvent.completed({"finish_reason": "stop", "end_turn": False})],
+            [
+                ModelStreamEvent.text_delta("Done."),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_end_turn_false_no_text",
+                messages=[Message.text("user", "Do all the work")],
+            ),
+        )
+    )
+
+    assert len(provider.requests) == 2
+    completed = [event for event in events if event.type == EventType.MODEL_COMPLETED]
+    assert completed[0].payload["step_classification"]["type"] == "continue"
+    assert events[-1].type == EventType.SESSION_COMPLETED
 
 
 def test_cayu_app_requires_structured_output_final_tool_call():

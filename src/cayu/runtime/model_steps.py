@@ -68,6 +68,11 @@ def classify_assistant_step(result: AssistantStepResult) -> StepClassification:
             type=StepClassificationType.FILTERED,
             reason="provider stopped because output was filtered",
         )
+    if completion_requests_follow_up(result.completion):
+        return StepClassification(
+            type=StepClassificationType.CONTINUE,
+            reason="provider requested another model step",
+        )
     if result.has_user_visible_content:
         return StepClassification(
             type=StepClassificationType.FINAL,
@@ -82,6 +87,18 @@ def classify_assistant_step(result: AssistantStepResult) -> StepClassification:
         type=StepClassificationType.INVALID,
         reason="assistant produced no tool calls and no user-visible content",
     )
+
+
+def completion_requests_follow_up(completion: ModelCompletion) -> bool:
+    """Return whether a normal completion explicitly requests another model step."""
+
+    if type(completion) is not ModelCompletion:
+        raise TypeError("Completion must be a ModelCompletion instance.")
+    return completion.end_turn is False and completion.finish_reason not in {
+        ModelFinishReason.ERROR,
+        ModelFinishReason.LENGTH,
+        ModelFinishReason.CONTENT_FILTER,
+    }
 
 
 def assistant_text_content(message: Message | None) -> str:
