@@ -149,6 +149,10 @@ REVISIONS: tuple[Revision, ...] = (
     # contract is not safe for mixed-version readers, so raise the compatibility
     # floor and block rolling deploys or app-only rollbacks across this revision.
     Revision(revision=21, kind=RevisionKind.BREAKING, compatible_from=21),
+    # MCP manifest authorization now depends on a store-atomic accepted
+    # baseline. Pre-22 workers do not maintain that state, so mixed-version
+    # session workers could silently bypass drift policy.
+    Revision(revision=22, kind=RevisionKind.BREAKING, compatible_from=22),
 )
 
 #: The revision an empty database is initialized to.

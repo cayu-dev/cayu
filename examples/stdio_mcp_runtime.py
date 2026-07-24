@@ -41,6 +41,7 @@ class FakeProvider(ModelProvider):
 async def main() -> None:
     server = McpServerSpec(
         name="local-mcp",
+        connection_id="example/stdio/local-mcp",
         command=[sys.executable, str(Path(__file__).resolve()), "--server"],
     )
     toolset = await connect_mcp_toolset(server)

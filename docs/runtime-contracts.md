@@ -1116,6 +1116,13 @@ because older readers do not accept the new durable event payload. Roll back
 the database and application together from a pre-upgrade backup if a revision-20
 rollback is required.
 
+Revision 22 adds the authoritative MCP manifest-baseline table. Stop
+revision-21 and older session workers and run
+`cayu storage migrate` before deploying revision-22 workers. The revision is
+breaking because every writer
+that can expose MCP tools must participate in the same atomic baseline fence;
+mixed-version session workers and app-only rollback are rejected.
+
 The durable billing envelope is provider-neutral: `provider_name` and
 `resource_id` identify the commercial resource, request/completion evidence
 remain opaque provider-owned JSON, and `pricing_contexts` enumerate exact
@@ -3310,16 +3317,66 @@ The first MCP implementation supports stdio servers:
   events/transcripts can show which MCP contract produced a result.
 - Before a run or resume enters the model loop, Cayu emits a durable
   `mcp.manifest.checked` event for each MCP toolset exposed through the agent's
-  registered tool adapters. The event compares the current manifest hash with
-  prior durable events for the same server/environment and marks it as
-  `first_seen`, `unchanged`, or `changed`. The payload stores the manifest hash,
-  compact per-tool hashes, and added/removed/changed Cayu tool names; it does
-  not store full schemas or server instructions. The comparison key is a stable
-  `manifest_identity` built from the server name and generated Cayu tool names,
-  so distinct same-name MCP toolsets are audited independently. This is an audit
-  signal for dashboards, watchers, and deployment checks. It becomes an
-  authorization decision only when `CayuApp(mcp_manifest_policy=...)` is
-  configured.
+  registered tool adapters. Admission fingerprints both the complete
+  server-advertised source manifest and the exact registered, provider-visible
+  adapter set, including aliases, descriptions, schemas, parallel-safety, and
+  effects. Registering only a subset therefore records that subset as the
+  authorized exposure; later adding or removing a registered adapter is drift
+  even when the server advertises the same definitions. The event's
+  `source_manifest_hash` is `McpToolset.manifest_hash`; its `manifest_hash` is
+  the combined authoritative exposure fingerprint, which commits to the source
+  and server fingerprints plus the separately stored advertised and exposed
+  tool evidence. The event compares that combined fingerprint with the store's
+  authoritative accepted baseline for the same environment and stable
+  connection identity, then marks it as `first_seen`, `unchanged`, or `changed`.
+  Manifest fingerprint changes never create a new history identity.
+  The event payload contains only hashed identities and fingerprints, bounded
+  added/removed/changed opaque tool-ID samples and counts, change classes, and
+  the policy outcome; it does not contain raw tool names, schemas, descriptions,
+  annotations, server instructions, connection identifiers, transport
+  configuration, or secrets. Accepted baselines use the same fixed-size opaque
+  tool IDs and contract hashes, separately preserving advertised and exposed
+  evidence so reconstruction cannot erase either side of the authorization
+  decision.
+- `McpServerSpec.connection_id` is the operator-controlled stable identity for a
+  logical connection. It remains optional for direct MCP discovery/client use,
+  but every MCP toolset exposed to a Cayu run must have one; admission otherwise
+  fails closed before the provider receives any tools. Include the application,
+  tenant, and endpoint namespace needed to distinguish connections that may
+  reuse a display name. The value is hashed before it is persisted in an event
+  or baseline key. Changing an explicit ID starts a new first-seen namespace and
+  requires the same security review as accepting a new server. The identity
+  remains stable across presentation-name changes, which are still evaluated as
+  manifest drift.
+- Built-in session stores atomically compare the baseline generation, append the
+  manifest decision event, and install an accepted replacement. Concurrent
+  reconnects therefore produce one accepted baseline and an explicitly
+  re-evaluated or fenced loser, never two silently accepted versions. A blocked
+  candidate never replaces the baseline, and a batch containing several MCP
+  toolsets publishes no accepted candidate if any candidate is blocked. Every
+  member still receives a durable audit outcome; nonblocking siblings are marked
+  `batch_blocked` rather than accepted.
+  Baselines are independent of session/event retention, so application
+  reconstruction and deletion of the accepting session do not reset a connection
+  to first-seen.
+- Revision-21 and earlier event history cannot prove that its newest surviving
+  event was the terminal accepted revision because later sessions may already
+  have been pruned. After upgrading, review each connection and set an explicit
+  `McpServerSpec.connection_id` to establish a new authoritative first-seen
+  namespace. Custom `SessionStore` implementations must opt in with
+  `supports_mcp_manifest_history = True`, return their durable baselines from
+  `load_mcp_manifest_baselines(...)`, and implement the atomic
+  `compare_and_publish_mcp_manifest_checks(...)` contract. A successful
+  publication must return the exact post-publication baseline set for the
+  requested identities. An MCP-enabled run fails closed on stores that do not
+  support this contract.
+- Stores and custom adapters must return strictly validated SHA-256 baseline
+  evidence for the requested environment/connection identity. Malformed,
+  oversized, duplicate, mutated, or identity-mismatched evidence is treated as a
+  history conflict and is never copied into an audit event.
+- Manifest checks remain an audit signal for dashboards, watchers, and
+  deployment checks. They become an authorization decision only when
+  `CayuApp(mcp_manifest_policy=...)` is configured.
 - `McpManifestPolicy` maps manifest statuses and diffs to `allow`, `alert`, or
   `block`. `alert` keeps the run moving and records the policy decision on
   `mcp.manifest.checked`; `block` emits `mcp.manifest.blocked` and fails the
@@ -3338,6 +3395,12 @@ The first MCP implementation supports stdio servers:
   `cayu guide tool-effects`: remote transport alone does not turn a declared
   read-only operation into a mutation. Cayu accepts only exact boolean hints;
   authorization still remains a separate tool-policy decision.
+- Adapter dispatch authority is fixed when the toolset is constructed. Public
+  `server` and `definition` values are defensive copies, and the adapter calls
+  the original advertised MCP name through the original toolset session. An
+  alias or provider-facing spec may be selected before agent registration and
+  is included in manifest authorization, but mutating a returned definition or
+  replacing an adapter binding cannot redirect an accepted call.
 - Cayu tool names are prefixed with the MCP server namespace, such as
   `mcp__local-mcp__echo`, to make provenance visible and avoid collisions.
 
@@ -3349,11 +3412,15 @@ allows unbounded list discovery: `tools/list` and `resources/list` stop after
 `DEFAULT_MCP_MAX_LIST_PAGES` (100) pages or
 `DEFAULT_MCP_MAX_LIST_ITEMS` (10,000) items. Configure lower or higher positive
 integer ceilings with `max_list_pages=` and `max_list_items=` on either client;
-the values are carried into its session. A server that advertises another page
-at the page ceiling is rejected before that request is sent, and a page that
-would exceed the item ceiling is rejected before its items are retained. Both
-fail with `McpProtocolError` naming the list method and observed limit. The
-clients do not store raw secrets in the spec. For stdio, `secret_env` is resolved and injected
+the values are carried into its session. Direct discovery may use a higher item
+ceiling, but runtime admission supports at most 10,000 advertised tools and
+10,000 registered adapters per toolset so its authoritative manifest baseline
+remains bounded; an oversized runtime toolset or exposure is rejected before
+the provider receives any tools. A server that advertises
+another page at the page ceiling is rejected before that request is sent, and a
+page that would exceed the item ceiling is rejected before its items are
+retained. Both fail with `McpProtocolError` naming the list method and observed
+limit. The clients do not store raw secrets in the spec. For stdio, `secret_env` is resolved and injected
 into the subprocess environment before it starts. For HTTP, `secret_headers`
 (for example `{"Authorization": SecretRef(name="github_token")}`) require an
 HTTP client constructed with a secret resolver, such as

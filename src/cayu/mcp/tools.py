@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import re
+from dataclasses import dataclass
 from hashlib import sha1
 from typing import Any
 
@@ -27,6 +28,32 @@ _MAX_STRUCTURED_CONTENT_TEXT_BYTES = 20_000
 _MAX_SERVER_INSTRUCTIONS_DESCRIPTION_CHARS = 1_000
 
 
+@dataclass(frozen=True, slots=True)
+class _McpManifestToolEvidence:
+    cayu_name: str
+    mcp_name: str
+    contract_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class _McpManifestSnapshot:
+    identity_is_explicit: bool
+    identity: str
+    manifest_hash: str
+    server_hash: str
+    tools: tuple[_McpManifestToolEvidence, ...]
+    tool_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class _McpAdapterBinding:
+    """Immutable construction-time authority for one MCP adapter."""
+
+    toolset: McpToolset
+    mcp_name: str
+    source_contract_hash: str
+
+
 class McpToolAdapter(Tool):
     """Expose one MCP server tool as a Cayu tool."""
 
@@ -41,15 +68,16 @@ class McpToolAdapter(Tool):
             raise TypeError("toolset must be an McpToolset.")
         if type(definition) is not McpToolDefinition:
             raise TypeError("definition must be an McpToolDefinition.")
+        binding = toolset._bind_adapter_definition(definition)
         tool_name = name or mcp_cayu_tool_name(toolset.server.name, definition.name)
         if not _TOOL_NAME_RE.fullmatch(tool_name):
             raise ValueError(
                 "MCP Cayu tool names must contain 1-64 letters, numbers, underscores, or hyphens."
             )
-        self.toolset = toolset
-        self.mcp_manifest_hash = toolset.manifest_hash
-        self.server = toolset.server.model_copy(deep=True)
-        self.definition = definition.model_copy(deep=True)
+        self.__binding = binding
+        self.__mcp_manifest_hash = toolset.manifest_hash
+        self.__server = toolset.server
+        self.__definition = definition.model_copy(deep=True)
         super().__init__(
             spec=ToolSpec(
                 name=tool_name,
@@ -60,20 +88,42 @@ class McpToolAdapter(Tool):
             )
         )
 
+    @property
+    def _manifest_binding(self) -> _McpAdapterBinding:
+        """Return the immutable dispatch binding used by runtime admission."""
+
+        return self.__binding
+
+    @property
+    def toolset(self) -> McpToolset:
+        return self.__binding.toolset
+
+    @property
+    def mcp_manifest_hash(self) -> str:
+        return self.__mcp_manifest_hash
+
+    @property
+    def server(self) -> McpServerSpec:
+        return self.__server.model_copy(deep=True)
+
+    @property
+    def definition(self) -> McpToolDefinition:
+        return self.__definition.model_copy(deep=True)
+
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         if type(args) is not dict:
             raise TypeError("MCP tool arguments must be an object.")
         arguments = copy_json_value(args, "arguments")
         if type(arguments) is not dict:
             raise TypeError("MCP tool arguments must be an object.")
-        result = await self.toolset.call_tool(self.definition.name, arguments)
+        result = await self.__binding.toolset.call_tool(self.__binding.mcp_name, arguments)
         content = _mcp_tool_result_text(
             result.content,
             structured_content=result.structured_content,
         )
         mcp_content = result.content
         mcp_structured_content = result.structured_content
-        redactor = self.toolset.secret_redactor
+        redactor = self.__binding.toolset.secret_redactor
         if redactor.has_values:
             # A hostile MCP server can echo injected secrets (secret_env/secret_headers)
             # back through its result; scrub the rendered text AND the raw content/
@@ -84,9 +134,9 @@ class McpToolAdapter(Tool):
         return ToolResult(
             content=content,
             structured={
-                "mcp_server": self.server.name,
-                "mcp_tool": self.definition.name,
-                "mcp_manifest_hash": self.mcp_manifest_hash,
+                "mcp_server": self.__server.name,
+                "mcp_tool": self.__binding.mcp_name,
+                "mcp_manifest_hash": self.__mcp_manifest_hash,
                 "mcp_content": mcp_content,
                 "mcp_structured_content": mcp_structured_content,
             },
@@ -108,30 +158,122 @@ class McpToolset:
             raise TypeError("server must be an McpServerSpec.")
         if not isinstance(session, McpSession):
             raise TypeError("session must be an McpSession.")
-        self.server = server.model_copy(deep=True)
-        self.session = session
-        self.definitions = tuple(definition.model_copy(deep=True) for definition in definitions)
-        self.manifest_hash = mcp_tool_manifest_hash(
-            server=self.server,
+        self.__server = server.model_copy(deep=True)
+        self.__session = session
+        self.__definitions = tuple(definition.model_copy(deep=True) for definition in definitions)
+        manifest_hash = mcp_tool_manifest_hash(
+            server=self.__server,
             initialize_result=self.initialize_result,
-            definitions=self.definitions,
+            definitions=self.__definitions,
         )
-        self.manifest_identity = mcp_tool_manifest_identity(
-            server=self.server,
-            definitions=self.definitions,
+        manifest_identity = mcp_tool_manifest_identity(
+            server=self.__server,
         )
-        self.manifest_server_hash = mcp_tool_manifest_server_hash(
-            server=self.server,
+        manifest_server_hash = mcp_tool_manifest_server_hash(
+            server=self.__server,
             initialize_result=self.initialize_result,
         )
-        self.manifest_tools = mcp_tool_manifest_tools(
-            server=self.server,
-            definitions=self.definitions,
+        manifest_tools = mcp_tool_manifest_tools(
+            server=self.__server,
+            definitions=self.__definitions,
         )
-        self.tools = tuple(
-            McpToolAdapter(toolset=self, definition=definition) for definition in self.definitions
+        self.__manifest_snapshot = _McpManifestSnapshot(
+            identity_is_explicit=self.__server.connection_id is not None,
+            identity=manifest_identity,
+            manifest_hash=manifest_hash,
+            server_hash=manifest_server_hash,
+            tools=tuple(
+                _McpManifestToolEvidence(
+                    cayu_name=entry["cayu_name"],
+                    mcp_name=entry["mcp_name"],
+                    contract_hash=entry["hash"],
+                )
+                for entry in manifest_tools
+            ),
+            tool_count=len(self.__definitions),
         )
-        _validate_unique_tool_names(list(self.tools))
+        source_tool_keys = [
+            (entry.cayu_name, entry.mcp_name) for entry in self.__manifest_snapshot.tools
+        ]
+        if len(source_tool_keys) != len(set(source_tool_keys)):
+            raise ValueError("MCP tool definitions must not contain duplicate tools.")
+        self.__tools = tuple(
+            McpToolAdapter(toolset=self, definition=definition) for definition in self.__definitions
+        )
+        _validate_unique_tool_names(list(self.__tools))
+
+    @property
+    def server(self) -> McpServerSpec:
+        return self.__server.model_copy(deep=True)
+
+    @property
+    def session(self) -> McpSession:
+        return self.__session
+
+    @property
+    def definitions(self) -> tuple[McpToolDefinition, ...]:
+        return tuple(definition.model_copy(deep=True) for definition in self.__definitions)
+
+    @property
+    def tools(self) -> tuple[McpToolAdapter, ...]:
+        return self.__tools
+
+    def _bind_adapter_definition(self, definition: McpToolDefinition) -> _McpAdapterBinding:
+        """Bind an adapter only to a definition advertised by this toolset."""
+
+        entry = mcp_tool_manifest_tools(
+            server=self.__server,
+            definitions=(definition.model_copy(deep=True),),
+        )[0]
+        matches = [
+            candidate
+            for candidate in self.__manifest_snapshot.tools
+            if candidate.mcp_name == entry["mcp_name"] and candidate.contract_hash == entry["hash"]
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "MCP adapters must bind exactly one definition advertised by their toolset."
+            )
+        return _McpAdapterBinding(
+            toolset=self,
+            mcp_name=matches[0].mcp_name,
+            source_contract_hash=matches[0].contract_hash,
+        )
+
+    @property
+    def _manifest_snapshot(self) -> _McpManifestSnapshot:
+        """Return the immutable construction-time evidence used by runtime admission."""
+
+        return self.__manifest_snapshot
+
+    @property
+    def manifest_identity_is_explicit(self) -> bool:
+        """Whether the cached manifest identity came from an explicit connection ID."""
+
+        return self.__manifest_snapshot.identity_is_explicit
+
+    @property
+    def manifest_identity(self) -> str:
+        return self.__manifest_snapshot.identity
+
+    @property
+    def manifest_hash(self) -> str:
+        return self.__manifest_snapshot.manifest_hash
+
+    @property
+    def manifest_server_hash(self) -> str:
+        return self.__manifest_snapshot.server_hash
+
+    @property
+    def manifest_tools(self) -> tuple[dict[str, Any], ...]:
+        return tuple(
+            {
+                "cayu_name": entry.cayu_name,
+                "mcp_name": entry.mcp_name,
+                "hash": entry.contract_hash,
+            }
+            for entry in self.__manifest_snapshot.tools
+        )
 
     @classmethod
     async def connect(
@@ -156,18 +298,18 @@ class McpToolset:
 
     @property
     def initialize_result(self) -> McpInitializeResult:
-        return self.session.initialize_result
+        return self.__session.initialize_result
 
     @property
     def secret_redactor(self) -> SecretRedactor:
         """Redactor for secrets injected into this server's session (empty if none)."""
-        return self.session.secret_redactor
+        return self.__session.secret_redactor
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> McpToolResult:
-        return await self.session.call_tool(name, arguments)
+        return await self.__session.call_tool(name, arguments)
 
     async def close(self) -> None:
-        await self.session.close()
+        await self.__session.close()
 
 
 async def connect_mcp_toolset(
@@ -231,22 +373,33 @@ def mcp_tool_manifest_hash(
 def mcp_tool_manifest_identity(
     *,
     server: McpServerSpec,
-    definitions: tuple[McpToolDefinition, ...],
+    definitions: tuple[McpToolDefinition, ...] | None = None,
 ) -> str:
-    """Return a stable identity for comparing one exposed MCP toolset over time."""
+    """Return an opaque candidate identity for one MCP server connection.
+
+    ``definitions`` remains accepted for source compatibility with the original
+    helper, but manifest contents intentionally do not participate in identity.
+    Only an explicit ``McpServerSpec.connection_id`` is authoritative for
+    runtime manifest history. The server-name form exists solely so a rejected
+    ID-less toolset can carry bounded, non-identifying audit evidence.
+    """
 
     if type(server) is not McpServerSpec:
         raise TypeError("server must be an McpServerSpec.")
-    if not isinstance(definitions, tuple):
-        raise TypeError("definitions must be a tuple of McpToolDefinition instances.")
-    cayu_names: list[str] = []
-    for definition in definitions:
-        if type(definition) is not McpToolDefinition:
+    if definitions is not None:
+        if not isinstance(definitions, tuple):
+            raise TypeError("definitions must be a tuple of McpToolDefinition instances.")
+        if any(type(definition) is not McpToolDefinition for definition in definitions):
             raise TypeError("definitions must contain McpToolDefinition instances.")
-        cayu_names.append(mcp_cayu_tool_name(server.name, definition.name))
     payload = {
-        "server_name": server.name,
-        "cayu_tool_names": sorted(cayu_names),
+        "schema": "cayu.mcp.connection_identity.v1",
+        # Domain-separate authoritative explicit identities from the audit-only
+        # server-name candidate. An explicit ID equal to the presentation name
+        # must still establish a genuinely new authorization namespace.
+        "identity_kind": ("connection_id" if server.connection_id is not None else "server_name"),
+        "connection_id": (
+            server.connection_id if server.connection_id is not None else server.name
+        ),
     }
     encoded = json.dumps(
         payload,

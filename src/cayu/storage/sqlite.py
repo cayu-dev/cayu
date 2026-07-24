@@ -36,6 +36,9 @@ from cayu.runtime.sessions import (
     EventQuery,
     EventRecord,
     EventSummary,
+    McpManifestBaseline,
+    McpManifestBaselineLoadResult,
+    McpManifestPublicationResult,
     PendingActionIssue,
     PendingActionKind,
     PendingActionListResult,
@@ -76,13 +79,17 @@ from cayu.runtime.sessions import (
     _active_unexpired_session_operation_id,
     _assert_session_run_epoch,
     _assert_session_run_epoch_value,
+    _copy_mcp_manifest_publication,
     _copy_session_event_batch,
     _current_session_run_epoch,
     _deactivate_session_run_fence,
     _prepare_session_fork_request,
     _project_interruption_cascade_marker_fields,
     _queued_session_message_event_payload,
+    _stored_mcp_manifest_baseline_json,
     _validate_equivalent_queued_session_message,
+    _validate_mcp_manifest_history_keys,
+    _validate_mcp_manifest_publication_state,
     _validate_session_fork_source,
     _validate_status_set,
     copy_enqueue_session_message_request,
@@ -136,7 +143,7 @@ from cayu.storage import migrations as schema
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = 21
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = 22
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
     contains_style="sqlite_nocase_like",
@@ -588,6 +595,7 @@ class SQLiteSessionStore(SessionStore):
     """SQLite-backed session store for durable local runtime state."""
 
     supports_usage_aggregates: ClassVar[bool] = True
+    supports_mcp_manifest_history: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -1527,6 +1535,168 @@ class SQLiteSessionStore(SessionStore):
                 raise
 
         await self._run_write(statement)
+
+    async def load_mcp_manifest_baselines(
+        self,
+        history_keys: tuple[str, ...],
+    ) -> McpManifestBaselineLoadResult:
+        keys = _validate_mcp_manifest_history_keys(history_keys)
+
+        def query(connection: sqlite3.Connection) -> McpManifestBaselineLoadResult:
+            result: dict[str, McpManifestBaseline] = {}
+            for key in keys:
+                row = connection.execute(
+                    "SELECT generation, baseline_json FROM cayu_mcp_manifest_baselines "
+                    "WHERE history_key = ?",
+                    (key,),
+                ).fetchone()
+                if row is not None:
+                    result[key] = _stored_mcp_manifest_baseline_json(
+                        key,
+                        row["generation"],
+                        row["baseline_json"],
+                    )
+            return McpManifestBaselineLoadResult(baselines=result)
+
+        return await self._run_read(query)
+
+    async def compare_and_publish_mcp_manifest_checks(
+        self,
+        session_id: str,
+        *,
+        expected_generations: dict[str, int | None],
+        baseline_updates: dict[str, McpManifestBaseline],
+        events: list[Event],
+    ) -> McpManifestPublicationResult:
+        from cayu.runtime.pending_actions import pending_action_event_storage_values
+
+        session_id, expected, updates, copied_events = _copy_mcp_manifest_publication(
+            session_id,
+            expected_generations=expected_generations,
+            baseline_updates=baseline_updates,
+            events=events,
+        )
+
+        def statement(connection: sqlite3.Connection) -> McpManifestPublicationResult:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                session = _load_session(connection, session_id)
+                if session is None:
+                    raise KeyError(f"Session not found: {session_id}")
+                _assert_session_run_epoch(session_id, session)
+                current: dict[str, McpManifestBaseline] = {}
+                for key in expected:
+                    row = connection.execute(
+                        "SELECT generation, baseline_json "
+                        "FROM cayu_mcp_manifest_baselines "
+                        "WHERE history_key = ?",
+                        (key,),
+                    ).fetchone()
+                    if row is not None:
+                        current[key] = _stored_mcp_manifest_baseline_json(
+                            key,
+                            row["generation"],
+                            row["baseline_json"],
+                        )
+                if any(
+                    expected_generation
+                    != (None if (baseline := current.get(key)) is None else baseline.generation)
+                    for key, expected_generation in expected.items()
+                ):
+                    connection.rollback()
+                    return McpManifestPublicationResult(
+                        published=False,
+                        baselines=current,
+                    )
+
+                _validate_mcp_manifest_publication_state(
+                    expected_generations=expected,
+                    current_baselines=current,
+                    baseline_updates=updates,
+                    events=copied_events,
+                )
+                _touch_session_activity(connection, session_id, datetime.now(UTC))
+                event_rows = []
+                for event in copied_events:
+                    lookup_key, projection, projection_bytes = pending_action_event_storage_values(
+                        event
+                    )
+                    event_rows.append(
+                        (
+                            session_id,
+                            event.id,
+                            str(event.type),
+                            sqlite_support.format_datetime(event.timestamp),
+                            event.agent_name,
+                            event.environment_name,
+                            event.workflow_name,
+                            event.tool_name,
+                            sqlite_support.json_dumps(event.payload),
+                            lookup_key,
+                            projection,
+                            projection_bytes,
+                        )
+                    )
+                connection.executemany(
+                    """
+                    INSERT INTO cayu_events (
+                        session_id, event_id, event_type, timestamp, agent_name,
+                        environment_name, workflow_name, tool_name, payload_json,
+                        pending_action_lookup_key, pending_action_projection_json,
+                        pending_action_projection_bytes
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    event_rows,
+                )
+                _enqueue_persisted_event_side_effects(
+                    connection,
+                    session_id,
+                    [event.id for event in copied_events],
+                )
+                updated_at = sqlite_support.format_datetime(datetime.now(UTC))
+                for key, baseline in updates.items():
+                    connection.execute(
+                        """
+                        INSERT INTO cayu_mcp_manifest_baselines (
+                            history_key, generation, baseline_json, updated_at
+                        )
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(history_key) DO UPDATE SET
+                            generation = excluded.generation,
+                            baseline_json = excluded.baseline_json,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            key,
+                            baseline.generation,
+                            sqlite_support.json_dumps(baseline.model_dump(mode="json")),
+                            updated_at,
+                        ),
+                    )
+                    current[key] = baseline.model_copy(deep=True)
+                connection.commit()
+                return McpManifestPublicationResult(
+                    published=True,
+                    baselines=current,
+                )
+            except sqlite3.IntegrityError as exc:
+                connection.rollback()
+                existing_event_id = _first_existing_event_id(
+                    connection,
+                    session_id,
+                    [event.id for event in copied_events],
+                )
+                if existing_event_id is not None:
+                    raise ValueError(
+                        f"Event already exists for session {session_id}: {existing_event_id}"
+                    ) from exc
+                raise
+            except Exception:
+                connection.rollback()
+                raise
+
+        return await self._run_write(statement)
 
     async def claim_persisted_event_side_effect(
         self,

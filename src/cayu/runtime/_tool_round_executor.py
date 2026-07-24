@@ -10,14 +10,20 @@ through narrow callbacks.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Iterable, Mapping
+import hashlib
+import json
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from types import MappingProxyType
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 from uuid import uuid4
 
+from cayu._task_wait import (
+    consume_pending_task_cancellation,
+    unexpected_child_cancellation_error,
+)
 from cayu._validation import (
     copy_durable_json_object,
     copy_durable_json_value,
@@ -89,7 +95,19 @@ from cayu.runtime.mcp_manifest_policy import (
     mcp_manifest_policy_payload,
 )
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
-from cayu.runtime.sessions import EventQuery, EventRecord, Session, SessionStore
+from cayu.runtime.sessions import (
+    _MCP_MANIFEST_BASELINE_MAX_TOOLS,
+    EventQuery,
+    McpManifestBaseline,
+    McpManifestBaselineLoadResult,
+    McpManifestHistoryConflict,
+    McpManifestPublicationResult,
+    Session,
+    SessionStore,
+    _mcp_authoritative_manifest_hash,
+    _mcp_manifest_session_ref,
+    _McpManifestBaselineEvidenceInvalid,
+)
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.runtime.structured_output import (
     StructuredOutputSpec,
@@ -1097,96 +1115,338 @@ class ToolRoundExecutor:
         registered_agent: runtime_records.RegisteredAgentState,
         environment_name: str | None,
     ) -> AsyncIterator[Event]:
-        seen_toolsets: set[int] = set()
-        prior_records = await query_all_event_records(
-            self._session_store,
-            EventQuery(
-                event_type=EventType.MCP_MANIFEST_CHECKED,
-                environment_name=environment_name,
-            ),
-        )
-        toolsets = _mcp_toolsets_for_agent(registered_agent)
-        current_server_counts = _mcp_current_server_counts(toolsets)
-        prior_server_counts = _mcp_prior_server_counts(
-            prior_records,
+        candidates = _mcp_manifest_candidates_for_agent(
+            registered_agent,
             environment_name=environment_name,
         )
-        checks: list[tuple[dict[str, Any], McpManifestPolicyDecision | None]] = []
-        for toolset in toolsets:
-            toolset_key = id(toolset)
-            if toolset_key in seen_toolsets:
-                continue
-            seen_toolsets.add(toolset_key)
-            previous = _latest_mcp_manifest_event(
-                prior_records,
-                manifest_identity=toolset.manifest_identity,
-                environment_name=environment_name,
-            )
-            if (
-                previous is None
-                and current_server_counts.get(toolset.server.name) == 1
-                and prior_server_counts.get(toolset.server.name) == 1
-            ):
-                previous = _latest_mcp_manifest_event_for_server(
-                    prior_records,
-                    server_name=toolset.server.name,
-                    environment_name=environment_name,
-                )
-            status, previous_payload, diff = _mcp_manifest_status(
-                toolset=toolset,
-                previous=previous,
-            )
-            payload: dict[str, Any] = {
-                "server_name": toolset.server.name,
-                "manifest_identity": toolset.manifest_identity,
-                "manifest_hash": toolset.manifest_hash,
-                "server_hash": toolset.manifest_server_hash,
-                "status": status,
-                "tool_count": len(toolset.definitions),
-                "tools": copy_json_value(list(toolset.manifest_tools), "tools"),
-                "server": {
-                    "protocol_version": toolset.initialize_result.protocol_version,
-                    "server_name": toolset.initialize_result.server_name,
-                    "server_version": toolset.initialize_result.server_version,
-                },
-                "previous": previous_payload,
-                "diff": diff,
-            }
-            decision = None
-            if self._mcp_manifest_policy is not None:
-                decision = self._mcp_manifest_policy.decide(status=status, diff=diff)
-                payload["policy"] = mcp_manifest_policy_payload(decision)
-            checks.append((payload, decision))
+        if not candidates:
+            return
 
-        blocked_checks = [
-            (payload, decision)
-            for payload, decision in checks
-            if decision is not None and decision.action == McpManifestPolicyAction.BLOCK
+        async def publish_rejection_batch(events: list[Event]) -> list[Event]:
+            return await _await_mcp_manifest_operation(
+                lambda: self._event_writer.emit_many(session.id, events),
+                operation="MCP manifest rejection publication",
+            )
+
+        def invalid_baseline_events() -> list[Event]:
+            return [
+                _mcp_manifest_history_blocked_event(
+                    session=session,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    history_key=candidate.history_key,
+                    snapshot=candidate.snapshot,
+                    status="history_conflict",
+                    reason="authoritative_baseline_invalid",
+                )
+                for candidate in candidates
+            ]
+
+        if not self._session_store.supports_mcp_manifest_history:
+            events = [
+                _mcp_manifest_history_blocked_event(
+                    session=session,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    history_key=candidate.history_key,
+                    snapshot=candidate.snapshot,
+                    status="history_unavailable",
+                    reason="session_store_manifest_history_unsupported",
+                )
+                for candidate in candidates
+            ]
+            for event in await publish_rejection_batch(events):
+                yield event
+            raise McpManifestHistoryConflict(
+                f"{type(self._session_store).__name__} does not support durable MCP "
+                "manifest history."
+            )
+
+        oversized_toolsets = [
+            candidate
+            for candidate in candidates
+            if (
+                candidate.snapshot.advertised_tool_count > _MCP_MANIFEST_BASELINE_MAX_TOOLS
+                or candidate.snapshot.tool_count > _MCP_MANIFEST_BASELINE_MAX_TOOLS
+            )
         ]
-        if blocked_checks:
-            for payload, _ in blocked_checks:
-                yield await self._event_writer.emit(
-                    Event(
-                        type=EventType.MCP_MANIFEST_BLOCKED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
+        if oversized_toolsets:
+            oversized_ids = {id(candidate.toolset) for candidate in oversized_toolsets}
+            events = [
+                (
+                    _mcp_manifest_history_blocked_event(
+                        session=session,
+                        registered_agent=registered_agent,
                         environment_name=environment_name,
-                        payload=copy_json_value(payload, "payload"),
+                        history_key=candidate.history_key,
+                        snapshot=candidate.snapshot,
+                        status="history_conflict",
+                        reason="manifest_tool_limit_exceeded",
+                    )
+                    if id(candidate.toolset) in oversized_ids
+                    else _mcp_manifest_batch_blocked_event(
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        history_key=candidate.history_key,
+                        snapshot=candidate.snapshot,
+                        reason="sibling_manifest_tool_limit_exceeded",
                     )
                 )
-            reasons = "; ".join(decision.reason for _, decision in blocked_checks)
-            raise McpManifestPolicyError(reasons)
+                for candidate in candidates
+            ]
+            for event in await publish_rejection_batch(events):
+                yield event
+            raise McpManifestHistoryConflict(
+                "MCP toolsets exposed to a run cannot contain more than "
+                f"{_MCP_MANIFEST_BASELINE_MAX_TOOLS} manifest tools."
+            )
 
-        for payload, _ in checks:
-            yield await self._event_writer.emit(
-                Event(
-                    type=EventType.MCP_MANIFEST_CHECKED,
+        missing_identity_toolsets = [
+            candidate for candidate in candidates if not candidate.snapshot.identity_is_explicit
+        ]
+        if missing_identity_toolsets:
+            missing_ids = {id(candidate.toolset) for candidate in missing_identity_toolsets}
+            events = [
+                (
+                    _mcp_manifest_history_blocked_event(
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        history_key=candidate.history_key,
+                        snapshot=candidate.snapshot,
+                        status="history_conflict",
+                        reason="connection_identity_required",
+                    )
+                    if id(candidate.toolset) in missing_ids
+                    else _mcp_manifest_batch_blocked_event(
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        history_key=candidate.history_key,
+                        snapshot=candidate.snapshot,
+                        reason="sibling_connection_identity_missing",
+                    )
+                )
+                for candidate in candidates
+            ]
+            for event in await publish_rejection_batch(events):
+                yield event
+            raise McpManifestHistoryConflict(
+                "MCP toolsets exposed to a run require an explicit, stable "
+                "McpServerSpec.connection_id."
+            )
+
+        history_keys = tuple(candidate.history_key for candidate in candidates)
+        if len(history_keys) != len(set(history_keys)):
+            events = [
+                _mcp_manifest_history_blocked_event(
+                    session=session,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    history_key=candidate.history_key,
+                    snapshot=candidate.snapshot,
+                    status="history_conflict",
+                    reason="duplicate_connection_identity",
+                )
+                for candidate in candidates
+            ]
+            for event in await publish_rejection_batch(events):
+                yield event
+            raise McpManifestHistoryConflict(
+                "Multiple MCP toolsets use the same environment and connection identity; "
+                "configure distinct McpServerSpec.connection_id values."
+            )
+
+        for _ in range(_MCP_MANIFEST_PUBLICATION_MAX_ATTEMPTS):
+            try:
+                loaded = await _await_mcp_manifest_operation(
+                    lambda: self._session_store.load_mcp_manifest_baselines(history_keys),
+                    operation="MCP manifest baseline loading",
+                )
+            except _McpManifestBaselineEvidenceInvalid:
+                for event in await publish_rejection_batch(invalid_baseline_events()):
+                    yield event
+                raise McpManifestHistoryConflict(
+                    "The session store returned invalid MCP manifest baseline evidence."
+                ) from None
+            try:
+                baseline_load = _validated_mcp_manifest_baseline_load(
+                    loaded,
+                    candidates=candidates,
+                    environment_name=environment_name,
+                )
+            except Exception:
+                for event in await publish_rejection_batch(invalid_baseline_events()):
+                    yield event
+                raise McpManifestHistoryConflict(
+                    "The session store returned invalid MCP manifest baseline evidence."
+                ) from None
+
+            stored_baselines = baseline_load.baselines
+            expected_generations = {
+                history_key: (
+                    None
+                    if (baseline := stored_baselines.get(history_key)) is None
+                    else baseline.generation
+                )
+                for history_key in history_keys
+            }
+            evaluations: list[_McpManifestEvaluation] = []
+            for candidate in candidates:
+                previous = stored_baselines.get(candidate.history_key)
+                status, previous_payload, full_diff = _mcp_manifest_status(
+                    snapshot=candidate.snapshot,
+                    previous=previous,
+                )
+                decision = None
+                if self._mcp_manifest_policy is not None:
+                    decision = self._mcp_manifest_policy.decide(
+                        status=status,
+                        diff=full_diff,
+                    )
+                blocked = decision is not None and decision.action == McpManifestPolicyAction.BLOCK
+                payload = _mcp_manifest_event_payload(
+                    history_key=candidate.history_key,
+                    snapshot=candidate.snapshot,
+                    status=status,
+                    previous=previous_payload,
+                    diff=full_diff,
+                    decision=decision,
+                    outcome="blocked" if blocked else "accepted",
+                )
+                event = Event(
+                    type=(
+                        EventType.MCP_MANIFEST_BLOCKED
+                        if blocked
+                        else EventType.MCP_MANIFEST_CHECKED
+                    ),
                     session_id=session.id,
                     agent_name=registered_agent.spec.name,
                     environment_name=environment_name,
                     payload=payload,
                 )
+                evaluations.append(
+                    _McpManifestEvaluation(
+                        candidate=candidate,
+                        status=status,
+                        decision=decision,
+                        event=event,
+                    )
+                )
+
+            blocked = [
+                evaluation
+                for evaluation in evaluations
+                if evaluation.decision is not None
+                and evaluation.decision.action == McpManifestPolicyAction.BLOCK
+            ]
+            publication_events = [evaluation.event for evaluation in evaluations]
+            if blocked:
+                publication_events = [
+                    (
+                        evaluation.event
+                        if evaluation.decision is not None
+                        and evaluation.decision.action == McpManifestPolicyAction.BLOCK
+                        else evaluation.event.model_copy(
+                            update={
+                                "payload": {
+                                    **evaluation.event.payload,
+                                    "outcome": "batch_blocked",
+                                }
+                            },
+                            deep=True,
+                        )
+                    )
+                    for evaluation in evaluations
+                ]
+            baseline_updates: dict[str, McpManifestBaseline] = {}
+            if not blocked:
+                for evaluation in evaluations:
+                    candidate = evaluation.candidate
+                    stored = stored_baselines.get(candidate.history_key)
+                    if stored is None or evaluation.status == "changed":
+                        baseline_updates[candidate.history_key] = _mcp_manifest_baseline(
+                            history_key=candidate.history_key,
+                            snapshot=candidate.snapshot,
+                            generation=1 if stored is None else stored.generation + 1,
+                            event=evaluation.event,
+                        )
+
+            try:
+                publication_result = await _await_mcp_manifest_operation(
+                    lambda expected=expected_generations, updates=baseline_updates, events=publication_events: (
+                        self._session_store.compare_and_publish_mcp_manifest_checks(
+                            session.id,
+                            expected_generations=expected,
+                            baseline_updates=updates,
+                            events=events,
+                        )
+                    ),
+                    operation="MCP manifest decision publication",
+                )
+            except _McpManifestBaselineEvidenceInvalid:
+                for event in await publish_rejection_batch(invalid_baseline_events()):
+                    yield event
+                raise McpManifestHistoryConflict(
+                    "The session store returned invalid MCP manifest baseline evidence."
+                ) from None
+            expected_published_baselines = {
+                **stored_baselines,
+                **baseline_updates,
+            }
+            try:
+                publication = _validated_mcp_manifest_publication_result(
+                    publication_result,
+                    candidates=candidates,
+                    environment_name=environment_name,
+                    expected_published_baselines=expected_published_baselines,
+                )
+            except Exception:
+                raise McpManifestHistoryConflict(
+                    "The session store returned invalid MCP manifest publication evidence."
+                ) from None
+            if not publication.published:
+                continue
+            await _await_mcp_manifest_operation(
+                lambda events=publication_events: self._event_writer.fan_out_persisted(events),
+                operation="MCP manifest event side-effect delivery",
             )
+            for event in publication_events:
+                yield event.model_copy(deep=True)
+            if blocked:
+                reasons = "; ".join(
+                    evaluation.decision.reason
+                    for evaluation in blocked
+                    if evaluation.decision is not None
+                )
+                raise McpManifestPolicyError(reasons)
+            return
+
+        conflict_events = [
+            Event(
+                type=EventType.MCP_MANIFEST_BLOCKED,
+                session_id=session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                payload={
+                    "history_key": candidate.history_key,
+                    "manifest_identity": candidate.snapshot.identity,
+                    "manifest_hash": candidate.snapshot.manifest_hash,
+                    "source_manifest_hash": candidate.snapshot.source_manifest_hash,
+                    "status": "fenced",
+                    "change_classes": [],
+                    "outcome": "fenced",
+                    "reason": "authoritative_baseline_changed_repeatedly",
+                },
+            )
+            for candidate in candidates
+        ]
+        for event in await publish_rejection_batch(conflict_events):
+            yield event
+        raise McpManifestHistoryConflict(
+            "MCP manifest history changed repeatedly while the run was being admitted."
+        )
 
     async def _emit_proxy_authorization_events(
         self,
@@ -2418,86 +2678,269 @@ def _proxy(
     return _RedactingCredentialProxy(proxy, on_resolve, on_authorize)
 
 
-def _mcp_toolsets_for_agent(
+def _mcp_manifest_candidates_for_agent(
     registered_agent: runtime_records.RegisteredAgentState,
-) -> tuple[McpToolset, ...]:
-    toolsets: list[McpToolset] = []
+    *,
+    environment_name: str | None,
+) -> tuple[_McpManifestCandidate, ...]:
+    grouped: dict[int, tuple[McpToolset, list[runtime_records.RegisteredTool]]] = {}
     for registered_tool in registered_agent.tools.values():
         tool = registered_tool.tool
         if isinstance(tool, McpToolAdapter):
-            toolsets.append(tool.toolset)
-    return tuple(toolsets)
+            binding = tool._manifest_binding
+            toolset_key = id(binding.toolset)
+            existing = grouped.get(toolset_key)
+            if existing is None:
+                grouped[toolset_key] = (binding.toolset, [registered_tool])
+            else:
+                if existing[0] is not binding.toolset:
+                    raise McpManifestHistoryConflict(
+                        "MCP adapter ownership changed during manifest admission."
+                    )
+                existing[1].append(registered_tool)
+
+    candidates: list[_McpManifestCandidate] = []
+    for toolset, registered_tools in grouped.values():
+        source = toolset._manifest_snapshot
+        exposed_tools = tuple(
+            sorted(
+                (
+                    _mcp_manifest_exposed_tool_evidence(registered_tool)
+                    for registered_tool in registered_tools
+                ),
+                key=lambda entry: entry.tool_id,
+            )
+        )
+        if len(exposed_tools) != len({entry.tool_id for entry in exposed_tools}):
+            raise McpManifestHistoryConflict(
+                "MCP provider exposure contains ambiguous duplicate tool identities."
+            )
+        durable_tools = _durable_mcp_manifest_source_tools(source.tools)
+        durable_exposed_tools = _durable_mcp_manifest_exposed_tool_evidence(exposed_tools)
+        snapshot = _McpManifestAuditSnapshot(
+            identity_is_explicit=source.identity_is_explicit,
+            identity=source.identity,
+            manifest_hash=_mcp_authoritative_manifest_hash(
+                source_manifest_hash=source.manifest_hash,
+                server_hash=source.server_hash,
+                tools=durable_tools,
+                exposed_tools=durable_exposed_tools,
+            ),
+            source_manifest_hash=source.manifest_hash,
+            server_hash=source.server_hash,
+            tools=source.tools,
+            exposed_tools=exposed_tools,
+            advertised_tool_count=source.tool_count,
+            tool_count=len(exposed_tools),
+        )
+        candidates.append(
+            _McpManifestCandidate(
+                history_key=_mcp_manifest_history_key(
+                    environment_name=environment_name,
+                    manifest_identity=snapshot.identity,
+                ),
+                toolset=toolset,
+                snapshot=snapshot,
+            )
+        )
+    return tuple(candidates)
 
 
-def _mcp_current_server_counts(toolsets: tuple[McpToolset, ...]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    seen_toolsets: set[int] = set()
-    for toolset in toolsets:
-        toolset_key = id(toolset)
-        if toolset_key in seen_toolsets:
-            continue
-        seen_toolsets.add(toolset_key)
-        counts[toolset.server.name] = counts.get(toolset.server.name, 0) + 1
-    return counts
+_MCP_MANIFEST_PUBLICATION_MAX_ATTEMPTS = 8
+_MCP_MANIFEST_EVENT_TOOL_SAMPLE_LIMIT = 100
+_McpManifestResultT = TypeVar("_McpManifestResultT")
 
 
-def _mcp_prior_server_counts(
-    records: list[EventRecord],
+@dataclass(frozen=True, slots=True)
+class _McpManifestExposedToolEvidence:
+    tool_id: str
+    contract_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class _McpManifestAuditSnapshot:
+    identity_is_explicit: bool
+    identity: str
+    manifest_hash: str
+    source_manifest_hash: str
+    server_hash: str
+    tools: tuple[Any, ...]
+    exposed_tools: tuple[_McpManifestExposedToolEvidence, ...]
+    advertised_tool_count: int
+    tool_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class _McpManifestCandidate:
+    history_key: str
+    toolset: McpToolset
+    snapshot: _McpManifestAuditSnapshot
+
+
+@dataclass(frozen=True)
+class _McpManifestEvaluation:
+    candidate: _McpManifestCandidate
+    status: str
+    decision: McpManifestPolicyDecision | None
+    event: Event
+
+
+def _mcp_manifest_exposed_tool_evidence(
+    registered_tool: runtime_records.RegisteredTool,
+) -> _McpManifestExposedToolEvidence:
+    tool = registered_tool.tool
+    if not isinstance(tool, McpToolAdapter):
+        raise TypeError("MCP exposure evidence requires an McpToolAdapter.")
+    binding = tool._manifest_binding
+    source = binding.toolset._manifest_snapshot
+    matching_source_entries = [
+        entry
+        for entry in source.tools
+        if entry.mcp_name == binding.mcp_name
+        and entry.contract_hash == binding.source_contract_hash
+    ]
+    if len(matching_source_entries) != 1:
+        raise McpManifestHistoryConflict(
+            "An MCP adapter is not backed by exactly one advertised tool definition."
+        )
+    tool_id = _mcp_manifest_tool_identity(
+        cayu_name=registered_tool.name,
+        mcp_name=binding.mcp_name,
+    )
+    contract = json.dumps(
+        {
+            "schema": "cayu.mcp.exposed_tool_contract.v1",
+            "tool_id": tool_id,
+            "source_contract_hash": binding.source_contract_hash,
+            "name": registered_tool.name,
+            "description": registered_tool.description,
+            "input_schema": registered_tool.schema,
+            "parallel_safe": registered_tool.parallel_safe,
+            "effect": registered_tool.effect.value,
+            "mcp_name": binding.mcp_name,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return _McpManifestExposedToolEvidence(
+        tool_id=tool_id,
+        contract_hash=f"sha256:{hashlib.sha256(contract).hexdigest()}",
+    )
+
+
+async def _await_mcp_manifest_operation(
+    operation_factory: Callable[[], Awaitable[_McpManifestResultT]],
     *,
-    environment_name: str | None,
-) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    seen_identities: set[str] = set()
-    for record in records:
-        if record.event.environment_name != environment_name:
-            continue
-        server_name = record.event.payload.get("server_name")
-        manifest_identity = record.event.payload.get("manifest_identity")
-        if not isinstance(server_name, str) or not isinstance(manifest_identity, str):
-            continue
-        if manifest_identity in seen_identities:
-            continue
-        seen_identities.add(manifest_identity)
-        counts[server_name] = counts.get(server_name, 0) + 1
-    return counts
+    operation: str,
+) -> _McpManifestResultT:
+    """Preserve new caller cancellation while rejecting child-only cancellation."""
+
+    current_task = asyncio.current_task()
+    # Deliver a request already pending at this boundary before creating the
+    # operation. If no cancellation is delivered, the resulting count contains
+    # only historical requests and is the provenance baseline for the await.
+    await asyncio.sleep(0)
+    cancellation_requests = 0 if current_task is None else current_task.cancelling()
+    try:
+        result = await operation_factory()
+    except asyncio.CancelledError as cancellation:
+        if current_task is not None and current_task.cancelling() > cancellation_requests:
+            raise
+        raise unexpected_child_cancellation_error(
+            cancellation,
+            operation=operation,
+        ) from cancellation
+    if current_task is not None and current_task.cancelling() > cancellation_requests:
+        cancellation = consume_pending_task_cancellation(
+            preserve_requests=cancellation_requests,
+        )
+        if cancellation is None:
+            raise RuntimeError("MCP manifest caller cancellation could not be recovered.")
+        raise cancellation
+    return result
 
 
-def _latest_mcp_manifest_event(
-    records: list[EventRecord],
+def _mcp_manifest_history_key(
     *,
     manifest_identity: str,
     environment_name: str | None,
-) -> EventRecord | None:
-    for record in reversed(records):
-        if (
-            record.event.environment_name == environment_name
-            and record.event.payload.get("manifest_identity") == manifest_identity
-        ):
-            return record
-    return None
+) -> str:
+    encoded = json.dumps(
+        {
+            "schema": "cayu.mcp.manifest_history.v1",
+            "environment_name": environment_name,
+            "manifest_identity": manifest_identity,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
-def _latest_mcp_manifest_event_for_server(
-    records: list[EventRecord],
+def _validated_mcp_manifest_baseline_load(
+    value: object,
     *,
-    server_name: str,
+    candidates: tuple[_McpManifestCandidate, ...],
     environment_name: str | None,
-) -> EventRecord | None:
-    for record in reversed(records):
+) -> McpManifestBaselineLoadResult:
+    if not isinstance(value, McpManifestBaselineLoadResult):
+        raise TypeError("load_mcp_manifest_baselines must return McpManifestBaselineLoadResult.")
+    validated = McpManifestBaselineLoadResult.model_validate(value.model_dump(mode="python"))
+    expected_keys = {candidate.history_key for candidate in candidates}
+    unexpected_keys = set(validated.baselines) - expected_keys
+    if unexpected_keys:
+        raise ValueError("MCP baseline load returned unrequested history identities.")
+    for candidate in candidates:
+        baseline = validated.baselines.get(candidate.history_key)
+        if baseline is None:
+            continue
+        expected_history_key = _mcp_manifest_history_key(
+            environment_name=environment_name,
+            manifest_identity=candidate.snapshot.identity,
+        )
         if (
-            record.event.environment_name == environment_name
-            and record.event.payload.get("server_name") == server_name
+            baseline.manifest_identity != candidate.snapshot.identity
+            or baseline.history_key != expected_history_key
+            or candidate.history_key != expected_history_key
         ):
-            return record
-    return None
+            raise ValueError("MCP baseline identity does not match the exposed toolset.")
+    return validated
+
+
+def _validated_mcp_manifest_publication_result(
+    value: object,
+    *,
+    candidates: tuple[_McpManifestCandidate, ...],
+    environment_name: str | None,
+    expected_published_baselines: dict[str, McpManifestBaseline],
+) -> McpManifestPublicationResult:
+    if not isinstance(value, McpManifestPublicationResult):
+        raise TypeError(
+            "compare_and_publish_mcp_manifest_checks must return McpManifestPublicationResult."
+        )
+    validated = McpManifestPublicationResult.model_validate(value.model_dump(mode="python"))
+    _validated_mcp_manifest_baseline_load(
+        McpManifestBaselineLoadResult(baselines=validated.baselines),
+        candidates=candidates,
+        environment_name=environment_name,
+    )
+    expected = McpManifestBaselineLoadResult(
+        baselines=expected_published_baselines,
+    ).baselines
+    if validated.published and validated.baselines != expected:
+        raise ValueError("Published MCP manifest baselines do not match the accepted publication.")
+    return validated
 
 
 def _mcp_manifest_status(
     *,
-    toolset: McpToolset,
-    previous: EventRecord | None,
+    snapshot: _McpManifestAuditSnapshot,
+    previous: McpManifestBaseline | None,
 ) -> tuple[str, dict[str, Any] | None, dict[str, Any]]:
-    current_tools = _mcp_manifest_tool_hashes(toolset.manifest_tools)
+    current_source_tools = _mcp_manifest_tool_hashes(_durable_mcp_manifest_tools(snapshot))
+    current_exposed_tools = _mcp_manifest_tool_hashes(_durable_mcp_manifest_exposed_tools(snapshot))
     empty_diff = {
         "server_changed": False,
         "added_tools": [],
@@ -2507,36 +2950,177 @@ def _mcp_manifest_status(
     if previous is None:
         return "first_seen", None, empty_diff
 
-    previous_payload = previous.event.payload
     previous_summary = {
-        "event_id": previous.event.id,
-        "session_id": previous.event.session_id,
-        "sequence": previous.sequence,
-        "manifest_identity": previous_payload.get("manifest_identity"),
-        "manifest_hash": previous_payload.get("manifest_hash"),
-        "server_hash": previous_payload.get("server_hash"),
-        "status": previous_payload.get("status"),
+        "event_id": previous.accepted_event_id,
+        "session_ref": previous.accepted_session_ref,
+        "generation": previous.generation,
+        "manifest_identity": previous.manifest_identity,
+        "manifest_hash": previous.manifest_hash,
+        "source_manifest_hash": previous.source_manifest_hash,
+        "server_hash": previous.server_hash,
     }
-    if previous_payload.get("manifest_hash") == toolset.manifest_hash:
+    if previous.manifest_hash == snapshot.manifest_hash:
         return "unchanged", previous_summary, empty_diff
 
-    previous_tools = _mcp_manifest_tool_hashes(previous_payload.get("tools"))
-    added = sorted(name for name in current_tools if name not in previous_tools)
-    removed = sorted(name for name in previous_tools if name not in current_tools)
-    changed = sorted(
-        name
-        for name, tool_hash in current_tools.items()
-        if name in previous_tools and previous_tools[name] != tool_hash
-    )
+    added: set[str] = set()
+    removed: set[str] = set()
+    changed: set[str] = set()
+    for current_tools, previous_tools in (
+        (current_source_tools, _mcp_manifest_tool_hashes(previous.tools)),
+        (
+            current_exposed_tools,
+            _mcp_manifest_tool_hashes(previous.exposed_tools),
+        ),
+    ):
+        added.update(name for name in current_tools if name not in previous_tools)
+        removed.update(name for name in previous_tools if name not in current_tools)
+        changed.update(
+            name
+            for name, tool_hash in current_tools.items()
+            if name in previous_tools and previous_tools[name] != tool_hash
+        )
     return (
         "changed",
         previous_summary,
         {
-            "server_changed": previous_payload.get("server_hash") != toolset.manifest_server_hash,
-            "added_tools": added,
-            "removed_tools": removed,
-            "changed_tools": changed,
+            "server_changed": previous.server_hash != snapshot.server_hash,
+            "added_tools": sorted(added),
+            "removed_tools": sorted(removed),
+            "changed_tools": sorted(changed),
         },
+    )
+
+
+def _mcp_manifest_history_blocked_event(
+    *,
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    environment_name: str | None,
+    history_key: str,
+    snapshot: _McpManifestAuditSnapshot,
+    status: str,
+    reason: str,
+) -> Event:
+    return Event(
+        type=EventType.MCP_MANIFEST_BLOCKED,
+        session_id=session.id,
+        agent_name=registered_agent.spec.name,
+        environment_name=environment_name,
+        payload={
+            "history_key": history_key,
+            "manifest_identity": snapshot.identity,
+            "manifest_hash": snapshot.manifest_hash,
+            "source_manifest_hash": snapshot.source_manifest_hash,
+            "status": status,
+            "change_classes": [],
+            "outcome": "blocked",
+            "reason": reason,
+        },
+    )
+
+
+def _mcp_manifest_batch_blocked_event(
+    *,
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    environment_name: str | None,
+    history_key: str,
+    snapshot: _McpManifestAuditSnapshot,
+    reason: str,
+) -> Event:
+    return Event(
+        type=EventType.MCP_MANIFEST_CHECKED,
+        session_id=session.id,
+        agent_name=registered_agent.spec.name,
+        environment_name=environment_name,
+        payload={
+            "history_key": history_key,
+            "manifest_identity": snapshot.identity,
+            "manifest_hash": snapshot.manifest_hash,
+            "source_manifest_hash": snapshot.source_manifest_hash,
+            "server_hash": snapshot.server_hash,
+            "status": "not_evaluated",
+            "change_classes": [],
+            "outcome": "batch_blocked",
+            "reason": reason,
+        },
+    )
+
+
+def _mcp_manifest_event_payload(
+    *,
+    history_key: str,
+    snapshot: _McpManifestAuditSnapshot,
+    status: str,
+    previous: dict[str, Any] | None,
+    diff: dict[str, Any],
+    decision: McpManifestPolicyDecision | None,
+    outcome: str,
+) -> dict[str, Any]:
+    projected_diff = _bounded_mcp_manifest_diff(diff)
+    change_classes = []
+    if diff.get("server_changed") is True:
+        change_classes.append("server_changed")
+    for field, change_class in (
+        ("added_tools", "tools_added"),
+        ("removed_tools", "tools_removed"),
+        ("changed_tools", "tools_changed"),
+    ):
+        if isinstance(diff.get(field), list) and diff[field]:
+            change_classes.append(change_class)
+    payload: dict[str, Any] = {
+        "history_key": history_key,
+        "manifest_identity": snapshot.identity,
+        "manifest_hash": snapshot.manifest_hash,
+        "source_manifest_hash": snapshot.source_manifest_hash,
+        "server_hash": snapshot.server_hash,
+        "status": status,
+        "tool_count": snapshot.tool_count,
+        "advertised_tool_count": snapshot.advertised_tool_count,
+        "previous": previous,
+        "diff": projected_diff,
+        "change_classes": change_classes,
+        "outcome": outcome,
+    }
+    if decision is not None:
+        payload["policy"] = mcp_manifest_policy_payload(decision)
+    return payload
+
+
+def _bounded_mcp_manifest_diff(diff: Mapping[str, Any]) -> dict[str, Any]:
+    projected: dict[str, Any] = {
+        "server_changed": diff.get("server_changed") is True,
+    }
+    truncated = False
+    for field in ("added_tools", "removed_tools", "changed_tools"):
+        value = diff.get(field)
+        items = [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
+        projected[field] = items[:_MCP_MANIFEST_EVENT_TOOL_SAMPLE_LIMIT]
+        projected[f"{field}_count"] = len(items)
+        truncated = truncated or len(items) > _MCP_MANIFEST_EVENT_TOOL_SAMPLE_LIMIT
+    projected["truncated"] = truncated
+    return projected
+
+
+def _mcp_manifest_baseline(
+    *,
+    history_key: str,
+    snapshot: _McpManifestAuditSnapshot,
+    generation: int,
+    event: Event,
+) -> McpManifestBaseline:
+    return McpManifestBaseline(
+        history_key=history_key,
+        generation=generation,
+        manifest_identity=snapshot.identity,
+        manifest_hash=snapshot.manifest_hash,
+        source_manifest_hash=snapshot.source_manifest_hash,
+        server_hash=snapshot.server_hash,
+        tools=_durable_mcp_manifest_tools(snapshot),
+        exposed_tools=_durable_mcp_manifest_exposed_tools(snapshot),
+        accepted_session_ref=_mcp_manifest_session_ref(event.session_id),
+        accepted_event_id=event.id,
+        accepted_at=event.timestamp,
     )
 
 
@@ -2548,11 +3132,69 @@ def _mcp_manifest_tool_hashes(value: object) -> dict[str, str]:
         if not isinstance(item, Mapping):
             continue
         entry = cast("Mapping[str, object]", item)
-        cayu_name = entry.get("cayu_name")
-        tool_hash = entry.get("hash")
-        if isinstance(cayu_name, str) and isinstance(tool_hash, str):
-            result[cayu_name] = tool_hash
+        tool_id = entry.get("tool_id")
+        contract_hash = entry.get("contract_hash")
+        if isinstance(tool_id, str) and isinstance(contract_hash, str):
+            result[tool_id] = contract_hash
     return result
+
+
+def _durable_mcp_manifest_tools(
+    snapshot: _McpManifestAuditSnapshot,
+) -> tuple[dict[str, str], ...]:
+    """Project immutable manifest entries into bounded, non-identifying evidence."""
+
+    return _durable_mcp_manifest_source_tools(snapshot.tools)
+
+
+def _durable_mcp_manifest_source_tools(
+    tools: Iterable[Any],
+) -> tuple[dict[str, str], ...]:
+    projected: list[dict[str, str]] = []
+    for entry in tools:
+        projected.append(
+            {
+                "tool_id": _mcp_manifest_tool_identity(
+                    cayu_name=entry.cayu_name,
+                    mcp_name=entry.mcp_name,
+                ),
+                "contract_hash": entry.contract_hash,
+            }
+        )
+    projected.sort(key=lambda item: item["tool_id"])
+    return tuple(projected)
+
+
+def _durable_mcp_manifest_exposed_tools(
+    snapshot: _McpManifestAuditSnapshot,
+) -> tuple[dict[str, str], ...]:
+    return _durable_mcp_manifest_exposed_tool_evidence(snapshot.exposed_tools)
+
+
+def _durable_mcp_manifest_exposed_tool_evidence(
+    exposed_tools: Iterable[_McpManifestExposedToolEvidence],
+) -> tuple[dict[str, str], ...]:
+    return tuple(
+        {
+            "tool_id": entry.tool_id,
+            "contract_hash": entry.contract_hash,
+        }
+        for entry in exposed_tools
+    )
+
+
+def _mcp_manifest_tool_identity(*, cayu_name: str, mcp_name: str) -> str:
+    identity = json.dumps(
+        {
+            "schema": "cayu.mcp.audit_tool_identity.v1",
+            "cayu_name": cayu_name,
+            "mcp_name": mcp_name,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(identity).hexdigest()}"
 
 
 def _tool_effect(

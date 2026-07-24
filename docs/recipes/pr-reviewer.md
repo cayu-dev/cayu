@@ -168,6 +168,7 @@ vault = LocalEnvVault({"github_token": "GITHUB_TOKEN"})
 toolset = await connect_mcp_toolset(
     McpServerSpec(
         name="github",
+        connection_id="example/github-pr-reviewer/github",
         url="https://api.githubcopilot.com/mcp/",
         secret_headers={"Authorization": SecretRef(name="github_token")},
     ),

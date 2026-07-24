@@ -20,6 +20,10 @@ class McpServerSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str
+    # Stable, operator-assigned identity for this logical connection. Runtime
+    # admission requires it whenever this server's tools are exposed to a model;
+    # direct discovery/client use may leave it unset.
+    connection_id: str | None = None
     command: list[str] | None = None
     url: str | None = None
     env: dict[str, str] = Field(default_factory=dict)
@@ -51,9 +55,9 @@ class McpServerSpec(BaseModel):
     def validate_nonblank_name(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
 
-    @field_validator("url")
+    @field_validator("connection_id", "url")
     @classmethod
-    def validate_nonblank_url(cls, value: str | None, info) -> str | None:
+    def validate_optional_nonblank_strings(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
         return require_clean_nonblank(value, info.field_name)

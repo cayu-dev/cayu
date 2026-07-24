@@ -131,3 +131,27 @@ def test_revision_twenty_one_rejects_pre_billing_identity_readers() -> None:
         app_latest=21,
         app_min_supported=21,
     )
+
+
+def test_revision_twenty_two_rejects_workers_without_manifest_baselines() -> None:
+    state = m.SchemaState(revision=22, compatible_from=22)
+
+    with pytest.raises(m.SchemaTooNew, match="understands revision >= 22"):
+        m.validate(
+            state,
+            app_latest=21,
+            app_min_supported=21,
+        )
+
+    with pytest.raises(m.SchemaTooOld, match="requires >= 22"):
+        m.validate(
+            m.SchemaState(revision=21, compatible_from=21),
+            app_latest=22,
+            app_min_supported=22,
+        )
+
+    m.validate(
+        state,
+        app_latest=22,
+        app_min_supported=22,
+    )

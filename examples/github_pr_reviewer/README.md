@@ -76,9 +76,11 @@ layer, not the only tool model). You have two composable options:
 
 1. **A custom `Tool`** through the credential proxy — used here
    (`GetPRDiffTool` / `PostPRCommentTool`). Full control, zero extra infra.
-2. **The GitHub MCP server** via `McpServerSpec(url=..., secret_headers=...)` and
-   `connect_mcp_toolset` — zero custom tool code. See the recipe and the README's
-   "Streamable HTTP MCP" section.
+2. **The GitHub MCP server** via
+   `McpServerSpec(connection_id=..., url=..., secret_headers=...)` and
+   `connect_mcp_toolset` — zero custom tool code. See the recipe and the
+   README's "Streamable HTTP MCP" section. Keep `connection_id` stable and
+   namespace it to the application, tenant, and endpoint.
 
 `GetPRDiffTool` declares `ToolEffect.NONE` because its GitHub requests only read
 PR state. `PostPRCommentTool` remains `ToolEffect.EXTERNAL`: its per-session

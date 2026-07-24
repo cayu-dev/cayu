@@ -30,7 +30,11 @@ from cayu.runtime import (
     SessionStatus,
     TranscriptQuery,
 )
-from cayu.runtime.sessions import PendingActionKind, PendingActionQuery
+from cayu.runtime.sessions import (
+    PendingActionKind,
+    PendingActionQuery,
+    _McpManifestBaselineEvidenceInvalid,
+)
 
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
 
@@ -46,6 +50,7 @@ _TABLES = (
     "cayu_transcript_messages",
     "cayu_session_message_queue",
     "cayu_persisted_event_side_effects",
+    "cayu_mcp_manifest_baselines",
     "cayu_checkpoints",
     "cayu_session_operations",
     "cayu_tasks",
@@ -90,6 +95,35 @@ def _run(dsn: str, coro_factory) -> object:
 
 def test_postgres_pending_action_store_conformance(postgres_dsn: str) -> None:
     _run(postgres_dsn, assert_pending_action_store_conformance)
+
+
+def test_postgres_manifest_baseline_validation_redacts_corrupt_jsonb(postgres_dsn: str) -> None:
+    async def ops(store):
+        import psycopg
+
+        secret = "raw-secret-postgres-baseline"
+        history_key = "sha256:" + "1" * 64
+        await store.load_mcp_manifest_baselines(())
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO cayu_mcp_manifest_baselines (
+                        history_key, generation, baseline, updated_at
+                    )
+                    VALUES (%s, 1, jsonb_build_object('manifest_hash', %s::text), %s)
+                    """,
+                    (history_key, secret, datetime.now(UTC)),
+                )
+            await conn.commit()
+
+        with pytest.raises(_McpManifestBaselineEvidenceInvalid) as raised:
+            await store.load_mcp_manifest_baselines((history_key,))
+        assert str(raised.value) == "Stored MCP manifest baseline evidence is invalid."
+        assert raised.value.__cause__ is None
+        assert secret not in str(raised.value)
+
+    _run(postgres_dsn, ops)
 
 
 def test_postgres_session_store_queries_checkpoint_backed_pending_actions(postgres_dsn):

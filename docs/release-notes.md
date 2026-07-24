@@ -2,6 +2,38 @@
 
 ## v0.1.0 (unreleased)
 
+### MCP manifest drift keeps one durable accepted baseline
+
+MCP manifest authorization now keys history by a stable connection identity
+instead of by the changing tool-name set. Every later fingerprint is evaluated
+against the last accepted baseline, including after application reconstruction
+or session retention, and a blocked candidate cannot become model-visible or
+replace that baseline. Baseline comparison, decision-event publication, and
+accepted replacement are atomic across built-in stores, so concurrent
+reconnects cannot silently install competing versions.
+
+Authorization now binds that source manifest to the exact registered adapter
+exposure sent to the model. Subsets, aliases, and provider-facing contract
+changes participate in drift evaluation, while adapter execution remains bound
+to the original advertised MCP tool and session. Durable baselines retain
+separate bounded evidence for the advertised and exposed sets.
+
+`McpServerSpec.connection_id` provides the required stable
+application/tenant/endpoint namespace whenever MCP tools are exposed to a run.
+It remains optional for direct discovery/client use, but runtime admission fails
+closed when it is absent because a display name cannot safely identify a
+connection across applications or tenants. Manifest baselines and events persist
+only validated hashed identities, fingerprints, fixed-size opaque tool IDs,
+bounded change summaries, and policy outcomes. MCP-enabled custom stores without
+the new atomic history capability fail closed. After upgrading from revision 21,
+review each MCP connection and set an explicit `connection_id` to authorize its
+new first-seen namespace.
+
+SQLite and PostgreSQL deployments must run `cayu storage migrate` before
+deploying this change. Schema revision 22 is breaking because older workers do
+not maintain the accepted-baseline table and therefore cannot safely share a
+database with revision-22 workers.
+
 ### Read-only session inspection
 
 `cayu session` now provides bounded, backend-neutral `list`, `show`, `usage`,

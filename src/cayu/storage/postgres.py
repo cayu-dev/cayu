@@ -87,6 +87,9 @@ from cayu.runtime.sessions import (
     EventQuery,
     EventRecord,
     EventSummary,
+    McpManifestBaseline,
+    McpManifestBaselineLoadResult,
+    McpManifestPublicationResult,
     PendingActionIssue,
     PendingActionKind,
     PendingActionListResult,
@@ -127,13 +130,17 @@ from cayu.runtime.sessions import (
     _active_unexpired_session_operation_id,
     _assert_session_run_epoch,
     _assert_session_run_epoch_value,
+    _copy_mcp_manifest_publication,
     _copy_session_event_batch,
     _current_session_run_epoch,
     _deactivate_session_run_fence,
     _prepare_session_fork_request,
     _project_interruption_cascade_marker_fields,
     _queued_session_message_event_payload,
+    _stored_mcp_manifest_baseline,
     _validate_equivalent_queued_session_message,
+    _validate_mcp_manifest_history_keys,
+    _validate_mcp_manifest_publication_state,
     _validate_session_fork_source,
     _validate_status_set,
     copy_enqueue_session_message_request,
@@ -224,7 +231,7 @@ from cayu.storage.memory import (
 _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 _SCHEMA_ADVISORY_LOCK_POLL_SECONDS = 0.25
 _POSTGRES_MIN_REQUIRED_REVISION = 18
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 21
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 22
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="%s",
@@ -663,6 +670,16 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     21: (
         "ALTER TABLE IF EXISTS cayu_budget_reservations "
         "ADD COLUMN IF NOT EXISTS billing_identity JSONB",
+    ),
+    22: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_mcp_manifest_baselines (
+            history_key TEXT PRIMARY KEY,
+            generation BIGINT NOT NULL CHECK (generation >= 1),
+            baseline JSONB NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL
+        )
+        """,
     ),
 }
 
@@ -4105,6 +4122,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     """Postgres-backed session store for durable multi-tenant runtime state."""
 
     supports_usage_aggregates: ClassVar[bool] = True
+    supports_mcp_manifest_history: ClassVar[bool] = True
     _min_required_revision = _POSTGRES_SESSION_MIN_REQUIRED_REVISION
     _supports_read_only = True
 
@@ -4936,6 +4954,205 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 await conn.rollback()
                 existing = await self._first_existing_event_id(
                     session_id, [event.id for event in copied_events]
+                )
+                if existing is not None:
+                    raise ValueError(
+                        f"Event already exists for session {session_id}: {existing}"
+                    ) from exc
+                raise
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def load_mcp_manifest_baselines(
+        self,
+        history_keys: tuple[str, ...],
+    ) -> McpManifestBaselineLoadResult:
+        keys = _validate_mcp_manifest_history_keys(history_keys)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            rows = []
+            if keys:
+                await cur.execute(
+                    "SELECT history_key, generation, baseline "
+                    "FROM cayu_mcp_manifest_baselines "
+                    "WHERE history_key = ANY(%s)",
+                    (list(keys),),
+                )
+                rows = await cur.fetchall()
+        return McpManifestBaselineLoadResult(
+            baselines={
+                row[0]: _stored_mcp_manifest_baseline(row[0], row[1], row[2]) for row in rows
+            },
+        )
+
+    async def compare_and_publish_mcp_manifest_checks(
+        self,
+        session_id: str,
+        *,
+        expected_generations: dict[str, int | None],
+        baseline_updates: dict[str, McpManifestBaseline],
+        events: list[Event],
+    ) -> McpManifestPublicationResult:
+        from cayu.runtime.pending_actions import pending_action_event_storage_values
+
+        session_id, expected, updates, copied_events = _copy_mcp_manifest_publication(
+            session_id,
+            expected_generations=expected_generations,
+            baseline_updates=baseline_updates,
+            events=events,
+        )
+        await self._ensure_ready()
+        expected_run_epoch = _current_session_run_epoch(session_id)
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    # Missing rows need the same fence as existing rows. Locking
+                    # the stable keys first also gives multi-toolset batches one
+                    # deterministic lock order.
+                    for key in sorted(expected):
+                        await cur.execute(
+                            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                            (key,),
+                        )
+                    await cur.execute(
+                        "SELECT history_key, generation, baseline "
+                        "FROM cayu_mcp_manifest_baselines "
+                        "WHERE history_key = ANY(%s) FOR UPDATE",
+                        (list(expected),),
+                    )
+                    current = {
+                        row[0]: _stored_mcp_manifest_baseline(row[0], row[1], row[2])
+                        for row in await cur.fetchall()
+                    }
+                    if any(
+                        expected_generation
+                        != (None if (baseline := current.get(key)) is None else baseline.generation)
+                        for key, expected_generation in expected.items()
+                    ):
+                        await conn.rollback()
+                        return McpManifestPublicationResult(
+                            published=False,
+                            baselines=current,
+                        )
+
+                    _validate_mcp_manifest_publication_state(
+                        expected_generations=expected,
+                        current_baselines=current,
+                        baseline_updates=updates,
+                        events=copied_events,
+                    )
+                    activity_at = datetime.now(UTC)
+                    if expected_run_epoch is None:
+                        await cur.execute(
+                            """
+                            UPDATE cayu_sessions
+                            SET event_seq = event_seq + %s, last_activity_at = %s
+                            WHERE id = %s
+                            RETURNING event_seq
+                            """,
+                            (len(copied_events), activity_at, session_id),
+                        )
+                    else:
+                        await cur.execute(
+                            """
+                            UPDATE cayu_sessions
+                            SET event_seq = event_seq + %s, last_activity_at = %s
+                            WHERE id = %s AND run_epoch = %s
+                            RETURNING event_seq
+                            """,
+                            (
+                                len(copied_events),
+                                activity_at,
+                                session_id,
+                                expected_run_epoch,
+                            ),
+                        )
+                    order_row = await cur.fetchone()
+                    if order_row is None:
+                        if expected_run_epoch is not None:
+                            await _raise_session_write_conflict(
+                                cur,
+                                session_id,
+                                expected_run_epoch,
+                            )
+                        raise KeyError(f"Session not found: {session_id}")
+
+                    next_order = order_row[0] - len(copied_events)
+                    event_rows = []
+                    for event in copied_events:
+                        next_order += 1
+                        lookup_key, projection, projection_bytes = (
+                            pending_action_event_storage_values(event)
+                        )
+                        event_rows.append(
+                            (
+                                session_id,
+                                next_order,
+                                event.id,
+                                str(event.type),
+                                pg_support.to_utc(event.timestamp),
+                                event.agent_name,
+                                event.environment_name,
+                                event.workflow_name,
+                                event.tool_name,
+                                _dumps(event.payload),
+                                _dumps(event.model_dump(mode="json")),
+                                lookup_key,
+                                projection,
+                                projection_bytes,
+                            )
+                        )
+                    await cur.executemany(
+                        """
+                        INSERT INTO cayu_events (
+                            session_id, session_order, event_id, event_type, timestamp,
+                            agent_name, environment_name, workflow_name, tool_name,
+                            payload, event, pending_action_lookup_key,
+                            pending_action_projection, pending_action_projection_bytes
+                        )
+                        VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s, %s
+                        )
+                        """,
+                        event_rows,
+                    )
+                    await self._enqueue_persisted_event_side_effects(
+                        cur,
+                        session_id,
+                        [event.id for event in copied_events],
+                    )
+                    for key, baseline in updates.items():
+                        await cur.execute(
+                            """
+                            INSERT INTO cayu_mcp_manifest_baselines (
+                                history_key, generation, baseline, updated_at
+                            )
+                            VALUES (%s, %s, %s, %s)
+                            ON CONFLICT (history_key) DO UPDATE SET
+                                generation = EXCLUDED.generation,
+                                baseline = EXCLUDED.baseline,
+                                updated_at = EXCLUDED.updated_at
+                            """,
+                            (
+                                key,
+                                baseline.generation,
+                                _dumps(baseline.model_dump(mode="json")),
+                                activity_at,
+                            ),
+                        )
+                        current[key] = baseline.model_copy(deep=True)
+                await conn.commit()
+                return McpManifestPublicationResult(
+                    published=True,
+                    baselines=current,
+                )
+            except UniqueViolation as exc:
+                await conn.rollback()
+                existing = await self._first_existing_event_id(
+                    session_id,
+                    [event.id for event in copied_events],
                 )
                 if existing is not None:
                     raise ValueError(

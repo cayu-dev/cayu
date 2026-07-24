@@ -2357,6 +2357,13 @@ def test_framework_spec_models_reject_edge_whitespace_identity_fields():
         McpServerSpec(name=" local", command=["node", "server.js"])
 
     with pytest.raises(ValidationError, match="must not start or end with whitespace"):
+        McpServerSpec(
+            name="local",
+            connection_id=" tenant-a/local",
+            command=["node", "server.js"],
+        )
+
+    with pytest.raises(ValidationError, match="must not start or end with whitespace"):
         SecretRef(name=" OPENAI_API_KEY")
 
     with pytest.raises(ValidationError, match="must not start or end with whitespace"):
@@ -2368,6 +2375,9 @@ def test_framework_spec_models_reject_edge_whitespace_identity_fields():
 
 
 def test_mcp_server_rejects_blank_transport_values():
+    with pytest.raises(ValidationError, match="cannot be blank"):
+        McpServerSpec(name="local", connection_id=" ", command=["node"])
+
     with pytest.raises(ValidationError, match="cannot be blank"):
         McpServerSpec(name="local", command=["node", " "])
 

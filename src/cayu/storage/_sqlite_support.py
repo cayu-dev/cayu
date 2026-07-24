@@ -135,6 +135,13 @@ _BASELINE_DDL = """
         UNIQUE(session_id, event_id)
     );
 
+    CREATE TABLE IF NOT EXISTS cayu_mcp_manifest_baselines (
+        history_key TEXT PRIMARY KEY,
+        generation INTEGER NOT NULL CHECK (generation >= 1),
+        baseline_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS cayu_persisted_event_side_effects (
         session_id TEXT NOT NULL,
         event_id TEXT NOT NULL,
@@ -618,6 +625,15 @@ _MIGRATION_STEPS: dict[int, str] = {
 
     """,
     21: "",
+    22: """
+        CREATE TABLE IF NOT EXISTS cayu_mcp_manifest_baselines (
+            history_key TEXT PRIMARY KEY,
+            generation INTEGER NOT NULL CHECK (generation >= 1),
+            baseline_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no

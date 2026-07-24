@@ -2120,7 +2120,7 @@ def test_sqlite_budget_ledger_revision_21_adds_billing_identity_column(tmp_path)
     asyncio.run(create_current_schema())
     connection = sqlite3.connect(path)
     try:
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 21")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 21")
         connection.execute("ALTER TABLE cayu_budget_reservations DROP COLUMN billing_identity_json")
         connection.execute("PRAGMA user_version = 20")
         connection.commit()

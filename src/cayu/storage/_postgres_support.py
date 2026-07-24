@@ -127,6 +127,14 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS cayu_mcp_manifest_baselines (
+        history_key TEXT PRIMARY KEY,
+        generation BIGINT NOT NULL CHECK (generation >= 1),
+        baseline JSONB NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS cayu_session_message_queue (
         ordering_key BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         queue_id TEXT NOT NULL UNIQUE,

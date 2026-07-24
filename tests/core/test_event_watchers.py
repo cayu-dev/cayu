@@ -37,6 +37,7 @@ _POSTGRES_TABLES = (
     "cayu_transcript_messages",
     "cayu_session_message_queue",
     "cayu_persisted_event_side_effects",
+    "cayu_mcp_manifest_baselines",
     "cayu_checkpoints",
     "cayu_session_operations",
     "cayu_tasks",
