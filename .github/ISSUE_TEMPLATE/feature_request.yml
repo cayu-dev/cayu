@@ -1,12 +1,15 @@
-name: ✨ Feature request
-description: Propose a new capability or a change to an existing contract.
-labels: ["enhancement"]
+name: ✨ New feature
+description: Propose a genuinely new caller-visible capability.
+labels: ["New Feature", "Proposed"]
 body:
   - type: markdown
     attributes:
       value: |
         Before filing: search open and closed issues/PRs, and search the source — many
         requested capabilities already exist in-tree.
+
+        If the request makes existing behavior safer or more reliable under failure,
+        concurrency, or hostile input, use the **Hardening request** form instead.
 
         Proposing a **new third-party integration or backend adapter**? Read the
         [placement policy](https://github.com/cayu-dev/cayu/blob/main/CONTRIBUTING.md#placement-policy-what-lands-in-tree)

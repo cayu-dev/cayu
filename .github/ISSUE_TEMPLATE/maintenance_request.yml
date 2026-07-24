@@ -1,0 +1,44 @@
+name: 🧰 Maintenance request
+description: Improve architecture, verification, CI, documentation, examples, or releases.
+labels: ["Maintenance", "Proposed"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for work that improves how Cayu is built, verified, understood, or
+        released without introducing a new caller-visible capability.
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: What should be easier, clearer, faster, or more reliable after this work?
+    validations:
+      required: true
+  - type: textarea
+    id: reason
+    attributes:
+      label: Why now?
+      description: What current cost, ambiguity, or repeated failure makes this worth doing?
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and verification
+      description: What should change, what should remain unchanged, and how will completion be verified?
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Architecture / refactoring
+        - Tests / verification
+        - CI / developer tooling
+        - Documentation / examples
+        - Packaging / releases
+        - Repository / project hygiene
+        - Other
+    validations:
+      required: true

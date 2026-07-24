@@ -1,0 +1,60 @@
+name: 🛡️ Hardening request
+description: Make existing behavior safer or more reliable at a difficult boundary.
+labels: ["Hardening", "Proposed"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form when an existing capability needs stronger behavior under failure,
+        concurrency, recovery, or hostile input. If the documented behavior is already
+        broken in an ordinary use case, use the **Bug report** form instead.
+
+        **Security issue?** (policy bypass, sandbox escape, secret exposure, egress
+        bypass) — do **not** file or discuss it publicly. Use [private reporting](https://github.com/cayu-dev/cayu/security/advisories/new).
+  - type: textarea
+    id: boundary
+    attributes:
+      label: Boundary to harden
+      description: Which existing capability or contract needs stronger guarantees?
+    validations:
+      required: true
+  - type: textarea
+    id: failure
+    attributes:
+      label: Failure or adversarial case
+      description: >-
+        Describe the crash, race, partial failure, recovery path, or hostile input that
+        exposes the weakness. Include a minimal reproduction or failing test when possible.
+    validations:
+      required: true
+  - type: textarea
+    id: invariant
+    attributes:
+      label: Required invariant
+      description: What must always be true after this work, including after interruption or retry?
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification
+      description: How should the invariant be demonstrated and regression-tested?
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Runtime / sessions / durability
+        - Providers / models
+        - Runners / environments / workspaces
+        - Policies / approvals / budgets / taint
+        - Egress / secrets / vaults
+        - Artifacts / files
+        - Knowledge / memory
+        - Server / dashboard
+        - Evals
+        - Other
+    validations:
+      required: true

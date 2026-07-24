@@ -1,6 +1,6 @@
 name: 🐛 Bug report
 description: A crash, incorrect behavior, or data loss in Cayu.
-labels: ["bug"]
+labels: ["Bug", "Proposed"]
 body:
   - type: markdown
     attributes:

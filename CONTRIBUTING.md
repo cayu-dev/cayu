@@ -38,6 +38,33 @@ Our current maintainer priorities are:
   a competing one.
 - For larger work, comment on the issue first so the approach is agreed before you build.
 
+## Issue taxonomy
+
+Every open issue has exactly one **type**, one **state**, and one **priority**. Types
+describe what the work is; states describe whether the project has accepted and
+scheduled it.
+
+| Type | Meaning |
+| --- | --- |
+| `Bug` | A reproduced violation of an existing contract. |
+| `Hardening` | Makes existing behavior safer or more reliable under failure, concurrency, recovery, or hostile input. |
+| `New Feature` | Introduces a genuinely new caller-visible capability. |
+| `Maintenance` | Improves architecture, verification, CI, documentation, examples, releases, or repository health without adding a capability. |
+
+| State | Meaning |
+| --- | --- |
+| `Proposed` | Reported or suggested, but not yet accepted or scheduled. |
+| `Backlog` | Accepted work, but not selected for the upcoming queue. |
+| `Ready` | Selected upcoming work that is fully specified and unblocked. |
+| `In Progress` | Actively being implemented. |
+| `Blocked` | Selected work that cannot currently proceed. |
+
+Priorities are `P0` through `P3`. `P0` is a stop-the-line exception: do it above
+everything else. It should be rare, assigned deliberately, and removed as soon as the
+emergency is resolved. Priority does not replace state: a high-priority proposal is
+still `Proposed` until accepted, and a high-priority accepted issue is not `Ready`
+until it is sufficiently specified and selected for implementation.
+
 ## Placement policy: what lands in-tree
 
 Cayu's backend extension points — including model providers, runners, workspaces,

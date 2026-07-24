@@ -12,12 +12,10 @@ https://github.com/cayu-dev/cayu/security/advisories/new first. "Security harden
 below is for preventative changes that do not disclose a suspected vulnerability.
 -->
 
-- [ ] 🐛 Bug fix
-- [ ] ✨ Feature
-- [ ] 🔒 Security hardening
-- [ ] ♻️ Refactor (no behavior change)
-- [ ] 📝 Docs / examples
-- [ ] ✅ Tests only
+- [ ] 🐛 Bug
+- [ ] 🛡️ Hardening
+- [ ] ✨ New Feature
+- [ ] 🧰 Maintenance
 
 ## How to verify
 
@@ -31,8 +29,8 @@ below is for preventative changes that do not disclose a suspected vulnerability
 - [ ] The PR is one logical change (no unrelated commits or drive-by refactors)
 - [ ] `uv run pytest` passes locally
 - [ ] `uv run ruff check` + `uv run ruff format --check` + `uv run ty check` pass (see [CONTRIBUTING](https://github.com/cayu-dev/cayu/blob/main/CONTRIBUTING.md#lint-and-types) for paths)
-- [ ] Bug fix → includes a regression test that fails without the fix
-- [ ] Feature / contract change → docs updated (`README`, `docs/`, `docs/runtime-contracts.md`) — or N/A
+- [ ] Bug / hardening → includes a focused regression or adversarial test that fails without the change
+- [ ] New feature / contract change → docs updated (`README`, `docs/`, `docs/runtime-contracts.md`) — or N/A
 - [ ] Touches stores / runners / egress → ran the relevant Docker/Postgres test tier locally — or N/A
 - [ ] Touches the dashboard → ran its lint, test, typecheck, API-contract, and packaged-asset build checks — or N/A
 - [ ] New dependency → justified and constrained to Cayu's verified compatibility range — or N/A

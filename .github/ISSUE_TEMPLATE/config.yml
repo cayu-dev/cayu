@@ -1,6 +1,6 @@
-# Intentional: the forms are the default path, but blank issues stay enabled for
-# maintainer/meta issues that don't fit a bug-or-feature form. Revisit if low-quality
-# blank issues become a triage burden.
+# Intentional: the four typed forms are the default path, but blank issues stay enabled
+# for maintainer/meta issues that do not fit one cleanly. Revisit if low-quality blank
+# issues become a triage burden.
 blank_issues_enabled: true
 contact_links:
   - name: 💬 Discord
