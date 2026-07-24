@@ -542,9 +542,20 @@ def _build_tool_round_publication_request(
     )
     if len(transcript_messages) != 1:
         raise AssertionError("Tool-round transcript construction must return one message.")
+    interaction_ids = {
+        event.interaction_id
+        for event in evidence.lifecycle_events
+        if event.interaction_id is not None
+    }
+    if len(interaction_ids) > 1:
+        raise ValueError(
+            "Tool-round publication lifecycle evidence has conflicting interaction identities."
+        )
+    interaction_id = next(iter(interaction_ids), None)
     ordinary_request = RuntimePublicationRequest(
         publication_id=f"tool-round:{copied_pending_round.tool_round_id}",
         kind="tool-round",
+        interaction_id=interaction_id,
         intent={
             "schema_version": _TOOL_ROUND_PUBLICATION_SCHEMA_VERSION,
             "round_id": copied_pending_round.tool_round_id,
@@ -765,6 +776,7 @@ def _copy_publication_request(
     return RuntimePublicationRequest(
         publication_id=request.publication_id,
         kind=request.kind,
+        interaction_id=request.interaction_id,
         intent=request.intent,
         mutation=request.mutation,
         transcript_messages=request.transcript_messages,

@@ -213,6 +213,14 @@ from cayu.runtime.hooks import (
 from cayu.runtime.hooks import (
     _runtime_hook_event as _build_runtime_hook_event,
 )
+from cayu.runtime.interactions import (
+    INTERACTION_LIFECYCLE_EVENT_TYPES,
+    INTERACTION_SUMMARY_EVENT_TYPES,
+    INTERACTION_TERMINAL_EVENT_TYPES,
+    InteractionStatus,
+    InteractionSummaryEvidence,
+    interaction_usage_summary,
+)
 from cayu.runtime.loop_policies import (
     BeforeStopAction,
     BeforeStopContext,
@@ -236,9 +244,12 @@ from cayu.runtime.sessions import (
     CompactSessionRequest,
     EnqueueSessionMessageRequest,
     EnqueueSessionMessageResult,
+    EventOrder,
     EventQuery,
     ForkSessionRequest,
     IncompleteSessionRecoveryRequest,
+    IncompleteSessionRecoveryResult,
+    IncompleteSessionsRecoveryRequest,
     InterruptSessionRequest,
     ResumeRequest,
     RunRequest,
@@ -253,8 +264,21 @@ from cayu.runtime.sessions import (
     SessionStatus,
     SessionStatusConflict,
     SessionStore,
+    TranscriptQuery,
+    _activate_session_interaction,
+    _clear_session_interaction_recovered_active_through,
+    _current_session_interaction_id,
+    _current_session_interaction_recovered_active_through,
+    _current_session_interaction_started_at,
+    _current_session_invocation_interaction_ids,
+    _deactivate_session_interaction,
     _incomplete_recovery_claim_from_checkpoint,
+    _set_session_interaction_recovered_active_through,
+    attribute_event_to_current_interaction,
+    attribute_events_to_current_interaction,
     copy_compact_session_request,
+    copy_incomplete_session_recovery_request,
+    copy_incomplete_sessions_recovery_request,
     copy_resume_request,
     copy_run_request,
     runtime_publication_checkpoint_mutation,
@@ -292,6 +316,7 @@ from cayu.runtime.tool_policy import (
 from cayu.runtime.usage import (
     SessionUsageSummary,
     aggregate_usage_metrics_payload,
+    combine_session_usage_summaries,
     session_usage_summary,
     session_usage_summary_payload,
 )
@@ -1931,6 +1956,465 @@ class SessionEngine:
             retry_request=retry_request,
         )
 
+    async def recover_incomplete_session(
+        self,
+        request: IncompleteSessionRecoveryRequest,
+    ) -> IncompleteSessionRecoveryResult:
+        request = copy_incomplete_session_recovery_request(request)
+        interaction_id = await self._activate_latest_open_interaction(request.session_id)
+        active_through = (
+            None
+            if interaction_id is None
+            else await self._latest_interaction_activity_at(
+                request.session_id,
+                interaction_id,
+            )
+        )
+        if active_through is not None:
+            _set_session_interaction_recovered_active_through(
+                request.session_id,
+                active_through,
+            )
+        try:
+            result = await self._recovery_coordinator.recover_incomplete_session(request)
+            if interaction_id is not None:
+                _activate_session_interaction(request.session_id, interaction_id)
+            return await self._reconcile_recovered_interaction(
+                result,
+                recovered_active_through=active_through,
+            )
+        finally:
+            if interaction_id is not None:
+                _deactivate_session_interaction(request.session_id)
+
+    async def recover_incomplete_sessions(
+        self,
+        request: IncompleteSessionsRecoveryRequest,
+    ) -> list[IncompleteSessionRecoveryResult]:
+        request = copy_incomplete_sessions_recovery_request(request)
+        active_through_by_session: dict[str, datetime] = {}
+
+        async def activate_interaction(session_id: str) -> None:
+            interaction_id = await self._activate_latest_open_interaction(session_id)
+            if interaction_id is not None:
+                active_through_by_session[session_id] = await self._latest_interaction_activity_at(
+                    session_id,
+                    interaction_id,
+                )
+                _set_session_interaction_recovered_active_through(
+                    session_id,
+                    active_through_by_session[session_id],
+                )
+
+        async def deactivate_interaction(session_id: str) -> None:
+            _deactivate_session_interaction(session_id)
+
+        results = await self._recovery_coordinator.recover_incomplete_sessions(
+            request,
+            before_recovery=activate_interaction,
+            after_recovery=deactivate_interaction,
+        )
+        reconciled: list[IncompleteSessionRecoveryResult] = []
+        for result in results:
+            interaction_id = await self._activate_latest_open_interaction(result.session_id)
+            try:
+                reconciled.append(
+                    await self._reconcile_recovered_interaction(
+                        result,
+                        recovered_active_through=active_through_by_session.get(result.session_id),
+                    )
+                )
+            finally:
+                if interaction_id is not None:
+                    _deactivate_session_interaction(result.session_id)
+        return reconciled
+
+    async def _activate_latest_open_interaction(self, session_id: str) -> str | None:
+        records = await self.session_store.query_events(
+            EventQuery(
+                session_id=session_id,
+                event_types=INTERACTION_LIFECYCLE_EVENT_TYPES,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=1,
+            )
+        )
+        if not records or records[0].event.type in INTERACTION_TERMINAL_EVENT_TYPES:
+            return None
+        interaction_id = records[0].event.interaction_id
+        if interaction_id is None:
+            raise RuntimeError("Interaction lifecycle event has no interaction identity.")
+        _activate_session_interaction(session_id, interaction_id)
+        return interaction_id
+
+    async def _latest_interaction_activity_at(
+        self,
+        session_id: str,
+        interaction_id: str,
+    ) -> datetime:
+        records = await self.session_store.query_events(
+            EventQuery(
+                session_id=session_id,
+                interaction_id=interaction_id,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=1,
+            )
+        )
+        if not records:
+            raise RuntimeError(f"Interaction has no durable activity: {interaction_id}")
+        return records[0].event.timestamp
+
+    async def _reconcile_recovered_interaction(
+        self,
+        result: IncompleteSessionRecoveryResult,
+        *,
+        recovered_active_through: datetime | None,
+    ) -> IncompleteSessionRecoveryResult:
+        if _current_session_interaction_id(result.session_id) is None:
+            return result
+        session = await self.session_store.load(result.session_id)
+        if session is None:
+            return result
+        try:
+            registered_agent = self._get_registered_agent(session.agent_name)
+        except KeyError:
+            return result
+        registered_environment = self._get_registered_environment_for_session(
+            session.environment_name
+        )
+        event_type: EventType | None = None
+        status: InteractionStatus | None = None
+        pending_action_kind: str | None = None
+        if result.pending_approval_id is not None:
+            event_type = EventType.INTERACTION_PAUSED
+            status = InteractionStatus.PAUSED
+            pending_action_kind = "tool_approval"
+        elif result.pending_user_input_id is not None:
+            event_type = EventType.INTERACTION_PAUSED
+            status = InteractionStatus.PAUSED
+            pending_action_kind = "user_input"
+        elif result.status == SessionStatus.COMPLETED:
+            event_type = EventType.INTERACTION_COMPLETED
+            status = InteractionStatus.COMPLETED
+        elif result.status == SessionStatus.FAILED:
+            event_type = EventType.INTERACTION_FAILED
+            status = InteractionStatus.FAILED
+        elif result.status == SessionStatus.INTERRUPTED:
+            event_type = EventType.INTERACTION_INTERRUPTED
+            status = InteractionStatus.INTERRUPTED
+        if event_type is None or status is None:
+            return result
+        interaction_event = await self._emit_interaction_state(
+            session=session,
+            registered_agent=registered_agent,
+            environment_name=_environment_name(registered_environment),
+            event_type=event_type,
+            status=status,
+            pending_action_kind=pending_action_kind,
+            recovered_active_through=recovered_active_through,
+        )
+        if interaction_event is None:
+            return result
+        return result.model_copy(update={"events": (*result.events, interaction_event)})
+
+    async def _emit_interaction_started(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+    ) -> Event:
+        interaction_id = _current_session_interaction_id(session.id)
+        if interaction_id is None:
+            raise RuntimeError("Interaction identity is not active for the session.")
+        return await self._event_writer.emit(
+            self._interaction_started_event(
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                interaction_id=interaction_id,
+            )
+        )
+
+    def _interaction_started_event(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+        interaction_id: str,
+    ) -> Event:
+        return self._interaction_started_event_from_identity(
+            session_id=session.id,
+            agent_name=registered_agent.spec.name,
+            environment_name=environment_name,
+            interaction_id=interaction_id,
+        )
+
+    def _interaction_started_event_from_identity(
+        self,
+        *,
+        session_id: str,
+        agent_name: str,
+        environment_name: str | None,
+        interaction_id: str,
+    ) -> Event:
+        event_id = str(uuid4())
+        started_at = self._clock()
+        evidence = InteractionSummaryEvidence(
+            status=InteractionStatus.ACTIVE,
+            start_event_id=event_id,
+            started_at=started_at,
+        )
+        return Event(
+            id=event_id,
+            type=EventType.INTERACTION_STARTED,
+            session_id=session_id,
+            interaction_id=interaction_id,
+            timestamp=started_at,
+            agent_name=agent_name,
+            environment_name=environment_name,
+            payload=evidence.model_dump(mode="json"),
+        )
+
+    async def _emit_interaction_started_if_needed(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+    ) -> Event | None:
+        interaction_id = _current_session_interaction_id(session.id)
+        if interaction_id is None:
+            raise RuntimeError("Interaction identity is not active for the session.")
+        existing = await self.session_store.query_events(
+            EventQuery(
+                session_id=session.id,
+                interaction_id=interaction_id,
+                event_types=INTERACTION_LIFECYCLE_EVENT_TYPES,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=1,
+            )
+        )
+        if not existing:
+            return await self._emit_interaction_started(
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+            )
+        latest = existing[0]
+        if latest.event.type in INTERACTION_TERMINAL_EVENT_TYPES:
+            raise RuntimeError(f"Interaction is already terminal: {interaction_id}")
+        if latest.event.type in {EventType.INTERACTION_STARTED, EventType.INTERACTION_RESUMED}:
+            return None
+        return await self._emit_interaction_state(
+            session=session,
+            registered_agent=registered_agent,
+            environment_name=environment_name,
+            event_type=EventType.INTERACTION_RESUMED,
+            status=InteractionStatus.ACTIVE,
+        )
+
+    async def _emit_interaction_state(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+        event_type: EventType,
+        status: InteractionStatus,
+        pending_action_kind: str | None = None,
+        recovered_active_through: datetime | None = None,
+    ) -> Event | None:
+        interaction_id = _current_session_interaction_id(session.id)
+        if interaction_id is None:
+            raise RuntimeError("Interaction identity is not active for the session.")
+        start_records = await self.session_store.query_events(
+            EventQuery(
+                session_id=session.id,
+                interaction_id=interaction_id,
+                event_type=EventType.INTERACTION_STARTED,
+                order_by=EventOrder.SEQUENCE_ASC,
+                limit=1,
+            )
+        )
+        if not start_records:
+            raise RuntimeError(f"Interaction has no durable start: {interaction_id}")
+        latest_records = await self.session_store.query_events(
+            EventQuery(
+                session_id=session.id,
+                interaction_id=interaction_id,
+                event_types=INTERACTION_LIFECYCLE_EVENT_TYPES,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=1,
+            )
+        )
+        latest = latest_records[0]
+        if latest.event.type in INTERACTION_TERMINAL_EVENT_TYPES:
+            return None
+        start_record = start_records[0]
+        start_evidence = InteractionSummaryEvidence.model_validate(start_record.event.payload)
+        prior_evidence = InteractionSummaryEvidence.model_validate(latest.event.payload)
+        if (
+            event_type == EventType.INTERACTION_PAUSED
+            and latest.event.type == EventType.INTERACTION_PAUSED
+            and prior_evidence.pending_action_kind == pending_action_kind
+        ):
+            return None
+        usage_pages: list[SessionUsageSummary] = []
+        after_sequence: int | None = None
+        while True:
+            usage_records = await self.session_store.query_events(
+                EventQuery(
+                    session_id=session.id,
+                    interaction_id=interaction_id,
+                    event_types=INTERACTION_SUMMARY_EVENT_TYPES,
+                    after_sequence=after_sequence,
+                    order_by=EventOrder.SEQUENCE_ASC,
+                    limit=5000,
+                )
+            )
+            usage_pages.append(
+                interaction_usage_summary(
+                    session.id,
+                    [record.event for record in usage_records],
+                )
+            )
+            if len(usage_records) < 5000:
+                break
+            after_sequence = usage_records[-1].sequence
+        usage_summary = combine_session_usage_summaries(session.id, usage_pages)
+
+        async def transcript_range(role: MessageRole) -> tuple[int | None, int | None]:
+            first_page = await self.session_store.query_transcript(
+                TranscriptQuery(
+                    session_id=session.id,
+                    interaction_id=interaction_id,
+                    role=role,
+                    limit=1,
+                )
+            )
+            if not first_page.records:
+                return None, None
+            first = first_page.records[0].index
+            if first_page.total_records == 1:
+                return first, first
+            last_page = await self.session_store.query_transcript(
+                TranscriptQuery(
+                    session_id=session.id,
+                    interaction_id=interaction_id,
+                    role=role,
+                    offset=first_page.total_records - 1,
+                    limit=1,
+                )
+            )
+            if not last_page.records:
+                raise RuntimeError("Interaction transcript changed during summary projection.")
+            return first, last_page.records[0].index
+
+        source_start, source_end = await transcript_range(MessageRole.USER)
+        result_start, result_end = await transcript_range(MessageRole.ASSISTANT)
+        segment_started_at = _current_session_interaction_started_at(session.id)
+        observed_at = self._clock()
+        if recovered_active_through is None:
+            recovered_active_through = _current_session_interaction_recovered_active_through(
+                session.id
+            )
+        if recovered_active_through is not None:
+            if (
+                recovered_active_through.tzinfo is None
+                or recovered_active_through.utcoffset() is None
+            ):
+                raise ValueError("recovered_active_through must be timezone-aware.")
+            current_segment_ms = (
+                max(
+                    0,
+                    int(
+                        (
+                            min(recovered_active_through, observed_at) - latest.event.timestamp
+                        ).total_seconds()
+                        * 1000
+                    ),
+                )
+                if prior_evidence.status is InteractionStatus.ACTIVE
+                else 0
+            )
+        else:
+            current_segment_ms = (
+                0
+                if segment_started_at is None or event_type == EventType.INTERACTION_RESUMED
+                else max(0, int((time.monotonic() - segment_started_at) * 1000))
+            )
+        terminal = event_type in INTERACTION_TERMINAL_EVENT_TYPES
+        evidence = InteractionSummaryEvidence(
+            status=status,
+            start_event_id=start_record.event.id,
+            start_event_sequence=start_record.sequence,
+            source_transcript_start=source_start,
+            source_transcript_end=source_end,
+            result_transcript_start=result_start,
+            result_transcript_end=result_end,
+            started_at=start_evidence.started_at,
+            completed_at=observed_at if terminal else None,
+            active_duration_ms=prior_evidence.active_duration_ms + current_segment_ms,
+            wall_duration_ms=(
+                max(
+                    0,
+                    int((observed_at - start_evidence.started_at).total_seconds() * 1000),
+                )
+                if terminal
+                else None
+            ),
+            model_step_count=usage_summary.model_steps,
+            tool_call_count=usage_summary.tool_calls,
+            token_usage=usage_summary.usage,
+            provider_names=usage_summary.provider_names,
+            models=usage_summary.models,
+            pending_action_kind=pending_action_kind,
+        )
+        emitted = await self._event_writer.emit(
+            Event(
+                type=event_type,
+                session_id=session.id,
+                interaction_id=interaction_id,
+                timestamp=observed_at,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                payload=evidence.model_dump(mode="json"),
+            )
+        )
+        if event_type == EventType.INTERACTION_RESUMED:
+            _clear_session_interaction_recovered_active_through(session.id)
+        return emitted
+
+    async def _emit_interaction_completed(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+    ) -> Event | None:
+        return await self._emit_interaction_state(
+            session=session,
+            registered_agent=registered_agent,
+            environment_name=environment_name,
+            event_type=EventType.INTERACTION_COMPLETED,
+            status=InteractionStatus.COMPLETED,
+        )
+
+    async def resume_interaction(
+        self,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+    ) -> Event | None:
+        return await self._emit_interaction_state(
+            session=session,
+            registered_agent=registered_agent,
+            environment_name=_environment_name(registered_environment),
+            event_type=EventType.INTERACTION_RESUMED,
+            status=InteractionStatus.ACTIVE,
+        )
+
     async def run(self, request: RunRequest) -> AsyncGenerator[Event, None]:
         request = session_request_boundary.prepare_run_request(
             request,
@@ -1975,45 +2459,31 @@ class SessionEngine:
         if request.environment_name is None and registered_environment is not None:
             request = _with_environment_name(request, registered_environment.spec.name)
         workspace_instructions = None
-        if registered_environment is None or registered_environment.factory is None:
-            workspace_instructions = await self._environment_lifecycle.load_workspace_instructions(
-                registered_environment,
-            )
+        if request.session_id is None:
+            request = request.model_copy(update={"session_id": str(uuid4())})
+        session_id = request.session_id
+        if session_id is None:
+            raise AssertionError("Run request session identity was not assigned.")
+        interaction_id = str(uuid4())
+        interaction_started_event = self._interaction_started_event_from_identity(
+            session_id=session_id,
+            agent_name=registered_agent.spec.name,
+            environment_name=_environment_name(registered_environment),
+            interaction_id=interaction_id,
+        )
         session = await self.session_store.create(
             request,
             identity=_session_identity(
                 provider_name=registered_provider.name,
                 model=model,
             ),
+            interaction_started_event=interaction_started_event,
+            interaction_source_messages=request.messages,
         )
-        try:
-            session = await self.session_store.transition_status(
-                session.id,
-                from_statuses={SessionStatus.PENDING},
-                to_status=SessionStatus.RUNNING,
-            )
-        except ValueError:
-            loaded_session = await self.session_store.load(session.id)
-            if (
-                loaded_session is not None
-                and loaded_session.status in INTERRUPT_REQUESTED_SESSION_STATUSES
-            ):
-                async for event in self._handle_session_interrupted(
-                    session=loaded_session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    environment_name=_environment_name(registered_environment),
-                ):
-                    yield event
-                return
-            raise
+        _activate_session_interaction(session.id, interaction_id)
         current_task = asyncio.current_task()
         active_factory_run: ActiveSessionRun[SessionUsageTracker] | None = None
-        if (
-            registered_environment is not None
-            and registered_environment.factory is not None
-            and current_task is not None
-        ):
+        if current_task is not None:
             active_factory_run = self._session_control.register_active_task(
                 session.id,
                 current_task,
@@ -2026,7 +2496,11 @@ class SessionEngine:
         # and failures while recording the original setup failure.
         release_before_run = True
         pre_run_task_started = False
+        interaction_started = True
+        messages: list[Message] | None = None
         try:
+            await self._event_writer.fan_out_persisted([interaction_started_event])
+            yield interaction_started_event
             factory_started_event = await self._environment_lifecycle.emit_factory_started(
                 session=session,
                 registered_agent=registered_agent,
@@ -2077,6 +2551,7 @@ class SessionEngine:
                     resolution.error,
                     redactor=self._secret_redactor,
                 )
+                await self.session_store.materialize_deferred_interaction_input(session.id)
                 task_failure_event, task_failure_error = await self._fail_task_for_run_setup_error(
                     task_id=request.task_id,
                     task_worker_id=request.task_worker_id,
@@ -2087,6 +2562,15 @@ class SessionEngine:
                 )
                 if task_failure_event is not None:
                     yield task_failure_event
+                interaction_failed_event = await self._emit_interaction_state(
+                    session=session,
+                    registered_agent=registered_agent,
+                    environment_name=_environment_name(registered_environment),
+                    event_type=EventType.INTERACTION_FAILED,
+                    status=InteractionStatus.FAILED,
+                )
+                if interaction_failed_event is not None:
+                    yield interaction_failed_event
                 session = await self.session_store.update_status(session.id, SessionStatus.FAILED)
                 failure_payload = exception_failure_payload(
                     resolution.error,
@@ -2126,9 +2610,23 @@ class SessionEngine:
                         registered_environment,
                     )
                 )
+            messages = transcript_helpers.initial_messages(
+                system_prompt=render_initial_system_prompt(
+                    agent_system_prompt=registered_agent.spec.system_prompt,
+                    workspace_instructions=workspace_instructions,
+                ),
+                request_messages=request.messages,
+            )
+            await self.session_store.replace_initial_transcript_messages(
+                session.id,
+                request.messages,
+                messages,
+            )
             release_before_run = False
         except asyncio.CancelledError as cancellation:
             if await self._session_control.interrupt_requested(session.id):
+                if interaction_started:
+                    await self.session_store.materialize_deferred_interaction_input(session.id)
                 async for event in self._handle_session_interrupted(
                     session=session,
                     registered_agent=registered_agent,
@@ -2156,6 +2654,8 @@ class SessionEngine:
                 and persisted_session is not None
                 and persisted_session.status in _INTERRUPTIBLE_SESSION_STATUSES
             ):
+                if interaction_started:
+                    await self.session_store.materialize_deferred_interaction_input(session.id)
                 async for event in self._handle_session_interrupted(
                     session=persisted_session,
                     registered_agent=registered_agent,
@@ -2170,6 +2670,8 @@ class SessionEngine:
                 exc,
                 redactor=self._secret_redactor,
             )
+            if interaction_started:
+                await self.session_store.materialize_deferred_interaction_input(session.id)
             task_failure_event, task_failure_error = await self._fail_task_for_run_setup_error(
                 task_id=request.task_id,
                 task_worker_id=request.task_worker_id,
@@ -2180,6 +2682,16 @@ class SessionEngine:
             )
             if task_failure_event is not None:
                 yield task_failure_event
+            if interaction_started:
+                interaction_failed_event = await self._emit_interaction_state(
+                    session=session,
+                    registered_agent=registered_agent,
+                    environment_name=_environment_name(registered_environment),
+                    event_type=EventType.INTERACTION_FAILED,
+                    status=InteractionStatus.FAILED,
+                )
+                if interaction_failed_event is not None:
+                    yield interaction_failed_event
             session = await self.session_store.update_status(session.id, SessionStatus.FAILED)
             failure_payload = exception_failure_payload(
                 exc,
@@ -2211,7 +2723,19 @@ class SessionEngine:
         except GeneratorExit:
             # A consumer that closes the stream during factory-resolution yields would
             # otherwise strand the session RUNNING (this window is outside _run_session's
-            # own finalizer). Finalize before propagating the close.
+            # own finalizer). Make the interaction terminal before the session so a crash
+            # cannot leave an active interaction hidden behind a terminal session.
+            await self.session_store.materialize_deferred_interaction_input(session.id)
+            if _current_session_interaction_id(session.id) is not None:
+                current_session = await self.session_store.load(session.id)
+                if current_session is not None:
+                    await self._emit_interaction_state(
+                        session=current_session,
+                        registered_agent=registered_agent,
+                        environment_name=_environment_name(registered_environment),
+                        event_type=EventType.INTERACTION_INTERRUPTED,
+                        status=InteractionStatus.INTERRUPTED,
+                    )
             await self._recovery_coordinator.finalize_abandoned_session_by_id(session.id)
             raise
         finally:
@@ -2230,20 +2754,15 @@ class SessionEngine:
                         self._session_control.unregister_active_task(session.id, current_task)
 
         try:
-            messages = transcript_helpers.initial_messages(
-                system_prompt=render_initial_system_prompt(
-                    agent_system_prompt=registered_agent.spec.system_prompt,
-                    workspace_instructions=workspace_instructions,
-                ),
-                request_messages=request.messages,
-            )
+            if messages is None:
+                raise RuntimeError("Initial transcript was not finalized during setup.")
             session_stream = self._run_session(
                 session=session,
                 registered_agent=registered_agent,
                 registered_provider=registered_provider,
                 registered_environment=registered_environment,
                 messages=messages,
-                messages_to_append=messages,
+                messages_to_append=[],
                 max_steps=request.max_steps,
                 limits=request.limits,
                 budget_limits=request.budget_limits,
@@ -2488,11 +3007,30 @@ class SessionEngine:
         self,
         *,
         session_id: str,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
         messages: list[Message],
         include_on_idle: bool,
+        continue_active_interaction: bool = False,
     ) -> list[Event]:
         delivered_events: list[Event] = []
         eligible_through: int | None = None
+        if continue_active_interaction:
+            delivery_interaction_id = _current_session_interaction_id(session_id)
+            if delivery_interaction_id is None:
+                raise RuntimeError("Queued input has no active interaction to continue.")
+            interaction_started = True
+            interaction_started_event = None
+        else:
+            delivery_interaction_id = str(uuid4())
+            interaction_started = False
+            interaction_started_event = self._interaction_started_event(
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                interaction_id=delivery_interaction_id,
+            )
         while True:
             try:
                 batch: SessionMessageDeliveryBatch = (
@@ -2500,6 +3038,10 @@ class SessionEngine:
                         session_id,
                         include_on_idle=include_on_idle,
                         eligible_through=eligible_through,
+                        interaction_id=delivery_interaction_id,
+                        interaction_started_event=(
+                            None if interaction_started else interaction_started_event
+                        ),
                     )
                 )
             except SessionStatusConflict:
@@ -2517,9 +3059,19 @@ class SessionEngine:
                 Message.text(MessageRole.USER, queued_message.content)
                 for queued_message in batch.messages
             )
+            if batch.messages and not continue_active_interaction:
+                _activate_session_interaction(session_id, delivery_interaction_id)
             if batch.events:
                 await self._event_writer.fan_out_persisted(list(batch.events))
                 delivered_events.extend(batch.events)
+            if batch.messages and not interaction_started:
+                if interaction_started_event is None:
+                    raise RuntimeError("Queued interaction start event was not prepared.")
+                if not any(event.id == interaction_started_event.id for event in batch.events):
+                    raise RuntimeError(
+                        "Queued message delivery did not atomically persist interaction start."
+                    )
+                interaction_started = True
             if not batch.has_more:
                 return delivered_events
 
@@ -2933,6 +3485,7 @@ class SessionEngine:
                 operation_records=archived_records,
             )
 
+        started_event = attribute_event_to_current_interaction(started_event)
         replay_event_ids: tuple[str, ...] | None = None
 
         def require_unexpired_initial_claim_commit() -> None:
@@ -4092,15 +4645,17 @@ class SessionEngine:
                 },
             )
             published_events = self._event_writer.prepare_many(
-                [
-                    *attempt_events,
-                    *[
-                        event
-                        for event in telemetry_events
-                        if event.type != EventType.MODEL_COMPLETED
-                    ],
-                    checkpoint_event,
-                ]
+                attribute_events_to_current_interaction(
+                    [
+                        *attempt_events,
+                        *[
+                            event
+                            for event in telemetry_events
+                            if event.type != EventType.MODEL_COMPLETED
+                        ],
+                        checkpoint_event,
+                    ]
+                )
             )
             event_ids = [started_event.id, *[event.id for event in published_events]]
             try:
@@ -4676,7 +5231,9 @@ class SessionEngine:
                     event for event in attempt_events if event.id not in persisted_attempt_event_ids
                 ]
                 failed_events = self._event_writer.prepare_many(
-                    [*unpublished_attempt_events, failed_event]
+                    attribute_events_to_current_interaction(
+                        [*unpublished_attempt_events, failed_event]
+                    )
                 )
                 failed_terminal_claim_expires_at: datetime | None = None
 
@@ -4894,6 +5451,9 @@ class SessionEngine:
         if step < max_steps:
             return True, await self._deliver_queued_session_messages(
                 session_id=session.id,
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
                 messages=messages,
                 include_on_idle=True,
             )
@@ -5380,7 +5940,7 @@ class SessionEngine:
     ) -> None:
         if not events:
             return
-        events[:] = self._event_writer.prepare_many(events)
+        events[:] = self._event_writer.prepare_many(attribute_events_to_current_interaction(events))
         event_inventory.update((event.id, event.model_copy(deep=True)) for event in events)
         publication_claim_expires_at: datetime | None = None
         renewed_claim_expires_at: datetime | None = None
@@ -6146,15 +6706,78 @@ class SessionEngine:
         # concurrent checkpoint update cannot bypass the guard.
         checkpoint = await self.session_store.load_checkpoint(loaded_session.id)
         reject_unresumable_checkpoint(loaded_session, checkpoint)
-        await self._recovery_coordinator.preflight_model_completion_boundary(loaded_session)
-
-        session = await self.session_store.transition_status_and_checkpoint(
-            loaded_session.id,
-            from_statuses=_RESUMABLE_SESSION_STATUSES,
-            to_status=SessionStatus.RUNNING,
-            checkpoint_transform=reject_unresumable_checkpoint,
+        pending_model_completion = (
+            await self._recovery_coordinator.preflight_model_completion_boundary(loaded_session)
         )
+
+        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        continuing_recovery_boundary = pending_round is not None or pending_model_completion
+        legacy_pending_round = False
+        existing_deferred_input = await self.session_store.load_deferred_interaction_input(
+            loaded_session.id
+        )
+        if continuing_recovery_boundary:
+            interaction_id = await self._activate_latest_open_interaction(loaded_session.id)
+            if interaction_id is None:
+                legacy_pending_round = True
+            interaction_started_event = None
+        else:
+            interaction_id = str(uuid4())
+            interaction_started_event = self._interaction_started_event(
+                session=loaded_session,
+                registered_agent=registered_agent,
+                environment_name=_environment_name(registered_environment),
+                interaction_id=interaction_id,
+            )
+        if existing_deferred_input is not None:
+            if legacy_pending_round:
+                raise RuntimeError(
+                    "Session has deferred interaction input without an open interaction."
+                )
+            if existing_deferred_input.interaction_id != interaction_id:
+                if continuing_recovery_boundary:
+                    _deactivate_session_interaction(loaded_session.id)
+                raise RuntimeError("Deferred interaction input belongs to another interaction.")
+        interaction_source_messages = [
+            *(
+                existing_deferred_input.source_messages
+                if existing_deferred_input is not None
+                else []
+            ),
+            *request.messages,
+        ]
         try:
+            session = await self.session_store.transition_status_and_checkpoint(
+                loaded_session.id,
+                from_statuses=_RESUMABLE_SESSION_STATUSES,
+                to_status=SessionStatus.RUNNING,
+                checkpoint_transform=reject_unresumable_checkpoint,
+                interaction_started_event=interaction_started_event,
+                interaction_source_messages=(
+                    None if legacy_pending_round else interaction_source_messages
+                ),
+                continued_interaction_id=(
+                    interaction_id
+                    if continuing_recovery_boundary and not legacy_pending_round
+                    else None
+                ),
+                defer_interaction_source=(
+                    continuing_recovery_boundary and not legacy_pending_round
+                ),
+            )
+        except BaseException:
+            if continuing_recovery_boundary and not legacy_pending_round:
+                _deactivate_session_interaction(loaded_session.id)
+            raise
+        if not continuing_recovery_boundary:
+            if interaction_id is None:
+                raise RuntimeError("New interaction admission produced no interaction identity.")
+            _activate_session_interaction(session.id, interaction_id)
+        interaction_active = not legacy_pending_round
+        try:
+            if interaction_started_event is not None:
+                await self._event_writer.fan_out_persisted([interaction_started_event])
+                yield interaction_started_event
             model_boundary = await self._recovery_coordinator.reconcile_model_completion_boundary(
                 session
             )
@@ -6191,6 +6814,18 @@ class SessionEngine:
             raise
         except Exception as exc:
             try:
+                if continuing_recovery_boundary and not legacy_pending_round:
+                    await self.session_store.materialize_deferred_interaction_input(session.id)
+                if interaction_active:
+                    interaction_failed_event = await self._emit_interaction_state(
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=_environment_name(registered_environment),
+                        event_type=EventType.INTERACTION_FAILED,
+                        status=InteractionStatus.FAILED,
+                    )
+                    if interaction_failed_event is not None:
+                        yield interaction_failed_event
                 await self.session_store.update_status(session.id, SessionStatus.FAILED)
                 yield await self._event_writer.emit(
                     Event(
@@ -6210,7 +6845,14 @@ class SessionEngine:
         except BaseException:
             await self.session_store.release_run_fence(session.id)
             raise
-        messages = transcript + request.messages
+        reconciled_pending_round = model_boundary.pending_tool_round or pending_round
+        messages = (
+            transcript + interaction_source_messages
+            if continuing_recovery_boundary and not legacy_pending_round
+            else transcript + request.messages
+            if legacy_pending_round
+            else transcript
+        )
 
         session_stream = self._run_session(
             session=session,
@@ -6218,7 +6860,11 @@ class SessionEngine:
             registered_provider=registered_provider,
             registered_environment=registered_environment,
             messages=messages,
-            messages_to_append=request.messages,
+            messages_to_append=(
+                interaction_source_messages
+                if continuing_recovery_boundary and not legacy_pending_round
+                else request.messages
+            ),
             max_steps=request.max_steps,
             limits=request.limits,
             budget_limits=request.budget_limits,
@@ -6236,6 +6882,17 @@ class SessionEngine:
                 **copy_json_value(start_event_payload_extra, "start_event_payload_extra"),
             },
             start_task_on_enter=start_task_on_enter,
+            messages_already_persisted=not continuing_recovery_boundary,
+            messages_deferred=continuing_recovery_boundary and not legacy_pending_round,
+            deliver_queued_input_before_first_step=(
+                not continuing_recovery_boundary or legacy_pending_round
+            ),
+            admit_interaction_after_recovery=legacy_pending_round,
+            pending_tool_round_source_transcript_cursor=(
+                None
+                if reconciled_pending_round is None
+                else reconciled_pending_round.source_transcript_cursor
+            ),
         )
         try:
             if model_boundary.state == "promoted" and model_boundary.completion_event is not None:
@@ -6602,6 +7259,7 @@ class SessionEngine:
         runtime_publication = RuntimePublicationRequest(
             publication_id=publication.dispatch.logical_step_id,
             kind="model-step",
+            interaction_id=publication.completion_event.interaction_id,
             intent=publication.dispatch.intent,
             mutation=runtime_publication_checkpoint_mutation(
                 source_checkpoint,
@@ -6693,6 +7351,11 @@ class SessionEngine:
         start_event_payload: dict[str, Any],
         start_task_on_enter: bool = True,
         release_run_fence_on_exit: bool = True,
+        messages_already_persisted: bool = False,
+        messages_deferred: bool = False,
+        deliver_queued_input_before_first_step: bool = True,
+        admit_interaction_after_recovery: bool = False,
+        pending_tool_round_source_transcript_cursor: int | None = None,
     ) -> AsyncGenerator[Event, None]:
         # Deep defense for internal recovery callers. Public entry points
         # validate before claiming mutable session ownership.
@@ -6701,6 +7364,37 @@ class SessionEngine:
             redactor=self._secret_redactor,
             field_name="structured_output",
         )
+        if messages_already_persisted and messages_deferred:
+            raise ValueError(
+                "messages_already_persisted and messages_deferred are mutually exclusive."
+            )
+        if admit_interaction_after_recovery and (messages_already_persisted or messages_deferred):
+            raise ValueError(
+                "admit_interaction_after_recovery requires unpersisted, nondeferred messages."
+            )
+
+        async def materialize_deferred_messages() -> None:
+            nonlocal messages_deferred
+            if not messages_deferred:
+                return
+            await self.session_store.materialize_deferred_interaction_input(session.id)
+            messages_deferred = False
+
+        async def materialize_deferred_messages_after_failure() -> None:
+            if not messages_deferred:
+                return
+            checkpoint = await self.session_store.load_checkpoint(session.id)
+            if (
+                tool_round_recovery.pending_tool_round_from_checkpoint(
+                    checkpoint,
+                    redactor=self._secret_redactor,
+                    consume_on_rejection=True,
+                )
+                is not None
+            ):
+                return
+            await materialize_deferred_messages()
+
         provider = registered_provider.provider
         messages = [
             redact_message_for_boundary(
@@ -6877,6 +7571,14 @@ class SessionEngine:
             ):
                 yield event
             if start_event_type is not None:
+                if not admit_interaction_after_recovery:
+                    interaction_started_event = await self._emit_interaction_started_if_needed(
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                    )
+                    if interaction_started_event is not None:
+                        yield interaction_started_event
                 yield await self._event_writer.emit(
                     Event(
                         type=start_event_type,
@@ -6891,12 +7593,20 @@ class SessionEngine:
                 )
             recovered_structured_outcome: Event | None = None
             recovered_structured_retry = False
+            recovery_tail_message_count = len(messages_to_append)
+            if pending_tool_round_source_transcript_cursor is not None:
+                pending_result_cursor = pending_tool_round_source_transcript_cursor + 1
+                if pending_result_cursor > len(messages):
+                    raise RuntimeError(
+                        "Pending tool round transcript cursor exceeds the resume context."
+                    )
+                recovery_tail_message_count = len(messages) - pending_result_cursor
             async for event in self._recovery_coordinator.recover_pending_tool_round(
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 messages=messages,
-                tail_message_count=len(messages_to_append),
+                tail_message_count=recovery_tail_message_count,
             ):
                 if event.type in {
                     EventType.STRUCTURED_OUTPUT_VALIDATED,
@@ -6927,6 +7637,23 @@ class SessionEngine:
                 raise RuntimeError(
                     f"Structured output validation failed after {recovered_attempt} attempt(s)."
                 )
+            if admit_interaction_after_recovery:
+                interaction_id = str(uuid4())
+                interaction_started_event = self._interaction_started_event(
+                    session=session,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    interaction_id=interaction_id,
+                )
+                await self.session_store.admit_interaction(
+                    session.id,
+                    started_event=interaction_started_event,
+                    source_messages=messages_to_append,
+                )
+                _activate_session_interaction(session.id, interaction_id)
+                await self._event_writer.fan_out_persisted([interaction_started_event])
+                yield interaction_started_event
+                messages_already_persisted = True
             # Typed backstop for a missed entrance: every entry point already
             # preflights this before touching persisted state. Here the session
             # is running, so a raise fails it cleanly instead of preventing it.
@@ -6936,10 +7663,13 @@ class SessionEngine:
             task_start_event = await start_linked_task_if_needed()
             if task_start_event is not None:
                 yield task_start_event
-            await self.session_store.append_transcript_messages(
-                session.id,
-                messages_to_append,
-            )
+            if messages_deferred:
+                await materialize_deferred_messages()
+            elif not messages_already_persisted:
+                await self.session_store.append_transcript_messages(
+                    session.id,
+                    messages_to_append,
+                )
             skip_model_steps = False
             if (
                 recovered_structured_outcome is not None
@@ -7057,12 +7787,17 @@ class SessionEngine:
             for step in model_steps:
                 model_step_identity = new_model_step_identity()
                 await self._session_control.raise_if_interrupted(session.id)
-                for event in await self._deliver_queued_session_messages(
-                    session_id=session.id,
-                    messages=messages,
-                    include_on_idle=False,
-                ):
-                    yield event
+                if step == 1 and deliver_queued_input_before_first_step:
+                    for event in await self._deliver_queued_session_messages(
+                        session_id=session.id,
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        messages=messages,
+                        include_on_idle=False,
+                        continue_active_interaction=True,
+                    ):
+                        yield event
                 budget_evaluation = await limit_gate.evaluate_budget(
                     self._get_budget_policy(),
                     execution_identity=model_step_identity,
@@ -7410,6 +8145,13 @@ class SessionEngine:
                             session.id,
                             validation.output,
                         )
+                        interaction_completed_event = await self._emit_interaction_completed(
+                            session=session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                        )
+                        if interaction_completed_event is not None:
+                            yield interaction_completed_event
                         try:
                             session = await self._complete_session_if_no_queued_messages(session.id)
                         except SessionQueuedMessagesPending:
@@ -7491,6 +8233,15 @@ class SessionEngine:
                                         redactor=self._secret_redactor,
                                     )
                                 )
+                                interaction_completed_event = (
+                                    await self._emit_interaction_completed(
+                                        session=session,
+                                        registered_agent=registered_agent,
+                                        environment_name=environment_name,
+                                    )
+                                )
+                                if interaction_completed_event is not None:
+                                    yield interaction_completed_event
                                 try:
                                     session = await self._complete_session_if_no_queued_messages(
                                         session.id
@@ -7615,7 +8366,7 @@ class SessionEngine:
                                 session.id,
                                 SessionStatus.INTERRUPTED,
                             )
-                            yield await self._emit_turn_completed_once(
+                            for event in await self._emit_turn_completed_once(
                                 session=session,
                                 registered_agent=registered_agent,
                                 environment_name=environment_name,
@@ -7623,7 +8374,8 @@ class SessionEngine:
                                 run_started_at=run_started_at,
                                 usage_tracker=turn_usage_tracker,
                                 active_run=active_run,
-                            )
+                            ):
+                                yield event
                             async for event in self._emit_terminal_event_with_hooks(
                                 event=Event(
                                     type=EventType.SESSION_INTERRUPTED,
@@ -7652,6 +8404,13 @@ class SessionEngine:
                             raise RuntimeError(
                                 f"Before-stop policy failed session: {before_stop_decision.reason}"
                             )
+                    interaction_completed_event = await self._emit_interaction_completed(
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                    )
+                    if interaction_completed_event is not None:
+                        yield interaction_completed_event
                     try:
                         session = await self._complete_session_if_no_queued_messages(session.id)
                     except SessionQueuedMessagesPending:
@@ -7725,7 +8484,7 @@ class SessionEngine:
                         registered_environment=registered_environment,
                     )
                 )
-            yield await self._emit_turn_completed_once(
+            for event in await self._emit_turn_completed_once(
                 session=session,
                 registered_agent=registered_agent,
                 environment_name=environment_name,
@@ -7733,7 +8492,8 @@ class SessionEngine:
                 run_started_at=run_started_at,
                 usage_tracker=turn_usage_tracker,
                 active_run=active_run,
-            )
+            ):
+                yield event
             async for event in self._emit_terminal_event_with_hooks(
                 event=Event(
                     type=EventType.SESSION_COMPLETED,
@@ -7748,8 +8508,9 @@ class SessionEngine:
             ):
                 yield event
         except ToolApprovalRequired as exc:
+            await materialize_deferred_messages_after_failure()
             session = await self.session_store.update_status(session.id, SessionStatus.INTERRUPTED)
-            yield await self._emit_turn_completed_once(
+            for event in await self._emit_turn_completed_once(
                 session=session,
                 registered_agent=registered_agent,
                 environment_name=environment_name,
@@ -7757,7 +8518,8 @@ class SessionEngine:
                 run_started_at=run_started_at,
                 usage_tracker=turn_usage_tracker,
                 active_run=active_run,
-            )
+            ):
+                yield event
             async for event in self._emit_terminal_event_with_hooks(
                 event=Event(
                     type=EventType.SESSION_INTERRUPTED,
@@ -7779,8 +8541,9 @@ class SessionEngine:
             ):
                 yield event
         except UserInputRequired as exc:
+            await materialize_deferred_messages_after_failure()
             session = await self.session_store.update_status(session.id, SessionStatus.INTERRUPTED)
-            yield await self._emit_turn_completed_once(
+            for event in await self._emit_turn_completed_once(
                 session=session,
                 registered_agent=registered_agent,
                 environment_name=environment_name,
@@ -7788,7 +8551,8 @@ class SessionEngine:
                 run_started_at=run_started_at,
                 usage_tracker=turn_usage_tracker,
                 active_run=active_run,
-            )
+            ):
+                yield event
             async for event in self._emit_terminal_event_with_hooks(
                 event=Event(
                     type=EventType.SESSION_INTERRUPTED,
@@ -7810,6 +8574,7 @@ class SessionEngine:
             ):
                 yield event
         except SessionInterruptedByRequest:
+            await materialize_deferred_messages_after_failure()
             interruption_events: list[Event] = []
             if close_new_pending_round_on_interrupt:
                 async for event in self._close_durable_pending_tool_round_after_interrupt(
@@ -7838,6 +8603,7 @@ class SessionEngine:
                 raise
             if await self._session_control.interrupt_requested(session.id):
                 clear_current_task_cancellation()
+                await materialize_deferred_messages_after_failure()
                 interruption_events = []
                 if close_new_pending_round_on_interrupt:
                     async for event in self._close_durable_pending_tool_round_after_interrupt(
@@ -7900,6 +8666,7 @@ class SessionEngine:
             # stranding it in RUNNING; an async generator must not yield while
             # handling GeneratorExit, so the terminal emission is drained, not
             # streamed.
+            await materialize_deferred_messages_after_failure()
             await self._recovery_coordinator.finalize_abandoned_session_run(
                 RecoveryAbandonedSessionRequest(
                     session=session,
@@ -7917,6 +8684,7 @@ class SessionEngine:
                 exc,
                 redactor=self._secret_redactor,
             )
+            await materialize_deferred_messages_after_failure()
             task_failure_error: Exception | None = None
             if (
                 not task_started
@@ -7973,7 +8741,7 @@ class SessionEngine:
                         redactor=self._secret_redactor,
                     )
                 )
-            yield await self._emit_turn_completed_once(
+            for event in await self._emit_turn_completed_once(
                 session=session,
                 registered_agent=registered_agent,
                 environment_name=environment_name,
@@ -7981,7 +8749,8 @@ class SessionEngine:
                 run_started_at=run_started_at,
                 usage_tracker=turn_usage_tracker,
                 active_run=active_run,
-            )
+            ):
+                yield event
             async for event in self._emit_terminal_event_with_hooks(
                 event=Event(
                     type=EventType.SESSION_FAILED,
@@ -8020,14 +8789,44 @@ class SessionEngine:
         status: SessionStatus,
         run_started_at: float,
         usage_tracker: SessionUsageTracker,
-    ) -> Event:
+    ) -> tuple[Event, ...]:
+        interaction_event: Event | None = None
+        interaction_id = _current_session_interaction_id(session.id)
+        if interaction_id is not None and status != SessionStatus.COMPLETED:
+            checkpoint = await self.session_store.load_checkpoint(session.id)
+            pending_action_kind: str | None = None
+            if approval_support.pending_approval_from_checkpoint(checkpoint) is not None:
+                pending_action_kind = "tool_approval"
+            elif pending_user_input_from_checkpoint(checkpoint) is not None:
+                pending_action_kind = "user_input"
+            elif tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint) is not None:
+                pending_action_kind = "tool_recovery"
+            if pending_action_kind is not None:
+                interaction_event_type = EventType.INTERACTION_PAUSED
+                interaction_status = InteractionStatus.PAUSED
+            elif status == SessionStatus.FAILED:
+                interaction_event_type = EventType.INTERACTION_FAILED
+                interaction_status = InteractionStatus.FAILED
+            else:
+                interaction_event_type = EventType.INTERACTION_INTERRUPTED
+                interaction_status = InteractionStatus.INTERRUPTED
+            interaction_event = await self._emit_interaction_state(
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                event_type=interaction_event_type,
+                status=interaction_status,
+                pending_action_kind=pending_action_kind,
+            )
         usage_events = await usage_tracker.usage_events()
         summary = session_usage_summary(session.id, usage_events)
         duration_ms = max(0, int((time.monotonic() - run_started_at) * 1000))
-        return await self._event_writer.emit(
+        interaction_ids = _current_session_invocation_interaction_ids(session.id)
+        turn_completed_event = await self._event_writer.emit(
             Event(
                 type=EventType.TURN_COMPLETED,
                 session_id=session.id,
+                interaction_id=None,
                 agent_name=registered_agent.spec.name,
                 environment_name=environment_name,
                 payload={
@@ -8038,9 +8837,13 @@ class SessionEngine:
                     "token_usage": aggregate_usage_metrics_payload(summary.usage),
                     "provider_names": summary.provider_names,
                     "models": summary.models,
+                    "interaction_ids": list(interaction_ids),
                 },
             )
         )
+        if interaction_event is None:
+            return (turn_completed_event,)
+        return (interaction_event, turn_completed_event)
 
     async def _emit_turn_completed_once(
         self,
@@ -8052,7 +8855,7 @@ class SessionEngine:
         run_started_at: float,
         usage_tracker: SessionUsageTracker,
         active_run: ActiveSessionRun[SessionUsageTracker] | None,
-    ) -> Event:
+    ) -> tuple[Event, ...]:
         if active_run is None:
             return await self._emit_turn_completed(
                 session=session,
@@ -8064,8 +8867,8 @@ class SessionEngine:
             )
         async with active_run.turn_completed_lock:
             if active_run.turn_completed_event is not None:
-                return active_run.turn_completed_event
-            event = await self._emit_turn_completed(
+                return (active_run.turn_completed_event,)
+            events = await self._emit_turn_completed(
                 session=session,
                 registered_agent=registered_agent,
                 environment_name=environment_name,
@@ -8073,8 +8876,8 @@ class SessionEngine:
                 run_started_at=run_started_at,
                 usage_tracker=usage_tracker,
             )
-            active_run.turn_completed_event = event
-            return event
+            active_run.turn_completed_event = events[-1]
+            return events
 
     async def _emit_active_turn_completed_if_needed(
         self,
@@ -8089,7 +8892,7 @@ class SessionEngine:
                 or active_run.turn_usage_tracker is None
             ):
                 continue
-            return await self._emit_turn_completed_once(
+            events = await self._emit_turn_completed_once(
                 session=session,
                 registered_agent=active_run.turn_registered_agent,
                 environment_name=active_run.turn_environment_name,
@@ -8098,6 +8901,7 @@ class SessionEngine:
                 usage_tracker=active_run.turn_usage_tracker,
                 active_run=active_run,
             )
+            return events[-1]
         return None
 
     async def _start_task(
@@ -8445,7 +9249,7 @@ class SessionEngine:
         if tool_round_identity is not None:
             terminal_payload.update(tool_round_identity.payload())
         if run_started_at is not None and turn_usage_tracker is not None:
-            yield await self._emit_turn_completed_once(
+            for event in await self._emit_turn_completed_once(
                 session=interrupted_session,
                 registered_agent=registered_agent,
                 environment_name=environment_name,
@@ -8453,7 +9257,8 @@ class SessionEngine:
                 run_started_at=run_started_at,
                 usage_tracker=turn_usage_tracker,
                 active_run=active_run,
-            )
+            ):
+                yield event
         async for event in self._emit_terminal_event_with_hooks(
             event=Event(
                 type=EventType.SESSION_INTERRUPTED,
@@ -9166,6 +9971,34 @@ class SessionEngine:
                     SessionStatus.INTERRUPTED,
                 )
             payload = await self._load_pending_session_interrupt_payload(session.id, default={})
+            interaction_event: Event | None = None
+            if _current_session_interaction_id(session.id) is not None:
+                checkpoint = await self.session_store.load_checkpoint(session.id)
+                pending_action_kind: str | None = None
+                if approval_support.pending_approval_from_checkpoint(checkpoint) is not None:
+                    pending_action_kind = "tool_approval"
+                elif pending_user_input_from_checkpoint(checkpoint) is not None:
+                    pending_action_kind = "user_input"
+                elif tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint) is not None:
+                    pending_action_kind = "tool_recovery"
+                interaction_event = await self._emit_interaction_state(
+                    session=loaded_interrupted,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    event_type=(
+                        EventType.INTERACTION_PAUSED
+                        if pending_action_kind is not None
+                        else EventType.INTERACTION_INTERRUPTED
+                    ),
+                    status=(
+                        InteractionStatus.PAUSED
+                        if pending_action_kind is not None
+                        else InteractionStatus.INTERRUPTED
+                    ),
+                    pending_action_kind=pending_action_kind,
+                )
+            if interaction_event is not None:
+                yield interaction_event
             interruption_request_id = interruption_request_id_from_payload(payload)
             existing_interrupt_event = await self._session_control.wait_for_interrupted_event(
                 session.id,
@@ -9191,7 +10024,7 @@ class SessionEngine:
             payload.setdefault("interruption_type", _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED)
             payload.setdefault("interruption_request_id", str(uuid4()))
             if run_started_at is not None and turn_usage_tracker is not None:
-                yield await self._emit_turn_completed_once(
+                for event in await self._emit_turn_completed_once(
                     session=loaded_interrupted,
                     registered_agent=registered_agent,
                     environment_name=environment_name,
@@ -9199,7 +10032,8 @@ class SessionEngine:
                     run_started_at=run_started_at,
                     usage_tracker=turn_usage_tracker,
                     active_run=active_run,
-                )
+                ):
+                    yield event
             terminal_event_stream = self._emit_terminal_event_with_hooks(
                 event=Event(
                     type=EventType.SESSION_INTERRUPTED,

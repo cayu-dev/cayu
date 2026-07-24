@@ -603,6 +603,10 @@ class CayuApp:
                 self._pending_session_interrupt_checkpoint_for_recovery
             ),
             abandoned_turn_completed=self._complete_abandoned_recovery_turn,
+            materialize_deferred_interaction_input=(
+                self.session_store.materialize_deferred_interaction_input
+            ),
+            resume_interaction=self._resume_recovery_interaction,
         )
         self._background_interruption_coordinator = BackgroundInterruptionCoordinator(
             session_store=self.session_store,
@@ -1260,7 +1264,7 @@ class CayuApp:
         request: IncompleteSessionRecoveryRequest,
     ) -> IncompleteSessionRecoveryResult:
         request = copy_incomplete_session_recovery_request(request)
-        return await self._recovery_coordinator.recover_incomplete_session(request)
+        return await self._session_engine.recover_incomplete_session(request)
 
     async def recover_persisted_event_side_effects(self, *, limit: int = 1000) -> list[Event]:
         """Retry committed event fan-out that was not acknowledged before a crash.
@@ -1289,7 +1293,7 @@ class CayuApp:
         and cancellation still raise.
         """
         request = copy_incomplete_sessions_recovery_request(request)
-        return await self._recovery_coordinator.recover_incomplete_sessions(request)
+        return await self._session_engine.recover_incomplete_sessions(request)
 
     async def dispatch(self, request: DispatchRequest) -> DispatchHandle:
         if type(request) is not DispatchRequest:
@@ -1648,6 +1652,7 @@ class CayuApp:
             start_event_payload=request.start_event_payload,
             start_task_on_enter=request.start_task_on_enter,
             release_run_fence_on_exit=request.release_run_fence_on_exit,
+            deliver_queued_input_before_first_step=False,
         )
 
     def _emit_recovery_terminal_event_with_hooks(
@@ -1713,6 +1718,18 @@ class CayuApp:
             run_started_at=request.run_started_at,
             usage_tracker=request.usage_tracker,
             active_run=request.active_run,
+        )
+
+    async def _resume_recovery_interaction(
+        self,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+    ) -> Event | None:
+        return await self._session_engine.resume_interaction(
+            session,
+            registered_agent,
+            registered_environment,
         )
 
     async def resolve_user_input(
@@ -1832,6 +1849,7 @@ class CayuApp:
         start_event_payload: dict[str, Any],
         start_task_on_enter: bool = True,
         release_run_fence_on_exit: bool = True,
+        deliver_queued_input_before_first_step: bool = True,
     ) -> AsyncGenerator[Event, None]:
         stream = self._session_engine._run_session(
             session=session,
@@ -1854,6 +1872,7 @@ class CayuApp:
             start_event_payload=start_event_payload,
             start_task_on_enter=start_task_on_enter,
             release_run_fence_on_exit=release_run_fence_on_exit,
+            deliver_queued_input_before_first_step=(deliver_queued_input_before_first_step),
         )
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:
@@ -1870,7 +1889,7 @@ class CayuApp:
         usage_tracker: SessionUsageTracker,
         active_run: ActiveSessionRun[SessionUsageTracker] | None,
     ) -> Event:
-        return await self._session_engine._emit_turn_completed_once(
+        events = await self._session_engine._emit_turn_completed_once(
             session=session,
             registered_agent=registered_agent,
             environment_name=environment_name,
@@ -1879,6 +1898,7 @@ class CayuApp:
             usage_tracker=usage_tracker,
             active_run=active_run,
         )
+        return events[-1]
 
     async def _apply_model_step_budget_evaluation(
         self,

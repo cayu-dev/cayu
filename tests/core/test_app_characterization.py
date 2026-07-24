@@ -43,9 +43,11 @@ from cayu.runtime import (
     CayuApp,
     ContextCountingConfig,
     ContextCountingMode,
+    EventQuery,
     InMemorySessionStore,
     ModelPrice,
     PriceBook,
+    ResumeRequest,
     RunLimits,
     RunRequest,
     ToolApprovalDecision,
@@ -54,6 +56,7 @@ from cayu.runtime import (
     ToolPolicyDecision,
     ToolPolicyRequest,
     ToolPolicyResult,
+    TranscriptQuery,
     UserInputResponse,
 )
 from cayu.tools.user_input import UserInputTool
@@ -190,6 +193,7 @@ def test_g1_full_multi_tool_round_run() -> None:
     )
 
     assert _types(events) == [
+        EventType.INTERACTION_STARTED,
         EventType.SESSION_STARTED,
         EventType.CONTEXT_PRESSURE_ESTIMATED,
         EventType.CONTEXT_COUNTED,
@@ -206,9 +210,91 @@ def test_g1_full_multi_tool_round_run() -> None:
         EventType.MODEL_COMPLETED,
         EventType.CONTEXT_PRESSURE_RECONCILED,
         EventType.CONTEXT_COUNT_RECONCILED,
+        EventType.INTERACTION_COMPLETED,
         EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
+
+
+def test_interaction_identity_partitions_two_responses() -> None:
+    provider = ScriptedProvider(
+        [
+            [ModelStreamEvent.text_delta("first"), _completed()],
+            [ModelStreamEvent.text_delta("second"), _completed()],
+        ]
+    )
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def exercise() -> None:
+        first_events = await _collect(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="interaction_two_responses",
+                    messages=[Message.text("user", "one")],
+                )
+            )
+        )
+        second_events = await _collect(
+            app.resume(
+                ResumeRequest(
+                    session_id="interaction_two_responses",
+                    messages=[Message.text("user", "two")],
+                )
+            )
+        )
+
+        first_ids = {
+            event.interaction_id for event in first_events if event.type != EventType.TURN_COMPLETED
+        }
+        second_ids = {
+            event.interaction_id
+            for event in second_events
+            if event.type != EventType.TURN_COMPLETED
+        }
+        assert len(first_ids) == 1
+        assert None not in first_ids
+        assert len(second_ids) == 1
+        assert None not in second_ids
+        assert first_ids.isdisjoint(second_ids)
+
+        first_id = next(iter(first_ids))
+        second_id = next(iter(second_ids))
+        first_turn = next(event for event in first_events if event.type == EventType.TURN_COMPLETED)
+        second_turn = next(
+            event for event in second_events if event.type == EventType.TURN_COMPLETED
+        )
+        assert first_turn.interaction_id is None
+        assert first_turn.payload["interaction_ids"] == [first_id]
+        assert second_turn.interaction_id is None
+        assert second_turn.payload["interaction_ids"] == [second_id]
+        first_transcript = await store.query_transcript(
+            TranscriptQuery(
+                session_id="interaction_two_responses",
+                interaction_id=first_id,
+            )
+        )
+        second_transcript = await store.query_transcript(
+            TranscriptQuery(
+                session_id="interaction_two_responses",
+                interaction_id=second_id,
+            )
+        )
+        assert [record.message.role for record in first_transcript.records] == [
+            "user",
+            "assistant",
+        ]
+        assert [record.message.role for record in second_transcript.records] == [
+            "user",
+            "assistant",
+        ]
+        assert [record.index for record in first_transcript.records] == [0, 1]
+        assert [record.index for record in second_transcript.records] == [2, 3]
+
+    asyncio.run(exercise())
 
 
 def test_g2a_user_input_pause_then_resume() -> None:
@@ -246,24 +332,43 @@ def test_g2a_user_input_pause_then_resume() -> None:
     )
 
     assert _types(pause_events) == [
+        EventType.INTERACTION_STARTED,
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
         EventType.SESSION_CHECKPOINTED,
         EventType.SESSION_AWAITING_USER_INPUT,
+        EventType.INTERACTION_PAUSED,
         EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
     interrupted = pause_events[-1]
     assert interrupted.payload["interruption_type"] == "user_input_required"
+    paused_records = asyncio.run(
+        app.session_store.query_events(
+            EventQuery(
+                session_id="g2a_user_input",
+                event_type=EventType.INTERACTION_PAUSED,
+            )
+        )
+    )
+    from cayu.runtime import InteractionSummaryEvidence
+
+    paused_evidence = InteractionSummaryEvidence.model_validate(paused_records[-1].event.payload)
+    assert paused_evidence.wall_duration_ms is None
 
     input_id = next(
         event for event in pause_events if event.type == EventType.SESSION_AWAITING_USER_INPUT
     ).payload["input_id"]
+    resumed_app = CayuApp(session_store=app.session_store, enable_logging=False)
+    resumed_app.register_provider(provider, default=True)
+    resumed_app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"), tools=[UserInputTool()]
+    )
 
     resume_events = asyncio.run(
         _collect(
-            app.resolve_user_input(
+            resumed_app.resolve_user_input(
                 UserInputResponse(
                     session_id="g2a_user_input",
                     input_id=input_id,
@@ -274,15 +379,32 @@ def test_g2a_user_input_pause_then_resume() -> None:
     )
 
     assert _types(resume_events) == [
+        EventType.INTERACTION_RESUMED,
         EventType.SESSION_RESUMED,
         EventType.TOOL_CALL_STARTED,
         EventType.TOOL_CALL_COMPLETED,
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.INTERACTION_COMPLETED,
         EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
+    pause_ids = {
+        event.interaction_id for event in pause_events if event.type != EventType.TURN_COMPLETED
+    }
+    resume_ids = {
+        event.interaction_id for event in resume_events if event.type != EventType.TURN_COMPLETED
+    }
+    assert pause_ids == resume_ids == {resume_events[0].interaction_id}
+    assert resume_events[0].interaction_id is not None
+    completed_evidence = InteractionSummaryEvidence.model_validate(
+        next(
+            event for event in resume_events if event.type is EventType.INTERACTION_COMPLETED
+        ).payload
+    )
+    assert completed_evidence.wall_duration_ms is not None
+    assert completed_evidence.wall_duration_ms >= completed_evidence.active_duration_ms
 
 
 def test_g2b_tool_approval_pause_then_resume() -> None:
@@ -320,11 +442,13 @@ def test_g2b_tool_approval_pause_then_resume() -> None:
     )
 
     assert _types(pause_events) == [
+        EventType.INTERACTION_STARTED,
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
         EventType.SESSION_CHECKPOINTED,
         EventType.TOOL_CALL_APPROVAL_REQUESTED,
+        EventType.INTERACTION_PAUSED,
         EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
@@ -361,6 +485,7 @@ def test_g2b_tool_approval_pause_then_resume() -> None:
     )
 
     assert _types(resume_events) == [
+        EventType.INTERACTION_RESUMED,
         EventType.SESSION_RESUMED,
         EventType.TOOL_CALL_APPROVED,
         EventType.TOOL_CALL_STARTED,
@@ -369,9 +494,18 @@ def test_g2b_tool_approval_pause_then_resume() -> None:
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.INTERACTION_COMPLETED,
         EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
+    pause_ids = {
+        event.interaction_id for event in pause_events if event.type != EventType.TURN_COMPLETED
+    }
+    resume_ids = {
+        event.interaction_id for event in resume_events if event.type != EventType.TURN_COMPLETED
+    }
+    assert pause_ids == resume_ids == {resume_events[0].interaction_id}
+    assert resume_events[0].interaction_id is not None
 
 
 def test_g3a_run_limit_trip() -> None:
@@ -414,6 +548,7 @@ def test_g3a_run_limit_trip() -> None:
     )
 
     assert _types(events) == [
+        EventType.INTERACTION_STARTED,
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
@@ -423,6 +558,7 @@ def test_g3a_run_limit_trip() -> None:
         EventType.MODEL_COMPLETED,
         EventType.SESSION_LIMIT_REACHED,
         EventType.TOOL_CALL_FAILED,
+        EventType.INTERACTION_INTERRUPTED,
         EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
@@ -485,15 +621,22 @@ def test_g3b_budget_trip() -> None:
     )
 
     assert _types(events) == [
+        EventType.INTERACTION_STARTED,
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
         EventType.SESSION_LIMIT_REACHED,
         EventType.TOOL_CALL_FAILED,
+        EventType.INTERACTION_INTERRUPTED,
         EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
-    assert events[3].payload["limit"] == "estimated_cost"
+    assert (
+        next(event for event in events if event.type == EventType.SESSION_LIMIT_REACHED).payload[
+            "limit"
+        ]
+        == "estimated_cost"
+    )
     assert events[-1].payload["interruption_type"] == "limit_reached"
     # The tool call is failed before it can run.
     assert tool.calls == []

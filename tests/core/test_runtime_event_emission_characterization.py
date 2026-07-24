@@ -105,10 +105,12 @@ def test_failing_sink_does_not_block_later_sink() -> None:
     session = asyncio.run(store.load("sess_later_sink"))
 
     assert [event.type for event in events] == [
+        EventType.INTERACTION_STARTED,
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
+        EventType.INTERACTION_COMPLETED,
         EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
@@ -126,9 +128,9 @@ def test_sink_mutation_cannot_rewrite_returned_or_later_sink_events() -> None:
 
     events = asyncio.run(_collect_run(app, "sess_sink_mutation"))
 
-    assert events[0].type == EventType.SESSION_STARTED
-    assert events[0].payload == {"agent_name": "assistant"}
-    assert recorder.events[0].payload == {"agent_name": "assistant"}
+    assert events[1].type == EventType.SESSION_STARTED
+    assert events[1].payload == {"agent_name": "assistant"}
+    assert recorder.events[1].payload == {"agent_name": "assistant"}
 
 
 def test_model_completed_is_forwarded_to_budget_store_once() -> None:

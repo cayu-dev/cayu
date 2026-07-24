@@ -100,6 +100,10 @@ from cayu.runtime.execution_units import (
     copy_tool_round_identity,
 )
 from cayu.runtime.hooks import RuntimeHookPhase
+from cayu.runtime.interactions import (
+    INTERACTION_LIFECYCLE_EVENT_TYPES,
+    INTERACTION_TERMINAL_EVENT_TYPES,
+)
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.sessions import (
@@ -122,7 +126,9 @@ from cayu.runtime.sessions import (
     SessionStatusConflict,
     SessionStore,
     TranscriptQuery,
+    _activate_session_interaction,
     _activate_session_run_fence,
+    _deactivate_session_interaction,
     _deactivate_session_run_fence,
     _incomplete_recovery_claim_from_checkpoint,
 )
@@ -596,6 +602,16 @@ RegisteredEnvironmentResolver = Callable[[str | None], runtime_records.Registere
 RecoveryInterruptionStream = Callable[[RecoveryInterruptionRequest], AsyncIterator[Event]]
 PendingSessionInterruptCheckpoint = Callable[[dict[str, Any], datetime], CheckpointTransform]
 AbandonedTurnCompleted = Callable[[RecoveryAbandonedTurnRequest], Awaitable[Event]]
+IncompleteRecoveryScopeHook = Callable[[str], Awaitable[None]]
+MaterializeDeferredInteractionInput = Callable[[str], Awaitable[bool]]
+ResumeInteraction = Callable[
+    [
+        Session,
+        runtime_records.RegisteredAgentState,
+        runtime_records.RegisteredEnvironment | None,
+    ],
+    Awaitable[Event | None],
+]
 
 
 class RecoveryCoordinator:
@@ -625,6 +641,8 @@ class RecoveryCoordinator:
         interrupt_session_for_recovery: RecoveryInterruptionStream,
         pending_session_interrupt_checkpoint: PendingSessionInterruptCheckpoint,
         abandoned_turn_completed: AbandonedTurnCompleted,
+        materialize_deferred_interaction_input: MaterializeDeferredInteractionInput,
+        resume_interaction: ResumeInteraction,
     ) -> None:
         self._session_store = session_store
         self._task_store = task_store
@@ -647,13 +665,15 @@ class RecoveryCoordinator:
         self._interrupt_session_for_recovery = interrupt_session_for_recovery
         self._pending_session_interrupt_checkpoint = pending_session_interrupt_checkpoint
         self._abandoned_turn_completed = abandoned_turn_completed
+        self._materialize_deferred_interaction_input = materialize_deferred_interaction_input
+        self._resume_interaction = resume_interaction
 
-    async def preflight_model_completion_boundary(self, session: Session) -> None:
-        """Reject a non-terminal provider dispatch before mutating session state."""
+    async def preflight_model_completion_boundary(self, session: Session) -> bool:
+        """Reject a non-terminal dispatch and report terminal work to promote."""
 
         active = await self._session_store.load_active_model_completion_stage(session.id)
         if active is None:
-            return
+            return False
         stage = active.stage
         self._validate_active_model_completion_stage(session, stage)
         if stage.state == "in_flight":
@@ -662,6 +682,7 @@ class RecoveryCoordinator:
                 "Its provider outcome and linked budget reservations require manual "
                 f"reconciliation before retrying: {stage.stage_id}"
             )
+        return True
 
     async def reconcile_model_completion_boundary(
         self,
@@ -1456,13 +1477,31 @@ class RecoveryCoordinator:
             # Cleanup can run in a shielded child task with copied context. The
             # public caller must never retain a stale run epoch after handoff.
             _deactivate_session_run_fence(session_id)
+            _deactivate_session_interaction(session_id)
+
+    async def _activate_latest_open_interaction(self, session_id: str) -> str | None:
+        records = await self._session_store.query_events(
+            EventQuery(
+                session_id=session_id,
+                event_types=INTERACTION_LIFECYCLE_EVENT_TYPES,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=1,
+            )
+        )
+        if not records or records[0].event.type in INTERACTION_TERMINAL_EVENT_TYPES:
+            return None
+        interaction_id = records[0].event.interaction_id
+        if interaction_id is None:
+            raise RuntimeError("Interaction lifecycle event has no interaction identity.")
+        _activate_session_interaction(session_id, interaction_id)
+        return interaction_id
 
     async def _transition_recovery_session_to_running(
         self,
         session_id: str,
         *,
         from_statuses: set[SessionStatus] | None = None,
-    ) -> Session:
+    ) -> tuple[Session, Event | None]:
         """Claim a paused session without leaving cancellation outcome-uncertain.
 
         Session stores activate run fences in task-local context after the durable
@@ -1472,6 +1511,19 @@ class RecoveryCoordinator:
         arrived, the claim is finalized and released before that cancellation is
         propagated.
         """
+        latest_events = await self._session_store.query_events(
+            EventQuery(
+                session_id=session_id,
+                event_types=INTERACTION_LIFECYCLE_EVENT_TYPES,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=1,
+            )
+        )
+        interaction_id = (
+            latest_events[0].event.interaction_id
+            if latest_events and latest_events[0].event.type not in INTERACTION_TERMINAL_EVENT_TYPES
+            else None
+        )
         expected_statuses = (
             {SessionStatus.INTERRUPTED} if from_statuses is None else set(from_statuses)
         )
@@ -1530,8 +1582,18 @@ class RecoveryCoordinator:
         # The transition activated this epoch only in the child task's copied
         # context. The caller owns all subsequent writes and cleanup.
         _activate_session_run_fence(session)
+        resumed_event: Event | None = None
+        if interaction_id is not None:
+            _activate_session_interaction(session.id, interaction_id)
+            registered_agent = self._resolve_registered_agent(session.agent_name)
+            registered_environment = self._resolve_registered_environment(session.environment_name)
+            resumed_event = await self._resume_interaction(
+                session,
+                registered_agent,
+                registered_environment,
+            )
         if cancellation is None:
-            return session
+            return session, resumed_event
 
         try:
             await _run_recovery_cleanup_steps(
@@ -1551,6 +1613,7 @@ class RecoveryCoordinator:
             # Shielded cleanup runs in a copied context. Never leave the caller's
             # task-local epoch active if it catches and handles the cancellation.
             _deactivate_session_run_fence(session.id)
+            _deactivate_session_interaction(session.id)
         raise cancellation
 
     async def resolve_user_input(
@@ -1598,7 +1661,11 @@ class RecoveryCoordinator:
         registered_environment = self._resolve_registered_environment(
             loaded_session.environment_name
         )
-        session = await self._transition_recovery_session_to_running(loaded_session.id)
+        session, resumed_event = await self._transition_recovery_session_to_running(
+            loaded_session.id
+        )
+        if resumed_event is not None:
+            yield resumed_event
 
         continuation_stream = self.continue_user_input_resolution(
             response=response,
@@ -1674,7 +1741,11 @@ class RecoveryCoordinator:
         registered_environment = self._resolve_registered_environment(
             loaded_session.environment_name
         )
-        session = await self._transition_recovery_session_to_running(loaded_session.id)
+        session, resumed_event = await self._transition_recovery_session_to_running(
+            loaded_session.id
+        )
+        if resumed_event is not None:
+            yield resumed_event
         recovery_stream = self.recover_user_input(
             request=request,
             loaded_session=loaded_session,
@@ -1739,7 +1810,11 @@ class RecoveryCoordinator:
         registered_environment = self._resolve_registered_environment(
             loaded_session.environment_name
         )
-        session = await self._transition_recovery_session_to_running(loaded_session.id)
+        session, resumed_event = await self._transition_recovery_session_to_running(
+            loaded_session.id
+        )
+        if resumed_event is not None:
+            yield resumed_event
 
         continuation_stream = self.continue_tool_approval_resolution(
             request=request,
@@ -1809,7 +1884,11 @@ class RecoveryCoordinator:
         registered_environment = self._resolve_registered_environment(
             loaded_session.environment_name
         )
-        session = await self._transition_recovery_session_to_running(loaded_session.id)
+        session, resumed_event = await self._transition_recovery_session_to_running(
+            loaded_session.id
+        )
+        if resumed_event is not None:
+            yield resumed_event
         recovery_stream = self.recover_tool_approval(
             request=request,
             loaded_session=loaded_session,
@@ -1915,6 +1994,7 @@ class RecoveryCoordinator:
                 task_started=False,
                 task_finished=False,
             )
+        interaction_id = await self._activate_latest_open_interaction(loaded_session.id)
         recovery_stream = self.recover_tool_round(
             request=request,
             loaded_session=loaded_session,
@@ -1943,6 +2023,8 @@ class RecoveryCoordinator:
                     abort_environment_setup=False,
                 )
             finally:
+                if interaction_id is not None:
+                    _deactivate_session_interaction(loaded_session.id)
                 if current_task is not None:
                     self._session_control.unregister_active_task(
                         loaded_session.id,
@@ -5419,6 +5501,9 @@ class RecoveryCoordinator:
     async def recover_incomplete_sessions(
         self,
         request: IncompleteSessionsRecoveryRequest,
+        *,
+        before_recovery: IncompleteRecoveryScopeHook | None = None,
+        after_recovery: IncompleteRecoveryScopeHook | None = None,
     ) -> list[IncompleteSessionRecoveryResult]:
         """Fault-isolate recovery across the requested non-terminal sessions."""
         sessions: list[Session] = []
@@ -5457,12 +5542,18 @@ class RecoveryCoordinator:
         results: list[IncompleteSessionRecoveryResult] = []
         for session in sessions:
             try:
-                result = await self._recover_incomplete_session_scoped(
-                    session=session,
-                    inactive_before=request.inactive_before,
-                    reason=request.reason,
-                    metadata=request.metadata,
-                )
+                if before_recovery is not None:
+                    await before_recovery(session.id)
+                try:
+                    result = await self._recover_incomplete_session_scoped(
+                        session=session,
+                        inactive_before=request.inactive_before,
+                        reason=request.reason,
+                        metadata=request.metadata,
+                    )
+                finally:
+                    if after_recovery is not None:
+                        await after_recovery(session.id)
             except Exception as exc:
                 diagnostic = exception_diagnostic(
                     exc,
@@ -5594,6 +5685,7 @@ class RecoveryCoordinator:
                     events=(),
                     message="Session activity or recovery ownership changed; recovery skipped.",
                 )
+            await self._materialize_deferred_interaction_input(session.id)
             return await self._recover_incomplete_session_with_heartbeat(
                 claim=claim,
                 recovery=lambda: self._recover_incomplete_session(

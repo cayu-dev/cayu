@@ -10,6 +10,7 @@ from cayu import (
     AgentSpec,
     CayuApp,
     Event,
+    EventType,
     Message,
     ModelStreamEvent,
     RunOutcome,
@@ -59,6 +60,10 @@ def test_run_to_completion_returns_final_text_and_ok() -> None:
     assert outcome.final_text == "Hello world"
     assert outcome.error is None
     assert outcome.session_id == "s1"
+    assert outcome.interaction_id is not None
+    assert {
+        event.interaction_id for event in outcome.events if event.interaction_id is not None
+    } == {outcome.interaction_id}
 
 
 def test_run_to_completion_exposes_repaired_structured_output() -> None:
@@ -232,6 +237,43 @@ class _PlainStrFailureApp:
             session_id=request.session_id or "s1",
             payload={"error": "boom"},
         )
+
+
+class _TwoInteractionApp:
+    async def run(self, request: RunRequest) -> AsyncIterator[Event]:
+        for interaction_id, text in (
+            ("interaction-a", "first"),
+            ("interaction-b", "second"),
+        ):
+            yield Event(
+                type=EventType.MODEL_STARTED,
+                session_id=request.session_id or "s1",
+                interaction_id=interaction_id,
+            )
+            yield Event(
+                type=EventType.MODEL_TEXT_DELTA,
+                session_id=request.session_id or "s1",
+                interaction_id=interaction_id,
+                payload={"delta": text},
+            )
+            yield Event(
+                type=EventType.MODEL_COMPLETED,
+                session_id=request.session_id or "s1",
+                interaction_id=interaction_id,
+            )
+        yield Event(
+            type=EventType.SESSION_COMPLETED,
+            session_id=request.session_id or "s1",
+            interaction_id="interaction-b",
+        )
+
+
+def test_run_to_completion_returns_the_interaction_for_final_text() -> None:
+    outcome = asyncio.run(run_to_completion(_TwoInteractionApp(), _request()))  # type: ignore[arg-type]
+
+    assert outcome.ok
+    assert outcome.final_text == "second"
+    assert outcome.interaction_id == "interaction-b"
 
 
 def test_run_to_completion_detects_failure_when_event_type_is_plain_str() -> None:

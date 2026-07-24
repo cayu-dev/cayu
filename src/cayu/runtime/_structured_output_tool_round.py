@@ -56,6 +56,7 @@ class _StructuredOutputToolRoundPublicationExtension:
         return RuntimePublicationRequest(
             publication_id=ordinary_request.publication_id,
             kind=ordinary_request.kind,
+            interaction_id=ordinary_request.interaction_id,
             intent={
                 **ordinary_request.intent,
                 "auxiliary": copy_json_value(

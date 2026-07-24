@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
@@ -3094,6 +3095,59 @@ def test_runtime_tool_event_cannot_restore_secret_linkage_control() -> None:
             event,
             redactor=SecretRedactor(secret),
         )
+
+
+def test_interaction_lifecycle_schema_keys_survive_secret_name_collisions() -> None:
+    from cayu.runtime import InteractionStatus, InteractionSummaryEvidence
+    from cayu.runtime._event_writer import prepare_runtime_event
+    from cayu.vaults import SecretRedactor
+
+    now = datetime.now(UTC)
+    evidence = InteractionSummaryEvidence(
+        status=InteractionStatus.COMPLETED,
+        start_event_id="interaction-start-safe",
+        source_transcript_start=0,
+        source_transcript_end=0,
+        result_transcript_start=1,
+        result_transcript_end=1,
+        started_at=now,
+        completed_at=now,
+        active_duration_ms=1,
+        wall_duration_ms=1,
+        model_step_count=1,
+        tool_call_count=1,
+        provider_names=["safe-provider"],
+        models=["safe-model"],
+    )
+
+    prepared = prepare_runtime_event(
+        Event(
+            type=EventType.INTERACTION_COMPLETED,
+            session_id="sess-safe",
+            interaction_id="interaction-safe",
+            payload=evidence.model_dump(mode="json"),
+        ),
+        redactor=SecretRedactor(
+            [
+                "active",
+                "cache",
+                "completed",
+                "input",
+                "model",
+                "output",
+                "provider",
+                "result",
+                "source",
+                "start",
+                "tool",
+                "write",
+            ]
+        ),
+    )
+
+    restored = InteractionSummaryEvidence.model_validate(prepared.payload)
+    assert restored.status is InteractionStatus.COMPLETED
+    assert restored.start_event_id == "interaction-start-safe"
 
 
 def test_pending_tool_round_rejects_secret_authority_on_write_and_legacy_load() -> None:

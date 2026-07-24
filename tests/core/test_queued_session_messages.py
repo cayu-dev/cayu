@@ -5,7 +5,7 @@ import asyncio
 import pytest
 from pydantic import ValidationError
 
-from cayu.core import AgentSpec, EventType, Message, MessageRole
+from cayu.core import AgentSpec, Event, EventType, Message, MessageRole
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
@@ -22,6 +22,7 @@ from cayu.runtime import (
     SessionStatus,
     ToolApprovalDecision,
     ToolApprovalRequest,
+    TranscriptQuery,
     UserInputResponse,
 )
 from cayu.runtime.sessions import SESSION_MESSAGE_DELIVERY_BATCH_LIMIT
@@ -78,7 +79,10 @@ class ToolRoundProvider(ModelProvider):
             )
             yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
             return
-        yield ModelStreamEvent.text_delta("finished after steering")
+        text = (
+            "finished original response" if len(self.requests) == 2 else "finished after steering"
+        )
+        yield ModelStreamEvent.text_delta(text)
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
@@ -102,7 +106,10 @@ class BlockingApprovalProvider(ModelProvider):
             )
             yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
             return
-        yield ModelStreamEvent.text_delta("finished after approved tool and steering")
+        text = (
+            "finished after approved tool" if len(self.requests) == 2 else "finished after steering"
+        )
+        yield ModelStreamEvent.text_delta(text)
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
@@ -126,7 +133,8 @@ class BlockingUserInputProvider(ModelProvider):
             )
             yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
             return
-        yield ModelStreamEvent.text_delta("finished after user input and steering")
+        text = "finished after user input" if len(self.requests) == 2 else "finished after steering"
+        yield ModelStreamEvent.text_delta(text)
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
@@ -209,6 +217,8 @@ class DeliveryFenceStore(InterruptTrackingStore):
         include_on_idle: bool,
         eligible_through: int | None = None,
         limit: int = SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
+        interaction_id: str | None = None,
+        interaction_started_event: Event | None = None,
     ) -> SessionMessageDeliveryBatch:
         self._delivery_calls += 1
         if self._delivery_calls == self._block_on_call:
@@ -219,6 +229,8 @@ class DeliveryFenceStore(InterruptTrackingStore):
             include_on_idle=include_on_idle,
             eligible_through=eligible_through,
             limit=limit,
+            interaction_id=interaction_id,
+            interaction_started_event=interaction_started_event,
         )
 
 
@@ -381,16 +393,59 @@ def test_cross_process_enqueue_drains_next_turn_before_on_idle_without_event_con
             *(result.message.content for result in ordered_next),
             "idle steering",
         ]
+        stored_events = await store.load_events("sess_durable_steering")
         delivery_events = [
-            event
-            for event in await store.load_events("sess_durable_steering")
-            if event.type == EventType.SESSION_MESSAGE_DELIVERED
+            event for event in stored_events if event.type == EventType.SESSION_MESSAGE_DELIVERED
         ]
         assert [event.payload["queue_id"] for event in delivery_events] == [
             *(result.message.queue_id for result in ordered_next),
             idle_result.message.queue_id,
         ]
         assert all("content" not in event.payload for event in delivery_events)
+
+        model_started = [event for event in run_events if event.type == EventType.MODEL_STARTED]
+        assert len(model_started) == 2
+        first_interaction_id = model_started[0].interaction_id
+        second_interaction_id = model_started[1].interaction_id
+        assert first_interaction_id is not None
+        assert second_interaction_id is not None
+        assert second_interaction_id != first_interaction_id
+        assert {event.interaction_id for event in delivery_events} == {second_interaction_id}
+        queued_interaction_start = next(
+            event
+            for event in stored_events
+            if event.type == EventType.INTERACTION_STARTED
+            and event.interaction_id == second_interaction_id
+        )
+        assert stored_events.index(queued_interaction_start) < stored_events.index(
+            delivery_events[0]
+        )
+
+        first_records = await store.query_transcript(
+            TranscriptQuery(
+                session_id="sess_durable_steering",
+                interaction_id=first_interaction_id,
+            )
+        )
+        second_records = await store.query_transcript(
+            TranscriptQuery(
+                session_id="sess_durable_steering",
+                interaction_id=second_interaction_id,
+            )
+        )
+        assert [record.index for record in first_records.records] == [0, 1]
+        assert [record.index for record in second_records.records] == [2, 3, 4, 5, 6]
+        terminal_interactions = {
+            event.interaction_id
+            for event in stored_events
+            if event.type
+            in {
+                EventType.INTERACTION_COMPLETED,
+                EventType.INTERACTION_FAILED,
+                EventType.INTERACTION_INTERRUPTED,
+            }
+        }
+        assert terminal_interactions == {first_interaction_id, second_interaction_id}
 
     asyncio.run(run())
 
@@ -438,14 +493,13 @@ def test_next_turn_waits_for_complete_tool_round_before_provider_delivery() -> N
         tool.release.set()
         await run_task
 
-        assert len(provider.requests) == 2
+        assert len(provider.requests) == 3
         assert [message.role for message in provider.requests[1].messages] == [
             MessageRole.USER,
             MessageRole.ASSISTANT,
             MessageRole.TOOL,
-            MessageRole.USER,
         ]
-        assert provider.requests[1].messages[-1].content[0].text == (  # type: ignore[union-attr]
+        assert provider.requests[2].messages[-1].content[0].text == (  # type: ignore[union-attr]
             "steer only after the tool result"
         )
         events = await store.load_events("sess_tool_round_steering")
@@ -459,6 +513,31 @@ def test_next_turn_waits_for_complete_tool_round_before_provider_delivery() -> N
         )
         assert events.index(delivery) > tool_completed_index
         assert delivery.payload["queue_id"] == accepted.message.queue_id
+        model_started = [event for event in events if event.type == EventType.MODEL_STARTED]
+        first_interaction_id = model_started[0].interaction_id
+        second_interaction_id = model_started[2].interaction_id
+        assert first_interaction_id is not None
+        assert model_started[1].interaction_id == first_interaction_id
+        assert second_interaction_id is not None
+        assert second_interaction_id != first_interaction_id
+        first_completed_index = next(
+            index
+            for index, event in enumerate(events)
+            if event.type == EventType.INTERACTION_COMPLETED
+            and event.interaction_id == first_interaction_id
+        )
+        second_started_index = next(
+            index
+            for index, event in enumerate(events)
+            if event.type == EventType.INTERACTION_STARTED
+            and event.interaction_id == second_interaction_id
+        )
+        assert first_completed_index < second_started_index < events.index(delivery)
+        assert {
+            event.interaction_id
+            for event in events
+            if event.type == EventType.INTERACTION_COMPLETED
+        } == {first_interaction_id, second_interaction_id}
 
     asyncio.run(run())
 
@@ -527,14 +606,13 @@ def test_queued_message_waits_for_pending_tool_approval_resolution() -> None:
             )
         ]
 
-        assert len(provider.requests) == 2
+        assert len(provider.requests) == 3
         assert [message.role for message in provider.requests[1].messages] == [
             MessageRole.USER,
             MessageRole.ASSISTANT,
             MessageRole.TOOL,
-            MessageRole.USER,
         ]
-        assert provider.requests[1].messages[-1].content[0].text == (  # type: ignore[union-attr]
+        assert provider.requests[2].messages[-1].content[0].text == (  # type: ignore[union-attr]
             "steer only after approval and the tool result"
         )
         delivery = next(
@@ -549,6 +627,13 @@ def test_queued_message_waits_for_pending_tool_approval_resolution() -> None:
         )
         assert resolution_events.index(delivery) > tool_completed_index
         assert delivery.payload["queue_id"] == accepted.message.queue_id
+        model_started = [
+            event
+            for event in [*run_events, *resolution_events]
+            if event.type == EventType.MODEL_STARTED
+        ]
+        assert model_started[0].interaction_id == model_started[1].interaction_id
+        assert model_started[2].interaction_id != model_started[1].interaction_id
 
     asyncio.run(run())
 
@@ -617,10 +702,22 @@ def test_queued_message_does_not_bypass_pending_user_input() -> None:
             if event.type == EventType.SESSION_MESSAGE_DELIVERED
         )
         assert delivery.payload["queue_id"] == accepted.message.queue_id
-        assert len(provider.requests) == 2
-        assert provider.requests[1].messages[-1].content[0].text == (  # type: ignore[union-attr]
+        assert len(provider.requests) == 3
+        assert all(
+            message.role is not MessageRole.USER
+            or message.content[0].text != "steer only after the answer"  # type: ignore[union-attr]
+            for message in provider.requests[1].messages
+        )
+        assert provider.requests[2].messages[-1].content[0].text == (  # type: ignore[union-attr]
             "steer only after the answer"
         )
+        model_started = [
+            event
+            for event in [*run_events, *resolution_events]
+            if event.type == EventType.MODEL_STARTED
+        ]
+        assert model_started[0].interaction_id == model_started[1].interaction_id
+        assert model_started[2].interaction_id != model_started[1].interaction_id
 
     asyncio.run(run())
 

@@ -2514,10 +2514,12 @@ def test_cayu_app_can_use_sqlite_session_store(tmp_path):
         session = await store.load("sess_runtime_sqlite")
 
         assert [event.type for event in events] == [
+            EventType.INTERACTION_STARTED,
             EventType.SESSION_STARTED,
             EventType.MODEL_STARTED,
             EventType.MODEL_TEXT_DELTA,
             EventType.MODEL_COMPLETED,
+            EventType.INTERACTION_COMPLETED,
             EventType.TURN_COMPLETED,
             EventType.SESSION_COMPLETED,
         ]
@@ -2573,10 +2575,12 @@ def test_cayu_app_can_resume_with_sqlite_session_store(tmp_path):
         session = await store.load("sess_resume_sqlite")
 
         assert [event.type for event in resume_events] == [
+            EventType.INTERACTION_STARTED,
             EventType.SESSION_RESUMED,
             EventType.MODEL_STARTED,
             EventType.MODEL_TEXT_DELTA,
             EventType.MODEL_COMPLETED,
+            EventType.INTERACTION_COMPLETED,
             EventType.TURN_COMPLETED,
             EventType.SESSION_COMPLETED,
         ]
@@ -2592,16 +2596,20 @@ def test_cayu_app_can_resume_with_sqlite_session_store(tmp_path):
             "second answer",
         ]
         assert [event.type for event in persisted_events] == [
+            EventType.INTERACTION_STARTED,
             EventType.SESSION_STARTED,
             EventType.MODEL_STARTED,
             EventType.MODEL_TEXT_DELTA,
             EventType.MODEL_COMPLETED,
+            EventType.INTERACTION_COMPLETED,
             EventType.TURN_COMPLETED,
             EventType.SESSION_COMPLETED,
+            EventType.INTERACTION_STARTED,
             EventType.SESSION_RESUMED,
             EventType.MODEL_STARTED,
             EventType.MODEL_TEXT_DELTA,
             EventType.MODEL_COMPLETED,
+            EventType.INTERACTION_COMPLETED,
             EventType.TURN_COMPLETED,
             EventType.SESSION_COMPLETED,
         ]

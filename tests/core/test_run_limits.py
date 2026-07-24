@@ -788,10 +788,12 @@ def test_app_policy_replacement_is_used_by_the_next_run():
 
     assert provider.calls == 0
     assert [event.type for event in events] == [
+        EventType.INTERACTION_STARTED,
         EventType.SESSION_STARTED,
         EventType.BUDGET_CHECKED,
         EventType.BUDGET_LIMIT_REACHED,
         EventType.SESSION_LIMIT_REACHED,
+        EventType.INTERACTION_INTERRUPTED,
         EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]

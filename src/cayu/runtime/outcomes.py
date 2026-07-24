@@ -48,6 +48,8 @@ class RunOutcome:
     - ``events`` is the full event stream, if you need more than the summary.
     - ``structured_output`` is the last successfully validated structured value,
       including valid JSON ``null``, or ``None`` when the run had no validated output.
+    - ``interaction_id`` identifies the interaction that produced ``final_text`` or
+      the final interaction-scoped terminal outcome.
     """
 
     session_id: str
@@ -56,6 +58,7 @@ class RunOutcome:
     error: str | None
     events: tuple[Event, ...]
     structured_output: StructuredOutputResult | None = None
+    interaction_id: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -78,12 +81,15 @@ async def run_to_completion(app: CayuApp, request: RunRequest) -> RunOutcome:
     status = SessionStatus.INTERRUPTED
     error: str | None = None
     structured_output: StructuredOutputResult | None = None
+    interaction_id: str | None = None
     session_id = request.session_id or ""
 
     try:
         async for event in app.run(request):
             events.append(event)
             session_id = event.session_id
+            if event.interaction_id is not None:
+                interaction_id = event.interaction_id
             payload = event.payload or {}
             # EventType is a StrEnum — compare with == never `is` (see the note on Event.type).
             if event.type == EventType.MODEL_STARTED:
@@ -121,4 +127,5 @@ async def run_to_completion(app: CayuApp, request: RunRequest) -> RunOutcome:
         error=error,
         events=tuple(events),
         structured_output=structured_output,
+        interaction_id=interaction_id,
     )

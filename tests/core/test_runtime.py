@@ -193,6 +193,7 @@ from cayu.runtime import (
     ToolRoundIdentity,
     ToolRoundRecoveryRequest,
     TranscriptDigestCompactor,
+    TranscriptQuery,
     UsageTriggeredContextPolicy,
     UserInputResponse,
     default_compaction_prompt,
@@ -1248,8 +1249,37 @@ class FailBeforeStopPolicy(LoopPolicy):
         return BeforeStopDecision.fail("completion gate failed")
 
 
+_INTERACTION_LIFECYCLE_EVENT_TYPES = {
+    EventType.INTERACTION_STARTED,
+    EventType.INTERACTION_RESUMED,
+    EventType.INTERACTION_PAUSED,
+    EventType.INTERACTION_COMPLETED,
+    EventType.INTERACTION_FAILED,
+    EventType.INTERACTION_INTERRUPTED,
+}
+
+
+def _without_interaction_lifecycle(events: list[Event]) -> list[Event]:
+    """Keep legacy event-sequence assertions focused on their original contract."""
+    return [event for event in events if event.type not in _INTERACTION_LIFECYCLE_EVENT_TYPES]
+
+
+def _assert_events_share_one_interaction(*event_batches: list[Event]) -> str:
+    interaction_ids = {
+        event.interaction_id
+        for events in event_batches
+        for event in events
+        if event.type is not EventType.TURN_COMPLETED
+    }
+    assert len(interaction_ids) == 1
+    interaction_id = next(iter(interaction_ids))
+    assert interaction_id is not None
+    return interaction_id
+
+
 async def collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
-    return [event async for event in app.run(request)]
+    events = [event async for event in app.run(request)]
+    return _without_interaction_lifecycle(events)
 
 
 def tool_round_identity_payload(event: Event) -> dict[str, str]:
@@ -1267,7 +1297,8 @@ def _tool_round_identity() -> ToolRoundIdentity:
 
 
 async def collect_resume_events(app: CayuApp, request: ResumeRequest) -> list[Event]:
-    return [event async for event in app.resume(request)]
+    events = [event async for event in app.resume(request)]
+    return _without_interaction_lifecycle(events)
 
 
 def assert_model_step_limit_interruption(
@@ -3405,7 +3436,8 @@ async def collect_fork_events(app: CayuApp, request: ForkSessionRequest) -> list
 
 
 async def collect_dispatch_events(app: CayuApp, request: DispatchRequest) -> list[Event]:
-    return [event async for event in app.dispatch_inline(request)]
+    events = [event async for event in app.dispatch_inline(request)]
+    return _without_interaction_lifecycle(events)
 
 
 async def submit_dispatch(app: CayuApp, request: DispatchRequest) -> DispatchHandle:
@@ -3416,28 +3448,32 @@ async def collect_tool_approval_events(
     app: CayuApp,
     request: ToolApprovalRequest,
 ) -> list[Event]:
-    return [event async for event in app.resolve_tool_approval(request)]
+    events = [event async for event in app.resolve_tool_approval(request)]
+    return _without_interaction_lifecycle(events)
 
 
 async def collect_user_input_events(
     app: CayuApp,
     response: UserInputResponse,
 ) -> list[Event]:
-    return [event async for event in app.resolve_user_input(response)]
+    events = [event async for event in app.resolve_user_input(response)]
+    return _without_interaction_lifecycle(events)
 
 
 async def collect_tool_approval_recovery_events(
     app: CayuApp,
     request: ToolApprovalRecoveryRequest,
 ) -> list[Event]:
-    return [event async for event in app.recover_tool_approval(request)]
+    events = [event async for event in app.recover_tool_approval(request)]
+    return _without_interaction_lifecycle(events)
 
 
 async def collect_tool_round_recovery_events(
     app: CayuApp,
     request: ToolRoundRecoveryRequest,
 ) -> list[Event]:
-    return [event async for event in app.recover_tool_round(request)]
+    events = [event async for event in app.recover_tool_round(request)]
+    return _without_interaction_lifecycle(events)
 
 
 def _test_session() -> Session:
@@ -3718,6 +3754,8 @@ def test_environment_factory_completion_payload_is_isolated_from_started_event()
                 messages=[Message.text("user", "run")],
             )
         )
+        interaction_started = await anext(stream)
+        assert interaction_started.type == EventType.INTERACTION_STARTED
         started = await anext(stream)
         started.payload["factory_type"] = "consumer-spoof"
         started.payload["consumer_only"] = True
@@ -4092,9 +4130,18 @@ def test_cayu_app_environment_factory_failure_fails_session_before_start_event(t
             ),
         )
         session = await store.load("sess_factory_fail")
-        return events, session, factory, provider
+        transcript = await store.query_transcript(
+            TranscriptQuery(session_id="sess_factory_fail", interaction_id=None)
+        )
+        lifecycle = await store.query_events(
+            EventQuery(
+                session_id="sess_factory_fail",
+                event_type=EventType.INTERACTION_FAILED,
+            )
+        )
+        return events, session, factory, provider, transcript, lifecycle
 
-    events, session, factory, provider = asyncio.run(run())
+    events, session, factory, provider, transcript, lifecycle = asyncio.run(run())
 
     assert session is not None
     assert session.status == SessionStatus.FAILED
@@ -4109,6 +4156,86 @@ def test_cayu_app_environment_factory_failure_fails_session_before_start_event(t
     assert events[2].payload["error_type"] == "RuntimeError"
     assert len(factory.requests) == 1
     assert provider.requests == []
+    assert [record.message for record in transcript.records] == [Message.text("user", "run")]
+    assert transcript.records[0].interaction_id is not None
+    from cayu.runtime.interactions import InteractionSummaryEvidence
+
+    evidence = InteractionSummaryEvidence.model_validate(lifecycle[0].event.payload)
+    assert evidence.source_transcript_start == 0
+    assert evidence.source_transcript_end == 0
+
+
+def test_cayu_app_resume_factory_failure_retains_atomic_source_input(tmp_path):
+    async def run():
+        store = InMemorySessionStore()
+        workspace_root = tmp_path / "resume-factory"
+        workspace_root.mkdir()
+        factory = RecordingEnvironmentFactory(
+            Environment(
+                EnvironmentSpec(name="dynamic"),
+                workspace=LocalWorkspace(
+                    workspace_root,
+                    workspace_id="resume-factory-workspace",
+                ),
+            )
+        )
+        provider = FakeProvider(
+            [
+                ModelStreamEvent.text_delta("first response"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_resume_factory_fail",
+                messages=[Message.text("user", "first request")],
+            ),
+        )
+        factory.fail_create = True
+        await collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_resume_factory_fail",
+                messages=[Message.text("user", "exact resume request")],
+            ),
+        )
+        session = await store.load("sess_resume_factory_fail")
+        assert session is not None
+        interactions = await store.query_latest_interaction_events(session.id, limit=10)
+        latest_interaction_id = interactions[0].event.interaction_id
+        assert latest_interaction_id is not None
+        transcript = await store.query_transcript(
+            TranscriptQuery(
+                session_id=session.id,
+                interaction_id=latest_interaction_id,
+            )
+        )
+        return session, provider, transcript, interactions[0]
+
+    session, provider, transcript, latest = asyncio.run(run())
+
+    assert session.status is SessionStatus.FAILED
+    assert len(provider.requests) == 1
+    assert [record.message for record in transcript.records] == [
+        Message.text("user", "exact resume request")
+    ]
+    assert latest.event.type is EventType.INTERACTION_FAILED
+    from cayu.runtime.interactions import InteractionSummaryEvidence
+
+    evidence = InteractionSummaryEvidence.model_validate(latest.event.payload)
+    assert evidence.source_transcript_start == transcript.records[0].index
+    assert evidence.source_transcript_end == transcript.records[0].index
 
 
 def test_cayu_app_environment_factory_failure_fails_worker_claimed_task(tmp_path):
@@ -4383,7 +4510,7 @@ def test_cayu_app_releases_run_fence_when_pre_run_failure_recording_fails(tmp_pa
     assert session.run_epoch == 2
 
 
-def test_cayu_app_releases_run_fence_when_initial_message_projection_fails(monkeypatch):
+def test_cayu_app_terminalizes_interaction_when_initial_message_projection_fails(monkeypatch):
     store = InMemorySessionStore()
     app = CayuApp(session_store=store, enable_logging=False)
     app.register_provider(FakeProvider([]), default=True)
@@ -4396,24 +4523,36 @@ def test_cayu_app_releases_run_fence_when_initial_message_projection_fails(monke
         session_engine_module.transcript_helpers, "initial_messages", fail_initial_messages
     )
 
-    async def run() -> Session:
-        with pytest.raises(RuntimeError, match="initial message projection unavailable"):
-            await collect_events(
-                app,
-                RunRequest(
-                    agent_name="assistant",
-                    session_id="sess_initial_message_failure",
-                    messages=[Message.text("user", "run")],
-                ),
-            )
+    async def run() -> tuple[Session, list[Event], list[Message], list[EventRecord]]:
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_initial_message_failure",
+                messages=[Message.text("user", "run")],
+            ),
+        )
         session = await store.load("sess_initial_message_failure")
         assert session is not None
-        return session
+        transcript = await store.load_transcript(session.id)
+        lifecycle = await store.query_events(
+            EventQuery(
+                session_id=session.id,
+                event_types=(EventType.INTERACTION_STARTED, EventType.INTERACTION_FAILED),
+            )
+        )
+        return session, events, transcript, lifecycle
 
-    session = asyncio.run(run())
+    session, events, transcript, lifecycle = asyncio.run(run())
 
-    assert session.status == SessionStatus.RUNNING
+    assert session.status == SessionStatus.FAILED
     assert session.run_epoch == 2
+    assert [event.type for event in events] == [EventType.SESSION_FAILED]
+    assert transcript == [Message.text("user", "run")]
+    assert [record.event.type for record in lifecycle] == [
+        EventType.INTERACTION_STARTED,
+        EventType.INTERACTION_FAILED,
+    ]
 
 
 def test_cayu_app_environment_factory_failure_runs_failed_session_hooks(tmp_path):
@@ -5429,15 +5568,13 @@ def test_cayu_app_resume_uses_stored_factory_backed_environment(tmp_path):
                 messages=[Message.text("user", "run tool")],
             ),
         )
-        resume_events = [
-            event
-            async for event in app.resume(
-                ResumeRequest(
-                    session_id="sess_factory_resume",
-                    messages=[Message.text("user", "run again")],
-                )
-            )
-        ]
+        resume_events = await collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_factory_resume",
+                messages=[Message.text("user", "run again")],
+            ),
+        )
         return run_events, resume_events, factory, dynamic_workspace
 
     run_events, resume_events, factory, dynamic_workspace = asyncio.run(run())
@@ -6038,6 +6175,8 @@ def test_environment_binding_completion_payload_is_isolated_from_started_event()
                 messages=[Message.text("user", "run")],
             )
         )
+        interaction_started = await anext(stream)
+        assert interaction_started.type == EventType.INTERACTION_STARTED
         started = await anext(stream)
         started.payload["binding_type"] = "consumer-spoof"
         started.payload["consumer_only"] = True
@@ -6828,16 +6967,14 @@ def test_cayu_app_binds_environment_for_approved_tool_continuation(tmp_path):
             event for event in first_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
         )
         approval_id = approval_event.payload["approval"]["approval_id"]
-        approved_events = [
-            event
-            async for event in app.resolve_tool_approval(
-                ToolApprovalRequest(
-                    session_id="sess_binding_approval",
-                    approval_id=approval_id,
-                    decision=ToolApprovalDecision.APPROVE,
-                )
-            )
-        ]
+        approved_events = await collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_binding_approval",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+            ),
+        )
         return first_events, approved_events, binding, bound_workspace
 
     first_events, approved_events, binding, bound_workspace = asyncio.run(run())
@@ -6930,16 +7067,14 @@ def test_cayu_app_validates_tool_approval_retry_before_binding(tmp_path):
             ),
         )
 
-        retry_events = [
-            event
-            async for event in app.resolve_tool_approval(
-                ToolApprovalRequest(
-                    session_id="sess_binding_invalid_approval_retry",
-                    approval_id=approval_id,
-                    decision=ToolApprovalDecision.APPROVE,
-                )
-            )
-        ]
+        retry_events = await collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_binding_invalid_approval_retry",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+            ),
+        )
         session = await store.load("sess_binding_invalid_approval_retry")
         return (
             retry_events,
@@ -7032,16 +7167,14 @@ def test_cayu_app_validates_tool_approval_retry_before_factory_resolution(tmp_pa
             ),
         )
 
-        retry_events = [
-            event
-            async for event in app.resolve_tool_approval(
-                ToolApprovalRequest(
-                    session_id="sess_factory_invalid_approval_retry",
-                    approval_id=approval_id,
-                    decision=ToolApprovalDecision.APPROVE,
-                )
-            )
-        ]
+        retry_events = await collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_factory_invalid_approval_retry",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+            ),
+        )
         session = await store.load("sess_factory_invalid_approval_retry")
         return retry_events, session, factory, factory_calls_after_interrupt
 
@@ -7380,12 +7513,12 @@ def test_cayu_app_runs_text_only_session_and_persists_events():
     assert provider.requests[0].model == "fake-model"
     assert provider.requests[0].messages[0].content[0].text == "hi"
     assert provider.requests[0].tools == []
-    assert sink.events == events
+    assert _without_interaction_lifecycle(sink.events) == events
 
     persisted = asyncio.run(store.load_events("sess_text"))
     session = asyncio.run(store.load("sess_text"))
 
-    assert persisted == events
+    assert _without_interaction_lifecycle(persisted) == events
     assert session is not None
     assert session.status == SessionStatus.COMPLETED
     assert session.provider_name == "fake"
@@ -14072,6 +14205,8 @@ def test_dispatch_inline_cleanup_failure_has_one_forwarding_owner() -> None:
                 messages=[Message.text("user", "run dispatched work")],
             )
         )
+        interaction_event = await anext(stream)
+        assert interaction_event.type == EventType.INTERACTION_STARTED
         first_event = await anext(stream)
         assert first_event.type == EventType.SESSION_RESUMED
 
@@ -18014,6 +18149,16 @@ def test_subagent_tool_interrupts_child_session_during_startup_window():
             self.child_running = asyncio.Event()
             self.release_child_startup = asyncio.Event()
 
+        async def create(self, request, *, identity, **kwargs) -> Session:
+            session = await super().create(request, identity=identity, **kwargs)
+            if (
+                session.parent_session_id == "sess_subagent_parent_startup_interrupt"
+                and session.status is SessionStatus.RUNNING
+            ):
+                self.child_running.set()
+                await self.release_child_startup.wait()
+            return session
+
         async def transition_status(
             self,
             session_id: str,
@@ -18041,12 +18186,14 @@ def test_subagent_tool_interrupts_child_session_during_startup_window():
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
             checkpoint_transform,
+            **kwargs,
         ) -> Session:
             session = await super().transition_status_and_checkpoint(
                 session_id,
                 from_statuses=from_statuses,
                 to_status=to_status,
                 checkpoint_transform=checkpoint_transform,
+                **kwargs,
             )
             if (
                 session.parent_session_id == "sess_subagent_parent_startup_interrupt"
@@ -18292,7 +18439,7 @@ def test_cayu_app_dispatch_returns_inline_handle():
         session_id="sess_dispatch_handle",
         backend="inline",
         status=DispatchStatus.COMPLETED,
-        metadata={"events": 6},
+        metadata={"events": 8},
     )
     assert [message.content[0].text for message in provider.requests[1].messages] == [
         "first request",
@@ -20309,7 +20456,12 @@ def test_cayu_app_resume_releases_run_fence_when_setup_is_cancelled():
     app.register_provider(FakeProvider([]), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    async def setup_and_resume() -> tuple[Session, list[Event]]:
+    async def setup_and_resume() -> tuple[
+        Session,
+        list[Message],
+        list[EventRecord],
+        list[Event],
+    ]:
         await store.create(
             RunRequest(
                 agent_name="assistant",
@@ -20330,13 +20482,24 @@ def test_cayu_app_resume_releases_run_fence_when_setup_is_cancelled():
             )
         session = await store.load("sess_resume_setup_cancel")
         assert session is not None
+        store.cancel_load = False
+        transcript = await store.load_transcript(session.id)
+        interactions = await store.query_events(
+            EventQuery(
+                session_id=session.id,
+                event_type=EventType.INTERACTION_STARTED,
+            )
+        )
         events = await store.load_events("sess_resume_setup_cancel")
-        return session, events
+        return session, transcript, interactions, events
 
-    session, events = asyncio.run(setup_and_resume())
+    session, transcript, interactions, events = asyncio.run(setup_and_resume())
 
     assert session.status == SessionStatus.INTERRUPTED
     assert session.run_epoch == 2
+    assert transcript == [Message.text("user", "continue")]
+    assert len(interactions) == 1
+    assert interactions[0].event.interaction_id is not None
     interrupted = [event for event in events if event.type == EventType.SESSION_INTERRUPTED]
     assert len(interrupted) == 1
     assert interrupted[0].payload["abandoned"] is True
@@ -20752,6 +20915,39 @@ def test_cayu_app_fails_task_when_run_fails():
     }
 
 
+def test_cayu_app_live_stream_includes_failed_interaction_terminal_before_turn_completed():
+    session_id = "sess_live_failed_interaction"
+    store = InMemorySessionStore()
+    provider = FakeProvider([ModelStreamEvent.error("provider down")])
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def run() -> tuple[list[Event], list[Event]]:
+        live = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "hi")],
+                )
+            )
+        ]
+        return live, await store.load_events(session_id)
+
+    live, durable = asyncio.run(run())
+    live_failed = [event for event in live if event.type == EventType.INTERACTION_FAILED]
+    durable_failed = [event for event in durable if event.type == EventType.INTERACTION_FAILED]
+
+    assert live_failed == durable_failed
+    assert len(live_failed) == 1
+    live_types = [event.type for event in live]
+    assert live_types.index(EventType.INTERACTION_FAILED) < live_types.index(
+        EventType.TURN_COMPLETED
+    )
+
+
 def test_cayu_app_retries_retryable_model_error_before_tool_side_effects():
     store = InMemorySessionStore()
     tool = SideEffectTool()
@@ -20798,6 +20994,9 @@ def test_cayu_app_retries_retryable_model_error_before_tool_side_effects():
         )
     )
     transcript = asyncio.run(store.load_transcript("sess_retry_before_tool"))
+    interaction = asyncio.run(
+        store.query_latest_interaction_events("sess_retry_before_tool", limit=1)
+    )[0].event
 
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
@@ -20833,6 +21032,13 @@ def test_cayu_app_retries_retryable_model_error_before_tool_side_effects():
     ]
     assert transcript[1].content[0].type == "tool_call"
     assert transcript[1].content[0].tool_call_id == "call_successful_attempt"
+    from cayu.runtime.interactions import InteractionSummaryEvidence
+
+    evidence = InteractionSummaryEvidence.model_validate(interaction.payload)
+    assert evidence.model_step_count == 3
+    assert evidence.tool_call_count == 1
+    assert evidence.provider_names == ["fake"]
+    assert evidence.models == ["fake-model"]
 
 
 def test_cayu_app_does_not_retry_without_retry_policy():
@@ -21635,6 +21841,30 @@ def test_cayu_app_recovers_pending_tool_round_from_recorded_terminal_event():
     assert provider.requests[1].messages[-3].role == "assistant"
     assert provider.requests[1].messages[-2].role == "tool"
     assert provider.requests[1].messages[-1].content[0].text == "continue"
+
+    lifecycle = asyncio.run(
+        store.query_events(
+            EventQuery(
+                session_id="sess_tool_round_recover_recorded",
+                event_types=tuple(_INTERACTION_LIFECYCLE_EVENT_TYPES),
+            )
+        )
+    )
+    interaction_ids = {record.event.interaction_id for record in lifecycle}
+    assert len(interaction_ids) == 1
+    assert None not in interaction_ids
+    lifecycle_types = [record.event.type for record in lifecycle]
+    assert lifecycle_types.count(EventType.INTERACTION_STARTED) == 1
+    assert EventType.INTERACTION_PAUSED in lifecycle_types
+    assert EventType.INTERACTION_RESUMED in lifecycle_types
+    assert lifecycle_types[-1] is EventType.INTERACTION_COMPLETED
+
+    attributed_transcript = asyncio.run(
+        store.query_transcript(
+            TranscriptQuery(session_id="sess_tool_round_recover_recorded", limit=10)
+        )
+    )
+    assert {record.interaction_id for record in attributed_transcript.records} == interaction_ids
 
 
 def test_cayu_app_recovers_legacy_failed_policy_outcome_without_reexecution():
@@ -25532,6 +25762,193 @@ def test_cayu_app_recovery_does_not_complete_abandoned_end_turn_false_step():
     assert transcript[-1].content[0].text == "I am still working."
 
 
+def test_cayu_app_recovery_terminalizes_the_original_durable_interaction():
+    from cayu.runtime.interactions import InteractionStatus, InteractionSummaryEvidence
+
+    store = InMemorySessionStore()
+    started_at = datetime.now(UTC) - timedelta(seconds=5)
+    recovered_at = started_at + timedelta(seconds=10)
+    app = CayuApp(session_store=store, clock=lambda: recovered_at)
+    app.register_provider(FakeProvider([]), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    interaction_id = "interaction-before-crash"
+    start_event = Event(
+        id="interaction-before-crash-started",
+        type=EventType.INTERACTION_STARTED,
+        session_id="sess_recovered_interaction",
+        interaction_id=interaction_id,
+        timestamp=started_at,
+        payload=InteractionSummaryEvidence(
+            status=InteractionStatus.ACTIVE,
+            start_event_id="interaction-before-crash-started",
+            started_at=started_at,
+        ).model_dump(mode="json"),
+    )
+
+    async def setup_and_recover():
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_recovered_interaction",
+                messages=[Message.text("user", "start")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status("sess_recovered_interaction", SessionStatus.RUNNING)
+        await store.append_event("sess_recovered_interaction", start_event)
+        await store.append_event(
+            "sess_recovered_interaction",
+            Event(
+                id="interaction-before-crash-model-started",
+                type=EventType.MODEL_STARTED,
+                session_id="sess_recovered_interaction",
+                interaction_id=interaction_id,
+                timestamp=started_at + timedelta(seconds=2),
+            ),
+        )
+        return await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id="sess_recovered_interaction")
+        )
+
+    result = asyncio.run(setup_and_recover())
+    lifecycle = asyncio.run(
+        store.query_events(
+            EventQuery(
+                session_id="sess_recovered_interaction",
+                interaction_id=interaction_id,
+                event_types=(
+                    EventType.INTERACTION_STARTED,
+                    EventType.INTERACTION_INTERRUPTED,
+                ),
+            )
+        )
+    )
+
+    assert [record.event.type for record in lifecycle] == [
+        EventType.INTERACTION_STARTED,
+        EventType.INTERACTION_INTERRUPTED,
+    ]
+    assert [event.type for event in result.events] == [
+        EventType.INTERACTION_INTERRUPTED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    evidence = InteractionSummaryEvidence.model_validate(lifecycle[-1].event.payload)
+    assert evidence.status == InteractionStatus.INTERRUPTED
+    assert evidence.completed_at is not None
+    assert evidence.active_duration_ms == 2_000
+    assert evidence.wall_duration_ms == 10_000
+
+
+def test_reactivating_same_interaction_does_not_reset_active_segment(monkeypatch):
+    from cayu.runtime.interactions import InteractionStatus, InteractionSummaryEvidence
+
+    monotonic = {"value": 10.0}
+    wall = {"value": datetime(2026, 7, 27, tzinfo=UTC)}
+    monkeypatch.setattr(session_engine_module.time, "monotonic", lambda: monotonic["value"])
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False, clock=lambda: wall["value"])
+    app.register_provider(FakeProvider([]), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def exercise() -> Event:
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_interaction_reactivation_timing",
+                messages=[Message.text("user", "start")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        session = await store.transition_status(
+            session.id,
+            from_statuses={SessionStatus.PENDING},
+            to_status=SessionStatus.RUNNING,
+        )
+        sessions_module._activate_session_interaction(session.id, "interaction-timing")
+        registered_agent = app._get_registered_agent("assistant")
+        await app._session_engine._emit_interaction_started(
+            session=session,
+            registered_agent=registered_agent,
+            environment_name=None,
+        )
+        monotonic["value"] = 15.0
+        sessions_module._activate_session_interaction(session.id, "interaction-timing")
+        monotonic["value"] = 20.0
+        wall["value"] += timedelta(seconds=10)
+        paused = await app._session_engine._emit_interaction_state(
+            session=session,
+            registered_agent=registered_agent,
+            environment_name=None,
+            event_type=EventType.INTERACTION_PAUSED,
+            status=InteractionStatus.PAUSED,
+            pending_action_kind="tool_approval",
+        )
+        assert paused is not None
+        await store.release_run_fence(session.id)
+        sessions_module._deactivate_session_interaction(session.id)
+        return paused
+
+    evidence = InteractionSummaryEvidence.model_validate(asyncio.run(exercise()).payload)
+    assert evidence.active_duration_ms == 10_000
+
+
+def test_interaction_summary_pages_more_than_5000_usage_events_without_failing():
+    from cayu.runtime.interactions import InteractionStatus, InteractionSummaryEvidence
+
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(FakeProvider([]), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def exercise() -> Event:
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_large_interaction",
+                messages=[Message.text("user", "count tools")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        session = await store.transition_status(
+            session.id,
+            from_statuses={SessionStatus.PENDING},
+            to_status=SessionStatus.RUNNING,
+        )
+        sessions_module._activate_session_interaction(session.id, "interaction-large")
+        registered_agent = app._get_registered_agent("assistant")
+        await app._session_engine._emit_interaction_started(
+            session=session,
+            registered_agent=registered_agent,
+            environment_name=None,
+        )
+        await store.append_events(
+            session.id,
+            [
+                Event(
+                    id=f"large-tool-{index}",
+                    type=EventType.TOOL_CALL_STARTED,
+                    session_id=session.id,
+                    interaction_id="interaction-large",
+                )
+                for index in range(5001)
+            ],
+        )
+        completed = await app._session_engine._emit_interaction_state(
+            session=session,
+            registered_agent=registered_agent,
+            environment_name=None,
+            event_type=EventType.INTERACTION_COMPLETED,
+            status=InteractionStatus.COMPLETED,
+        )
+        assert completed is not None
+        await store.release_run_fence(session.id)
+        return completed
+
+    completed = asyncio.run(exercise())
+    evidence = InteractionSummaryEvidence.model_validate(completed.payload)
+    assert evidence.tool_call_count == 5001
+
+
 def test_cayu_app_recover_incomplete_session_skips_terminal_without_registered_agent():
     store = InMemorySessionStore()
     app = CayuApp(session_store=store)
@@ -26292,6 +26709,56 @@ def test_cayu_app_recover_incomplete_sessions_can_include_abandoned_running_and_
             (IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,),
         ),
     }
+
+
+def test_cayu_app_batch_recovery_attributes_repairs_before_terminal_reconciliation():
+    from cayu.runtime.interactions import InteractionStatus, InteractionSummaryEvidence
+
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store)
+    app.register_provider(FakeProvider([]), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    interaction_id = "interaction-batch-recovery"
+
+    async def setup_and_recover():
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_batch_interaction",
+                messages=[Message.text("user", "start")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status("sess_batch_interaction", SessionStatus.RUNNING)
+        started_at = datetime.now(UTC) - timedelta(seconds=1)
+        started = Event(
+            id="interaction-batch-recovery-start",
+            type=EventType.INTERACTION_STARTED,
+            session_id="sess_batch_interaction",
+            interaction_id=interaction_id,
+            timestamp=started_at,
+            payload=InteractionSummaryEvidence(
+                status=InteractionStatus.ACTIVE,
+                start_event_id="interaction-batch-recovery-start",
+                started_at=started_at,
+            ).model_dump(mode="json"),
+        )
+        await store.append_event("sess_batch_interaction", started)
+        results = await app.recover_incomplete_sessions(
+            IncompleteSessionsRecoveryRequest(
+                statuses={SessionStatus.RUNNING},
+                limit=10,
+            )
+        )
+        return results, await store.load_events("sess_batch_interaction")
+
+    results, events = asyncio.run(setup_and_recover())
+
+    assert results[0].actions == (IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,)
+    recovery_events = [event for event in events if event.id != "interaction-batch-recovery-start"]
+    assert recovery_events
+    assert all(event.interaction_id == interaction_id for event in recovery_events)
+    assert [event.type for event in events].count(EventType.INTERACTION_INTERRUPTED) == 1
 
 
 def test_cayu_app_recover_incomplete_sessions_skips_unregistered_agent_and_continues():
@@ -27327,6 +27794,7 @@ def test_tool_approval_denial_events_carry_resolved_by_actor():
     )
 
     denied = next(event for event in events if event.type == EventType.TOOL_CALL_APPROVAL_DENIED)
+    _assert_events_share_one_interaction(interrupt_events, events)
     assert denied.payload["resolved_by"]["subject"] == "reviewer@example.com"
     assert denied.payload["resolved_by"]["source"] == "request"
     assert denied.payload["expired"] is False
@@ -27405,6 +27873,7 @@ def test_expired_tool_approval_resolves_as_deterministic_denial():
     assert expired_event.payload["triggered_by"]["subject"] == "reviewer@example.com"
 
     denied = next(event for event in events if event.type == EventType.TOOL_CALL_APPROVAL_DENIED)
+    _assert_events_share_one_interaction(interrupt_events, events)
     assert denied.payload["expired"] is True
     assert "expired at" in denied.payload["reason"]
     assert denied.payload["resolved_by"]["source"] == "system"
@@ -27572,6 +28041,7 @@ def test_expired_approval_retry_after_recorded_grant_is_not_coerced():
 
     assert not any(event.type == EventType.TOOL_CALL_APPROVAL_EXPIRED for event in events)
     assert not any(event.type == EventType.TOOL_CALL_APPROVAL_DENIED for event in events)
+    _assert_events_share_one_interaction(interrupt_events, events)
     assert tool.calls == [{"value": "secret"}]
     assert events[-1].type == EventType.SESSION_COMPLETED
 
@@ -43697,7 +44167,7 @@ def test_workspace_instruction_file_config_rejects_paths_outside_workspace():
         WorkspaceInstructionsConfig(paths=("../AGENTS.md",))
 
 
-def test_cayu_app_rejects_oversized_workspace_instructions_before_session_create(tmp_path):
+def test_workspace_instruction_failure_terminalizes_admitted_interaction(tmp_path):
     (tmp_path / "AGENTS.md").write_text("too long")
     provider = FakeProvider(
         [
@@ -43720,21 +44190,51 @@ def test_cayu_app_rejects_oversized_workspace_instructions_before_session_create
     )
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    with pytest.raises(ValueError, match="exceeds 3 bytes"):
-        asyncio.run(
-            collect_events(
-                app,
+    async def run() -> list[Event]:
+        return [
+            event
+            async for event in app.run(
                 RunRequest(
                     agent_name="assistant",
                     session_id="sess_oversized_workspace_instructions",
                     messages=[Message.text("user", "hi")],
-                ),
+                )
             )
-        )
+        ]
+
+    events = asyncio.run(run())
 
     session = asyncio.run(app.session_store.load("sess_oversized_workspace_instructions"))
-    assert session is None
+    assert session is not None
+    assert session.status is SessionStatus.FAILED
     assert provider.requests == []
+    lifecycle = [
+        event
+        for event in events
+        if event.type
+        in {
+            EventType.INTERACTION_STARTED,
+            EventType.INTERACTION_FAILED,
+        }
+    ]
+    assert [event.type for event in lifecycle] == [
+        EventType.INTERACTION_STARTED,
+        EventType.INTERACTION_FAILED,
+    ]
+    interaction_id = lifecycle[0].interaction_id
+    assert interaction_id is not None
+    assert lifecycle[1].interaction_id == interaction_id
+    transcript = asyncio.run(
+        app.session_store.query_transcript(
+            TranscriptQuery(
+                session_id=session.id,
+                interaction_id=interaction_id,
+            )
+        )
+    )
+    assert [record.message for record in transcript.records] == [Message.text("user", "hi")]
+    assert events[-1].type is EventType.SESSION_FAILED
+    assert events[-1].payload["error_type"] == "ValueError"
 
 
 @pytest.mark.parametrize("system_prompt", [None, "", "   "])
@@ -46494,6 +46994,9 @@ def test_cayu_app_retries_structured_output_with_durable_repair_prompt():
         )
     )
     transcript = asyncio.run(store.load_transcript("sess_structured_output_retry"))
+    interaction_record = asyncio.run(
+        store.query_latest_interaction_events("sess_structured_output_retry", limit=1)
+    )[0]
 
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
@@ -46530,6 +47033,19 @@ def test_cayu_app_retries_structured_output_with_durable_repair_prompt():
     assert "Validation errors:" in repair_message
     assert provider.requests[1].messages[-1].role == "user"
     assert provider.requests[1].messages[-1].content[0].text == repair_message
+    from cayu.runtime.interactions import InteractionSummaryEvidence
+
+    evidence = InteractionSummaryEvidence.model_validate(interaction_record.event.payload)
+    assert evidence.model_step_count == 2
+    transcript_records = asyncio.run(
+        store.query_transcript(
+            TranscriptQuery(
+                session_id="sess_structured_output_retry",
+                interaction_id=interaction_record.event.interaction_id,
+            )
+        )
+    )
+    assert len(transcript_records.records) == len(transcript)
 
 
 def test_cayu_app_fails_structured_output_after_retries_exhausted():

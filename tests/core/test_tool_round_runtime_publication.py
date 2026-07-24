@@ -320,6 +320,10 @@ def test_pending_tool_round_recovery_does_not_retry_precommit_rejection() -> Non
     first_checkpoint = asyncio.run(store.load_checkpoint(session_id))
     assert first_checkpoint is not None
     assert first_checkpoint["pending_tool_round"]["tool_round_id"] == round_id
+    assert Message.text("user", "continue") not in asyncio.run(store.load_transcript(session_id))
+    deferred = asyncio.run(store.load_deferred_interaction_input(session_id))
+    assert deferred is not None
+    assert deferred.source_messages == [Message.text("user", "continue")]
 
     second_resume = asyncio.run(
         collect_resume_events(
@@ -335,6 +339,13 @@ def test_pending_tool_round_recovery_does_not_retry_precommit_rejection() -> Non
     assert tool.calls == [{}]
     transcript = asyncio.run(store.load_transcript(session_id))
     assert sum(message.role == "tool" for message in transcript) == 1
+    tool_result_index = next(
+        index for index, message in enumerate(transcript) if message.role == "tool"
+    )
+    assert transcript[tool_result_index + 1 : tool_result_index + 3] == [
+        Message.text("user", "continue"),
+        Message.text("user", "retry recovery"),
+    ]
 
 
 def test_pending_tool_round_recovery_preserves_cancellation_after_exact_replay() -> None:

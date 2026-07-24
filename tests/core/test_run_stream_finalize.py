@@ -117,6 +117,50 @@ def _assert_turn_completed_before_abandoned_terminal(events: list[Event]) -> Non
     assert turn.payload["status"] == "interrupted"
 
 
+async def _expect_session_started(stream: AsyncIterator[Event]) -> Event:
+    interaction_event = await anext(stream)
+    assert interaction_event.type == EventType.INTERACTION_STARTED
+    session_event = await anext(stream)
+    assert session_event.type == EventType.SESSION_STARTED
+    return session_event
+
+
+def test_abandoned_setup_stream_terminalizes_started_interaction() -> None:
+    h = _build([_batch("unreached")])
+
+    async def scenario() -> tuple[list[Event], list[Message]]:
+        stream = h.app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_abandoned_setup",
+                messages=[Message.text("user", "hello")],
+            )
+        )
+        started = await anext(stream)
+        assert started.type == EventType.INTERACTION_STARTED
+        await stream.aclose()
+        return (
+            await h.store.load_events("sess_abandoned_setup"),
+            await h.store.load_transcript("sess_abandoned_setup"),
+        )
+
+    events, transcript = asyncio.run(scenario())
+
+    session = asyncio.run(h.store.load("sess_abandoned_setup"))
+    assert session is not None
+    assert session.status == SessionStatus.INTERRUPTED
+    assert [
+        event.type
+        for event in events
+        if event.type in {EventType.INTERACTION_STARTED, EventType.INTERACTION_INTERRUPTED}
+    ] == [EventType.INTERACTION_STARTED, EventType.INTERACTION_INTERRUPTED]
+    event_types = [event.type for event in events]
+    assert event_types.index(EventType.INTERACTION_INTERRUPTED) < event_types.index(
+        EventType.SESSION_INTERRUPTED
+    )
+    assert transcript == [Message.text("user", "hello")]
+
+
 def test_abandoned_run_stream_finalizes_running_session() -> None:
     # The first provider batch is consumed by the post-abandon resume, proving the
     # abandoned run never reached the model and the session stayed resumable.
@@ -130,6 +174,8 @@ def test_abandoned_run_stream_finalizes_running_session() -> None:
                 messages=[Message.text("user", "hello")],
             )
         )
+        interaction_event = await anext(stream)
+        assert interaction_event.type == EventType.INTERACTION_STARTED
         first_event = await anext(stream)
         assert first_event.type == EventType.SESSION_STARTED
         # The consumer walks away mid-run (e.g. SSE client disconnect).
@@ -180,8 +226,7 @@ def test_injected_run_stream_exception_finalizes_before_return() -> None:
                 messages=[Message.text("user", "hello")],
             )
         )
-        first_event = await anext(stream)
-        assert first_event.type == EventType.SESSION_STARTED
+        await _expect_session_started(stream)
 
         injected = RuntimeError("consumer rejected run event")
         try:
@@ -219,8 +264,7 @@ def test_cleanup_cancellation_remains_authoritative_and_waits_for_release() -> N
                 messages=[Message.text("user", "hello")],
             )
         )
-        first_event = await anext(stream)
-        assert first_event.type == EventType.SESSION_STARTED
+        await _expect_session_started(stream)
 
         injected = RuntimeError("consumer rejected run event")
         throw_task = asyncio.create_task(stream.athrow(injected))
@@ -267,8 +311,7 @@ def test_cancellation_requested_before_cleanup_starts_remains_authoritative() ->
                 messages=[Message.text("user", "hello")],
             )
         )
-        first_event = await anext(stream)
-        assert first_event.type == EventType.SESSION_STARTED
+        await _expect_session_started(stream)
 
         async def cancel_then_close() -> None:
             current_task = asyncio.current_task()
@@ -402,8 +445,7 @@ def test_previously_delivered_cancellation_is_not_rediscovered_during_cleanup() 
                 messages=[Message.text("user", "hello")],
             )
         )
-        first_event = await anext(stream)
-        assert first_event.type == EventType.SESSION_STARTED
+        await _expect_session_started(stream)
 
         async def handle_cancellation_then_close() -> None:
             current_task = asyncio.current_task()
@@ -448,8 +490,7 @@ def test_cleanup_cancellation_preserves_release_failure_without_loop_report() ->
                     messages=[Message.text("user", "hello")],
                 )
             )
-            first_event = await anext(stream)
-            assert first_event.type == EventType.SESSION_STARTED
+            await _expect_session_started(stream)
 
             injected = RuntimeError("consumer rejected run event")
             throw_task = asyncio.create_task(stream.athrow(injected))
@@ -498,8 +539,7 @@ def test_wait_for_stream_resumption_retains_stale_run_fence() -> None:
                 messages=[Message.text("user", "hello")],
             )
         )
-        first_event = await asyncio.wait_for(anext(stream), timeout=5)
-        assert first_event.type == EventType.SESSION_STARTED
+        await asyncio.wait_for(_expect_session_started(stream), timeout=5)
         stale_owner = await h.store.load(session_id)
         assert stale_owner is not None
 
@@ -559,6 +599,8 @@ def test_abandoned_resume_stream_finalizes_running_session() -> None:
                 messages=[Message.text("user", "continue")],
             )
         )
+        interaction_event = await anext(stream)
+        assert interaction_event.type == EventType.INTERACTION_STARTED
         first_event = await anext(stream)
         assert first_event.type == EventType.SESSION_RESUMED
         await stream.aclose()

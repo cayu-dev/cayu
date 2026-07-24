@@ -544,7 +544,7 @@ class _KillpointSink(EventSink):
             await asyncio.Event().wait()
         if (
             self.killpoint == "subagent_child_started"
-            and event.type == EventType.SESSION_STARTED
+            and event.type == EventType.INTERACTION_STARTED
             and self.parent_session_id is not None
             and event.session_id.startswith(f"{self.parent_session_id}_subagent_")
         ):

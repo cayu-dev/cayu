@@ -19,6 +19,8 @@ from cayu.runtime.sessions import (
     PersistedEventSideEffectDelivery,
     PersistedEventSideEffectStatus,
     SessionStore,
+    attribute_event_to_current_interaction,
+    attribute_events_to_current_interaction,
     portable_persisted_event_side_effect_error,
 )
 from cayu.vaults.redaction import SecretRedactor
@@ -45,6 +47,7 @@ _EVENT_CONTROL_STRING_FIELDS = frozenset(
         "finish_reason",
         "idempotency_key",
         "input_id",
+        "pending_action_kind",
         "interruption_type",
         "is_error",
         "model_attempt_id",
@@ -61,7 +64,10 @@ _EVENT_CONTROL_STRING_FIELDS = frozenset(
         "scope",
         "session_id",
         "source",
+        "start_event_id",
+        "started_at",
         "status",
+        "completed_at",
         "step_classification",
         "strategy",
         "terminal_outcome",
@@ -101,25 +107,45 @@ _EVENT_SECRET_FREE_AUTHORITY_FIELDS = frozenset(
     }
 )
 _EVENT_PUBLIC_STRUCTURE_KEYS = _EVENT_CONTROL_STRING_FIELDS | {
+    "active_duration_ms",
     "arguments",
     "cache",
+    "cached_input_tokens",
     "completion",
     "content",
     "details",
     "error",
     "estimated_tool_schema_input_tokens",
     "failures",
+    "interaction_ids",
+    "input_tokens",
     "metadata",
+    "model_step_count",
+    "models",
     "provider_name",
     "provider_names",
     "raw_finish_reason",
     "reason",
     "result",
     "reasoning_output_tokens",
+    "read_tokens",
+    "result_transcript_end",
+    "result_transcript_start",
+    "source_transcript_end",
+    "source_transcript_start",
+    "start_event_sequence",
     "structured",
     "token_usage",
+    "total_tokens",
     "tool_call_count",
+    "uncached_input_tokens",
     "usage",
+    "wall_duration_ms",
+    "write_1h_tokens",
+    "write_5m_tokens",
+    "write_tokens",
+    "write_unknown_ttl_tokens",
+    "output_tokens",
 }
 
 logger = logging.getLogger(__name__)
@@ -162,7 +188,7 @@ class RuntimeEventWriter:
         self._secret_redactor = secret_redactor or SecretRedactor()
 
     async def emit(self, event: Event) -> Event:
-        event = self.prepare(event)
+        event = self.prepare(attribute_event_to_current_interaction(event))
         await self._session_store.append_event(event.session_id, event)
         claim = await self._session_store.claim_persisted_event_side_effect(
             session_id=event.session_id,
@@ -183,7 +209,7 @@ class RuntimeEventWriter:
         budget and sink delivery.
         """
 
-        event = self.prepare(event)
+        event = self.prepare(attribute_event_to_current_interaction(event))
         await self._session_store.append_event(event.session_id, event)
         return event.model_copy(deep=True)
 
@@ -242,7 +268,7 @@ class RuntimeEventWriter:
         if type(events) is not list:
             raise TypeError("Runtime events must be a list.")
         copied_events: list[Event] = []
-        for event in events:
+        for event in attribute_events_to_current_interaction(events):
             if type(event) is not Event:
                 raise TypeError("Runtime events must be Event instances.")
             if event.session_id != session_id:
@@ -454,6 +480,7 @@ class RuntimeEventWriter:
                             Event(
                                 type=EventType.RUNTIME_SINK_FAILED,
                                 session_id=event.session_id,
+                                interaction_id=event.interaction_id,
                                 agent_name=event.agent_name,
                                 environment_name=event.environment_name,
                                 payload={
@@ -482,7 +509,7 @@ class RuntimeEventWriter:
         """Return the event shape safe for durable or external publication."""
 
         return prepare_runtime_event(
-            event,
+            attribute_event_to_current_interaction(event),
             redactor=self._secret_redactor,
         )
 
