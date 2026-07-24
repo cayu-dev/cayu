@@ -6,8 +6,11 @@ import mimetypes
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from fnmatch import fnmatchcase
+from hashlib import sha256
+from itertools import islice
 from math import isfinite
 from pathlib import Path
 from types import MappingProxyType
@@ -239,6 +242,13 @@ RegisteredEnvironment = runtime_records.RegisteredEnvironment
 
 
 DEFAULT_MAX_PARALLEL_TOOL_CALLS = 4
+
+
+@dataclass(frozen=True, slots=True)
+class _ArtifactStoreRegistration:
+    store_id: str
+    store: ArtifactStore
+    fingerprint: str
 
 
 class _RunFenceOwnedEventStream:
@@ -515,7 +525,7 @@ class CayuApp:
         self._agents: dict[str, runtime_records.RegisteredAgentState] = {}
         self._providers: dict[str, runtime_records.RegisteredProvider] = {}
         self._environments: dict[str, runtime_records.RegisteredEnvironment] = {}
-        self._artifact_stores_by_id: dict[str, ArtifactStore] = {}
+        self._artifact_store_registrations_by_id: dict[str, _ArtifactStoreRegistration] = {}
         self._default_provider_name: str | None = None
         self._default_environment_name: str | None = None
         self._session_control = SessionControl[SessionUsageTracker](
@@ -792,7 +802,7 @@ class CayuApp:
         if stored_spec.name in self._environments:
             raise ValueError(f"Environment already registered: {stored_spec.name}")
         artifact_store = stored_environment.artifact_store
-        artifact_store_id = self._validate_artifact_store_registration(artifact_store)
+        artifact_store_registration = self._validate_artifact_store_registration(artifact_store)
 
         registration_source, registration_symbol = _registration_site()
         self._environments[stored_spec.name] = runtime_records.RegisteredEnvironment(
@@ -801,8 +811,10 @@ class CayuApp:
             registration_source=registration_source,
             registration_symbol=registration_symbol,
         )
-        if artifact_store_id is not None and artifact_store is not None:
-            self._artifact_stores_by_id[artifact_store_id] = artifact_store
+        if artifact_store_registration is not None:
+            self._artifact_store_registrations_by_id[artifact_store_registration.store_id] = (
+                artifact_store_registration
+            )
         self._select_default_environment_if_requested(stored_spec.name, default=default)
         return environment
 
@@ -824,7 +836,7 @@ class CayuApp:
         if stored_spec.name in self._environments:
             raise ValueError(f"Environment already registered: {stored_spec.name}")
         stored_environment = Environment(stored_spec, artifact_store=artifact_store)
-        artifact_store_id = self._validate_artifact_store_registration(artifact_store)
+        artifact_store_registration = self._validate_artifact_store_registration(artifact_store)
 
         registration_source, registration_symbol = _registration_site()
         self._environments[stored_spec.name] = runtime_records.RegisteredEnvironment(
@@ -834,15 +846,17 @@ class CayuApp:
             registration_source=registration_source,
             registration_symbol=registration_symbol,
         )
-        if artifact_store_id is not None and artifact_store is not None:
-            self._artifact_stores_by_id[artifact_store_id] = artifact_store
+        if artifact_store_registration is not None:
+            self._artifact_store_registrations_by_id[artifact_store_registration.store_id] = (
+                artifact_store_registration
+            )
         self._select_default_environment_if_requested(stored_spec.name, default=default)
         return factory
 
     def _validate_artifact_store_registration(
         self,
         artifact_store: ArtifactStore | None,
-    ) -> str | None:
+    ) -> _ArtifactStoreRegistration | None:
         if artifact_store is None:
             return None
         artifact_store_id = require_clean_nonblank(artifact_store.id, "artifact_store.id")
@@ -850,13 +864,19 @@ class CayuApp:
             artifact_store_id,
             "artifact_store.id",
         )
-        registered_store = self._artifact_stores_by_id.get(artifact_store_id)
-        if registered_store is not None and registered_store is not artifact_store:
+        registered = self._artifact_store_registrations_by_id.get(artifact_store_id)
+        if registered is not None and registered.store is not artifact_store:
             raise ValueError(
                 "Artifact store id already belongs to a different registered store: "
                 f"{artifact_store_id}"
             )
-        return artifact_store_id
+        if registered is not None:
+            return registered
+        return _ArtifactStoreRegistration(
+            store_id=artifact_store_id,
+            store=artifact_store,
+            fingerprint=f"sha256:{sha256(artifact_store_id.encode('utf-8')).hexdigest()}",
+        )
 
     def _select_default_environment_if_requested(
         self,
@@ -896,7 +916,29 @@ class CayuApp:
         and does not copy registration metadata or materialize environment factories.
         """
 
-        return bool(self._artifact_stores_by_id)
+        return bool(self._artifact_store_registrations_by_id)
+
+    def artifact_store_registration_fingerprints(
+        self,
+        *,
+        limit: int,
+    ) -> tuple[tuple[str, ...], int]:
+        """Return a bounded snapshot of opaque store identities and the exact count.
+
+        Fingerprints are fixed-size SHA-256 correlations of the store identities
+        accepted at registration. They let protected diagnostics correlate shared
+        registrations without returning a local path or application-defined id.
+        """
+
+        if type(limit) is not int:
+            raise TypeError("Artifact store fingerprint limit must be an integer.")
+        if limit < 1:
+            raise ValueError("Artifact store fingerprint limit must be positive.")
+        registrations = self._artifact_store_registrations_by_id
+        fingerprints = tuple(
+            registration.fingerprint for registration in islice(registrations.values(), limit)
+        )
+        return fingerprints, len(registrations)
 
     def list_environment_registrations(self) -> tuple[runtime_records.RegisteredEnvironment, ...]:
         """Return registered environment metadata without materializing factories."""
