@@ -8,10 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import json
 import math
 import os
-import tempfile
+import secrets
+import stat
+import struct
+import sys
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -65,6 +69,11 @@ _SAFE_AUTH_STORE_ERRORS = frozenset(
     {
         "Cayu auth store must contain a JSON object.",
         "Cayu auth store providers must be a JSON object.",
+        "Cayu auth store could not be made durable.",
+        "Cayu auth store durability is unsupported on this platform.",
+        "Cayu auth store has unsafe permissions or ownership.",
+        "Cayu auth-store directory changed while in use.",
+        "Cayu auth-store directory has unsafe permissions or ownership.",
         "Cayu auth-store parent is not a directory.",
         "Could not read Cayu auth store.",
         "OpenAI subscription credentials are invalid.",
@@ -87,6 +96,42 @@ _PROTECTED_SUBSCRIPTION_HEADERS = {
 }
 _AUTH_THREAD_LOCKS_GUARD = threading.Lock()
 _AUTH_THREAD_LOCKS: dict[str, threading.RLock] = {}
+_AUTH_TEMP_CREATE_ATTEMPTS = 16
+_AUTH_ACCESS_TOKEN_MAX_BYTES = 256 * 1024
+_AUTH_REFRESH_TOKEN_MAX_BYTES = 256 * 1024
+_AUTH_ACCOUNT_ID_MAX_BYTES = 16 * 1024
+# Python's fcntl module does not export these stable Darwin sys/fcntl.h ABI values.
+_DARWIN_F_PREALLOCATE = 42
+_DARWIN_F_ALLOCATEALL = 0x00000004
+_DARWIN_F_PEOFPOSMODE = 3
+_DARWIN_FSTORE = struct.Struct("@Iiqqq")
+_OPEN_NOFOLLOW_FLAG = getattr(os, "O_NOFOLLOW", 0)
+_OPEN_DIRECTORY_FLAG = getattr(os, "O_DIRECTORY", 0)
+_OPEN_CLOEXEC_FLAG = getattr(os, "O_CLOEXEC", 0)
+_OPEN_BINARY_FLAG = getattr(os, "O_BINARY", 0)
+_OPEN_NONBLOCK_FLAG = getattr(os, "O_NONBLOCK", 0)
+_SUPPORTS_DURABLE_AUTH_STORE = (
+    os.name == "posix"
+    and bool(_OPEN_DIRECTORY_FLAG)
+    and bool(_OPEN_NOFOLLOW_FLAG)
+    and bool(_OPEN_NONBLOCK_FLAG)
+    and hasattr(os, "fchmod")
+    and hasattr(os, "geteuid")
+    and os.mkdir in os.supports_dir_fd
+    and os.open in os.supports_dir_fd
+    and os.stat in os.supports_dir_fd
+    and os.stat in os.supports_follow_symlinks
+    and os.unlink in os.supports_dir_fd
+)
+
+
+@dataclass(slots=True)
+class _PreparedAuthStoreWrite:
+    descriptor: int
+    temporary_name: str
+    identity: tuple[int, int]
+    reserved_bytes: int | None = None
+    published: bool = False
 
 
 class OpenAISubscriptionAuthError(RuntimeError):
@@ -116,12 +161,20 @@ class OpenAISubscriptionCredentials:
         object.__setattr__(
             self,
             "access_token",
-            require_clean_nonblank(self.access_token, "access_token"),
+            _require_bounded_auth_value(
+                self.access_token,
+                "access_token",
+                max_bytes=_AUTH_ACCESS_TOKEN_MAX_BYTES,
+            ),
         )
         object.__setattr__(
             self,
             "refresh_token",
-            require_clean_nonblank(self.refresh_token, "refresh_token"),
+            _require_bounded_auth_value(
+                self.refresh_token,
+                "refresh_token",
+                max_bytes=_AUTH_REFRESH_TOKEN_MAX_BYTES,
+            ),
         )
         if isinstance(self.expires_at, bool) or not isinstance(self.expires_at, int | float):
             raise TypeError("expires_at must be a number.")
@@ -136,8 +189,37 @@ class OpenAISubscriptionCredentials:
             object.__setattr__(
                 self,
                 "account_id",
-                require_clean_nonblank(self.account_id, "account_id"),
+                _require_bounded_auth_value(
+                    self.account_id,
+                    "account_id",
+                    max_bytes=_AUTH_ACCOUNT_ID_MAX_BYTES,
+                ),
             )
+
+
+def _require_bounded_auth_value(
+    value: str,
+    field_name: str,
+    *,
+    max_bytes: int,
+) -> str:
+    value = require_clean_nonblank(value, field_name)
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError(f"`{field_name}` must contain valid Unicode text.") from None
+    if len(encoded) > max_bytes:
+        raise ValueError(f"`{field_name}` must not exceed {max_bytes} bytes.")
+    return value
+
+
+def _maximum_size_subscription_credentials() -> OpenAISubscriptionCredentials:
+    return OpenAISubscriptionCredentials(
+        access_token="\0" * _AUTH_ACCESS_TOKEN_MAX_BYTES,
+        refresh_token="\0" * _AUTH_REFRESH_TOKEN_MAX_BYTES,
+        expires_at=sys.float_info.max,
+        account_id="\0" * _AUTH_ACCOUNT_ID_MAX_BYTES,
+    )
 
 
 class OpenAISubscriptionAuthStore:
@@ -155,27 +237,30 @@ class OpenAISubscriptionAuthStore:
             if not self.path.exists() and not self.path.is_symlink():
                 result = None
             else:
-                with self._exclusive_lock():
-                    result = self._load_credentials_unlocked()
+                with self._exclusive_lock() as directory_fd:
+                    result = self._load_credentials_unlocked(directory_fd)
         except Exception as exc:
             failure_message = _safe_auth_store_error_message(exc)
+        if failure_message is not None:
+            result = sentinel
+            raise ValueError(failure_message) from None
         if result is sentinel:
-            raise ValueError(failure_message or "Could not access Cayu auth store.")
+            raise ValueError("Could not access Cayu auth store.")
         return result if isinstance(result, OpenAISubscriptionCredentials) else None
 
-    def _load_credentials_unlocked(self) -> OpenAISubscriptionCredentials | None:
-        if self.path.is_symlink():
-            raise ValueError("Refusing to read a symlinked Cayu auth store.")
-        if not self.path.exists():
+    def _load_credentials_unlocked(
+        self,
+        directory_fd: int | None,
+    ) -> OpenAISubscriptionCredentials | None:
+        decoded = self._load_document(directory_fd, missing_ok=True)
+        return self._credentials_from_document(decoded)
+
+    def _credentials_from_document(
+        self,
+        decoded: dict[str, Any] | None,
+    ) -> OpenAISubscriptionCredentials | None:
+        if decoded is None:
             return None
-        read_failed = object()
-        decoded: Any = read_failed
-        with suppress(OSError, ValueError):
-            decoded = json.loads(self.path.read_text(encoding="utf-8"))
-        if decoded is read_failed:
-            raise ValueError("Could not read Cayu auth store.")
-        if not isinstance(decoded, dict):
-            raise ValueError("Cayu auth store must contain a JSON object.")
         providers = decoded.get("providers")
         if not isinstance(providers, dict):
             return None
@@ -201,15 +286,37 @@ class OpenAISubscriptionAuthStore:
             raise TypeError("credentials must be OpenAISubscriptionCredentials.")
         failure_message: str | None = None
         try:
-            with self._exclusive_lock():
-                self._save_credentials_unlocked(credentials)
+            with self._exclusive_lock() as directory_fd:
+                self._save_credentials_unlocked(credentials, directory_fd)
         except Exception as exc:
             failure_message = _safe_auth_store_error_message(exc)
         if failure_message is not None:
-            raise ValueError(failure_message)
+            del credentials
+            raise ValueError(failure_message) from None
 
-    def _save_credentials_unlocked(self, credentials: OpenAISubscriptionCredentials) -> None:
-        document = self._load_document()
+    def _save_credentials_unlocked(
+        self,
+        credentials: OpenAISubscriptionCredentials,
+        directory_fd: int | None,
+        *,
+        prepared_write: _PreparedAuthStoreWrite | None = None,
+        document: dict[str, Any] | None = None,
+    ) -> None:
+        if document is None:
+            document = self._load_document(directory_fd)
+            assert document is not None
+        self._set_credentials_in_document(document, credentials)
+        self._write_document(
+            document,
+            directory_fd,
+            prepared_write=prepared_write,
+        )
+
+    def _set_credentials_in_document(
+        self,
+        document: dict[str, Any],
+        credentials: OpenAISubscriptionCredentials,
+    ) -> None:
         providers = document.setdefault("providers", {})
         if not isinstance(providers, dict):
             raise ValueError("Cayu auth store providers must be a JSON object.")
@@ -220,28 +327,35 @@ class OpenAISubscriptionAuthStore:
             "account_id": credentials.account_id,
         }
         document["version"] = _AUTH_STORE_VERSION
-        self._write_document(document)
 
     def delete(self) -> bool:
         result: bool | None = None
         failure_message: str | None = None
         try:
-            with self._exclusive_lock():
-                result = self._delete_unlocked()
+            self._validate_existing_parent()
+            missing = not self.path.exists() and not self.path.is_symlink()
+            if missing and not _supports_durable_auth_store():
+                result = False
+            else:
+                with self._exclusive_lock() as directory_fd:
+                    result = self._delete_unlocked(directory_fd)
         except Exception as exc:
             failure_message = _safe_auth_store_error_message(exc)
+        if failure_message is not None:
+            raise ValueError(failure_message)
         if result is None:
-            raise ValueError(failure_message or "Could not access Cayu auth store.")
+            raise ValueError("Could not access Cayu auth store.")
         return result
 
-    def _delete_unlocked(self) -> bool:
-        document = self._load_document()
+    def _delete_unlocked(self, directory_fd: int | None) -> bool:
+        document = self._load_document(directory_fd)
+        assert document is not None
         providers = document.get("providers")
         if not isinstance(providers, dict) or _AUTH_PROVIDER_KEY not in providers:
             return False
         del providers[_AUTH_PROVIDER_KEY]
         document["version"] = _AUTH_STORE_VERSION
-        self._write_document(document)
+        self._write_document(document, directory_fd)
         return True
 
     @contextmanager
@@ -250,57 +364,132 @@ class OpenAISubscriptionAuthStore:
         key = os.path.normcase(os.path.abspath(self.path))
         with _AUTH_THREAD_LOCKS_GUARD:
             thread_lock = _AUTH_THREAD_LOCKS.setdefault(key, threading.RLock())
-        with thread_lock, _process_file_lock(self.path.with_name(f".{self.path.name}.lock")):
-            yield
+        lock_path = self.path.with_name(f".{self.path.name}.lock")
+        with thread_lock:
+            if _supports_durable_auth_store():
+                with (
+                    _open_auth_store_directory(self.path.parent) as directory_fd,
+                    _process_file_lock(lock_path, directory_fd=directory_fd),
+                ):
+                    _require_current_auth_store_directory(self.path.parent, directory_fd)
+                    try:
+                        yield directory_fd
+                    except BaseException:
+                        raise
+                    else:
+                        _require_current_auth_store_directory(self.path.parent, directory_fd)
+            else:
+                with _process_file_lock(lock_path):
+                    yield None
 
-    def _load_document(self) -> dict[str, Any]:
-        if self.path.is_symlink():
-            raise ValueError("Refusing to write a symlinked Cayu auth store.")
-        if not self.path.exists():
-            return {"version": _AUTH_STORE_VERSION, "providers": {}}
+    def _load_document(
+        self,
+        directory_fd: int | None,
+        *,
+        missing_ok: bool = False,
+    ) -> dict[str, Any] | None:
+        raw = _read_auth_store_file(self.path, directory_fd=directory_fd)
+        if raw is None:
+            return None if missing_ok else {"version": _AUTH_STORE_VERSION, "providers": {}}
         read_failed = object()
         decoded: Any = read_failed
-        with suppress(OSError, ValueError):
-            decoded = json.loads(self.path.read_text(encoding="utf-8"))
+        with suppress(UnicodeDecodeError, ValueError):
+            decoded = json.loads(raw)
         if decoded is read_failed:
             raise ValueError("Could not read Cayu auth store.")
         if not isinstance(decoded, dict):
             raise ValueError("Cayu auth store must contain a JSON object.")
         return decoded
 
-    def _write_document(self, document: dict[str, Any]) -> None:
-        self._prepare_parent()
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{self.path.name}.",
-            dir=self.path.parent,
+    def _write_document(
+        self,
+        document: dict[str, Any],
+        directory_fd: int | None,
+        *,
+        prepared_write: _PreparedAuthStoreWrite | None = None,
+    ) -> None:
+        if prepared_write is not None:
+            assert directory_fd is not None
+            self._publish_prepared_document(document, directory_fd, prepared_write)
+            return
+        with self._prepare_write_unlocked(directory_fd) as current_write:
+            assert directory_fd is not None
+            self._publish_prepared_document(document, directory_fd, current_write)
+
+    def _publish_prepared_document(
+        self,
+        document: dict[str, Any],
+        directory_fd: int,
+        prepared_write: _PreparedAuthStoreWrite,
+    ) -> None:
+        descriptor = prepared_write.descriptor
+        _require_current_auth_store_directory(self.path.parent, directory_fd)
+        _require_private_auth_file(os.fstat(descriptor), prepared_write.identity)
+        payload = _auth_store_document_payload(document)
+        if (
+            prepared_write.reserved_bytes is not None
+            and len(payload) > prepared_write.reserved_bytes
+        ):
+            raise ValueError("Cayu auth store could not be made durable.")
+        if prepared_write.reserved_bytes is None:
+            _write_auth_store_payload(descriptor, payload)
+        else:
+            _write_reserved_auth_store_payload(
+                descriptor,
+                payload,
+                reserved_bytes=prepared_write.reserved_bytes,
+            )
+        _sync_auth_store_descriptor(descriptor)
+        _require_private_auth_file(os.fstat(descriptor), prepared_write.identity)
+        os.replace(
+            prepared_write.temporary_name,
+            self.path.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
         )
-        temporary_path = Path(temporary_name)
-        try:
-            if hasattr(os, "fchmod"):
-                os.fchmod(descriptor, 0o600)
-            else:
-                temporary_path.chmod(0o600)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                json.dump(document, handle, sort_keys=True, separators=(",", ":"))
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary_path, self.path)
-            self.path.chmod(0o600)
-        except BaseException:
-            with suppress(OSError):
-                os.close(descriptor)
-            temporary_path.unlink(missing_ok=True)
-            raise
+        prepared_write.published = True
+        _require_published_auth_file(
+            self.path.name,
+            directory_fd=directory_fd,
+            expected_identity=prepared_write.identity,
+        )
+        _sync_auth_store_directory(directory_fd)
+        _require_current_auth_store_directory(self.path.parent, directory_fd)
+        _require_published_auth_file(
+            self.path.name,
+            directory_fd=directory_fd,
+            expected_identity=prepared_write.identity,
+        )
+
+    @contextmanager
+    def _prepare_write_unlocked(
+        self,
+        directory_fd: int | None,
+        *,
+        reservation_document: dict[str, Any] | None = None,
+    ):
+        self._require_durable_write_support_unlocked(directory_fd)
+        assert directory_fd is not None
+        with _prepare_auth_store_write(
+            self.path.name,
+            directory_fd=directory_fd,
+            reservation_document=reservation_document,
+        ) as prepared_write:
+            _require_current_auth_store_directory(self.path.parent, directory_fd)
+            yield prepared_write
+
+    def _require_durable_write_support_unlocked(self, directory_fd: int | None) -> None:
+        if directory_fd is None:
+            raise ValueError("Cayu auth store durability is unsupported on this platform.")
+        _sync_auth_store_directory_chain(self.path.parent, directory_fd)
 
     def _prepare_parent(self) -> None:
-        try:
-            self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=False)
-        except FileExistsError:
-            self._validate_existing_parent()
-            return
-        with suppress(OSError):
-            self.path.parent.chmod(0o700)
+        if not self.path.parent.exists() and not _supports_durable_auth_store():
+            raise ValueError("Cayu auth store durability is unsupported on this platform.")
+        self._validate_existing_parent()
+        if not self.path.parent.exists():
+            _create_private_auth_store_directory_chain(self.path.parent)
+        self._validate_existing_parent()
 
     def _validate_existing_parent(self) -> None:
         if self.path.parent.is_symlink():
@@ -383,23 +572,38 @@ class OpenAISubscriptionAuth:
         # The path lock covers the complete rotating-token transaction, not just
         # the JSON write, so separate providers and processes cannot reuse the
         # same refresh token concurrently.
-        with self.store._exclusive_lock():
-            credentials = self.store._load_credentials_unlocked()
+        with self.store._exclusive_lock() as directory_fd:
+            document = self.store._load_document(directory_fd, missing_ok=True)
+            credentials = self.store._credentials_from_document(document)
             if credentials is None:
                 raise OpenAISubscriptionAuthError(
                     "OpenAI subscription login is missing. Run `cayu auth openai login`."
                 )
             if credentials.expires_at > self._now() + self.refresh_skew_seconds:
                 return credentials
-            response = self.oauth_transport.refresh(credentials.refresh_token)
-            refreshed = openai_subscription_credentials_from_token_response(
-                response,
-                now=self._now(),
-                fallback_refresh_token=credentials.refresh_token,
-                fallback_account_id=credentials.account_id,
+            assert document is not None
+            self.store._set_credentials_in_document(
+                document,
+                _maximum_size_subscription_credentials(),
             )
-            self.store._save_credentials_unlocked(refreshed)
-            return refreshed
+            with self.store._prepare_write_unlocked(
+                directory_fd,
+                reservation_document=document,
+            ) as prepared_write:
+                response = self.oauth_transport.refresh(credentials.refresh_token)
+                refreshed = openai_subscription_credentials_from_token_response(
+                    response,
+                    now=self._now(),
+                    fallback_refresh_token=credentials.refresh_token,
+                    fallback_account_id=credentials.account_id,
+                )
+                self.store._save_credentials_unlocked(
+                    refreshed,
+                    directory_fd,
+                    prepared_write=prepared_write,
+                    document=document,
+                )
+                return refreshed
 
 
 class OpenAISubscriptionProvider(ModelProvider):
@@ -881,12 +1085,27 @@ def _default_auth_path() -> Path:
 
 
 @contextmanager
-def _process_file_lock(path: Path):
+def _process_file_lock(path: Path, *, directory_fd: int | None = None):
     flags = os.O_CREAT | os.O_RDWR
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
-    descriptor = os.open(path, flags, 0o600)
+    if directory_fd is not None:
+        flags |= _OPEN_NOFOLLOW_FLAG
+    descriptor = os.open(
+        path.name if directory_fd is not None else path,
+        flags,
+        0o600,
+        dir_fd=directory_fd,
+    )
     try:
+        if directory_fd is not None:
+            initial = os.fstat(descriptor)
+            _require_owned_regular_auth_file(initial)
+            os.fchmod(descriptor, 0o600)
+            _require_private_auth_file(
+                os.fstat(descriptor),
+                _stat_identity(initial),
+            )
         if os.name == "nt":
             import msvcrt
 
@@ -912,3 +1131,400 @@ def _process_file_lock(path: Path):
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
     finally:
         os.close(descriptor)
+
+
+def _supports_durable_auth_store() -> bool:
+    return _SUPPORTS_DURABLE_AUTH_STORE and (
+        sys.platform != "darwin" or _darwin_full_sync_command() is not None
+    )
+
+
+def _darwin_full_sync_command() -> int | None:
+    if sys.platform != "darwin":
+        return None
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    command = getattr(fcntl, "F_FULLFSYNC", None)
+    return command if isinstance(command, int) else None
+
+
+@contextmanager
+def _open_auth_store_directory(path: Path, *, require_private: bool = True):
+    if not _supports_durable_auth_store():
+        raise ValueError("Cayu auth store durability is unsupported on this platform.")
+    flags = os.O_RDONLY | _OPEN_DIRECTORY_FLAG | _OPEN_NOFOLLOW_FLAG | _OPEN_CLOEXEC_FLAG
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        if path.is_symlink():
+            raise ValueError("Refusing to use a symlinked Cayu auth-store directory.") from None
+        raise exc
+    try:
+        _require_current_auth_store_directory(
+            path,
+            descriptor,
+            require_private=require_private,
+        )
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+def _require_current_auth_store_directory(
+    path: Path,
+    directory_fd: int,
+    *,
+    require_private: bool = True,
+) -> None:
+    opened = os.fstat(directory_fd)
+    try:
+        current = os.stat(path, follow_symlinks=False)
+    except (OSError, RuntimeError):
+        raise ValueError("Cayu auth-store directory changed while in use.") from None
+    if not stat.S_ISDIR(opened.st_mode) or _stat_identity(opened) != _stat_identity(current):
+        if stat.S_ISLNK(current.st_mode):
+            raise ValueError("Refusing to use a symlinked Cayu auth-store directory.")
+        raise ValueError("Cayu auth-store directory changed while in use.")
+    if require_private and (opened.st_uid != os.geteuid() or stat.S_IMODE(opened.st_mode) & 0o022):
+        raise ValueError("Cayu auth-store directory has unsafe permissions or ownership.")
+
+
+def _create_private_auth_store_directory_chain(path: Path) -> None:
+    if not _supports_durable_auth_store():
+        raise ValueError("Cayu auth store durability is unsupported on this platform.")
+    missing_directories: list[Path] = []
+    anchor = path
+    while not anchor.exists():
+        missing_directories.append(anchor)
+        parent = anchor.parent
+        if parent == anchor:
+            raise ValueError("Cayu auth-store parent is not a directory.")
+        anchor = parent
+    try:
+        resolved_anchor = anchor.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise ValueError("Cayu auth-store directory changed while in use.") from None
+    flags = os.O_RDONLY | _OPEN_DIRECTORY_FLAG | _OPEN_NOFOLLOW_FLAG | _OPEN_CLOEXEC_FLAG
+    with _open_auth_store_directory(resolved_anchor, require_private=False) as anchor_fd:
+        current_fd = os.dup(anchor_fd)
+        try:
+            for directory in reversed(missing_directories):
+                created = False
+                try:
+                    os.mkdir(directory.name, mode=0o700, dir_fd=current_fd)
+                    created = True
+                except FileExistsError:
+                    pass
+                try:
+                    child_fd = os.open(directory.name, flags, dir_fd=current_fd)
+                except OSError:
+                    raise ValueError("Cayu auth-store directory changed while in use.") from None
+                try:
+                    if created:
+                        os.fchmod(child_fd, 0o700)
+                    info = os.fstat(child_fd)
+                    _require_private_auth_directory(info, exact_mode=created)
+                except BaseException:
+                    os.close(child_fd)
+                    raise
+                os.close(current_fd)
+                current_fd = child_fd
+        finally:
+            os.close(current_fd)
+
+
+def _require_private_auth_directory(info: os.stat_result, *, exact_mode: bool) -> None:
+    mode = stat.S_IMODE(info.st_mode)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or mode & 0o022
+        or (exact_mode and mode != 0o700)
+    ):
+        raise ValueError("Cayu auth-store directory has unsafe permissions or ownership.")
+
+
+def _read_auth_store_file(path: Path, *, directory_fd: int | None) -> str | None:
+    if directory_fd is None:
+        if path.is_symlink():
+            raise ValueError("Refusing to read a symlinked Cayu auth store.")
+        if not path.exists():
+            return None
+        try:
+            return path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            raise ValueError("Could not read Cayu auth store.") from None
+
+    flags = (
+        os.O_RDONLY
+        | _OPEN_NOFOLLOW_FLAG
+        | _OPEN_CLOEXEC_FLAG
+        | _OPEN_BINARY_FLAG
+        | _OPEN_NONBLOCK_FLAG
+    )
+    try:
+        descriptor = os.open(path.name, flags, dir_fd=directory_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ValueError("Refusing to read a symlinked Cayu auth store.") from None
+        raise ValueError("Could not read Cayu auth store.") from None
+    try:
+        info = os.fstat(descriptor)
+        _require_private_auth_file(info, _stat_identity(info))
+        with os.fdopen(descriptor, "r", encoding="utf-8", closefd=False) as handle:
+            return handle.read()
+    except (OSError, UnicodeDecodeError):
+        raise ValueError("Could not read Cayu auth store.") from None
+    finally:
+        os.close(descriptor)
+
+
+def _open_auth_store_temporary(leaf_name: str, *, directory_fd: int) -> tuple[int, str]:
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | _OPEN_NOFOLLOW_FLAG
+        | _OPEN_CLOEXEC_FLAG
+        | _OPEN_BINARY_FLAG
+    )
+    for _ in range(_AUTH_TEMP_CREATE_ATTEMPTS):
+        temporary_name = f".{leaf_name}.tmp-{secrets.token_hex(16)}"
+        try:
+            descriptor = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
+        except FileExistsError:
+            continue
+        return descriptor, temporary_name
+    raise OSError("could not allocate a unique auth-store staging file")
+
+
+def _auth_store_document_payload(document: dict[str, Any]) -> bytes:
+    return (
+        json.dumps(
+            document,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _write_auth_store_payload(descriptor: int, payload: bytes) -> None:
+    os.ftruncate(descriptor, 0)
+    _overwrite_auth_store_payload(descriptor, payload)
+
+
+def _overwrite_auth_store_payload(descriptor: int, payload: bytes) -> None:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    remaining = memoryview(payload)
+    while remaining:
+        written = os.write(descriptor, remaining)
+        if written <= 0:
+            raise OSError("could not write Cayu auth store")
+        remaining = remaining[written:]
+
+
+def _write_reserved_auth_store_payload(
+    descriptor: int,
+    payload: bytes,
+    *,
+    reserved_bytes: int,
+) -> None:
+    if len(payload) > reserved_bytes:
+        raise ValueError("Cayu auth store could not be made durable.")
+    # Keep every allocated byte live until the complete final record is present.
+    # JSON accepts trailing whitespace, so a failed size-only compaction can
+    # safely publish the synchronized padded record instead of losing a rotated
+    # refresh token after the provider has consumed its predecessor.
+    padded_payload = payload.ljust(reserved_bytes, b" ")
+    _overwrite_auth_store_payload(descriptor, padded_payload)
+    if len(payload) == reserved_bytes:
+        return
+    try:
+        os.ftruncate(descriptor, len(payload))
+    except OSError:
+        try:
+            size = os.fstat(descriptor).st_size
+        except OSError:
+            raise ValueError("Cayu auth store could not be made durable.") from None
+        if size < len(payload) or size > reserved_bytes:
+            raise ValueError("Cayu auth store could not be made durable.") from None
+
+
+def _reserve_auth_store_capacity(descriptor: int, reserved_bytes: int) -> None:
+    if sys.platform == "darwin":
+        _reserve_darwin_auth_store_capacity(descriptor, reserved_bytes)
+    else:
+        allocator = getattr(os, "posix_fallocate", None)
+        if not callable(allocator):
+            raise ValueError("Cayu auth store durability is unsupported on this platform.")
+        try:
+            allocator(descriptor, 0, reserved_bytes)
+        except OSError:
+            raise ValueError("Cayu auth store could not be made durable.") from None
+    try:
+        os.ftruncate(descriptor, reserved_bytes)
+        if os.fstat(descriptor).st_size != reserved_bytes:
+            raise ValueError("Cayu auth store could not be made durable.")
+    except OSError:
+        raise ValueError("Cayu auth store could not be made durable.") from None
+
+
+def _reserve_darwin_auth_store_capacity(descriptor: int, reserved_bytes: int) -> None:
+    try:
+        import fcntl
+    except ImportError:
+        raise ValueError("Cayu auth store durability is unsupported on this platform.") from None
+    request = _DARWIN_FSTORE.pack(
+        _DARWIN_F_ALLOCATEALL,
+        _DARWIN_F_PEOFPOSMODE,
+        0,
+        reserved_bytes,
+        0,
+    )
+    try:
+        response = fcntl.fcntl(descriptor, _DARWIN_F_PREALLOCATE, request)
+    except OSError:
+        raise ValueError("Cayu auth store could not be made durable.") from None
+    if not isinstance(response, bytes) or len(response) != _DARWIN_FSTORE.size:
+        raise ValueError("Cayu auth store could not be made durable.")
+    *_, allocated_bytes = _DARWIN_FSTORE.unpack(response)
+    if allocated_bytes < reserved_bytes:
+        raise ValueError("Cayu auth store could not be made durable.")
+
+
+@contextmanager
+def _prepare_auth_store_write(
+    leaf_name: str,
+    *,
+    directory_fd: int,
+    reservation_document: dict[str, Any] | None,
+):
+    descriptor, temporary_name = _open_auth_store_temporary(
+        leaf_name,
+        directory_fd=directory_fd,
+    )
+    identity: tuple[int, int] | None = None
+    prepared_write: _PreparedAuthStoreWrite | None = None
+    try:
+        identity = _stat_identity(os.fstat(descriptor))
+        os.fchmod(descriptor, 0o600)
+        _require_private_auth_file(os.fstat(descriptor), identity)
+        reserved_bytes: int | None = None
+        if reservation_document is not None:
+            reservation_payload = _auth_store_document_payload(reservation_document)
+            reserved_bytes = len(reservation_payload)
+            _reserve_auth_store_capacity(descriptor, reserved_bytes)
+            _sync_auth_store_descriptor(descriptor)
+            _require_private_auth_file(os.fstat(descriptor), identity)
+        prepared_write = _PreparedAuthStoreWrite(
+            descriptor=descriptor,
+            temporary_name=temporary_name,
+            identity=identity,
+            reserved_bytes=reserved_bytes,
+        )
+        yield prepared_write
+    finally:
+        if identity is not None and not (prepared_write is not None and prepared_write.published):
+            _unlink_auth_store_temporary_if_unchanged(
+                temporary_name,
+                directory_fd=directory_fd,
+                expected_identity=identity,
+            )
+        with suppress(OSError):
+            os.close(descriptor)
+
+
+def _require_private_auth_file(
+    info: os.stat_result,
+    expected_identity: tuple[int, int],
+) -> None:
+    _require_owned_regular_auth_file(info)
+    if _stat_identity(info) != expected_identity or stat.S_IMODE(info.st_mode) != 0o600:
+        raise ValueError("Cayu auth store has unsafe permissions or ownership.")
+
+
+def _require_owned_regular_auth_file(info: os.stat_result) -> None:
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+        raise ValueError("Cayu auth store has unsafe permissions or ownership.")
+
+
+def _require_published_auth_file(
+    leaf_name: str,
+    *,
+    directory_fd: int,
+    expected_identity: tuple[int, int],
+) -> None:
+    try:
+        info = os.stat(leaf_name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError:
+        raise ValueError("Cayu auth store could not be made durable.") from None
+    try:
+        _require_private_auth_file(info, expected_identity)
+    except ValueError:
+        raise ValueError("Cayu auth store could not be made durable.") from None
+
+
+def _unlink_auth_store_temporary_if_unchanged(
+    temporary_name: str,
+    *,
+    directory_fd: int,
+    expected_identity: tuple[int, int],
+) -> None:
+    try:
+        info = os.stat(temporary_name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError:
+        return
+    if stat.S_ISREG(info.st_mode) and _stat_identity(info) == expected_identity:
+        with suppress(OSError):
+            os.unlink(temporary_name, dir_fd=directory_fd)
+
+
+def _sync_auth_store_directory(directory_fd: int) -> None:
+    _sync_auth_store_descriptor(directory_fd)
+
+
+def _sync_auth_store_descriptor(descriptor: int) -> None:
+    try:
+        command = _darwin_full_sync_command()
+        if sys.platform == "darwin":
+            if command is None:
+                raise ValueError("Cayu auth store durability is unsupported on this platform.")
+            import fcntl
+
+            fcntl.fcntl(descriptor, command)
+        else:
+            os.fsync(descriptor)
+    except OSError:
+        raise ValueError("Cayu auth store could not be made durable.") from None
+
+
+def _sync_auth_store_directory_path(path: Path) -> None:
+    try:
+        synchronized_path = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise ValueError("Cayu auth-store directory changed while in use.") from None
+    with _open_auth_store_directory(synchronized_path, require_private=False) as directory_fd:
+        _sync_auth_store_directory(directory_fd)
+
+
+def _sync_auth_store_directory_chain(path: Path, directory_fd: int) -> None:
+    _require_current_auth_store_directory(path, directory_fd)
+    try:
+        resolved_path = path.resolve(strict=True)
+        resolved_info = os.stat(resolved_path, follow_symlinks=False)
+    except (OSError, RuntimeError):
+        raise ValueError("Cayu auth-store directory changed while in use.") from None
+    if _stat_identity(resolved_info) != _stat_identity(os.fstat(directory_fd)):
+        raise ValueError("Cayu auth-store directory changed while in use.")
+    for candidate in (*reversed(resolved_path.parents), resolved_path):
+        _sync_auth_store_directory_path(candidate)
+    _require_current_auth_store_directory(path, directory_fd)
+
+
+def _stat_identity(info: os.stat_result) -> tuple[int, int]:
+    return info.st_dev, info.st_ino

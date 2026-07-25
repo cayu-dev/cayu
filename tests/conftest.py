@@ -85,6 +85,7 @@ def provider_credential_canaries(
         ),
         encoding="utf-8",
     )
+    (auth_home / "auth.json").chmod(0o600)
     aws_credentials_path.write_text(
         "[default]\n"
         f"aws_access_key_id={values['aws_access_key_id']}\n"

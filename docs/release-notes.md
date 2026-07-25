@@ -29,6 +29,18 @@ int64 as canonical decimal strings, and enforces Cayu's durable-JSON contract on
 both export and import. Versions 1 and 2 were prerelease formats and must be
 regenerated rather than being interpreted under the new shape.
 
+### OpenAI subscription token rotation is power-loss durable
+
+Successful local subscription login, refresh, and logout now synchronize both
+the private replacement file and its containing directory before returning.
+Credential writes are serialized across processes, reject unsafe filesystem
+objects, create missing auth-path components privately, re-establish directory
+entry durability after interrupted setup, preserve complete post-replacement
+state when a later durability check fails, and fail explicitly on platforms
+that cannot provide the required local durability primitives. Refresh rotation
+also retains native worst-case capacity allocation until the complete new
+credential record has been written.
+
 ### MCP manifest drift keeps one durable accepted baseline
 
 MCP manifest authorization now keys history by a stable connection identity

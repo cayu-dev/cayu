@@ -31,6 +31,39 @@ project, container image, shared server, log, or support request. Cayu keeps a
 separate refresh-token chain instead of reading or modifying Codex CLI's token
 store.
 
+Cayu serializes credential changes across threads and processes. The last
+writer that completes the locked transaction is authoritative. On supported
+local POSIX filesystems, Cayu acknowledges a login, refresh, or logout only
+after synchronizing the private replacement file and the containing directory.
+A nested auth-store path that Cayu must create is built from private,
+owner-controlled directory components, and each directory entry is synchronized
+again before every credential mutation so an interrupted earlier creation
+cannot weaken a later acknowledgement.
+Before exchanging a rotating refresh token, Cayu uses the host's native
+full-allocation primitive to reserve and synchronize the worst-case encoded
+credential size in the actual staging file. The allocation remains live until
+the complete rotated record has been written, so a capacity failure stops before
+the provider call instead of stranding a consumed refresh token. If optional
+size compaction fails, Cayu can publish the complete record with bounded trailing
+JSON whitespace rather than discard it. A waiter also revalidates the pinned
+auth directory after acquiring its process lock, immediately before publishing
+rotated credentials, and before reporting success.
+A failure after atomic publication can therefore leave a complete newer
+credential record in place while still reporting that durability was not
+confirmed; a later load adopts that complete record instead of repeating a
+refresh. Hidden staging files left by a terminated process are ignored.
+
+Credential writes fail closed when the host or filesystem cannot provide the
+required atomic replacement and directory-synchronization primitives. Existing
+credentials remain readable on such a host, but Cayu does not silently describe
+a best-effort rotation as power-loss durable. This local-filesystem protocol
+does not promise durability for remote or distributed filesystems whose server
+acknowledgements do not honor the host's synchronization requests.
+Coordination covers Cayu writers using the same auth-store path. External
+same-user mutation of ancestor namespace entries while a credential transaction
+is in flight is outside this contract; publication remains pinned to the opened
+auth directory and will not be redirected to a replacement directory.
+
 ## Register the provider
 
 ```python

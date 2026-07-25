@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 
 import cayu.cli.auth as auth_cli
+import cayu.providers.openai_subscription as subscription_auth
 from cayu.cli import main
 from cayu.providers.openai_subscription import OpenAISubscriptionCredentials
 
@@ -40,6 +41,27 @@ def test_auth_openai_status_and_logout_never_print_tokens(
     assert main(["auth", "openai", "status"]) == 1
 
 
+def test_auth_openai_logout_is_noop_without_unsupported_store(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    auth_home = tmp_path / "missing-cayu-home"
+    monkeypatch.setenv("CAYU_HOME", str(auth_home))
+    monkeypatch.setattr(
+        subscription_auth,
+        "_supports_durable_auth_store",
+        lambda: False,
+    )
+
+    assert main(["auth", "openai", "logout"]) == 0
+
+    output = capsys.readouterr()
+    assert "already signed out" in output.out.lower()
+    assert output.err == ""
+    assert not auth_home.exists()
+
+
 def test_auth_openai_login_saves_browser_credentials(
     tmp_path: Path,
     monkeypatch,
@@ -58,6 +80,33 @@ def test_auth_openai_login_saves_browser_credentials(
     assert "experimental" in output.lower()
     assert "originator: cayu" in output
     assert auth_cli.OpenAISubscriptionAuthStore().load() == _credentials()
+
+
+def test_auth_openai_login_reports_durability_failure_without_tokens(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setenv("CAYU_HOME", str(tmp_path / "cayu-home"))
+    monkeypatch.setattr(
+        auth_cli,
+        "_browser_login",
+        lambda *, transport, open_browser: _credentials(),
+    )
+    monkeypatch.setattr(
+        auth_cli.OpenAISubscriptionAuthStore,
+        "save",
+        lambda _self, _credentials: (_ for _ in ()).throw(
+            ValueError("Cayu auth store could not be made durable.")
+        ),
+    )
+
+    assert main(["auth", "openai", "login", "--no-browser"]) == 1
+
+    output = capsys.readouterr()
+    assert "could not be made durable" in output.err
+    assert "secret-access-token" not in output.out + output.err
+    assert "secret-refresh-token" not in output.out + output.err
 
 
 def test_oauth_callback_rejects_error_from_wrong_state() -> None:
