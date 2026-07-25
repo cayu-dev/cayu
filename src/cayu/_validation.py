@@ -15,6 +15,13 @@ _MAX_LABEL_KEY_LENGTH = 128
 _MAX_LABEL_VALUE_LENGTH = 512
 _RESERVED_LABEL_PREFIX = "cayu:"
 
+EXECUTION_UNIT_ID_MAX_CHARS = 70
+_EXECUTION_UNIT_ID_PATTERNS = {
+    "model_step_id": re.compile(r"mstep_[0-9a-f]{32}\Z"),
+    "model_attempt_id": re.compile(r"matt_[0-9a-f]{32}\Z"),
+    "budget_limit_id": re.compile(r"blim_[0-9a-f]{64}\Z"),
+}
+
 MIN_DURABLE_JSON_INTEGER = -(2**63)
 MAX_DURABLE_JSON_INTEGER = 2**63 - 1
 MAX_DURABLE_JSON_NESTING = 128
@@ -413,6 +420,18 @@ def require_durable_clean_nonblank(value: str, field_name: str) -> str:
     """Return portable durable text without surrounding whitespace."""
 
     return require_clean_nonblank(require_durable_text(value, field_name), field_name)
+
+
+def require_execution_unit_id(value: str, field_name: str) -> str:
+    """Return one canonical, portable Cayu execution-unit identifier."""
+
+    pattern = _EXECUTION_UNIT_ID_PATTERNS.get(field_name)
+    if pattern is None:
+        raise ValueError("Unknown execution-unit identity field.")
+    value = require_durable_clean_nonblank(value, field_name)
+    if pattern.fullmatch(value) is None:
+        raise ValueError(f"{field_name} is not a valid Cayu execution-unit identifier.")
+    return value
 
 
 def _require_durable_text(value: Any, field_name: str, *, path: str) -> str:
