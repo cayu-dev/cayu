@@ -23,7 +23,9 @@ from pydantic import (
 from cayu._validation import (
     FrozenJsonDict,
     copy_json_value,
+    json_utf8_size_within_limit,
     require_clean_nonblank,
+    require_durable_clean_nonblank,
 )
 from cayu.core.billing import BillingIdentity, PricingContext
 from cayu.core.events import Event, EventType
@@ -1028,9 +1030,8 @@ def _estimate_session_cost(
         if event.type != EventType.MODEL_COMPLETED:
             continue
         model_step += 1
-        metrics = usage_metrics_from_event_payload(event.payload)
+        metrics = _cost_usage_metrics_from_event_payload(event.payload)
         if metrics is None:
-            raw_identity = event.payload.get("billing_identity")
             line_items.append(
                 _unpriced_line_item(
                     model_step=model_step,
@@ -1038,11 +1039,9 @@ def _estimate_session_cost(
                     requested_model=_optional_nonblank(event.payload.get("requested_model")),
                     model=_optional_nonblank(event.payload.get("model")),
                     currency=currency,
-                    reason="model.completed event has no token usage metrics",
-                    billing_identity=(
-                        BillingIdentity.model_validate(raw_identity)
-                        if type(raw_identity) is dict
-                        else None
+                    reason=_missing_usage_pricing_reason(event.payload),
+                    billing_identity=_optional_billing_identity(
+                        event.payload.get("billing_identity")
                     ),
                 )
             )
@@ -1559,9 +1558,67 @@ def _best_match_record(
 
 
 def _optional_nonblank(value: object) -> str | None:
-    if type(value) is str and value.strip():
-        return value
-    return None
+    if type(value) is not str:
+        return None
+    try:
+        return require_durable_clean_nonblank(value, "cost identity")
+    except ValueError:
+        return None
+
+
+def _optional_billing_identity(value: object) -> BillingIdentity | None:
+    if type(value) is not dict:
+        return None
+    from cayu.runtime.aggregates import MAX_USAGE_PRICING_INPUT_BYTES
+
+    if not json_utf8_size_within_limit(value, MAX_USAGE_PRICING_INPUT_BYTES):
+        return None
+    try:
+        return BillingIdentity.model_validate(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _cost_usage_metrics_from_event_payload(payload: dict[str, Any]) -> UsageMetrics | None:
+    """Return priceable metrics without reinterpreting a normalized projection.
+
+    A present ``usage_metrics`` field is authoritative even when malformed. The
+    strict raw-usage fallback remains only for events written before normalized
+    usage was published. Invalid price-relevant data makes the step unpriced
+    instead of aborting cost composition or budget enforcement.
+    """
+
+    if payload.get("usage_normalization_failed") is True:
+        return None
+    if "usage_metrics" in payload:
+        from cayu.runtime.aggregates import MAX_USAGE_PRICING_INPUT_BYTES
+
+        raw_metrics = payload.get("usage_metrics")
+        if type(raw_metrics) is not dict:
+            return None
+        pricing_payload = {"usage_metrics": raw_metrics}
+        raw_identity = payload.get("billing_identity")
+        if type(raw_identity) is dict:
+            pricing_payload["billing_identity"] = raw_identity
+        if not json_utf8_size_within_limit(
+            pricing_payload,
+            MAX_USAGE_PRICING_INPUT_BYTES,
+        ):
+            return None
+        try:
+            return usage_metrics_from_event_payload(pricing_payload)
+        except (TypeError, ValueError):
+            return None
+    try:
+        return usage_metrics_from_event_payload(payload)
+    except (TypeError, ValueError):
+        return None
+
+
+def _missing_usage_pricing_reason(payload: dict[str, Any]) -> str:
+    if "usage_metrics" in payload:
+        return "model.completed event has no valid normalized usage metrics"
+    return "model.completed event has no token usage metrics"
 
 
 def _copy_string_list(value: list[str], field_name: str) -> list[str]:

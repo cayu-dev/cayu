@@ -50,7 +50,16 @@ PgBouncer, where backend session defaults are not stable across operations.
 
 All commands default to tables and support `--output table|json|jsonl` where a
 list of records is returned. Limits are finite; JSON field names form a stable
-CLI schema and include `schema_version` in JSON envelopes.
+CLI schema and include `schema_version` in JSON envelopes. Every `session usage`
+JSONL row also carries the schema version so independently consumed
+`model_call`, `unmatched_ledger`, and `aggregate` records cannot be mistaken for
+the version 1 representation.
+
+Session-inspection CLI schema version `2` encodes identity-free aggregate usage
+counters as canonical nonnegative decimal strings in `show.usage`,
+`usage.aggregate`, and the JSONL aggregate record. Per-model-call counters
+remain signed-64-bit JSON integers. Consumers of schema version `1` must update
+their aggregate-counter parsing before accepting version `2`.
 
 ```console
 # Newest activity first; filters may be combined.

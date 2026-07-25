@@ -1489,7 +1489,11 @@ message contract yet.
 events. The optional FastAPI server exposes the same value at
 `GET /api/sessions/{session_id}/usage`. Usage summaries are observability
 records; retry, budget, and stop policies should consume them instead of parsing
-provider-specific payloads directly.
+provider-specific payloads directly. Their `usage` field is an
+`AggregateUsageMetrics`: individual completion counters remain signed 64-bit
+integers, while exact session totals may exceed that range. Python-mode dumps
+retain exact integers and JSON-mode dumps encode aggregate counters as canonical
+nonnegative decimal strings.
 
 `CayuApp.get_causal_budget_usage(causal_budget_id)` derives the same normalized
 usage totals across every session whose stored `causal_budget_id` matches. The
@@ -1655,11 +1659,16 @@ remain exact beyond signed 64-bit range.
 Server contract version 2 serializes aggregate counters as nonnegative decimal
 strings, rather than JSON numbers, so totals beyond JavaScript's safe-integer
 range remain exact. It also makes the bounded `cost.billing_breakdown` projection
-part of the usage-rollup response. Clients generated against contract version 1
-must regenerate from the current OpenAPI document and treat these aggregate
-counter fields as strings; independently hosted dashboards must not render
-control-plane routes against a server reporting a different contract version.
-The exported aggregate models parse that canonical JSON representation back to
+part of the usage-rollup response. Server contract version 3 applies the same
+lossless aggregate representation to session summaries, causal-budget summaries,
+session aggregate summaries, and usage breakdowns; those fields previously used
+the signed-64-bit, numeric per-model-step `UsageMetrics` shape. Clients generated
+against contract version 1 or 2 must regenerate from the current OpenAPI document
+and treat all aggregate counter fields as strings; independently hosted
+dashboards must not render control-plane routes against a server reporting a
+different contract version.
+The exported aggregate models—including the aggregate usage fields on session
+and causal-budget summaries—parse that canonical JSON representation back to
 Python integers, while direct Python construction remains strict and does not
 accept string counters.
 

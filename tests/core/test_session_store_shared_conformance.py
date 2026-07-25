@@ -56,6 +56,7 @@ from cayu.runtime import (
     SessionStore,
     UsageRollupQuery,
 )
+from cayu.runtime.aggregates import estimate_usage_rollup_cost
 from cayu.runtime.budgets import BudgetLimit, BudgetPolicy, BudgetReservation
 from cayu.runtime.costs import ModelPrice, PriceBook
 from cayu.runtime.sessions import (
@@ -338,6 +339,91 @@ def test_session_store_conformance_inspection_uses_tolerant_usage_aggregates(
             assert inspection.usage.usage.reasoning_output_tokens == 0
             assert inspection.usage.usage.cache.read_tokens == 4
             assert inspection.usage.usage.cache.write_tokens == 0
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_usage_normalization_failure_is_authoritative(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = f"normalization-failed-usage-{session_store_case[0]}"
+        timestamp = datetime(2026, 7, 20, 13, 0, tzinfo=UTC)
+        try:
+            await store.create(
+                RunRequest(
+                    session_id=session_id,
+                    agent_name="assistant",
+                    messages=[Message.text("user", "inspect")],
+                ),
+                identity=_identity(),
+            )
+            await store.append_event(
+                session_id,
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id=session_id,
+                    timestamp=timestamp,
+                    payload={
+                        "provider_name": "raw-provider",
+                        "model": "raw-model",
+                        "usage_normalization_failed": True,
+                        "usage": {
+                            "input_tokens": 70,
+                            "output_tokens": 30,
+                            "total_tokens": 100,
+                        },
+                        "usage_metrics": {
+                            "provider_name": "normalized-provider",
+                            "model": "normalized-model",
+                            "input_tokens": 7,
+                            "output_tokens": 3,
+                            "total_tokens": 10,
+                        },
+                    },
+                ),
+            )
+
+            inspection = await store.inspect_summary(session_id)
+            native = await store.aggregate_usage(
+                UsageRollupQuery(
+                    start_at=timestamp - timedelta(seconds=1),
+                    end_at=timestamp + timedelta(seconds=1),
+                    include_pricing_inputs=True,
+                )
+            )
+            cost = estimate_usage_rollup_cost(
+                native,
+                PriceBook(
+                    prices=(
+                        ModelPrice.fixed(
+                            provider_name="normalized-provider",
+                            model="normalized-model",
+                            input_per_million=Decimal("1"),
+                            output_per_million=Decimal("1"),
+                        ),
+                    )
+                ),
+            )
+
+            assert inspection.model_calls == native.totals.model_steps == 1
+            assert inspection.model_calls_with_usage == 0
+            assert native.totals.model_steps_with_usage == 0
+            assert inspection.usage.provider_names == []
+            assert inspection.usage.models == []
+            assert inspection.usage.usage.total_tokens == 0
+            assert native.totals.usage.total_tokens == 0
+            assert native.pricing_input_group_count == 1
+            assert native.pricing_inputs[0].metrics is None
+            assert native.pricing_inputs[0].occurrences == 1
+            assert cost.priced_model_steps == 0
+            assert cost.unpriced_model_steps == 1
+            assert cost.unpriced_reasons[0].reason == (
+                "model.completed event has no valid normalized usage metrics"
+            )
         finally:
             await _close_store(store)
 

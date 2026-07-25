@@ -38,7 +38,7 @@ from cayu.runtime.sessions import (
     SessionStatus,
     copy_run_request,
 )
-from cayu.runtime.usage import SessionUsageSummary
+from cayu.runtime.usage import SessionUsageSummary, session_usage_summary_payload
 
 # Sessions per page when walking the sub-agent tree, and the max pages walked per node. The walk
 # pages past the first 1000 children (rather than silently keeping only the first page) but stays
@@ -460,7 +460,9 @@ async def _run_case_once(
         assertions=tuple(assertion_results),
         error=run_error,
         events_count=len(events),
-        usage_summary=usage_summary.model_dump(mode="json") if usage_summary is not None else None,
+        usage_summary=session_usage_summary_payload(usage_summary)
+        if usage_summary is not None
+        else None,
         started_at=started_at,
         completed_at=completed_at,
         duration_ms=_duration_ms(started_at, completed_at),

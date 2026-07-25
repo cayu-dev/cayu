@@ -177,7 +177,7 @@ export type AggregateUsageSummary = {
      * Tool Calls
      */
     tool_calls: number;
-    usage: UsageMetrics;
+    usage: AggregateUsageMetrics;
 };
 
 /**
@@ -1317,42 +1317,6 @@ export type BudgetWindow = {
 };
 
 /**
- * CacheUsageMetrics
- *
- * Provider-neutral cache token counters for one model step.
- */
-export type CacheUsageMetrics = {
-    /**
-     * Cached Input Tokens
-     */
-    cached_input_tokens?: number;
-    /**
-     * Read Tokens
-     */
-    read_tokens?: number;
-    /**
-     * Uncached Input Tokens
-     */
-    uncached_input_tokens?: number;
-    /**
-     * Write 1H Tokens
-     */
-    write_1h_tokens?: number;
-    /**
-     * Write 5M Tokens
-     */
-    write_5m_tokens?: number;
-    /**
-     * Write Tokens
-     */
-    write_tokens?: number;
-    /**
-     * Write Unknown Ttl Tokens
-     */
-    write_unknown_ttl_tokens?: number;
-};
-
-/**
  * CapabilityOperation
  *
  * Availability of one control-plane read or mutation operation.
@@ -1474,7 +1438,7 @@ export type CausalBudgetUsageSummary = {
      * Tool Calls
      */
     tool_calls?: number;
-    usage?: UsageMetrics;
+    usage?: AggregateUsageMetrics;
 };
 
 /**
@@ -2772,7 +2736,7 @@ export type SessionUsageSummary = {
      * Tool Calls
      */
     tool_calls?: number;
-    usage?: UsageMetrics;
+    usage?: AggregateUsageMetrics;
 };
 
 /**
@@ -3669,7 +3633,7 @@ export type UsageBreakdownItem = {
      * Session Count
      */
     session_count: number;
-    usage: UsageMetrics;
+    usage: AggregateUsageMetrics;
 };
 
 /**
@@ -3732,44 +3696,6 @@ export type UsageCurrencyCost = {
      * Total Cost
      */
     total_cost: string;
-};
-
-/**
- * UsageMetrics
- *
- * Provider-neutral token counters for one model step.
- */
-export type UsageMetrics = {
-    billing_identity?: BillingIdentity | null;
-    cache?: CacheUsageMetrics;
-    /**
-     * Input Tokens
-     */
-    input_tokens?: number;
-    /**
-     * Model
-     */
-    model?: string | null;
-    /**
-     * Output Tokens
-     */
-    output_tokens?: number;
-    /**
-     * Provider Name
-     */
-    provider_name?: string | null;
-    /**
-     * Reasoning Output Tokens
-     */
-    reasoning_output_tokens?: number;
-    /**
-     * Requested Model
-     */
-    requested_model?: string | null;
-    /**
-     * Total Tokens
-     */
-    total_tokens?: number;
 };
 
 /**

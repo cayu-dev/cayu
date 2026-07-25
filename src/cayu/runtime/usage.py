@@ -2,9 +2,18 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from enum import StrEnum
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    PlainSerializer,
+    StrictInt,
+    ValidationInfo,
+    field_validator,
+)
 
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
@@ -94,6 +103,166 @@ class UsageMetrics(BaseModel):
         return require_durable_clean_nonblank(value, info.field_name)
 
 
+def _serialize_aggregate_count(value: int) -> str:
+    """Serialize exact aggregate counters without crossing JSON's safe-integer boundary."""
+
+    return str(value)
+
+
+def _aggregate_count_from_json(value: object) -> int:
+    if (
+        type(value) is not str
+        or not value
+        or (value != "0" and (value[0] == "0" or not value.isascii() or not value.isdigit()))
+    ):
+        raise ValueError(
+            "Aggregate counters in JSON must be canonical nonnegative decimal strings."
+        )
+    return int(value)
+
+
+def _deserialize_aggregate_count(value: object, info: ValidationInfo) -> object:
+    """Parse the JSON string representation without weakening strict Python construction."""
+
+    if info.mode != "json":
+        return value
+    return _aggregate_count_from_json(value)
+
+
+AggregateCountString = Annotated[str, Field(pattern=r"^(0|[1-9]\d*)$")]
+AggregateCount = Annotated[
+    StrictInt,
+    BeforeValidator(
+        _deserialize_aggregate_count,
+        json_schema_input_type=AggregateCountString,
+    ),
+    PlainSerializer(_serialize_aggregate_count, return_type=AggregateCountString, when_used="json"),
+]
+PositiveAggregateCountString = Annotated[str, Field(pattern=r"^[1-9]\d*$")]
+PositiveAggregateCount = Annotated[
+    StrictInt,
+    BeforeValidator(
+        _deserialize_aggregate_count,
+        json_schema_input_type=PositiveAggregateCountString,
+    ),
+    PlainSerializer(
+        _serialize_aggregate_count,
+        return_type=PositiveAggregateCountString,
+        when_used="json",
+    ),
+]
+
+
+class AggregateCacheUsageMetrics(BaseModel):
+    """Lossless JSON projection of identity-free aggregate cache counters."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    read_tokens: AggregateCount = Field(ge=0)
+    write_tokens: AggregateCount = Field(ge=0)
+    write_5m_tokens: AggregateCount = Field(ge=0)
+    write_1h_tokens: AggregateCount = Field(ge=0)
+    write_unknown_ttl_tokens: AggregateCount = Field(ge=0)
+    cached_input_tokens: AggregateCount = Field(ge=0)
+    uncached_input_tokens: AggregateCount = Field(ge=0)
+
+
+class AggregateUsageMetrics(BaseModel):
+    """Lossless JSON projection of identity-free aggregate token counters."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    input_tokens: AggregateCount = Field(ge=0)
+    output_tokens: AggregateCount = Field(ge=0)
+    total_tokens: AggregateCount = Field(ge=0)
+    reasoning_output_tokens: AggregateCount = Field(ge=0)
+    cache: AggregateCacheUsageMetrics
+
+
+def build_aggregate_usage_metrics(
+    *,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    total_tokens: int = 0,
+    reasoning_output_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    cache_write_5m_tokens: int = 0,
+    cache_write_1h_tokens: int = 0,
+    cache_write_unknown_ttl_tokens: int = 0,
+    cached_input_tokens: int = 0,
+    uncached_input_tokens: int = 0,
+) -> AggregateUsageMetrics:
+    """Build identity-free aggregate counters without weakening step metrics."""
+
+    return AggregateUsageMetrics(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        reasoning_output_tokens=reasoning_output_tokens,
+        cache=AggregateCacheUsageMetrics(
+            read_tokens=cache_read_tokens,
+            write_tokens=cache_write_tokens,
+            write_5m_tokens=cache_write_5m_tokens,
+            write_1h_tokens=cache_write_1h_tokens,
+            write_unknown_ttl_tokens=cache_write_unknown_ttl_tokens,
+            cached_input_tokens=cached_input_tokens,
+            uncached_input_tokens=uncached_input_tokens,
+        ),
+    )
+
+
+def add_aggregate_usage(
+    left: AggregateUsageMetrics,
+    right: AggregateUsageMetrics | UsageMetrics,
+) -> AggregateUsageMetrics:
+    """Add token counters while deliberately discarding per-step identity fields."""
+
+    return build_aggregate_usage_metrics(
+        input_tokens=left.input_tokens + right.input_tokens,
+        output_tokens=left.output_tokens + right.output_tokens,
+        total_tokens=left.total_tokens + right.total_tokens,
+        reasoning_output_tokens=(left.reasoning_output_tokens + right.reasoning_output_tokens),
+        cache_read_tokens=left.cache.read_tokens + right.cache.read_tokens,
+        cache_write_tokens=left.cache.write_tokens + right.cache.write_tokens,
+        cache_write_5m_tokens=left.cache.write_5m_tokens + right.cache.write_5m_tokens,
+        cache_write_1h_tokens=left.cache.write_1h_tokens + right.cache.write_1h_tokens,
+        cache_write_unknown_ttl_tokens=(
+            left.cache.write_unknown_ttl_tokens + right.cache.write_unknown_ttl_tokens
+        ),
+        cached_input_tokens=(left.cache.cached_input_tokens + right.cache.cached_input_tokens),
+        uncached_input_tokens=(
+            left.cache.uncached_input_tokens + right.cache.uncached_input_tokens
+        ),
+    )
+
+
+def aggregate_usage_metrics_payload(metrics: AggregateUsageMetrics) -> dict[str, Any]:
+    """Build a durable payload while preserving legacy in-range JSON integers."""
+
+    if type(metrics) is not AggregateUsageMetrics:
+        raise TypeError("metrics must be an AggregateUsageMetrics instance.")
+
+    def durable_count(value: int) -> int | str:
+        return value if value <= MAX_DURABLE_JSON_INTEGER else str(value)
+
+    return {
+        "input_tokens": durable_count(metrics.input_tokens),
+        "output_tokens": durable_count(metrics.output_tokens),
+        "total_tokens": durable_count(metrics.total_tokens),
+        "reasoning_output_tokens": durable_count(metrics.reasoning_output_tokens),
+        "cache": {
+            "read_tokens": durable_count(metrics.cache.read_tokens),
+            "write_tokens": durable_count(metrics.cache.write_tokens),
+            "write_5m_tokens": durable_count(metrics.cache.write_5m_tokens),
+            "write_1h_tokens": durable_count(metrics.cache.write_1h_tokens),
+            "write_unknown_ttl_tokens": durable_count(metrics.cache.write_unknown_ttl_tokens),
+            "cached_input_tokens": durable_count(metrics.cache.cached_input_tokens),
+            "uncached_input_tokens": durable_count(metrics.cache.uncached_input_tokens),
+        },
+    }
+
+
 class SessionUsageSummary(BaseModel):
     """Usage totals derived from durable session events."""
 
@@ -104,7 +273,14 @@ class SessionUsageSummary(BaseModel):
     tool_calls: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
     provider_names: list[str] = Field(default_factory=list)
     models: list[str] = Field(default_factory=list)
-    usage: UsageMetrics = Field(default_factory=UsageMetrics)
+    usage: AggregateUsageMetrics = Field(default_factory=build_aggregate_usage_metrics)
+
+    @field_validator("usage", mode="before")
+    @classmethod
+    def project_step_usage(cls, value: object) -> object:
+        if type(value) is UsageMetrics:
+            return add_aggregate_usage(build_aggregate_usage_metrics(), value)
+        return value
 
     @field_validator("session_id")
     @classmethod
@@ -137,8 +313,15 @@ class CausalBudgetUsageSummary(BaseModel):
     tool_calls: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
     provider_names: list[str] = Field(default_factory=list)
     models: list[str] = Field(default_factory=list)
-    usage: UsageMetrics = Field(default_factory=UsageMetrics)
+    usage: AggregateUsageMetrics = Field(default_factory=build_aggregate_usage_metrics)
     session_summaries: tuple[SessionUsageSummary, ...] = Field(default_factory=tuple)
+
+    @field_validator("usage", mode="before")
+    @classmethod
+    def project_step_usage(cls, value: object) -> object:
+        if type(value) is UsageMetrics:
+            return add_aggregate_usage(build_aggregate_usage_metrics(), value)
+        return value
 
     @field_validator("causal_budget_id")
     @classmethod
@@ -157,6 +340,21 @@ class CausalBudgetUsageSummary(BaseModel):
                 raise ValueError(f"{info.field_name}[{index}] must be a string.")
             result.append(require_durable_clean_nonblank(item, f"{info.field_name}[{index}]"))
         return result
+
+
+def session_usage_summary_payload(summary: SessionUsageSummary) -> dict[str, Any]:
+    """Build the stable durable event projection for a session usage summary."""
+
+    if type(summary) is not SessionUsageSummary:
+        raise TypeError("summary must be a SessionUsageSummary instance.")
+    return {
+        "session_id": summary.session_id,
+        "model_steps": summary.model_steps,
+        "tool_calls": summary.tool_calls,
+        "provider_names": list(summary.provider_names),
+        "models": list(summary.models),
+        "usage": aggregate_usage_metrics_payload(summary.usage),
+    }
 
 
 # Canonical usage dialects (string values mirror ``providers.base.UsageDialect``
@@ -505,9 +703,11 @@ USAGE_BEARING_EVENT_TYPES: tuple[EventType, ...] = (
 
 
 def session_usage_summary(session_id: str, events: list[Event]) -> SessionUsageSummary:
+    from cayu.runtime.aggregates import summary_usage_metrics_from_event_payload
+
     provider_names: list[str] = []
     models: list[str] = []
-    usage = UsageMetrics()
+    usage = build_aggregate_usage_metrics()
     model_steps = 0
     tool_calls = 0
 
@@ -519,12 +719,12 @@ def session_usage_summary(session_id: str, events: list[Event]) -> SessionUsageS
             continue
         model_steps += 1
         try:
-            metrics = usage_metrics_from_event_payload(event.payload)
+            metrics = summary_usage_metrics_from_event_payload(event.payload)
         except (TypeError, ValueError):
             metrics = None
         if metrics is None:
             continue
-        usage = _add_usage(usage, metrics)
+        usage = add_aggregate_usage(usage, metrics)
         if metrics.provider_name is not None and metrics.provider_name not in provider_names:
             provider_names.append(metrics.provider_name)
         if metrics.model is not None and metrics.model not in models:
@@ -542,12 +742,14 @@ def session_usage_summary(session_id: str, events: list[Event]) -> SessionUsageS
 
 def count_model_steps_with_usage(events: Iterable[Event]) -> int:
     """Count durable model completions carrying valid normalized usage."""
+    from cayu.runtime.aggregates import summary_usage_metrics_from_event_payload
+
     count = 0
     for event in events:
         if event.type != EventType.MODEL_COMPLETED:
             continue
         try:
-            metrics = usage_metrics_from_event_payload(event.payload)
+            metrics = summary_usage_metrics_from_event_payload(event.payload)
         except (TypeError, ValueError):
             continue
         if metrics is not None:
@@ -611,27 +813,6 @@ def usage_metrics_from_event_payload(payload: dict[str, Any]) -> UsageMetrics | 
         requested_model=_optional_string(payload.get("requested_model")),
         raw_usage=payload.get("usage"),
         billing_identity=event_identity,
-    )
-
-
-def _add_usage(left: UsageMetrics, right: UsageMetrics) -> UsageMetrics:
-    return UsageMetrics(
-        input_tokens=left.input_tokens + right.input_tokens,
-        output_tokens=left.output_tokens + right.output_tokens,
-        total_tokens=left.total_tokens + right.total_tokens,
-        reasoning_output_tokens=left.reasoning_output_tokens + right.reasoning_output_tokens,
-        cache=CacheUsageMetrics(
-            read_tokens=left.cache.read_tokens + right.cache.read_tokens,
-            write_tokens=left.cache.write_tokens + right.cache.write_tokens,
-            write_5m_tokens=left.cache.write_5m_tokens + right.cache.write_5m_tokens,
-            write_1h_tokens=left.cache.write_1h_tokens + right.cache.write_1h_tokens,
-            write_unknown_ttl_tokens=(
-                left.cache.write_unknown_ttl_tokens + right.cache.write_unknown_ttl_tokens
-            ),
-            cached_input_tokens=left.cache.cached_input_tokens + right.cache.cached_input_tokens,
-            uncached_input_tokens=left.cache.uncached_input_tokens
-            + right.cache.uncached_input_tokens,
-        ),
     )
 
 

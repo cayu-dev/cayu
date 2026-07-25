@@ -50,7 +50,10 @@ from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, MessageRole
 from cayu.core.thinking import ThinkingConfig
 from cayu.runtime._binding_cleanup import is_containable_cleanup_error
-from cayu.runtime.aggregates import estimate_usage_rollup_cost
+from cayu.runtime.aggregates import (
+    estimate_usage_rollup_cost,
+    summary_usage_metrics_from_event_payload,
+)
 from cayu.runtime.approvals import (
     ResolutionActor,
     ResolutionActorSource,
@@ -106,12 +109,13 @@ from cayu.runtime.structured_output import StructuredOutputSpec
 from cayu.runtime.tasks import Task, TaskCreate, TaskOrder, TaskQuery, TaskStatus
 from cayu.runtime.tool_rounds import ToolRoundRecoveryRequest
 from cayu.runtime.usage import (
-    CacheUsageMetrics,
+    AggregateUsageMetrics,
     CausalBudgetUsageSummary,
     SessionUsageSummary,
     UsageMetrics,
+    add_aggregate_usage,
+    build_aggregate_usage_metrics,
     causal_budget_usage_summary,
-    usage_metrics_from_event_payload,
 )
 from cayu.runtime.user_input import UserInputRecoveryRequest, UserInputResponse
 from cayu.server._capabilities import inspect_control_plane_capabilities
@@ -1475,7 +1479,10 @@ def _usage_breakdown(
     for event in events:
         if event.type != EventType.MODEL_COMPLETED:
             continue
-        metrics = usage_metrics_from_event_payload(event.payload)
+        try:
+            metrics = summary_usage_metrics_from_event_payload(event.payload)
+        except (TypeError, ValueError):
+            continue
         if metrics is None:
             continue
         provider_name, model = key_fn(metrics)
@@ -1487,7 +1494,7 @@ def _usage_breakdown(
                 "model": model,
                 "session_ids": set(),
                 "model_steps": 0,
-                "usage": UsageMetrics(provider_name=provider_name, model=model),
+                "usage": build_aggregate_usage_metrics(),
             },
         )
         bucket["session_ids"].add(event.session_id)
@@ -1514,28 +1521,15 @@ def _usage_breakdown(
     )
 
 
-def _add_usage_metrics(left: UsageMetrics, right: UsageMetrics) -> UsageMetrics:
-    return UsageMetrics(
-        provider_name=left.provider_name,
-        requested_model=left.requested_model or right.requested_model,
-        model=left.model,
-        input_tokens=left.input_tokens + right.input_tokens,
-        output_tokens=left.output_tokens + right.output_tokens,
-        total_tokens=left.total_tokens + right.total_tokens,
-        reasoning_output_tokens=left.reasoning_output_tokens + right.reasoning_output_tokens,
-        cache=CacheUsageMetrics(
-            read_tokens=left.cache.read_tokens + right.cache.read_tokens,
-            write_tokens=left.cache.write_tokens + right.cache.write_tokens,
-            write_5m_tokens=left.cache.write_5m_tokens + right.cache.write_5m_tokens,
-            write_1h_tokens=left.cache.write_1h_tokens + right.cache.write_1h_tokens,
-            write_unknown_ttl_tokens=(
-                left.cache.write_unknown_ttl_tokens + right.cache.write_unknown_ttl_tokens
-            ),
-            cached_input_tokens=left.cache.cached_input_tokens + right.cache.cached_input_tokens,
-            uncached_input_tokens=left.cache.uncached_input_tokens
-            + right.cache.uncached_input_tokens,
-        ),
-    )
+def _add_usage_metrics(
+    left: AggregateUsageMetrics | UsageMetrics,
+    right: UsageMetrics,
+) -> AggregateUsageMetrics:
+    if isinstance(left, UsageMetrics):
+        aggregate = add_aggregate_usage(build_aggregate_usage_metrics(), left)
+    else:
+        aggregate = left
+    return add_aggregate_usage(aggregate, right)
 
 
 def _parse_session_label_filters(values: list[str] | None) -> dict[str, str]:

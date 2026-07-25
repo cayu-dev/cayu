@@ -2,6 +2,27 @@
 
 ## v0.1.0 (unreleased)
 
+### Aggregate usage remains exact across every public summary
+
+Session, causal-budget, multi-session, and usage-breakdown summaries now use the
+same lossless aggregate counter model as usage rollups. Aggregate counters are
+nonnegative decimal strings on the JSON wire, so cumulative values can exceed
+signed 64-bit and JavaScript safe-integer ranges without becoming invalid or
+losing precision.
+
+This advances the server contract from version 2 to version 3. Generated clients
+and independently deployed dashboards built for contract version 1 or 2 must be
+regenerated from the current OpenAPI document and deployed with the matching
+server. The dashboard continues to fail closed when its exact contract version
+does not match the server.
+
+The read-only session CLI schema advances from version 1 to version 2 for the
+same reason. Aggregate counters in `session show` and `session usage` JSON/JSONL
+output are now canonical decimal strings; per-model-call counters remain
+signed-64-bit JSON integers. Every `session usage --jsonl` record declares
+`schema_version="2"`, including model-call, unmatched-ledger, and aggregate
+records.
+
 ### MCP manifest drift keeps one durable accepted baseline
 
 MCP manifest authorization now keys history by a stable connection identity

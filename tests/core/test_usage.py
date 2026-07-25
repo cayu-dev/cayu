@@ -11,6 +11,7 @@ from tests.core._budget_ledger_contract import (
     assert_portable_text_boundaries,
 )
 
+from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.core import Event, EventType, Message
 from cayu.providers import (
     UsageDialect,
@@ -31,6 +32,10 @@ from cayu.runtime import (
     SessionBudgetStore,
     SessionIdentity,
     default_price_book,
+)
+from cayu.runtime.aggregates import (
+    aggregate_usage_metrics_from_event_payload,
+    summary_usage_metrics_from_event_payload,
 )
 from cayu.runtime.budgets import (
     InMemoryBudgetStore,
@@ -55,6 +60,7 @@ from cayu.runtime.stop_policy import (
 from cayu.runtime.usage import (
     ModelCompletionPurpose,
     causal_budget_usage_summary,
+    count_model_steps_with_usage,
     durable_model_completed_payload,
     is_conversational_model_completion_payload,
     normalize_usage_metrics,
@@ -883,24 +889,40 @@ def test_auto_usage_rejects_unreconciled_mixed_cache_evidence(
 
 
 def test_durable_normalization_failure_is_not_reinterpreted_from_raw_usage() -> None:
-    assert (
-        usage_metrics_from_event_payload(
-            {
-                "provider_name": "renamed-openai",
-                "usage_normalization_failed": True,
-                "usage_metrics": {
-                    "input_tokens": 1,
-                    "cache": {"uncached_input_tokens": 1},
-                },
-                "usage": {
-                    "input_tokens": 100,
-                    "input_tokens_details": {"cached_tokens": 80},
-                    "cache_read_input_tokens": 70,
-                },
-            }
-        )
-        is None
+    payload = {
+        "provider_name": "renamed-openai",
+        "usage_normalization_failed": True,
+        "usage_metrics": {
+            "input_tokens": 1,
+            "cache": {"uncached_input_tokens": 1},
+        },
+        "usage": {
+            "input_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 80},
+            "cache_read_input_tokens": 70,
+        },
+    }
+    event = Event(
+        type=EventType.MODEL_COMPLETED,
+        session_id="session_1",
+        payload=payload,
     )
+
+    assert usage_metrics_from_event_payload(payload) is None
+    assert aggregate_usage_metrics_from_event_payload(payload) is None
+    assert summary_usage_metrics_from_event_payload(payload) is None
+
+    summary = session_usage_summary("session_1", [event])
+    decision = first_reached_limit(
+        limits=RunLimits(max_total_tokens=1),
+        usage=summary,
+        elapsed_seconds=0,
+    )
+
+    assert count_model_steps_with_usage([event]) == 0
+    assert summary.model_steps == 1
+    assert summary.usage.total_tokens == 0
+    assert decision is None
 
 
 def test_budget_policy_validates_scope_keys_and_duplicates() -> None:
@@ -3054,6 +3076,89 @@ def test_session_usage_summary_aggregates_model_steps_and_tools() -> None:
     assert summary.usage.cache.uncached_input_tokens == 90
 
 
+def test_session_usage_summary_preserves_valid_counters_from_malformed_projection() -> None:
+    events = [
+        Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id="session_1",
+            payload={
+                "usage_metrics": {
+                    "provider_name": " fake ",
+                    "model": "valid-model",
+                    "input_tokens": 7,
+                    "output_tokens": 3,
+                    "total_tokens": 10,
+                    "reasoning_output_tokens": "not-an-integer",
+                    "custom_counter": 1,
+                    "cache": {
+                        "read_tokens": 4,
+                        "write_tokens": -1,
+                    },
+                }
+            },
+        )
+    ]
+
+    summary = session_usage_summary("session_1", events)
+    decision = first_reached_limit(
+        limits=RunLimits(max_total_tokens=5),
+        usage=summary,
+        elapsed_seconds=0,
+    )
+
+    assert summary.model_steps == 1
+    assert count_model_steps_with_usage(events) == 1
+    assert summary.provider_names == []
+    assert summary.models == ["valid-model"]
+    assert summary.usage.input_tokens == 7
+    assert summary.usage.output_tokens == 3
+    assert summary.usage.total_tokens == 10
+    assert summary.usage.reasoning_output_tokens == 0
+    assert summary.usage.cache.read_tokens == 4
+    assert summary.usage.cache.write_tokens == 0
+    assert decision is not None
+    assert decision.limit is StopLimit.TOTAL_TOKENS
+    assert decision.actual == 10
+
+
+@pytest.mark.parametrize(
+    "normalized_usage",
+    [None, "invalid", []],
+    ids=["null", "string", "array"],
+)
+def test_session_usage_summary_does_not_reinterpret_present_invalid_projection(
+    normalized_usage: object,
+) -> None:
+    payload = {
+        "provider_name": "fake",
+        "model": "valid-model",
+        "usage_metrics": normalized_usage,
+        "usage": {
+            "input_tokens": 7,
+            "output_tokens": 3,
+            "total_tokens": 10,
+        },
+    }
+    events = [
+        Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id="session_1",
+            payload=payload,
+        )
+    ]
+
+    assert aggregate_usage_metrics_from_event_payload(payload) is None
+    assert summary_usage_metrics_from_event_payload(payload) is None
+
+    summary = session_usage_summary("session_1", events)
+
+    assert summary.model_steps == 1
+    assert count_model_steps_with_usage(events) == 0
+    assert summary.provider_names == []
+    assert summary.models == []
+    assert summary.usage.total_tokens == 0
+
+
 def test_causal_budget_usage_summary_aggregates_related_sessions() -> None:
     events = [
         Event(
@@ -3107,6 +3212,74 @@ def test_causal_budget_usage_summary_aggregates_related_sessions() -> None:
     ]
     assert summary.session_summaries[0].usage.input_tokens == 100
     assert summary.session_summaries[1].tool_calls == 1
+
+
+def test_session_and_causal_usage_summaries_preserve_counters_beyond_int64() -> None:
+    maximum = MAX_DURABLE_JSON_INTEGER
+    expected = maximum * 2
+    events = [
+        Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id="sess_overflow",
+            payload={
+                "usage_metrics": {
+                    "provider_name": "fake",
+                    "model": "fake-model",
+                    "input_tokens": maximum,
+                    "output_tokens": maximum,
+                    "total_tokens": maximum,
+                    "reasoning_output_tokens": maximum,
+                    "cache": {
+                        "read_tokens": maximum,
+                        "write_tokens": maximum,
+                        "write_5m_tokens": maximum,
+                        "write_1h_tokens": maximum,
+                        "write_unknown_ttl_tokens": maximum,
+                        "cached_input_tokens": maximum,
+                        "uncached_input_tokens": maximum,
+                    },
+                }
+            },
+        )
+        for _ in range(2)
+    ]
+
+    summary = session_usage_summary("sess_overflow", events)
+    causal = causal_budget_usage_summary(
+        causal_budget_id="budget_overflow",
+        session_ids=["sess_overflow"],
+        events=events,
+    )
+
+    assert summary.usage.input_tokens == expected
+    assert summary.usage.output_tokens == expected
+    assert summary.usage.total_tokens == expected
+    assert summary.usage.reasoning_output_tokens == expected
+    assert summary.usage.cache.read_tokens == expected
+    assert summary.usage.cache.write_tokens == expected
+    assert summary.usage.cache.write_5m_tokens == expected
+    assert summary.usage.cache.write_1h_tokens == expected
+    assert summary.usage.cache.write_unknown_ttl_tokens == expected
+    assert summary.usage.cache.cached_input_tokens == expected
+    assert summary.usage.cache.uncached_input_tokens == expected
+    assert causal.usage.total_tokens == expected
+    assert causal.session_summaries[0].usage.total_tokens == expected
+
+    python_dump = summary.model_dump(mode="python")
+    assert python_dump["usage"]["total_tokens"] == expected
+    assert type(summary).model_validate(python_dump) == summary
+    json_dump = summary.model_dump(mode="json")
+    assert json_dump["usage"]["total_tokens"] == str(expected)
+    assert type(summary).model_validate_json(summary.model_dump_json()) == summary
+
+    decision = first_reached_limit(
+        limits=RunLimits(max_total_tokens=maximum),
+        usage=summary,
+        elapsed_seconds=0,
+    )
+    assert decision is not None
+    assert decision.limit is StopLimit.TOTAL_TOKENS
+    assert decision.actual == expected
 
 
 def test_estimate_session_cost_prices_each_model_step() -> None:
@@ -3190,6 +3363,70 @@ def test_estimate_session_cost_prices_each_model_step() -> None:
     assert summary.line_items[1].output_cost == Decimal("0.0015")
     assert summary.line_items[1].total_cost == Decimal("0.00384")
     assert summary.total_cost == Decimal("0.00684")
+
+
+def test_estimate_cost_marks_malformed_normalized_usage_unpriced() -> None:
+    malformed = Event(
+        type=EventType.MODEL_COMPLETED,
+        session_id="session_1",
+        payload={
+            "provider_name": " fake ",
+            "requested_model": " valid-model ",
+            "model": " valid-model ",
+            "billing_identity": {
+                "provider_name": " fake ",
+                "resource_id": "valid-model",
+            },
+            "usage_metrics": {
+                "provider_name": " fake ",
+                "model": "valid-model",
+                "input_tokens": 7,
+                "output_tokens": 3,
+                "total_tokens": 10,
+                "reasoning_output_tokens": "not-an-integer",
+                "cache": {
+                    "read_tokens": 4,
+                    "write_tokens": -1,
+                },
+            },
+        },
+    )
+    pricing = PriceBook(
+        prices=(
+            ModelPrice.fixed(
+                provider_name="fake",
+                model="valid-model",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("1"),
+            ),
+        )
+    )
+
+    session = estimate_session_cost(
+        session_id="session_1",
+        events=[malformed],
+        pricing=pricing,
+    )
+    causal = estimate_causal_budget_cost(
+        causal_budget_id="budget_1",
+        session_ids=["session_1"],
+        events=[malformed],
+        pricing=pricing,
+    )
+
+    assert session.model_steps == 1
+    assert session.priced_model_steps == 0
+    assert session.unpriced_model_steps == 1
+    assert session.total_cost == 0
+    assert session.line_items[0].provider_name is None
+    assert session.line_items[0].requested_model is None
+    assert session.line_items[0].model is None
+    assert session.line_items[0].billing_identity is None
+    assert session.line_items[0].missing_pricing_reason == (
+        "model.completed event has no valid normalized usage metrics"
+    )
+    assert causal.unpriced_model_steps == 1
+    assert causal.session_costs == (session,)
 
 
 def test_estimate_session_cost_matches_a_provider_dated_model_prefix() -> None:

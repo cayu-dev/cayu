@@ -6,6 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
+from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.runtime.usage import SessionUsageSummary
 
 
@@ -45,11 +46,11 @@ class RunLimits(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    max_input_tokens: StrictInt | None = Field(default=None, ge=1)
-    max_output_tokens: StrictInt | None = Field(default=None, ge=1)
-    max_total_tokens: StrictInt | None = Field(default=None, ge=1)
-    max_tool_calls: StrictInt | None = Field(default=None, ge=1)
-    max_elapsed_seconds: StrictInt | None = Field(default=None, ge=1)
+    max_input_tokens: StrictInt | None = Field(default=None, ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    max_output_tokens: StrictInt | None = Field(default=None, ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    max_total_tokens: StrictInt | None = Field(default=None, ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    max_tool_calls: StrictInt | None = Field(default=None, ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    max_elapsed_seconds: StrictInt | None = Field(default=None, ge=1, le=MAX_DURABLE_JSON_INTEGER)
     scope: Literal["session", "run"] = "run"
 
 

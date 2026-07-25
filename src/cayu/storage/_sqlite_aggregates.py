@@ -44,11 +44,20 @@ usage_events AS MATERIALIZED (
         event.event_type,
         event.timestamp,
         CASE
-            WHEN json_type(event.payload_json, '$.usage_metrics') = 'object' THEN 1
+            WHEN json_type(
+                     event.payload_json,
+                     '$.usage_normalization_failed'
+                 ) IS NOT 'true'
+             AND json_type(event.payload_json, '$.usage_metrics') = 'object'
+            THEN 1
             ELSE 0
         END AS has_usage,
         CASE
-            WHEN json_type(event.payload_json, '$.usage_metrics.provider_name') = 'text'
+            WHEN json_type(
+                     event.payload_json,
+                     '$.usage_normalization_failed'
+                 ) IS NOT 'true'
+             AND json_type(event.payload_json, '$.usage_metrics.provider_name') = 'text'
              AND trim(
                  json_extract(event.payload_json, '$.usage_metrics.provider_name'),
                  (SELECT identity_trim FROM scope)
@@ -57,7 +66,11 @@ usage_events AS MATERIALIZED (
             THEN json_extract(event.payload_json, '$.usage_metrics.provider_name')
         END AS provider_name,
         CASE
-            WHEN json_type(event.payload_json, '$.usage_metrics.model') = 'text'
+            WHEN json_type(
+                     event.payload_json,
+                     '$.usage_normalization_failed'
+                 ) IS NOT 'true'
+             AND json_type(event.payload_json, '$.usage_metrics.model') = 'text'
              AND trim(
                  json_extract(event.payload_json, '$.usage_metrics.model'),
                  (SELECT identity_trim FROM scope)
@@ -450,7 +463,11 @@ def _sqlite_usage_metrics_projection() -> str:
     identity = _sqlite_billing_identity_projection(identity_path)
     return f"""
         CASE
-            WHEN json_type(event.payload_json, '{metrics_path}') = 'object'
+            WHEN json_type(
+                     event.payload_json,
+                     '$.usage_normalization_failed'
+                 ) IS NOT 'true'
+             AND json_type(event.payload_json, '{metrics_path}') = 'object'
             THEN CASE
                 WHEN json_type(event.payload_json, '{identity_path}') = 'object'
                 THEN json_set(
@@ -527,7 +544,11 @@ def _sqlite_text_evidence_projection(evidence_path: str, fields: tuple[str, ...]
 def _nonnegative_json_integer(path: str) -> str:
     return f"""
         CASE
-            WHEN json_type(event.payload_json, '{path}') = 'integer'
+            WHEN json_type(
+                     event.payload_json,
+                     '$.usage_normalization_failed'
+                 ) IS NOT 'true'
+             AND json_type(event.payload_json, '{path}') = 'integer'
              AND json_extract(event.payload_json, '{path}') >= 0
              AND json_extract(event.payload_json, '{path}') <= {MAX_AGGREGATE_USAGE_COUNTER}
             THEN json_extract(event.payload_json, '{path}')

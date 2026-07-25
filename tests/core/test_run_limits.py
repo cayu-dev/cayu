@@ -9,8 +9,20 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
+from pydantic import ValidationError
 
-from cayu.core import AgentSpec, Event, EventType, Message
+from cayu._validation import MAX_DURABLE_JSON_INTEGER
+from cayu.core import (
+    AgentSpec,
+    Event,
+    EventType,
+    Message,
+    Tool,
+    ToolContext,
+    ToolEffect,
+    ToolResult,
+    ToolSpec,
+)
 from cayu.core.billing import BillingIdentity
 from cayu.providers import (
     ModelProvider,
@@ -18,7 +30,7 @@ from cayu.providers import (
     ModelStreamEvent,
     bedrock_billing_identity,
 )
-from cayu.runtime import CayuApp
+from cayu.runtime import AlwaysRequireApprovalToolPolicy, CayuApp
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._run_limits import (
     BudgetedOperationFailed,
@@ -44,6 +56,7 @@ from cayu.runtime.costs import ModelPrice, PriceBook
 from cayu.runtime.sessions import (
     EventQuery,
     InMemorySessionStore,
+    ResumeRequest,
     RunRequest,
     Session,
     SessionIdentity,
@@ -146,6 +159,35 @@ class _RecordingProvider(ModelProvider):
                 "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
             }
         )
+
+
+class _ApprovalTool(Tool):
+    spec = ToolSpec(
+        name="approval_tool",
+        input_schema={"type": "object", "properties": {}},
+        effect=ToolEffect.EXTERNAL,
+    )
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        del ctx, args
+        return ToolResult(content="done")
+
+
+class _ApprovalProvider(ModelProvider):
+    name = "fake"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        del request
+        self.calls += 1
+        yield ModelStreamEvent.tool_call(
+            id="approval-call",
+            name="approval_tool",
+            arguments={},
+        )
+        yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
 
 
 class _LoseLeaseOnSecondHeartbeat(InMemoryBudgetLedger):
@@ -272,6 +314,124 @@ async def _running_session(store: InMemorySessionStore, session_id: str) -> Sess
     return await store.update_status(session.id, SessionStatus.RUNNING)
 
 
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "max_input_tokens",
+        "max_output_tokens",
+        "max_total_tokens",
+        "max_tool_calls",
+        "max_elapsed_seconds",
+    ],
+)
+def test_run_limits_reject_nonportable_integer_values(field_name: str) -> None:
+    with pytest.raises(ValidationError):
+        RunLimits(**{field_name: MAX_DURABLE_JSON_INTEGER + 1})
+
+
+def test_app_revalidates_run_limits_before_provider_or_durable_mutation() -> None:
+    store = InMemorySessionStore()
+    provider = _ApprovalProvider()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[_ApprovalTool()],
+        tool_policy=AlwaysRequireApprovalToolPolicy(),
+    )
+    invalid_limits = RunLimits.model_construct(max_total_tokens=MAX_DURABLE_JSON_INTEGER + 1)
+    request = RunRequest(
+        agent_name="assistant",
+        session_id="sess_nonportable_run_limit",
+        messages=[Message.text("user", "call the tool")],
+        limits=invalid_limits,
+    )
+
+    async def scenario():
+        with pytest.raises(ValidationError):
+            async for _ in app.run(request):
+                pass
+        session = await store.load("sess_nonportable_run_limit")
+        records = await store.query_events(
+            EventQuery(session_id="sess_nonportable_run_limit", limit=100)
+        )
+        return session, records
+
+    session, records = asyncio.run(scenario())
+
+    assert provider.calls == 0
+    assert session is None
+    assert records == []
+
+
+def test_session_run_limit_publishes_usage_beyond_int64_without_provider_call() -> None:
+    store = InMemorySessionStore()
+    provider = _RecordingProvider()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    maximum = MAX_DURABLE_JSON_INTEGER
+    expected = maximum * 2
+
+    async def scenario():
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_aggregate_run_limit",
+                messages=[Message.text("user", "initial")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.append_events(
+            "sess_aggregate_run_limit",
+            [
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id="sess_aggregate_run_limit",
+                    payload={
+                        "usage_metrics": {
+                            "input_tokens": maximum,
+                            "output_tokens": maximum,
+                            "total_tokens": maximum,
+                        }
+                    },
+                )
+                for _ in range(2)
+            ],
+        )
+        await store.update_status("sess_aggregate_run_limit", SessionStatus.COMPLETED)
+        events = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id="sess_aggregate_run_limit",
+                    messages=[Message.text("user", "do not dispatch")],
+                    limits=RunLimits(
+                        max_total_tokens=maximum,
+                        scope="session",
+                    ),
+                )
+            )
+        ]
+        records = await store.query_events(
+            EventQuery(session_id="sess_aggregate_run_limit", limit=100)
+        )
+        return events, records
+
+    events, records = asyncio.run(scenario())
+
+    assert provider.calls == 0
+    limit_event = next(event for event in events if event.type == EventType.SESSION_LIMIT_REACHED)
+    assert limit_event.payload["actual"] == str(expected)
+    assert limit_event.payload["usage_summary"]["usage"]["total_tokens"] == str(expected)
+    turn = next(event for event in events if event.type == EventType.TURN_COMPLETED)
+    assert turn.payload["token_usage"]["total_tokens"] == 0
+    assert any(
+        record.event.id == limit_event.id and record.event.payload == limit_event.payload
+        for record in records
+    )
+
+
 def test_controller_returns_typed_limit_decision_without_finalizing_session():
     store = InMemorySessionStore()
     controller = _controller(store)
@@ -317,6 +477,61 @@ def test_controller_returns_typed_limit_decision_without_finalizing_session():
     assert result.usage_summary.usage.total_tokens == 11
     assert result.events == ()
     assert session.status == SessionStatus.RUNNING
+
+
+def test_controller_fails_closed_on_malformed_normalized_usage_without_crashing():
+    store = InMemorySessionStore()
+    controller = _controller(store)
+
+    async def scenario() -> tuple[LimitEvaluation, Session]:
+        session = await _running_session(store, "sess_malformed_usage_budget")
+        await store.append_event(
+            session.id,
+            Event(
+                type=EventType.MODEL_COMPLETED,
+                session_id=session.id,
+                agent_name="assistant",
+                payload={
+                    "usage_metrics": {
+                        "provider_name": " fake ",
+                        "model": "fake-model",
+                        "input_tokens": 7,
+                        "output_tokens": 3,
+                        "total_tokens": 10,
+                        "reasoning_output_tokens": "not-an-integer",
+                    }
+                },
+            ),
+        )
+        result = await controller.evaluate_request_limits(
+            session=session,
+            agent_name="assistant",
+            environment_name=None,
+            limits=RunLimits(),
+            budget_limits=(
+                BudgetLimit(
+                    scope="session",
+                    max_estimated_cost=Decimal("1"),
+                    pricing=_pricing(),
+                ),
+            ),
+            run_started_at=time.monotonic(),
+        )
+        loaded = await store.load(session.id)
+        assert loaded is not None
+        return result, loaded
+
+    result, session = asyncio.run(scenario())
+
+    assert result.decision is not None
+    assert result.decision.limit is StopLimit.ESTIMATED_COST
+    assert "cannot be verified" in result.decision.message
+    assert result.cost_summary is not None
+    assert result.cost_summary.unpriced_model_steps == 1
+    assert result.cost_summary.line_items[0].missing_pricing_reason == (
+        "model.completed event has no valid normalized usage metrics"
+    )
+    assert session.status is SessionStatus.RUNNING
 
 
 def test_operation_session_limit_deduplicates_persisted_operation_events():

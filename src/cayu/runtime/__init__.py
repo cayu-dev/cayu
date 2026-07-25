@@ -341,6 +341,8 @@ from cayu.runtime.tool_policy import (
 )
 from cayu.runtime.tool_rounds import ToolRoundRecoveryRequest
 from cayu.runtime.usage import (
+    AggregateCacheUsageMetrics,
+    AggregateUsageMetrics,
     CacheUsageMetrics,
     CausalBudgetUsageSummary,
     SessionUsageSummary,
@@ -376,6 +378,8 @@ __all__ = [
     "AgentManifest",
     "AggregateAccuracy",
     "AggregateAccuracyKind",
+    "AggregateCacheUsageMetrics",
+    "AggregateUsageMetrics",
     "AllowAllToolPolicy",
     "AllowlistRule",
     "AlwaysRequireApprovalToolPolicy",

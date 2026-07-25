@@ -68,6 +68,7 @@ import {
   formatTime,
   modelUsagePayload,
   numericValue,
+  sumCounts,
 } from "../lib/format"
 import { dashboardPath } from "../lib/links"
 import type { MutationExecutionOptions } from "../lib/mutation-browser"
@@ -231,7 +232,7 @@ function statusVariant(status: string): "default" | "secondary" | "destructive" 
 
 function totalTokens(summary: SessionSummary | undefined) {
   const usage = summary?.usage.usage
-  return usage?.total_tokens ?? (usage?.input_tokens ?? 0) + (usage?.output_tokens ?? 0)
+  return usage?.total_tokens ?? sumCounts(usage?.input_tokens ?? 0, usage?.output_tokens ?? 0)
 }
 
 function summaryModels(summary: SessionSummary | undefined) {

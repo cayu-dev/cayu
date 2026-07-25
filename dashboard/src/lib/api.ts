@@ -61,7 +61,7 @@ import type {
   UserInputRecoveryBody,
 } from "./generated/server-api"
 
-export const SUPPORTED_SERVER_CONTRACT_VERSION = "2"
+export const SUPPORTED_SERVER_CONTRACT_VERSION = "3"
 
 export class ApiClientError extends Error {
   readonly status: number

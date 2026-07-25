@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from cayu import SQLiteSessionStore
+from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.cli import main
 from cayu.core import (
     Event,
@@ -97,7 +98,7 @@ def test_session_list_uses_project_target_and_emits_stable_json(
     assert payload == {
         "has_more": False,
         "next_cursor": None,
-        "schema_version": "1",
+        "schema_version": "2",
         "sessions": [
             {
                 "agent": "writer",
@@ -451,8 +452,8 @@ def test_session_show_summarizes_oversized_state_without_printing_content(
     assert payload["events"]["largest_payload_bytes"] >= 20_000
     assert payload["activity"]["model_calls"] == 2
     assert payload["activity"]["model_calls_with_usage"] == 2
-    assert payload["usage"]["input_tokens"] == 101
-    assert payload["usage"]["cached_input_tokens"] == 80
+    assert payload["usage"]["input_tokens"] == "101"
+    assert payload["usage"]["cached_input_tokens"] == "80"
     assert payload["budget"]["cost_state"] == "unknown"
     assert payload["budget"]["amount"] is None
 
@@ -996,17 +997,17 @@ def test_session_usage_reports_per_call_cache_and_honest_pricing_state(
     assert payload["has_more"] is True
     assert payload["next_offset"] == 1
     assert payload["aggregate"] == {
-        "cache_read_tokens": 7,
-        "cache_write_tokens": 0,
-        "cached_input_tokens": 7,
-        "input_tokens": 10,
+        "cache_read_tokens": "7",
+        "cache_write_tokens": "0",
+        "cached_input_tokens": "7",
+        "input_tokens": "11",
         "model_calls": 2,
-        "model_calls_with_usage": 1,
-        "output_tokens": 2,
-        "reasoning_tokens": 1,
+        "model_calls_with_usage": 2,
+        "output_tokens": "2",
+        "reasoning_tokens": "1",
         "tool_calls": 0,
-        "total_tokens": 12,
-        "uncached_input_tokens": 3,
+        "total_tokens": "12",
+        "uncached_input_tokens": "3",
     }
     first = payload["calls"][0]
     assert first["provider"] == "fake"
@@ -1045,7 +1046,7 @@ def test_session_usage_reports_per_call_cache_and_honest_pricing_state(
         == 0
     )
     second = json.loads(capsys.readouterr().out)["calls"][0]
-    assert second["input_tokens"] is None
+    assert second["input_tokens"] == 1
     assert second["pricing_state"] == "unknown"
     assert second["ledger"] == []
 
@@ -1095,8 +1096,86 @@ def test_session_usage_reports_per_call_cache_and_honest_pricing_state(
         "model_call",
         "unmatched_ledger",
     }
+    assert {row["schema_version"] for row in jsonl_rows} == {"2"}
     aggregate_row = next(row for row in jsonl_rows if row["record_type"] == "aggregate")
-    assert aggregate_row["total_tokens"] == 12
+    assert aggregate_row["total_tokens"] == "12"
+
+
+def test_session_usage_json_serializes_aggregate_counters_losslessly(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    database = _write_project(tmp_path)
+    expected = str(MAX_DURABLE_JSON_INTEGER * 2)
+
+    async def seed() -> None:
+        store = SQLiteSessionStore(database)
+        try:
+            await store.create(
+                RunRequest(
+                    agent_name="operator",
+                    session_id="sess_usage_overflow",
+                    messages=[Message.text("user", "inspect exact aggregate usage")],
+                ),
+                identity=SessionIdentity(provider_name="fake", model="model"),
+            )
+            await store.append_events(
+                "sess_usage_overflow",
+                [
+                    Event(
+                        type=EventType.MODEL_COMPLETED,
+                        session_id="sess_usage_overflow",
+                        payload={
+                            "usage_metrics": {
+                                "input_tokens": MAX_DURABLE_JSON_INTEGER,
+                                "output_tokens": 0,
+                                "total_tokens": MAX_DURABLE_JSON_INTEGER,
+                            }
+                        },
+                    )
+                    for _ in range(2)
+                ],
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+
+    assert (
+        main(
+            [
+                "session",
+                "usage",
+                "sess_usage_overflow",
+                "--sqlite",
+                str(database),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema_version"] == "2"
+    assert payload["aggregate"]["input_tokens"] == expected
+    assert payload["aggregate"]["total_tokens"] == expected
+
+    assert (
+        main(
+            [
+                "session",
+                "usage",
+                "sess_usage_overflow",
+                "--sqlite",
+                str(database),
+                "--jsonl",
+            ]
+        )
+        == 0
+    )
+    rows = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    aggregate = next(row for row in rows if row["record_type"] == "aggregate")
+    assert aggregate["input_tokens"] == expected
+    assert aggregate["total_tokens"] == expected
 
 
 def test_session_aggregate_commands_bound_retained_projections_not_raw_payloads(

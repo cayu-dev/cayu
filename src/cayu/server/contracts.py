@@ -38,7 +38,11 @@ from cayu.runtime.sessions import (
     SessionOperationalSnapshot,
 )
 from cayu.runtime.tasks import TaskAggregateFilter, TaskOperationalSnapshot
-from cayu.runtime.usage import CausalBudgetUsageSummary, SessionUsageSummary, UsageMetrics
+from cayu.runtime.usage import (
+    AggregateUsageMetrics,
+    CausalBudgetUsageSummary,
+    SessionUsageSummary,
+)
 from cayu.server.sse import (
     SSE_ERROR_TEXT_MAX_BYTES,
     SSE_EVENT_DATA_MAX_BYTES,
@@ -48,7 +52,7 @@ from cayu.server.sse import (
 )
 
 SERVER_API_PREFIX = "/api"
-SERVER_CONTRACT_VERSION = "2"
+SERVER_CONTRACT_VERSION = "3"
 SSE_CONTENT_TYPE = "text/event-stream"
 SSE_LAST_EVENT_ID_FORMAT = "session_id:event_id"
 MAX_SYSTEM_ARTIFACT_STORE_REGISTRATIONS = 64
@@ -713,7 +717,7 @@ class AggregateUsageSummary(ApiBaseModel):
     tool_calls: StrictInt = Field(ge=0)
     provider_names: list[str]
     models: list[str]
-    usage: UsageMetrics
+    usage: AggregateUsageMetrics
     session_summaries: tuple[SessionUsageSummary, ...]
 
 
@@ -722,7 +726,7 @@ class UsageBreakdownItem(ApiBaseModel):
     model: str | None
     session_count: StrictInt = Field(ge=0)
     model_steps: StrictInt = Field(ge=0)
-    usage: UsageMetrics
+    usage: AggregateUsageMetrics
 
 
 class AggregateCostSummary(ApiBaseModel):

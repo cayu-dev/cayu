@@ -7,17 +7,14 @@ from dataclasses import field as dataclass_field
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import Annotated, cast
+from typing import cast
 
 from pydantic import (
     BaseModel,
-    BeforeValidator,
     ConfigDict,
     Field,
-    PlainSerializer,
     StrictBool,
     StrictInt,
-    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -25,7 +22,16 @@ from pydantic import (
 from cayu._validation import json_utf8_size_within_limit, require_clean_nonblank
 from cayu.core.billing import BillingIdentity
 from cayu.core.events import Event, EventType
-from cayu.runtime.usage import CacheUsageMetrics, UsageMetrics
+from cayu.runtime.usage import (
+    AggregateCacheUsageMetrics,  # noqa: F401 - compatibility re-export
+    AggregateCount,
+    AggregateUsageMetrics,
+    CacheUsageMetrics,
+    PositiveAggregateCount,
+    UsageMetrics,
+    add_aggregate_usage,  # noqa: F401 - compatibility re-export
+    build_aggregate_usage_metrics,  # noqa: F401 - compatibility re-export
+)
 
 
 class AggregateAccuracyKind(StrEnum):
@@ -68,55 +74,6 @@ MAX_USAGE_PRICING_INPUT_BYTES = 8 * 1024 * 1024
 MAX_USAGE_PRICING_RAW_CANDIDATES = 5000
 
 
-def _serialize_aggregate_count(value: int) -> str:
-    """Serialize exact aggregate counters without crossing JSON's safe-integer boundary."""
-
-    return str(value)
-
-
-def _aggregate_count_from_json(value: object) -> int:
-    if (
-        type(value) is not str
-        or not value
-        or (value != "0" and (value[0] == "0" or not value.isascii() or not value.isdigit()))
-    ):
-        raise ValueError(
-            "Aggregate counters in JSON must be canonical nonnegative decimal strings."
-        )
-    return int(value)
-
-
-def _deserialize_aggregate_count(value: object, info: ValidationInfo) -> object:
-    """Parse the v2 wire representation without weakening strict Python construction."""
-
-    if info.mode != "json":
-        return value
-    return _aggregate_count_from_json(value)
-
-
-AggregateCountString = Annotated[str, Field(pattern=r"^(0|[1-9]\d*)$")]
-AggregateCount = Annotated[
-    StrictInt,
-    BeforeValidator(
-        _deserialize_aggregate_count,
-        json_schema_input_type=AggregateCountString,
-    ),
-    PlainSerializer(_serialize_aggregate_count, return_type=AggregateCountString, when_used="json"),
-]
-PositiveAggregateCountString = Annotated[str, Field(pattern=r"^[1-9]\d*$")]
-PositiveAggregateCount = Annotated[
-    StrictInt,
-    BeforeValidator(
-        _deserialize_aggregate_count,
-        json_schema_input_type=PositiveAggregateCountString,
-    ),
-    PlainSerializer(
-        _serialize_aggregate_count,
-        return_type=PositiveAggregateCountString,
-        when_used="json",
-    ),
-]
-
 # Python's ``str.strip`` set, written explicitly so SQLite and PostgreSQL can
 # apply the same identity contract instead of relying on database-specific
 # ASCII whitespace defaults.
@@ -127,70 +84,6 @@ AGGREGATE_IDENTITY_TRIM_CHARACTERS = (
     "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
     "\u2028\u2029\u202f\u205f\u3000"
 )
-
-
-class AggregateCacheUsageMetrics(BaseModel):
-    """Lossless JSON projection of identity-free aggregate cache counters."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    read_tokens: AggregateCount = Field(ge=0)
-    write_tokens: AggregateCount = Field(ge=0)
-    write_5m_tokens: AggregateCount = Field(ge=0)
-    write_1h_tokens: AggregateCount = Field(ge=0)
-    write_unknown_ttl_tokens: AggregateCount = Field(ge=0)
-    cached_input_tokens: AggregateCount = Field(ge=0)
-    uncached_input_tokens: AggregateCount = Field(ge=0)
-
-
-class AggregateUsageMetrics(BaseModel):
-    """Lossless JSON projection of identity-free aggregate token counters."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    input_tokens: AggregateCount = Field(ge=0)
-    output_tokens: AggregateCount = Field(ge=0)
-    total_tokens: AggregateCount = Field(ge=0)
-    reasoning_output_tokens: AggregateCount = Field(ge=0)
-    cache: AggregateCacheUsageMetrics
-
-
-def build_aggregate_usage_metrics(
-    *,
-    input_tokens: int = 0,
-    output_tokens: int = 0,
-    total_tokens: int = 0,
-    reasoning_output_tokens: int = 0,
-    cache_read_tokens: int = 0,
-    cache_write_tokens: int = 0,
-    cache_write_5m_tokens: int = 0,
-    cache_write_1h_tokens: int = 0,
-    cache_write_unknown_ttl_tokens: int = 0,
-    cached_input_tokens: int = 0,
-    uncached_input_tokens: int = 0,
-) -> AggregateUsageMetrics:
-    """Build identity-free aggregate counters without weakening step metrics.
-
-    Individual model-step counters use the portable signed-64-bit contract.
-    Exact totals may legitimately exceed that range, so aggregate projections
-    use their own validated public type and serialize counters as decimal strings.
-    """
-
-    return AggregateUsageMetrics(
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        total_tokens=total_tokens,
-        reasoning_output_tokens=reasoning_output_tokens,
-        cache=AggregateCacheUsageMetrics(
-            read_tokens=cache_read_tokens,
-            write_tokens=cache_write_tokens,
-            write_5m_tokens=cache_write_5m_tokens,
-            write_1h_tokens=cache_write_1h_tokens,
-            write_unknown_ttl_tokens=cache_write_unknown_ttl_tokens,
-            cached_input_tokens=cached_input_tokens,
-            uncached_input_tokens=uncached_input_tokens,
-        ),
-    )
 
 
 class UsageAggregateTotals(BaseModel):
@@ -211,43 +104,21 @@ class UsageAggregateTotals(BaseModel):
         return self
 
 
-def add_aggregate_usage(
-    left: AggregateUsageMetrics,
-    right: AggregateUsageMetrics | UsageMetrics,
-) -> AggregateUsageMetrics:
-    """Add token counters while deliberately discarding per-step identity fields."""
-
-    return build_aggregate_usage_metrics(
-        input_tokens=left.input_tokens + right.input_tokens,
-        output_tokens=left.output_tokens + right.output_tokens,
-        total_tokens=left.total_tokens + right.total_tokens,
-        reasoning_output_tokens=(left.reasoning_output_tokens + right.reasoning_output_tokens),
-        cache_read_tokens=left.cache.read_tokens + right.cache.read_tokens,
-        cache_write_tokens=left.cache.write_tokens + right.cache.write_tokens,
-        cache_write_5m_tokens=left.cache.write_5m_tokens + right.cache.write_5m_tokens,
-        cache_write_1h_tokens=left.cache.write_1h_tokens + right.cache.write_1h_tokens,
-        cache_write_unknown_ttl_tokens=(
-            left.cache.write_unknown_ttl_tokens + right.cache.write_unknown_ttl_tokens
-        ),
-        cached_input_tokens=(left.cache.cached_input_tokens + right.cache.cached_input_tokens),
-        uncached_input_tokens=(
-            left.cache.uncached_input_tokens + right.cache.uncached_input_tokens
-        ),
-    )
-
-
 def aggregate_usage_metrics_from_event_payload(
     payload: dict[str, object],
 ) -> UsageMetrics | None:
     """Project normalized counters without trusting arbitrary event JSON.
 
     Aggregate queries intentionally consume only the durable ``usage_metrics``
-    projection. A present object counts as reported usage; malformed counters
-    contribute zero and malformed optional identity becomes unknown. This
-    definition is simple enough for SQL stores to implement exactly and keeps a
-    custom event from failing an otherwise valid operational report.
+    projection. An explicit normalization failure is authoritative; otherwise,
+    a present object counts as reported usage, malformed counters contribute
+    zero, and malformed optional identity becomes unknown. This definition is
+    simple enough for SQL stores to implement exactly and keeps a custom event
+    from failing an otherwise valid operational report.
     """
 
+    if payload.get("usage_normalization_failed") is True:
+        return None
     raw_metrics = payload.get("usage_metrics")
     if type(raw_metrics) is not dict:
         return None
@@ -272,6 +143,25 @@ def aggregate_usage_metrics_from_event_payload(
             uncached_input_tokens=_aggregate_counter(raw_cache.get("uncached_input_tokens")),
         ),
     )
+
+
+def summary_usage_metrics_from_event_payload(
+    payload: dict[str, object],
+) -> UsageMetrics | None:
+    """Return metrics for an application-memory usage summary.
+
+    A durable normalized projection is authoritative and uses the same
+    tolerant parsing contract as native store rollups. The strict raw-usage
+    normalization fallback is retained only for older events that do not carry
+    ``usage_metrics``.
+    """
+
+    if "usage_metrics" in payload:
+        return aggregate_usage_metrics_from_event_payload(payload)
+
+    from cayu.runtime.usage import usage_metrics_from_event_payload
+
+    return usage_metrics_from_event_payload(payload)
 
 
 def project_aggregate_usage_inspection_event(
@@ -302,6 +192,8 @@ def pricing_usage_metrics_from_event_payload(
 
     from cayu.runtime.usage import usage_metrics_from_event_payload
 
+    if payload.get("usage_normalization_failed") is True:
+        return None
     raw_metrics = payload.get("usage_metrics")
     if type(raw_metrics) is not dict:
         return None

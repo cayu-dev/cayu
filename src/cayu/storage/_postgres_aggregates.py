@@ -42,11 +42,18 @@ usage_events AS MATERIALIZED (
         event.event_type,
         event.timestamp,
         CASE
-            WHEN jsonb_typeof(event.payload -> 'usage_metrics') = 'object' THEN 1
+            WHEN event.payload -> 'usage_normalization_failed'
+                     IS DISTINCT FROM 'true'::jsonb
+             AND jsonb_typeof(event.payload -> 'usage_metrics') = 'object'
+            THEN 1
             ELSE 0
         END AS has_usage,
         (CASE
-            WHEN jsonb_typeof(event.payload #> '{{usage_metrics,provider_name}}') = 'string'
+            WHEN event.payload -> 'usage_normalization_failed'
+                     IS DISTINCT FROM 'true'::jsonb
+             AND jsonb_typeof(
+                     event.payload #> '{{usage_metrics,provider_name}}'
+                 ) = 'string'
              AND btrim(
                  event.payload #>> '{{usage_metrics,provider_name}}',
                  (SELECT identity_trim FROM scope)
@@ -55,7 +62,9 @@ usage_events AS MATERIALIZED (
             THEN event.payload #>> '{{usage_metrics,provider_name}}'
         END) COLLATE "C" AS provider_name,
         (CASE
-            WHEN jsonb_typeof(event.payload #> '{{usage_metrics,model}}') = 'string'
+            WHEN event.payload -> 'usage_normalization_failed'
+                     IS DISTINCT FROM 'true'::jsonb
+             AND jsonb_typeof(event.payload #> '{{usage_metrics,model}}') = 'string'
              AND btrim(
                  event.payload #>> '{{usage_metrics,model}}',
                  (SELECT identity_trim FROM scope)
@@ -489,7 +498,9 @@ def _postgres_usage_metrics_projection() -> str:
     identity = _postgres_billing_identity_projection(identity_path)
     return f"""
         CASE
-            WHEN jsonb_typeof({metrics}) = 'object'
+            WHEN event.payload -> 'usage_normalization_failed'
+                     IS DISTINCT FROM 'true'::jsonb
+             AND jsonb_typeof({metrics}) = 'object'
             THEN CASE
                 WHEN jsonb_typeof(
                     event.payload #> {_postgres_json_path(identity_path)}
@@ -572,7 +583,9 @@ def _postgres_json_path(parts: tuple[str, ...]) -> str:
 def _nonnegative_json_integer(path: str) -> str:
     return f"""
         CASE
-            WHEN jsonb_typeof(event.payload #> '{path}') = 'number'
+            WHEN event.payload -> 'usage_normalization_failed'
+                     IS DISTINCT FROM 'true'::jsonb
+             AND jsonb_typeof(event.payload #> '{path}') = 'number'
              AND (event.payload #>> '{path}') ~ '^[0-9]+$'
              AND (
                  length(event.payload #>> '{path}') < 19

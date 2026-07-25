@@ -22,6 +22,7 @@ from cayu.cli.store_targets import (
 )
 from cayu.core import EventType
 from cayu.runtime import (
+    AggregateUsageMetrics,
     EventOrder,
     EventQuery,
     EventRecord,
@@ -34,12 +35,13 @@ from cayu.runtime import (
     session_usage_summary,
     usage_metrics_from_event_payload,
 )
+from cayu.runtime.aggregates import summary_usage_metrics_from_event_payload
 from cayu.runtime.usage import count_model_steps_with_usage
 from cayu.storage import SQLiteSessionStore
 from cayu.storage import migrations as schema
 
 FORMAT_CHOICES = ("json", "table", "jsonl")
-CLI_SCHEMA_VERSION = "1"
+CLI_SCHEMA_VERSION = "2"
 _MAX_COLLECTED_EVENT_BYTES = 64 * 1024 * 1024
 _MAX_COLLECTED_EVENT_RECORDS = 100_000
 _MAX_TRANSCRIPT_CONTENT_BYTES = 1_048_576
@@ -340,7 +342,7 @@ async def _show_session(args: argparse.Namespace, store: SessionStore) -> int:
     except KeyError as exc:
         raise ValueError(f"Session not found: {args.session_id}") from exc
     identity = summary.session
-    usage = summary.usage.usage
+    usage = _aggregate_usage_cli_payload(summary.usage.usage)
     payload = {
         "schema_version": CLI_SCHEMA_VERSION,
         "session": {
@@ -377,16 +379,7 @@ async def _show_session(args: argparse.Namespace, store: SessionStore) -> int:
             "model_calls_with_usage": summary.model_calls_with_usage,
             "tool_calls": summary.tool_calls,
         },
-        "usage": {
-            "input_tokens": usage.input_tokens,
-            "output_tokens": usage.output_tokens,
-            "total_tokens": usage.total_tokens,
-            "reasoning_tokens": usage.reasoning_output_tokens,
-            "cache_read_tokens": usage.cache.read_tokens,
-            "cache_write_tokens": usage.cache.write_tokens,
-            "cached_input_tokens": usage.cache.cached_input_tokens,
-            "uncached_input_tokens": usage.cache.uncached_input_tokens,
-        },
+        "usage": usage,
         "pending_action": {
             "count": summary.pending_action_count,
             "kinds": [kind.value for kind in summary.pending_action_kinds],
@@ -462,14 +455,7 @@ async def _session_usage(args: argparse.Namespace, store: SessionStore) -> int:
             "model_calls": aggregate.model_steps,
             "model_calls_with_usage": model_calls_with_usage,
             "tool_calls": aggregate.tool_calls,
-            "input_tokens": aggregate_usage.input_tokens,
-            "output_tokens": aggregate_usage.output_tokens,
-            "total_tokens": aggregate_usage.total_tokens,
-            "reasoning_tokens": aggregate_usage.reasoning_output_tokens,
-            "cache_read_tokens": aggregate_usage.cache.read_tokens,
-            "cache_write_tokens": aggregate_usage.cache.write_tokens,
-            "cached_input_tokens": aggregate_usage.cache.cached_input_tokens,
-            "uncached_input_tokens": aggregate_usage.cache.uncached_input_tokens,
+            **_aggregate_usage_cli_payload(aggregate_usage),
         },
     }
     _render_usage(
@@ -479,6 +465,25 @@ async def _session_usage(args: argparse.Namespace, store: SessionStore) -> int:
         ledger_page,
     )
     return 0
+
+
+def _aggregate_usage_cli_payload(usage: AggregateUsageMetrics) -> dict[str, str]:
+    """Project validated aggregate counters through their lossless JSON representation."""
+
+    if type(usage) is not AggregateUsageMetrics:
+        raise TypeError("CLI aggregate usage must be an AggregateUsageMetrics instance.")
+    serialized = usage.model_dump(mode="json")
+    cache = serialized["cache"]
+    return {
+        "input_tokens": serialized["input_tokens"],
+        "output_tokens": serialized["output_tokens"],
+        "total_tokens": serialized["total_tokens"],
+        "reasoning_tokens": serialized["reasoning_output_tokens"],
+        "cache_read_tokens": cache["read_tokens"],
+        "cache_write_tokens": cache["write_tokens"],
+        "cached_input_tokens": cache["cached_input_tokens"],
+        "uncached_input_tokens": cache["uncached_input_tokens"],
+    }
 
 
 def _render_usage(
@@ -495,7 +500,13 @@ def _render_usage(
         for call in calls:
             print(
                 json.dumps(
-                    _redact_sensitive({"record_type": "model_call", **call}),
+                    _redact_sensitive(
+                        {
+                            "record_type": "model_call",
+                            **call,
+                            "schema_version": payload["schema_version"],
+                        }
+                    ),
                     ensure_ascii=False,
                     sort_keys=True,
                 )
@@ -503,14 +514,26 @@ def _render_usage(
         for ledger in unmatched_ledger:
             print(
                 json.dumps(
-                    _redact_sensitive({"record_type": "unmatched_ledger", **ledger}),
+                    _redact_sensitive(
+                        {
+                            "record_type": "unmatched_ledger",
+                            **ledger,
+                            "schema_version": payload["schema_version"],
+                        }
+                    ),
                     ensure_ascii=False,
                     sort_keys=True,
                 )
             )
         print(
             json.dumps(
-                _redact_sensitive({"record_type": "aggregate", **payload["aggregate"]}),
+                _redact_sensitive(
+                    {
+                        "record_type": "aggregate",
+                        **payload["aggregate"],
+                        "schema_version": payload["schema_version"],
+                    }
+                ),
                 ensure_ascii=False,
                 sort_keys=True,
             )
@@ -1295,7 +1318,7 @@ def _usage_inspection_record(record: EventRecord) -> EventRecord:
         if transcript_cursor is not None:
             payload["transcript_cursor"] = transcript_cursor
         try:
-            metrics = usage_metrics_from_event_payload(event.payload)
+            metrics = summary_usage_metrics_from_event_payload(event.payload)
         except (TypeError, ValueError):
             payload["usage_metrics"] = {"_invalid": True}
         else:

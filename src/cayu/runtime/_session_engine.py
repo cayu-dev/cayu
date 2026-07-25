@@ -24,6 +24,8 @@ from cayu._task_wait import (
     unexpected_child_cancellation_error,
 )
 from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
+    MIN_DURABLE_JSON_INTEGER,
     copy_durable_json_value,
     copy_json_value,
     copy_label_map,
@@ -255,7 +257,9 @@ from cayu.runtime.tool_policy import (
 )
 from cayu.runtime.usage import (
     SessionUsageSummary,
+    aggregate_usage_metrics_payload,
     session_usage_summary,
+    session_usage_summary_payload,
 )
 from cayu.runtime.user_input import (
     pending_user_input_from_checkpoint,
@@ -1350,7 +1354,7 @@ def _limit_reached_payload(
         "maximum": _limit_value_for_payload(decision.maximum),
         "actual": _limit_value_for_payload(decision.actual),
         "message": decision.message,
-        "usage_summary": usage_summary.model_dump(),
+        "usage_summary": session_usage_summary_payload(usage_summary),
     }
     if cost_summary is not None:
         payload["cost_summary"] = cost_summary.model_dump(mode="json")
@@ -1365,7 +1369,9 @@ def _limit_value_for_payload(value: int | Decimal) -> int | str:
     if type(value) is Decimal:
         return str(value)
     if type(value) is int:
-        return value
+        if MIN_DURABLE_JSON_INTEGER <= value <= MAX_DURABLE_JSON_INTEGER:
+            return value
+        return str(value)
     raise TypeError("limit payload value must be an int or Decimal.")
 
 
@@ -7098,7 +7104,7 @@ class SessionEngine:
                     "duration_ms": duration_ms,
                     "step_count": summary.model_steps,
                     "tool_call_count": summary.tool_calls,
-                    "token_usage": summary.usage.model_dump(),
+                    "token_usage": aggregate_usage_metrics_payload(summary.usage),
                     "provider_names": summary.provider_names,
                     "models": summary.models,
                 },

@@ -88,8 +88,7 @@ def write_trajectory_json(trajectory: Trajectory, path: str | Path) -> None:
 def load_trajectory(path: str | Path) -> Trajectory:
     # The opt-in replay/export object; unlike EvalRun it carries no persisted baseline
     # schema_version (it is not folded into the score-first baseline in v1).
-    with Path(path).open("r", encoding="utf-8") as file:
-        return Trajectory.model_validate(json.load(file))
+    return Trajectory.model_validate_json(Path(path).read_text(encoding="utf-8"))
 
 
 def render_html_report(run: EvalRun) -> str:

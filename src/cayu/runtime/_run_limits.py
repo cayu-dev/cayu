@@ -55,7 +55,7 @@ from cayu.runtime.stop_policy import (
 from cayu.runtime.usage import (
     USAGE_BEARING_EVENT_TYPES,
     SessionUsageSummary,
-    UsageMetrics,
+    build_aggregate_usage_metrics,
     session_usage_summary,
 )
 
@@ -472,7 +472,7 @@ class RunLimitController:
             usage_for_limits = SessionUsageSummary(
                 session_id=session.id,
                 tool_calls=max(0, usage_summary.tool_calls - run_baseline.tool_calls),
-                usage=UsageMetrics(
+                usage=build_aggregate_usage_metrics(
                     input_tokens=max(0, current.input_tokens - baseline.input_tokens),
                     output_tokens=max(0, current.output_tokens - baseline.output_tokens),
                     total_tokens=max(0, current.total_tokens - baseline.total_tokens),

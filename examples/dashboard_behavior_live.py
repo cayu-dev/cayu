@@ -895,7 +895,7 @@ async def _exercise_contract_version_gate(page: Page, base_url: str) -> None:
     try:
         await page.goto(f"{base_url}/cayu/usage", wait_until="networkidle")
         await expect(page.get_by_test_id("dashboard-contract-gate")).to_contain_text(
-            "Dashboard expects CAYU server contract v2, but the server reports v1."
+            "Dashboard expects CAYU server contract v3, but the server reports v1."
         )
         await expect(page.get_by_role("heading", name="Usage", exact=True)).to_have_count(0)
         require_equal(

@@ -51,6 +51,7 @@ from cayu import (
     WorkspaceBinding,
     default_price_book,
 )
+from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.artifacts import ArtifactListResult, ArtifactMetadata, ArtifactReadResult, ArtifactStore
 from cayu.core.events import Event, EventType
 from cayu.providers import (
@@ -132,6 +133,32 @@ class UsageProvider(ModelProvider):
                 }
             }
         )
+
+
+def _aggregate_usage_json(
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    total_tokens: int,
+    cache_read_tokens: int,
+    cached_input_tokens: int,
+    uncached_input_tokens: int,
+) -> dict:
+    return {
+        "input_tokens": str(input_tokens),
+        "output_tokens": str(output_tokens),
+        "total_tokens": str(total_tokens),
+        "reasoning_output_tokens": "0",
+        "cache": {
+            "read_tokens": str(cache_read_tokens),
+            "write_tokens": "0",
+            "write_5m_tokens": "0",
+            "write_1h_tokens": "0",
+            "write_unknown_ttl_tokens": "0",
+            "cached_input_tokens": str(cached_input_tokens),
+            "uncached_input_tokens": str(uncached_input_tokens),
+        },
+    }
 
 
 def test_server_usage_aggregation_preserves_cache_ttl_buckets() -> None:
@@ -1989,22 +2016,168 @@ def test_server_exposes_session_usage_summary() -> None:
         "tool_calls": 0,
         "provider_names": ["fake"],
         "models": ["fake-model"],
-        "usage": {
-            "provider_name": None,
-            "model": None,
-            "input_tokens": 10,
-            "output_tokens": 2,
-            "total_tokens": 12,
-            "reasoning_output_tokens": 0,
-            "requested_model": None,
-            "cache": {
-                "read_tokens": 4,
-                "write_tokens": 0,
-                "cached_input_tokens": 4,
-                "uncached_input_tokens": 6,
-            },
-        },
+        "usage": _aggregate_usage_json(
+            input_tokens=10,
+            output_tokens=2,
+            total_tokens=12,
+            cache_read_tokens=4,
+            cached_input_tokens=4,
+            uncached_input_tokens=6,
+        ),
     }
+
+
+def test_server_usage_summaries_serialize_counters_beyond_int64() -> None:
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    maximum = MAX_DURABLE_JSON_INTEGER
+    expected = str(maximum * 2)
+
+    async def seed() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="usage_overflow",
+                causal_budget_id="budget_overflow",
+                messages=[Message.text("user", "seed")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.append_events(
+            "usage_overflow",
+            [
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id="usage_overflow",
+                    payload={
+                        "usage_metrics": {
+                            "provider_name": "fake",
+                            "model": "fake-model",
+                            "input_tokens": maximum,
+                            "output_tokens": maximum,
+                            "total_tokens": maximum,
+                        }
+                    },
+                )
+                for _ in range(2)
+            ],
+        )
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    session_response = client.get("/api/sessions/usage_overflow/usage")
+    causal_response = client.get("/api/causal-budgets/budget_overflow/usage")
+    aggregate_response = client.post("/api/sessions/summary", json={})
+
+    assert session_response.status_code == 200
+    assert session_response.json()["usage"]["total_tokens"] == expected
+    assert causal_response.status_code == 200
+    assert causal_response.json()["usage"]["total_tokens"] == expected
+    assert aggregate_response.status_code == 200
+    aggregate = aggregate_response.json()
+    assert aggregate["usage"]["usage"]["total_tokens"] == expected
+    assert aggregate["provider_breakdown"][0]["usage"]["total_tokens"] == expected
+    assert aggregate["model_breakdown"][0]["usage"]["total_tokens"] == expected
+
+
+def test_server_usage_summaries_tolerate_malformed_optional_usage_fields() -> None:
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+
+    async def seed() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="usage_malformed_optional",
+                causal_budget_id="usage_malformed_budget",
+                messages=[Message.text("user", "seed")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="valid-model"),
+        )
+        await store.append_events(
+            "usage_malformed_optional",
+            [
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id="usage_malformed_optional",
+                    payload={
+                        "usage_metrics": {
+                            "provider_name": " fake ",
+                            "model": "valid-model",
+                            "input_tokens": 7,
+                            "output_tokens": 3,
+                            "total_tokens": 10,
+                            "reasoning_output_tokens": "not-an-integer",
+                            "custom_counter": 1,
+                            "cache": {
+                                "read_tokens": 4,
+                                "write_tokens": -1,
+                            },
+                        }
+                    },
+                )
+            ],
+        )
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+    pricing_body = {
+        "pricing": _price_book_payload(
+            provider_name="fake",
+            model="valid-model",
+        )
+    }
+
+    session_response = client.get("/api/sessions/usage_malformed_optional/usage")
+    aggregate_response = client.post("/api/sessions/summary", json=pricing_body)
+    session_cost_response = client.post(
+        "/api/sessions/usage_malformed_optional/cost",
+        json=pricing_body,
+    )
+    causal_cost_response = client.post(
+        "/api/causal-budgets/usage_malformed_budget/cost",
+        json=pricing_body,
+    )
+
+    assert session_response.status_code == 200
+    session_usage = session_response.json()
+    assert session_usage["provider_names"] == []
+    assert session_usage["models"] == ["valid-model"]
+    assert session_usage["usage"]["input_tokens"] == "7"
+    assert session_usage["usage"]["output_tokens"] == "3"
+    assert session_usage["usage"]["total_tokens"] == "10"
+    assert session_usage["usage"]["reasoning_output_tokens"] == "0"
+    assert session_usage["usage"]["cache"]["read_tokens"] == "4"
+    assert session_usage["usage"]["cache"]["write_tokens"] == "0"
+
+    assert aggregate_response.status_code == 200
+    aggregate = aggregate_response.json()
+    assert aggregate["usage"]["model_steps"] == 1
+    assert aggregate["usage"]["usage"]["total_tokens"] == "10"
+    assert aggregate["provider_breakdown"][0]["provider_name"] is None
+    assert aggregate["provider_breakdown"][0]["usage"]["total_tokens"] == "10"
+    assert aggregate["model_breakdown"][0]["provider_name"] is None
+    assert aggregate["cost"]["model_steps"] == 1
+    assert aggregate["cost"]["priced_model_steps"] == 0
+    assert aggregate["cost"]["unpriced_model_steps"] == 1
+    assert aggregate["cost"]["total_cost"] == "0"
+    assert aggregate["cost"]["line_items"][0]["missing_pricing_reason"] == (
+        "model.completed event has no valid normalized usage metrics"
+    )
+
+    for response in (session_cost_response, causal_cost_response):
+        assert response.status_code == 200
+        cost = response.json()
+        assert cost["model_steps"] == 1
+        assert cost["priced_model_steps"] == 0
+        assert cost["unpriced_model_steps"] == 1
+        assert cost["total_cost"] == "0"
+        assert cost["line_items"][0]["missing_pricing_reason"] == (
+            "model.completed event has no valid normalized usage metrics"
+        )
+    assert aggregate["model_breakdown"][0]["model"] == "valid-model"
+    assert aggregate["model_breakdown"][0]["usage"]["total_tokens"] == "10"
 
 
 def test_server_run_accepts_budget_limits() -> None:
@@ -2767,28 +2940,21 @@ def test_server_exposes_filtered_sessions_summary() -> None:
         "summary_filter_research",
     ]
     assert body["usage"]["session_count"] == 2
-    assert body["usage"]["usage"]["total_tokens"] == 24
+    assert body["usage"]["usage"]["total_tokens"] == "24"
     assert body["provider_breakdown"] == [
         {
             "provider_name": "fake",
             "model": None,
             "session_count": 2,
             "model_steps": 2,
-            "usage": {
-                "provider_name": "fake",
-                "requested_model": "fake-model",
-                "model": None,
-                "input_tokens": 20,
-                "output_tokens": 4,
-                "total_tokens": 24,
-                "reasoning_output_tokens": 0,
-                "cache": {
-                    "read_tokens": 8,
-                    "write_tokens": 0,
-                    "cached_input_tokens": 8,
-                    "uncached_input_tokens": 12,
-                },
-            },
+            "usage": _aggregate_usage_json(
+                input_tokens=20,
+                output_tokens=4,
+                total_tokens=24,
+                cache_read_tokens=8,
+                cached_input_tokens=8,
+                uncached_input_tokens=12,
+            ),
         }
     ]
     assert body["model_breakdown"] == [
@@ -2797,21 +2963,14 @@ def test_server_exposes_filtered_sessions_summary() -> None:
             "model": "fake-model",
             "session_count": 2,
             "model_steps": 2,
-            "usage": {
-                "provider_name": "fake",
-                "requested_model": "fake-model",
-                "model": "fake-model",
-                "input_tokens": 20,
-                "output_tokens": 4,
-                "total_tokens": 24,
-                "reasoning_output_tokens": 0,
-                "cache": {
-                    "read_tokens": 8,
-                    "write_tokens": 0,
-                    "cached_input_tokens": 8,
-                    "uncached_input_tokens": 12,
-                },
-            },
+            "usage": _aggregate_usage_json(
+                input_tokens=20,
+                output_tokens=4,
+                total_tokens=24,
+                cache_read_tokens=8,
+                cached_input_tokens=8,
+                uncached_input_tokens=12,
+            ),
         }
     ]
     assert body["cost"]["session_count"] == 2
@@ -2896,7 +3055,7 @@ def test_server_sessions_summary_allows_omitted_body() -> None:
     assert body["total_count"] == 1
     assert body["next_cursor"] is None
     assert body["sessions"][0]["session"]["id"] == "summary_no_body"
-    assert body["usage"]["usage"]["total_tokens"] == 12
+    assert body["usage"]["usage"]["total_tokens"] == "12"
     assert body["cost"] is None
 
 
@@ -3799,21 +3958,14 @@ def test_server_exposes_causal_budget_usage_and_cost_with_tiered_price_book() ->
         "tool_calls": 0,
         "provider_names": ["fake"],
         "models": ["fake-model"],
-        "usage": {
-            "provider_name": None,
-            "model": None,
-            "input_tokens": 20,
-            "output_tokens": 4,
-            "total_tokens": 24,
-            "reasoning_output_tokens": 0,
-            "requested_model": None,
-            "cache": {
-                "read_tokens": 8,
-                "write_tokens": 0,
-                "cached_input_tokens": 8,
-                "uncached_input_tokens": 12,
-            },
-        },
+        "usage": _aggregate_usage_json(
+            input_tokens=20,
+            output_tokens=4,
+            total_tokens=24,
+            cache_read_tokens=8,
+            cached_input_tokens=8,
+            uncached_input_tokens=12,
+        ),
         "session_summaries": [
             {
                 "session_id": "causal_parent",
@@ -3821,21 +3973,14 @@ def test_server_exposes_causal_budget_usage_and_cost_with_tiered_price_book() ->
                 "tool_calls": 0,
                 "provider_names": ["fake"],
                 "models": ["fake-model"],
-                "usage": {
-                    "provider_name": None,
-                    "model": None,
-                    "input_tokens": 10,
-                    "output_tokens": 2,
-                    "total_tokens": 12,
-                    "reasoning_output_tokens": 0,
-                    "requested_model": None,
-                    "cache": {
-                        "read_tokens": 4,
-                        "write_tokens": 0,
-                        "cached_input_tokens": 4,
-                        "uncached_input_tokens": 6,
-                    },
-                },
+                "usage": _aggregate_usage_json(
+                    input_tokens=10,
+                    output_tokens=2,
+                    total_tokens=12,
+                    cache_read_tokens=4,
+                    cached_input_tokens=4,
+                    uncached_input_tokens=6,
+                ),
             },
             {
                 "session_id": "causal_child",
@@ -3843,21 +3988,14 @@ def test_server_exposes_causal_budget_usage_and_cost_with_tiered_price_book() ->
                 "tool_calls": 0,
                 "provider_names": ["fake"],
                 "models": ["fake-model"],
-                "usage": {
-                    "provider_name": None,
-                    "model": None,
-                    "input_tokens": 10,
-                    "output_tokens": 2,
-                    "total_tokens": 12,
-                    "reasoning_output_tokens": 0,
-                    "requested_model": None,
-                    "cache": {
-                        "read_tokens": 4,
-                        "write_tokens": 0,
-                        "cached_input_tokens": 4,
-                        "uncached_input_tokens": 6,
-                    },
-                },
+                "usage": _aggregate_usage_json(
+                    input_tokens=10,
+                    output_tokens=2,
+                    total_tokens=12,
+                    cache_read_tokens=4,
+                    cached_input_tokens=4,
+                    uncached_input_tokens=6,
+                ),
             },
         ],
     }
@@ -3897,7 +4035,7 @@ def test_server_exposes_causal_budget_usage_and_cost_with_tiered_price_book() ->
         assert item["events"]["counts_by_type"]["model.completed"] == 1
         assert item["events"]["counts_by_type"]["session.completed"] == 1
         assert item["events"]["latest_event"]["type"] == "session.completed"
-    assert summary_body["usage"]["usage"]["total_tokens"] == 24
+    assert summary_body["usage"]["usage"]["total_tokens"] == "24"
     assert summary_body["cost"]["total_cost"] == "0.00028"
 
     missing_summary_response = client.post(
@@ -4040,21 +4178,14 @@ def test_server_exposes_session_summary() -> None:
         "tool_calls": 0,
         "provider_names": ["fake"],
         "models": ["fake-model"],
-        "usage": {
-            "provider_name": None,
-            "model": None,
-            "input_tokens": 10,
-            "output_tokens": 2,
-            "total_tokens": 12,
-            "reasoning_output_tokens": 0,
-            "requested_model": None,
-            "cache": {
-                "read_tokens": 4,
-                "write_tokens": 0,
-                "cached_input_tokens": 4,
-                "uncached_input_tokens": 6,
-            },
-        },
+        "usage": _aggregate_usage_json(
+            input_tokens=10,
+            output_tokens=2,
+            total_tokens=12,
+            cache_read_tokens=4,
+            cached_input_tokens=4,
+            uncached_input_tokens=6,
+        ),
     }
 
 
