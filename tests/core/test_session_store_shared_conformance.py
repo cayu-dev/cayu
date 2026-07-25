@@ -865,6 +865,112 @@ def test_session_store_conformance_usage_normalization_failure_is_authoritative(
     asyncio.run(run())
 
 
+def test_session_store_conformance_inspection_fails_closed_for_malformed_budget_evidence(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        store_kind = session_store_case[0]
+        try:
+            for index, case in enumerate(
+                (
+                    "invalid-attempt",
+                    "whitespace-reservation",
+                    "invalid-amount",
+                    "outstanding",
+                    "invalid-pricing",
+                ),
+                start=1,
+            ):
+                session_id = f"inspection-budget-{case}-{store_kind}"
+                budget_limit_id = f"blim_{index:064x}"
+                identity = {
+                    "model_step_id": f"mstep_{index:032x}",
+                    "model_attempt_id": f"matt_{index:032x}",
+                }
+                reservation_id = (
+                    " reservation-with-whitespace "
+                    if case == "whitespace-reservation"
+                    else f"reservation-{case}"
+                )
+                reservation_identity = (
+                    {**identity, "model_attempt_id": "bad"}
+                    if case == "invalid-attempt"
+                    else identity
+                )
+
+                await store.create(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "inspect")],
+                    ),
+                    identity=_identity(),
+                )
+                await store.append_event(
+                    session_id,
+                    Event(
+                        type=EventType.BUDGET_RESERVED,
+                        session_id=session_id,
+                        payload={
+                            "reservation_id": reservation_id,
+                            "budget_limit_id": budget_limit_id,
+                            **reservation_identity,
+                            "scope": "session",
+                            "key": session_id,
+                            "window": "all_time",
+                            "currency": "USD",
+                            "maximum": "1",
+                            "action": "interrupt",
+                        },
+                    ),
+                )
+                if case not in {"invalid-attempt", "outstanding"}:
+                    pricing: object = (
+                        {"provider_name": 42}
+                        if case == "invalid-pricing"
+                        else {
+                            "provider_name": "fake",
+                            "model": "model",
+                            "match": "exact",
+                            "provenance": {
+                                "source": "application",
+                                "url": "application://test-price-book",
+                                "as_of": "2026-07-25",
+                            },
+                            "effective_from": None,
+                            "effective_through": None,
+                            "tier_max_input_tokens": None,
+                        }
+                    )
+                    await store.append_event(
+                        session_id,
+                        Event(
+                            type=EventType.BUDGET_RECONCILED,
+                            session_id=session_id,
+                            payload={
+                                "reservation_id": reservation_id,
+                                "budget_limit_id": budget_limit_id,
+                                **identity,
+                                "actual_amount": (
+                                    "not-a-number" if case == "invalid-amount" else "0.25"
+                                ),
+                                "pricing": pricing,
+                            },
+                        ),
+                    )
+
+                inspection = await store.inspect_summary(session_id)
+
+                assert inspection.budget.cost_state == "partial"
+                assert inspection.budget.amount is None
+                assert inspection.budget.currency is None
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("invalid_text", ["100\x00", "\ud800"], ids=["nul", "surrogate"])
 @pytest.mark.parametrize(
     "invalid_primary_counter",

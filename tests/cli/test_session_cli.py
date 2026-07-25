@@ -40,6 +40,22 @@ def _tool_round_identity(value: int) -> dict[str, str]:
     }
 
 
+def _pricing_evidence(*, model: str = "model") -> dict[str, object]:
+    return {
+        "provider_name": "fake",
+        "model": model,
+        "match": "exact",
+        "provenance": {
+            "source": "application",
+            "url": "application://test-price-book",
+            "as_of": "2026-07-25",
+        },
+        "effective_from": None,
+        "effective_through": None,
+        "tier_max_input_tokens": None,
+    }
+
+
 def _write_project(root: Path, database: str = "data/cayu.db") -> Path:
     (root / "pyproject.toml").write_text(
         """
@@ -524,8 +540,8 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                                 "budget_limit_id": budget_limit_id,
                                 **attempt_identity,
                                 "scope": "session",
-                                "key": session_id,
-                                "window": "lifetime",
+                                "key": None,
+                                "window": "all_time",
                                 "currency": currency,
                                 "maximum": "1.00",
                                 "action": "interrupt",
@@ -543,11 +559,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                                 "budget_limit_id": budget_limit_id,
                                 **attempt_identity,
                                 "actual_amount": "0.25",
-                                **(
-                                    {"pricing": {"provider_name": "fake", "model": "model"}}
-                                    if has_pricing
-                                    else {}
-                                ),
+                                **({"pricing": _pricing_evidence()} if has_pricing else {}),
                             },
                         ),
                     )
@@ -570,8 +582,8 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                                 "budget_limit_id": budget_limit_id,
                                 **attempt_identity,
                                 "scope": "session",
-                                "key": session_id,
-                                "window": "lifetime",
+                                "key": None,
+                                "window": "all_time",
                                 "currency": "USD",
                                 "maximum": "1.00",
                                 "action": "interrupt",
@@ -590,10 +602,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                                     "budget_limit_id": budget_limit_id,
                                     **attempt_identity,
                                     "actual_amount": "0.25",
-                                    "pricing": {
-                                        "provider_name": "fake",
-                                        "model": "model",
-                                    },
+                                    "pricing": _pricing_evidence(),
                                 },
                             ),
                         )
@@ -625,8 +634,8 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                             "budget_limit_id": budget_limit_id,
                             **parallel_attempt_identity,
                             "scope": scope,
-                            "key": "runtime" if scope == "app" else "operator",
-                            "window": "lifetime",
+                            "key": None if scope == "app" else "operator",
+                            "window": "all_time",
                             "currency": "USD",
                             "maximum": "1.00",
                             "action": "interrupt",
@@ -644,7 +653,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                             "budget_limit_id": budget_limit_id,
                             **parallel_attempt_identity,
                             "actual_amount": "0.25",
-                            "pricing": {"provider_name": "fake", "model": "model"},
+                            "pricing": _pricing_evidence(),
                         },
                     ),
                 )
@@ -659,8 +668,8 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                         "budget_limit_id": _budget_limit_id(1),
                         **_model_attempt_identity(1),
                         "scope": "session",
-                        "key": "sess_unpriced_cost",
-                        "window": "lifetime",
+                        "key": None,
+                        "window": "all_time",
                         "currency": "USD",
                         "maximum": "1.00",
                         "action": "interrupt",
@@ -678,8 +687,8 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                         "budget_limit_id": _budget_limit_id(1),
                         **_model_attempt_identity(1),
                         "scope": "session",
-                        "key": "sess_failed_reservation_cost",
-                        "window": "lifetime",
+                        "key": None,
+                        "window": "all_time",
                         "currency": "USD",
                         "maximum": "1.00",
                         "action": "interrupt",
@@ -988,7 +997,18 @@ def test_session_usage_reports_per_call_cache_and_honest_pricing_state(
                         "reserved_amount": "0.25",
                         "actual_amount": "0.01",
                         "released_amount": "0.24",
-                        "pricing": {"provider_name": "fake", "model": "resolved-model"},
+                        "pricing": _pricing_evidence(model="resolved-model"),
+                    },
+                ),
+                Event(
+                    type=EventType.BUDGET_RECONCILED,
+                    session_id="sess_usage",
+                    timestamp=started_at + timedelta(seconds=2, milliseconds=500),
+                    payload={
+                        "reservation_id": "reservation-invalid-pricing",
+                        "reserved_amount": "0.10",
+                        "actual_amount": "0.02",
+                        "pricing": {"provider_name": 42},
                     },
                 ),
                 Event(
@@ -1086,7 +1106,7 @@ def test_session_usage_reports_per_call_cache_and_honest_pricing_state(
             "reserved_amount": "0.25",
         },
     ]
-    assert payload["unmatched_ledger_total"] == 3
+    assert payload["unmatched_ledger_total"] == 4
     assert payload["unmatched_ledger_has_more"] is True
     assert payload["unmatched_ledger_next_offset"] == 1
 
@@ -1105,10 +1125,19 @@ def test_session_usage_reports_per_call_cache_and_honest_pricing_state(
         )
         == 0
     )
-    second = json.loads(capsys.readouterr().out)["calls"][0]
+    second_payload = json.loads(capsys.readouterr().out)
+    second = second_payload["calls"][0]
     assert second["input_tokens"] == 1
     assert second["pricing_state"] == "unknown"
     assert second["ledger"] == []
+    assert second_payload["unmatched_ledger"][0] == {
+        "actual_amount": "0.02",
+        "currency": None,
+        "outcome": "reconciled",
+        "pricing_state": "unknown",
+        "reservation_id": "reservation-invalid-pricing",
+        "reserved_amount": "0.10",
+    }
 
     assert (
         main(

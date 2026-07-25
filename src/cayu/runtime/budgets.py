@@ -4,7 +4,7 @@ import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, DecimalException, Inexact, localcontext
 from hashlib import sha256
 from itertools import chain
 from threading import Lock
@@ -80,6 +80,18 @@ _BUDGET_INSPECTION_EVENT_TYPES = frozenset(
         EventType.BUDGET_RESERVATION_RELEASED,
     }
 )
+_BUDGET_RECONCILIATION_PRICING_KEYS = frozenset(
+    {
+        "provider_name",
+        "model",
+        "match",
+        "provenance",
+        "effective_from",
+        "effective_through",
+        "tier_max_input_tokens",
+    }
+)
+_BUDGET_INSPECTION_PRICING_STATE_KEY = "_cayu_pricing_state"
 
 
 class BudgetReservationIdentityConflict(RuntimeError):
@@ -153,21 +165,44 @@ def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
         if previous_descriptor != descriptor:
             contradictory_limit_identity = True
 
+    step_ids_by_attempt_id: dict[str, str] = {}
+    failure_keys: set[tuple[str, ModelAttemptIdentity]] = set()
+    failed_attempt_identities: set[ModelAttemptIdentity] = set()
+    invalid_failure_identity = False
+    for event in failures:
+        budget_limit_id = _inspection_budget_limit_id(event.payload.get("budget_limit_id"))
+        model_attempt_identity = _inspection_model_attempt_identity(event.payload)
+        if budget_limit_id is None or model_attempt_identity is None:
+            invalid_failure_identity = True
+            continue
+        failure_key = (budget_limit_id, model_attempt_identity)
+        if failure_key in failure_keys:
+            invalid_failure_identity = True
+        failure_keys.add(failure_key)
+        if model_attempt_identity in failed_attempt_identities:
+            invalid_failure_identity = True
+        failed_attempt_identities.add(model_attempt_identity)
+        previous_step_id = step_ids_by_attempt_id.setdefault(
+            model_attempt_identity.model_attempt_id,
+            model_attempt_identity.model_step_id,
+        )
+        if previous_step_id != model_attempt_identity.model_step_id:
+            invalid_failure_identity = True
+
     reservation_ids: set[str] = set()
     reservation_ids_by_attempt: dict[ModelAttemptIdentity, set[str]] = {}
     limit_ids_by_reservation: dict[str, str] = {}
     attempt_identities_by_reservation: dict[str, ModelAttemptIdentity] = {}
-    step_ids_by_attempt_id: dict[str, str] = {}
-    reservation_ids_by_limit_attempt: dict[tuple[str, str], str] = {}
+    reservation_ids_by_limit_attempt: dict[tuple[str, ModelAttemptIdentity], str] = {}
     currencies_by_reservation: dict[str, str] = {}
     invalid_reservation_limit_identity = False
     invalid_reservation_evidence = False
     for event in reservations:
-        reservation_id = event.payload.get("reservation_id")
+        reservation_id = _inspection_reservation_id(event.payload.get("reservation_id"))
         budget_limit_id = _inspection_budget_limit_id(event.payload.get("budget_limit_id"))
         model_attempt_identity = _inspection_model_attempt_identity(event.payload)
         currency = event.payload.get("currency")
-        if type(reservation_id) is not str or not reservation_id:
+        if reservation_id is None:
             invalid_reservation_evidence = True
             continue
         if reservation_id in reservation_ids:
@@ -214,7 +249,7 @@ def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
             ).add(reservation_id)
             limit_attempt_key = (
                 budget_limit_id,
-                model_attempt_identity.model_attempt_id,
+                model_attempt_identity,
             )
             previous_reservation_id = reservation_ids_by_limit_attempt.setdefault(
                 limit_attempt_key,
@@ -232,11 +267,11 @@ def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
     reconciled_reservation_ids: set[str] = set()
     terminal_count_by_reservation: dict[str, int] = {}
     for event in reconciliations:
-        reservation_id = event.payload.get("reservation_id")
+        reservation_id = _inspection_reservation_id(event.payload.get("reservation_id"))
         budget_limit_id = _inspection_budget_limit_id(event.payload.get("budget_limit_id"))
         model_attempt_identity = _inspection_model_attempt_identity(event.payload)
         if (
-            type(reservation_id) is not str
+            reservation_id is None
             or budget_limit_id is None
             or model_attempt_identity is None
             or limit_ids_by_reservation.get(reservation_id) != budget_limit_id
@@ -249,28 +284,30 @@ def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
             terminal_count_by_reservation.get(reservation_id, 0) + 1
         )
         amount = event.payload.get("actual_amount")
-        pricing = event.payload.get("pricing")
-        if type(amount) is not str or type(pricing) is not dict:
+        pricing_state = _inspection_pricing_state(event.payload)
+        parsed_amount = _inspection_decimal(amount)
+        if parsed_amount is None:
+            invalid_reservation_evidence = True
+            continue
+        if pricing_state == "unpriced":
+            continue
+        if pricing_state == "invalid":
+            invalid_reservation_evidence = True
             continue
         currency = currencies_by_reservation.get(reservation_id)
         if currency is None:
-            continue
-        try:
-            parsed_amount = Decimal(amount)
-        except ArithmeticError:
-            continue
-        if parsed_amount < 0 or not parsed_amount.is_finite():
+            invalid_reservation_evidence = True
             continue
         priced_amount_by_reservation[reservation_id] = parsed_amount
         priced_reservation_ids.add(reservation_id)
 
     released_reservation_ids: set[str] = set()
     for event in releases:
-        reservation_id = event.payload.get("reservation_id")
+        reservation_id = _inspection_reservation_id(event.payload.get("reservation_id"))
         budget_limit_id = _inspection_budget_limit_id(event.payload.get("budget_limit_id"))
         model_attempt_identity = _inspection_model_attempt_identity(event.payload)
         if (
-            type(reservation_id) is not str
+            reservation_id is None
             or budget_limit_id is None
             or model_attempt_identity is None
             or limit_ids_by_reservation.get(reservation_id) != budget_limit_id
@@ -283,22 +320,49 @@ def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
             terminal_count_by_reservation.get(reservation_id, 0) + 1
         )
     settled_reservation_ids = reconciled_reservation_ids | released_reservation_ids
-    complete_priced_coverage = (
+    complete_terminal_coverage = (
         bool(reservation_ids)
         and not invalid_reservation_limit_identity
         and not invalid_reservation_evidence
         and settled_reservation_ids == reservation_ids
-        and priced_reservation_ids == reconciled_reservation_ids
         and all(
             terminal_count_by_reservation.get(reservation_id) == 1
             for reservation_id in reservation_ids
         )
     )
+    contradictory_attempt_terminal_outcome = any(
+        bool(attempt_reservation_ids & reconciled_reservation_ids)
+        and bool(attempt_reservation_ids & released_reservation_ids)
+        for attempt_reservation_ids in reservation_ids_by_attempt.values()
+    )
+    contradictory_failure_outcome = bool(
+        failure_keys & reservation_ids_by_limit_attempt.keys()
+    ) or any(
+        bool(reservation_ids_by_attempt.get(attempt_identity, set()) & reconciled_reservation_ids)
+        for attempt_identity in failed_attempt_identities
+    )
+    complete_priced_coverage = (
+        complete_terminal_coverage and priced_reservation_ids == reconciled_reservation_ids
+    )
 
+    check_cost_state: Literal["unknown", "unpriced", "partial", "mixed_currency", "priced"]
+    check_cost_state, check_amount, check_currency = (
+        _inspection_latest_check_cost(checks) if not reservations else ("unknown", None, None)
+    )
     cost_state: Literal["unknown", "unpriced", "partial", "mixed_currency", "priced"]
     amount: str | None = None
     currency: str | None = None
-    if contradictory_limit_identity:
+    if (
+        contradictory_limit_identity
+        or invalid_reservation_limit_identity
+        or invalid_reservation_evidence
+        or invalid_failure_identity
+        or contradictory_failure_outcome
+        or (
+            reservations
+            and (not complete_terminal_coverage or contradictory_attempt_terminal_outcome)
+        )
+    ):
         cost_state = "partial"
     elif complete_priced_coverage:
         attempt_costs: list[tuple[Decimal, str]] = []
@@ -307,9 +371,6 @@ def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
         for attempt_reservation_ids in reservation_ids_by_attempt.values():
             attempt_reconciled_ids = attempt_reservation_ids & reconciled_reservation_ids
             attempt_released_ids = attempt_reservation_ids & released_reservation_ids
-            if attempt_reconciled_ids and attempt_released_ids:
-                contradictory_attempt_cost = True
-                continue
             currencies = {
                 currencies_by_reservation[reservation_id]
                 for reservation_id in attempt_reservation_ids
@@ -335,96 +396,49 @@ def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
         elif mixed_currency or len({item_currency for _, item_currency in attempt_costs}) > 1:
             cost_state = "mixed_currency"
         elif attempt_costs:
-            cost_state = "priced"
-            amount = str(sum((item_amount for item_amount, _ in attempt_costs), Decimal("0")))
-            currency = attempt_costs[0][1]
-        else:
-            cost_state = "partial"
-    elif invalid_reservation_evidence:
-        cost_state = "partial"
-    elif not reservations and checks and not (reconciliations or releases or failures):
-        latest_checks: dict[str, tuple[Decimal, str, int]] = {}
-        invalid_check = False
-        for event in checks:
-            budget_limit_id = _inspection_budget_limit_id(event.payload.get("budget_limit_id"))
-            scope = event.payload.get("scope")
-            key = event.payload.get("key")
-            window = event.payload.get("window")
-            maximum = _inspection_decimal(event.payload.get("maximum"), positive=True)
-            action = event.payload.get("action")
-            actual = _inspection_decimal(event.payload.get("actual"))
-            currency_value = event.payload.get("currency")
-            unpriced_steps = event.payload.get("unpriced_model_steps")
-            cost_summary = event.payload.get("cost_summary")
-            if (
-                budget_limit_id is None
-                or type(scope) is not str
-                or (key is not None and type(key) is not str)
-                or type(window) is not str
-                or maximum is None
-                or type(action) is not str
-                or action not in {"interrupt", "notify"}
-                or actual is None
-                or type(currency_value) is not str
-                or not currency_value.strip()
-                or type(unpriced_steps) is not int
-                or unpriced_steps < 0
-                or type(cost_summary) is not dict
-            ):
-                invalid_check = True
-                continue
-            checked_currency = currency_value.upper()
-            latest_checks[budget_limit_id] = (actual, checked_currency, unpriced_steps)
-
-        if invalid_check:
-            cost_state = "partial"
-        elif any(unpriced_steps > 0 for _, _, unpriced_steps in latest_checks.values()):
-            cost_state = (
-                "unpriced"
-                if all(unpriced_steps > 0 for _, _, unpriced_steps in latest_checks.values())
-                else "partial"
-            )
-        else:
-            check_totals = {
-                (actual, checked_currency) for actual, checked_currency, _ in latest_checks.values()
-            }
-            if len({checked_currency for _, checked_currency in check_totals}) > 1:
-                cost_state = "mixed_currency"
-            elif len(check_totals) == 1:
-                checked_amount, checked_currency = next(iter(check_totals))
-                cost_state = "priced"
-                amount = str(checked_amount)
-                currency = checked_currency
-            else:
+            total = _inspection_decimal_sum(item_amount for item_amount, _ in attempt_costs)
+            if total is None:
                 cost_state = "partial"
-    elif not reservation_ids and failures:
-        failure_keys: set[tuple[str, ModelAttemptIdentity]] = set()
-        failure_step_ids_by_attempt_id: dict[str, str] = {}
-        invalid_failure_identity = False
-        for event in failures:
-            budget_limit_id = _inspection_budget_limit_id(event.payload.get("budget_limit_id"))
-            model_attempt_identity = _inspection_model_attempt_identity(event.payload)
-            if budget_limit_id is None or model_attempt_identity is None:
-                invalid_failure_identity = True
-                continue
-            failure_key = (budget_limit_id, model_attempt_identity)
-            if failure_key in failure_keys:
-                invalid_failure_identity = True
-            failure_keys.add(failure_key)
-            previous_step_id = failure_step_ids_by_attempt_id.setdefault(
-                model_attempt_identity.model_attempt_id,
-                model_attempt_identity.model_step_id,
-            )
-            if previous_step_id != model_attempt_identity.model_step_id:
-                invalid_failure_identity = True
-        failure_currencies = {
-            currency for event in failures if type(currency := event.payload.get("currency")) is str
-        }
-        if invalid_failure_identity:
+            else:
+                cost_state = "priced"
+                amount = str(total)
+                currency = attempt_costs[0][1]
+        else:
             cost_state = "partial"
-        elif len(failure_currencies) == 1 and len(failure_currencies) == len(
-            {event.payload.get("currency") for event in failures}
-        ):
+    elif not reservations and checks and not (reconciliations or releases or failures):
+        cost_state = check_cost_state
+        amount = check_amount
+        currency = check_currency
+    elif not reservation_ids and failures:
+        failure_currencies = {
+            descriptor[5]
+            for event in failures
+            if (descriptor := _inspection_budget_limit_descriptor(event.payload)) is not None
+        }
+        if checks:
+            if check_cost_state == "partial":
+                cost_state = "partial"
+            elif check_cost_state == "mixed_currency":
+                cost_state = "mixed_currency"
+            elif (
+                check_cost_state == "priced"
+                and check_currency is not None
+                and failure_currencies == {check_currency}
+            ):
+                cost_state = "priced"
+                amount = check_amount
+                currency = check_currency
+            elif (
+                check_cost_state == "priced"
+                and check_currency is not None
+                and len(failure_currencies | {check_currency}) > 1
+            ):
+                cost_state = "mixed_currency"
+            else:
+                cost_state = check_cost_state
+                amount = check_amount
+                currency = check_currency
+        elif len(failure_currencies) == 1:
             cost_state = "priced"
             amount = "0"
             currency = next(iter(failure_currencies))
@@ -451,6 +465,61 @@ def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
     )
 
 
+def _inspection_latest_check_cost(
+    checks: list[Event],
+) -> tuple[
+    Literal["unknown", "unpriced", "partial", "mixed_currency", "priced"],
+    str | None,
+    str | None,
+]:
+    """Return the agreed latest cumulative spend reported by budget checks."""
+
+    if not checks:
+        return "unknown", None, None
+    latest_checks: dict[str, tuple[Decimal, str, int]] = {}
+    invalid_check = False
+    for event in checks:
+        budget_limit_id = _inspection_budget_limit_id(event.payload.get("budget_limit_id"))
+        descriptor = _inspection_budget_limit_descriptor(event.payload)
+        actual = _inspection_decimal(event.payload.get("actual"))
+        unpriced_steps = event.payload.get("unpriced_model_steps")
+        cost_summary = event.payload.get("cost_summary")
+        if (
+            budget_limit_id is None
+            or descriptor is None
+            or actual is None
+            or type(unpriced_steps) is not int
+            or unpriced_steps < 0
+            or type(cost_summary) is not dict
+        ):
+            invalid_check = True
+            continue
+        latest_checks[budget_limit_id] = (
+            actual,
+            descriptor[5],
+            unpriced_steps,
+        )
+
+    if invalid_check:
+        return "partial", None, None
+    if any(unpriced_steps > 0 for _, _, unpriced_steps in latest_checks.values()):
+        state = (
+            "unpriced"
+            if all(unpriced_steps > 0 for _, _, unpriced_steps in latest_checks.values())
+            else "partial"
+        )
+        return state, None, None
+    check_totals = {
+        (actual, checked_currency) for actual, checked_currency, _ in latest_checks.values()
+    }
+    if len({checked_currency for _, checked_currency in check_totals}) > 1:
+        return "mixed_currency", None, None
+    if len(check_totals) != 1:
+        return "partial", None, None
+    checked_amount, checked_currency = next(iter(check_totals))
+    return "priced", str(checked_amount), checked_currency
+
+
 def _inspection_decimal(value: Any, *, positive: bool = False) -> Decimal | None:
     if type(value) is not str:
         return None
@@ -463,6 +532,23 @@ def _inspection_decimal(value: Any, *, positive: bool = False) -> Decimal | None
     return parsed
 
 
+def _inspection_decimal_sum(values: Iterable[Decimal]) -> Decimal | None:
+    """Add inspected amounts without rounding or leaking Decimal failures."""
+
+    try:
+        with localcontext() as context:
+            # Inspection must never manufacture a confident rounded cost. The
+            # default context already traps invalid operations and overflow;
+            # additionally reject an otherwise silent precision loss.
+            context.traps[Inexact] = True
+            total = Decimal("0")
+            for value in values:
+                total += value
+    except DecimalException:
+        return None
+    return total if total.is_finite() and total >= 0 else None
+
+
 def _inspection_budget_limit_id(value: Any) -> str | None:
     if type(value) is not str:
         return None
@@ -470,6 +556,91 @@ def _inspection_budget_limit_id(value: Any) -> str | None:
         return BudgetLimitIdentity(budget_limit_id=value).budget_limit_id
     except ValueError:
         return None
+
+
+def _inspection_reservation_id(value: Any) -> str | None:
+    if type(value) is not str:
+        return None
+    try:
+        return require_clean_nonblank(value, "reservation_id")
+    except ValueError:
+        return None
+
+
+def is_complete_budget_reconciliation_pricing(value: Any) -> bool:
+    """Whether a reconciliation carries complete runtime-owned pricing evidence."""
+
+    if (
+        type(value) is not dict
+        or len(value) != len(_BUDGET_RECONCILIATION_PRICING_KEYS)
+        or value.keys() != _BUDGET_RECONCILIATION_PRICING_KEYS
+    ):
+        return False
+    try:
+        require_clean_nonblank(value.get("provider_name"), "provider_name")
+        require_clean_nonblank(value.get("model"), "model")
+    except ValueError:
+        return False
+    match = value.get("match")
+    if type(match) is not str or match not in {"exact", "prefix", "resource_mapping"}:
+        return False
+
+    provenance = value.get("provenance")
+    if type(provenance) is not dict:
+        return False
+    try:
+        Provenance.model_validate(provenance)
+    except (TypeError, ValueError):
+        return False
+
+    parsed_dates: list[date | None] = []
+    for field_name in ("effective_from", "effective_through"):
+        raw_date = value.get(field_name)
+        if raw_date is None:
+            parsed_dates.append(None)
+            continue
+        if type(raw_date) is not str:
+            return False
+        try:
+            parsed_date = date.fromisoformat(raw_date)
+        except ValueError:
+            return False
+        if parsed_date.isoformat() != raw_date:
+            return False
+        parsed_dates.append(parsed_date)
+    effective_from, effective_through = parsed_dates
+    if (
+        effective_from is not None
+        and effective_through is not None
+        and effective_from > effective_through
+    ):
+        return False
+
+    tier_max_input_tokens = value.get("tier_max_input_tokens")
+    return tier_max_input_tokens is None or (
+        type(tier_max_input_tokens) is int and 0 < tier_max_input_tokens <= MAX_DURABLE_JSON_INTEGER
+    )
+
+
+def _inspection_pricing_state(
+    payload: Mapping[str, Any],
+) -> Literal["unpriced", "priced", "invalid"]:
+    """Classify raw pricing evidence or the bounded projector's trusted state."""
+
+    projected_state = payload.get(_BUDGET_INSPECTION_PRICING_STATE_KEY)
+    if projected_state is not None:
+        if (
+            "pricing" in payload
+            or type(projected_state) is not str
+            or projected_state not in {"priced", "invalid"}
+        ):
+            return "invalid"
+        return cast("Literal['priced', 'invalid']", projected_state)
+
+    pricing = payload.get("pricing")
+    if pricing is None:
+        return "unpriced"
+    return "priced" if is_complete_budget_reconciliation_pricing(pricing) else "invalid"
 
 
 def _inspection_model_attempt_identity(
@@ -508,9 +679,20 @@ def _inspection_budget_limit_descriptor(
         or type(currency) is not str
         or not currency
         or currency.strip() != currency
+        or currency != currency.upper()
     ):
         return None
-    return scope, key, window, maximum, action, currency.upper()
+    if scope in {"app", "session", "run"} and key is not None:
+        return None
+    if scope in {"agent", "causal"} and key is None:
+        return None
+    try:
+        parsed_window = _budget_window_from_string(window)
+    except (TypeError, ValueError):
+        return None
+    if parsed_window.storage_key != window:
+        return None
+    return scope, key, window, maximum, action, currency
 
 
 def is_budget_inspection_event(event: Event) -> bool:
@@ -586,8 +768,17 @@ def project_budget_inspection_event(event: Event) -> Event:
         and type(event.payload.get("cost_summary")) is dict
     ):
         payload["cost_summary"] = {}
-    if event.type == EventType.BUDGET_RECONCILED and type(event.payload.get("pricing")) is dict:
-        payload["pricing"] = {}
+    if event.type == EventType.BUDGET_RECONCILED:
+        actual_amount = event.payload.get("actual_amount")
+        if type(actual_amount) is not str:
+            # Retain a bounded invalid-shape marker instead of caller-controlled data.
+            payload["actual_amount"] = False
+        pricing = event.payload.get("pricing")
+        if is_complete_budget_reconciliation_pricing(pricing):
+            payload[_BUDGET_INSPECTION_PRICING_STATE_KEY] = "priced"
+        elif pricing is not None:
+            # Preserve only the fact that malformed pricing evidence was present.
+            payload[_BUDGET_INSPECTION_PRICING_STATE_KEY] = "invalid"
     return event.model_copy(update={"payload": payload})
 
 

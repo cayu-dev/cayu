@@ -15,6 +15,22 @@ from cayu.runtime import RunRequest, SessionIdentity, SessionStatus, SessionStor
 from cayu.storage.migrations import SchemaMode
 
 
+def _pricing_evidence(*, model: str) -> dict[str, object]:
+    return {
+        "provider_name": "fake",
+        "model": model,
+        "match": "exact",
+        "provenance": {
+            "source": "application",
+            "url": "application://test-price-book",
+            "as_of": "2026-07-25",
+        },
+        "effective_from": None,
+        "effective_through": None,
+        "tier_max_input_tokens": None,
+    }
+
+
 async def _drop_postgres_schema(dsn: str) -> None:
     import psycopg
     from psycopg import sql
@@ -152,7 +168,7 @@ async def _seed(store: SessionStore) -> None:
                 "reservation_id": "reservation-1",
                 "reserved_amount": "0.25",
                 "actual_amount": "0.01",
-                "pricing": {"provider_name": "fake", "model": "resolved-model"},
+                "pricing": _pricing_evidence(model="resolved-model"),
             },
         ),
         Event(

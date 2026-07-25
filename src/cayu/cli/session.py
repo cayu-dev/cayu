@@ -37,6 +37,7 @@ from cayu.runtime import (
     usage_metrics_from_event_payload,
 )
 from cayu.runtime.aggregates import summary_usage_metrics_from_event_payload
+from cayu.runtime.budgets import is_complete_budget_reconciliation_pricing
 from cayu.runtime.usage import count_model_steps_with_usage
 from cayu.storage import SQLiteSessionStore
 from cayu.storage import migrations as schema
@@ -48,6 +49,7 @@ _MAX_COLLECTED_EVENT_RECORDS = 100_000
 _MAX_TRANSCRIPT_CONTENT_BYTES = 1_048_576
 _MAX_TRANSCRIPT_SUMMARY_PARTS = 100
 _EVENT_QUERY_PAGE_SIZE = 200
+_USAGE_INSPECTION_PRICING_STATE_KEY = "_cayu_pricing_state"
 
 
 def add_session_parser(subparsers: Any) -> None:
@@ -654,8 +656,11 @@ def _model_call_usage(
             }
         if event.type == EventType.BUDGET_RECONCILED:
             ledger["actual_amount"] = _optional_string(event.payload.get("actual_amount"))
+            pricing_state = event.payload.get(_USAGE_INSPECTION_PRICING_STATE_KEY)
             ledger["pricing_state"] = (
-                "priced" if type(event.payload.get("pricing")) is dict else "unpriced"
+                pricing_state
+                if type(pricing_state) is str and pricing_state in {"priced", "unpriced", "unknown"}
+                else "unknown"
             )
         ledger["outcome"] = (
             "reconciled" if event.type == EventType.BUDGET_RECONCILED else "released"
@@ -1346,8 +1351,13 @@ def _usage_inspection_record(record: EventRecord) -> EventRecord:
         for key in ("reservation_id", "reserved_amount", "actual_amount"):
             if key in event.payload:
                 payload[key] = event.payload[key]
-        if type(event.payload.get("pricing")) is dict:
-            payload["pricing"] = {}
+        pricing = event.payload.get("pricing")
+        if pricing is None:
+            payload[_USAGE_INSPECTION_PRICING_STATE_KEY] = "unpriced"
+        elif is_complete_budget_reconciliation_pricing(pricing):
+            payload[_USAGE_INSPECTION_PRICING_STATE_KEY] = "priced"
+        else:
+            payload[_USAGE_INSPECTION_PRICING_STATE_KEY] = "unknown"
     elif event.type == EventType.BUDGET_RESERVATION_RELEASED:
         if "reservation_id" in event.payload:
             payload["reservation_id"] = event.payload["reservation_id"]
