@@ -18,6 +18,7 @@ from cayu._validation import (
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
 )
+from cayu.runtime._diagnostics import exception_diagnostic
 from cayu.runtime.sessions import EventQuery, EventRecord, copy_event_query
 
 EVENT_WATCHER_QUERY_PAGE_LIMIT = 5000
@@ -552,10 +553,11 @@ def copy_event_watcher_dead_letter(
 
 
 def event_watcher_error_payload(error: BaseException) -> str:
-    message = str(error).strip()
-    if message:
-        return message
-    return type(error).__name__
+    return exception_diagnostic(
+        error,
+        empty_message="event watcher failed",
+        nonportable_message="Event watcher failed with a non-portable diagnostic.",
+    ).message
 
 
 def _matching_claim_state(

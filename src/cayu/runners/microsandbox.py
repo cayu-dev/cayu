@@ -11,6 +11,7 @@ from math import isfinite
 from types import ModuleType
 from typing import Any, Literal, cast
 
+from cayu._exception_groups import exception_group_children
 from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.runners._cleanup import (
     DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
@@ -1441,9 +1442,13 @@ async def _cleanup_created_sandbox_after_failure(
             remove_timeout_s=remove_timeout_s,
         )
     except _MicrosandboxCleanupExceptionGroup as cleanup_group:
+        cleanup_failures = exception_group_children(cleanup_group)
         raise BaseExceptionGroup(
             message,
-            [original_error, *cleanup_group.exceptions],
+            [
+                original_error,
+                *(cleanup_failures if cleanup_failures is not None else (cleanup_group,)),
+            ],
         ) from cleanup_group
     except (BaseExceptionGroup, Exception, asyncio.CancelledError) as cleanup_error:
         raise BaseExceptionGroup(message, [original_error, cleanup_error]) from cleanup_error

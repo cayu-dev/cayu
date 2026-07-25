@@ -16,6 +16,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from cayu._exception_groups import exception_cause, set_exception_cause
 from cayu._validation import (
     copy_json_value,
     copy_label_map,
@@ -278,7 +279,7 @@ def _attach_delegated_failure_causes(
     message: str,
 ) -> None:
     evidence: list[BaseException] = []
-    for failure in (*failures, authoritative_failure.__cause__):
+    for failure in (*failures, exception_cause(authoritative_failure)):
         if failure is None or failure is authoritative_failure:
             continue
         if any(candidate is failure for candidate in evidence):
@@ -286,8 +287,9 @@ def _attach_delegated_failure_causes(
         evidence.append(failure)
     if not evidence:
         return
-    authoritative_failure.__cause__ = (
-        evidence[0] if len(evidence) == 1 else BaseExceptionGroup(message, evidence)
+    set_exception_cause(
+        authoritative_failure,
+        evidence[0] if len(evidence) == 1 else BaseExceptionGroup(message, evidence),
     )
 
 
@@ -2258,7 +2260,7 @@ def _validate_runtime_hooks(
     hooks: Iterable[RuntimeHook] | None,
     *,
     field_name: str,
-) -> tuple[RuntimeHook, ...]:
+) -> tuple[runtime_records.RegisteredRuntimeHook, ...]:
     if hooks is None:
         return ()
     if isinstance(hooks, str | bytes):
@@ -2267,11 +2269,17 @@ def _validate_runtime_hooks(
         hook_list = list(hooks)
     except TypeError as exc:
         raise TypeError(f"{field_name} must be an iterable of RuntimeHook instances.") from exc
+    registered_hooks: list[runtime_records.RegisteredRuntimeHook] = []
     for hook in hook_list:
         if not isinstance(hook, RuntimeHook):
             raise TypeError(f"{field_name} must contain RuntimeHook instances.")
-        require_clean_nonblank(hook.name, "runtime_hook.name")
-    return tuple(hook_list)
+        registered_hooks.append(
+            runtime_records.RegisteredRuntimeHook(
+                name=hook.name,
+                hook=hook,
+            )
+        )
+    return tuple(registered_hooks)
 
 
 def _validate_event_watchers(watchers: Iterable[EventWatcher]) -> tuple[EventWatcher, ...]:

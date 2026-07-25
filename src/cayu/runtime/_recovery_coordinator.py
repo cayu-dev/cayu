@@ -22,6 +22,11 @@ from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
+from cayu._exception_groups import (
+    exception_cause,
+    iter_exception_tree,
+    set_exception_cause,
+)
 from cayu._task_wait import await_shielded_task_outcome
 from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.core.events import Event, EventType
@@ -35,6 +40,12 @@ from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
+from cayu.runtime._diagnostics import (
+    bound_diagnostic_text,
+    exception_diagnostic,
+    task_failure_payload_from_diagnostic,
+    task_update_error_payload,
+)
 from cayu.runtime._environment_lifecycle import (
     EnvironmentLifecycle,
     exception_failure_payload,
@@ -134,6 +145,25 @@ _TOOL_ROUND_RECOVERABLE_SESSION_STATUSES = {
     SessionStatus.FAILED,
 }
 
+
+def _optional_exception_type_name(error: BaseException | None) -> str:
+    return "Exception" if error is None else exception_diagnostic(error).error_type
+
+
+def _environment_factory_resolution_error_payload(
+    error: BaseException,
+) -> dict[str, Any]:
+    """Project one factory reconnect failure for durable recovery records."""
+
+    return exception_diagnostic(
+        error,
+        empty_message="environment factory resolution failed",
+        nonportable_message=(
+            "Environment factory resolution failed with a non-portable diagnostic."
+        ),
+    ).payload_fields()
+
+
 logger = logging.getLogger(__name__)
 
 CheckpointTransformFactory = Callable[[dict[str, Any]], CheckpointTransform]
@@ -168,15 +198,11 @@ def _recovery_abandonment_signal(
             task = None
         cancellation_delivered = task is None or task.cancelling() > cancellation_baseline
         generator_exit: GeneratorExit | None = None
-        for child in error.exceptions:
-            abandonment = _recovery_abandonment_signal(
-                child,
-                cancellation_baseline=cancellation_baseline,
-            )
-            if isinstance(abandonment, asyncio.CancelledError) and cancellation_delivered:
-                return abandonment
-            if isinstance(abandonment, GeneratorExit) and generator_exit is None:
-                generator_exit = abandonment
+        for candidate in iter_exception_tree(error):
+            if isinstance(candidate, asyncio.CancelledError) and cancellation_delivered:
+                return candidate
+            if isinstance(candidate, GeneratorExit) and generator_exit is None:
+                generator_exit = candidate
         return generator_exit
     return None
 
@@ -189,8 +215,8 @@ def _task_cancellation_count() -> int:
 
 def _prepend_exception_cause(error: BaseException, cause: BaseException) -> None:
     """Preserve a new structured cause without discarding an existing chain."""
-    cause.__cause__ = error.__cause__
-    error.__cause__ = cause
+    set_exception_cause(cause, exception_cause(error))
+    set_exception_cause(error, cause)
 
 
 async def _run_recovery_cleanup_steps(
@@ -1788,6 +1814,7 @@ class RecoveryCoordinator:
             await self.finalize_abandoned_session_by_id(session.id)
             raise
         except Exception as exc:
+            failure_diagnostic = exception_diagnostic(exc)
             if isinstance(exc, approval_support.ToolApprovalManualRecoveryRequired):
                 session = await self._session_store.update_status(
                     session.id,
@@ -1851,12 +1878,13 @@ class RecoveryCoordinator:
                 try:
                     task = await self._task_store.fail_task(
                         pending_approval.task_id,
-                        {
-                            "message": str(exc),
-                            "type": type(exc).__name__,
-                            "session_id": session.id,
-                            "approval_id": pending_approval.approval_id,
-                        },
+                        task_failure_payload_from_diagnostic(
+                            failure_diagnostic,
+                            session_id=session.id,
+                            additional_fields={
+                                "approval_id": pending_approval.approval_id,
+                            },
+                        ),
                     )
                     yield await self._event_writer.emit(
                         self._task_event(
@@ -1873,13 +1901,15 @@ class RecoveryCoordinator:
                     task_failure_error = task_exc
             session = await self._session_store.update_status(session.id, SessionStatus.FAILED)
             payload: dict[str, Any] = {
-                **exception_failure_payload(exc),
+                **exception_failure_payload(
+                    exc,
+                    diagnostic=failure_diagnostic,
+                ),
                 "approval_id": pending_approval.approval_id,
                 "tool_call_id": pending_approval.tool_call_id,
             }
             if task_failure_error is not None:
-                payload["task_update_error"] = str(task_failure_error)
-                payload["task_update_error_type"] = type(task_failure_error).__name__
+                payload.update(task_update_error_payload(task_failure_error))
             async for event in self._emit_terminal_event_with_hooks(
                 RecoveryTerminalEventRequest(
                     event=Event(
@@ -2073,8 +2103,9 @@ class RecoveryCoordinator:
                             payload={
                                 "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
                                 "user_input": pending.model_dump(mode="json"),
-                                "error": str(factory_resolution.error),
-                                "error_type": type(factory_resolution.error).__name__,
+                                **_environment_factory_resolution_error_payload(
+                                    factory_resolution.error
+                                ),
                             },
                         ),
                         phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
@@ -2192,11 +2223,12 @@ class RecoveryCoordinator:
                     if recovery_persisted
                     else {
                         "manual_recovery_persistence_unknown": True,
-                        "persistence_reconciliation_error_type": type(
-                            reconciliation_error
-                        ).__name__,
+                        "persistence_reconciliation_error_type": (
+                            _optional_exception_type_name(reconciliation_error)
+                        ),
                     }
                 )
+                diagnostic = exception_diagnostic(exc)
                 try:
                     async for event in self._interrupt_for_resumable_manual_recovery(
                         session=session,
@@ -2208,8 +2240,7 @@ class RecoveryCoordinator:
                             "input_id": pending.input_id,
                             "tool_call_id": pending_tool_call.tool_call_id,
                             **persistence_payload,
-                            "error": str(exc),
-                            "error_type": type(exc).__name__,
+                            **diagnostic.payload_fields(),
                         },
                     ):
                         yield event
@@ -2382,8 +2413,9 @@ class RecoveryCoordinator:
                             payload={
                                 "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
                                 "approval": pending_approval.model_dump(mode="json"),
-                                "error": str(factory_resolution.error),
-                                "error_type": type(factory_resolution.error).__name__,
+                                **_environment_factory_resolution_error_payload(
+                                    factory_resolution.error
+                                ),
                                 "approval_id": pending_approval.approval_id,
                             },
                         ),
@@ -2500,11 +2532,12 @@ class RecoveryCoordinator:
                     if recovery_persisted
                     else {
                         "manual_recovery_persistence_unknown": True,
-                        "persistence_reconciliation_error_type": type(
-                            reconciliation_error
-                        ).__name__,
+                        "persistence_reconciliation_error_type": (
+                            _optional_exception_type_name(reconciliation_error)
+                        ),
                     }
                 )
+                diagnostic = exception_diagnostic(exc)
                 try:
                     async for event in self._interrupt_for_resumable_manual_recovery(
                         session=session,
@@ -2516,8 +2549,7 @@ class RecoveryCoordinator:
                             "approval_id": pending_approval.approval_id,
                             "tool_call_id": pending_tool_call.tool_call_id,
                             **persistence_payload,
-                            "error": str(exc),
-                            "error_type": type(exc).__name__,
+                            **diagnostic.payload_fields(),
                         },
                     ):
                         yield event
@@ -3307,8 +3339,7 @@ class RecoveryCoordinator:
                     payload={
                         "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
                         "tool_round_id": pending_round.round_id,
-                        "error": str(factory_resolution.error),
-                        "error_type": type(factory_resolution.error).__name__,
+                        **_environment_factory_resolution_error_payload(factory_resolution.error),
                     },
                 ):
                     yield event
@@ -3472,6 +3503,7 @@ class RecoveryCoordinator:
                             from_statuses={SessionStatus.RUNNING},
                             to_status=SessionStatus.INTERRUPTING,
                         )
+                    diagnostic = exception_diagnostic(exc)
                     async for event in self._interrupt_for_resumable_manual_recovery(
                         session=session,
                         registered_agent=registered_agent,
@@ -3481,8 +3513,7 @@ class RecoveryCoordinator:
                             "tool_round_id": pending_round.round_id,
                             "tool_call_id": pending_tool_call.tool_call_id,
                             "manual_recovery_stale_live_failure": True,
-                            "error": str(exc),
-                            "error_type": type(exc).__name__,
+                            **diagnostic.payload_fields(),
                             "resolved_by": resolution_actor_payload(request.resolved_by),
                         },
                     ):
@@ -3517,9 +3548,12 @@ class RecoveryCoordinator:
                 if recovery_persisted
                 else {
                     "manual_recovery_persistence_unknown": True,
-                    "persistence_reconciliation_error_type": type(reconciliation_error).__name__,
+                    "persistence_reconciliation_error_type": (
+                        _optional_exception_type_name(reconciliation_error)
+                    ),
                 }
             )
+            diagnostic = exception_diagnostic(exc)
             async for event in self._interrupt_for_resumable_manual_recovery(
                 session=session,
                 registered_agent=registered_agent,
@@ -3529,8 +3563,7 @@ class RecoveryCoordinator:
                     "tool_round_id": pending_round.round_id,
                     "tool_call_id": pending_tool_call.tool_call_id,
                     **persistence_payload,
-                    "error": str(exc),
-                    "error_type": type(exc).__name__,
+                    **diagnostic.payload_fields(),
                     "resolved_by": resolution_actor_payload(request.resolved_by),
                 },
             ):
@@ -4042,6 +4075,11 @@ class RecoveryCoordinator:
                     metadata=request.metadata,
                 )
             except Exception as exc:
+                diagnostic = exception_diagnostic(
+                    exc,
+                    empty_message="recovery failed",
+                    nonportable_message="Recovery failed with a non-portable diagnostic.",
+                )
                 logger.warning(
                     "Recovery failed for session %s (agent %s): %s",
                     session.id,
@@ -4057,7 +4095,9 @@ class RecoveryCoordinator:
                     previous_status=session.status,
                     status=session.status if reloaded is None else reloaded.status,
                     actions=(IncompleteSessionRecoveryAction.FAILED,),
-                    message=f"Recovery failed: {type(exc).__name__}: {exc}",
+                    message=bound_diagnostic_text(
+                        f"Recovery failed: {diagnostic.error_type}: {diagnostic.message}"
+                    ),
                 )
             results.append(result)
         return results

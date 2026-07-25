@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Generic, TypeVar
 
+from cayu._exception_groups import exception_cause
 from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.core.billing import (
     UNRESOLVED_BILLING_IDENTITY,
@@ -1437,7 +1438,7 @@ class RunLimitController:
                 )
         except BaseException as exc:
             authoritative_failure = exc
-            authoritative_cause = exc.__cause__
+            authoritative_cause = exception_cause(exc)
             if not lifecycle.provider_dispatch_started:
                 lifecycle.predispatch_release_reason = (
                     "reservation setup cancelled"
@@ -1452,7 +1453,7 @@ class RunLimitController:
             except BaseException as evidence_failure:
                 if authoritative_failure is None:
                     authoritative_failure = evidence_failure
-                    authoritative_cause = evidence_failure.__cause__
+                    authoritative_cause = exception_cause(evidence_failure)
                 else:
                     authoritative_failure.add_note(
                         "Automatic compaction completion evidence also failed: "
@@ -1527,7 +1528,7 @@ class RunLimitController:
         if lease_failure is not None:
             return BudgetedOperationFailed(
                 error=lease_failure,
-                cause=lease_failure.__cause__,
+                cause=exception_cause(lease_failure),
                 events=tuple(lifecycle.events),
             )
         if reservation_failure is not None:

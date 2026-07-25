@@ -12,7 +12,6 @@ from cayu._validation import (
     FrozenJsonList,
     compact_json_utf8_size,
     copy_durable_json_value,
-    extract_durable_value_error,
     json_utf8_size_within_limit,
     require_durable_text,
     safe_durable_value_error_details,
@@ -20,10 +19,15 @@ from cayu._validation import (
 from cayu.core.events import Event
 from cayu.core.tools import ToolEffect, ToolResult
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime._diagnostics import (
+    MAX_DIAGNOSTIC_UTF8_BYTES,
+    ExceptionDiagnostic,
+    bound_diagnostic_text,
+    exception_diagnostic,
+)
 from cayu.vaults import SecretRedactor
 
-_MAX_DIAGNOSTIC_UTF8_BYTES = 4 * 1024
-_MAX_DIAGNOSTIC_TYPE_UTF8_BYTES = 128
+_MAX_DIAGNOSTIC_UTF8_BYTES = MAX_DIAGNOSTIC_UTF8_BYTES
 _MAX_PORTABLE_EVIDENCE_UTF8_BYTES = 12 * 1024
 _MAX_PORTABLE_EVIDENCE_DEPTH = 16
 _MAX_PORTABLE_EVIDENCE_NODES = 256
@@ -79,26 +83,6 @@ _RUNTIME_TOOL_EVENT_LINKAGE_FIELDS = frozenset(
     }
 )
 _TOOL_EFFECT_VALUES = frozenset(effect.value for effect in ToolEffect)
-
-
-@dataclass(frozen=True, slots=True)
-class ExceptionDiagnostic:
-    """Bounded, portable exception evidence for durable observability records."""
-
-    message: str
-    error_type: str
-    durable_value_error_code: str | None = None
-    durable_value_error_path: str | None = None
-
-    def payload_fields(self) -> dict[str, Any]:
-        fields: dict[str, Any] = {
-            "error": self.message,
-            "error_type": self.error_type,
-        }
-        if self.durable_value_error_code is not None:
-            fields["durable_value_error_code"] = self.durable_value_error_code
-            fields["durable_value_error_path"] = self.durable_value_error_path
-        return fields
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,55 +280,6 @@ def redact_tool_call_outcomes(
 
 def tool_result_from_payload(payload: dict[str, Any]) -> ToolResult:
     return normalize_tool_result(validate_tool_result(ToolResult(**deepcopy(payload))))
-
-
-def exception_diagnostic(
-    exc: Exception,
-    *,
-    empty_message: str = "operation failed",
-    nonportable_message: str = "Operation failed with a non-portable diagnostic.",
-) -> ExceptionDiagnostic:
-    """Render an exception without letting rejected values enter another boundary.
-
-    Durable-value failures are read through their structured, bounded fields. Other
-    exception text is accepted only after it satisfies the durable text contract.
-    """
-
-    error_type = _safe_exception_type_name(exc)
-    durable_error = extract_durable_value_error(exc)
-    if durable_error is not None:
-        code, path = safe_durable_value_error_details(durable_error)
-        return ExceptionDiagnostic(
-            message=_bound_diagnostic_text(nonportable_message),
-            error_type=error_type,
-            durable_value_error_code=code,
-            durable_value_error_path=path,
-        )
-    try:
-        rendered = str(exc).strip()
-    except BaseException:
-        rendered = ""
-    if rendered:
-        try:
-            require_durable_text(rendered, "error")
-        except BaseException as validation_error:
-            durable_error = extract_durable_value_error(validation_error)
-            code = path = None
-            if durable_error is not None:
-                code, path = safe_durable_value_error_details(durable_error)
-            return ExceptionDiagnostic(
-                message=_bound_diagnostic_text(nonportable_message),
-                error_type=error_type,
-                durable_value_error_code=code,
-                durable_value_error_path=path,
-            )
-        message = rendered
-    else:
-        message = f"{error_type}: {empty_message}"
-    return ExceptionDiagnostic(
-        message=_bound_diagnostic_text(message),
-        error_type=error_type,
-    )
 
 
 def redact_exception_diagnostic(
@@ -664,20 +599,6 @@ def _json_string_character_size(character: str) -> int:
     return len(character.encode("utf-8"))
 
 
-def _safe_exception_type_name(exc: Exception) -> str:
-    try:
-        name = type.__getattribute__(type(exc), "__name__")
-    except BaseException:
-        name = "Exception"
-    if type(name) is not str:
-        name = "Exception"
-    try:
-        require_durable_text(name, "error_type")
-    except BaseException:
-        name = "Exception"
-    return _bound_utf8_text(name, _MAX_DIAGNOSTIC_TYPE_UTF8_BYTES)
-
-
 def _redact_terminal_result(result: ToolResult, redactor: SecretRedactor) -> ToolResult:
     """Redact terminal evidence while preserving runtime-owned wrapper keys and bounds."""
 
@@ -705,20 +626,4 @@ def _redact_terminal_result(result: ToolResult, redactor: SecretRedactor) -> Too
 
 
 def _bound_diagnostic_text(value: str) -> str:
-    return _bound_utf8_text(value, _MAX_DIAGNOSTIC_UTF8_BYTES)
-
-
-def _bound_utf8_text(value: str, max_bytes: int) -> str:
-    used_bytes = 0
-    characters: list[str] = []
-    for character in value:
-        character_bytes = len(character.encode("utf-8"))
-        if used_bytes + character_bytes > max_bytes:
-            marker_bytes = len(_TRUNCATION_MARKER.encode("utf-8"))
-            while characters and used_bytes + marker_bytes > max_bytes:
-                removed = characters.pop()
-                used_bytes -= len(removed.encode("utf-8"))
-            return "".join(characters) + _TRUNCATION_MARKER
-        characters.append(character)
-        used_bytes += character_bytes
-    return value
+    return bound_diagnostic_text(value)

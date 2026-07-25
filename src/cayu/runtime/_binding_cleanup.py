@@ -14,14 +14,37 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from cayu._exception_groups import (
+    exception_cause,
+    exception_context,
+    exception_group_children,
+    iter_exception_tree,
+)
+from cayu._exception_state import exception_state, set_exception_state
+from cayu._validation import require_durable_text
+from cayu.runtime._diagnostics import (
+    _attach_runtime_exception_payload,
+    _copy_runtime_exception_payload,
+    _runtime_exception_payload,
+    exception_diagnostic,
+)
 from cayu.vaults import SecretRedactor
 
 _STATUS_ATTRIBUTE = "_cayu_binding_cleanup_status"
 _FINALIZE_STATUS_ATTRIBUTE = "_cayu_binding_finalize_status"
-BINDING_FINALIZE_SAFE_PAYLOAD_ATTRIBUTE = "_cayu_binding_finalize_safe_payload"
+_FINALIZE_SAFE_PAYLOAD_ATTRIBUTE = "_cayu_binding_finalize_safe_payload"
+_BINDING_STATUS_TOKEN = object()
+_MISSING_STATUS_FIELD = object()
 BINDING_FINALIZE_ERROR_TEXT_MAX_BYTES = 512
 _BINDING_FINALIZE_ERROR_TYPE_MAX_BYTES = 128
 _TRUNCATED_SUFFIX = "... [truncated]"
+_BINDING_FINALIZE_EMPTY_MESSAGE = "binding finalization failed"
+_BINDING_FINALIZE_NONPORTABLE_MESSAGE = (
+    "Binding finalization failed with a non-portable diagnostic."
+)
+_BINDING_FINALIZE_REDACTION_FAILURE_MESSAGE = (
+    "Binding finalization failed and its diagnostic could not be safely redacted."
+)
 
 BindingFinalizePhase = Literal[
     "cancellation",
@@ -60,6 +83,50 @@ class BindingFinalizeStatus:
     supplemental_redactor: SecretRedactor | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _BindingStatusHandoff:
+    """Authenticated runtime-owned attachment for in-process lifecycle state."""
+
+    attribute_name: str
+    status: object
+    token: object
+
+
+def attach_binding_finalize_safe_payload(
+    error: BaseException,
+    payload: dict[str, Any],
+) -> None:
+    """Attach validated finalization evidence without trusting exception accessors."""
+
+    _attach_runtime_exception_payload(
+        error,
+        attribute_name=_FINALIZE_SAFE_PAYLOAD_ATTRIBUTE,
+        payload=payload,
+    )
+
+
+def binding_finalize_safe_payload(error: BaseException) -> dict[str, Any] | None:
+    """Return only evidence attached through the runtime-owned handoff."""
+
+    return _runtime_exception_payload(
+        error,
+        attribute_name=_FINALIZE_SAFE_PAYLOAD_ATTRIBUTE,
+    )
+
+
+def copy_binding_finalize_safe_payload(
+    source: BaseException,
+    target: BaseException,
+) -> None:
+    """Propagate an authenticated immutable handoff to an aggregate error."""
+
+    _copy_runtime_exception_payload(
+        source,
+        target,
+        attribute_name=_FINALIZE_SAFE_PAYLOAD_ATTRIBUTE,
+    )
+
+
 def record_binding_cleanup_failure(
     bind_error: BaseException,
     cleanup_error: BaseException,
@@ -68,6 +135,12 @@ def record_binding_cleanup_failure(
 ) -> BindingCleanupStatus:
     """Attach cleanup state while preserving the binding exception identity."""
 
+    if not isinstance(bind_error, BaseException):
+        raise TypeError("bind_error must be an exception.")
+    if not isinstance(cleanup_error, BaseException):
+        raise TypeError("cleanup_error must be an exception.")
+    if not callable(retry):
+        raise TypeError("retry must be callable.")
     status = BindingCleanupStatus(initial_error=cleanup_error, retry=retry)
     attach_binding_cleanup_status(bind_error, status)
     return status
@@ -79,14 +152,24 @@ def attach_binding_cleanup_status(
 ) -> None:
     """Attach existing cleanup state to an aggregate that preserves its source."""
 
-    setattr(error, _STATUS_ATTRIBUTE, status)
+    if type(status) is not BindingCleanupStatus:
+        raise TypeError("status must be a BindingCleanupStatus.")
+    _attach_binding_status(
+        error,
+        attribute_name=_STATUS_ATTRIBUTE,
+        status=status,
+    )
 
 
 def binding_cleanup_status(error: BaseException) -> BindingCleanupStatus | None:
     """Return runtime-owned cleanup state attached by a binding, if present."""
 
-    status = getattr(error, _STATUS_ATTRIBUTE, None)
-    return status if isinstance(status, BindingCleanupStatus) else None
+    status = _binding_status(
+        error,
+        attribute_name=_STATUS_ATTRIBUTE,
+        expected_type=BindingCleanupStatus,
+    )
+    return status if type(status) is BindingCleanupStatus else None
 
 
 def binding_cleanup_payload(error: BaseException) -> dict[str, Any] | None:
@@ -95,17 +178,48 @@ def binding_cleanup_payload(error: BaseException) -> dict[str, Any] | None:
     status = binding_cleanup_status(error)
     if status is None:
         return None
+    initial_error = _binding_status_field(status, "initial_error", _MISSING_STATUS_FIELD)
+    if not isinstance(initial_error, BaseException):
+        initial_error = RuntimeError("Binding cleanup failure metadata was invalid.")
+    retry_attempted = (
+        _binding_status_field(status, "retry_attempted", _MISSING_STATUS_FIELD) is True
+    )
+    retry_error = _binding_status_field(status, "retry_error", _MISSING_STATUS_FIELD)
+    if retry_error is _MISSING_STATUS_FIELD:
+        retry_error = (
+            RuntimeError("Binding cleanup retry metadata was invalid.") if retry_attempted else None
+        )
+    if retry_error is not None and not isinstance(retry_error, BaseException):
+        retry_error = RuntimeError("Binding cleanup retry metadata was invalid.")
     payload: dict[str, Any] = {
-        "incomplete": status.incomplete,
-        "initial_error": str(status.initial_error),
-        "initial_error_type": type(status.initial_error).__name__,
-        "retry_attempted": status.retry_attempted,
+        "incomplete": not retry_attempted or retry_error is not None,
+        **exception_diagnostic(
+            initial_error,
+            empty_message="binding cleanup failed",
+            nonportable_message=("Binding cleanup failed with a non-portable diagnostic."),
+        ).payload_fields(
+            message_key="initial_error",
+            error_type_key="initial_error_type",
+            detail_prefix="initial_",
+        ),
+        "retry_attempted": retry_attempted,
     }
-    if status.retry_attempted:
-        payload["retry_completed"] = status.retry_error is None
-    if status.retry_error is not None:
-        payload["retry_error"] = str(status.retry_error)
-        payload["retry_error_type"] = type(status.retry_error).__name__
+    if retry_attempted:
+        payload["retry_completed"] = retry_error is None
+    if retry_error is not None:
+        payload.update(
+            exception_diagnostic(
+                retry_error,
+                empty_message="binding cleanup retry failed",
+                nonportable_message=(
+                    "Binding cleanup retry failed with a non-portable diagnostic."
+                ),
+            ).payload_fields(
+                message_key="retry_error",
+                error_type_key="retry_error_type",
+                detail_prefix="retry_",
+            )
+        )
     return payload
 
 
@@ -117,47 +231,67 @@ def record_binding_finalize_failures(
 ) -> BindingFinalizeStatus:
     """Attach trusted phase ordering without replacing any child exception."""
 
-    if not failures:
+    if type(failures) is not tuple or not failures:
         raise ValueError("Binding finalization failures cannot be empty.")
+    for failure in failures:
+        if type(failure) is not BindingFinalizeFailure:
+            raise TypeError("failures must contain BindingFinalizeFailure values.")
+        if failure.phase not in {
+            "cancellation",
+            "workspace_finalize",
+            "managed_resource_cleanup",
+        }:
+            raise ValueError("Binding finalization failure phase is invalid.")
+        if not isinstance(failure.error, BaseException):
+            raise TypeError("Binding finalization failure errors must be exceptions.")
     if supplemental_redactor is not None and not isinstance(supplemental_redactor, SecretRedactor):
         raise TypeError("supplemental_redactor must be a SecretRedactor or None.")
     status = BindingFinalizeStatus(
         failures=failures,
         supplemental_redactor=supplemental_redactor,
     )
-    setattr(error, _FINALIZE_STATUS_ATTRIBUTE, status)
+    _attach_binding_status(
+        error,
+        attribute_name=_FINALIZE_STATUS_ATTRIBUTE,
+        status=status,
+    )
     return status
 
 
 def binding_finalize_status(error: BaseException) -> BindingFinalizeStatus | None:
     """Return trusted phase ordering attached by a binding, if present."""
 
-    status = getattr(error, _FINALIZE_STATUS_ATTRIBUTE, None)
-    return status if isinstance(status, BindingFinalizeStatus) else None
+    status = _binding_status(
+        error,
+        attribute_name=_FINALIZE_STATUS_ATTRIBUTE,
+        expected_type=BindingFinalizeStatus,
+    )
+    return status if type(status) is BindingFinalizeStatus else None
 
 
 def binding_finalize_cancellation(error: BaseException) -> asyncio.CancelledError | None:
-    """Find the first cancellation in an exception group or causal chain."""
+    """Find cancellation without invoking extension-defined accessors."""
 
+    pending: list[BaseException] = [error]
     visited: set[int] = set()
-
-    def find(candidate: BaseException | None) -> asyncio.CancelledError | None:
-        if candidate is None or id(candidate) in visited:
-            return None
+    while pending:
+        candidate = pending.pop()
+        if id(candidate) in visited:
+            continue
         visited.add(id(candidate))
         if isinstance(candidate, asyncio.CancelledError):
             return candidate
+        context = exception_context(candidate)
+        if context is not None:
+            pending.append(context)
+        cause = exception_cause(candidate)
+        if cause is not None:
+            pending.append(cause)
         if isinstance(candidate, BaseExceptionGroup):
-            for child in candidate.exceptions:
-                cancellation = find(child)
-                if cancellation is not None:
-                    return cancellation
-        cancellation = find(candidate.__cause__)
-        if cancellation is not None:
-            return cancellation
-        return find(candidate.__context__)
-
-    return find(error)
+            children = exception_group_children(candidate)
+            if children is not None:
+                pending.extend(reversed(children))
+    return None
 
 
 def binding_finalize_explicit_cancellation(
@@ -165,24 +299,30 @@ def binding_finalize_explicit_cancellation(
 ) -> asyncio.CancelledError | None:
     """Find cancellation explicitly propagated by an error or exception group."""
 
-    if isinstance(error, asyncio.CancelledError):
-        return error
-    if isinstance(error, BaseExceptionGroup):
-        for child in error.exceptions:
-            cancellation = binding_finalize_explicit_cancellation(child)
-            if cancellation is not None:
-                return cancellation
+    for candidate in iter_exception_tree(error):
+        if isinstance(candidate, asyncio.CancelledError):
+            return candidate
     return None
 
 
 def is_containable_cleanup_error(error: BaseException) -> bool:
     """Return whether best-effort cleanup may contain every propagated leaf."""
 
-    if isinstance(error, Exception | asyncio.CancelledError):
-        return True
-    if isinstance(error, BaseExceptionGroup):
-        return all(is_containable_cleanup_error(child) for child in error.exceptions)
-    return False
+    pending = [error]
+    visited: set[int] = set()
+    while pending:
+        candidate = pending.pop()
+        if id(candidate) in visited:
+            continue
+        visited.add(id(candidate))
+        if isinstance(candidate, BaseExceptionGroup):
+            children = exception_group_children(candidate)
+            if children is None:
+                return False
+            pending.extend(children)
+        elif not isinstance(candidate, Exception | asyncio.CancelledError):
+            return False
+    return True
 
 
 def binding_finalize_fatal_signal(error: BaseException) -> BaseException | None:
@@ -192,7 +332,16 @@ def binding_finalize_fatal_signal(error: BaseException) -> BaseException | None:
     if isinstance(error, fatal_types):
         return error
     if isinstance(error, BaseExceptionGroup):
-        return error.subgroup(lambda candidate: isinstance(candidate, fatal_types))
+        fatal_signals = [
+            candidate
+            for candidate in iter_exception_tree(error)
+            if isinstance(candidate, fatal_types)
+        ]
+        if fatal_signals:
+            return BaseExceptionGroup(
+                "Binding finalization carried fatal control-flow signals.",
+                fatal_signals,
+            )
     return None
 
 
@@ -221,9 +370,7 @@ def append_binding_finalize_cancellation(
         "Binding finalization reported failures before cancellation.",
         [failure.error for failure in failures],
     )
-    safe_payload = getattr(error, BINDING_FINALIZE_SAFE_PAYLOAD_ATTRIBUTE, None)
-    if isinstance(safe_payload, dict):
-        setattr(aggregate, BINDING_FINALIZE_SAFE_PAYLOAD_ATTRIBUTE, safe_payload)
+    copy_binding_finalize_safe_payload(error, aggregate)
     record_binding_finalize_failures(
         aggregate,
         failures,
@@ -271,16 +418,24 @@ def _binding_finalize_error_details(
     *,
     redactors: tuple[SecretRedactor, ...],
 ) -> dict[str, str]:
+    diagnostic = exception_diagnostic(
+        error,
+        empty_message=_BINDING_FINALIZE_EMPTY_MESSAGE,
+        nonportable_message=_BINDING_FINALIZE_NONPORTABLE_MESSAGE,
+        preserve_empty_message=True,
+    )
     return {
         "error": _bounded_redacted_text(
-            str(error),
+            diagnostic.message,
             redactors=redactors,
             max_bytes=BINDING_FINALIZE_ERROR_TEXT_MAX_BYTES,
+            fallback=_BINDING_FINALIZE_REDACTION_FAILURE_MESSAGE,
         ),
         "error_type": _bounded_redacted_text(
-            type(error).__name__,
+            diagnostic.error_type,
             redactors=redactors,
             max_bytes=_BINDING_FINALIZE_ERROR_TYPE_MAX_BYTES,
+            fallback="Exception",
         ),
     }
 
@@ -290,11 +445,14 @@ def _diagnostic_redactors(
     *,
     status: BindingFinalizeStatus | None,
 ) -> tuple[SecretRedactor, ...]:
-    if status is None or status.supplemental_redactor is None:
+    supplemental_redactor = (
+        None if status is None else _binding_status_field(status, "supplemental_redactor", None)
+    )
+    if not isinstance(supplemental_redactor, SecretRedactor):
         return (redactor,)
     # Exact binding-owned credentials must be removed before an application
     # secret that happens to be a substring can make the exact value unmatchable.
-    return (status.supplemental_redactor, redactor)
+    return (supplemental_redactor, redactor)
 
 
 def _bounded_redacted_text(
@@ -302,15 +460,61 @@ def _bounded_redacted_text(
     *,
     redactors: tuple[SecretRedactor, ...],
     max_bytes: int,
+    fallback: str,
 ) -> str:
     """Redact first, then retain valid UTF-8 within one durable byte bound."""
 
-    redacted = value
-    for redactor in redactors:
-        redacted = redactor.redact_text(redacted)
+    try:
+        redacted = value
+        for redactor in redactors:
+            redacted = SecretRedactor.redact_text(redactor, redacted)
+        require_durable_text(redacted, "binding finalization diagnostic")
+    except BaseException:
+        redacted = fallback
     encoded = redacted.encode("utf-8", errors="replace")
     if len(encoded) <= max_bytes:
         return encoded.decode("utf-8")
     suffix = _TRUNCATED_SUFFIX.encode("utf-8")
     prefix = encoded[: max_bytes - len(suffix)].decode("utf-8", errors="ignore")
     return prefix + _TRUNCATED_SUFFIX
+
+
+def _attach_binding_status(
+    error: BaseException,
+    *,
+    attribute_name: str,
+    status: object,
+) -> None:
+    if not isinstance(error, BaseException):
+        raise TypeError("error must be an exception.")
+    handoff = _BindingStatusHandoff(
+        attribute_name=attribute_name,
+        status=status,
+        token=_BINDING_STATUS_TOKEN,
+    )
+    if not set_exception_state(error, attribute_name, handoff):
+        raise RuntimeError("Could not attach binding lifecycle status.")
+
+
+def _binding_status(
+    error: BaseException,
+    *,
+    attribute_name: str,
+    expected_type: type[object],
+) -> object | None:
+    handoff = exception_state(error, attribute_name)
+    if (
+        type(handoff) is not _BindingStatusHandoff
+        or handoff.token is not _BINDING_STATUS_TOKEN
+        or handoff.attribute_name != attribute_name
+        or type(handoff.status) is not expected_type
+    ):
+        return None
+    return handoff.status
+
+
+def _binding_status_field(status: object, name: str, default: object) -> object:
+    try:
+        return object.__getattribute__(status, name)
+    except BaseException:
+        return default

@@ -6,7 +6,11 @@ from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import (
+    copy_json_value,
+    require_clean_nonblank,
+    require_durable_clean_nonblank,
+)
 from cayu.core.events import Event, EventType, copy_event
 from cayu.core.tools import ToolResult
 from cayu.runtime.dispatch import DispatchHandle, DispatchRequest, copy_dispatch_handle
@@ -55,7 +59,7 @@ class _HookActionContext:
         session: Session,
     ) -> None:
         self._runtime = runtime
-        self._hook_name = require_clean_nonblank(hook_name, "hook_name")
+        self._hook_name = require_durable_clean_nonblank(hook_name, "hook_name")
         self._phase = phase
         self._session = session.model_copy(deep=True)
         self._actions: list[dict[str, Any]] = []
@@ -400,7 +404,7 @@ def _runtime_hook_event(
     """Build the canonical lifecycle event for one runtime-hook invocation."""
 
     event_payload = {
-        "hook_name": require_clean_nonblank(hook_name, "runtime_hook.name"),
+        "hook_name": require_durable_clean_nonblank(hook_name, "runtime_hook.name"),
         "scope": require_clean_nonblank(scope, "runtime_hook.scope"),
         "phase": phase.value,
         "terminal_event_id": terminal_event.id,

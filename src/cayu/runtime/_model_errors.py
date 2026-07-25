@@ -4,6 +4,11 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
+from cayu._exception_groups import (
+    exception_tree_contains,
+    iter_exception_tree,
+    rebuild_exception_group,
+)
 from cayu._validation import (
     DurableValueError,
     copy_durable_json_object,
@@ -72,36 +77,29 @@ def detach_billing_identity_cancellation_group(
 
 
 def _contains_billing_identity_cancellation(exc: BaseException) -> bool:
-    if isinstance(exc, _BillingIdentityResolutionCancelled):
-        return True
-    if isinstance(exc, BaseExceptionGroup):
-        return any(_contains_billing_identity_cancellation(child) for child in exc.exceptions)
-    return False
+    return exception_tree_contains(exc, _BillingIdentityResolutionCancelled)
 
 
 def _detach_billing_identity_cancellation_tree(
     exc: BaseExceptionGroup,
 ) -> BaseExceptionGroup:
-    detached_children: list[BaseException] = []
-    for child in exc.exceptions:
-        if isinstance(child, BaseExceptionGroup):
-            detached_children.append(_detach_billing_identity_cancellation_tree(child))
-        elif isinstance(child, asyncio.CancelledError):
-            detached_children.append(
-                detach_billing_identity_cancellation(child)
-                or asyncio.CancelledError(
-                    "Concurrent cancellation during model provider billing identity resolution"
-                )
-            )
-        else:
-            detached_children.append(_detached_concurrent_billing_failure(child))
-    return BaseExceptionGroup(
-        "Model provider billing identity resolution cancellation had concurrent failures",
-        detached_children,
+    return rebuild_exception_group(
+        exc,
+        group_message=(
+            "Model provider billing identity resolution cancellation had concurrent failures"
+        ),
+        leaf_mapper=_detached_concurrent_billing_failure,
+        invalid_leaf_factory=lambda: RuntimeError(
+            "Concurrent failure during model provider billing identity resolution"
+        ),
     )
 
 
 def _detached_concurrent_billing_failure(exc: BaseException) -> BaseException:
+    if isinstance(exc, asyncio.CancelledError):
+        return detach_billing_identity_cancellation(exc) or asyncio.CancelledError(
+            "Concurrent cancellation during model provider billing identity resolution"
+        )
     if isinstance(exc, KeyboardInterrupt):
         return KeyboardInterrupt(
             "Concurrent keyboard interrupt during model provider billing identity resolution"
@@ -136,11 +134,17 @@ async def resolve_request_billing_identity(
     supplied_identity: BillingIdentity | None = None
     cancellation: asyncio.CancelledError | None = None
     failure: ModelProviderError | None = None
+    fatal_failure: BaseException | None = None
     hook_returned = False
     try:
         supplied_identity = await provider.billing_identity_for_request(request)
         hook_returned = True
         supplied_identity = copy_billing_identity(supplied_identity)
+    except BaseExceptionGroup as exc:
+        cancellation, failure, fatal_failure = _classify_billing_hook_group(
+            exc,
+            provider_name=provider_name,
+        )
     except asyncio.CancelledError:
         cancellation = _billing_identity_cancellation()
     except Exception as exc:
@@ -149,14 +153,20 @@ async def resolve_request_billing_identity(
             provider_name=provider_name,
             direct_hook_failure=not hook_returned,
         )
-    del provider
-    del request
+    except BaseException as exc:
+        fatal_failure = _detached_billing_hook_failure(exc)
+    finally:
+        del provider
+        del request
+    if fatal_failure is not None:
+        supplied_identity = None
+        raise fatal_failure from None
     if cancellation is not None:
         supplied_identity = None
-        raise cancellation
+        raise cancellation from None
     if failure is not None:
         supplied_identity = None
-        raise failure
+        raise failure from None
     return supplied_identity
 
 
@@ -175,6 +185,7 @@ def resolve_completion_billing_identity(
     completed_identity: BillingIdentity | None = None
     cancellation: asyncio.CancelledError | None = None
     failure: ModelProviderError | None = None
+    fatal_failure: BaseException | None = None
     hook_invoked = False
     hook_returned = False
     try:
@@ -198,6 +209,11 @@ def resolve_completion_billing_identity(
             request_snapshot,
             completed_identity,
         )
+    except BaseExceptionGroup as exc:
+        cancellation, failure, fatal_failure = _classify_billing_hook_group(
+            exc,
+            provider_name=provider_name,
+        )
     except asyncio.CancelledError:
         cancellation = _billing_identity_cancellation()
     except Exception as exc:
@@ -206,19 +222,95 @@ def resolve_completion_billing_identity(
             provider_name=provider_name,
             direct_hook_failure=hook_invoked and not hook_returned,
         )
-    del provider
-    del request_identity
-    del completed_payload
-    del request_snapshot
-    del hook_identity
-    del hook_payload
+    except BaseException as exc:
+        fatal_failure = _detached_billing_hook_failure(exc)
+    finally:
+        del provider
+        del request_identity
+        del completed_payload
+        del request_snapshot
+        del hook_identity
+        del hook_payload
+    if fatal_failure is not None:
+        completed_identity = None
+        raise fatal_failure from None
     if cancellation is not None:
         completed_identity = None
-        raise cancellation
+        raise cancellation from None
     if failure is not None:
         completed_identity = None
-        raise failure
+        raise failure from None
     return completed_identity
+
+
+def _classify_billing_hook_group(
+    exc: BaseExceptionGroup,
+    *,
+    provider_name: str,
+) -> tuple[
+    asyncio.CancelledError | None,
+    ModelProviderError | None,
+    BaseException | None,
+]:
+    """Classify one untrusted group into detached runtime-owned outcomes."""
+
+    leaves = (
+        candidate
+        for candidate in iter_exception_tree(exc)
+        if not isinstance(candidate, BaseExceptionGroup)
+    )
+    saw_cancellation = False
+    saw_ordinary_failure = False
+    saw_fatal_failure = False
+    for candidate in leaves:
+        if isinstance(candidate, asyncio.CancelledError):
+            saw_cancellation = True
+        elif isinstance(candidate, (GeneratorExit, KeyboardInterrupt, SystemExit)):
+            saw_fatal_failure = True
+        elif isinstance(candidate, Exception):
+            saw_ordinary_failure = True
+        else:
+            saw_fatal_failure = True
+    if saw_fatal_failure:
+        return None, None, _detached_billing_hook_failure(exc)
+    if saw_ordinary_failure or not saw_cancellation:
+        return (
+            None,
+            ModelProviderError(
+                _BILLING_IDENTITY_ERROR_MESSAGE,
+                provider=provider_name,
+                error_type=_BILLING_IDENTITY_ERROR_TYPE,
+                error_code=_BILLING_IDENTITY_ERROR_CODE,
+                retryable=False,
+            ),
+            None,
+        )
+    return _billing_identity_cancellation(), None, None
+
+
+def _detached_billing_hook_failure(exc: BaseException) -> BaseException:
+    """Return fatal billing-hook control flow without provider-owned state."""
+
+    if isinstance(exc, BaseExceptionGroup):
+        return rebuild_exception_group(
+            exc,
+            group_message="Model provider billing identity resolution terminated",
+            leaf_mapper=_detached_billing_hook_failure,
+            invalid_leaf_factory=lambda: RuntimeError(
+                "Model provider billing identity resolution failed"
+            ),
+        )
+    if isinstance(exc, asyncio.CancelledError):
+        return _billing_identity_cancellation()
+    if isinstance(exc, KeyboardInterrupt):
+        return KeyboardInterrupt("Model provider billing identity resolution interrupted")
+    if isinstance(exc, SystemExit):
+        return SystemExit("Model provider billing identity resolution exited")
+    if isinstance(exc, GeneratorExit):
+        return GeneratorExit("Model provider billing identity resolution terminated")
+    if isinstance(exc, Exception):
+        return RuntimeError("Model provider billing identity resolution failed")
+    return BaseException("Model provider billing identity resolution failed")
 
 
 def _billing_identity_error(

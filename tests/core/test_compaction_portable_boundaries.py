@@ -469,7 +469,12 @@ def test_cayu_app_does_not_redispatch_compaction_when_derived_usage_overflows():
     assert failed.payload["error_type"] == "DurableValueError"
     assert "error" not in failed.payload
     assert events[-1].type == EventType.SESSION_FAILED
-    assert "code=integer_out_of_range" in events[-1].payload["error"]
+    assert events[-1].payload == {
+        "error": "Operation failed with a non-portable diagnostic.",
+        "error_type": "DurableValueError",
+        "durable_value_error_code": "integer_out_of_range",
+        "durable_value_error_path": "$",
+    }
 
 
 def test_model_compactor_rejects_non_portable_provider_error_without_retry_or_cause():
@@ -1180,7 +1185,12 @@ def test_cayu_app_retains_completion_before_rejecting_forged_compaction_result()
     ]
     assert events[2].payload == completion_payload
     assert events[3].payload["error_type"] == "ValidationError"
-    assert "code=nul_character" in events[-1].payload["error"]
+    assert events[-1].payload == {
+        "error": "Operation failed with a non-portable diagnostic.",
+        "error_type": "ValidationError",
+        "durable_value_error_code": "nul_character",
+        "durable_value_error_path": "$",
+    }
     assert runtime_provider.requests == []
 
 
@@ -1341,7 +1351,12 @@ def test_cayu_app_rejects_non_portable_compaction_error_before_retry_or_publicat
     assert "usage_metrics" not in attempt.payload
     assert failed.payload["error_type"] == "DurableValueError"
     assert "error" not in failed.payload
-    assert "code=nul_character" in terminal.payload["error"]
+    assert terminal.payload == {
+        "error": "Operation failed with a non-portable diagnostic.",
+        "error_type": "DurableValueError",
+        "durable_value_error_code": "nul_character",
+        "durable_value_error_path": "$/#0",
+    }
     rendered = json.dumps(
         [event.model_dump(mode="json") for event in events],
         allow_nan=False,
@@ -1494,10 +1509,12 @@ def test_cayu_app_does_not_publish_forged_compaction_durable_value_diagnostics(
     assert "error" not in failed.payload
     terminal = events[-1]
     assert terminal.type == EventType.SESSION_FAILED
-    assert terminal.payload["error"] == (
-        "`provider stream value` must contain JSON-compatible values. "
-        "[code=invalid_json_type; path=$]"
-    )
+    assert terminal.payload == {
+        "error": "Operation failed with a non-portable diagnostic.",
+        "error_type": "DurableValueError",
+        "durable_value_error_code": "invalid_json_type",
+        "durable_value_error_path": "$",
+    }
     rendered = json.dumps([event.model_dump(mode="json") for event in events])
     assert "workload-secret" not in rendered
     assert "workload-secret" not in caplog.text

@@ -10,6 +10,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from cayu._exception_groups import iter_exception_tree
 from cayu.egress._remote_adapter import (
     DEFAULT_PROXY_SERVER_FACTORY,
     DEFAULT_REMOTE_SETUP_COMMAND_TIMEOUT_SECONDS,
@@ -243,13 +244,9 @@ def _find_authoritative_egress_failure(
 ) -> UnsupportedEgressError | E2BGuestHandoffError | None:
     """Find the public fail-closed error without hiding rollback diagnostics."""
 
-    for item in error.exceptions:
+    for item in iter_exception_tree(error):
         if isinstance(item, UnsupportedEgressError | E2BGuestHandoffError):
             return item
-        if isinstance(item, ExceptionGroup):
-            nested = _find_authoritative_egress_failure(item)
-            if nested is not None:
-                return nested
     return None
 
 

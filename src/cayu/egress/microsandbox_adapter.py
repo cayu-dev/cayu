@@ -20,6 +20,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, BinaryIO, TypedDict
 
+from cayu._exception_groups import add_exception_note_safely, exception_cause
 from cayu.egress._remote_adapter import (
     ProxyServerFactory,
     prepare_exposed_proxy_binding,
@@ -467,9 +468,10 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
                     )
                     rollback_complete = True
                 except BaseException as cleanup_error:
-                    original.add_note(
+                    add_exception_note_safely(
+                        original,
                         "Microsandbox egress runner rollback incomplete: "
-                        f"{type(cleanup_error).__name__}."
+                        f"{type(cleanup_error).__name__}.",
                     )
                     try:
                         _raise_primary_with_cleanup_cancellation(
@@ -490,7 +492,7 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
             if unbound_claim is not None:
                 unbound_claim.close()
             if rollback_failure is not None:
-                raise rollback_failure from rollback_failure.__cause__
+                raise rollback_failure from exception_cause(rollback_failure)
             if rollback_cancelled:
                 cancellation = asyncio.CancelledError()
                 raise BaseExceptionGroup(

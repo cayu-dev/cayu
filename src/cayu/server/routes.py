@@ -30,6 +30,7 @@ from sse_starlette.sse import EventSourceResponse
 if TYPE_CHECKING:
     from starlette.types import Receive, Scope, Send
 
+from cayu._exception_groups import exception_tree_contains
 from cayu._validation import (
     copy_json_value,
     copy_label_map,
@@ -722,7 +723,7 @@ def _start_detached_event_stream_response(
             if not saw_first_event:
                 resolve_acceptance(exc, "before_first_event")
             await _close_event_stream(event_stream)
-            if exc.subgroup(Exception) is not None and is_containable_cleanup_error(exc):
+            if exception_tree_contains(exc, Exception) and is_containable_cleanup_error(exc):
                 await enqueue("runtime_error", exc, terminal=True)
             else:
                 await enqueue("done", None, terminal=True)

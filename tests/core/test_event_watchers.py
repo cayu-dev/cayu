@@ -387,6 +387,99 @@ def test_event_watcher_dead_letters_after_max_attempts_and_unblocks_cursor() -> 
     assert state.dead_lettered_count == 1
 
 
+@pytest.mark.parametrize(
+    "rejected_text",
+    [
+        "watcher failure\u0000with invalid text",
+        "watcher failure\ud800with invalid text",
+    ],
+)
+def test_sqlite_watcher_recovers_nonportable_failure_and_unblocks_later_events(
+    tmp_path: Path,
+    rejected_text: str,
+) -> None:
+    async def run():
+        session_store = InMemorySessionStore()
+        await _create_session(session_store)
+        first = await _append_event(session_store, payload={"number": 1})
+        second = await _append_event(session_store, payload={"number": 2})
+        handled: list[str] = []
+
+        async def handler(context: EventWatcherContext) -> None:
+            handled.append(context.record.event.id)
+            if context.record.event.id == first.id:
+                raise RuntimeError(rejected_text)
+
+        watcher = EventWatcher(
+            name="portable-failure-watcher",
+            query=EventQuery(event_type=EventType.BUDGET_LIMIT_REACHED),
+            handler=handler,
+            max_attempts=2,
+        )
+        db_path = tmp_path / "nonportable-watcher.sqlite"
+        first_store = SQLiteEventWatcherStore(db_path)
+        first_app = CayuApp(
+            session_store=session_store,
+            event_watcher_store=first_store,
+            enable_logging=False,
+        )
+        first_result = await first_app.run_event_watchers([watcher], limit=10)
+        failed_state = await first_store.load_state(watcher.name)
+        await first_store.close()
+
+        second_store = SQLiteEventWatcherStore(db_path)
+        second_app = CayuApp(
+            session_store=session_store,
+            event_watcher_store=second_store,
+            enable_logging=False,
+        )
+        recovered_result = await second_app.run_event_watchers([watcher], limit=10)
+        recovered_state = await second_store.load_state(watcher.name)
+        dead_letters = await second_store.list_dead_letters(watcher.name)
+        await second_store.close()
+        return (
+            first,
+            second,
+            handled,
+            first_result,
+            failed_state,
+            recovered_result,
+            recovered_state,
+            dead_letters,
+        )
+
+    (
+        first,
+        second,
+        handled,
+        first_result,
+        failed_state,
+        recovered_result,
+        recovered_state,
+        dead_letters,
+    ) = asyncio.run(run())
+
+    safe_error = "Event watcher failed with a non-portable diagnostic."
+    assert handled == [first.id, first.id, second.id]
+    assert first_result[0].deliveries[0].status is EventWatcherDeliveryStatus.FAILED
+    assert first_result[0].deliveries[0].error == safe_error
+    assert failed_state.delivery_status is EventWatcherDeliveryStatus.FAILED
+    assert failed_state.pending_claim_id is None
+    assert failed_state.lease_expires_at is None
+    assert [delivery.status for delivery in recovered_result[0].deliveries] == [
+        EventWatcherDeliveryStatus.DEAD_LETTERED,
+        EventWatcherDeliveryStatus.SUCCEEDED,
+    ]
+    assert [delivery.event_id for delivery in recovered_result[0].deliveries] == [
+        first.id,
+        second.id,
+    ]
+    assert recovered_state.cursor_sequence == recovered_result[0].deliveries[-1].event_sequence
+    assert recovered_state.dead_lettered_count == 1
+    assert len(dead_letters) == 1
+    assert dead_letters[0].error == safe_error
+
+
 def test_event_watcher_active_lease_blocks_duplicate_processing() -> None:
     async def run():
         session_store = InMemorySessionStore()

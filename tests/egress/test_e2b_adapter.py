@@ -18,10 +18,15 @@ from cayu.egress import (
     VirtualCredentialRegistry,
     VirtualEgressRunnerRequest,
 )
-from cayu.egress.e2b_adapter import E2BEgressAdapter
+from cayu.egress.adapter import _explicit_cleanup_cancellation
+from cayu.egress.e2b_adapter import (
+    E2BEgressAdapter,
+    _find_authoritative_egress_failure,
+)
 from cayu.egress.proxy_exposure import ExposedProxy
 from cayu.environments import ExecutionRequirements, evaluate_execution_admission
 from cayu.runners import E2BRunner
+from cayu.runners.e2b import _contains_cancellation
 from cayu.vaults import SecretRef, StaticVault
 
 
@@ -645,6 +650,68 @@ def test_e2b_prepare_rollback_is_bounded_and_reports_incomplete_cleanup(
     error = asyncio.run(run())
 
     assert error.__notes__ == ["e2b egress prepare rollback incomplete: TimeoutError."]
+
+
+def test_e2b_prepare_rollback_bypasses_hostile_primary_add_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cayu.egress._remote_adapter as remote_adapter
+
+    canary = "provider-secret-from-add-note"
+    finish = asyncio.Event()
+
+    class HostilePrimary(RuntimeError):
+        def add_note(self, _note: str) -> None:
+            raise RuntimeError(canary)
+
+    class HostileExposure:
+        async def expose(self, *, local_host: str, local_port: int) -> ExposedProxy:
+            del local_host, local_port
+            raise HostilePrimary("tunnel failed")
+
+    class HangingCloseProxyServer(_FakeProxyServer):
+        async def close(self) -> None:
+            await finish.wait()
+
+    async def run() -> HostilePrimary:
+        broker, grant = _broker_and_grant()
+        adapter = E2BEgressAdapter(
+            exposure=HostileExposure(),
+            e2b_module=_FakeE2BModule,
+            proxy_server_factory=HangingCloseProxyServer,
+        )
+        with pytest.raises(HostilePrimary, match="tunnel failed") as exc_info:
+            await adapter.prepare(
+                session_id="session-1",
+                grants=[grant],
+                broker=broker,
+            )
+        return exc_info.value
+
+    monkeypatch.setattr(remote_adapter, "DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS", 0.01)
+    error = asyncio.run(run())
+
+    assert canary not in repr(error)
+    assert error.__notes__ == ["e2b egress prepare rollback incomplete: TimeoutError."]
+
+
+def test_e2b_exception_classifiers_handle_deep_groups_iteratively() -> None:
+    cancellation = asyncio.CancelledError("cancel cleanup")
+    cancellation_group: BaseException = cancellation
+    for _ in range(1_500):
+        cancellation_group = BaseExceptionGroup(
+            "nested cleanup cancellation",
+            [cancellation_group],
+        )
+    assert _explicit_cleanup_cancellation(cancellation_group) is cancellation
+    assert _contains_cancellation(cancellation_group) is True
+
+    authoritative = UnsupportedEgressError("egress unavailable")
+    failure_group: BaseException = authoritative
+    for _ in range(1_500):
+        failure_group = ExceptionGroup("nested egress failure", [failure_group])
+    assert isinstance(failure_group, BaseExceptionGroup)
+    assert _find_authoritative_egress_failure(failure_group) is authoritative
 
 
 def test_e2b_adapter_closes_exposure_that_returns_invalid_url() -> None:

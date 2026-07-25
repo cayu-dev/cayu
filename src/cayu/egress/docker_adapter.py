@@ -11,6 +11,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from functools import partial
 
+from cayu._exception_groups import add_exception_note_safely
 from cayu.credentials import CredentialMode
 from cayu.egress.adapter import (
     DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
@@ -384,8 +385,9 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                     timeout_message="Docker egress prepare rollback timed out.",
                 )
             except BaseException as cleanup_error:
-                original.add_note(
-                    f"Docker egress prepare rollback incomplete: {type(cleanup_error).__name__}."
+                add_exception_note_safely(
+                    original,
+                    f"Docker egress prepare rollback incomplete: {type(cleanup_error).__name__}.",
                 )
                 _raise_primary_with_cleanup_cancellation(
                     original,

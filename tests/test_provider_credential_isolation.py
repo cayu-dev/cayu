@@ -539,6 +539,25 @@ def test_shared_provider_cancellation_drops_notes_and_custom_metadata() -> None:
     assert safe.__context__ is None
 
 
+def test_shared_provider_cancellation_bypasses_hostile_artifact_descriptor() -> None:
+    canary = "provider-cancellation-descriptor-canary-0123456789"
+
+    class HostileCancellation(asyncio.CancelledError):
+        @property
+        def artifacts(self):
+            raise RuntimeError(canary)
+
+    safe = sanitize_provider_cancellation(
+        HostileCancellation(canary),
+        provider_label="OpenAI",
+        credential_values=(canary,),
+    )
+
+    rendered = repr(safe) + repr(vars(safe))
+    assert canary not in rendered
+    assert not hasattr(safe, "artifacts")
+
+
 def test_shared_typed_provider_error_drops_notes_and_custom_metadata() -> None:
     canary = "provider-overflow-canary-0123456789"
     error = ModelContextOverflowError(

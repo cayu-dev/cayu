@@ -20,7 +20,9 @@ from urllib.parse import urlparse
 import certifi
 import httpx
 
+from cayu._exception_state import exception_state_contains
 from cayu._validation import require_clean_nonblank, require_nonblank
+from cayu.providers._credential_boundary import credential_safe_provider_cancellation
 from cayu.providers._sse import SseIdleTimeoutError, aiter_sse_json_events
 from cayu.providers.base import (
     ModelContextOverflowError,
@@ -576,15 +578,16 @@ def sanitize_provider_cancellation(
 
     provider_label = require_clean_nonblank(provider_label, "provider_label")
     del credential_values
-    had_artifacts = hasattr(exc, "artifacts")
+    had_artifacts = exception_state_contains(exc, "artifacts")
     message = (
         require_nonblank(safe_message, "safe_message")
         if safe_message is not None
         else f"{provider_label} provider request cancelled"
     )
-    safe = asyncio.CancelledError(message)
-    if had_artifacts:
-        vars(safe)["artifacts"] = []
+    safe = credential_safe_provider_cancellation(
+        message,
+        preserve_empty_artifacts=had_artifacts,
+    )
     safe.__cause__ = None
     safe.__context__ = None
     return safe

@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from cayu._validation import require_durable_clean_nonblank
 from cayu.core.agents import AgentSpec
 from cayu.core.tools import Tool, ToolEffect, ToolResult
 from cayu.environments import (
@@ -36,7 +37,7 @@ class RegisteredAgentState:
     context_policy: ContextPolicy
     context_overflow_policy: ContextPolicy | None
     tool_policy: ToolPolicy
-    runtime_hooks: tuple[RuntimeHook, ...]
+    runtime_hooks: tuple[RegisteredRuntimeHook, ...]
     loop_policies: tuple[LoopPolicy, ...]
     execution_requirements: ExecutionRequirements
     registration_source: str | None = None
@@ -51,6 +52,23 @@ class RegisteredTool:
     parallel_safe: bool
     effect: ToolEffect
     tool: Tool
+
+
+@dataclass(frozen=True)
+class RegisteredRuntimeHook:
+    """A runtime hook paired with its validated, registration-time identity."""
+
+    name: str
+    hook: RuntimeHook
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.hook, RuntimeHook):
+            raise TypeError("Registered runtime hook must contain a RuntimeHook instance.")
+        object.__setattr__(
+            self,
+            "name",
+            require_durable_clean_nonblank(self.name, "runtime_hook.name"),
+        )
 
 
 @dataclass(frozen=True)

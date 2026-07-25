@@ -14,8 +14,9 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any
 
+from cayu._exception_groups import exception_tree_contains, iter_exception_tree
 from cayu._task_wait import await_shielded_task_outcome
-from cayu._validation import copy_json_value, copy_label_map
+from cayu._validation import copy_durable_json_object, copy_json_value, copy_label_map
 from cayu.core.events import Event, EventType
 from cayu.environments import (
     BoundWorkspace,
@@ -37,9 +38,9 @@ from cayu.environments import (
 from cayu.runners import Runner
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._binding_cleanup import (
-    BINDING_FINALIZE_SAFE_PAYLOAD_ATTRIBUTE,
     append_binding_finalize_cancellation,
     attach_binding_cleanup_status,
+    attach_binding_finalize_safe_payload,
     binding_cleanup_payload,
     binding_cleanup_status,
     binding_finalize_cancellation,
@@ -47,6 +48,14 @@ from cayu.runtime._binding_cleanup import (
     binding_finalize_explicit_cancellation,
     binding_finalize_failure_payload,
     binding_finalize_fatal_signal,
+    binding_finalize_safe_payload,
+)
+from cayu.runtime._diagnostics import (
+    ExceptionDiagnostic,
+    _attach_runtime_exception_payload,
+    _runtime_exception_payload,
+    bound_diagnostic_text,
+    exception_diagnostic,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime.sessions import CheckpointTransform, Session, SessionStore
@@ -252,12 +261,8 @@ class EnvironmentLifecycle:
                 # transactional write begins. Only a durable read proving the
                 # expected owner and metadata absent permits the allocation to
                 # be discarded.
-                allocation_checkpoint_may_be_committed = bool(
-                    getattr(
-                        exc,
-                        _ENVIRONMENT_FACTORY_CHECKPOINT_MAY_BE_COMMITTED_ATTRIBUTE,
-                        False,
-                    )
+                allocation_checkpoint_may_be_committed = (
+                    _environment_factory_checkpoint_may_be_committed(exc)
                 )
                 raise
             allocation_checkpointed = True
@@ -312,10 +317,8 @@ class EnvironmentLifecycle:
                     ),
                     original_error=exc,
                 )
-                setattr(exc, _ENVIRONMENT_FACTORY_RELEASE_ERROR_ATTRIBUTE, release_payload)
-            ordinary_failure = isinstance(exc, Exception) or (
-                isinstance(exc, BaseExceptionGroup) and exc.subgroup(Exception) is not None
-            )
+                _attach_environment_factory_release_payload(exc, release_payload)
+            ordinary_failure = isinstance(exc, Exception) or exception_tree_contains(exc, Exception)
             fatal_signal = binding_finalize_fatal_signal(exc)
             if fatal_signal is not None and not ordinary_failure:
                 raise
@@ -494,7 +497,7 @@ class EnvironmentLifecycle:
             action=EnvironmentFactoryReleaseAction.PRESERVE,
             original_error=error,
         )
-        setattr(error, _ENVIRONMENT_FACTORY_RELEASE_ERROR_ATTRIBUTE, release_payload)
+        _attach_environment_factory_release_payload(error, release_payload)
         return (
             replace(
                 registered_environment,
@@ -599,9 +602,7 @@ class EnvironmentLifecycle:
                 except BaseException as cleanup_exc:
                     cleanup_status.retry_error = cleanup_exc
                     retry_error = cleanup_exc
-            ordinary_failure = isinstance(exc, Exception) or (
-                isinstance(exc, BaseExceptionGroup) and exc.subgroup(Exception) is not None
-            )
+            ordinary_failure = isinstance(exc, Exception) or exception_tree_contains(exc, Exception)
             fatal_signal = binding_finalize_fatal_signal(exc)
             if fatal_signal is not None and not ordinary_failure:
                 raise
@@ -843,10 +844,19 @@ class EnvironmentLifecycle:
                     ),
                 )
             except BaseException as diagnostic_error:
-                setattr(exc, BINDING_FINALIZE_SAFE_PAYLOAD_ATTRIBUTE, finalize_error_payload)
-                exc.add_note(
+                attach_binding_finalize_safe_payload(exc, finalize_error_payload)
+                diagnostic = exception_diagnostic(
+                    diagnostic_error,
+                    empty_message="binding finalization failure publication failed",
+                    nonportable_message=(
+                        "Binding finalization failure publication failed with a "
+                        "non-portable diagnostic."
+                    ),
+                )
+                _add_exception_note_safely(
+                    exc,
                     "Binding finalization durable failure publication also failed: "
-                    f"{type(diagnostic_error).__name__}: {diagnostic_error}."
+                    f"{diagnostic.error_type}: {diagnostic.message}.",
                 )
                 fatal_signal = binding_finalize_fatal_signal(diagnostic_error)
                 if fatal_signal is not None:
@@ -873,13 +883,22 @@ class EnvironmentLifecycle:
                 )
                 failure_event = (await asyncio.shield(fanout_task))[0]
             except asyncio.CancelledError as cancellation:
-                setattr(exc, BINDING_FINALIZE_SAFE_PAYLOAD_ATTRIBUTE, finalize_error_payload)
+                attach_binding_finalize_safe_payload(exc, finalize_error_payload)
                 raise append_binding_finalize_cancellation(exc, cancellation) from cancellation
             except BaseException as diagnostic_error:
-                setattr(exc, BINDING_FINALIZE_SAFE_PAYLOAD_ATTRIBUTE, finalize_error_payload)
-                exc.add_note(
+                attach_binding_finalize_safe_payload(exc, finalize_error_payload)
+                diagnostic = exception_diagnostic(
+                    diagnostic_error,
+                    empty_message="binding finalization diagnostic fan-out failed",
+                    nonportable_message=(
+                        "Binding finalization diagnostic fan-out failed with a "
+                        "non-portable diagnostic."
+                    ),
+                )
+                _add_exception_note_safely(
+                    exc,
                     "Binding finalization diagnostic fan-out failed: "
-                    f"{type(diagnostic_error).__name__}: {diagnostic_error}."
+                    f"{diagnostic.error_type}: {diagnostic.message}.",
                 )
                 fatal_signal = binding_finalize_fatal_signal(diagnostic_error)
                 if fatal_signal is not None:
@@ -992,9 +1011,17 @@ class EnvironmentLifecycle:
                 },
             )
         except BaseException as cleanup_error:
-            original_error.add_note(
+            diagnostic = exception_diagnostic(
+                cleanup_error,
+                empty_message="environment binding cleanup failed",
+                nonportable_message=(
+                    "Environment binding cleanup failed with a non-portable diagnostic."
+                ),
+            )
+            _add_exception_note_safely(
+                original_error,
                 "Environment binding cleanup failed while aborting setup: "
-                f"{type(cleanup_error).__name__}: {cleanup_error}."
+                f"{diagnostic.error_type}: {diagnostic.message}.",
             )
             if cleanup_error is original_error:
                 raise
@@ -1092,19 +1119,17 @@ class EnvironmentLifecycle:
             if outcome.error is not None:
                 fatal_signal = binding_finalize_fatal_signal(outcome.error)
                 if fatal_signal is not None:
-                    setattr(
+                    _mark_environment_factory_checkpoint_may_be_committed(fatal_signal)
+                    _add_exception_note_safely(
                         fatal_signal,
-                        _ENVIRONMENT_FACTORY_CHECKPOINT_MAY_BE_COMMITTED_ATTRIBUTE,
-                        True,
-                    )
-                    fatal_signal.add_note(
                         "The environment factory checkpoint write also failed; "
-                        "its commit outcome could not be reconciled."
+                        "its commit outcome could not be reconciled.",
                     )
                     raise fatal_signal from exc
-                exc.add_note(
+                _add_exception_note_safely(
+                    exc,
                     "Could not reconcile whether the environment factory checkpoint "
-                    "committed; the allocation will be preserved."
+                    "committed; the allocation will be preserved.",
                 )
             propagated_error: BaseException = exc
             if outcome.cancellation is not None and outcome.cancellation is not exc:
@@ -1113,11 +1138,7 @@ class EnvironmentLifecycle:
                     [exc, outcome.cancellation],
                 )
             if checkpoint_may_be_committed:
-                setattr(
-                    propagated_error,
-                    _ENVIRONMENT_FACTORY_CHECKPOINT_MAY_BE_COMMITTED_ATTRIBUTE,
-                    True,
-                )
+                _mark_environment_factory_checkpoint_may_be_committed(propagated_error)
             if outcome.error is not None:
                 raise propagated_error from outcome.error
             if propagated_error is exc:
@@ -1162,32 +1183,91 @@ def render_initial_system_prompt(
     return f"[Agent instructions]\n{agent_prompt}\n\n{workspace_section}"
 
 
-def exception_failure_payload(error: BaseException) -> dict[str, Any]:
-    safe_payload = getattr(error, BINDING_FINALIZE_SAFE_PAYLOAD_ATTRIBUTE, None)
-    if not isinstance(safe_payload, dict) and isinstance(error, BaseExceptionGroup):
-        for child in error.exceptions:
-            child_payload = exception_failure_payload(child)
-            if "failures" in child_payload and "outcome" in child_payload:
-                safe_payload = child_payload
-                break
-    if isinstance(safe_payload, dict):
-        return copy_json_value(safe_payload, "binding_finalize_safe_payload")
-    payload: dict[str, Any] = {
-        "error": str(error),
-        "error_type": type(error).__name__,
-    }
-    if isinstance(error, ExecutionAdmissionError):
-        payload["execution_admission"] = error.decision.model_dump(mode="json")
-    cleanup_payload = binding_cleanup_payload(error)
+def exception_failure_payload(
+    error: BaseException,
+    *,
+    diagnostic: ExceptionDiagnostic | None = None,
+) -> dict[str, Any]:
+    """Return portable terminal evidence without trusting exception behavior."""
+
+    if diagnostic is None:
+        diagnostic = exception_diagnostic(error)
+    elif type(diagnostic) is not ExceptionDiagnostic:
+        raise TypeError("diagnostic must be an ExceptionDiagnostic.")
+    fallback = diagnostic.payload_fields()
+
+    safe_payload = binding_finalize_safe_payload(error)
+    if safe_payload is None and isinstance(error, BaseExceptionGroup):
+        safe_payload = next(
+            (
+                payload
+                for child in iter_exception_tree(error)
+                if child is not error
+                and (payload := binding_finalize_safe_payload(child)) is not None
+            ),
+            None,
+        )
+    if safe_payload is not None:
+        return safe_payload
+
+    payload = dict(fallback)
+    try:
+        if isinstance(error, ExecutionAdmissionError):
+            payload["execution_admission"] = error.decision.model_dump(mode="json")
+    except BaseException:
+        return fallback
+    try:
+        cleanup_payload = binding_cleanup_payload(error)
+    except BaseException:
+        cleanup_payload = None
     if cleanup_payload is not None:
         payload["binding_cleanup"] = cleanup_payload
-    factory_release = getattr(error, _ENVIRONMENT_FACTORY_RELEASE_ERROR_ATTRIBUTE, None)
-    if isinstance(factory_release, dict):
-        payload["environment_factory_release"] = copy_json_value(
-            factory_release,
-            "environment_factory_release",
-        )
-    return payload
+    factory_release = _environment_factory_release_payload(error)
+    if factory_release is not None:
+        payload["environment_factory_release"] = factory_release
+    try:
+        return copy_durable_json_object(payload, "failure_payload")
+    except BaseException:
+        return fallback
+
+
+def _mark_environment_factory_checkpoint_may_be_committed(
+    error: BaseException,
+) -> None:
+    _attach_runtime_exception_payload(
+        error,
+        attribute_name=_ENVIRONMENT_FACTORY_CHECKPOINT_MAY_BE_COMMITTED_ATTRIBUTE,
+        payload={"checkpoint_may_be_committed": True},
+    )
+
+
+def _environment_factory_checkpoint_may_be_committed(
+    error: BaseException,
+) -> bool:
+    return _runtime_exception_payload(
+        error,
+        attribute_name=_ENVIRONMENT_FACTORY_CHECKPOINT_MAY_BE_COMMITTED_ATTRIBUTE,
+    ) == {"checkpoint_may_be_committed": True}
+
+
+def _attach_environment_factory_release_payload(
+    error: BaseException,
+    payload: dict[str, Any],
+) -> None:
+    _attach_runtime_exception_payload(
+        error,
+        attribute_name=_ENVIRONMENT_FACTORY_RELEASE_ERROR_ATTRIBUTE,
+        payload=payload,
+    )
+
+
+def _environment_factory_release_payload(
+    error: BaseException,
+) -> dict[str, Any] | None:
+    return _runtime_exception_payload(
+        error,
+        attribute_name=_ENVIRONMENT_FACTORY_RELEASE_ERROR_ATTRIBUTE,
+    )
 
 
 def _copy_event_with_payload(event: Event, payload: dict[str, Any]) -> Event:
@@ -1222,8 +1302,9 @@ async def _reconcile_binding_finalize_failure_event(
     if fatal_signal is not None:
         raise fatal_signal
     if cancellation is not None:
-        persistence_error.add_note(
-            "Could not reconcile whether the binding finalization failure event committed."
+        _add_exception_note_safely(
+            persistence_error,
+            "Could not reconcile whether the binding finalization failure event committed.",
         )
         raise BaseExceptionGroup(
             "Binding finalization failure reconciliation failed after caller cancellation.",
@@ -1410,17 +1491,24 @@ async def _release_unclaimed_factory_result(
                 timeout_s=result.release_timeout_s,
             )
         except BaseException as cleanup_error:
+            diagnostic = exception_diagnostic(
+                cleanup_error,
+                empty_message="environment factory release failed",
+                nonportable_message=(
+                    "Environment factory release failed with a non-portable diagnostic."
+                ),
+            )
             payload.update(
                 {
                     "completed": False,
-                    "error": str(cleanup_error),
-                    "error_type": type(cleanup_error).__name__,
+                    **diagnostic.payload_fields(),
                     "timeout_s": result.release_timeout_s,
                 }
             )
-            original_error.add_note(
+            _add_exception_note_safely(
+                original_error,
                 "Environment factory result release failed after "
-                f"{action.value}: {type(cleanup_error).__name__}: {cleanup_error}."
+                f"{action.value}: {diagnostic.error_type}: {diagnostic.message}.",
             )
             fatal_signal = binding_finalize_fatal_signal(cleanup_error)
             if fatal_signal is not None:
@@ -1434,7 +1522,7 @@ async def _release_unclaimed_factory_result(
                 cancellation = asyncio.CancelledError()
                 cancellation.add_note(
                     "Environment factory result release failed while cancellation was pending: "
-                    f"{type(cleanup_error).__name__}: {cleanup_error}."
+                    f"{diagnostic.error_type}: {diagnostic.message}."
                 )
                 raise BaseExceptionGroup(
                     "Environment factory result release failed after caller cancellation.",
@@ -1453,9 +1541,10 @@ async def _release_unclaimed_factory_result(
                 "error_type": "MissingEnvironmentFactoryRelease",
             }
         )
-        original_error.add_note(
+        _add_exception_note_safely(
+            original_error,
             "Environment factory result has durable reconnect state but no release callback; "
-            "the runtime left the live allocation untouched rather than closing it terminally."
+            "the runtime left the live allocation untouched rather than closing it terminally.",
         )
         return payload
 
@@ -1486,11 +1575,17 @@ async def _release_unclaimed_factory_result(
             timeout_s=result.release_timeout_s,
         )
     except BaseException as cleanup_error:
+        diagnostic = exception_diagnostic(
+            cleanup_error,
+            empty_message="environment factory fallback release failed",
+            nonportable_message=(
+                "Environment factory fallback release failed with a non-portable diagnostic."
+            ),
+        )
         payload.update(
             {
                 "completed": False,
-                "error": str(cleanup_error),
-                "error_type": type(cleanup_error).__name__,
+                **diagnostic.payload_fields(),
                 "timeout_s": result.release_timeout_s,
             }
         )
@@ -1499,7 +1594,7 @@ async def _release_unclaimed_factory_result(
             cancellation = asyncio.CancelledError()
             cancellation.add_note(
                 "Environment factory fallback release failed while cancellation was pending: "
-                f"{type(cleanup_error).__name__}: {cleanup_error}."
+                f"{diagnostic.error_type}: {diagnostic.message}."
             )
             raise cancellation from cleanup_error
         return payload
@@ -1507,15 +1602,29 @@ async def _release_unclaimed_factory_result(
         raise asyncio.CancelledError()
     payload["completed"] = not cleanup_errors
     if cleanup_errors:
-        details = "; ".join(
-            f"{phase}: {type(error).__name__}: {error}" for phase, error in cleanup_errors
+        diagnostics = [(phase, exception_diagnostic(error)) for phase, error in cleanup_errors]
+        details = bound_diagnostic_text(
+            "; ".join(
+                f"{phase}: {diagnostic.error_type}: {diagnostic.message}"
+                for phase, diagnostic in diagnostics
+            )
         )
         payload["error"] = details
-        payload["error_type"] = type(cleanup_errors[0][1]).__name__
-        original_error.add_note(
-            f"Environment factory fallback release incomplete after {action.value}: {details}."
+        payload["error_type"] = diagnostics[0][1].error_type
+        _add_exception_note_safely(
+            original_error,
+            f"Environment factory fallback release incomplete after {action.value}: {details}.",
         )
     return payload
+
+
+def _add_exception_note_safely(error: BaseException, note: str) -> None:
+    """Attach runtime-owned portable context without invoking subclass accessors."""
+
+    try:
+        BaseException.add_note(error, bound_diagnostic_text(note))
+    except BaseException:
+        return
 
 
 async def _await_bounded_environment_factory_release(

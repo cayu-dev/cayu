@@ -20,6 +20,7 @@ from types import MappingProxyType
 from typing import Any, TypeVar, cast
 from uuid import uuid4
 
+from cayu._exception_groups import exception_group_children, iter_exception_tree
 from cayu._task_wait import (
     consume_pending_task_cancellation,
     unexpected_child_cancellation_error,
@@ -78,7 +79,6 @@ from cayu.runtime.hooks import (
     AfterToolCallDecision,
     BeforeToolCallDecision,
     BeforeToolCallHookContext,
-    RuntimeHook,
     RuntimeHookPhase,
     RuntimeHookRuntime,
     ToolCallHookContext,
@@ -211,7 +211,7 @@ class ToolRoundExecutor:
         event_writer: RuntimeEventWriter,
         session_control: SessionControl[SessionUsageTracker],
         hook_runtime: RuntimeHookRuntime,
-        runtime_hooks: tuple[RuntimeHook, ...],
+        runtime_hooks: tuple[runtime_records.RegisteredRuntimeHook, ...],
         mcp_manifest_policy: McpManifestPolicy | None,
         secret_redactor: SecretRedactor,
         tool_timeout_seconds: float | None,
@@ -1562,13 +1562,14 @@ class ToolRoundExecutor:
             (self._runtime_hooks, "app"),
             (registered_agent.runtime_hooks, "agent"),
         ):
-            for hook in hooks:
+            for registered_hook in hooks:
+                hook = registered_hook.hook
                 if not _runtime_hook_supports_phase(
                     hook=hook,
                     phase=RuntimeHookPhase.BEFORE_TOOL_CALL,
                 ):
                     continue
-                hook_name = require_clean_nonblank(hook.name, "runtime_hook.name")
+                hook_name = registered_hook.name
                 yield await self._event_writer.emit(
                     _runtime_hook_event(
                         event_type=EventType.HOOK_STARTED,
@@ -1763,19 +1764,20 @@ class ToolRoundExecutor:
         tool_call: runtime_records.ToolCallRequest,
         result: ToolResult,
         task_id: str | None,
-        hooks: tuple[RuntimeHook, ...],
+        hooks: tuple[runtime_records.RegisteredRuntimeHook, ...],
         scope: str,
         redactor: SecretRedactor,
         allow_modification: bool = False,
     ) -> AsyncIterator[tuple[Event, ToolResult | None]]:
         current_result = result
-        for hook in hooks:
+        for registered_hook in hooks:
+            hook = registered_hook.hook
             if not _runtime_hook_supports_phase(
                 hook=hook,
                 phase=RuntimeHookPhase.AFTER_TOOL_CALL,
             ):
                 continue
-            hook_name = require_clean_nonblank(hook.name, "runtime_hook.name")
+            hook_name = registered_hook.name
             yield (
                 await self._event_writer.emit(
                     _runtime_hook_event(
@@ -2403,16 +2405,12 @@ def _tool_call_is_parallel_safe(
 
 
 def _parallel_tool_round_exception(group: BaseExceptionGroup) -> BaseException:
-    flattened: list[BaseException] = []
-
-    def flatten(exc: BaseException) -> None:
-        if isinstance(exc, BaseExceptionGroup):
-            for sub_exc in exc.exceptions:
-                flatten(sub_exc)
-        else:
-            flattened.append(exc)
-
-    flatten(group)
+    flattened = [
+        candidate
+        for candidate in iter_exception_tree(group)
+        if not isinstance(candidate, BaseExceptionGroup)
+        or exception_group_children(candidate) is None
+    ]
     for exc in flattened:
         if isinstance(exc, SessionInterruptedByRequest | ToolApprovalRequired):
             return exc

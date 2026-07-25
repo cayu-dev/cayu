@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 
+from cayu._exception_groups import add_exception_note_safely
 from cayu.egress.adapter import (
     DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
     EgressBinding,
@@ -97,8 +98,9 @@ async def prepare_exposed_proxy_binding(
                 timeout_message=f"{runner_kind} egress prepare rollback timed out.",
             )
         except BaseException as cleanup_error:
-            original.add_note(
-                f"{runner_kind} egress prepare rollback incomplete: {type(cleanup_error).__name__}."
+            add_exception_note_safely(
+                original,
+                f"{runner_kind} egress prepare rollback incomplete: {type(cleanup_error).__name__}.",
             )
             _raise_primary_with_cleanup_cancellation(
                 original,

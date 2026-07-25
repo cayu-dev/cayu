@@ -6,7 +6,12 @@ from collections.abc import AsyncIterator
 import pytest
 from tests.provider_traceback_assertions import assert_cayu_traceback_does_not_retain
 
-from cayu.providers._credential_boundary import detach_provider_stream_traceback
+from cayu._exception_groups import iter_exception_tree
+from cayu.providers._credential_boundary import (
+    detach_provider_call_traceback,
+    detach_provider_stream_traceback,
+)
+from cayu.providers._http import sanitize_provider_cancellation
 
 
 class _FailingCloseStream:
@@ -50,6 +55,14 @@ class _ProviderWithGroupedCleanup:
     @detach_provider_stream_traceback
     def stream(self) -> AsyncIterator[str]:
         return _GroupedCloseStream(self._failure)
+
+
+def _deep_group(leaf: BaseException, *, depth: int = 1_500) -> BaseExceptionGroup:
+    failure: BaseException = leaf
+    for _ in range(depth):
+        failure = BaseExceptionGroup("provider failure", [failure])
+    assert isinstance(failure, BaseExceptionGroup)
+    return failure
 
 
 def _exception_texts(failure: BaseException) -> list[str]:
@@ -169,4 +182,240 @@ async def test_detached_provider_stream_rebuilds_nonfatal_cleanup_group() -> Non
 
     assert all(credential not in text for text in _exception_texts(exc_info.value))
     _assert_detached_exception_tree(exc_info.value)
+    assert_cayu_traceback_does_not_retain(exc_info.value, provider)
+
+
+@pytest.mark.anyio
+async def test_detached_provider_stream_bypasses_hostile_group_accessors() -> None:
+    credential = "provider-secret-group-accessor-canary"
+
+    class HostileCleanupGroup(ExceptionGroup):
+        def __getattribute__(self, name: str):
+            if name in {"exceptions", "__cause__", "__context__"}:
+                raise RuntimeError(f"{credential}-{name}")
+            return super().__getattribute__(name)
+
+        def subgroup(self, _condition):
+            raise RuntimeError(f"{credential}-subgroup")
+
+        def split(self, _condition):
+            raise RuntimeError(f"{credential}-split")
+
+    provider = _ProviderWithGroupedCleanup(
+        HostileCleanupGroup(
+            f"raw cleanup group {credential}",
+            [RuntimeError(f"raw cleanup child {credential}")],
+        )
+    )
+    events = provider.stream()
+    assert await anext(events) == "started"
+
+    with pytest.raises(ExceptionGroup) as exc_info:
+        await events.aclose()
+
+    assert all(credential not in text for text in _exception_texts(exc_info.value))
+    _assert_detached_exception_tree(exc_info.value)
+    assert_cayu_traceback_does_not_retain(exc_info.value, provider)
+
+
+@pytest.mark.anyio
+async def test_detached_provider_call_rebuilds_mixed_exception_group() -> None:
+    credential = "provider-secret-call-group-canary"
+
+    class Provider:
+        @detach_provider_call_traceback
+        async def call(self) -> None:
+            raise BaseExceptionGroup(
+                f"provider call failed near {credential}",
+                [
+                    asyncio.CancelledError(f"cancelled near {credential}"),
+                    RuntimeError(f"request failed near {credential}"),
+                ],
+            )
+
+    provider = Provider()
+    with pytest.raises(BaseExceptionGroup) as exc_info:
+        await provider.call()
+
+    assert credential not in repr(exc_info.value)
+    assert [type(candidate) for candidate in iter_exception_tree(exc_info.value)] == [
+        BaseExceptionGroup,
+        asyncio.CancelledError,
+        RuntimeError,
+    ]
+    _assert_detached_exception_tree(exc_info.value)
+    assert_cayu_traceback_does_not_retain(exc_info.value, provider)
+
+
+@pytest.mark.anyio
+async def test_detached_provider_call_preserves_fatal_child_hidden_by_descriptor() -> None:
+    credential = "provider-secret-group-descriptor-canary"
+
+    class HostileFatalGroup(BaseExceptionGroup):
+        @property
+        def exceptions(self) -> tuple[BaseException, ...]:
+            raise RuntimeError(credential)
+
+    class Provider:
+        @detach_provider_call_traceback
+        async def call(self) -> None:
+            raise HostileFatalGroup(
+                f"provider call failed near {credential}",
+                [KeyboardInterrupt(f"interrupted near {credential}")],
+            )
+
+    provider = Provider()
+    with pytest.raises(BaseExceptionGroup) as exc_info:
+        await provider.call()
+
+    assert [type(candidate) for candidate in iter_exception_tree(exc_info.value)] == [
+        BaseExceptionGroup,
+        KeyboardInterrupt,
+    ]
+    assert credential not in repr(exc_info.value)
+    _assert_detached_exception_tree(exc_info.value)
+    assert_cayu_traceback_does_not_retain(exc_info.value, provider)
+
+
+@pytest.mark.anyio
+async def test_detached_provider_call_bypasses_hostile_with_traceback() -> None:
+    credential = "provider-secret-with-traceback-canary"
+
+    class HostileFailure(RuntimeError):
+        def with_traceback(self, _traceback):
+            raise RuntimeError(credential)
+
+    class Provider:
+        @detach_provider_call_traceback
+        async def call(self) -> None:
+            raise HostileFailure("safe provider failure")
+
+    provider = Provider()
+    with pytest.raises(HostileFailure, match="safe provider failure") as exc_info:
+        await provider.call()
+
+    assert credential not in repr(exc_info.value)
+    assert_cayu_traceback_does_not_retain(exc_info.value, provider)
+
+
+@pytest.mark.anyio
+async def test_detached_provider_call_scrubs_direct_fatal_failure() -> None:
+    credential = "provider-secret-direct-fatal-canary"
+
+    class Provider:
+        @detach_provider_call_traceback
+        async def call(self) -> None:
+            failure = KeyboardInterrupt(credential)
+            failure.authorization = credential
+            raise failure
+
+    provider = Provider()
+    with pytest.raises(KeyboardInterrupt, match="Provider operation interrupted") as exc_info:
+        await provider.call()
+
+    assert type(exc_info.value) is KeyboardInterrupt
+    assert credential not in repr(exc_info.value)
+    assert vars(exc_info.value) == {}
+    _assert_detached_exception_tree(exc_info.value)
+    assert_cayu_traceback_does_not_retain(exc_info.value, provider)
+
+
+@pytest.mark.anyio
+async def test_detached_provider_call_preserves_authenticated_cancellation_message() -> None:
+    credential = "provider-secret-sanitized-cancellation-canary"
+    safe_message = "OpenAI provider request cancelled"
+
+    class Provider:
+        @detach_provider_call_traceback
+        async def call(self) -> None:
+            raise sanitize_provider_cancellation(
+                asyncio.CancelledError(credential),
+                provider_label="OpenAI",
+                credential_values=(credential,),
+                safe_message=safe_message,
+            )
+
+    provider = Provider()
+    with pytest.raises(asyncio.CancelledError, match=safe_message) as exc_info:
+        await provider.call()
+
+    assert type(exc_info.value) is asyncio.CancelledError
+    assert exc_info.value.args == (safe_message,)
+    assert credential not in repr(exc_info.value)
+    assert vars(exc_info.value) == {}
+    _assert_detached_exception_tree(exc_info.value)
+    assert_cayu_traceback_does_not_retain(exc_info.value, provider)
+
+
+@pytest.mark.anyio
+async def test_detached_provider_stream_scrubs_direct_cancellation() -> None:
+    credential = "provider-secret-direct-cancellation-canary"
+
+    class Provider:
+        @detach_provider_stream_traceback
+        async def stream(self) -> AsyncIterator[str]:
+            failure = asyncio.CancelledError(credential)
+            failure.authorization = credential
+            failure.artifacts = [{"credential": credential}]
+            failure.__dict__["_cayu_credential_safe_provider_cancellation"] = {
+                "message": credential,
+            }
+            raise failure
+            yield "unreachable"
+
+    provider = Provider()
+    with pytest.raises(asyncio.CancelledError, match="Provider operation cancelled") as exc_info:
+        async for _ in provider.stream():
+            pass
+
+    assert type(exc_info.value) is asyncio.CancelledError
+    assert credential not in repr(exc_info.value)
+    assert vars(exc_info.value) == {"artifacts": []}
+    _assert_detached_exception_tree(exc_info.value)
+    assert_cayu_traceback_does_not_retain(exc_info.value, provider)
+
+
+@pytest.mark.anyio
+async def test_detached_provider_stream_contains_hostile_close_lookup() -> None:
+    credential = "provider-secret-close-lookup-canary"
+
+    class HostileCloseLookupStream:
+        def __init__(self, provider: object) -> None:
+            self.provider = provider
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self) -> str:
+            raise StopAsyncIteration
+
+        def __getattribute__(self, name: str):
+            if name == "aclose":
+                raise RuntimeError(credential)
+            return super().__getattribute__(name)
+
+    class Provider:
+        @detach_provider_stream_traceback
+        def stream(self) -> AsyncIterator[str]:
+            return HostileCloseLookupStream(self)
+
+    provider = Provider()
+    with pytest.raises(RuntimeError, match="Provider stream cleanup failed") as exc_info:
+        async for _ in provider.stream():
+            pass
+
+    assert credential not in repr(exc_info.value)
+    assert_cayu_traceback_does_not_retain(exc_info.value, provider)
+
+
+@pytest.mark.anyio
+async def test_detached_provider_stream_rebuilds_deep_cleanup_group_iteratively() -> None:
+    provider = _ProviderWithGroupedCleanup(_deep_group(RuntimeError("provider cleanup failed")))
+    events = provider.stream()
+    assert await anext(events) == "started"
+
+    with pytest.raises(ExceptionGroup) as exc_info:
+        await events.aclose()
+
+    assert sum(1 for _ in iter_exception_tree(exc_info.value)) == 1_501
     assert_cayu_traceback_does_not_retain(exc_info.value, provider)

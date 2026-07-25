@@ -17,12 +17,14 @@ from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 from uuid import uuid4
 
+from cayu._exception_groups import exception_cause
 from cayu._task_wait import (
     ShieldedTaskOutcome,
     await_shielded_task_outcome,
     unexpected_child_cancellation_error,
 )
 from cayu._validation import (
+    copy_durable_json_value,
     copy_json_value,
     copy_label_map,
     require_clean_nonblank,
@@ -57,6 +59,12 @@ from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime._binding_cleanup import binding_finalize_explicit_cancellation
+from cayu.runtime._diagnostics import (
+    ExceptionDiagnostic,
+    exception_diagnostic,
+    task_failure_payload_from_diagnostic,
+    task_update_error_payload,
+)
 from cayu.runtime._environment_lifecycle import (
     EnvironmentLifecycle,
     exception_failure_payload,
@@ -318,7 +326,7 @@ def _session_operation_heartbeat_failure(task: asyncio.Task[None]) -> BaseExcept
         try:
             task.result()
         except asyncio.CancelledError as cancellation:
-            concurrent_failure = cancellation.__cause__
+            concurrent_failure = exception_cause(cancellation)
             if concurrent_failure is not None:
                 return concurrent_failure
         return SessionCompactionAttemptSuperseded(
@@ -511,7 +519,7 @@ async def _run_while_session_operation_claimed(
                 "Compaction also failed while caller cancellation was handled: "
                 f"{type(outcome.error).__name__}: {outcome.error}"
             )
-        raise cancellation from cancellation.__cause__
+        raise cancellation from exception_cause(cancellation)
     finally:
         if not operation_task.done():
             operation_task.cancel()
@@ -1222,6 +1230,18 @@ async def _call_runtime_hook(
     raise ValueError(f"Unsupported runtime hook phase: {phase}")
 
 
+def _runtime_hook_actions_payload(context: RuntimeHookContext) -> dict[str, Any]:
+    """Return portable action evidence without making hooks unterminalizable."""
+
+    try:
+        actions = copy_durable_json_value(context.actions, "hook_actions")
+    except BaseException:
+        return {"actions": [], "actions_omitted": True}
+    if type(actions) is not list:
+        return {"actions": [], "actions_omitted": True}
+    return {"actions": actions}
+
+
 def _loop_policy_supports_before_stop(policy: LoopPolicy) -> bool:
     policy_method = type(policy).before_stop
     default_method = LoopPolicy.before_stop
@@ -1693,7 +1713,7 @@ class SessionEngine:
         background_interruption_coordinator: BackgroundInterruptionCoordinator,
         secret_redactor: SecretRedactor,
         clock: Callable[[], datetime],
-        runtime_hooks: tuple[RuntimeHook, ...],
+        runtime_hooks: tuple[runtime_records.RegisteredRuntimeHook, ...],
         loop_policies: tuple[LoopPolicy, ...],
         hook_runtime: RuntimeHookRuntime,
         get_registered_agent: Callable[[str], runtime_records.RegisteredAgentState],
@@ -2119,21 +2139,24 @@ class SessionEngine:
             async for queued_event in self._session_control.drain_out_of_band_events(session.id):
                 yield queued_event
             if resolution.error is not None:
+                failure_diagnostic = exception_diagnostic(resolution.error)
                 task_failure_event, task_failure_error = await self._fail_task_for_run_setup_error(
                     task_id=request.task_id,
                     task_worker_id=request.task_worker_id,
                     session=session,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
-                    error=resolution.error,
+                    diagnostic=failure_diagnostic,
                 )
                 if task_failure_event is not None:
                     yield task_failure_event
                 session = await self.session_store.update_status(session.id, SessionStatus.FAILED)
-                failure_payload = exception_failure_payload(resolution.error)
+                failure_payload = exception_failure_payload(
+                    resolution.error,
+                    diagnostic=failure_diagnostic,
+                )
                 if task_failure_error is not None:
-                    failure_payload["task_update_error"] = str(task_failure_error)
-                    failure_payload["task_update_error_type"] = type(task_failure_error).__name__
+                    failure_payload.update(task_update_error_payload(task_failure_error))
                 async for event in self._emit_terminal_event_with_hooks(
                     event=Event(
                         type=EventType.SESSION_FAILED,
@@ -2189,21 +2212,24 @@ class SessionEngine:
                 raise exc
             raise
         except Exception as exc:
+            failure_diagnostic = exception_diagnostic(exc)
             task_failure_event, task_failure_error = await self._fail_task_for_run_setup_error(
                 task_id=request.task_id,
                 task_worker_id=request.task_worker_id,
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
-                error=exc,
+                diagnostic=failure_diagnostic,
             )
             if task_failure_event is not None:
                 yield task_failure_event
             session = await self.session_store.update_status(session.id, SessionStatus.FAILED)
-            failure_payload = exception_failure_payload(exc)
+            failure_payload = exception_failure_payload(
+                exc,
+                diagnostic=failure_diagnostic,
+            )
             if task_failure_error is not None:
-                failure_payload["task_update_error"] = str(task_failure_error)
-                failure_payload["task_update_error_type"] = type(task_failure_error).__name__
+                failure_payload.update(task_update_error_payload(task_failure_error))
             async for event in self._emit_terminal_event_with_hooks(
                 event=Event(
                     type=EventType.SESSION_FAILED,
@@ -2991,7 +3017,7 @@ class SessionEngine:
             if heartbeat_failure is None:
                 return None
             if isinstance(heartbeat_failure, asyncio.CancelledError):
-                concurrent_failure = heartbeat_failure.__cause__
+                concurrent_failure = exception_cause(heartbeat_failure)
                 if concurrent_failure is None:
                     return None
                 heartbeat_failure = concurrent_failure
@@ -5826,10 +5852,7 @@ class SessionEngine:
                         session_id=session.id,
                         agent_name=registered_agent.spec.name,
                         environment_name=_environment_name(registered_environment),
-                        payload={
-                            "error": str(exc),
-                            "error_type": type(exc).__name__,
-                        },
+                        payload=exception_failure_payload(exc),
                     )
                 )
             finally:
@@ -6964,6 +6987,7 @@ class SessionEngine:
             )
             raise
         except Exception as exc:
+            failure_diagnostic = exception_diagnostic(exc)
             task_failure_error: Exception | None = None
             if (
                 not task_started
@@ -6986,11 +7010,10 @@ class SessionEngine:
                 try:
                     task = await self.task_store.fail_task(
                         task_id,
-                        {
-                            "message": str(exc),
-                            "type": type(exc).__name__,
-                            "session_id": session.id,
-                        },
+                        task_failure_payload_from_diagnostic(
+                            failure_diagnostic,
+                            session_id=session.id,
+                        ),
                     )
                     task_finished = True
                     if active_run is not None:
@@ -7007,10 +7030,12 @@ class SessionEngine:
                 except Exception as task_exc:
                     task_failure_error = task_exc
             session = await self.session_store.update_status(session.id, SessionStatus.FAILED)
-            payload = exception_failure_payload(exc)
+            payload = exception_failure_payload(
+                exc,
+                diagnostic=failure_diagnostic,
+            )
             if task_failure_error is not None:
-                payload["task_update_error"] = str(task_failure_error)
-                payload["task_update_error_type"] = type(task_failure_error).__name__
+                payload.update(task_update_error_payload(task_failure_error))
             yield await self._emit_turn_completed_once(
                 session=session,
                 registered_agent=registered_agent,
@@ -7172,7 +7197,7 @@ class SessionEngine:
         session: Session,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
-        error: Exception,
+        diagnostic: ExceptionDiagnostic,
     ) -> tuple[Event | None, Exception | None]:
         """Fail only a task this run can prove it owns before `_run_session`."""
         if task_id is None:
@@ -7201,11 +7226,10 @@ class SessionEngine:
                 return None, None
             task = await self.task_store.fail_task(
                 task_id,
-                {
-                    "message": str(error),
-                    "type": type(error).__name__,
-                    "session_id": session.id,
-                },
+                task_failure_payload_from_diagnostic(
+                    diagnostic,
+                    session_id=session.id,
+                ),
                 worker_id=task_worker_id,
             )
             return (
@@ -8225,16 +8249,17 @@ class SessionEngine:
         terminal_event: Event,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
-        hooks: tuple[RuntimeHook, ...],
+        hooks: tuple[runtime_records.RegisteredRuntimeHook, ...],
         scope: str,
     ) -> AsyncGenerator[Event, None]:
-        for hook in hooks:
+        for registered_hook in hooks:
+            hook = registered_hook.hook
             if not _runtime_hook_supports_phase(
                 hook=hook,
                 phase=phase,
             ):
                 continue
-            hook_name = require_clean_nonblank(hook.name, "runtime_hook.name")
+            hook_name = registered_hook.name
             yield await self._event_writer.emit(
                 _runtime_hook_event(
                     event_type=EventType.HOOK_STARTED,
@@ -8258,6 +8283,11 @@ class SessionEngine:
             try:
                 await _call_runtime_hook(hook=hook, phase=phase, context=context)
             except Exception as exc:
+                diagnostic = exception_diagnostic(
+                    exc,
+                    empty_message="runtime hook failed",
+                    nonportable_message="Runtime hook failed with a non-portable diagnostic.",
+                )
                 yield await self._event_writer.emit(
                     _runtime_hook_event(
                         event_type=EventType.HOOK_FAILED,
@@ -8269,9 +8299,8 @@ class SessionEngine:
                         registered_environment=registered_environment,
                         terminal_event=terminal_event,
                         payload={
-                            "error": str(exc),
-                            "error_type": type(exc).__name__,
-                            "actions": context.actions,
+                            **diagnostic.payload_fields(),
+                            **_runtime_hook_actions_payload(context),
                         },
                     )
                 )
@@ -8286,9 +8315,7 @@ class SessionEngine:
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
                     terminal_event=terminal_event,
-                    payload={
-                        "actions": context.actions,
-                    },
+                    payload=_runtime_hook_actions_payload(context),
                 )
             )
 
@@ -8348,6 +8375,11 @@ class SessionEngine:
                 try:
                     decision = copy_before_stop_decision(await policy.before_stop(context))
                 except Exception as exc:
+                    diagnostic = exception_diagnostic(
+                        exc,
+                        empty_message="loop policy failed",
+                        nonportable_message=("Loop policy failed with a non-portable diagnostic."),
+                    )
                     yield (
                         await self._event_writer.emit(
                             _before_stop_policy_event(
@@ -8359,10 +8391,7 @@ class SessionEngine:
                                 registered_environment=registered_environment,
                                 step=step,
                                 classification=classification,
-                                payload={
-                                    "error": str(exc),
-                                    "error_type": type(exc).__name__,
-                                },
+                                payload=diagnostic.payload_fields(),
                             )
                         ),
                         None,

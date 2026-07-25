@@ -170,6 +170,15 @@ def test_recovery_abandonment_signal_finds_nested_grouped_cancellation() -> None
     )
 
 
+def test_recovery_abandonment_signal_handles_deep_group_iteratively() -> None:
+    cancellation = asyncio.CancelledError("cancel recovery")
+    grouped: BaseException = cancellation
+    for _ in range(1_500):
+        grouped = BaseExceptionGroup("nested recovery failure", [grouped])
+
+    assert _recovery_abandonment_signal(grouped) is cancellation
+
+
 def test_recovery_cleanup_preserves_ordered_failures_under_cancellation() -> None:
     async def scenario() -> None:
         cancellation = asyncio.CancelledError("cancel recovery")

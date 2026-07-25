@@ -23,6 +23,7 @@ from pydantic import (
     model_validator,
 )
 
+from cayu._exception_groups import exception_cause
 from cayu._task_wait import consume_pending_task_cancellation
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
@@ -73,6 +74,7 @@ from cayu.providers.base import (
     copy_usage_dialect,
 )
 from cayu.runtime._completion_projection import portable_model_completion_projection
+from cayu.runtime._diagnostics import exception_diagnostic
 from cayu.runtime._model_errors import (
     ProviderExceptionControl,
     copy_provider_exception_control,
@@ -1443,20 +1445,22 @@ class KnowledgeInjectionPolicy(RuntimeManagedContextPolicy):
         try:
             search_result = await request.knowledge_store.search(query)
         except Exception as exc:
+            diagnostic = exception_diagnostic(
+                exc,
+                empty_message="knowledge search failed",
+                nonportable_message="Knowledge search failed with a non-portable diagnostic.",
+            )
             telemetry.append(
                 _knowledge_search_telemetry(
                     event_type=EventType.KNOWLEDGE_SEARCH_FAILED,
                     policy=self,
                     query=query,
-                    payload={
-                        "error": str(exc),
-                        "error_type": type(exc).__name__,
-                    },
+                    payload=diagnostic.payload_fields(),
                 )
             )
             if not self.fail_open:
                 raise ContextBuildError(
-                    str(exc),
+                    diagnostic.message,
                     compaction_telemetry=list(base_result.compaction_telemetry),
                     knowledge_telemetry=telemetry,
                     checkpoint=base_result.checkpoint,
@@ -4355,11 +4359,11 @@ async def _run_compaction_model(
                             if public_cancellation is not None:
                                 if runtime_dispatch_boundary:
                                     del provider
-                                    raise failure from failure.__cause__
+                                    raise failure from exception_cause(failure)
                                 del provider
                                 raise public_cancellation from None
                             del provider
-                            raise failure from failure.__cause__
+                            raise failure from exception_cause(failure)
                         del provider
                         raise publication_cancellation from failure
                     except Exception as publication_error:

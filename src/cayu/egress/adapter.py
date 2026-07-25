@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from math import isfinite
 from typing import Any, Literal
 
+from cayu._exception_groups import iter_exception_tree
 from cayu._task_wait import await_shielded_task_outcome, consume_pending_task_cancellation
 from cayu.egress.broker import TransparentEgressBroker
 from cayu.egress.capabilities import EgressCapabilityEvidence
@@ -254,14 +255,14 @@ def _explicit_cleanup_cancellation(
 ) -> asyncio.CancelledError | None:
     """Find cancellation carried by cleanup without following stale causes."""
 
-    if isinstance(error, asyncio.CancelledError):
-        return error
-    if isinstance(error, BaseExceptionGroup):
-        for child in error.exceptions:
-            cancellation = _explicit_cleanup_cancellation(child)
-            if cancellation is not None:
-                return cancellation
-    return None
+    return next(
+        (
+            candidate
+            for candidate in iter_exception_tree(error)
+            if isinstance(candidate, asyncio.CancelledError)
+        ),
+        None,
+    )
 
 
 def _consume_accounted_task_cancellation(error: BaseException) -> None:

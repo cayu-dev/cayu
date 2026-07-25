@@ -22,6 +22,12 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from cayu._exception_groups import (
+    add_exception_note_safely,
+    exception_group_children,
+    exception_tree_contains,
+    set_exception_cause,
+)
 from cayu._task_wait import (
     await_shielded_task_outcome,
     consume_pending_task_cancellation,
@@ -654,7 +660,10 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 details = "; ".join(
                     f"{phase}: {type(error).__name__}" for phase, error in cleanup_errors
                 )
-                original.add_note(f"Virtual-egress rollback incomplete: {details}.")
+                add_exception_note_safely(
+                    original,
+                    f"Virtual-egress rollback incomplete: {details}.",
+                )
                 cleanup_cancellation = next(
                     (
                         cancellation
@@ -891,25 +900,38 @@ def _split_cleanup_cancellation(
     """Separate one explicit cancellation from ordinary cleanup failures."""
 
     cancellation = binding_finalize_explicit_cancellation(error)
-    _, ordinary_group = error.split(asyncio.CancelledError)
-    if ordinary_group is None:
+    ordinary_failures: list[Exception] = []
+    pending: list[BaseException] = [error]
+    while pending:
+        candidate = pending.pop()
+        if isinstance(candidate, asyncio.CancelledError):
+            continue
+        if isinstance(candidate, BaseExceptionGroup):
+            children = exception_group_children(candidate)
+            if children is None:
+                raise error
+            pending.extend(reversed(children))
+            continue
+        if not isinstance(candidate, Exception):
+            raise error
+        ordinary_failures.append(candidate)
+    if not ordinary_failures:
         return cancellation, None
-    ordinary_error: BaseException = ordinary_group
-    while isinstance(ordinary_error, BaseExceptionGroup) and len(ordinary_error.exceptions) == 1:
-        ordinary_error = ordinary_error.exceptions[0]
-    if not isinstance(ordinary_error, Exception):
-        raise error
-    return cancellation, ordinary_error
+    if len(ordinary_failures) == 1:
+        return cancellation, ordinary_failures[0]
+    return (
+        cancellation,
+        ExceptionGroup(
+            "Virtual-egress cleanup had concurrent failures.",
+            ordinary_failures,
+        ),
+    )
 
 
 def _contains_timeout(error: BaseException) -> bool:
     """Return whether a cleanup error contains a timeout at any nesting level."""
 
-    if isinstance(error, TimeoutError):
-        return True
-    if isinstance(error, BaseExceptionGroup):
-        return any(_contains_timeout(child) for child in error.exceptions)
-    return False
+    return exception_tree_contains(error, TimeoutError)
 
 
 def _append_prior_cleanup_cancellation(
@@ -1108,7 +1130,7 @@ class _EgressManagedRunner(Runner):
             if (
                 phase_cancellation is not None
                 and isinstance(timeout_error, TimeoutError)
-                and len(failure.exceptions) == 2
+                and len(exception_group_children(failure) or ()) == 2
             ):
                 errors.append((phase, failure))
                 return
@@ -1141,7 +1163,7 @@ class _EgressManagedRunner(Runner):
             fatal_signal = binding_finalize_fatal_signal(exc)
             if fatal_signal is not None:
                 raise
-            if exc.subgroup(TimeoutError) is not None:
+            if exception_tree_contains(exc, TimeoutError):
                 timeout_failure = _append_prior_cleanup_cancellation(exc, cancellation)
                 record_timeout("runner", timeout_failure)
             else:
@@ -1171,7 +1193,7 @@ class _EgressManagedRunner(Runner):
                 fatal_signal = binding_finalize_fatal_signal(exc)
                 if fatal_signal is not None:
                     raise
-                if exc.subgroup(TimeoutError) is not None:
+                if exception_tree_contains(exc, TimeoutError):
                     timeout_failure = _append_prior_cleanup_cancellation(exc, cancellation)
                     record_timeout("binding", timeout_failure)
                 else:
@@ -1197,7 +1219,7 @@ class _EgressManagedRunner(Runner):
                 fatal_signal = binding_finalize_fatal_signal(exc)
                 if fatal_signal is not None:
                     raise
-                if exc.subgroup(TimeoutError) is not None:
+                if exception_tree_contains(exc, TimeoutError):
                     timeout_failure = _append_prior_cleanup_cancellation(exc, cancellation)
                     record_timeout("audit", timeout_failure)
                 else:
@@ -1244,7 +1266,7 @@ class _EgressManagedRunner(Runner):
                 f"{phase}: {type(error).__name__}: {error}" for phase, error in errors
             )
             cleanup_error = RuntimeError(f"Virtual-egress resource cleanup incomplete: {details}")
-            cleanup_error.__cause__ = failure_tree
+            set_exception_cause(cleanup_error, failure_tree)
             if cancellation is not None:
                 raise BaseExceptionGroup(
                     "Virtual-egress cleanup failed after caller cancellation.",
@@ -1495,9 +1517,10 @@ class _EgressTeardownBinding(WorkspaceBinding):
             try:
                 await self._close_resources(outcome=outcome)
             except BaseException as retry_error:
-                retry_error.add_note(
+                add_exception_note_safely(
+                    retry_error,
                     "Virtual-egress factory release retry followed "
-                    f"{type(initial_error).__name__}: {initial_error}."
+                    f"{type(initial_error).__name__}.",
                 )
                 cleanup_error = retry_error
         except BaseException as exc:

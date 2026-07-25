@@ -13,6 +13,7 @@ from types import ModuleType
 from typing import Any, Literal, cast
 from uuid import uuid4
 
+from cayu._exception_groups import add_exception_note_safely, exception_tree_contains
 from cayu._validation import require_clean_nonblank
 from cayu.runners._cleanup import (
     DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
@@ -1726,15 +1727,22 @@ async def _cleanup_handoff_failure(
             cleanup_error = exc
     if primary_cancellation is not None:
         if cleanup_error is not None:
-            primary_cancellation.add_note(_handoff_rollback_diagnostic(cleanup_error))
+            add_exception_note_safely(
+                primary_cancellation,
+                _handoff_rollback_diagnostic(cleanup_error),
+            )
         raise primary_cancellation from cleanup_error
     if cleanup_cancellation is not None:
-        cleanup_cancellation.add_note(
-            f"E2B guest handoff also failed: {type(original_error).__name__}."
+        add_exception_note_safely(
+            cleanup_cancellation,
+            f"E2B guest handoff also failed: {type(original_error).__name__}.",
         )
         cause: BaseException = original_error
         if cleanup_error is not None:
-            cleanup_cancellation.add_note(_handoff_rollback_diagnostic(cleanup_error))
+            add_exception_note_safely(
+                cleanup_cancellation,
+                _handoff_rollback_diagnostic(cleanup_error),
+            )
             cause = BaseExceptionGroup(
                 "E2B guest handoff and rollback failed.",
                 [original_error, cleanup_error],
@@ -1861,11 +1869,7 @@ async def _kill_handoff_sandboxes_by_metadata(
 
 
 def _contains_cancellation(error: BaseException) -> bool:
-    if isinstance(error, asyncio.CancelledError):
-        return True
-    if isinstance(error, BaseExceptionGroup):
-        return any(_contains_cancellation(item) for item in error.exceptions)
-    return False
+    return exception_tree_contains(error, asyncio.CancelledError)
 
 
 def _uncancel_current_task_once() -> None:

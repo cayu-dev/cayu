@@ -921,6 +921,7 @@ class RecordingEnvironmentFactory(EnvironmentFactory):
         reconnect_metadata: dict[str, Any] | None = None,
         release: Any = None,
         release_timeout_s: float = 15.0,
+        create_error: BaseException | None = None,
     ) -> None:
         self.environment = environment
         self.fail_create = fail_create
@@ -928,10 +929,13 @@ class RecordingEnvironmentFactory(EnvironmentFactory):
         self.reconnect_metadata = reconnect_metadata or {}
         self.release = release
         self.release_timeout_s = release_timeout_s
+        self.create_error = create_error
         self.requests: list[EnvironmentFactoryRequest] = []
 
     async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
         self.requests.append(request)
+        if self.create_error is not None:
+            raise self.create_error
         if self.fail_create:
             raise RuntimeError("factory failed")
         return EnvironmentFactoryResult(
@@ -4977,6 +4981,26 @@ def test_factory_checkpoint_write_failure_reconciles_allocation_ownership(
     expected_action: EnvironmentFactoryReleaseAction,
     expected_checkpointed: bool,
 ):
+    class HostileCheckpointError(ConnectionError):
+        @property
+        def _cayu_environment_factory_checkpoint_may_be_committed(self) -> object:
+            raise RuntimeError("workload-secret-from-checkpoint-access")
+
+        @_cayu_environment_factory_checkpoint_may_be_committed.setter
+        def _cayu_environment_factory_checkpoint_may_be_committed(
+            self,
+            _value: object,
+        ) -> None:
+            raise RuntimeError("workload-secret-from-checkpoint-mutation")
+
+        @property
+        def _cayu_environment_factory_release(self) -> object:
+            raise RuntimeError("workload-secret-from-release-access")
+
+        @_cayu_environment_factory_release.setter
+        def _cayu_environment_factory_release(self, _value: object) -> None:
+            raise RuntimeError("workload-secret-from-release-mutation")
+
     class FailingFactoryCheckpointStore(InMemorySessionStore):
         def __init__(self) -> None:
             super().__init__()
@@ -4993,6 +5017,7 @@ def test_factory_checkpoint_write_failure_reconciles_allocation_ownership(
             await super().transform_checkpoint(session_id, checkpoint_transform)
             if failure_mode == "after_commit_unreadable":
                 self.reconciliation_read_failure_armed = True
+                raise HostileCheckpointError("checkpoint commit acknowledgement lost")
             raise ConnectionError("checkpoint commit acknowledgement lost")
 
         async def load_checkpoint(self, session_id: str) -> dict[str, Any] | None:
@@ -5066,6 +5091,7 @@ def test_factory_checkpoint_write_failure_reconciles_allocation_ownership(
     assert release_actions == [expected_action]
     factory_failure = events[1]
     assert factory_failure.payload["environment_factory_release"]["action"] == str(expected_action)
+    assert "workload-secret" not in json.dumps([event.model_dump(mode="json") for event in events])
     if expected_checkpointed:
         assert checkpoint is not None
         assert checkpoint["environment_factory_reconnect"] == {
@@ -7017,7 +7043,7 @@ def test_cayu_app_recovery_factory_failure_returns_to_interrupted_before_resume(
                 decision=ToolApprovalDecision.APPROVE,
             ),
         )
-        factory.fail_create = True
+        factory.create_error = RuntimeError("factory failed\u0000workload-secret")
         recovery_events = await collect_tool_approval_recovery_events(
             app,
             ToolApprovalRecoveryRequest(
@@ -7046,7 +7072,15 @@ def test_cayu_app_recovery_factory_failure_returns_to_interrupted_before_resume(
         EventType.ENVIRONMENT_FACTORY_FAILED,
         EventType.SESSION_INTERRUPTED,
     ]
-    assert recovery_events[-1].payload["error"] == "factory failed"
+    assert recovery_events[-1].payload["error"] == (
+        "Environment factory resolution failed with a non-portable diagnostic."
+    )
+    assert recovery_events[-1].payload["error_type"] == "RuntimeError"
+    assert recovery_events[-1].payload["durable_value_error_code"] == "nul_character"
+    assert recovery_events[-1].payload["durable_value_error_path"] == "$"
+    assert "workload-secret" not in json.dumps(
+        [event.model_dump(mode="json") for event in recovery_events]
+    )
     assert (
         recovery_events[-1].payload["approval_id"]
         == recovery_events[-1].payload["approval"]["approval_id"]
@@ -40889,12 +40923,17 @@ def test_cayu_app_inserts_returned_only_completion_before_anchored_inner_call():
 
 
 @pytest.mark.parametrize(
-    ("invalid_value", "invalid_location", "expected_error_code"),
+    ("invalid_value", "invalid_location", "expected_error_code", "expected_error_path"),
     [
-        ("timeout\x00workload-secret-value", "top-level", "nul_character"),
-        (float("nan"), "top-level", "non_finite_number"),
-        ("timeout\x00workload-secret-value", "usage", "nul_character"),
-        ("timeout\x00workload-secret-value", "model-and-usage", "nul_character"),
+        ("timeout\x00workload-secret-value", "top-level", "nul_character", "$/#2"),
+        (float("nan"), "top-level", "non_finite_number", "$/#2"),
+        ("timeout\x00workload-secret-value", "usage", "nul_character", "$/#1/#2"),
+        (
+            "timeout\x00workload-secret-value",
+            "model-and-usage",
+            "nul_character",
+            "$/#0",
+        ),
     ],
     ids=["nul", "nan", "nested-usage-aux", "invalid-model-and-nested-usage-aux"],
 )
@@ -40902,6 +40941,7 @@ def test_cayu_app_retains_only_authoritative_usage_when_completion_metadata_is_n
     invalid_value: object,
     invalid_location: str,
     expected_error_code: str,
+    expected_error_path: str,
 ):
     store = InMemorySessionStore()
     budget_store = InMemoryBudgetStore()
@@ -40989,7 +41029,12 @@ def test_cayu_app_retains_only_authoritative_usage_when_completion_metadata_is_n
     assert "compaction_attempt_id" not in completed.payload
     assert events[3].payload["error_type"] == "DurableValueError"
     assert "error" not in events[3].payload
-    assert f"code={expected_error_code}" in events[-1].payload["error"]
+    assert events[-1].payload == {
+        "error": "Operation failed with a non-portable diagnostic.",
+        "error_type": "DurableValueError",
+        "durable_value_error_code": expected_error_code,
+        "durable_value_error_path": expected_error_path,
+    }
     rendered = json.dumps(
         [event.model_dump(mode="json") for event in events],
         allow_nan=False,
@@ -41013,24 +41058,27 @@ def test_cayu_app_retains_only_authoritative_usage_when_completion_metadata_is_n
 
 
 @pytest.mark.parametrize(
-    ("summary_events", "expected_error", "expected_error_type"),
+    ("summary_events", "expected_error", "expected_error_type", "expected_error_code"),
     [
-        ([], "`summary` cannot be blank.", "ValueError"),
+        ([], "`summary` cannot be blank.", "ValueError", None),
         (
             [ModelStreamEvent.text_delta(" \n\t")],
             "`summary` cannot be blank.",
             "ValueError",
+            None,
         ),
         (
             [ModelStreamEvent.text_delta("invalid\x00summary")],
             "`summary` must not contain NUL characters. [code=nul_character; path=$]",
             "DurableValueError",
+            "nul_character",
         ),
         (
             [ModelStreamEvent.text_delta("invalid\ud800summary")],
             "`summary` must not contain Unicode surrogate code points. "
             "[code=unicode_surrogate; path=$]",
             "DurableValueError",
+            "unicode_surrogate",
         ),
     ],
     ids=["blank", "whitespace", "nul", "surrogate"],
@@ -41039,6 +41087,7 @@ def test_cayu_app_counts_completed_compaction_with_invalid_summary(
     summary_events: list[ModelStreamEvent],
     expected_error: str,
     expected_error_type: str,
+    expected_error_code: str | None,
 ):
     store = InMemorySessionStore()
     budget_store = InMemoryBudgetStore()
@@ -41124,10 +41173,19 @@ def test_cayu_app_counts_completed_compaction_with_invalid_summary(
     assert "error" not in events[3].payload
     assert events[4].payload["step_count"] == 1
     assert events[4].payload["token_usage"]["input_tokens"] == 100
-    assert events[5].payload == {
-        "error": expected_error,
-        "error_type": expected_error_type,
-    }
+    if expected_error_type == "DurableValueError":
+        assert expected_error_code is not None
+        assert events[5].payload == {
+            "error": "Operation failed with a non-portable diagnostic.",
+            "error_type": expected_error_type,
+            "durable_value_error_code": expected_error_code,
+            "durable_value_error_path": "$",
+        }
+    else:
+        assert events[5].payload == {
+            "error": expected_error,
+            "error_type": expected_error_type,
+        }
     assert runtime_provider.requests == []
     assert asyncio.run(store.load_checkpoint("sess_invalid_compaction_summary")) is None
 
