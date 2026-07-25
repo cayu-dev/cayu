@@ -31,6 +31,8 @@ from cayu.runtime.budgets import (
     BudgetReservationRecord,
     BudgetReservationResult,
     BudgetStore,
+    _effective_budget_limits,
+    _EffectiveBudgetLimit,
     budget_actual_cost_for_event,
     budget_check_from_events,
     budget_check_payload,
@@ -381,6 +383,11 @@ class RunLimitController:
     ) -> tuple[OperationBudgetCheck, ...]:
         """Evaluate scopes while including an operation's uncommitted events."""
 
+        budget_limits = request_budget_limits_for_session(
+            limits=budget_limits,
+            agent_name=session.agent_name,
+            causal_budget_id=session.causal_budget_id,
+        )
         checks: list[OperationBudgetCheck] = []
         for limit in budget_limits:
             if limit.scope in {"app", "agent", "causal"}:
@@ -671,7 +678,7 @@ class RunLimitController:
         limit: BudgetLimit,
         check: BudgetCheck,
     ) -> bool:
-        if type(limit) is not BudgetLimit:
+        if type(limit) not in {BudgetLimit, _EffectiveBudgetLimit}:
             raise TypeError("limit must be a BudgetLimit instance.")
         if type(check) is not BudgetCheck:
             raise TypeError("check must be a BudgetCheck instance.")
@@ -850,15 +857,18 @@ class RunLimitController:
         budget_policy: BudgetPolicy | None,
         request_budget_limits: tuple[BudgetLimit, ...] = (),
     ) -> tuple[BudgetLimit, ...]:
-        return tuple(
-            (
-                *budget_limits_for_session(
-                    policy=budget_policy,
-                    agent_name=agent_name,
-                    causal_budget_id=session.causal_budget_id,
-                ),
-                *request_budget_limits,
-            )
+        effective_request_limits = request_budget_limits_for_session(
+            limits=request_budget_limits,
+            agent_name=agent_name,
+            causal_budget_id=session.causal_budget_id,
+        )
+        return (
+            *budget_limits_for_session(
+                policy=budget_policy,
+                agent_name=agent_name,
+                causal_budget_id=session.causal_budget_id,
+            ),
+            *effective_request_limits,
         )
 
     async def reconcile_dispatched_reservations(
@@ -1320,6 +1330,11 @@ class RunLimitController:
     ):
         """Run one observable compactor dispatch under strict budget accounting."""
 
+        budget_limits = request_budget_limits_for_session(
+            limits=budget_limits,
+            agent_name=agent_name,
+            causal_budget_id=session.causal_budget_id,
+        )
         lifecycle = _BudgetedOperationLifecycle()
         prior_completion_events = (
             []
@@ -1344,6 +1359,7 @@ class RunLimitController:
                     continue
                 failure = BudgetReservationResult(
                     accepted=False,
+                    budget_limit_id=resolved.check.budget_limit_id,
                     scope=resolved.limit.scope,
                     key=resolved.limit.key,
                     window=resolved.limit.window,
@@ -1723,7 +1739,11 @@ class RunLimitController:
         accepted_record_error: str,
         billing_identity: BillingIdentity | None = None,
     ) -> OperationReservationSetup:
-        limits = [limit for limit in budget_limits if limit.reservation is not None]
+        effective_limits = _effective_budget_limits(
+            budget_limits,
+            identity_namespace="operation",
+        )
+        limits = [limit for limit in effective_limits if limit.reservation is not None]
         if not limits or provider_name is None or model is None:
             return OperationReservationSetup((), (), (), None, None)
 
@@ -2048,14 +2068,7 @@ def _budget_limit_reached_payload_matches(
         return False
     if type(check) is not BudgetCheck:
         raise TypeError("check must be a BudgetCheck.")
-    return (
-        payload.get("scope") == check.scope
-        and payload.get("key") == check.key
-        and payload.get("window") == check.window.storage_key
-        and payload.get("currency") == check.currency
-        and payload.get("maximum") == str(check.maximum)
-        and payload.get("action") == check.action
-    )
+    return payload.get("budget_limit_id") == check.budget_limit_id
 
 
 def _budget_notify_already_emitted_in_invocation(
@@ -2085,7 +2098,7 @@ def _first_budget_limit_outcome(
 ) -> _BudgetLimitOutcome | None:
     if type(session) is not Session:
         raise TypeError("session must be a Session instance.")
-    if type(limit) is not BudgetLimit:
+    if type(limit) is not _EffectiveBudgetLimit:
         raise TypeError("limit must be a BudgetLimit instance.")
     if type(cost_summary) is not SessionCostSummary:
         raise TypeError("cost_summary must be a SessionCostSummary.")
@@ -2171,7 +2184,7 @@ def _first_budget_limit_outcome(
 
 def _budget_check_from_stop_decision(
     *,
-    limit: BudgetLimit,
+    limit: _EffectiveBudgetLimit,
     decision: StopDecision,
     cost_summary: SessionCostSummary,
     unpriced_model_steps: int,
@@ -2181,6 +2194,7 @@ def _budget_check_from_stop_decision(
     if type(decision.actual) is not Decimal:
         raise TypeError("Estimated-cost decisions must use Decimal actual values.")
     return BudgetCheck(
+        budget_limit_id=limit.budget_limit_id,
         scope=limit.scope,
         key=limit.key,
         window=limit.window,

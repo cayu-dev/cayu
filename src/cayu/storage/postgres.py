@@ -54,6 +54,8 @@ from cayu.runtime.budgets import (
     BudgetReservationResult,
     _budget_reservation_amount,
     _clock_or_utc_now,
+    _EffectiveBudgetLimit,
+    _ensure_effective_budget_limit,
     _expired_reservation_reason,
     _is_expired_reservation_reason,
     _reconciled_record,
@@ -63,7 +65,6 @@ from cayu.runtime.budgets import (
     _reservation_result,
     _validate_amount,
     _validate_reservation_ttl,
-    copy_budget_limit,
 )
 from cayu.runtime.event_watchers import (
     EventWatcherClaim,
@@ -685,6 +686,12 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
             updated_at TIMESTAMPTZ NOT NULL
         )
         """,
+    ),
+    23: (
+        "ALTER TABLE IF EXISTS cayu_budget_reservations "
+        "ADD COLUMN IF NOT EXISTS budget_limit_id TEXT",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_budget_reservations_limit "
+        "ON cayu_budget_reservations(budget_limit_id, status, updated_at)",
     ),
 }
 
@@ -2015,17 +2022,10 @@ class PostgresEventWatcherStore(_PostgresStoreBase, EventWatcherStore):
         )
 
 
-def _budget_advisory_lock_key(limit: BudgetLimit) -> int:
-    """Stable 63-bit advisory-lock key for one budget scope/key/window/currency."""
-    material = "|".join(
-        (
-            "cayu_budget_reservations",
-            limit.scope,
-            limit.key or "",
-            limit.window.storage_key,
-            limit.currency.upper(),
-        )
-    )
+def _budget_advisory_lock_key(limit: _EffectiveBudgetLimit) -> int:
+    """Stable 63-bit advisory-lock key for one effective budget limit."""
+
+    material = f"cayu_budget_reservations|{limit.budget_limit_id}"
     digest = sha256(material.encode("utf-8")).digest()
     return int.from_bytes(digest[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
 
@@ -2041,7 +2041,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
     machinery (ADR 0001 revision 8).
     """
 
-    _min_required_revision = 21
+    _min_required_revision = 22
 
     def __init__(
         self,
@@ -2078,7 +2078,10 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         model: str,
         billing_identity: BillingIdentity | None = None,
     ) -> BudgetReservationResult:
-        limit = copy_budget_limit(limit)
+        limit = _ensure_effective_budget_limit(
+            limit,
+            identity_namespace="app_policy",
+        )
         session_id = require_clean_nonblank(session_id, "session_id")
         agent_name = require_clean_nonblank(agent_name, "agent_name")
         provider_name = require_clean_nonblank(provider_name, "provider_name")
@@ -2115,6 +2118,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                             ),
                         )
                     record = BudgetReservationRecord(
+                        budget_limit_id=limit.budget_limit_id,
                         scope=limit.scope,
                         key=limit.key,
                         window=limit.window,
@@ -2222,7 +2226,13 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                 raise
         return _reconciliation_from_record(released)
 
-    async def _reap_expired(self, cur: Any, now: datetime, *, limit: BudgetLimit) -> None:
+    async def _reap_expired(
+        self,
+        cur: Any,
+        now: datetime,
+        *,
+        limit: _EffectiveBudgetLimit,
+    ) -> None:
         if self._reservation_ttl_seconds is None:
             return
         cutoff = now - timedelta(seconds=self._reservation_ttl_seconds)
@@ -2237,30 +2247,27 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                 updated_at = %s
             WHERE status = 'active'
               AND updated_at <= %s
-              AND scope = %s
-              AND budget_key IS NOT DISTINCT FROM %s
-              AND budget_window = %s
-              AND currency = %s
+              AND budget_limit_id = %s
             """,
             (
                 _expired_reservation_reason(self._reservation_ttl_seconds),
                 pg_support.to_utc(now),
                 pg_support.to_utc(cutoff),
-                limit.scope,
-                limit.key,
-                limit.window.storage_key,
-                limit.currency.upper(),
+                limit.budget_limit_id,
             ),
         )
 
-    async def _used_amount(self, cur: Any, limit: BudgetLimit, *, now: datetime) -> Decimal:
+    async def _used_amount(
+        self,
+        cur: Any,
+        limit: _EffectiveBudgetLimit,
+        *,
+        now: datetime,
+    ) -> Decimal:
         since, until = limit.window.bounds(now=now)
         reconciled_bound_sql = ""
         params: list[object] = [
-            limit.scope,
-            limit.key,
-            limit.window.storage_key,
-            limit.currency.upper(),
+            limit.budget_limit_id,
         ]
         if since is not None:
             reconciled_bound_sql += " AND updated_at >= %s"
@@ -2268,14 +2275,47 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         if until is not None:
             reconciled_bound_sql += " AND updated_at < %s"
             params.append(pg_support.to_utc(until))
+        legacy_params: list[object] = [
+            limit.scope,
+            limit.key,
+            limit.window.storage_key,
+            limit.currency.upper(),
+        ]
+        legacy_bound_sql = ""
+        if since is not None:
+            legacy_bound_sql += " AND updated_at >= %s"
+            legacy_params.append(pg_support.to_utc(since))
+        if until is not None:
+            legacy_bound_sql += " AND updated_at < %s"
+            legacy_params.append(pg_support.to_utc(until))
+        await cur.execute(
+            f"""
+            SELECT 1
+            FROM cayu_budget_reservations
+            WHERE budget_limit_id IS NULL
+              AND scope = %s
+              AND budget_key IS NOT DISTINCT FROM %s
+              AND budget_window = %s
+              AND currency = %s
+              AND status IN ('active', 'reconciled')
+              AND (
+                    status = 'active'
+                    OR (status = 'reconciled' {legacy_bound_sql})
+              )
+            LIMIT 1
+            """,
+            legacy_params,
+        )
+        if await cur.fetchone() is not None:
+            raise RuntimeError(
+                "Budget ledger contains pre-identity reservations for this limit; "
+                "exact capacity cannot be verified."
+            )
         await cur.execute(
             f"""
             SELECT reserved_amount, actual_amount, status
             FROM cayu_budget_reservations
-            WHERE scope = %s
-              AND budget_key IS NOT DISTINCT FROM %s
-              AND budget_window = %s
-              AND currency = %s
+            WHERE budget_limit_id = %s
               AND status IN ('active', 'reconciled')
               AND (
                     status = 'active'
@@ -2297,6 +2337,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
             """
             INSERT INTO cayu_budget_reservations (
                 reservation_id,
+                budget_limit_id,
                 scope,
                 budget_key,
                 budget_window,
@@ -2313,10 +2354,14 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                 created_at,
                 updated_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s
+            )
             """,
             (
                 record.reservation_id,
+                record.budget_limit_id,
                 record.scope,
                 record.key,
                 record.window.storage_key,
@@ -2373,7 +2418,8 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
     ) -> BudgetReservationRecord:
         await cur.execute(
             """
-            SELECT reservation_id, scope, budget_key, budget_window, currency, session_id,
+            SELECT reservation_id, budget_limit_id, scope, budget_key, budget_window,
+                   currency, session_id,
                    agent_name, provider_name, model, billing_identity,
                    reserved_amount, actual_amount,
                    status, reason, created_at, updated_at
@@ -2386,25 +2432,31 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         row = await cur.fetchone()
         if row is None:
             raise KeyError(f"Budget reservation not found: {reservation_id}")
+        if row[1] is None:
+            raise RuntimeError(
+                "Budget reservation predates durable budget-limit identity and "
+                "cannot be reconciled safely."
+            )
         return BudgetReservationRecord(
             reservation_id=row[0],
-            scope=row[1],
-            key=row[2],
-            window=row[3],
-            currency=row[4],
-            session_id=row[5],
-            agent_name=row[6],
-            provider_name=row[7],
-            model=row[8],
+            budget_limit_id=row[1],
+            scope=row[2],
+            key=row[3],
+            window=row[4],
+            currency=row[5],
+            session_id=row[6],
+            agent_name=row[7],
+            provider_name=row[8],
+            model=row[9],
             billing_identity=(
-                None if row[9] is None else BillingIdentity.model_validate(_json_obj(row[9]))
+                None if row[10] is None else BillingIdentity.model_validate(_json_obj(row[10]))
             ),
-            reserved_amount=row[10],
-            actual_amount=row[11],
-            status=row[12],
-            reason=row[13],
-            created_at=pg_support.to_utc(row[14]),
-            updated_at=pg_support.to_utc(row[15]),
+            reserved_amount=row[11],
+            actual_amount=row[12],
+            status=row[13],
+            reason=row[14],
+            created_at=pg_support.to_utc(row[15]),
+            updated_at=pg_support.to_utc(row[16]),
         )
 
     async def _active_record_for_update(

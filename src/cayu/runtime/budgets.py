@@ -5,6 +5,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from hashlib import sha256
+from itertools import chain
 from typing import Any, Literal, NamedTuple, cast
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -21,6 +23,7 @@ from pydantic import (
 
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
+    canonical_durable_json_bytes,
 )
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
@@ -46,6 +49,7 @@ from cayu.runtime.costs import (
     estimate_session_cost,
     resolve_price_book,
 )
+from cayu.runtime.execution_units import BudgetLimitIdentity
 
 BudgetScope = Literal["app", "agent", "causal", "session", "run"]
 BudgetWindowKind = Literal["all_time", "rolling", "calendar"]
@@ -102,13 +106,27 @@ def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
     failures = [
         event for event in budget_events if event.type == EventType.BUDGET_RESERVATION_FAILED
     ]
+    limit_descriptors: dict[str, tuple[str, str | None, str, Decimal, str, str]] = {}
+    contradictory_limit_identity = False
+    for event in chain(checks, reservations, failures):
+        budget_limit_id = _inspection_budget_limit_id(event.payload.get("budget_limit_id"))
+        descriptor = _inspection_budget_limit_descriptor(event.payload)
+        if budget_limit_id is None or descriptor is None:
+            contradictory_limit_identity = True
+            continue
+        previous_descriptor = limit_descriptors.setdefault(budget_limit_id, descriptor)
+        if previous_descriptor != descriptor:
+            contradictory_limit_identity = True
+
     reservation_ids: set[str] = set()
-    reservation_ids_by_limit: dict[tuple[str, str | None, str, Decimal, str, str], set[str]] = {}
+    reservation_ids_by_limit: dict[str, set[str]] = {}
+    limit_ids_by_reservation: dict[str, str] = {}
     currencies_by_reservation: dict[str, str] = {}
     invalid_reservation_limit_identity = False
     invalid_reservation_evidence = False
     for event in reservations:
         reservation_id = event.payload.get("reservation_id")
+        budget_limit_id = _inspection_budget_limit_id(event.payload.get("budget_limit_id"))
         currency = event.payload.get("currency")
         if type(reservation_id) is not str:
             invalid_reservation_evidence = True
@@ -122,7 +140,8 @@ def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
         maximum = _inspection_decimal(event.payload.get("maximum"), positive=True)
         action = event.payload.get("action")
         if (
-            type(scope) is str
+            budget_limit_id is not None
+            and type(scope) is str
             and (key is None or type(key) is str)
             and type(window) is str
             and maximum is not None
@@ -131,8 +150,13 @@ def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
             and type(currency) is str
             and bool(currency.strip())
         ):
-            limit_identity = (scope, key, window, maximum, action, currency.upper())
-            reservation_ids_by_limit.setdefault(limit_identity, set()).add(reservation_id)
+            reservation_ids_by_limit.setdefault(budget_limit_id, set()).add(reservation_id)
+            previous_limit_id = limit_ids_by_reservation.setdefault(
+                reservation_id,
+                budget_limit_id,
+            )
+            if previous_limit_id != budget_limit_id:
+                invalid_reservation_evidence = True
         else:
             invalid_reservation_limit_identity = True
         if type(currency) is str:
@@ -144,7 +168,12 @@ def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
     terminal_count_by_reservation: dict[str, int] = {}
     for event in reconciliations:
         reservation_id = event.payload.get("reservation_id")
-        if type(reservation_id) is not str:
+        budget_limit_id = _inspection_budget_limit_id(event.payload.get("budget_limit_id"))
+        if (
+            type(reservation_id) is not str
+            or budget_limit_id is None
+            or limit_ids_by_reservation.get(reservation_id) != budget_limit_id
+        ):
             invalid_reservation_evidence = True
             continue
         reconciled_reservation_ids.add(reservation_id)
@@ -170,7 +199,12 @@ def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
     released_reservation_ids: set[str] = set()
     for event in releases:
         reservation_id = event.payload.get("reservation_id")
-        if type(reservation_id) is not str:
+        budget_limit_id = _inspection_budget_limit_id(event.payload.get("budget_limit_id"))
+        if (
+            type(reservation_id) is not str
+            or budget_limit_id is None
+            or limit_ids_by_reservation.get(reservation_id) != budget_limit_id
+        ):
             invalid_reservation_evidence = True
             continue
         released_reservation_ids.add(reservation_id)
@@ -182,10 +216,6 @@ def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
         bool(reservation_ids)
         and not invalid_reservation_limit_identity
         and not invalid_reservation_evidence
-        and all(
-            len(limit_reservation_ids & reconciled_reservation_ids) <= 1
-            for limit_reservation_ids in reservation_ids_by_limit.values()
-        )
         and settled_reservation_ids == reservation_ids
         and priced_reservation_ids == reconciled_reservation_ids
         and all(
@@ -197,7 +227,9 @@ def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
     cost_state: Literal["unknown", "unpriced", "partial", "mixed_currency", "priced"]
     amount: str | None = None
     currency: str | None = None
-    if complete_priced_coverage:
+    if contradictory_limit_identity:
+        cost_state = "partial"
+    elif complete_priced_coverage:
         limit_totals: set[tuple[Decimal, str]] = set()
         mixed_currency = False
         for limit_reservation_ids in reservation_ids_by_limit.values():
@@ -231,11 +263,10 @@ def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
     elif invalid_reservation_evidence:
         cost_state = "partial"
     elif not reservations and checks and not (reconciliations or releases or failures):
-        latest_checks: dict[
-            tuple[str, str | None, str, Decimal, str, str], tuple[Decimal, str, int]
-        ] = {}
+        latest_checks: dict[str, tuple[Decimal, str, int]] = {}
         invalid_check = False
         for event in checks:
+            budget_limit_id = _inspection_budget_limit_id(event.payload.get("budget_limit_id"))
             scope = event.payload.get("scope")
             key = event.payload.get("key")
             window = event.payload.get("window")
@@ -246,7 +277,8 @@ def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
             unpriced_steps = event.payload.get("unpriced_model_steps")
             cost_summary = event.payload.get("cost_summary")
             if (
-                type(scope) is not str
+                budget_limit_id is None
+                or type(scope) is not str
                 or (key is not None and type(key) is not str)
                 or type(window) is not str
                 or maximum is None
@@ -262,8 +294,7 @@ def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
                 invalid_check = True
                 continue
             checked_currency = currency_value.upper()
-            identity = (scope, key, window, maximum, action, checked_currency)
-            latest_checks[identity] = (actual, checked_currency, unpriced_steps)
+            latest_checks[budget_limit_id] = (actual, checked_currency, unpriced_steps)
 
         if invalid_check:
             cost_state = "partial"
@@ -287,10 +318,15 @@ def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
             else:
                 cost_state = "partial"
     elif not reservation_ids and failures:
+        valid_failure_limit_ids = [
+            _inspection_budget_limit_id(event.payload.get("budget_limit_id")) for event in failures
+        ]
         failure_currencies = {
             currency for event in failures if type(currency := event.payload.get("currency")) is str
         }
-        if len(failure_currencies) == 1 and len(failure_currencies) == len(
+        if any(limit_id is None for limit_id in valid_failure_limit_ids):
+            cost_state = "partial"
+        elif len(failure_currencies) == 1 and len(failure_currencies) == len(
             {event.payload.get("currency") for event in failures}
         ):
             cost_state = "priced"
@@ -331,6 +367,42 @@ def _inspection_decimal(value: Any, *, positive: bool = False) -> Decimal | None
     return parsed
 
 
+def _inspection_budget_limit_id(value: Any) -> str | None:
+    if type(value) is not str:
+        return None
+    try:
+        return BudgetLimitIdentity(budget_limit_id=value).budget_limit_id
+    except ValueError:
+        return None
+
+
+def _inspection_budget_limit_descriptor(
+    payload: Mapping[str, Any],
+) -> tuple[str, str | None, str, Decimal, str, str] | None:
+    scope = payload.get("scope")
+    key = payload.get("key")
+    window = payload.get("window")
+    maximum = _inspection_decimal(payload.get("maximum"), positive=True)
+    action = payload.get("action")
+    currency = payload.get("currency")
+    if (
+        type(scope) is not str
+        or scope not in {"app", "agent", "causal", "session", "run"}
+        or (key is not None and (type(key) is not str or not key or key.strip() != key))
+        or type(window) is not str
+        or not window
+        or window.strip() != window
+        or maximum is None
+        or type(action) is not str
+        or action not in {"interrupt", "notify"}
+        or type(currency) is not str
+        or not currency
+        or currency.strip() != currency
+    ):
+        return None
+    return scope, key, window, maximum, action, currency.upper()
+
+
 def is_budget_inspection_event(event: Event) -> bool:
     """Whether an event contributes to the session budget inspection projection."""
     return event.type in _BUDGET_INSPECTION_EVENT_TYPES
@@ -341,6 +413,7 @@ def project_budget_inspection_event(event: Event) -> Event:
     retained_keys: tuple[str, ...]
     if event.type in {EventType.BUDGET_CHECKED, EventType.BUDGET_LIMIT_REACHED}:
         retained_keys = (
+            "budget_limit_id",
             "scope",
             "key",
             "window",
@@ -353,6 +426,7 @@ def project_budget_inspection_event(event: Event) -> Event:
     elif event.type == EventType.BUDGET_RESERVED:
         retained_keys = (
             "reservation_id",
+            "budget_limit_id",
             "scope",
             "key",
             "window",
@@ -361,11 +435,19 @@ def project_budget_inspection_event(event: Event) -> Event:
             "action",
         )
     elif event.type == EventType.BUDGET_RECONCILED:
-        retained_keys = ("reservation_id", "actual_amount")
+        retained_keys = ("reservation_id", "budget_limit_id", "actual_amount")
     elif event.type == EventType.BUDGET_RESERVATION_RELEASED:
-        retained_keys = ("reservation_id",)
+        retained_keys = ("reservation_id", "budget_limit_id")
     elif event.type == EventType.BUDGET_RESERVATION_FAILED:
-        retained_keys = ("currency",)
+        retained_keys = (
+            "budget_limit_id",
+            "scope",
+            "key",
+            "window",
+            "currency",
+            "maximum",
+            "action",
+        )
     else:
         retained_keys = ()
 
@@ -557,6 +639,17 @@ class BudgetLimit(BaseModel):
         return copy_budget_reservation(value)
 
 
+class _EffectiveBudgetLimit(BudgetLimit):
+    """A configured limit after the runtime assigns its durable ledger identity."""
+
+    budget_limit_id: str
+
+    @field_validator("budget_limit_id")
+    @classmethod
+    def validate_budget_limit_id(cls, value: str) -> str:
+        return BudgetLimitIdentity(budget_limit_id=value).budget_limit_id
+
+
 class BudgetPolicy(BaseModel):
     """App-level budget policy applied automatically by the runtime."""
 
@@ -576,24 +669,13 @@ class BudgetPolicy(BaseModel):
         return tuple(_coerce_budget_limit(limit) for limit in value)
 
     @model_validator(mode="after")
-    def validate_unique_limits(self) -> BudgetPolicy:
-        seen: set[tuple[str, str, str | None, str, Decimal]] = set()
+    def validate_policy_scopes(self) -> BudgetPolicy:
         for limit in self.limits:
             if limit.scope in {"session", "run"}:
                 raise ValueError(
                     f"{limit.scope.title()} budget limits are request-scoped, "
                     "not app policy limits."
                 )
-            key = (
-                limit.scope,
-                limit.window.storage_key,
-                limit.key,
-                limit.action,
-                limit.max_estimated_cost,
-            )
-            if key in seen:
-                raise ValueError("Budget policy contains duplicate scope/window/key limits.")
-            seen.add(key)
         return self
 
 
@@ -602,6 +684,7 @@ class BudgetCheck(BaseModel):
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
+    budget_limit_id: str
     scope: BudgetScope
     key: str | None = None
     window: BudgetWindow = Field(default_factory=BudgetWindow.all_time)
@@ -621,6 +704,11 @@ class BudgetCheck(BaseModel):
         if value is None:
             return None
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("budget_limit_id")
+    @classmethod
+    def validate_budget_limit_id(cls, value: str) -> str:
+        return BudgetLimitIdentity(budget_limit_id=value).budget_limit_id
 
     @field_validator("window", mode="before")
     @classmethod
@@ -646,6 +734,7 @@ class BudgetReservationRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     reservation_id: str = Field(default_factory=lambda: f"bres_{uuid4().hex}")
+    budget_limit_id: str
     scope: BudgetScope
     key: str | None = None
     window: BudgetWindow = Field(default_factory=BudgetWindow.all_time)
@@ -664,6 +753,7 @@ class BudgetReservationRecord(BaseModel):
 
     @field_validator(
         "reservation_id",
+        "budget_limit_id",
         "currency",
         "session_id",
         "agent_name",
@@ -672,7 +762,10 @@ class BudgetReservationRecord(BaseModel):
     )
     @classmethod
     def validate_nonblank_strings(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        value = require_clean_nonblank(value, info.field_name)
+        if info.field_name == "budget_limit_id":
+            return BudgetLimitIdentity(budget_limit_id=value).budget_limit_id
+        return value
 
     @field_validator("key", "reason")
     @classmethod
@@ -712,6 +805,7 @@ class BudgetReservationResult(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     accepted: StrictBool
+    budget_limit_id: str
     scope: BudgetScope
     key: str | None = None
     window: BudgetWindow = Field(default_factory=BudgetWindow.all_time)
@@ -729,6 +823,11 @@ class BudgetReservationResult(BaseModel):
         if value is None:
             return None
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("budget_limit_id")
+    @classmethod
+    def validate_budget_limit_id(cls, value: str) -> str:
+        return BudgetLimitIdentity(budget_limit_id=value).budget_limit_id
 
     @field_validator("window", mode="before")
     @classmethod
@@ -755,6 +854,7 @@ class BudgetReconciliation(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     reservation_id: str
+    budget_limit_id: str
     status: BudgetReservationStatus
     reserved_amount: Decimal = Field(ge=0)
     actual_amount: Decimal | None = Field(default=None, ge=0)
@@ -775,6 +875,11 @@ class BudgetReconciliation(BaseModel):
     @classmethod
     def validate_reconciliation_id(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("budget_limit_id")
+    @classmethod
+    def validate_budget_limit_id(cls, value: str) -> str:
+        return BudgetLimitIdentity(budget_limit_id=value).budget_limit_id
 
     @field_validator("reason", "pricing_provider_name", "pricing_model")
     @classmethod
@@ -1041,7 +1146,10 @@ class InMemoryBudgetLedger(BudgetLedger):
         model: str,
         billing_identity: BillingIdentity | None = None,
     ) -> BudgetReservationResult:
-        limit = copy_budget_limit(limit)
+        limit = _ensure_effective_budget_limit(
+            limit,
+            identity_namespace="app_policy",
+        )
         session_id = require_clean_nonblank(session_id, "session_id")
         agent_name = require_clean_nonblank(agent_name, "agent_name")
         provider_name = require_clean_nonblank(provider_name, "provider_name")
@@ -1074,6 +1182,7 @@ class InMemoryBudgetLedger(BudgetLedger):
                     ),
                 )
             record = BudgetReservationRecord(
+                budget_limit_id=limit.budget_limit_id,
                 scope=limit.scope,
                 key=limit.key,
                 window=limit.window,
@@ -1161,7 +1270,12 @@ class InMemoryBudgetLedger(BudgetLedger):
             self._records[reservation_id] = released
             return _reconciliation_from_record(released)
 
-    def _reap_expired_unlocked(self, now: datetime, *, limit: BudgetLimit) -> None:
+    def _reap_expired_unlocked(
+        self,
+        now: datetime,
+        *,
+        limit: _EffectiveBudgetLimit,
+    ) -> None:
         if self._reservation_ttl_seconds is None:
             return
         for reservation_id, record in self._records.items():
@@ -1308,20 +1422,24 @@ def budget_limits_for_session(
     policy: BudgetPolicy | None,
     agent_name: str,
     causal_budget_id: str,
-) -> tuple[BudgetLimit, ...]:
+) -> tuple[_EffectiveBudgetLimit, ...]:
     policy = copy_budget_policy(policy)
     if policy is None:
         return ()
     agent_name = require_clean_nonblank(agent_name, "agent_name")
     causal_budget_id = require_clean_nonblank(causal_budget_id, "causal_budget_id")
-    matched: list[BudgetLimit] = []
-    for limit in policy.limits:
+    matched: list[_EffectiveBudgetLimit] = []
+    effective_limits = _effective_budget_limits(
+        policy.limits,
+        identity_namespace="app_policy",
+    )
+    for limit in effective_limits:
         if (
             limit.scope == "app"
             or (limit.scope == "agent" and limit.key == agent_name)
             or (limit.scope == "causal" and limit.key == causal_budget_id)
         ):
-            matched.append(_copy_budget_limit(limit))
+            matched.append(_copy_effective_budget_limit(limit))
     return tuple(matched)
 
 
@@ -1330,11 +1448,15 @@ def request_budget_limits_for_session(
     limits: Iterable[BudgetLimit | Mapping[str, Any]] | None,
     agent_name: str,
     causal_budget_id: str,
-) -> tuple[BudgetLimit, ...]:
+) -> tuple[_EffectiveBudgetLimit, ...]:
     copied = copy_request_budget_limits(limits)
     agent_name = require_clean_nonblank(agent_name, "agent_name")
     causal_budget_id = require_clean_nonblank(causal_budget_id, "causal_budget_id")
-    for limit in copied:
+    effective_limits = _effective_budget_limits(
+        copied,
+        identity_namespace="request",
+    )
+    for limit in effective_limits:
         if limit.scope == "agent" and limit.key != agent_name:
             raise ValueError(
                 f"Request agent budget limit key {limit.key!r} does not match "
@@ -1345,7 +1467,7 @@ def request_budget_limits_for_session(
                 f"Request causal budget limit key {limit.key!r} does not match "
                 f"session causal_budget_id {causal_budget_id!r}."
             )
-    return copied
+    return effective_limits
 
 
 def budget_check_from_events(
@@ -1357,8 +1479,12 @@ def budget_check_from_events(
     billing_identity_state: BillingIdentityState = UNRESOLVED_BILLING_IDENTITY,
     effective_at: datetime | None = None,
 ) -> BudgetCheck:
-    if type(limit) is not BudgetLimit:
+    if type(limit) not in {BudgetLimit, _EffectiveBudgetLimit}:
         raise TypeError("limit must be a BudgetLimit.")
+    limit = _ensure_effective_budget_limit(
+        limit,
+        identity_namespace="app_policy",
+    )
     summary = estimate_session_cost(
         session_id=_budget_summary_id(limit),
         events=events,
@@ -1397,6 +1523,7 @@ def budget_check_from_events(
             f"Budget checked: {summary.total_cost} < {limit.max_estimated_cost} {limit.currency}."
         )
     return BudgetCheck(
+        budget_limit_id=limit.budget_limit_id,
         scope=limit.scope,
         key=limit.key,
         window=limit.window,
@@ -1416,6 +1543,7 @@ def budget_check_payload(check: BudgetCheck) -> dict[str, Any]:
     if type(check) is not BudgetCheck:
         raise TypeError("check must be a BudgetCheck.")
     return {
+        "budget_limit_id": check.budget_limit_id,
         "scope": check.scope,
         "key": check.key,
         "window": check.window.storage_key,
@@ -1433,6 +1561,8 @@ def budget_check_payload(check: BudgetCheck) -> dict[str, Any]:
 
 
 def _copy_budget_limit(limit: BudgetLimit) -> BudgetLimit:
+    if type(limit) is _EffectiveBudgetLimit:
+        return _copy_effective_budget_limit(limit)
     if type(limit) is not BudgetLimit:
         raise TypeError("Budget limits must be BudgetLimit instances.")
     return BudgetLimit(
@@ -1450,15 +1580,122 @@ def _copy_budget_limit(limit: BudgetLimit) -> BudgetLimit:
     )
 
 
+def _copy_effective_budget_limit(limit: _EffectiveBudgetLimit) -> _EffectiveBudgetLimit:
+    if type(limit) is not _EffectiveBudgetLimit:
+        raise TypeError("Effective budget limits must be runtime-owned limit instances.")
+    copied = _copy_budget_limit_fields(limit)
+    return _EffectiveBudgetLimit(
+        **copied,
+        budget_limit_id=limit.budget_limit_id,
+    )
+
+
+def _copy_budget_limit_fields(limit: BudgetLimit) -> dict[str, Any]:
+    return {
+        "scope": limit.scope,
+        "max_estimated_cost": limit.max_estimated_cost,
+        "pricing": limit.pricing.model_copy(deep=True),
+        "currency": limit.currency,
+        "window": limit.window,
+        "key": limit.key,
+        "allow_unpriced": limit.allow_unpriced,
+        "action": limit.action,
+        "reservation": (
+            None if limit.reservation is None else copy_budget_reservation(limit.reservation)
+        ),
+    }
+
+
+def _effective_budget_limits(
+    limits: Iterable[BudgetLimit],
+    *,
+    identity_namespace: str,
+) -> tuple[_EffectiveBudgetLimit, ...]:
+    """Assign stable opaque identities while keeping identical entries distinct."""
+
+    namespace = require_clean_nonblank(identity_namespace, "identity_namespace")
+    prepared: list[tuple[BudgetLimit, str | None]] = []
+    definition_counts: dict[str, int] = {}
+    for limit in limits:
+        if type(limit) is _EffectiveBudgetLimit:
+            prepared.append((_copy_effective_budget_limit(limit), None))
+            continue
+        copied_limit = _copy_budget_limit(limit)
+        definition = canonical_durable_json_bytes(
+            copied_limit.model_dump(mode="json"),
+            "budget_limit",
+        )
+        definition_digest = sha256(definition).hexdigest()
+        definition_counts[definition_digest] = definition_counts.get(definition_digest, 0) + 1
+        prepared.append((copied_limit, definition_digest))
+
+    occurrences: dict[str, int] = {}
+    effective: list[_EffectiveBudgetLimit] = []
+    seen_ids: set[str] = set()
+    for limit, definition_digest in prepared:
+        if type(limit) is _EffectiveBudgetLimit:
+            copied = _copy_effective_budget_limit(limit)
+        else:
+            if definition_digest is None:  # pragma: no cover - prepared above
+                raise AssertionError("Configured budget limit is missing its definition digest.")
+            occurrence = occurrences.get(definition_digest, 0)
+            occurrences[definition_digest] = occurrence + 1
+            identity_material = canonical_durable_json_bytes(
+                {
+                    "namespace": namespace,
+                    "definition_sha256": definition_digest,
+                    # Membership is part of an indistinguishable duplicate
+                    # set's identity. Adding or removing one duplicate therefore
+                    # creates a new set instead of letting a survivor silently
+                    # assume the removed sibling's ledger identity.
+                    "definition_occurrences": definition_counts[definition_digest],
+                    "occurrence": occurrence,
+                },
+                "budget_limit_identity",
+            )
+            copied = _EffectiveBudgetLimit(
+                **_copy_budget_limit_fields(limit),
+                budget_limit_id=f"blim_{sha256(identity_material).hexdigest()}",
+            )
+        if copied.budget_limit_id in seen_ids:
+            raise ValueError("Effective budget limits must have distinct identities.")
+        seen_ids.add(copied.budget_limit_id)
+        effective.append(copied)
+    return tuple(effective)
+
+
+def _ensure_effective_budget_limit(
+    limit: BudgetLimit,
+    *,
+    identity_namespace: str,
+) -> _EffectiveBudgetLimit:
+    if type(limit) is _EffectiveBudgetLimit:
+        return _copy_effective_budget_limit(limit)
+    return _effective_budget_limits(
+        (limit,),
+        identity_namespace=identity_namespace,
+    )[0]
+
+
+def _effective_budget_limit_id(limit: BudgetLimit) -> str:
+    if type(limit) is not _EffectiveBudgetLimit:
+        raise TypeError("Budget limit has not been resolved to an effective identity.")
+    return limit.budget_limit_id
+
+
 def _coerce_budget_limit(limit: BudgetLimit | Mapping[str, Any]) -> BudgetLimit:
     if type(limit) is BudgetLimit:
         return _copy_budget_limit(limit)
+    if type(limit) is _EffectiveBudgetLimit:
+        return _copy_effective_budget_limit(limit)
     if isinstance(limit, Mapping):
         return BudgetLimit.model_validate(dict(limit))
     raise TypeError("Budget limits must be BudgetLimit instances or mappings.")
 
 
 def _budget_summary_id(limit: BudgetLimit) -> str:
+    if type(limit) is _EffectiveBudgetLimit:
+        return f"budget:{limit.budget_limit_id}"
     key = "all" if limit.key is None else limit.key
     return f"budget:{limit.scope}:{limit.window.storage_key}:{key}"
 
@@ -1551,6 +1788,7 @@ def budget_reservation_payload(result: BudgetReservationResult) -> dict[str, Any
         raise TypeError("result must be a BudgetReservationResult.")
     payload: dict[str, Any] = {
         "accepted": result.accepted,
+        "budget_limit_id": result.budget_limit_id,
         "scope": result.scope,
         "key": result.key,
         "window": result.window.storage_key,
@@ -1599,6 +1837,7 @@ def budget_reconciliation_payload(reconciliation: BudgetReconciliation) -> dict[
         }
     return {
         "reservation_id": reconciliation.reservation_id,
+        "budget_limit_id": reconciliation.budget_limit_id,
         "status": reconciliation.status,
         "reserved_amount": str(reconciliation.reserved_amount),
         "actual_amount": (
@@ -1621,7 +1860,7 @@ class _BudgetActualCost(NamedTuple):
 
 
 def budget_actual_cost_for_event(*, limit: BudgetLimit, event: Event) -> _BudgetActualCost:
-    if type(limit) is not BudgetLimit:
+    if type(limit) not in {BudgetLimit, _EffectiveBudgetLimit}:
         raise TypeError("limit must be a BudgetLimit.")
     if type(event) is not Event:
         raise TypeError("event must be an Event.")
@@ -1773,7 +2012,7 @@ def budget_price(
 def _ledger_used_amount(
     records: Iterable[BudgetReservationRecord],
     *,
-    limit: BudgetLimit,
+    limit: _EffectiveBudgetLimit,
     now: datetime | None = None,
 ) -> Decimal:
     total = Decimal("0")
@@ -1793,12 +2032,9 @@ def _ledger_used_amount(
 
 
 def _reservation_matches_limit(record: BudgetReservationRecord, limit: BudgetLimit) -> bool:
-    return (
-        record.scope == limit.scope
-        and record.key == limit.key
-        and record.window.storage_key == limit.window.storage_key
-        and record.currency.upper() == limit.currency.upper()
-    )
+    if type(limit) is not _EffectiveBudgetLimit:
+        raise TypeError("Reservation matching requires an effective budget limit.")
+    return record.budget_limit_id == limit.budget_limit_id
 
 
 def _validate_reservation_ttl(value: int | None) -> int | None:
@@ -1835,7 +2071,7 @@ def _is_expired_reservation_reason(reason: str | None) -> bool:
 
 def _reservation_result(
     *,
-    limit: BudgetLimit,
+    limit: _EffectiveBudgetLimit,
     accepted: bool,
     requested: Decimal,
     actual: Decimal,
@@ -1844,6 +2080,7 @@ def _reservation_result(
 ) -> BudgetReservationResult:
     return BudgetReservationResult(
         accepted=accepted,
+        budget_limit_id=limit.budget_limit_id,
         scope=limit.scope,
         key=limit.key,
         window=limit.window,
@@ -1929,6 +2166,7 @@ def _reconciliation_from_record(record: BudgetReservationRecord) -> BudgetReconc
         released_amount = record.reserved_amount - actual_amount
     return BudgetReconciliation(
         reservation_id=record.reservation_id,
+        budget_limit_id=record.budget_limit_id,
         status=record.status,
         reserved_amount=record.reserved_amount,
         actual_amount=actual_amount,

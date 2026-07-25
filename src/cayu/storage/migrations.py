@@ -153,6 +153,10 @@ REVISIONS: tuple[Revision, ...] = (
     # baseline. Pre-22 workers do not maintain that state, so mixed-version
     # session workers could silently bypass drift policy.
     Revision(revision=22, kind=RevisionKind.BREAKING, compatible_from=22),
+    # Budget reservations are now partitioned and attributed by a durable
+    # effective-limit identity. Older writers omit that identity and can merge
+    # independent ledgers, so mixed-version budget workers are unsafe.
+    Revision(revision=23, kind=RevisionKind.BREAKING, compatible_from=23),
 )
 
 #: The revision an empty database is initialized to.

@@ -24,6 +24,8 @@ from cayu.runtime.budgets import (
     BudgetReservationResult,
     _budget_reservation_amount,
     _clock_or_utc_now,
+    _EffectiveBudgetLimit,
+    _ensure_effective_budget_limit,
     _expired_reservation_reason,
     _is_expired_reservation_reason,
     _reconciled_record,
@@ -33,13 +35,12 @@ from cayu.runtime.budgets import (
     _reservation_result,
     _validate_amount,
     _validate_reservation_ttl,
-    copy_budget_limit,
 )
 
 from . import _sqlite_support as sqlite_support
 from . import migrations as schema
 
-_SQLITE_MIN_REQUIRED_REVISION = 21
+_SQLITE_MIN_REQUIRED_REVISION = 22
 
 
 class SQLiteBudgetLedger(BudgetLedger):
@@ -92,7 +93,10 @@ class SQLiteBudgetLedger(BudgetLedger):
         model: str,
         billing_identity: BillingIdentity | None = None,
     ) -> BudgetReservationResult:
-        limit = copy_budget_limit(limit)
+        limit = _ensure_effective_budget_limit(
+            limit,
+            identity_namespace="app_policy",
+        )
         session_id = require_clean_nonblank(session_id, "session_id")
         agent_name = require_clean_nonblank(agent_name, "agent_name")
         provider_name = require_clean_nonblank(provider_name, "provider_name")
@@ -125,6 +129,7 @@ class SQLiteBudgetLedger(BudgetLedger):
                     )
 
                 record = BudgetReservationRecord(
+                    budget_limit_id=limit.budget_limit_id,
                     scope=limit.scope,
                     key=limit.key,
                     window=limit.window,
@@ -240,15 +245,21 @@ class SQLiteBudgetLedger(BudgetLedger):
         async with self._lock:
             self._connection.close()
 
-    def _used_amount_unlocked(self, limit: BudgetLimit, *, now: datetime) -> Decimal:
+    def _used_amount_unlocked(
+        self,
+        limit: _EffectiveBudgetLimit,
+        *,
+        now: datetime,
+    ) -> Decimal:
         since, until = limit.window.bounds(now=now)
         cutoff = None if since is None else sqlite_support.format_datetime(since)
         upper_cutoff = None if until is None else sqlite_support.format_datetime(until)
-        rows = self._connection.execute(
+        legacy = self._connection.execute(
             """
-            SELECT reserved_amount, actual_amount, status
+            SELECT 1
             FROM cayu_budget_reservations
-            WHERE scope = ?
+            WHERE budget_limit_id IS NULL
+              AND scope = ?
               AND budget_key IS ?
               AND budget_window = ?
               AND currency = ?
@@ -261,12 +272,41 @@ class SQLiteBudgetLedger(BudgetLedger):
                         AND (? IS NULL OR updated_at < ?)
                     )
               )
+            LIMIT 1
             """,
             (
                 limit.scope,
                 limit.key,
                 limit.window.storage_key,
                 limit.currency.upper(),
+                cutoff,
+                cutoff,
+                upper_cutoff,
+                upper_cutoff,
+            ),
+        ).fetchone()
+        if legacy is not None:
+            raise RuntimeError(
+                "Budget ledger contains pre-identity reservations for this limit; "
+                "exact capacity cannot be verified."
+            )
+        rows = self._connection.execute(
+            """
+            SELECT reserved_amount, actual_amount, status
+            FROM cayu_budget_reservations
+            WHERE budget_limit_id = ?
+              AND status IN ('active', 'reconciled')
+              AND (
+                    status = 'active'
+                    OR (
+                        status = 'reconciled'
+                        AND (? IS NULL OR updated_at >= ?)
+                        AND (? IS NULL OR updated_at < ?)
+                    )
+              )
+            """,
+            (
+                limit.budget_limit_id,
                 cutoff,
                 cutoff,
                 upper_cutoff,
@@ -281,7 +321,12 @@ class SQLiteBudgetLedger(BudgetLedger):
                 total += Decimal(row["actual_amount"] or "0")
         return total
 
-    def _reap_expired_unlocked(self, now: datetime, *, limit: BudgetLimit) -> None:
+    def _reap_expired_unlocked(
+        self,
+        now: datetime,
+        *,
+        limit: _EffectiveBudgetLimit,
+    ) -> None:
         if self._reservation_ttl_seconds is None:
             return
         cutoff = now - timedelta(seconds=self._reservation_ttl_seconds)
@@ -296,19 +341,13 @@ class SQLiteBudgetLedger(BudgetLedger):
                 updated_at = ?
             WHERE status = 'active'
               AND updated_at <= ?
-              AND scope = ?
-              AND budget_key IS ?
-              AND budget_window = ?
-              AND currency = ?
+              AND budget_limit_id = ?
             """,
             (
                 _expired_reservation_reason(self._reservation_ttl_seconds),
                 sqlite_support.format_datetime(now),
                 sqlite_support.format_datetime(cutoff),
-                limit.scope,
-                limit.key,
-                limit.window.storage_key,
-                limit.currency.upper(),
+                limit.budget_limit_id,
             ),
         )
 
@@ -319,6 +358,7 @@ class SQLiteBudgetLedger(BudgetLedger):
             """
             INSERT INTO cayu_budget_reservations (
                 reservation_id,
+                budget_limit_id,
                 scope,
                 budget_key,
                 budget_window,
@@ -335,10 +375,11 @@ class SQLiteBudgetLedger(BudgetLedger):
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.reservation_id,
+                record.budget_limit_id,
                 record.scope,
                 record.key,
                 record.window.storage_key,
@@ -392,7 +433,8 @@ class SQLiteBudgetLedger(BudgetLedger):
     def _load_record_unlocked(self, reservation_id: str) -> BudgetReservationRecord:
         row = self._connection.execute(
             """
-            SELECT reservation_id, scope, budget_key, budget_window, currency, session_id,
+            SELECT reservation_id, budget_limit_id, scope, budget_key, budget_window,
+                   currency, session_id,
                    agent_name, provider_name, model, billing_identity_json,
                    reserved_amount, actual_amount,
                    status, reason, created_at, updated_at
@@ -403,8 +445,14 @@ class SQLiteBudgetLedger(BudgetLedger):
         ).fetchone()
         if row is None:
             raise KeyError(f"Budget reservation not found: {reservation_id}")
+        if row["budget_limit_id"] is None:
+            raise RuntimeError(
+                "Budget reservation predates durable budget-limit identity and "
+                "cannot be reconciled safely."
+            )
         return BudgetReservationRecord(
             reservation_id=row["reservation_id"],
+            budget_limit_id=row["budget_limit_id"],
             scope=row["scope"],
             key=row["budget_key"],
             window=row["budget_window"],

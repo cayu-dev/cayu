@@ -40,6 +40,7 @@ from cayu.runtime.aggregates import (
 from cayu.runtime.budgets import (
     InMemoryBudgetStore,
     budget_check_from_events,
+    budget_limits_for_session,
     copy_budget_window,
     copy_request_budget_limits,
     events_for_budget_window,
@@ -925,7 +926,7 @@ def test_durable_normalization_failure_is_not_reinterpreted_from_raw_usage() -> 
     assert decision is None
 
 
-def test_budget_policy_validates_scope_keys_and_duplicates() -> None:
+def test_budget_policy_validates_scope_keys_and_keeps_duplicate_entries_distinct() -> None:
     pricing = PriceBook(
         prices=(
             ModelPrice.fixed(
@@ -1006,21 +1007,34 @@ def test_budget_policy_validates_scope_keys_and_duplicates() -> None:
             max_estimated_cost=Decimal("1"),
             pricing=pricing,
         )
-    with pytest.raises(ValueError, match="duplicate"):
-        BudgetPolicy(
-            limits=(
-                BudgetLimit(
-                    scope="app",
-                    max_estimated_cost=Decimal("1"),
-                    pricing=pricing,
-                ),
-                BudgetLimit(
-                    scope="app",
-                    max_estimated_cost=Decimal("1"),
-                    pricing=pricing,
-                ),
-            )
+    duplicate_policy = BudgetPolicy(
+        limits=(
+            BudgetLimit(
+                scope="app",
+                max_estimated_cost=Decimal("1"),
+                pricing=pricing,
+            ),
+            BudgetLimit(
+                scope="app",
+                max_estimated_cost=Decimal("1"),
+                pricing=pricing,
+            ),
         )
+    )
+    first_resolution = budget_limits_for_session(
+        policy=duplicate_policy,
+        agent_name="assistant",
+        causal_budget_id="job_1",
+    )
+    reconstructed_resolution = budget_limits_for_session(
+        policy=BudgetPolicy.model_validate(duplicate_policy.model_dump(mode="json")),
+        agent_name="assistant",
+        causal_budget_id="job_1",
+    )
+    assert first_resolution[0].budget_limit_id != first_resolution[1].budget_limit_id
+    assert [limit.budget_limit_id for limit in reconstructed_resolution] == [
+        limit.budget_limit_id for limit in first_resolution
+    ]
     with pytest.raises(ValueError, match="request-scoped"):
         BudgetPolicy(
             limits=(
@@ -2132,7 +2146,7 @@ def test_sqlite_budget_ledger_preserves_bedrock_identity_across_reopen(tmp_path)
     assert reconciled.actual_amount == Decimal("9")
 
 
-def test_sqlite_budget_ledger_revision_21_adds_billing_identity_column(tmp_path) -> None:
+def test_sqlite_budget_ledger_revisions_21_and_23_add_identity_columns(tmp_path) -> None:
     path = tmp_path / "bedrock-budget-migration.sqlite"
 
     async def create_current_schema() -> None:
@@ -2142,14 +2156,16 @@ def test_sqlite_budget_ledger_revision_21_adds_billing_identity_column(tmp_path)
     asyncio.run(create_current_schema())
     connection = sqlite3.connect(path)
     try:
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 21")
+        connection.execute("DROP INDEX IF EXISTS idx_cayu_budget_reservations_limit")
+        connection.execute("ALTER TABLE cayu_budget_reservations DROP COLUMN budget_limit_id")
         connection.execute("ALTER TABLE cayu_budget_reservations DROP COLUMN billing_identity_json")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 21")
         connection.execute("PRAGMA user_version = 20")
         connection.commit()
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 21"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 23"):
         SQLiteBudgetLedger(path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
     async def migrate() -> None:
@@ -2162,13 +2178,19 @@ def test_sqlite_budget_ledger_revision_21_adds_billing_identity_column(tmp_path)
         columns = {
             row[1] for row in connection.execute("PRAGMA table_info(cayu_budget_reservations)")
         }
-        revision = connection.execute(
-            "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 21"
-        ).fetchone()
+        revisions = connection.execute(
+            "SELECT revision, kind, compatible_from FROM cayu_schema_migrations "
+            "WHERE revision >= 21 ORDER BY revision"
+        ).fetchall()
     finally:
         connection.close()
     assert "billing_identity_json" in columns
-    assert revision == ("breaking", 21)
+    assert "budget_limit_id" in columns
+    assert revisions == [
+        (21, "breaking", 21),
+        (22, "breaking", 22),
+        (23, "breaking", 23),
+    ]
 
 
 def test_sqlite_budget_ledger_migrates_legacy_unprefixed_table(tmp_path) -> None:
@@ -2212,36 +2234,23 @@ def test_sqlite_budget_ledger_migrates_legacy_unprefixed_table(tmp_path) -> None
         ledger = SQLiteBudgetLedger(path)
         try:
             limit = _reservation_budget_limit(max_cost="0.25")
-            blocked = await ledger.reserve(
-                limit=limit,
-                session_id="sess_1",
-                agent_name="assistant",
-                provider_name="fake",
-                model="fake-model",
-            )
-            reconciled = await ledger.reconcile(
-                reservation_id="bres_legacy",
-                actual_amount=Decimal("0.01"),
-            )
-            accepted = await ledger.reserve(
-                limit=limit,
-                session_id="sess_2",
-                agent_name="assistant",
-                provider_name="fake",
-                model="fake-model",
-            )
-            return blocked, reconciled, accepted
+            with pytest.raises(RuntimeError, match="pre-identity reservations"):
+                await ledger.reserve(
+                    limit=limit,
+                    session_id="sess_1",
+                    agent_name="assistant",
+                    provider_name="fake",
+                    model="fake-model",
+                )
+            with pytest.raises(RuntimeError, match="predates durable budget-limit identity"):
+                await ledger.reconcile(
+                    reservation_id="bres_legacy",
+                    actual_amount=Decimal("0.01"),
+                )
         finally:
             await ledger.close()
 
-    blocked, reconciled, accepted = asyncio.run(run())
-
-    # The migrated legacy reservation still counts against the budget…
-    assert blocked.accepted is False
-    assert blocked.actual == Decimal("0.44")
-    # …and remains reconcilable under its original reservation_id.
-    assert reconciled.released_amount == Decimal("0.21")
-    assert accepted.accepted is True
+    asyncio.run(run())
 
     inspector = sqlite3.connect(path)
     try:
@@ -2249,10 +2258,15 @@ def test_sqlite_budget_ledger_migrates_legacy_unprefixed_table(tmp_path) -> None
             row[0]
             for row in inspector.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
+        migrated = inspector.execute(
+            "SELECT reservation_id, budget_limit_id, status "
+            "FROM cayu_budget_reservations WHERE reservation_id = 'bres_legacy'"
+        ).fetchone()
     finally:
         inspector.close()
     assert "cayu_budget_reservations" in tables
     assert "budget_reservations" not in tables
+    assert migrated == ("bres_legacy", None, "active")
 
 
 def test_in_memory_budget_store_filters_app_and_agent_events() -> None:

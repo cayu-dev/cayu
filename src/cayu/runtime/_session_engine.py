@@ -144,6 +144,7 @@ from cayu.runtime.budgets import (
     BudgetLimit,
     BudgetPolicy,
     BudgetReservationResult,
+    _effective_budget_limit_id,
     budget_check_payload,
     budget_limits_for_session,
     budget_reconciliation_payload,
@@ -882,14 +883,8 @@ def _application_compaction_ledger_event(
 
 def _budget_check_identity(
     check: BudgetCheck,
-) -> tuple[str, str | None, str, str, Decimal]:
-    return (
-        check.scope,
-        check.key,
-        check.window.storage_key,
-        check.action,
-        check.maximum,
-    )
+) -> str:
+    return check.budget_limit_id
 
 
 def _complete_session_operation_checkpoint(
@@ -2818,19 +2813,18 @@ class SessionEngine:
                 )
             )
         )
+        dispatch_settlement_budget_limit_ids = {
+            _effective_budget_limit_id(limit) for limit in dispatch_settlement_budget_limits
+        }
         outer_budget_limits = tuple(
             limit
             for limit in budget_limits
-            if not any(
-                limit is dispatch_limit for dispatch_limit in dispatch_settlement_budget_limits
-            )
+            if _effective_budget_limit_id(limit) not in dispatch_settlement_budget_limit_ids
         )
         outer_app_policy_budget_limits = tuple(
             limit
             for limit in app_policy_budget_limits
-            if not any(
-                limit is dispatch_limit for dispatch_limit in dispatch_settlement_budget_limits
-            )
+            if _effective_budget_limit_id(limit) not in dispatch_settlement_budget_limit_ids
         )
         needs_dispatch_admission = compactor_provider_name is not None and (
             has_run_limits(request.limits) or bool(budget_limits)
@@ -3183,7 +3177,7 @@ class SessionEngine:
         completion_event_attempt_ids: dict[str, str] = {}
         unresolved_attempt_publication_tasks: set[asyncio.Task[Any]] = set()
         unresolved_completion_publication_tasks: set[asyncio.Task[Any]] = set()
-        reached_budget_keys: set[tuple[str, str | None, str, str, Decimal]] = set()
+        reached_budget_keys: set[str] = set()
         budget_reservations: list[BudgetStepReservation] = []
         budget_reservations_settled = False
         try:
@@ -4811,7 +4805,7 @@ class SessionEngine:
         budget_limits: tuple[BudgetLimit, ...],
         app_policy_budget_limits: tuple[BudgetLimit, ...],
         attempt_events: list[Event],
-        reached_budget_keys: set[tuple[str, str | None, str, str, Decimal]],
+        reached_budget_keys: set[str],
         request: CompactSessionRequest,
         operation_id: str,
         attempt_id: str,
@@ -4822,6 +4816,9 @@ class SessionEngine:
         model: str | None,
         billing_identity_state: BillingIdentityState = UNRESOLVED_BILLING_IDENTITY,
     ) -> RuntimeError | None:
+        app_policy_budget_limit_ids = {
+            _effective_budget_limit_id(limit) for limit in app_policy_budget_limits
+        }
         checks = await self._run_limit_controller.evaluate_operation_budgets(
             session=session,
             budget_limits=budget_limits,
@@ -4843,7 +4840,7 @@ class SessionEngine:
                 )
             )
             if (
-                any(budget_limit is limit for limit in app_policy_budget_limits)
+                check.budget_limit_id in app_policy_budget_limit_ids
                 and not deferred_contextual_check
             ):
                 attempt_events.append(

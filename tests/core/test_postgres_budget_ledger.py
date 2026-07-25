@@ -18,11 +18,13 @@ from tests.core._budget_ledger_contract import (
 
 from cayu.runtime import (
     BudgetLimit,
+    BudgetPolicy,
     BudgetReservation,
     BudgetWindow,
     ModelPrice,
     PriceBook,
 )
+from cayu.runtime.budgets import budget_limits_for_session
 
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
 
@@ -211,6 +213,119 @@ def test_postgres_budget_ledger_survives_ledger_restart(postgres_dsn) -> None:
 
     assert blocked.accepted is False
     assert blocked.actual == Decimal("0.44")
+
+
+def test_postgres_budget_ledger_reconstructs_and_partitions_exact_limit_ids(
+    postgres_dsn,
+) -> None:
+    async def runner():
+        await _drop_all(postgres_dsn)
+        configured = _reservation_budget_limit(max_cost="0.25")
+        policy = BudgetPolicy(limits=(configured, configured))
+        first_resolution = budget_limits_for_session(
+            policy=policy,
+            agent_name="assistant",
+            causal_budget_id="job_1",
+        )
+        first_worker = _new_ledger(postgres_dsn)
+        try:
+            first = await _reserve(first_worker, first_resolution[0], "sess_1")
+            parallel = await _reserve(first_worker, first_resolution[1], "sess_1")
+        finally:
+            await first_worker.close()
+
+        reconstructed = budget_limits_for_session(
+            policy=BudgetPolicy.model_validate(policy.model_dump(mode="json")),
+            agent_name="assistant",
+            causal_budget_id="job_1",
+        )
+        changed = budget_limits_for_session(
+            policy=BudgetPolicy(limits=(_reservation_budget_limit(max_cost="0.30"),)),
+            agent_name="assistant",
+            causal_budget_id="job_1",
+        )[0]
+        second_worker = _new_ledger(postgres_dsn)
+        try:
+            repeated = await _reserve(second_worker, reconstructed[0], "sess_2")
+            changed_result = await _reserve(second_worker, changed, "sess_3")
+        finally:
+            await second_worker.close()
+        return first_resolution, reconstructed, first, parallel, repeated, changed_result
+
+    first_resolution, reconstructed, first, parallel, repeated, changed_result = asyncio.run(
+        runner()
+    )
+
+    assert first_resolution[0].budget_limit_id != first_resolution[1].budget_limit_id
+    assert [limit.budget_limit_id for limit in reconstructed] == [
+        limit.budget_limit_id for limit in first_resolution
+    ]
+    assert first.accepted is True
+    assert parallel.accepted is True
+    assert repeated.accepted is False
+    assert changed_result.accepted is True
+
+
+def test_postgres_budget_ledger_does_not_infer_identity_for_existing_rows(
+    postgres_dsn,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        from cayu import PostgresBudgetLedger
+        from cayu.storage.migrations import SchemaMode
+
+        await _drop_all(postgres_dsn)
+        limit = _reservation_budget_limit(max_cost="0.25")
+        creator = _new_ledger(postgres_dsn)
+        try:
+            existing = await _reserve(creator, limit, "sess_legacy")
+            assert existing.record is not None
+            reservation_id = existing.record.reservation_id
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DROP INDEX idx_cayu_budget_reservations_limit")
+                await cur.execute(
+                    "ALTER TABLE cayu_budget_reservations DROP COLUMN budget_limit_id"
+                )
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 22")
+            await conn.commit()
+
+        migrated = PostgresBudgetLedger(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.MIGRATE,
+        )
+        try:
+            with pytest.raises(RuntimeError, match="pre-identity reservations"):
+                await _reserve(migrated, limit, "sess_new")
+            with pytest.raises(
+                RuntimeError,
+                match="predates durable budget-limit identity",
+            ):
+                await migrated.reconcile(
+                    reservation_id=reservation_id,
+                    actual_amount=Decimal("0.01"),
+                )
+        finally:
+            await migrated.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute(
+                "SELECT budget_limit_id, status FROM cayu_budget_reservations "
+                "WHERE reservation_id = %s",
+                (reservation_id,),
+            )
+            assert await cur.fetchone() == (None, "active")
+
+    asyncio.run(runner())
 
 
 def test_postgres_budget_ledger_window_bounds_active_reservations(postgres_dsn) -> None:

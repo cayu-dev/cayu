@@ -22,6 +22,10 @@ from cayu.core import (
 from cayu.runtime import RunRequest, SessionIdentity, SessionStatus
 
 
+def _budget_limit_id(value: int) -> str:
+    return f"blim_{value:064x}"
+
+
 def _write_project(root: Path, database: str = "data/cayu.db") -> Path:
     (root / "pyproject.toml").write_text(
         """
@@ -494,6 +498,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                     start=1,
                 ):
                     reservation_id = f"{session_id}-reservation-{index}"
+                    budget_limit_id = _budget_limit_id(index)
                     await store.append_event(
                         session_id,
                         Event(
@@ -501,6 +506,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                             session_id=session_id,
                             payload={
                                 "reservation_id": reservation_id,
+                                "budget_limit_id": budget_limit_id,
                                 "scope": "session",
                                 "key": session_id,
                                 "window": "lifetime",
@@ -518,6 +524,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                             session_id=session_id,
                             payload={
                                 "reservation_id": reservation_id,
+                                "budget_limit_id": budget_limit_id,
                                 "actual_amount": "0.25",
                                 **(
                                     {"pricing": {"provider_name": "fake", "model": "model"}}
@@ -532,6 +539,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                 ("sess_outstanding_cost", None),
                 ("sess_released_cost", EventType.BUDGET_RESERVATION_RELEASED),
             ):
+                budget_limit_id = _budget_limit_id(1)
                 for index in (1, 2):
                     reservation_id = f"{session_id}-reservation-{index}"
                     await store.append_event(
@@ -541,6 +549,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                             session_id=session_id,
                             payload={
                                 "reservation_id": reservation_id,
+                                "budget_limit_id": budget_limit_id,
                                 "scope": "session",
                                 "key": session_id,
                                 "window": "lifetime",
@@ -559,6 +568,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                                 session_id=session_id,
                                 payload={
                                     "reservation_id": reservation_id,
+                                    "budget_limit_id": budget_limit_id,
                                     "actual_amount": "0.25",
                                     "pricing": {
                                         "provider_name": "fake",
@@ -573,12 +583,16 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                             Event(
                                 type=second_terminal,
                                 session_id=session_id,
-                                payload={"reservation_id": reservation_id},
+                                payload={
+                                    "reservation_id": reservation_id,
+                                    "budget_limit_id": budget_limit_id,
+                                },
                             ),
                         )
 
-            for scope in ("app", "agent"):
+            for index, scope in enumerate(("app", "agent"), start=1):
                 reservation_id = f"sess_parallel_limits-{scope}"
+                budget_limit_id = _budget_limit_id(index)
                 await store.append_event(
                     "sess_parallel_limits",
                     Event(
@@ -586,6 +600,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                         session_id="sess_parallel_limits",
                         payload={
                             "reservation_id": reservation_id,
+                            "budget_limit_id": budget_limit_id,
                             "scope": scope,
                             "key": "runtime" if scope == "app" else "operator",
                             "window": "lifetime",
@@ -603,6 +618,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                         session_id="sess_parallel_limits",
                         payload={
                             "reservation_id": reservation_id,
+                            "budget_limit_id": budget_limit_id,
                             "actual_amount": "0.25",
                             "pricing": {"provider_name": "fake", "model": "model"},
                         },
@@ -616,6 +632,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                     session_id="sess_unpriced_cost",
                     payload={
                         "reservation_id": "sess_unpriced_cost-reservation",
+                        "budget_limit_id": _budget_limit_id(1),
                         "scope": "session",
                         "key": "sess_unpriced_cost",
                         "window": "lifetime",
@@ -633,10 +650,13 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                     session_id="sess_failed_reservation_cost",
                     payload={
                         "accepted": False,
+                        "budget_limit_id": _budget_limit_id(1),
                         "scope": "session",
                         "key": "sess_failed_reservation_cost",
                         "window": "lifetime",
                         "currency": "USD",
+                        "maximum": "1.00",
+                        "action": "interrupt",
                         "requested": "1.00",
                     },
                 ),
@@ -648,6 +668,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                     session_id="sess_unpriced_cost",
                     payload={
                         "reservation_id": "sess_unpriced_cost-reservation",
+                        "budget_limit_id": _budget_limit_id(1),
                         "actual_amount": "0.25",
                     },
                 ),
