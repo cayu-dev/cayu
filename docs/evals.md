@@ -263,8 +263,23 @@ assert all(r.passed for r in results)
 
 `retain_trajectory` defaults to `False`, so a normal run keeps its existing memory profile
 and the trajectory is dropped after the case. The trajectory is **excluded from the saved
-`EvalRun` JSON** — the score-first baseline shape is unchanged; the trajectory is a separate,
-opt-in export.
+`EvalRun` JSON** and remains a separate, opt-in export.
+
+Saved `EvalRun` baselines use schema version `3`. Version 3 stores identity-free aggregate
+usage, preserves counters beyond signed int64 as canonical decimal strings, and applies
+Cayu's durable-JSON contract before an existing output is overwritten and while loading.
+`load_eval_run(...)` rejects missing versions and the prerelease version 1 and 2 formats;
+regenerate those baselines with the current Cayu version.
+
+Standalone exports use a versioned document envelope. The current trajectory
+schema version is `1`; `load_trajectory(...)` rejects files without that version
+or with an unsupported version before validating the trajectory payload. This is an
+intentional clean break from Cayu's earlier unversioned preview exports: they
+are not migrated and must be regenerated. The trajectory schema version is
+independent from `EvalRun.schema_version`. Version 1 applies Cayu's durable-JSON
+contract before writing and while decoding: nonportable text or numbers,
+duplicate object keys, and excessive nesting are rejected before an existing
+export can be overwritten or an imported trajectory can be replayed.
 
 Replay is faithful for the assertions the run captured: event / transcript / usage / output /
 tool assertions always re-check correctly, and a workspace or artifact assertion replays as long

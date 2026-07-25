@@ -29,6 +29,7 @@ from cayu.evals.assertions import (
 from cayu.evals.judges import LLMJudge
 from cayu.evals.models import (
     EVAL_SCHEMA_VERSION,
+    TRAJECTORY_SCHEMA_VERSION,
     WORKSPACE_PROBE_MAX_BYTES,
     EvalAssertionResult,
     EvalCaseResult,
@@ -69,6 +70,7 @@ from cayu.evals.testing import ScriptedModelProvider, scripted_structured_output
 
 __all__ = [
     "EVAL_SCHEMA_VERSION",
+    "TRAJECTORY_SCHEMA_VERSION",
     "WORKSPACE_PROBE_MAX_BYTES",
     "ArtifactCreated",
     "ChildSessionCompleted",

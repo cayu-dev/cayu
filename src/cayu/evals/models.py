@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import (
@@ -25,10 +25,16 @@ from cayu.runtime.sessions import Session
 from cayu.runtime.usage import SessionUsageSummary
 
 # Version of the persisted EvalRun JSON shape. Bump this by hand whenever the
-# saved structure changes incompatibly so load_eval_run can detect a baseline
-# written by a newer cayu instead of silently misreading it. Version 2 adds explicit
-# authored/concrete trial session identity; version 1 remains loadable via model normalization.
-EVAL_SCHEMA_VERSION = 2
+# saved structure changes incompatibly so load_eval_run can reject a baseline
+# written for a different contract instead of silently misreading it. Version 3
+# uses identity-free aggregate usage and enforces Cayu's durable-JSON contract.
+# Versions 1 and 2 were prerelease formats and are intentionally not migrated.
+EVAL_SCHEMA_VERSION = 3
+
+# Version of the standalone trajectory JSON document written by
+# write_trajectory_json. Trajectories were an unversioned preview before v1;
+# load_trajectory intentionally does not guess or migrate those shapes.
+TRAJECTORY_SCHEMA_VERSION = 1
 
 # Cap on the bytes copied out of a probed workspace file into the serialized trajectory. A file
 # larger than this is captured truncated — with its true size and a content hash still recorded —
@@ -167,7 +173,9 @@ class EvalCaseResult(BaseModel):
 class EvalRun(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: StrictInt = Field(default=EVAL_SCHEMA_VERSION, ge=1)
+    # Type checkers require the literal token here rather than the exported
+    # EVAL_SCHEMA_VERSION constant.
+    schema_version: Literal[3] = EVAL_SCHEMA_VERSION
     run_id: str = Field(default_factory=lambda: str(uuid4()))
     suite_id: str
     status: EvalStatus

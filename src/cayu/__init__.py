@@ -114,6 +114,7 @@ from cayu.environments import (
 )
 from cayu.evals import (
     EVAL_SCHEMA_VERSION,
+    TRAJECTORY_SCHEMA_VERSION,
     ArtifactCreated,
     ChildSessionCompleted,
     EvalAssertion,
@@ -771,6 +772,7 @@ __all__ = [
     "TAINT_LABELS_METADATA_KEY",
     "TOOL_POLICY_REAUTHORIZATION_METADATA_KEY",
     "TRACE_LEVEL",
+    "TRAJECTORY_SCHEMA_VERSION",
     "VIRTUAL_EGRESS_RECONNECT_VERSION",
     "AfterToolCallDecision",
     "Agent",

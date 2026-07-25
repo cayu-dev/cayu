@@ -23,6 +23,12 @@ signed-64-bit JSON integers. Every `session usage --jsonl` record declares
 `schema_version="2"`, including model-call, unmatched-ledger, and aggregate
 records.
 
+Persisted `EvalRun` baselines advance from schema version 2 to version 3.
+Version 3 stores identity-free aggregate usage, represents counters above signed
+int64 as canonical decimal strings, and enforces Cayu's durable-JSON contract on
+both export and import. Versions 1 and 2 were prerelease formats and must be
+regenerated rather than being interpreted under the new shape.
+
 ### MCP manifest drift keeps one durable accepted baseline
 
 MCP manifest authorization now keys history by a stable connection identity

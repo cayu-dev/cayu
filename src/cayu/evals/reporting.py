@@ -2,13 +2,41 @@ from __future__ import annotations
 
 import html
 import json
+from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, StrictFloat, field_validator
 
-from cayu._validation import require_clean_nonblank
-from cayu.evals.models import EVAL_SCHEMA_VERSION, EvalRun, EvalStatus, Trajectory
+from cayu._validation import (
+    copy_durable_json_object,
+    durable_json_object_from_pairs,
+    parse_durable_json_integer_literal,
+    reject_nonportable_json_constant,
+    require_clean_nonblank,
+    require_durable_text,
+)
+from cayu.evals.models import (
+    EVAL_SCHEMA_VERSION,
+    TRAJECTORY_SCHEMA_VERSION,
+    EvalRun,
+    EvalStatus,
+    Trajectory,
+)
+from cayu.runtime.usage import aggregate_usage_metrics_from_json_payload
+
+_ModelT = TypeVar("_ModelT", bound=BaseModel)
+
+
+class _TrajectoryDocument(BaseModel):
+    """Versioned persistence envelope for standalone trajectory exports."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    # Type checkers require the literal token here rather than the exported
+    # TRAJECTORY_SCHEMA_VERSION constant.
+    schema_version: Literal[1] = TRAJECTORY_SCHEMA_VERSION
+    trajectory: Trajectory
 
 
 class EvalCaseComparison(BaseModel):
@@ -47,27 +75,81 @@ class EvalRunComparison(BaseModel):
         return require_clean_nonblank(value, info.field_name)
 
 
-def _model_to_json(model: BaseModel, *, indent: int | None) -> str:
-    return json.dumps(model.model_dump(mode="json"), indent=indent, sort_keys=True) + "\n"
+def _validated_durable_model_document(
+    model: _ModelT,
+    *,
+    model_type: type[_ModelT],
+    field_name: str,
+) -> tuple[_ModelT, dict[str, Any]]:
+    """Defensively revalidate one public model before crossing an export boundary."""
+
+    # A caller can forge an instance with model_copy(update=...) or model_construct().
+    # Suppress serializer warnings from that untrusted state; validation below provides
+    # the deterministic typed failure before any durable or external write.
+    validated = model_type.model_validate(model.model_dump(mode="python", warnings=False))
+    document = copy_durable_json_object(validated.model_dump(mode="json"), field_name)
+    return validated, document
+
+
+def _model_to_json(
+    model: _ModelT,
+    *,
+    model_type: type[_ModelT],
+    field_name: str,
+    indent: int | None,
+) -> str:
+    _, document = _validated_durable_model_document(
+        model,
+        model_type=model_type,
+        field_name=field_name,
+    )
+    return json.dumps(document, indent=indent, sort_keys=True) + "\n"
+
+
+def _load_durable_json_document(source: str, *, field_name: str) -> dict[str, Any]:
+    decoded = json.loads(
+        source,
+        parse_int=partial(
+            parse_durable_json_integer_literal,
+            field_name=field_name,
+        ),
+        parse_constant=partial(
+            reject_nonportable_json_constant,
+            field_name=field_name,
+        ),
+        object_pairs_hook=partial(
+            durable_json_object_from_pairs,
+            field_name=field_name,
+        ),
+    )
+    return copy_durable_json_object(decoded, field_name)
 
 
 def eval_run_to_json(run: EvalRun, *, indent: int | None = 2) -> str:
     if type(run) is not EvalRun:
         raise TypeError("eval_run_to_json requires an EvalRun.")
-    return _model_to_json(run, indent=indent)
+    return _model_to_json(
+        run,
+        model_type=EvalRun,
+        field_name="eval run",
+        indent=indent,
+    )
 
 
 def load_eval_run(path: str | Path) -> EvalRun:
-    with Path(path).open("r", encoding="utf-8") as file:
-        data = json.load(file)
-    raw = data.get("schema_version") if isinstance(data, dict) else None
-    if raw is not None and (type(raw) is not int or raw < 1 or raw > EVAL_SCHEMA_VERSION):
+    source = Path(path).read_text(encoding="utf-8")
+    data = _load_durable_json_document(source, field_name="eval run file")
+    if "schema_version" not in data:
+        raise ValueError(
+            "Eval run file has no schema_version and is not supported; "
+            "regenerate it with this cayu version."
+        )
+    raw = data["schema_version"]
+    if type(raw) is not int or raw != EVAL_SCHEMA_VERSION:
         raise ValueError(
             f"Eval run has unsupported schema_version {raw!r}; this cayu supports "
-            f"1..{EVAL_SCHEMA_VERSION}. Upgrade cayu or regenerate the run."
+            f"only {EVAL_SCHEMA_VERSION}. Upgrade cayu or regenerate the run."
         )
-    if raw == 1:
-        data = {**data, "schema_version": EVAL_SCHEMA_VERSION}
     return EvalRun.model_validate(data)
 
 
@@ -78,7 +160,51 @@ def write_eval_run_json(run: EvalRun, path: str | Path) -> None:
 def trajectory_to_json(trajectory: Trajectory, *, indent: int | None = 2) -> str:
     if type(trajectory) is not Trajectory:
         raise TypeError("trajectory_to_json requires a Trajectory.")
-    return _model_to_json(trajectory, indent=indent)
+    validated, _ = _validated_durable_model_document(
+        trajectory,
+        model_type=Trajectory,
+        field_name="trajectory",
+    )
+    document = _TrajectoryDocument(trajectory=validated).model_dump(mode="json")
+    durable_document = copy_durable_json_object(document, "trajectory")
+    return (
+        json.dumps(
+            durable_document,
+            indent=indent,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+
+def _load_trajectory_document(source: str) -> dict[str, Any]:
+    return _load_durable_json_document(source, field_name="trajectory file")
+
+
+def _trajectory_document_python_input(data: dict[str, Any]) -> dict[str, Any]:
+    projected = dict(data)
+    trajectory = projected.get("trajectory")
+    if type(trajectory) is dict:
+        projected["trajectory"] = _trajectory_python_input(trajectory)
+    return projected
+
+
+def _trajectory_python_input(data: dict[str, Any]) -> dict[str, Any]:
+    projected = dict(data)
+    usage_summary = projected.get("usage_summary")
+    if type(usage_summary) is dict:
+        projected_summary = dict(usage_summary)
+        if "usage" in projected_summary:
+            projected_summary["usage"] = aggregate_usage_metrics_from_json_payload(
+                projected_summary["usage"]
+            )
+        projected["usage_summary"] = projected_summary
+    children = projected.get("children")
+    if type(children) is list:
+        projected["children"] = [
+            _trajectory_python_input(child) if type(child) is dict else child for child in children
+        ]
+    return projected
 
 
 def write_trajectory_json(trajectory: Trajectory, path: str | Path) -> None:
@@ -86,17 +212,33 @@ def write_trajectory_json(trajectory: Trajectory, path: str | Path) -> None:
 
 
 def load_trajectory(path: str | Path) -> Trajectory:
-    # The opt-in replay/export object; unlike EvalRun it carries no persisted baseline
-    # schema_version (it is not folded into the score-first baseline in v1).
-    return Trajectory.model_validate_json(Path(path).read_text(encoding="utf-8"))
+    source = Path(path).read_text(encoding="utf-8")
+    data = _load_trajectory_document(source)
+    if "schema_version" not in data:
+        raise ValueError(
+            "Trajectory file has no schema_version and is not supported; "
+            "regenerate it with this cayu version."
+        )
+    raw = data["schema_version"]
+    if type(raw) is not int or raw != TRAJECTORY_SCHEMA_VERSION:
+        raise ValueError(
+            f"Trajectory has unsupported schema_version {raw!r}; this cayu supports "
+            f"only {TRAJECTORY_SCHEMA_VERSION}. Upgrade cayu or regenerate the trajectory."
+        )
+    return _TrajectoryDocument.model_validate(_trajectory_document_python_input(data)).trajectory
 
 
 def render_html_report(run: EvalRun) -> str:
     if type(run) is not EvalRun:
         raise TypeError("render_html_report requires an EvalRun.")
+    run, _ = _validated_durable_model_document(
+        run,
+        model_type=EvalRun,
+        field_name="eval report",
+    )
     rows = "\n".join(_case_row(case) for case in run.cases)
     assertions = "\n".join(_assertion_section(case) for case in run.cases)
-    return f"""<!doctype html>
+    rendered = f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -158,6 +300,7 @@ def render_html_report(run: EvalRun) -> str:
 </body>
 </html>
 """
+    return require_durable_text(rendered, "eval report")
 
 
 def write_html_report(run: EvalRun, path: str | Path) -> None:
@@ -252,6 +395,13 @@ def compare_eval_runs(
 
 
 def render_comparison_html(comparison: EvalRunComparison) -> str:
+    if type(comparison) is not EvalRunComparison:
+        raise TypeError("render_comparison_html requires an EvalRunComparison.")
+    comparison, _ = _validated_durable_model_document(
+        comparison,
+        model_type=EvalRunComparison,
+        field_name="eval comparison",
+    )
     rows = "\n".join(
         "<tr>"
         f"<td>{_escape(case.case_id)}</td>"
@@ -263,7 +413,7 @@ def render_comparison_html(comparison: EvalRunComparison) -> str:
         "</tr>"
         for case in comparison.cases
     )
-    return f"""<!doctype html>
+    rendered = f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -294,10 +444,18 @@ def render_comparison_html(comparison: EvalRunComparison) -> str:
 </body>
 </html>
 """
+    return require_durable_text(rendered, "eval comparison")
 
 
 def comparison_to_json(comparison: EvalRunComparison, *, indent: int | None = 2) -> str:
-    return json.dumps(comparison.model_dump(mode="json"), indent=indent, sort_keys=True) + "\n"
+    if type(comparison) is not EvalRunComparison:
+        raise TypeError("comparison_to_json requires an EvalRunComparison.")
+    return _model_to_json(
+        comparison,
+        model_type=EvalRunComparison,
+        field_name="eval comparison",
+        indent=indent,
+    )
 
 
 def _case_row(case: Any) -> str:

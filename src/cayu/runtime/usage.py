@@ -263,6 +263,36 @@ def aggregate_usage_metrics_payload(metrics: AggregateUsageMetrics) -> dict[str,
     }
 
 
+def aggregate_usage_metrics_from_json_payload(value: object) -> AggregateUsageMetrics:
+    """Parse the canonical string-valued aggregate usage wire representation."""
+
+    copied = copy_durable_json_object(value, "aggregate usage")
+    raw_cache = copied.get("cache")
+    if type(raw_cache) is dict:
+        projected_cache = dict(raw_cache)
+        for key in (
+            "read_tokens",
+            "write_tokens",
+            "write_5m_tokens",
+            "write_1h_tokens",
+            "write_unknown_ttl_tokens",
+            "cached_input_tokens",
+            "uncached_input_tokens",
+        ):
+            if key in projected_cache:
+                projected_cache[key] = _aggregate_count_from_json(projected_cache[key])
+        copied["cache"] = projected_cache
+    for key in (
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "reasoning_output_tokens",
+    ):
+        if key in copied:
+            copied[key] = _aggregate_count_from_json(copied[key])
+    return AggregateUsageMetrics.model_validate(copied)
+
+
 class SessionUsageSummary(BaseModel):
     """Usage totals derived from durable session events."""
 

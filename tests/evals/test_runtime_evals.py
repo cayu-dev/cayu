@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from cayu import (
     EVAL_SCHEMA_VERSION,
+    TRAJECTORY_SCHEMA_VERSION,
     AgentSpec,
     ArtifactCreated,
     CayuApp,
@@ -61,12 +62,16 @@ from cayu import (
     TrajectoryProbes,
     WorkspaceFileContains,
     compare_eval_runs,
+    comparison_to_json,
     eval_run_to_json,
     load_eval_run,
     render_comparison_html,
     render_html_report,
     run_eval_suite,
+    write_eval_run_json,
+    write_html_report,
 )
+from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.artifacts import ArtifactMetadata, ArtifactScope
 from cayu.cli import main
 from cayu.evals import (
@@ -81,6 +86,7 @@ from cayu.evals.runner import _build_child_trajectories
 from cayu.providers import ModelProvider, ModelStreamEvent
 from cayu.runtime import InMemorySessionStore, SessionIdentity
 from cayu.runtime.sessions import Session
+from cayu.runtime.usage import SessionUsageSummary, build_aggregate_usage_metrics
 
 
 def _session(*, session_id: str = "sess_eval", environment_name: str | None = None) -> Session:
@@ -293,6 +299,34 @@ def test_eval_json_html_and_compare(tmp_path):
     assert "Cayu Eval Report" in html
     assert comparison.regressions == ()
     assert "Cayu Eval Comparison" in render_comparison_html(comparison)
+
+
+@pytest.mark.parametrize("invalid_text", ["contains\x00nul", "\ud800"], ids=["nul", "surrogate"])
+def test_write_html_report_rejects_nonportable_text_before_overwrite(
+    tmp_path,
+    invalid_text,
+):
+    now = datetime.now(UTC)
+    run = EvalRun(
+        suite_id="s",
+        status=EvalStatus.ERROR,
+        cases=(
+            EvalCaseResult(
+                case_id="c",
+                status=EvalStatus.ERROR,
+                error=invalid_text,
+                started_at=now,
+                completed_at=now,
+            ),
+        ),
+    )
+    path = tmp_path / "report.html"
+    path.write_text("existing report", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        write_html_report(run, path)
+
+    assert path.read_text(encoding="utf-8") == "existing report"
 
 
 def test_eval_cli_run_and_report(tmp_path, monkeypatch, capsys):
@@ -625,6 +659,46 @@ def test_compare_detects_status_regression():
     assert any("status regressed" in item for item in comparison.regressions)
 
 
+@pytest.mark.parametrize("invalid_text", ["contains\x00nul", "\ud800"], ids=["nul", "surrogate"])
+def test_comparison_exports_reject_nonportable_identity(invalid_text):
+    baseline = _run(
+        EvalStatus.PASSED,
+        1.0,
+        [_case_result("a", EvalStatus.PASSED, 1.0)],
+    ).model_copy(update={"run_id": invalid_text})
+    current = _run(
+        EvalStatus.PASSED,
+        1.0,
+        [_case_result("a", EvalStatus.PASSED, 1.0)],
+    )
+    comparison = compare_eval_runs(baseline, current)
+
+    with pytest.raises(ValueError):
+        comparison_to_json(comparison)
+    with pytest.raises(ValueError):
+        render_comparison_html(comparison)
+
+
+def test_comparison_exports_revalidate_forged_model():
+    run = _run(EvalStatus.PASSED, 1.0, [_case_result("a", EvalStatus.PASSED, 1.0)])
+    comparison = compare_eval_runs(run, run).model_copy(update={"baseline_status": "invalid"})
+
+    with pytest.raises(ValidationError):
+        comparison_to_json(comparison)
+    with pytest.raises(ValidationError):
+        render_comparison_html(comparison)
+
+
+def test_comparison_exports_reject_nonfinite_score():
+    run = _run(EvalStatus.PASSED, 1.0, [_case_result("a", EvalStatus.PASSED, 1.0)])
+    comparison = compare_eval_runs(run, run).model_copy(update={"baseline_score": float("nan")})
+
+    with pytest.raises(ValueError, match="non_finite_number"):
+        comparison_to_json(comparison)
+    with pytest.raises(ValueError, match="non_finite_number"):
+        render_comparison_html(comparison)
+
+
 def test_compare_flags_removed_case_but_not_added_case():
     base = _run(EvalStatus.PASSED, 1.0, [_case_result("a", EvalStatus.PASSED, 1.0)])
     cur = _run(EvalStatus.PASSED, 1.0, [_case_result("b", EvalStatus.PASSED, 1.0)])
@@ -816,29 +890,39 @@ def test_assertion_results_carry_score_and_run_has_schema_version(tmp_path):
 
     output = tmp_path / "run.json"
     output.write_text(eval_run_to_json(result), encoding="utf-8")
-    assert json.loads(output.read_text(encoding="utf-8"))["schema_version"] == 2
+    document = json.loads(output.read_text(encoding="utf-8"))
+    assert EVAL_SCHEMA_VERSION == 3
+    assert document["schema_version"] == EVAL_SCHEMA_VERSION
+    usage = document["cases"][0]["usage_summary"]["usage"]
+    assert set(usage) == {
+        "cache",
+        "input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+        "total_tokens",
+    }
+    assert set(usage["cache"]) == {
+        "cached_input_tokens",
+        "read_tokens",
+        "uncached_input_tokens",
+        "write_1h_tokens",
+        "write_5m_tokens",
+        "write_tokens",
+        "write_unknown_ttl_tokens",
+    }
     assert load_eval_run(output) == result  # round-trips with the new fields
 
 
-def test_load_eval_run_supports_version_one_session_identity_shape(tmp_path):
+@pytest.mark.parametrize("schema_version", [1, 2])
+def test_load_eval_run_rejects_prerelease_schema_versions(tmp_path, schema_version):
     run = _run(EvalStatus.PASSED, 1.0, [_case_result("a", EvalStatus.PASSED, 1.0)])
     data = json.loads(eval_run_to_json(run))
-    data["schema_version"] = 1
-    data["cases"][0]["session_id"] = "legacy-session"
-    data["cases"][0].pop("authored_session_id")
-    data["cases"][0].pop("trial_session_ids")
-    path = tmp_path / "v1.json"
+    data["schema_version"] = schema_version
+    path = tmp_path / f"v{schema_version}.json"
     path.write_text(json.dumps(data), encoding="utf-8")
 
-    loaded = load_eval_run(path)
-
-    assert loaded.schema_version == EVAL_SCHEMA_VERSION
-    assert loaded.cases[0].authored_session_id is None
-    assert loaded.cases[0].trial_session_ids == ("legacy-session",)
-    rewritten = json.loads(eval_run_to_json(loaded))
-    assert rewritten["schema_version"] == EVAL_SCHEMA_VERSION
-    assert rewritten["cases"][0]["authored_session_id"] is None
-    assert rewritten["cases"][0]["trial_session_ids"] == ["legacy-session"]
+    with pytest.raises(ValueError, match="unsupported schema_version"):
+        load_eval_run(path)
 
 
 def test_load_eval_run_rejects_newer_schema_version(tmp_path):
@@ -860,6 +944,130 @@ def test_load_eval_run_rejects_non_int_schema_version(tmp_path):
     path = tmp_path / "bad.json"
     path.write_text(json.dumps(data), encoding="utf-8")
     with pytest.raises(ValueError, match="schema_version"):
+        load_eval_run(path)
+
+
+def test_load_eval_run_rejects_missing_schema_version(tmp_path):
+    run = _run(EvalStatus.PASSED, 1.0, [_case_result("a", EvalStatus.PASSED, 1.0)])
+    data = json.loads(eval_run_to_json(run))
+    data.pop("schema_version")
+    path = tmp_path / "unversioned.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="has no schema_version.*regenerate"):
+        load_eval_run(path)
+
+
+def test_eval_run_durable_json_round_trip(tmp_path):
+    run = EvalRun(
+        suite_id="s",
+        status=EvalStatus.PASSED,
+        metadata={
+            "nested": {
+                "items": [
+                    None,
+                    True,
+                    -3,
+                    1.25,
+                    "ordinary Unicode: \u2603",
+                    MAX_DURABLE_JSON_INTEGER,
+                ]
+            }
+        },
+    )
+    path = tmp_path / "run.json"
+
+    write_eval_run_json(run, path)
+
+    assert load_eval_run(path) == run
+
+
+@pytest.mark.parametrize(
+    "invalid_value",
+    [
+        pytest.param("contains\x00nul", id="nul"),
+        pytest.param("\ud800", id="surrogate"),
+        pytest.param(MAX_DURABLE_JSON_INTEGER + 1, id="oversized-integer"),
+    ],
+)
+def test_write_eval_run_rejects_nonportable_metadata_before_overwrite(
+    tmp_path,
+    invalid_value,
+):
+    path = tmp_path / "run.json"
+    path.write_text("existing eval run", encoding="utf-8")
+    run = EvalRun(
+        suite_id="s",
+        status=EvalStatus.PASSED,
+        metadata={"nested": {"value": invalid_value}},
+    )
+
+    with pytest.raises(ValueError):
+        write_eval_run_json(run, path)
+
+    assert path.read_text(encoding="utf-8") == "existing eval run"
+
+
+def test_write_eval_run_revalidates_forged_model_before_overwrite(tmp_path):
+    path = tmp_path / "run.json"
+    path.write_text("existing eval run", encoding="utf-8")
+    forged = EvalRun(
+        suite_id="s",
+        status=EvalStatus.PASSED,
+    ).model_copy(
+        update={
+            "schema_version": 2,
+            "score": 2.0,
+        }
+    )
+
+    with pytest.raises(ValidationError):
+        write_eval_run_json(forged, path)
+
+    assert path.read_text(encoding="utf-8") == "existing eval run"
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_code"),
+    [
+        (
+            '{"schema_version":3,"schema_version":3,"suite_id":"s","status":"passed"}',
+            "duplicate_json_key",
+        ),
+        (
+            '{"schema_version":3,"suite_id":"s","status":"passed","metadata":{"value":NaN}}',
+            "non_finite_number",
+        ),
+        (
+            (
+                '{"schema_version":3,"suite_id":"s","status":"passed","metadata":{"value":'
+                f"{MAX_DURABLE_JSON_INTEGER + 1}"
+                "}}"
+            ),
+            "integer_out_of_range",
+        ),
+        (
+            (
+                '{"schema_version":3,"suite_id":"s","status":"passed",'
+                '"metadata":{"value":"\\u0000"}}'
+            ),
+            "nul_character",
+        ),
+        (
+            (
+                '{"schema_version":3,"suite_id":"s","status":"passed",'
+                '"metadata":{"value":"\\ud800"}}'
+            ),
+            "unicode_surrogate",
+        ),
+    ],
+    ids=["duplicate-key", "nan", "oversized-integer", "nul", "surrogate"],
+)
+def test_load_eval_run_rejects_nonportable_json(tmp_path, source, expected_code):
+    path = tmp_path / "run.json"
+    path.write_text(source, encoding="utf-8")
+
+    with pytest.raises(ValueError, match=expected_code):
         load_eval_run(path)
 
 
@@ -1075,15 +1283,120 @@ def test_trajectory_json_round_trip(tmp_path):
             ),
         ),
         children=(Trajectory(final_output="child output"),),
+        metadata={
+            "nested": {
+                "items": [None, True, -3, 1.25, "ordinary text"],
+            }
+        },
     )
     path = tmp_path / "trajectory.json"
     write_trajectory_json(trajectory, path)
+    document = json.loads(path.read_text(encoding="utf-8"))
+    assert document["schema_version"] == TRAJECTORY_SCHEMA_VERSION
+    assert set(document) == {"schema_version", "trajectory"}
     restored = load_trajectory(path)
     assert restored.final_output == "root output"
     assert restored.session is not None and restored.session.id == "root"
     assert restored.probes.workspace_files == {"a.txt": b"hello", "missing.txt": None}
     assert restored.probes.artifacts[0].id == "art_1"
     assert restored.children[0].final_output == "child output"
+    assert restored.metadata == trajectory.metadata
+
+
+@pytest.mark.parametrize("invalid_text", ["contains\x00nul", "\ud800"], ids=["nul", "surrogate"])
+def test_write_trajectory_rejects_nonportable_metadata_before_overwrite(
+    tmp_path,
+    invalid_text,
+):
+    path = tmp_path / "trajectory.json"
+    path.write_text("existing trajectory", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        write_trajectory_json(
+            Trajectory(metadata={"nested": {"value": invalid_text}}),
+            path,
+        )
+
+    assert path.read_text(encoding="utf-8") == "existing trajectory"
+
+
+def test_write_trajectory_revalidates_forged_aggregate_before_overwrite(tmp_path):
+    path = tmp_path / "trajectory.json"
+    path.write_text("existing trajectory", encoding="utf-8")
+    forged_usage = build_aggregate_usage_metrics().model_copy(update={"input_tokens": -1})
+    forged_summary = SessionUsageSummary(session_id="s").model_copy(update={"usage": forged_usage})
+    forged = Trajectory().model_copy(update={"usage_summary": forged_summary})
+
+    with pytest.raises(ValidationError):
+        write_trajectory_json(forged, path)
+
+    assert path.read_text(encoding="utf-8") == "existing trajectory"
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_code"),
+    [
+        (
+            '{"schema_version":1,"schema_version":1,"trajectory":{}}',
+            "duplicate_json_key",
+        ),
+        (
+            '{"schema_version":1,"trajectory":{"metadata":{"value":NaN}}}',
+            "non_finite_number",
+        ),
+        (
+            (
+                '{"schema_version":1,"trajectory":{"metadata":{"value":'
+                f"{MAX_DURABLE_JSON_INTEGER + 1}"
+                "}}}"
+            ),
+            "integer_out_of_range",
+        ),
+        (
+            '{"schema_version":1,"trajectory":{"metadata":{"value":"\\u0000"}}}',
+            "nul_character",
+        ),
+        (
+            '{"schema_version":1,"trajectory":{"metadata":{"value":"\\ud800"}}}',
+            "unicode_surrogate",
+        ),
+    ],
+    ids=["duplicate-key", "nan", "oversized-integer", "nul", "surrogate"],
+)
+def test_load_trajectory_rejects_nonportable_json(tmp_path, source, expected_code):
+    path = tmp_path / "trajectory.json"
+    path.write_text(source, encoding="utf-8")
+
+    with pytest.raises(ValueError, match=expected_code):
+        load_trajectory(path)
+
+
+def test_load_trajectory_rejects_unversioned_preview_export(tmp_path):
+    path = tmp_path / "unversioned-trajectory.json"
+    path.write_text(
+        json.dumps(Trajectory(final_output="old").model_dump(mode="json")),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="has no schema_version.*regenerate"):
+        load_trajectory(path)
+
+
+@pytest.mark.parametrize("schema_version", [0, 2, "1", True])
+def test_load_trajectory_rejects_unsupported_schema_version(tmp_path, schema_version):
+    path = tmp_path / "unsupported-trajectory.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": schema_version,
+                "trajectory": Trajectory().model_dump(mode="json"),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unsupported schema_version"):
+        load_trajectory(path)
 
 
 def test_workspace_assertions_read_captured_probes():
