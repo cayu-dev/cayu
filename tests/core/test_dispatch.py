@@ -8,7 +8,7 @@ from typing import NamedTuple
 
 import pytest
 
-from cayu.core import AgentSpec, EventType, Message
+from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
     CayuApp,
@@ -18,6 +18,7 @@ from cayu.runtime import (
     InMemoryTaskStore,
     RunRequest,
     SessionStatus,
+    SessionStatusConflict,
     TaskCreate,
     TaskQuery,
     TaskStatus,
@@ -474,6 +475,145 @@ def test_terminalize_does_not_clobber_a_reclaimed_task() -> None:
         assert reloaded is not None
         assert reloaded.status == TaskStatus.CLAIMED  # not clobbered to COMPLETED
         assert reloaded.worker_id == "worker_b"  # still the reclaimer's
+
+    asyncio.run(scenario())
+
+
+def test_malformed_dispatch_claim_loss_returns_without_clobbering_new_owner() -> None:
+    class ReclaimBeforeMalformedFailureStore(InMemoryTaskStore):
+        async def fail_task(self, task_id, error, *, worker_id=None):
+            if worker_id is not None:
+                await super().release_task(task_id, worker_id)
+                reclaimed = await super().claim_task("worker_b", lease_seconds=300)
+                assert reclaimed is not None
+                assert reclaimed.id == task_id
+            return await super().fail_task(task_id, error, worker_id=worker_id)
+
+    tasks = ReclaimBeforeMalformedFailureStore()
+    dispatcher = TaskStoreDispatcher(tasks)
+
+    class UnusedRuntime:
+        async def dispatch_inline(self, request: DispatchRequest) -> AsyncIterator[Event]:
+            del request
+            if False:
+                yield
+
+    async def scenario():
+        task = await tasks.create_task(
+            TaskCreate(
+                type=_DISPATCH_TASK_TYPE,
+                input={"request": "not-an-object"},
+            )
+        )
+        result = await dispatcher.process_next(UnusedRuntime(), worker_id="worker_a")
+        return result, await tasks.load_task(task.id)
+
+    result, task = asyncio.run(scenario())
+
+    assert result is None
+    assert task is not None
+    assert task.status is TaskStatus.CLAIMED
+    assert task.worker_id == "worker_b"
+
+
+def test_conflict_requeue_returns_reclaimed_handle_when_control_plane_wins() -> None:
+    tasks = InMemoryTaskStore()
+    dispatcher = TaskStoreDispatcher(tasks)
+    request = _dispatch_request("sess_conflict_claim_lost", "d_conflict_claim_lost")
+
+    async def scenario():
+        class SubmitRuntime:
+            async def dispatch_inline(
+                self,
+                request: DispatchRequest,
+            ) -> AsyncIterator[Event]:
+                del request
+                if False:
+                    yield
+
+        submitted = await dispatcher.submit(SubmitRuntime(), request)
+        task_id = submitted.metadata["queue_task_id"]
+
+        class TerminalizingConflictRuntime:
+            async def dispatch_inline(
+                self,
+                request: DispatchRequest,
+            ) -> AsyncIterator[Event]:
+                del request
+                await tasks.complete_task(task_id, {"winner": "control-plane"})
+                if False:
+                    yield
+                raise SessionStatusConflict("session already running")
+
+        result = await dispatcher.process_next(
+            TerminalizingConflictRuntime(),
+            worker_id="worker_a",
+        )
+        return result, await tasks.load_task(task_id)
+
+    result, task = asyncio.run(scenario())
+
+    assert result is not None
+    assert result.status is DispatchStatus.SUBMITTED
+    assert result.metadata["reclaimed"] is True
+    assert result.metadata.get("requeued") is None
+    assert task is not None
+    assert task.status is TaskStatus.COMPLETED
+    assert task.result == {"winner": "control-plane"}
+
+
+@pytest.mark.parametrize(
+    ("rejected_text", "error_code"),
+    [
+        ("provider failure\u0000with invalid text", "nul_character"),
+        ("provider failure\ud800with invalid text", "unicode_surrogate"),
+    ],
+)
+def test_dispatch_failure_with_nonportable_text_is_terminal_and_not_reclaimed(
+    rejected_text: str,
+    error_code: str,
+) -> None:
+    tasks = InMemoryTaskStore()
+    dispatcher = TaskStoreDispatcher(tasks)
+
+    class FailingRuntime:
+        async def dispatch_inline(self, request: DispatchRequest) -> AsyncIterator[Event]:
+            del request
+            if False:
+                yield
+            raise RuntimeError(rejected_text)
+
+    async def scenario():
+        submitted = await dispatcher.submit(
+            FailingRuntime(),
+            _dispatch_request("sess_nonportable_failure", "d_nonportable_failure"),
+        )
+        result = await dispatcher.process_next(FailingRuntime(), worker_id="worker_a")
+        task_id = submitted.metadata["queue_task_id"]
+        task = await tasks.load_task(task_id)
+        reclaimed = await tasks.reclaim_expired(query=TaskQuery(type=_DISPATCH_TASK_TYPE))
+        second_claim = await tasks.claim_task(
+            "worker_b",
+            TaskQuery(type=_DISPATCH_TASK_TYPE),
+            lease_seconds=300,
+        )
+        return result, task, reclaimed, second_claim
+
+    result, task, reclaimed, second_claim = asyncio.run(scenario())
+
+    assert result is not None
+    assert result.status is DispatchStatus.FAILED
+    assert result.metadata.get("reclaimed") is None
+    assert task is not None
+    assert task.status is TaskStatus.FAILED
+    assert task.error == {
+        "error": "Dispatch failed with a non-portable diagnostic.",
+        "error_type": "RuntimeError",
+        "durable_value_error_code": error_code,
+        "durable_value_error_path": "$",
+    }
+    assert reclaimed == []
+    assert second_claim is None
 
 
 def test_concurrent_workers_claim_distinct_dispatch_tasks(postgres_dsn: str) -> None:

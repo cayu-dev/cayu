@@ -5,10 +5,12 @@ from collections.abc import Callable
 
 import pytest
 from pydantic import ValidationError
+from tests.core.task_store_conformance import assert_task_claim_lost_conformance
 
 from cayu import (
     InMemoryTaskStore,
     SQLiteTaskStore,
+    TaskClaimLost,
     TaskCreate,
     TaskOrder,
     TaskQuery,
@@ -22,6 +24,19 @@ from cayu._validation import (
 )
 
 StoreFactory = Callable[[object], TaskStore]
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_task_stores_task_claim_lost_conformance(store_factory: StoreFactory, tmp_path):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        try:
+            await assert_task_claim_lost_conformance(store)
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run_store_operations())
 
 
 @pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
@@ -563,7 +578,7 @@ def test_task_stores_reject_expired_claim_handoff(store_factory: StoreFactory, t
         await asyncio.sleep(1.05)
         with pytest.raises(ValueError, match="cannot transition to running from claimed"):
             await store.start_task("task_expired_handoff", session_id="sess_expired")
-        with pytest.raises(ValueError, match="lease for worker worker_a has expired"):
+        with pytest.raises(TaskClaimLost, match="lease for worker worker_a has expired"):
             await store.heartbeat("task_expired_handoff", "worker_a")
 
         await _close_store(store)
@@ -695,7 +710,7 @@ def test_task_stores_reject_invalid_attached_worker_release(
         await asyncio.sleep(1.05)
         expired_before = await store.load_task("task_expired_worker")
         assert expired_before is not None
-        with pytest.raises(ValueError, match="lease for worker worker_a has expired"):
+        with pytest.raises(TaskClaimLost, match="lease for worker worker_a has expired"):
             await store.release_attached_task_worker("task_expired_worker", "worker_a")
 
         await store.create_task(TaskCreate(task_id="task_terminal", type="review"))

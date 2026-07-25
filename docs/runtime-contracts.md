@@ -1011,6 +1011,21 @@ session detach, or scheduler state.
 
 Claim queries intentionally do not support `q`, `session_id`, `limit`, or `offset`. Queue claims always pick one unattached pending task; tasks already linked to a session are no longer free queue work. `reclaim_expired(...)` also ignores attached tasks, even if their lease timestamp has passed, because the associated session may still be running or recoverable through session recovery. Once a claimed task is attached to a session, runtime completion/failure owns the task terminal update; the app should observe the session/task events instead of releasing that task back to the queue.
 
+Worker-guarded mutations raise `TaskClaimLost` when the supplied worker no
+longer owns the task or its lease is absent or expired. This applies consistently
+to the in-memory, SQLite, and PostgreSQL stores. Custom `TaskStore`
+implementations must raise the same public exception for these ownership and
+lease failures so dispatchers and worker loops can distinguish a safe handoff
+from an ordinary lifecycle or validation error. `TaskClaimLost` remains a
+`ValueError` subclass for callers that intentionally handle the broader error
+category. After an atomic worker-guarded mutation misses, stores classify
+ownership and lease loss before lifecycle shape: a stale worker receives
+`TaskClaimLost` even if another worker has attached the task or another
+controller has since reclaimed or terminalized it. Once the supplied worker is
+proven to own a live lease, structurally invalid operations—such as attaching
+an already attached task or releasing it back to the fresh-work queue—remain
+ordinary `ValueError` failures.
+
 Held tasks are not reclaimed by lease cleanup. If a worker claims a task and discovers a dependency or human-review requirement before attaching a session, it should call `block_task(...)`, `pause_task(...)`, or `mark_task_needs_attention(...)`; these clear worker ownership and lease state. Later, app/operator code can call `resume_task(...)` to return the task to the pending queue.
 
 The server exposes the same lifecycle for operator/backend integrations through `POST /api/tasks/{task_id}/pause`, `POST /api/tasks/{task_id}/block`, `POST /api/tasks/{task_id}/needs-attention`, and `POST /api/tasks/{task_id}/resume`. Hold endpoints accept optional `reason` and `payload` fields. `GET /api/tasks` stays a compact list view and does not include task input/result/error/metadata; it supports text search with `q`, filtering by status, type, session, parent task, assigned agent, offset/limit pagination, and `order_by` (`updated_at_desc` by default). Use `GET /api/tasks/{task_id}` to fetch full task detail, including input/result/error/metadata, for a selected task. Lifecycle mutation responses also return the full task detail for the task that was changed.

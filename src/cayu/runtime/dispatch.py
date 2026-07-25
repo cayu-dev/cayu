@@ -21,6 +21,7 @@ from cayu._validation import (
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, detach_message
 from cayu.core.thinking import ThinkingConfig
+from cayu.runtime._diagnostics import exception_diagnostic
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
@@ -31,7 +32,7 @@ from cayu.runtime.sessions import (
 )
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.runtime.structured_output import StructuredOutputSpec, copy_structured_output_spec
-from cayu.runtime.tasks import TaskCreate, TaskOrder, TaskQuery, TaskStore
+from cayu.runtime.tasks import TaskClaimLost, TaskCreate, TaskOrder, TaskQuery, TaskStore
 
 logger = logging.getLogger(__name__)
 
@@ -294,14 +295,24 @@ class TaskStoreDispatcher(Dispatcher):
                 raise ValueError("dispatch task request payload is not an object")
             request = DispatchRequest.model_validate(payload)
         except Exception as exc:
-            await self._tasks.fail_task(
-                task.id,
-                {
-                    "error": f"invalid dispatch request payload: {exc}",
-                    "error_type": type(exc).__name__,
-                },
-                worker_id=worker_id,
+            diagnostic = exception_diagnostic(
+                exc,
+                empty_message="invalid dispatch request",
+                nonportable_message=(
+                    "Invalid dispatch request contained a non-portable diagnostic."
+                ),
             )
+            try:
+                await self._tasks.fail_task(
+                    task.id,
+                    diagnostic.payload_fields(),
+                    worker_id=worker_id,
+                )
+            except TaskClaimLost:
+                logger.warning(
+                    "dispatch task %s lost its lease while rejecting a malformed request",
+                    task.id,
+                )
             return None
 
         # Heartbeat in the background so the lease survives long gaps between events (a slow
@@ -323,7 +334,20 @@ class TaskStoreDispatcher(Dispatcher):
                 # forever and every re-claim of the reclaimed task would conflict in a
                 # loop; recover a stalled session so the requeued dispatch can proceed.
                 recovered = await self._recover_stalled_session(runtime, request)
-                await self._tasks.release_task(task.id, worker_id)
+                try:
+                    await self._tasks.release_task(task.id, worker_id)
+                except TaskClaimLost:
+                    logger.warning(
+                        "dispatch %s lost its lease before conflict requeue",
+                        request.dispatch_id,
+                    )
+                    return self._handle(
+                        request,
+                        DispatchStatus.SUBMITTED,
+                        queue_task_id=task.id,
+                        reclaimed=True,
+                        recovered_session=recovered,
+                    )
                 return self._handle(
                     request,
                     DispatchStatus.SUBMITTED,
@@ -332,12 +356,17 @@ class TaskStoreDispatcher(Dispatcher):
                     recovered_session=recovered,
                 )
             except Exception as exc:
+                diagnostic = exception_diagnostic(
+                    exc,
+                    empty_message="dispatch failed",
+                    nonportable_message="Dispatch failed with a non-portable diagnostic.",
+                )
                 return await self._terminalize(
                     task.id,
                     worker_id,
                     request,
                     DispatchStatus.FAILED,
-                    {"error": str(exc), "error_type": type(exc).__name__},
+                    diagnostic.payload_fields(),
                 )
             # A run can fail in-band (a SESSION_FAILED event, not an exception); record that as
             # a failed task so failure queries and retries see it, not a COMPLETED one.
@@ -363,9 +392,9 @@ class TaskStoreDispatcher(Dispatcher):
                 await self._tasks.fail_task(task_id, payload, worker_id=worker_id)
             else:
                 await self._tasks.complete_task(task_id, payload, worker_id=worker_id)
-        except ValueError:
-            # Only the ownership/lease guard can raise ValueError here; it means the task is no
-            # longer ours (reclaimed / already terminalized elsewhere), so we must not clobber.
+        except TaskClaimLost:
+            # The task is no longer ours (reclaimed / already terminalized elsewhere),
+            # so do not clobber its current owner.
             logger.warning(
                 "dispatch %s (%s) lost its lease before terminalizing; another worker will re-run it",
                 request.dispatch_id,

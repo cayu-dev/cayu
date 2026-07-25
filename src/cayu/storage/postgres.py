@@ -179,7 +179,8 @@ from cayu.runtime.tasks import (
     _ensure_can_resume_task,
     _ensure_can_transition,
     _ensure_claim_query_supported,
-    _ensure_not_terminal,
+    _ensure_owned_active_task_lease,
+    _raise_task_claim_attach_error,
     _running_task_from_create,
     _task_from_create,
     copy_task_aggregate_filter,
@@ -8129,14 +8130,8 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         worker_id: str,
     ) -> None:
         task = await self._require_task(cur, task_id)
-        if task.status not in {TaskStatus.CLAIMED, TaskStatus.RUNNING}:
-            raise ValueError(f"Task {task.id} is not claimed or running.")
-        now = datetime.now(UTC)
-        if task.lease_expires_at is None:
-            raise ValueError(f"Task {task.id} has no active lease.")
-        if task.lease_expires_at <= now:
-            raise ValueError(f"Task {task.id} lease for worker {worker_id} has expired.")
-        raise ValueError(f"Worker {worker_id} does not own task {task.id}.")
+        _ensure_owned_active_task_lease(task, worker_id)
+        raise RuntimeError(f"Task {task.id} active-lease mutation did not update a row.")
 
     async def _raise_task_release_error(
         self,
@@ -8145,11 +8140,12 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         worker_id: str,
     ) -> None:
         task = await self._require_task(cur, task_id)
+        _ensure_owned_active_task_lease(task, worker_id)
         if task.session_id is not None:
             raise ValueError(f"Task {task.id} is already attached to session {task.session_id}.")
         if task.status is not TaskStatus.CLAIMED:
             raise ValueError(f"Task {task.id} is not claimed.")
-        await self._raise_task_active_lease_error(cur, task_id, worker_id)
+        raise RuntimeError(f"Task {task.id} active claim could not be released.")
 
     async def _raise_attached_task_worker_release_error(
         self,
@@ -8158,11 +8154,12 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         worker_id: str,
     ) -> None:
         task = await self._require_task(cur, task_id)
+        _ensure_owned_active_task_lease(task, worker_id)
         if task.status is not TaskStatus.RUNNING:
             raise ValueError(f"Task {task.id} is not running.")
         if task.session_id is None:
             raise ValueError(f"Task {task.id} is not attached to a session.")
-        await self._raise_task_active_lease_error(cur, task_id, worker_id)
+        raise RuntimeError(f"Task {task.id} active attached claim could not be released.")
 
     async def _raise_task_claim_attach_error(
         self,
@@ -8171,20 +8168,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         worker_id: str,
     ) -> None:
         task = await self._require_task(cur, task_id)
-        if task.status is TaskStatus.RUNNING:
-            if task.session_id is not None:
-                raise ValueError(
-                    f"Task {task.id} is already attached to session {task.session_id}."
-                )
-            raise ValueError(f"Task {task.id} is already running.")
-        if task.status is not TaskStatus.CLAIMED:
-            _ensure_not_terminal(task)
-            raise ValueError(f"Task {task.id} is not claimed by worker {worker_id}.")
-        if task.session_id is not None:
-            raise ValueError(f"Task {task.id} is already attached to session {task.session_id}.")
-        if task.worker_id != worker_id:
-            raise ValueError(f"Worker {worker_id} does not own task {task.id}.")
-        await self._raise_task_active_lease_error(cur, task_id, worker_id)
+        _raise_task_claim_attach_error(task, worker_id)
 
 
 def _new_id() -> str:

@@ -35,6 +35,10 @@ class TaskStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class TaskClaimLost(ValueError):
+    """A worker no longer owns the active lease required for a task mutation."""
+
+
 class TaskOrder(StrEnum):
     CREATED_AT_ASC = "created_at_asc"
     CREATED_AT_DESC = "created_at_desc"
@@ -301,7 +305,10 @@ class TaskStore(ABC):
         session_id: str,
         worker_id: str,
     ) -> Task:
-        """Attach a live worker-claimed task to a session and mark it running."""
+        """Attach a live worker-claimed task to a session and mark it running.
+
+        Raise ``TaskClaimLost`` if ``worker_id`` no longer owns a live claim.
+        """
 
     @abstractmethod
     async def complete_task(
@@ -309,9 +316,9 @@ class TaskStore(ABC):
     ) -> Task:
         """Mark a pending or running task as completed.
 
-        If ``worker_id`` is given, the update fails unless that worker still owns an active
-        lease on the task, so a worker that lost its lease cannot clobber a task another
-        worker has since reclaimed.
+        If ``worker_id`` is given, the update raises ``TaskClaimLost`` unless that
+        worker still owns an active lease on the task, so a worker that lost its
+        lease cannot clobber a task another worker has since reclaimed.
         """
 
     @abstractmethod
@@ -320,8 +327,8 @@ class TaskStore(ABC):
     ) -> Task:
         """Mark a pending or running task as failed.
 
-        If ``worker_id`` is given, the update fails unless that worker still owns an active
-        lease on the task.
+        If ``worker_id`` is given, the update raises ``TaskClaimLost`` unless that
+        worker still owns an active lease on the task.
         """
 
     @abstractmethod
@@ -384,15 +391,24 @@ class TaskStore(ABC):
         *,
         extend_seconds: int = 300,
     ) -> Task:
-        """Extend the active lease for a claimed or running task owned by ``worker_id``."""
+        """Extend a worker-owned active lease.
+
+        Raise ``TaskClaimLost`` if ``worker_id`` no longer owns a live claim.
+        """
 
     @abstractmethod
     async def release_task(self, task_id: str, worker_id: str) -> Task:
-        """Release a claimed task back to pending and clear worker ownership."""
+        """Release a claimed task back to pending and clear worker ownership.
+
+        Raise ``TaskClaimLost`` if ``worker_id`` no longer owns a live claim.
+        """
 
     @abstractmethod
     async def release_attached_task_worker(self, task_id: str, worker_id: str) -> Task:
-        """Release worker ownership while preserving a running task's session link."""
+        """Release worker ownership while preserving a running task's session link.
+
+        Raise ``TaskClaimLost`` if ``worker_id`` no longer owns a live claim.
+        """
 
     @abstractmethod
     async def reclaim_expired(
@@ -771,10 +787,7 @@ class InMemoryTaskStore(TaskStore):
 
     def _require_owned_leased_task(self, task_id: str, worker_id: str) -> Task:
         task = self._require_task(task_id)
-        if task.status not in {TaskStatus.CLAIMED, TaskStatus.RUNNING}:
-            raise ValueError(f"Task {task.id} is not claimed or running.")
-        if task.worker_id != worker_id:
-            raise ValueError(f"Worker {worker_id} does not own task {task.id}.")
+        _ensure_owned_active_task_lease(task, worker_id)
         return task
 
     def _finish_task(
@@ -789,7 +802,7 @@ class InMemoryTaskStore(TaskStore):
         task = self._require_task(task_id)
         if worker_id is not None:
             if task.worker_id != worker_id:
-                raise ValueError(f"Worker {worker_id} does not own task {task.id}.")
+                raise TaskClaimLost(f"Worker {worker_id} does not own task {task.id}.")
             _ensure_active_task_lease(task, worker_id)
         _ensure_can_transition(task, status)
         now = datetime.now(UTC)
@@ -1010,9 +1023,24 @@ def _can_attach_claimed_task(
 def _ensure_active_task_lease(task: Task, worker_id: str, *, now: datetime | None = None) -> None:
     now = datetime.now(UTC) if now is None else now
     if task.lease_expires_at is None:
-        raise ValueError(f"Task {task.id} has no active lease.")
+        raise TaskClaimLost(f"Task {task.id} has no active lease.")
     if task.lease_expires_at <= now:
-        raise ValueError(f"Task {task.id} lease for worker {worker_id} has expired.")
+        raise TaskClaimLost(f"Task {task.id} lease for worker {worker_id} has expired.")
+
+
+def _ensure_owned_active_task_lease(
+    task: Task,
+    worker_id: str,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Require the supplied worker to own the task's current live lease."""
+
+    if task.status not in {TaskStatus.CLAIMED, TaskStatus.RUNNING}:
+        raise TaskClaimLost(f"Task {task.id} is not claimed or running.")
+    if task.worker_id != worker_id:
+        raise TaskClaimLost(f"Worker {worker_id} does not own task {task.id}.")
+    _ensure_active_task_lease(task, worker_id, now=now)
 
 
 def _raise_task_claim_attach_error(
@@ -1021,19 +1049,16 @@ def _raise_task_claim_attach_error(
     *,
     now: datetime | None = None,
 ) -> None:
+    if task.status not in {TaskStatus.CLAIMED, TaskStatus.RUNNING}:
+        raise TaskClaimLost(f"Task {task.id} is not claimed by worker {worker_id}.")
+    _ensure_owned_active_task_lease(task, worker_id, now=now)
     if task.status is TaskStatus.RUNNING:
         if task.session_id is not None:
             raise ValueError(f"Task {task.id} is already attached to session {task.session_id}.")
         raise ValueError(f"Task {task.id} is already running.")
-    if task.status is TaskStatus.CLAIMED:
-        if task.session_id is not None:
-            raise ValueError(f"Task {task.id} is already attached to session {task.session_id}.")
-        if task.worker_id != worker_id:
-            raise ValueError(f"Worker {worker_id} does not own task {task.id}.")
-        _ensure_active_task_lease(task, worker_id, now=now)
-        raise ValueError(f"Task {task.id} is already claimed.")
-    _ensure_not_terminal(task)
-    raise ValueError(f"Task {task.id} is not claimed by worker {worker_id}.")
+    if task.session_id is not None:
+        raise ValueError(f"Task {task.id} is already attached to session {task.session_id}.")
+    raise RuntimeError(f"Task {task.id} active claim could not be attached.")
 
 
 def _task_matches(task: Task, query: TaskQuery) -> bool:

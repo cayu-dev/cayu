@@ -187,6 +187,59 @@ def test_run_task_worker_fails_task_when_handler_leaves_it_active(tmp_path: Path
     }
 
 
+@pytest.mark.parametrize(
+    ("rejected_text", "error_code"),
+    [
+        ("handler failure\u0000with invalid text", "nul_character"),
+        ("handler failure\ud800with invalid text", "unicode_surrogate"),
+    ],
+)
+def test_run_task_worker_terminalizes_nonportable_handler_failures(
+    tmp_path: Path,
+    rejected_text: str,
+    error_code: str,
+) -> None:
+    app, store = _build(tmp_path)
+
+    async def fail_handler(_app: CayuApp, _task: Task, _worker_id: str) -> None:
+        raise RuntimeError(rejected_text)
+
+    async def scenario():
+        created = await store.create_task(TaskCreate(type="job"))
+        handled = await run_task_worker(
+            app,
+            store,
+            fail_handler,
+            worker_id="w1",
+            query=TaskQuery(type="job"),
+            max_tasks=1,
+            poll_interval_s=0.05,
+            reclaim=False,
+        )
+        task = await store.load_task(created.id)
+        reclaimed = await store.reclaim_expired(query=TaskQuery(type="job"))
+        second_claim = await store.claim_task(
+            "w2",
+            TaskQuery(type="job"),
+            lease_seconds=300,
+        )
+        return handled, task, reclaimed, second_claim
+
+    handled, task, reclaimed, second_claim = asyncio.run(scenario())
+
+    assert handled == 1
+    assert task is not None
+    assert task.status == "failed"
+    assert task.error == {
+        "error": "RuntimeError",
+        "message": "Task handler failed with a non-portable diagnostic.",
+        "durable_value_error_code": error_code,
+        "durable_value_error_path": "$",
+    }
+    assert reclaimed == []
+    assert second_claim is None
+
+
 def test_run_task_worker_hands_interrupted_session_to_reconstructed_control_plane(
     tmp_path: Path,
 ) -> None:

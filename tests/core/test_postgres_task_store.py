@@ -10,8 +10,9 @@ import asyncio
 
 import pytest
 from pydantic import ValidationError
+from tests.core.task_store_conformance import assert_task_claim_lost_conformance
 
-from cayu import TaskCreate, TaskOrder, TaskQuery, TaskStatus
+from cayu import TaskClaimLost, TaskCreate, TaskOrder, TaskQuery, TaskStatus
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     DurableValueError,
@@ -63,6 +64,13 @@ def _run(dsn: str, coro_factory) -> object:
             await store.close()
 
     return asyncio.run(runner())
+
+
+def test_postgres_task_store_task_claim_lost_conformance(postgres_dsn):
+    async def ops(store):
+        await assert_task_claim_lost_conformance(store)
+
+    _run(postgres_dsn, ops)
 
 
 def test_postgres_task_store_create_load_and_copy_boundary(postgres_dsn):
@@ -528,7 +536,7 @@ def test_postgres_task_store_rejects_expired_claim_handoff(postgres_dsn):
         await asyncio.sleep(1.05)
         with pytest.raises(ValueError, match="cannot transition to running from claimed"):
             await store.start_task("task_expired_handoff", session_id="sess_expired")
-        with pytest.raises(ValueError, match="lease for worker worker_a has expired"):
+        with pytest.raises(TaskClaimLost, match="lease for worker worker_a has expired"):
             await store.heartbeat("task_expired_handoff", "worker_a")
 
     _run(postgres_dsn, ops)
@@ -629,7 +637,7 @@ def test_postgres_task_store_rejects_invalid_attached_worker_release(postgres_ds
         await asyncio.sleep(1.05)
         expired_before = await store.load_task("task_expired_worker")
         assert expired_before is not None
-        with pytest.raises(ValueError, match="lease for worker worker_a has expired"):
+        with pytest.raises(TaskClaimLost, match="lease for worker worker_a has expired"):
             await store.release_attached_task_worker("task_expired_worker", "worker_a")
 
         await store.create_task(TaskCreate(task_id="task_terminal", type="review"))

@@ -20,13 +20,13 @@ and keeps going -- one bad task does not kill it.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from collections.abc import Awaitable, Callable
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+from cayu.runtime._diagnostics import exception_diagnostic
 from cayu.runtime.sessions import SessionStatus
-from cayu.runtime.tasks import Task, TaskQuery, TaskStatus, TaskStore
+from cayu.runtime.tasks import Task, TaskClaimLost, TaskQuery, TaskStatus, TaskStore
 
 if TYPE_CHECKING:
     from cayu.runtime.app import CayuApp
@@ -198,14 +198,38 @@ async def _heartbeat_until(
 
 
 async def _safe_fail(task_store: TaskStore, task_id: str, worker_id: str, exc: Exception) -> None:
-    # Task may already be terminal (e.g. the handler completed it); if the fail
-    # is rejected, leave the task for lease reclaim.
-    with contextlib.suppress(Exception):
+    diagnostic = exception_diagnostic(
+        exc,
+        empty_message="task handler failed",
+        nonportable_message="Task handler failed with a non-portable diagnostic.",
+    )
+    payload: dict[str, Any] = {
+        "error": diagnostic.error_type,
+        "message": diagnostic.message,
+    }
+    if diagnostic.durable_value_error_code is not None:
+        payload["durable_value_error_code"] = diagnostic.durable_value_error_code
+        payload["durable_value_error_path"] = diagnostic.durable_value_error_path
+    try:
         await task_store.fail_task(
             task_id,
-            {"error": type(exc).__name__, "message": str(exc)[:500]},
+            payload,
             worker_id=worker_id,
         )
+    except TaskClaimLost:
+        return
+    except ValueError:
+        # A handler can terminalize its task and then raise. Preserve that
+        # authoritative terminal outcome, but never hide validation failures
+        # for a task that is still live.
+        task = await task_store.load_task(task_id)
+        if task is not None and task.status in {
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        }:
+            return
+        raise
 
 
 async def _safe_fail_unfinished(task_store: TaskStore, task_id: str, worker_id: str) -> None:
