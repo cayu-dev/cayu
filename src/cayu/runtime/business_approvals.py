@@ -50,6 +50,7 @@ from cayu.runtime.approvals import (
     ToolApprovalRequest,
 )
 from cayu.runtime.budgets import BudgetLimit
+from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.stop_policy import RunLimits
@@ -444,6 +445,11 @@ def business_approval_audit(events: Iterable[Event]) -> list[BusinessApprovalRec
     """
     materialized = list(events)
     records: dict[tuple[str, str], dict[str, Any]] = {}
+    pending_by_key: dict[tuple[str, str], PendingToolApproval] = {}
+    identities: dict[tuple[str, str], ToolRoundIdentity] = {}
+    contradictory_request_keys: set[tuple[str, str]] = set()
+    resolution_descriptors: dict[tuple[str, str], dict[str, Any]] = {}
+    contradictory_resolution_keys: set[tuple[str, str]] = set()
     for event in materialized:
         if event.type != EventType.TOOL_CALL_APPROVAL_REQUESTED:
             continue
@@ -456,7 +462,21 @@ def business_approval_audit(events: Iterable[Event]) -> list[BusinessApprovalRec
             routing = business_approval_routing(pending)
         except BusinessApprovalRoutingMissing:
             routing = None
-        records[(event.session_id, pending.approval_id)] = {
+        record_key = (event.session_id, pending.approval_id)
+        previous_pending = pending_by_key.setdefault(record_key, pending)
+        if previous_pending != pending:
+            contradictory_request_keys.add(record_key)
+            records.pop(record_key, None)
+            identities.pop(record_key, None)
+            continue
+        if record_key in contradictory_request_keys:
+            continue
+        identities[record_key] = ToolRoundIdentity(
+            model_step_id=pending.model_step_id,
+            model_attempt_id=pending.model_attempt_id,
+            tool_round_id=pending.tool_round_id,
+        )
+        records[record_key] = {
             "approval_id": pending.approval_id,
             "session_id": event.session_id,
             "tool_call_id": pending.tool_call_id,
@@ -482,9 +502,29 @@ def business_approval_audit(events: Iterable[Event]) -> list[BusinessApprovalRec
         ):
             continue
         approval_id = event.payload.get("approval_id")
-        if type(approval_id) is not str or (event.session_id, approval_id) not in records:
+        if type(approval_id) is not str:
             continue
-        record = records[(event.session_id, approval_id)]
+        record_key = (event.session_id, approval_id)
+        if record_key not in records or not identities[record_key].matches_payload(event.payload):
+            continue
+        descriptor = copy_durable_json_value(
+            {
+                "decision": str(event.type),
+                "expired": event.payload.get("expired") is True,
+                "resolved_by": event.payload.get("resolved_by"),
+                "reason": event.payload.get("reason"),
+                "metadata": event.payload.get("metadata"),
+            },
+            "approval_resolution_descriptor",
+        )
+        previous_descriptor = resolution_descriptors.setdefault(record_key, descriptor)
+        if previous_descriptor != descriptor:
+            contradictory_resolution_keys.add(record_key)
+            records.pop(record_key, None)
+            continue
+        if record_key in contradictory_resolution_keys:
+            continue
+        record = records[record_key]
         # The runtime emits one event per call in the round; every one carries the
         # resolution metadata, but prefer the gating call's event for identity.
         already_resolved = record["decision"] is not None

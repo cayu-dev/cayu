@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import AsyncIterator
+from decimal import Decimal
 
 import pytest
 
@@ -12,8 +13,11 @@ from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
+    BudgetLimit,
     CayuApp,
     InMemorySessionStore,
+    ModelPrice,
+    PriceBook,
     RetryPolicy,
     RunLimits,
     RunRequest,
@@ -24,6 +28,7 @@ from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._run_limits import RunLimitGate
 from cayu.runtime._session_control import SessionInterruptedByRequest
 from cayu.runtime._tool_round_executor import ToolRoundRun, _copy_agent_spec
+from cayu.runtime.execution_units import ToolRoundIdentity
 
 
 class _FakeProvider(ModelProvider):
@@ -98,6 +103,7 @@ def _limit_gate(
     session,
     *,
     limits: RunLimits,
+    budget_limits: tuple[BudgetLimit, ...] = (),
 ) -> RunLimitGate:
     return RunLimitGate(
         app._run_limit_controller,
@@ -105,7 +111,7 @@ def _limit_gate(
         agent_name="assistant",
         environment_name=None,
         limits=limits,
-        budget_limits=(),
+        budget_limits=budget_limits,
         run_started_at=time.monotonic(),
         run_baseline=None,
         budget_baseline_events=[],
@@ -118,20 +124,26 @@ def _tool_round_run(
     session: Session,
     *,
     limits: RunLimits,
+    budget_limits: tuple[BudgetLimit, ...] = (),
 ) -> ToolRoundRun:
     return app._tool_round_executor.create_run(
         session=session,
         registered_agent=app._get_registered_agent("assistant"),
         registered_environment=None,
         environment_name=None,
-        limit_gate=_limit_gate(app, session, limits=limits),
+        limit_gate=_limit_gate(
+            app,
+            session,
+            limits=limits,
+            budget_limits=budget_limits,
+        ),
         request_metadata={},
         task_id=None,
         structured_output=None,
         thinking=None,
         max_steps=16,
         limits=RunLimits(),
-        budget_limits=(),
+        budget_limits=budget_limits,
         retry_policy=RetryPolicy(),
         run_started_at=time.monotonic(),
         turn_usage_tracker=None,
@@ -141,6 +153,14 @@ def _tool_round_run(
 
 def _tool_call(call_id: str = "call_1") -> runtime_records.ToolCallRequest:
     return runtime_records.ToolCallRequest(id=call_id, name="side_effect", arguments={})
+
+
+def _tool_round_identity() -> ToolRoundIdentity:
+    return ToolRoundIdentity(
+        model_step_id=f"mstep_{'1' * 32}",
+        model_attempt_id=f"matt_{'2' * 32}",
+        tool_round_id=f"tround_{'3' * 32}",
+    )
 
 
 def test_tool_round_agent_copy_rejects_agent_spec_subclasses() -> None:
@@ -166,7 +186,7 @@ def test_tool_round_interrupt_close_ignores_unrequested_cancellation():
                 messages=messages,
                 tool_calls=[_tool_call()],
                 tool_outcomes=[],
-                tool_round_id="round_1",
+                tool_round_identity=_tool_round_identity(),
             )
         ]
         return events, messages
@@ -194,7 +214,7 @@ def test_tool_round_interrupt_close_persists_missing_results():
                 messages=messages,
                 tool_calls=[_tool_call()],
                 tool_outcomes=[],
-                tool_round_id="round_1",
+                tool_round_identity=_tool_round_identity(),
             )
         ]
         return events, messages
@@ -203,7 +223,7 @@ def test_tool_round_interrupt_close_persists_missing_results():
 
     assert [event.type for event in events] == [EventType.TOOL_CALL_FAILED]
     assert events[0].payload["tool_call_id"] == "call_1"
-    assert events[0].payload["tool_round_id"] == "round_1"
+    assert events[0].payload["tool_round_id"] == f"tround_{'3' * 32}"
     assert [message.role for message in messages] == ["tool"]
     transcript = asyncio.run(store.load_transcript("sess_guard_interrupt"))
     assert [message.role for message in transcript] == ["user", "assistant", "tool"]
@@ -226,7 +246,7 @@ def test_tool_round_interrupt_close_handles_requested_cancellation():
                 messages=messages,
                 tool_calls=[_tool_call()],
                 tool_outcomes=[],
-                tool_round_id="round_1",
+                tool_round_identity=_tool_round_identity(),
             )
         ]
         return events, messages
@@ -250,7 +270,7 @@ def test_tool_round_interrupt_close_rejects_unrelated_exceptions():
             messages=[],
             tool_calls=[],
             tool_outcomes=[],
-            tool_round_id=None,
+            tool_round_identity=_tool_round_identity(),
         ):
             pass
 
@@ -274,7 +294,7 @@ def test_tool_round_runner_stops_for_limit_before_tool_side_effects():
             async for event in runner.run(
                 messages=[],
                 tool_calls=[_tool_call()],
-                tool_round_id="round_1",
+                tool_round_identity=_tool_round_identity(),
             )
         ]
         return events, runner.stopped_for_limit
@@ -308,7 +328,7 @@ def test_tool_round_runner_executes_tool_round_and_persists_results():
             async for event in runner.run(
                 messages=messages,
                 tool_calls=[_tool_call()],
-                tool_round_id="round_1",
+                tool_round_identity=_tool_round_identity(),
             )
         ]
         return events, messages, runner.stopped_for_limit
@@ -324,3 +344,47 @@ def test_tool_round_runner_executes_tool_round_and_persists_results():
     assert [message.role for message in messages] == ["tool"]
     transcript = asyncio.run(store.load_transcript("sess_runner_execute"))
     assert transcript[-1].role == "tool"
+
+
+def test_tool_round_budget_gate_retains_the_originating_model_attempt() -> None:
+    app, store, _ = _app_with_completed_session("sess_tool_round_budget_identity")
+    budget_limit = BudgetLimit(
+        scope="session",
+        max_estimated_cost=Decimal("1"),
+        pricing=PriceBook(
+            prices=(
+                ModelPrice.fixed(
+                    provider_name="fake",
+                    model="fake-model",
+                    input_per_million=Decimal("1000000"),
+                    output_per_million=Decimal("1000000"),
+                ),
+            )
+        ),
+        action="notify",
+    )
+    identity = _tool_round_identity()
+
+    async def scenario() -> list[Event]:
+        session = await store.load("sess_tool_round_budget_identity")
+        assert session is not None
+        runner = _tool_round_run(
+            app,
+            session,
+            limits=RunLimits(),
+            budget_limits=(budget_limit,),
+        )
+        return [
+            event
+            async for event in runner.run(
+                messages=[],
+                tool_calls=[_tool_call()],
+                tool_round_identity=identity,
+            )
+        ]
+
+    events = asyncio.run(scenario())
+
+    reached = next(event for event in events if event.type == EventType.BUDGET_LIMIT_REACHED)
+    assert reached.payload["model_step_id"] == identity.model_step_id
+    assert reached.payload["model_attempt_id"] == identity.model_attempt_id

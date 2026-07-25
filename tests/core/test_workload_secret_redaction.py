@@ -6,6 +6,7 @@ import copy
 from typing import Any, cast
 
 import pytest
+from tests.core._execution_unit_fixtures import tool_round_identity
 from tests.core._workload_secret_support import (
     FakeProvider,
     collect_events,
@@ -2875,6 +2876,7 @@ def test_pending_tool_round_rejects_secret_authority_on_write_and_legacy_load() 
             tool_calls=tool_calls,
             policy_outcomes=None,
             structured_output=None,
+            tool_round_identity=tool_round_identity(),
             redactor=SecretRedactor(secret),
         )
 
@@ -2886,6 +2888,7 @@ def test_pending_tool_round_rejects_secret_authority_on_write_and_legacy_load() 
         tool_calls=tool_calls,
         policy_outcomes=None,
         structured_output=None,
+        tool_round_identity=tool_round_identity(),
     )
     with pytest.raises(ValueError, match="cannot be executed") as exc_info:
         tool_round_recovery.pending_tool_round_from_checkpoint(
@@ -2906,6 +2909,7 @@ def test_legacy_pending_approval_rejects_secret_authority_before_recovery() -> N
 
     secret = "legacy-approval-authority-secret-canary"
     pending = PendingToolApproval(
+        **tool_round_identity().payload(),
         approval_id=secret,
         tool_call_id="call-safe",
         tool_name="safe-tool",
@@ -2937,6 +2941,7 @@ def test_legacy_pending_approval_rejects_secret_argument_key_without_mutating_in
     secret = "legacy-approval-key-secret-canary"
     secret_key = f"prefix-{secret}-suffix"
     pending = PendingToolApproval(
+        **tool_round_identity().payload(),
         approval_id="approval-safe",
         tool_call_id="call-safe",
         tool_name="safe-tool",
@@ -2946,7 +2951,7 @@ def test_legacy_pending_approval_rejects_secret_argument_key_without_mutating_in
             PendingToolCallApproval(
                 tool_call_id="call-safe",
                 tool_name="safe-tool",
-                arguments={secret_key: "round-call"},
+                arguments={secret_key: "top-level"},
             )
         ],
     )
@@ -2977,6 +2982,7 @@ def test_legacy_pending_user_input_rejects_secret_authority_before_recovery() ->
 
     secret = "legacy-user-input-authority-secret-canary"
     pending = PendingUserInput(
+        **tool_round_identity().payload(),
         input_id=secret,
         tool_call_id="call-safe",
         tool_name="safe-tool",
@@ -3013,6 +3019,7 @@ def test_legacy_pending_user_input_rejects_secret_argument_key_without_mutating_
     secret = "legacy-user-input-key-secret-canary"
     secret_key = f"prefix-{secret}-suffix"
     pending = PendingUserInput(
+        **tool_round_identity().payload(),
         input_id="input-safe",
         tool_call_id="call-safe",
         tool_name="safe-tool",
@@ -3023,7 +3030,7 @@ def test_legacy_pending_user_input_rejects_secret_argument_key_without_mutating_
             PendingToolCallApproval(
                 tool_call_id="call-safe",
                 tool_name="safe-tool",
-                arguments={secret_key: "round-call"},
+                arguments={secret_key: "top-level"},
             )
         ],
     )
@@ -3049,6 +3056,7 @@ def test_explicit_compaction_rejects_secret_bearing_legacy_pending_checkpoint() 
 
     secret = "legacy-compaction-pending-secret-canary"
     pending = PendingToolApproval(
+        **tool_round_identity().payload(),
         approval_id=secret,
         tool_call_id="call-safe",
         tool_name="safe-tool",
@@ -3097,6 +3105,7 @@ def test_explicit_compaction_public_flow_rejects_legacy_secret_without_traceback
             identity=SessionIdentity(provider_name="fake", model="fake-model"),
         )
         pending = PendingToolApproval(
+            **tool_round_identity().payload(),
             approval_id=secret,
             tool_call_id="call-safe",
             tool_name="safe-tool",
@@ -3359,6 +3368,7 @@ def test_short_secret_substring_in_typed_structured_output_key_allows_pending_ro
             json_schema={"type": "object"},
             strategy=StructuredOutputStrategy.NATIVE,
         ),
+        tool_round_identity=tool_round_identity(),
         redactor=SecretRedactor("rate"),
     )
 
@@ -3395,6 +3405,7 @@ def test_json_schema_keyword_overlap_allows_pending_round_checkpoint_and_reload(
             },
             strategy=StructuredOutputStrategy.NATIVE,
         ),
+        tool_round_identity=tool_round_identity(),
         redactor=redactor,
     )
 
@@ -3436,15 +3447,17 @@ def test_schema_aware_checkpoint_still_rejects_data_owned_schema_keys() -> None:
                     "properties": {"typ": {"type": "string"}},
                 },
             ),
+            tool_round_identity=tool_round_identity(),
             redactor=SecretRedactor("typ"),
         )
 
 
-def test_short_secret_substring_in_round_id_key_allows_pending_round() -> None:
+def test_short_secret_substring_in_tool_round_id_key_allows_pending_round() -> None:
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime import _tool_round_recovery as tool_round_recovery
     from cayu.vaults import SecretRedactor
 
+    identity = tool_round_identity()
     checkpoint, pending_round = tool_round_recovery.checkpoint_with_pending_tool_round(
         None,
         agent_name="assistant",
@@ -3459,10 +3472,12 @@ def test_short_secret_substring_in_round_id_key_allows_pending_round() -> None:
         ],
         policy_outcomes=None,
         structured_output=None,
+        tool_round_identity=identity,
         redactor=SecretRedactor("id"),
     )
 
-    assert checkpoint["pending_tool_round"]["round_id"] == pending_round.round_id
+    assert checkpoint["pending_tool_round"]["tool_round_id"] == pending_round.tool_round_id
+    assert pending_round.tool_round_id == identity.tool_round_id
 
 
 def test_business_approval_rejects_legacy_secret_before_routing_or_traceback_exposure() -> None:
@@ -3488,6 +3503,7 @@ def test_business_approval_rejects_legacy_secret_before_routing_or_traceback_exp
             identity=SessionIdentity(provider_name="fake", model="fake-model"),
         )
         pending = PendingToolApproval(
+            **tool_round_identity().payload(),
             approval_id="approval-safe",
             tool_call_id="call-safe",
             tool_name="safe-tool",

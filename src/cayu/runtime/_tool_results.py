@@ -77,6 +77,8 @@ _RUNTIME_TOOL_EVENT_LINKAGE_FIELDS = frozenset(
         "approval_id",
         "idempotency_key",
         "input_id",
+        "model_attempt_id",
+        "model_step_id",
         "tool_call_id",
         "tool_name",
         "tool_round_id",

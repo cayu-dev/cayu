@@ -33,13 +33,17 @@ def _step_result(
         text_content = "".join(part.text for part in message.content if type(part) is TextPart)
         provider_state_count = sum(1 for part in message.content if type(part) is ProviderStatePart)
     model_attempt_identity = new_model_step_identity().new_attempt()
+    resolved_tool_calls = [] if tool_calls is None else tool_calls
     return AssistantStepResult(
         session_id="sess_1",
         step=1,
         model_step_id=model_attempt_identity.model_step_id,
         model_attempt_id=model_attempt_identity.model_attempt_id,
+        tool_round_identity=(
+            model_attempt_identity.new_tool_round() if resolved_tool_calls else None
+        ),
         assistant_message=message,
-        tool_calls=[] if tool_calls is None else tool_calls,
+        tool_calls=resolved_tool_calls,
         completion=ModelCompletion(finish_reason=finish_reason, end_turn=end_turn),
         text_content=text_content,
         has_user_visible_content=bool(text_content.strip()),

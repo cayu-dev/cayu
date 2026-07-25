@@ -5,16 +5,21 @@ from collections.abc import AsyncIterator
 from decimal import Decimal
 
 from cayu.core import AgentSpec, Event, EventType, Message
+from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
+    AlwaysRequireApprovalToolPolicy,
     BudgetLimit,
     BudgetPolicy,
     BudgetReservation,
     CayuApp,
     InMemoryBudgetLedger,
+    InMemorySessionStore,
     ModelPrice,
     PriceBook,
     RunRequest,
+    ToolApprovalDecision,
+    ToolApprovalRequest,
 )
 
 
@@ -37,6 +42,48 @@ class _UsageProvider(ModelProvider):
                 },
             }
         )
+
+
+class _ApprovalUsageProvider(ModelProvider):
+    name = "identity-budget"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        del request
+        self.calls += 1
+        if self.calls == 1:
+            yield ModelStreamEvent.tool_call(
+                id="call_1",
+                name="record",
+                arguments={},
+            )
+            yield ModelStreamEvent.completed(
+                {
+                    "finish_reason": "tool_calls",
+                    "usage": {
+                        "input_tokens": 1_000_000,
+                        "output_tokens": 0,
+                        "total_tokens": 1_000_000,
+                    },
+                }
+            )
+            return
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _RecordingTool(Tool):
+    spec = ToolSpec(name="record", input_schema={"type": "object"})
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        del ctx, args
+        self.calls += 1
+        return ToolResult(content="recorded")
 
 
 def _price_book() -> PriceBook:
@@ -80,6 +127,13 @@ def _collect_events(
 
 async def _collect_app_events(app: CayuApp, request: RunRequest) -> list[Event]:
     return [event async for event in app.run(request)]
+
+
+async def _collect_approval_events(
+    app: CayuApp,
+    request: ToolApprovalRequest,
+) -> list[Event]:
+    return [event async for event in app.resolve_tool_approval(request)]
 
 
 def _model_attempt_payload(event: Event) -> dict[str, object]:
@@ -132,6 +186,61 @@ def test_post_completion_request_budget_notification_retains_the_completed_attem
     assert len(reached) == 1
     assert reached[0].payload["actual"] == "1"
     assert _model_attempt_payload(reached[0]) == _model_attempt_payload(completed)
+
+
+def test_approval_resume_budget_notification_retains_the_originating_attempt() -> None:
+    store = InMemorySessionStore()
+    provider = _ApprovalUsageProvider()
+    tool = _RecordingTool()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="identity-model"),
+        tools=[tool],
+        tool_policy=AlwaysRequireApprovalToolPolicy(),
+    )
+
+    paused = asyncio.run(
+        _collect_app_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_approval_budget_identity",
+                messages=[Message.text("user", "record once")],
+            ),
+        )
+    )
+    approval_requested = next(
+        event for event in paused if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+    )
+
+    resumed = asyncio.run(
+        _collect_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_approval_budget_identity",
+                approval_id=approval_requested.payload["approval_id"],
+                decision=ToolApprovalDecision.APPROVE,
+                budget_limits=(
+                    BudgetLimit(
+                        scope="session",
+                        max_estimated_cost=Decimal("0.5"),
+                        pricing=_price_book(),
+                        action="notify",
+                    ),
+                ),
+            ),
+        )
+    )
+    approval_budget_notification = next(
+        event for event in resumed if event.type == EventType.BUDGET_LIMIT_REACHED
+    )
+
+    assert provider.calls == 2
+    assert tool.calls == 1
+    assert _model_attempt_payload(approval_budget_notification) == _model_attempt_payload(
+        approval_requested
+    )
 
 
 def _reservation_limit() -> BudgetLimit:

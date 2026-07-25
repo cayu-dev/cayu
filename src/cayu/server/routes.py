@@ -1808,12 +1808,16 @@ TraceContextMetadata = Annotated[dict[str, Any], Depends(_trace_context_metadata
 
 
 def _serialize_message_part(cayu_app: Any, part: Any) -> dict[str, Any]:
+    excluded_fields = {
+        field_name
+        for field_name in ("model_step_id", "model_attempt_id", "tool_round_id")
+        if getattr(part, field_name, None) is None
+    }
     if part.type == "thinking":
         # The opaque round-trip state (Anthropic signatures / redacted blobs) is
         # provider-internal and must not be exposed to transcript API consumers.
-        payload = part.model_dump(mode="json", exclude={"provider_state"})
-    else:
-        payload = part.model_dump(mode="json")
+        excluded_fields.add("provider_state")
+    payload = part.model_dump(mode="json", exclude=excluded_fields)
     return _redact_control_plane_values(
         cayu_app,
         payload,

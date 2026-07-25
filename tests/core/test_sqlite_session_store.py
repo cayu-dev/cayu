@@ -37,6 +37,14 @@ from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema_migrations
 
 
+def _tool_round_identity_payload() -> dict[str, str]:
+    return {
+        "model_step_id": f"mstep_{'1' * 32}",
+        "model_attempt_id": f"matt_{'2' * 32}",
+        "tool_round_id": f"tround_{'3' * 32}",
+    }
+
+
 def test_read_only_session_store_does_not_create_missing_database(tmp_path) -> None:
     missing = tmp_path / "missing" / "data" / "cayu.db"
 
@@ -270,10 +278,14 @@ def test_sqlite_pending_action_query_uses_persisted_projection_not_original_payl
                 type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
                 session_id=session_id,
                 payload={
+                    **_tool_round_identity_payload(),
+                    "approval_id": "persisted_pending_projection_approval",
+                    "tool_call_id": "persisted_pending_projection_call",
                     "approval": {
                         "approval_id": "persisted_pending_projection_approval",
+                        **_tool_round_identity_payload(),
                         "tool_name": "deploy",
-                    }
+                    },
                 },
             ),
         )
@@ -282,6 +294,7 @@ def test_sqlite_pending_action_query_uses_persisted_projection_not_original_payl
             {
                 "pending_tool_approval": {
                     "approval_id": "persisted_pending_projection_approval",
+                    **_tool_round_identity_payload(),
                     "tool_call_id": "persisted_pending_projection_call",
                     "tool_name": "deploy",
                     "arguments": {},

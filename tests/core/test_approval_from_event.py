@@ -10,6 +10,9 @@ from cayu import Event, EventType, PendingToolApproval, PendingToolCallApproval
 def _pending() -> PendingToolApproval:
     return PendingToolApproval(
         approval_id="ap_1",
+        model_step_id=f"mstep_{'1' * 32}",
+        model_attempt_id=f"matt_{'2' * 32}",
+        tool_round_id=f"tround_{'3' * 32}",
         tool_call_id="call_1",
         tool_name="send_email",
         agent_name="assistant",
@@ -18,9 +21,17 @@ def _pending() -> PendingToolApproval:
 
 
 def _approval_event() -> Event:
+    pending = _pending()
     return Event(
         type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
-        payload={"approval": _pending().model_dump(mode="json")},
+        payload={
+            "approval_id": pending.approval_id,
+            "tool_call_id": pending.tool_call_id,
+            "model_step_id": pending.model_step_id,
+            "model_attempt_id": pending.model_attempt_id,
+            "tool_round_id": pending.tool_round_id,
+            "approval": pending.model_dump(mode="json"),
+        },
         session_id="sess_1",
     )
 
@@ -30,8 +41,26 @@ def test_from_event_reads_the_nested_approval() -> None:
     got = PendingToolApproval.from_event(event)
     assert got.approval_id == "ap_1"
     assert got.tool_call_id == "call_1"
-    # The mistake from_event exists to prevent: the id is NOT at the top level.
-    assert event.payload.get("approval_id") is None
+    assert event.payload["approval_id"] == got.approval_id
+    assert event.payload["tool_call_id"] == got.tool_call_id
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("approval_id", "other"),
+        ("tool_call_id", "other"),
+        ("model_step_id", f"mstep_{'4' * 32}"),
+        ("model_attempt_id", f"matt_{'5' * 32}"),
+        ("tool_round_id", f"tround_{'6' * 32}"),
+    ],
+)
+def test_from_event_rejects_conflicting_direct_identity(field: str, value: str) -> None:
+    event = _approval_event()
+    event.payload[field] = value
+
+    with pytest.raises(ValueError, match="identity"):
+        PendingToolApproval.from_event(event)
 
 
 def test_from_event_rejects_wrong_event_type() -> None:

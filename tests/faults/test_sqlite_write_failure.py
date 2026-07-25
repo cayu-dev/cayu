@@ -183,7 +183,7 @@ async def test_sqlite_terminal_write_failure_requires_manual_recovery_without_re
             async for event in recovery_app.recover_tool_round(
                 ToolRoundRecoveryRequest(
                     session_id="sqlite-terminal-write-failure",
-                    round_id=pending_round["round_id"],
+                    round_id=pending_round["tool_round_id"],
                     tool_call_id="call_external_effect",
                     outcome=ToolApprovalRecoveryOutcome.COMPLETED,
                     message="operator verified the external effect",

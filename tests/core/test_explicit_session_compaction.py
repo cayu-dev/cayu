@@ -2759,6 +2759,9 @@ def test_compact_session_replays_legacy_terminal_record_before_later_pending_sta
         await store.append_events(created.id, replay_events)
         pending = PendingToolApproval(
             approval_id="approval-safe",
+            tool_round_id=f"tround_{'3' * 32}",
+            model_step_id=f"mstep_{'1' * 32}",
+            model_attempt_id=f"matt_{'2' * 32}",
             tool_call_id="call-safe",
             tool_name="safe-tool",
             agent_name="assistant",

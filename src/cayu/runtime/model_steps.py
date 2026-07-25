@@ -6,7 +6,11 @@ from enum import StrEnum
 from cayu.core.messages import Message, MessageRole, ProviderStatePart, TextPart, ThinkingPart
 from cayu.providers import ModelCompletion, ModelFinishReason
 from cayu.runtime._runtime_records import ToolCallRequest
-from cayu.runtime.execution_units import ModelAttemptIdentity
+from cayu.runtime.execution_units import (
+    ModelAttemptIdentity,
+    ToolRoundIdentity,
+    copy_tool_round_identity,
+)
 
 
 class StepClassificationType(StrEnum):
@@ -25,6 +29,7 @@ class AssistantStepResult:
     step: int
     model_step_id: str
     model_attempt_id: str
+    tool_round_identity: ToolRoundIdentity | None
     assistant_message: Message | None
     tool_calls: list[ToolCallRequest]
     completion: ModelCompletion
@@ -38,6 +43,17 @@ class AssistantStepResult:
             model_step_id=self.model_step_id,
             model_attempt_id=self.model_attempt_id,
         )
+        if self.tool_round_identity is not None:
+            identity = copy_tool_round_identity(self.tool_round_identity)
+            if (
+                identity.model_step_id != self.model_step_id
+                or identity.model_attempt_id != self.model_attempt_id
+            ):
+                raise ValueError(
+                    "Tool round identity must belong to the assistant step's model attempt."
+                )
+        if bool(self.tool_calls) != (self.tool_round_identity is not None):
+            raise ValueError("Assistant tool calls require exactly one tool-round identity.")
 
 
 @dataclass(frozen=True)

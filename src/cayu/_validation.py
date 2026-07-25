@@ -19,6 +19,7 @@ EXECUTION_UNIT_ID_MAX_CHARS = 70
 _EXECUTION_UNIT_ID_PATTERNS = {
     "model_step_id": re.compile(r"mstep_[0-9a-f]{32}\Z"),
     "model_attempt_id": re.compile(r"matt_[0-9a-f]{32}\Z"),
+    "tool_round_id": re.compile(r"tround_[0-9a-f]{32}\Z"),
     "budget_limit_id": re.compile(r"blim_[0-9a-f]{64}\Z"),
 }
 

@@ -18,6 +18,7 @@ from cayu.core.messages import (
     copy_message_part,
 )
 from cayu.runtime._runtime_records import ToolCallOutcome, ToolCallRequest
+from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.runtime.sessions import SessionStore
 from cayu.runtime.usage import strip_provider_billing_identity
 
@@ -50,20 +51,42 @@ async def tool_round_has_result_messages(
     session_store: SessionStore,
     session_id: str,
     tool_calls: list[ToolCallRequest],
+    *,
+    tool_round_identity: ToolRoundIdentity,
 ) -> bool:
     """Return whether one stored tool message closes every call in the round."""
+    identity = copy_tool_round_identity(tool_round_identity)
     expected_ids = {tool_call.id for tool_call in tool_calls}
     if not expected_ids:
         return True
     transcript = await session_store.load_transcript(session_id)
     for message in reversed(transcript):
-        result_ids = {part.tool_call_id for part in message.content if type(part) is ToolResultPart}
+        result_ids = {
+            part.tool_call_id
+            for part in message.content
+            if type(part) is ToolResultPart and _part_matches_tool_round_identity(part, identity)
+        }
         if expected_ids.issubset(result_ids):
             return True
-        call_ids = {part.tool_call_id for part in message.content if type(part) is ToolCallPart}
+        call_ids = {
+            part.tool_call_id
+            for part in message.content
+            if type(part) is ToolCallPart and _part_matches_tool_round_identity(part, identity)
+        }
         if expected_ids & call_ids:
             return False
     return False
+
+
+def _part_matches_tool_round_identity(
+    part: ToolCallPart | ToolResultPart,
+    identity: ToolRoundIdentity,
+) -> bool:
+    return (
+        part.tool_round_id == identity.tool_round_id
+        and part.model_step_id == identity.model_step_id
+        and part.model_attempt_id == identity.model_attempt_id
+    )
 
 
 def assistant_message(
@@ -196,7 +219,39 @@ def parse_tool_call(payload: dict[str, Any]) -> ToolCallRequest:
     )
 
 
-def tool_result_messages(outcomes: list[ToolCallOutcome]) -> list[Message]:
+def assistant_message_with_tool_round(
+    message: Message,
+    identity: ToolRoundIdentity,
+) -> Message:
+    """Attach runtime-owned lineage to every tool call in an assistant message."""
+
+    identity = copy_tool_round_identity(identity)
+    return Message(
+        role=message.role,
+        content=tuple(
+            ToolCallPart(
+                tool_call_id=part.tool_call_id,
+                tool_name=part.tool_name,
+                arguments=deepcopy(part.arguments),
+                tool_round_id=identity.tool_round_id,
+                model_step_id=identity.model_step_id,
+                model_attempt_id=identity.model_attempt_id,
+            )
+            if type(part) is ToolCallPart
+            else copy_message_part(part)
+            for part in message.content
+        ),
+    )
+
+
+def tool_result_messages(
+    outcomes: list[ToolCallOutcome],
+    *,
+    tool_round_identity: ToolRoundIdentity | None = None,
+) -> list[Message]:
+    identity = (
+        None if tool_round_identity is None else copy_tool_round_identity(tool_round_identity)
+    )
     return [
         Message.tool_result(
             results=[
@@ -207,6 +262,9 @@ def tool_result_messages(outcomes: list[ToolCallOutcome]) -> list[Message]:
                     structured=deepcopy(outcome.result.structured),
                     artifacts=deepcopy(outcome.result.artifacts),
                     is_error=outcome.result.is_error,
+                    tool_round_id=None if identity is None else identity.tool_round_id,
+                    model_step_id=None if identity is None else identity.model_step_id,
+                    model_attempt_id=None if identity is None else identity.model_attempt_id,
                 )
                 for outcome in outcomes
             ],

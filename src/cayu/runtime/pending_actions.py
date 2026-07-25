@@ -29,10 +29,15 @@ PENDING_ACTION_SESSION_STATUSES = frozenset(
 PENDING_ACTION_CHECKPOINT_KEYS = frozenset(
     {"pending_tool_approval", "pending_user_input", "pending_tool_round"}
 )
+_TOOL_ROUND_IDENTITY_PAYLOAD_KEYS = frozenset(
+    {"model_step_id", "model_attempt_id", "tool_round_id"}
+)
 
 _PENDING_ACTION_EVENT_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
-    "tool.call.approval_requested": frozenset({"approval"}),
-    "session.awaiting_user_input": frozenset({"input_id", "tool_call_id", "question", "options"}),
+    "tool.call.approval_requested": frozenset({"approval", "approval_id", "tool_call_id"})
+    | _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS,
+    "session.awaiting_user_input": frozenset({"input_id", "tool_call_id", "question", "options"})
+    | _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS,
     "session.interrupted": frozenset(
         {
             "interruption_type",
@@ -46,13 +51,14 @@ _PENDING_ACTION_EVENT_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
             "approval",
             "user_input",
         }
-    ),
-    "tool.call.started": frozenset({"tool_call_id", "tool_round_id"}),
-    "tool.call.completed": frozenset({"tool_call_id", "tool_round_id"}),
-    "tool.call.failed": frozenset({"tool_call_id", "tool_round_id"}),
-    "tool.call.blocked": frozenset({"tool_call_id", "tool_round_id"}),
-    "tool.call.approval_denied": frozenset({"tool_call_id", "tool_round_id"}),
-    "session.resumed": frozenset(),
+    )
+    | _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS,
+    "tool.call.started": frozenset({"tool_call_id"}) | _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS,
+    "tool.call.completed": frozenset({"tool_call_id"}) | _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS,
+    "tool.call.failed": frozenset({"tool_call_id"}) | _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS,
+    "tool.call.blocked": frozenset({"tool_call_id"}) | _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS,
+    "tool.call.approval_denied": frozenset({"tool_call_id"}) | _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS,
+    "session.resumed": _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS,
     "session.completed": frozenset(),
     "session.failed": frozenset(),
 }
@@ -146,7 +152,7 @@ def pending_action_checkpoint_lookup_ids(
     if pending_input is not None:
         identifiers.add(pending_input.input_id)
     if pending_round is not None:
-        identifiers.add(pending_round.round_id)
+        identifiers.add(pending_round.tool_round_id)
         identifiers.update(call.tool_call_id for call in pending_round.tool_calls)
     return frozenset(identifiers)
 
@@ -435,6 +441,8 @@ def _pending_approval_checkpoint_call(
     *,
     approval_id: str,
     tool_call_id: str | None = None,
+    identity_payload: Mapping[str, Any] | None = None,
+    gating_only: bool = False,
 ) -> dict[str, Any] | None:
     try:
         pending = approval_support.pending_approval_from_checkpoint(checkpoint)
@@ -442,22 +450,34 @@ def _pending_approval_checkpoint_call(
         return None
     if pending is None or pending.approval_id != approval_id:
         return None
+    if identity_payload is not None and any(
+        identity_payload.get(key) != value
+        for key, value in (
+            ("model_step_id", pending.model_step_id),
+            ("model_attempt_id", pending.model_attempt_id),
+            ("tool_round_id", pending.tool_round_id),
+        )
+    ):
+        return None
     if tool_call_id is None:
         return {
             "tool_name": pending.tool_name,
             "arguments": pending.arguments,
+            "tool_call_id": pending.tool_call_id,
+            "tool_round_id": pending.tool_round_id,
+            "reason": pending.reason,
         }
+    if gating_only and pending.tool_call_id != tool_call_id:
+        return None
     for call in pending.tool_calls:
         if call.tool_call_id == tool_call_id:
             return {
                 "tool_name": call.tool_name,
                 "arguments": call.arguments,
+                "tool_call_id": call.tool_call_id,
+                "tool_round_id": pending.tool_round_id,
+                "reason": pending.reason if call.tool_call_id == pending.tool_call_id else None,
             }
-    if pending.tool_call_id == tool_call_id:
-        return {
-            "tool_name": pending.tool_name,
-            "arguments": pending.arguments,
-        }
     return None
 
 
@@ -466,6 +486,8 @@ def _pending_user_input_checkpoint_call(
     *,
     input_id: str,
     tool_call_id: str | None = None,
+    identity_payload: Mapping[str, Any] | None = None,
+    gating_only: bool = False,
 ) -> dict[str, Any] | None:
     try:
         pending = pending_user_input_from_checkpoint(checkpoint)
@@ -473,22 +495,38 @@ def _pending_user_input_checkpoint_call(
         return None
     if pending is None or pending.input_id != input_id:
         return None
+    if identity_payload is not None and any(
+        identity_payload.get(key) != value
+        for key, value in (
+            ("model_step_id", pending.model_step_id),
+            ("model_attempt_id", pending.model_attempt_id),
+            ("tool_round_id", pending.tool_round_id),
+        )
+    ):
+        return None
     if tool_call_id is None:
         return {
             "tool_name": pending.tool_name,
             "arguments": pending.arguments,
+            "tool_call_id": pending.tool_call_id,
+            "tool_round_id": pending.tool_round_id,
+            "question": pending.question,
+            "options": list(pending.options),
         }
+    if gating_only and pending.tool_call_id != tool_call_id:
+        return None
     for call in pending.tool_calls:
         if call.tool_call_id == tool_call_id:
             return {
                 "tool_name": call.tool_name,
                 "arguments": call.arguments,
+                "tool_call_id": call.tool_call_id,
+                "tool_round_id": pending.tool_round_id,
+                "question": pending.question if call.tool_call_id == pending.tool_call_id else None,
+                "options": (
+                    list(pending.options) if call.tool_call_id == pending.tool_call_id else []
+                ),
             }
-    if pending.tool_call_id == tool_call_id:
-        return {
-            "tool_name": pending.tool_name,
-            "arguments": pending.arguments,
-        }
     return None
 
 
@@ -497,12 +535,22 @@ def _pending_tool_round_checkpoint_call(
     *,
     round_id: str,
     tool_call_id: str,
+    identity_payload: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     try:
         pending = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
     except (TypeError, ValueError, ValidationError):
         return None
-    if pending is None or pending.round_id != round_id:
+    if pending is None or pending.tool_round_id != round_id:
+        return None
+    if identity_payload is not None and any(
+        identity_payload.get(key) != value
+        for key, value in (
+            ("model_step_id", pending.model_step_id),
+            ("model_attempt_id", pending.model_attempt_id),
+            ("tool_round_id", pending.tool_round_id),
+        )
+    ):
         return None
     for call in pending.tool_calls:
         if call.tool_call_id == tool_call_id:
@@ -525,6 +573,7 @@ def _tool_round_manual_recovery_action(
     if pending_round is None:
         return None
 
+    identity = tool_round_recovery.pending_tool_round_identity(pending_round)
     started_ids: set[str] = set()
     terminal_ids: set[str] = set()
     terminal_types = {
@@ -536,7 +585,7 @@ def _tool_round_manual_recovery_action(
     pending_call_ids = {call.tool_call_id for call in pending_round.tool_calls}
     for record in reversed(records_desc):
         event = record.event
-        if event.payload.get("tool_round_id") != pending_round.round_id:
+        if not identity.matches_payload(event.payload):
             continue
         tool_call_id = event.payload.get("tool_call_id")
         if type(tool_call_id) is not str or tool_call_id not in pending_call_ids:
@@ -559,10 +608,7 @@ def _tool_round_manual_recovery_action(
             record
             for record in records_desc
             if record.event.type in {EventType.SESSION_INTERRUPTED, EventType.SESSION_FAILED}
-            and (
-                record.event.payload.get("tool_round_id") in {None, pending_round.round_id}
-                or record.event.payload.get("manual_recovery_required") is True
-            )
+            and identity.matches_payload(record.event.payload)
         ),
         None,
     )
@@ -572,7 +618,7 @@ def _tool_round_manual_recovery_action(
                 record
                 for record in records_desc
                 if record.event.type == EventType.TOOL_CALL_STARTED
-                and record.event.payload.get("tool_round_id") == pending_round.round_id
+                and identity.matches_payload(record.event.payload)
                 and record.event.payload.get("tool_call_id") == pending_call.tool_call_id
             ),
             None,
@@ -592,7 +638,7 @@ def _tool_round_manual_recovery_action(
         title="Manual recovery required",
         detail=detail,
         tool_name=pending_call.tool_name,
-        round_id=pending_round.round_id,
+        round_id=pending_round.tool_round_id,
         tool_call_id=pending_call.tool_call_id,
         arguments=pending_call.arguments,
     )
@@ -617,10 +663,21 @@ def pending_action_from_records(
 
             if event_type == "tool.call.approval_requested":
                 approval = _object_payload(payload.get("approval"))
-                approval_id = _optional_payload_string(approval, "approval_id")
-                if approval is not None and approval_id is not None:
+                nested_approval_id = _optional_payload_string(approval, "approval_id")
+                approval_id = _optional_payload_string(payload, "approval_id")
+                tool_call_id = _optional_payload_string(payload, "tool_call_id")
+                if (
+                    approval is not None
+                    and approval_id is not None
+                    and approval_id == nested_approval_id
+                    and tool_call_id is not None
+                ):
                     checkpoint_call = _pending_approval_checkpoint_call(
-                        checkpoint, approval_id=approval_id
+                        checkpoint,
+                        approval_id=approval_id,
+                        tool_call_id=tool_call_id,
+                        identity_payload=payload,
+                        gating_only=True,
                     )
                     if checkpoint_call is not None:
                         return _action_from_record(
@@ -628,25 +685,32 @@ def pending_action_from_records(
                             record=record,
                             action_kind=PendingActionKind.TOOL_APPROVAL,
                             title="Tool approval required",
-                            detail=_optional_payload_string(approval, "reason"),
-                            tool_name=_optional_payload_string(approval, "tool_name")
-                            or _optional_payload_string(checkpoint_call, "tool_name")
+                            detail=_optional_payload_string(approval, "reason")
+                            or _optional_payload_string(checkpoint_call, "reason"),
+                            tool_name=_optional_payload_string(checkpoint_call, "tool_name")
                             or event.tool_name,
                             approval_id=approval_id,
-                            arguments=_object_payload(approval.get("arguments"))
-                            or _object_payload(checkpoint_call.get("arguments"))
-                            or {},
+                            round_id=_optional_payload_string(checkpoint_call, "tool_round_id"),
+                            tool_call_id=tool_call_id,
+                            arguments=_object_payload(checkpoint_call.get("arguments")) or {},
                         )
 
             if event_type == "session.awaiting_user_input":
                 input_id = _optional_payload_string(payload, "input_id")
-                if input_id is not None:
-                    tool_call_id = _optional_payload_string(payload, "tool_call_id")
+                tool_call_id = _optional_payload_string(payload, "tool_call_id")
+                if input_id is not None and tool_call_id is not None:
                     checkpoint_call = _pending_user_input_checkpoint_call(
-                        checkpoint, input_id=input_id, tool_call_id=tool_call_id
+                        checkpoint,
+                        input_id=input_id,
+                        tool_call_id=tool_call_id,
+                        identity_payload=payload,
+                        gating_only=True,
                     )
                     if checkpoint_call is not None:
-                        question = _optional_payload_string(payload, "question") or "Input required"
+                        question = (
+                            _optional_payload_string(checkpoint_call, "question")
+                            or "Input required"
+                        )
                         return _action_from_record(
                             session=session,
                             record=record,
@@ -656,9 +720,13 @@ def pending_action_from_records(
                             tool_name=event.tool_name
                             or _optional_payload_string(checkpoint_call, "tool_name"),
                             input_id=input_id,
+                            round_id=_optional_payload_string(
+                                checkpoint_call,
+                                "tool_round_id",
+                            ),
                             tool_call_id=tool_call_id,
                             question=question,
-                            options=_payload_string_list(payload, "options"),
+                            options=_payload_string_list(checkpoint_call, "options"),
                             arguments=_object_payload(checkpoint_call.get("arguments")),
                         )
 
@@ -682,15 +750,24 @@ def pending_action_from_records(
                     continue
                 if input_id is not None:
                     checkpoint_call = _pending_user_input_checkpoint_call(
-                        checkpoint, input_id=input_id, tool_call_id=tool_call_id
+                        checkpoint,
+                        input_id=input_id,
+                        tool_call_id=tool_call_id,
+                        identity_payload=payload,
                     )
                 elif approval_id is not None:
                     checkpoint_call = _pending_approval_checkpoint_call(
-                        checkpoint, approval_id=approval_id, tool_call_id=tool_call_id
+                        checkpoint,
+                        approval_id=approval_id,
+                        tool_call_id=tool_call_id,
+                        identity_payload=payload,
                     )
                 else:
                     checkpoint_call = _pending_tool_round_checkpoint_call(
-                        checkpoint, round_id=round_id or "", tool_call_id=tool_call_id
+                        checkpoint,
+                        round_id=round_id or "",
+                        tool_call_id=tool_call_id,
+                        identity_payload=payload,
                     )
                 if checkpoint_call is None:
                     continue
@@ -723,7 +800,9 @@ def pending_action_from_records(
                 approval_id = _optional_payload_string(approval, "approval_id")
                 if approval is not None and approval_id is not None:
                     checkpoint_call = _pending_approval_checkpoint_call(
-                        checkpoint, approval_id=approval_id
+                        checkpoint,
+                        approval_id=approval_id,
+                        identity_payload=payload,
                     )
                     if checkpoint_call is not None:
                         return _action_from_record(
@@ -731,27 +810,32 @@ def pending_action_from_records(
                             record=record,
                             action_kind=PendingActionKind.TOOL_APPROVAL,
                             title="Tool approval required",
-                            detail=_optional_payload_string(approval, "reason"),
-                            tool_name=_optional_payload_string(approval, "tool_name")
-                            or _optional_payload_string(checkpoint_call, "tool_name")
+                            detail=_optional_payload_string(approval, "reason")
+                            or _optional_payload_string(checkpoint_call, "reason"),
+                            tool_name=_optional_payload_string(checkpoint_call, "tool_name")
                             or event.tool_name,
                             approval_id=approval_id,
-                            arguments=_object_payload(approval.get("arguments"))
-                            or _object_payload(checkpoint_call.get("arguments"))
-                            or {},
+                            round_id=_optional_payload_string(checkpoint_call, "tool_round_id"),
+                            tool_call_id=_optional_payload_string(checkpoint_call, "tool_call_id"),
+                            arguments=_object_payload(checkpoint_call.get("arguments")) or {},
                         )
 
             if interruption_type == "user_input_required":
                 user_input = _object_payload(payload.get("user_input"))
                 input_id = _optional_payload_string(user_input, "input_id")
-                if user_input is not None and input_id is not None:
-                    tool_call_id = _optional_payload_string(user_input, "tool_call_id")
+                tool_call_id = _optional_payload_string(user_input, "tool_call_id")
+                if user_input is not None and input_id is not None and tool_call_id is not None:
                     checkpoint_call = _pending_user_input_checkpoint_call(
-                        checkpoint, input_id=input_id, tool_call_id=tool_call_id
+                        checkpoint,
+                        input_id=input_id,
+                        tool_call_id=tool_call_id,
+                        identity_payload=payload,
+                        gating_only=True,
                     )
                     if checkpoint_call is not None:
                         question = (
-                            _optional_payload_string(user_input, "question") or "Input required"
+                            _optional_payload_string(checkpoint_call, "question")
+                            or "Input required"
                         )
                         return _action_from_record(
                             session=session,
@@ -762,9 +846,13 @@ def pending_action_from_records(
                             tool_name=event.tool_name
                             or _optional_payload_string(checkpoint_call, "tool_name"),
                             input_id=input_id,
+                            round_id=_optional_payload_string(
+                                checkpoint_call,
+                                "tool_round_id",
+                            ),
                             tool_call_id=tool_call_id,
                             question=question,
-                            options=_payload_string_list(user_input, "options"),
+                            options=_payload_string_list(checkpoint_call, "options"),
                             arguments=_object_payload(checkpoint_call.get("arguments")),
                         )
 
@@ -795,13 +883,14 @@ def pending_action_source_is_invalid(
     except (TypeError, ValueError, ValidationError):
         return True
     if pending_round is not None:
+        identity = tool_round_recovery.pending_tool_round_identity(pending_round)
         pending_call_ids = {call.tool_call_id for call in pending_round.tool_calls}
         checked_terminal_ids: set[str] = set()
         for record in records_desc:
             event = record.event
             if event.type not in _TERMINAL_EVENT_TYPES:
                 continue
-            if event.payload.get("tool_round_id") != pending_round.round_id:
+            if not identity.matches_payload(event.payload):
                 continue
             tool_call_id = event.payload.get("tool_call_id")
             if tool_call_id not in pending_call_ids or tool_call_id in checked_terminal_ids:

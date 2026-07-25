@@ -63,6 +63,14 @@ def _identity() -> SessionIdentity:
     return SessionIdentity(provider_name="fake", model="fake-model")
 
 
+def _tool_round_identity_payload() -> dict[str, str]:
+    return {
+        "model_step_id": f"mstep_{'1' * 32}",
+        "model_attempt_id": f"matt_{'2' * 32}",
+        "tool_round_id": f"tround_{'3' * 32}",
+    }
+
+
 async def _truncate(dsn: str) -> None:
     import psycopg
 
@@ -144,10 +152,14 @@ def test_postgres_session_store_queries_checkpoint_backed_pending_actions(postgr
                     type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
                     session_id=session.id,
                     payload={
+                        **_tool_round_identity_payload(),
+                        "approval_id": f"unrelated_approval_{index}",
+                        "tool_call_id": f"unrelated_call_{index}",
                         "approval": {
                             "approval_id": f"unrelated_approval_{index}",
+                            **_tool_round_identity_payload(),
                             "tool_name": "unrelated",
-                        }
+                        },
                     },
                 )
                 for index in range(500)
@@ -159,11 +171,15 @@ def test_postgres_session_store_queries_checkpoint_backed_pending_actions(postgr
                     session_id=session.id,
                     tool_name="deploy",
                     payload={
+                        **_tool_round_identity_payload(),
+                        "approval_id": "approval_pg",
+                        "tool_call_id": "call_pg",
                         "approval": {
                             "approval_id": "approval_pg",
+                            **_tool_round_identity_payload(),
                             "tool_name": "deploy",
                             "arguments": {"service": "api"},
-                        }
+                        },
                     },
                 ),
                 Event(
@@ -172,12 +188,16 @@ def test_postgres_session_store_queries_checkpoint_backed_pending_actions(postgr
                     session_id=session.id,
                     tool_name="deploy",
                     payload={
+                        **_tool_round_identity_payload(),
+                        "approval_id": "approval_pg",
+                        "tool_call_id": "call_pg",
                         "approval": {
                             "approval_id": "approval_pg",
+                            **_tool_round_identity_payload(),
                             "tool_name": "deploy",
                             "reason": "latest request",
                             "arguments": {"service": "api"},
-                        }
+                        },
                     },
                 ),
             ],
@@ -187,6 +207,7 @@ def test_postgres_session_store_queries_checkpoint_backed_pending_actions(postgr
             {
                 "pending_tool_approval": {
                     "approval_id": "approval_pg",
+                    **_tool_round_identity_payload(),
                     "tool_call_id": "call_pg",
                     "tool_name": "deploy",
                     "arguments": {"service": "api"},
@@ -234,6 +255,7 @@ def test_postgres_session_store_queries_checkpoint_backed_pending_actions(postgr
                 type=EventType.SESSION_AWAITING_USER_INPUT,
                 session_id=user_session.id,
                 payload={
+                    **_tool_round_identity_payload(),
                     "input_id": "input_pg",
                     "tool_call_id": "call_input_pg",
                     "question": "Deploy now?",
@@ -246,6 +268,7 @@ def test_postgres_session_store_queries_checkpoint_backed_pending_actions(postgr
             {
                 "pending_user_input": {
                     "input_id": "input_pg",
+                    **_tool_round_identity_payload(),
                     "tool_call_id": "call_input_pg",
                     "tool_name": "ask_user",
                     "question": "Deploy now?",
@@ -285,7 +308,7 @@ def test_postgres_session_store_queries_checkpoint_backed_pending_actions(postgr
                     session_id=round_session.id,
                     tool_name="charge",
                     payload={
-                        "tool_round_id": "round_pg",
+                        **_tool_round_identity_payload(),
                         "tool_call_id": "call_round_pg",
                     },
                 ),
@@ -294,8 +317,8 @@ def test_postgres_session_store_queries_checkpoint_backed_pending_actions(postgr
                     type=EventType.SESSION_FAILED,
                     session_id=round_session.id,
                     payload={
+                        **_tool_round_identity_payload(),
                         "manual_recovery_required": True,
-                        "tool_round_id": "round_pg",
                         "tool_call_id": "call_round_pg",
                     },
                 ),
@@ -305,7 +328,7 @@ def test_postgres_session_store_queries_checkpoint_backed_pending_actions(postgr
             round_session.id,
             {
                 "pending_tool_round": {
-                    "round_id": "round_pg",
+                    **_tool_round_identity_payload(),
                     "agent_name": "assistant",
                     "tool_calls": [
                         {
@@ -345,11 +368,15 @@ def test_postgres_session_store_queries_checkpoint_backed_pending_actions(postgr
                 type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
                 session_id=long_id_session.id,
                 payload={
+                    **_tool_round_identity_payload(),
+                    "approval_id": long_approval_id,
+                    "tool_call_id": "long_identifier_call",
                     "approval": {
                         "approval_id": long_approval_id,
+                        **_tool_round_identity_payload(),
                         "tool_name": "deploy",
                         "arguments": {},
-                    }
+                    },
                 },
             ),
         )
@@ -358,6 +385,7 @@ def test_postgres_session_store_queries_checkpoint_backed_pending_actions(postgr
             {
                 "pending_tool_approval": {
                     "approval_id": long_approval_id,
+                    **_tool_round_identity_payload(),
                     "tool_call_id": "long_identifier_call",
                     "tool_name": "deploy",
                     "arguments": {},

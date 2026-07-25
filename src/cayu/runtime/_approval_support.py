@@ -21,6 +21,7 @@ from cayu.runtime.approvals import (
     ToolApprovalRequest,
     resolution_actor_payload,
 )
+from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.runtime.sessions import Session, SessionStore
 from cayu.runtime.tool_policy import ToolPolicyResult
 from cayu.vaults import SecretRedactor, contains_redacted_secret
@@ -117,6 +118,9 @@ def resumed_event(
         agent_name=agent_name,
         environment_name=environment_name,
         payload={
+            "model_step_id": approval.model_step_id,
+            "model_attempt_id": approval.model_attempt_id,
+            "tool_round_id": approval.tool_round_id,
             "agent_name": agent_name,
             "approval_id": approval.approval_id,
             "tool_call_id": approval.tool_call_id,
@@ -132,7 +136,7 @@ def cleared_event(
     session: Session,
     agent_name: str,
     environment_name: str | None,
-    approval_id: str,
+    approval: PendingToolApproval,
 ) -> Event:
     return Event(
         type=EventType.SESSION_CHECKPOINTED,
@@ -140,8 +144,11 @@ def cleared_event(
         agent_name=agent_name,
         environment_name=environment_name,
         payload={
+            "model_step_id": approval.model_step_id,
+            "model_attempt_id": approval.model_attempt_id,
+            "tool_round_id": approval.tool_round_id,
             "checkpoint": PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,
-            "approval_id": approval_id,
+            "approval_id": approval.approval_id,
             "cleared": True,
         },
     )
@@ -204,6 +211,9 @@ def approval_denied_tool_result(
     return ToolResult(
         content=content,
         structured={
+            "model_step_id": approval.model_step_id,
+            "model_attempt_id": approval.model_attempt_id,
+            "tool_round_id": approval.tool_round_id,
             "decision": request.decision.value,
             "approval_id": approval.approval_id,
             "tool_call_id": tool_call.id,
@@ -256,6 +266,7 @@ def recorded_round_tool_outcomes(
     events: list[Event],
     pending_calls: list[PendingToolCallApproval],
     input_id: str,
+    tool_round_identity: ToolRoundIdentity,
 ) -> dict[str, runtime_records.ToolCallOutcome]:
     """Reconstruct already-recorded terminal outcomes for a paused user-input round, keyed by
     ``tool_call_id``, scoped to the pause's resume window (see ``user_input_resume_events``).
@@ -263,11 +274,12 @@ def recorded_round_tool_outcomes(
     Lets a retried resume skip re-executing a tool that already completed before a mid-resume
     failure, without colliding with a prior round that reused the same ids.
     """
+    identity = copy_tool_round_identity(tool_round_identity)
     pending_by_id = {call.tool_call_id: call for call in pending_calls}
     ledger = resume_ledger.scan_tool_call_events(
         events=user_input_resume_events(events, input_id),
         pending_calls=pending_calls,
-        in_scope=lambda event: True,
+        in_scope=lambda event: identity.matches_payload(event.payload),
         terminal_event_types=_USER_INPUT_ROUND_TERMINAL_EVENT_TYPES,
     )
     # A tool that started on a prior resume attempt but has no terminal event (a crash mid-tool)
@@ -286,12 +298,16 @@ def recorded_tool_outcomes(
     events: list[Event],
     approval: PendingToolApproval,
 ) -> dict[str, runtime_records.ToolCallOutcome]:
+    identity = _approval_tool_round_identity(approval)
     pending_calls = pending_round_tool_calls(approval)
     pending_by_id = {call.tool_call_id: call for call in pending_calls}
     ledger = resume_ledger.scan_tool_call_events(
         events=events,
         pending_calls=pending_calls,
-        in_scope=lambda event: event.payload.get("approval_id") == approval.approval_id,
+        in_scope=lambda event: (
+            event.payload.get("approval_id") == approval.approval_id
+            and identity.matches_payload(event.payload)
+        ),
         terminal_event_types=_APPROVAL_TERMINAL_EVENT_TYPES,
     )
 
@@ -310,12 +326,15 @@ def approval_resolution_history(
     events: list[Event],
     approval: PendingToolApproval,
 ) -> ApprovalResolutionHistory:
+    identity = _approval_tool_round_identity(approval)
     has_denied_result = False
     has_approved_call = False
     has_executed_or_recovered_result = False
 
     for event in events:
-        if event.payload.get("approval_id") != approval.approval_id:
+        if event.payload.get("approval_id") != approval.approval_id or not identity.matches_payload(
+            event.payload
+        ):
             continue
         if event.type == EventType.TOOL_CALL_APPROVAL_DENIED:
             has_denied_result = True
@@ -366,10 +385,14 @@ def validate_recovery_target(
     approval: PendingToolApproval,
     tool_call_id: str,
 ) -> None:
+    identity = _approval_tool_round_identity(approval)
     state = resume_ledger.tool_call_recovery_state(
         events=events,
         tool_call_id=tool_call_id,
-        in_scope=lambda event: event.payload.get("approval_id") == approval.approval_id,
+        in_scope=lambda event: (
+            event.payload.get("approval_id") == approval.approval_id
+            and identity.matches_payload(event.payload)
+        ),
         terminal_event_types=_APPROVAL_TERMINAL_EVENT_TYPES,
     )
 
@@ -400,16 +423,18 @@ def validate_round_recovery_target(
     pending_calls: list[PendingToolCallApproval],
     tool_call_id: str,
     input_id: str,
+    tool_round_identity: ToolRoundIdentity,
 ) -> None:
     # Round terminal events carry no approval_id (user-input rounds) and tool-call ids are not
     # unique across the session, so scope to the pause's resume window (matching
     # recorded_round_tool_outcomes) — a prior round reusing this id must not be seen here.
     if tool_call_id not in {call.tool_call_id for call in pending_calls}:
         raise ValueError(f"Tool call is not part of the paused round: {tool_call_id}")
+    identity = copy_tool_round_identity(tool_round_identity)
     state = resume_ledger.tool_call_recovery_state(
         events=user_input_resume_events(events, input_id),
         tool_call_id=tool_call_id,
-        in_scope=lambda event: True,
+        in_scope=lambda event: identity.matches_payload(event.payload),
         terminal_event_types=_USER_INPUT_ROUND_TERMINAL_EVENT_TYPES,
     )
 
@@ -421,6 +446,14 @@ def validate_round_recovery_target(
         raise RuntimeError(
             f"User input recovery requires a recorded tool.call.started event: {tool_call_id}"
         )
+
+
+def _approval_tool_round_identity(approval: PendingToolApproval) -> ToolRoundIdentity:
+    return ToolRoundIdentity(
+        tool_round_id=approval.tool_round_id,
+        model_step_id=approval.model_step_id,
+        model_attempt_id=approval.model_attempt_id,
+    )
 
 
 def recovered_tool_result(

@@ -431,6 +431,45 @@ def test_audit_is_order_insensitive_and_pairs_per_session() -> None:
     assert by_session["sess_audit_order_b"].approver_id == "u_other"
 
 
+def test_audit_does_not_attach_resolution_from_another_execution_unit() -> None:
+    session_id = "sess_audit_conflicting_identity"
+    app, store, _tool, approval_event = _paused_app(_tiered_policy(), session_id)
+    _resolve(app, session_id, approval_event)
+    events = asyncio.run(store.load_events(session_id))
+    resolution = next(event for event in events if event.type == EventType.TOOL_CALL_APPROVED)
+    conflicting_resolution = resolution.model_copy(
+        update={
+            "payload": {
+                **resolution.payload,
+                "model_attempt_id": f"matt_{'f' * 32}",
+            }
+        },
+        deep=True,
+    )
+
+    records = business_approval_audit([approval_event, conflicting_resolution])
+
+    assert len(records) == 1
+    assert records[0].pending
+    assert records[0].resolved_at is None
+
+
+def test_audit_fails_closed_on_conflicting_resolutions_for_one_execution_unit() -> None:
+    session_id = "sess_audit_conflicting_resolution"
+    app, store, _tool, approval_event = _paused_app(_tiered_policy(), session_id)
+    _resolve(app, session_id, approval_event)
+    events = asyncio.run(store.load_events(session_id))
+    approved = next(event for event in events if event.type == EventType.TOOL_CALL_APPROVED)
+    conflicting = approved.model_copy(
+        update={"type": EventType.TOOL_CALL_APPROVAL_DENIED},
+        deep=True,
+    )
+
+    records = business_approval_audit([approval_event, approved, conflicting])
+
+    assert records == []
+
+
 def test_lost_resolution_race_surfaces_the_primitives_error() -> None:
     # Pins the docstring contract: the primitive independently reloads and
     # re-validates when the returned stream is first iterated, so an adapter

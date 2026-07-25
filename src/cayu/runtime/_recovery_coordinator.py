@@ -81,6 +81,7 @@ from cayu.runtime.budgets import (
     request_budget_limits_for_session,
 )
 from cayu.runtime.costs import SessionCostSummary
+from cayu.runtime.execution_units import ModelAttemptIdentity, ToolRoundIdentity
 from cayu.runtime.hooks import RuntimeHookPhase
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.runtime.retry_policy import RetryPolicy
@@ -986,7 +987,7 @@ class RecoveryCoordinator:
         )
         if pending_round is None:
             raise RuntimeError("Session has no pending tool round.")
-        if pending_round.round_id != request.round_id:
+        if pending_round.tool_round_id != request.round_id:
             raise ValueError(f"Tool round id does not match pending round: {request.round_id}")
         effective_structured_output = _effective_tool_round_structured_output(
             structured_output=request.structured_output,
@@ -1074,6 +1075,11 @@ class RecoveryCoordinator:
         emit_resume_event: bool = True,
     ) -> AsyncGenerator[Event, None]:
         environment_name = _environment_name(registered_environment)
+        tool_round_identity = ToolRoundIdentity(
+            tool_round_id=pending.tool_round_id,
+            model_step_id=pending.model_step_id,
+            model_attempt_id=pending.model_attempt_id,
+        )
         pending_cleared = False
         tool_outcomes: list[runtime_records.ToolCallOutcome] = []
         # Restore the original run's config persisted on the pending input; explicit overrides
@@ -1129,6 +1135,7 @@ class RecoveryCoordinator:
                         agent_name=registered_agent.spec.name,
                         environment_name=environment_name,
                         payload={
+                            **tool_round_identity.payload(),
                             "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
                             "input_id": pending.input_id,
                             "tool_call_id": pending.tool_call_id,
@@ -1172,6 +1179,7 @@ class RecoveryCoordinator:
                 events=resume_events,
                 pending_calls=pending.tool_calls,
                 input_id=pending.input_id,
+                tool_round_identity=tool_round_identity,
             )
             pending_by_id = {call.tool_call_id: call for call in pending.tool_calls}
 
@@ -1188,6 +1196,7 @@ class RecoveryCoordinator:
                     registered_tool = registered_agent.tools.get(tool_call.name)
                     idempotency_key = tool_execution.tool_idempotency_key(
                         session_id=session.id,
+                        tool_round_id=tool_round_identity.tool_round_id,
                         tool_call_id=tool_call.id,
                         pause_id=pending.input_id,
                     )
@@ -1198,6 +1207,7 @@ class RecoveryCoordinator:
                         is_error=False,
                     )
                     started_payload: dict[str, Any] = {
+                        **tool_round_identity.payload(),
                         "tool_call_id": tool_call.id,
                         "idempotency_key": idempotency_key,
                         "arguments": deepcopy(tool_call.arguments),
@@ -1226,6 +1236,7 @@ class RecoveryCoordinator:
                             environment_name=environment_name,
                             tool_name=tool_call.name,
                             payload={
+                                **tool_round_identity.payload(),
                                 "tool_call_id": tool_call.id,
                                 "idempotency_key": idempotency_key,
                                 "input_id": pending.input_id,
@@ -1261,6 +1272,7 @@ class RecoveryCoordinator:
                     )
                     idempotency_key = tool_execution.tool_idempotency_key(
                         session_id=session.id,
+                        tool_round_id=tool_round_identity.tool_round_id,
                         tool_call_id=tool_call.id,
                         pause_id=pending.input_id,
                     )
@@ -1275,6 +1287,7 @@ class RecoveryCoordinator:
                             environment_name=environment_name,
                             tool_name=tool_call.name,
                             payload={
+                                **tool_round_identity.payload(),
                                 "tool_call_id": tool_call.id,
                                 "idempotency_key": idempotency_key,
                                 "input_id": pending.input_id,
@@ -1310,6 +1323,7 @@ class RecoveryCoordinator:
                     check_policy=False,
                     policy_result=policy_result,
                     input_id=pending.input_id,
+                    tool_round_identity=tool_round_identity,
                     taint_labels=call_taint_labels,
                 ):
                     yield event
@@ -1318,7 +1332,10 @@ class RecoveryCoordinator:
 
             # The resume executes the round's tools sequentially in model order, so the outcome
             # list already lines up with the assistant tool-call parts.
-            tool_result_messages = transcript_helpers.tool_result_messages(tool_outcomes)
+            tool_result_messages = transcript_helpers.tool_result_messages(
+                tool_outcomes,
+                tool_round_identity=tool_round_identity,
+            )
             transcript.extend(tool_result_messages)
             cleared_checkpoint = await self._checkpoint_without_pending_user_input(session.id)
             await self._session_store.append_transcript_messages_and_transform_checkpoint(
@@ -1380,6 +1397,7 @@ class RecoveryCoordinator:
                         exc,
                         redactor=self._secret_redactor,
                     ),
+                    **tool_round_identity.payload(),
                     "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
                     "user_input": pending.model_dump(mode="json"),
                 }
@@ -1431,6 +1449,11 @@ class RecoveryCoordinator:
         enforce_expiry: bool = True,
     ) -> AsyncGenerator[Event, None]:
         environment_name = _environment_name(registered_environment)
+        tool_round_identity = ToolRoundIdentity(
+            tool_round_id=pending_approval.tool_round_id,
+            model_step_id=pending_approval.model_step_id,
+            model_attempt_id=pending_approval.model_attempt_id,
+        )
         pending_approval_cleared = False
         tool_outcomes: list[runtime_records.ToolCallOutcome] = []
         expired = False
@@ -1543,6 +1566,7 @@ class RecoveryCoordinator:
                         environment_name=environment_name,
                         tool_name=pending_approval.tool_name,
                         payload={
+                            **tool_round_identity.payload(),
                             "approval_id": pending_approval.approval_id,
                             "tool_call_id": pending_approval.tool_call_id,
                             "expires_at": expired_at_iso,
@@ -1633,6 +1657,10 @@ class RecoveryCoordinator:
                         registered_provider.provider.billing_provider_name
                         or registered_provider.name
                     ),
+                    execution_identity=ModelAttemptIdentity(
+                        model_step_id=tool_round_identity.model_step_id,
+                        model_attempt_id=tool_round_identity.model_attempt_id,
+                    ),
                 )
                 for event in limit_evaluation.events:
                     yield event
@@ -1678,6 +1706,7 @@ class RecoveryCoordinator:
                     result = tool_execution.blocked_tool_result(policy_result, reason=reason)
                     idempotency_key = tool_execution.tool_idempotency_key(
                         session_id=session.id,
+                        tool_round_id=tool_round_identity.tool_round_id,
                         tool_call_id=tool_call.id,
                         approval_id=pending_approval.approval_id,
                     )
@@ -1692,6 +1721,7 @@ class RecoveryCoordinator:
                             environment_name=environment_name,
                             tool_name=tool_call.name,
                             payload={
+                                **tool_round_identity.payload(),
                                 "approval_id": pending_approval.approval_id,
                                 "tool_call_id": tool_call.id,
                                 "idempotency_key": idempotency_key,
@@ -1730,6 +1760,7 @@ class RecoveryCoordinator:
                             environment_name=environment_name,
                             tool_name=tool_call.name,
                             payload={
+                                **tool_round_identity.payload(),
                                 "approval_id": pending_approval.approval_id,
                                 "tool_call_id": tool_call.id,
                                 "reason": request.reason,
@@ -1752,6 +1783,7 @@ class RecoveryCoordinator:
                     )
                     idempotency_key = tool_execution.tool_idempotency_key(
                         session_id=session.id,
+                        tool_round_id=tool_round_identity.tool_round_id,
                         tool_call_id=tool_call.id,
                         approval_id=pending_approval.approval_id,
                     )
@@ -1766,6 +1798,7 @@ class RecoveryCoordinator:
                             environment_name=environment_name,
                             tool_name=tool_call.name,
                             payload={
+                                **tool_round_identity.payload(),
                                 "approval_id": pending_approval.approval_id,
                                 "tool_call_id": tool_call.id,
                                 "idempotency_key": idempotency_key,
@@ -1799,13 +1832,17 @@ class RecoveryCoordinator:
                     check_policy=False,
                     emit_started=True,
                     approval_id=pending_approval.approval_id,
+                    tool_round_identity=tool_round_identity,
                     taint_labels=call_taint_labels,
                 ):
                     yield event
                     if outcome is not None:
                         tool_outcomes.append(outcome)
 
-            tool_result_messages = transcript_helpers.tool_result_messages(tool_outcomes)
+            tool_result_messages = transcript_helpers.tool_result_messages(
+                tool_outcomes,
+                tool_round_identity=tool_round_identity,
+            )
             transcript.extend(tool_result_messages)
             cleared_checkpoint = await approval_support.checkpoint_without_pending_approval(
                 self._session_store,
@@ -1822,7 +1859,7 @@ class RecoveryCoordinator:
                     session=session,
                     agent_name=registered_agent.spec.name,
                     environment_name=environment_name,
-                    approval_id=pending_approval.approval_id,
+                    approval=pending_approval,
                 )
             )
 
@@ -1893,6 +1930,7 @@ class RecoveryCoordinator:
                                     exc,
                                     redactor=self._secret_redactor,
                                 ),
+                                **tool_round_identity.payload(),
                                 "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
                                 "approval": pending_approval.model_dump(mode="json"),
                                 "approval_id": pending_approval.approval_id,
@@ -1927,6 +1965,7 @@ class RecoveryCoordinator:
                                     exc,
                                     redactor=self._secret_redactor,
                                 ),
+                                **tool_round_identity.payload(),
                                 "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
                                 "approval": pending_approval.model_dump(mode="json"),
                             },
@@ -2118,6 +2157,11 @@ class RecoveryCoordinator:
         registered_provider: runtime_records.RegisteredProvider,
         registered_environment: runtime_records.RegisteredEnvironment | None,
     ) -> AsyncGenerator[Event, None]:
+        tool_round_identity = ToolRoundIdentity(
+            tool_round_id=pending.tool_round_id,
+            model_step_id=pending.model_step_id,
+            model_attempt_id=pending.model_attempt_id,
+        )
         recovery_prepared = False
         recovery_persisted = False
         cancellation_baseline = _task_cancellation_count()
@@ -2142,6 +2186,7 @@ class RecoveryCoordinator:
                 pending_calls=pending.tool_calls,
                 tool_call_id=request.tool_call_id,
                 input_id=pending.input_id,
+                tool_round_identity=tool_round_identity,
             )
             factory_started_event = await self._environment_lifecycle.emit_factory_started(
                 session=session,
@@ -2174,6 +2219,7 @@ class RecoveryCoordinator:
                             agent_name=registered_agent.spec.name,
                             environment_name=environment_name,
                             payload={
+                                **tool_round_identity.payload(),
                                 "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
                                 "user_input": pending.model_dump(mode="json"),
                                 **_environment_factory_resolution_error_payload(
@@ -2198,9 +2244,11 @@ class RecoveryCoordinator:
                     environment_name=environment_name,
                     tool_name=pending_tool_call.tool_name,
                     payload={
+                        **tool_round_identity.payload(),
                         "tool_call_id": pending_tool_call.tool_call_id,
                         "idempotency_key": tool_execution.tool_idempotency_key(
                             session_id=session.id,
+                            tool_round_id=tool_round_identity.tool_round_id,
                             tool_call_id=pending_tool_call.tool_call_id,
                             pause_id=pending.input_id,
                         ),
@@ -2223,6 +2271,7 @@ class RecoveryCoordinator:
                     agent_name=registered_agent.spec.name,
                     environment_name=environment_name,
                     payload={
+                        **tool_round_identity.payload(),
                         "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
                         "input_id": pending.input_id,
                         "tool_call_id": pending.tool_call_id,
@@ -2315,6 +2364,7 @@ class RecoveryCoordinator:
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
                         payload={
+                            **tool_round_identity.payload(),
                             "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
                             "user_input": pending.model_dump(mode="json"),
                             "input_id": pending.input_id,
@@ -2432,6 +2482,11 @@ class RecoveryCoordinator:
         registered_provider: runtime_records.RegisteredProvider,
         registered_environment: runtime_records.RegisteredEnvironment | None,
     ) -> AsyncGenerator[Event, None]:
+        tool_round_identity = ToolRoundIdentity(
+            tool_round_id=pending_approval.tool_round_id,
+            model_step_id=pending_approval.model_step_id,
+            model_attempt_id=pending_approval.model_attempt_id,
+        )
         recovery_prepared = False
         recovery_persisted = False
         cancellation_baseline = _task_cancellation_count()
@@ -2491,6 +2546,7 @@ class RecoveryCoordinator:
                             agent_name=registered_agent.spec.name,
                             environment_name=environment_name,
                             payload={
+                                **tool_round_identity.payload(),
                                 "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
                                 "approval": pending_approval.model_dump(mode="json"),
                                 **_environment_factory_resolution_error_payload(
@@ -2516,10 +2572,12 @@ class RecoveryCoordinator:
                     environment_name=environment_name,
                     tool_name=pending_tool_call.tool_name,
                     payload={
+                        **tool_round_identity.payload(),
                         "approval_id": pending_approval.approval_id,
                         "tool_call_id": pending_tool_call.tool_call_id,
                         "idempotency_key": tool_execution.tool_idempotency_key(
                             session_id=session.id,
+                            tool_round_id=tool_round_identity.tool_round_id,
                             tool_call_id=pending_tool_call.tool_call_id,
                             approval_id=pending_approval.approval_id,
                         ),
@@ -2631,6 +2689,7 @@ class RecoveryCoordinator:
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
                         payload={
+                            **tool_round_identity.payload(),
                             "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
                             "approval": pending_approval.model_dump(mode="json"),
                             "approval_id": pending_approval.approval_id,
@@ -2757,7 +2816,7 @@ class RecoveryCoordinator:
             )
             if current_round is None:
                 raise RuntimeError("Session has no pending tool round.")
-            if current_round.round_id != pending_round.round_id:
+            if current_round.tool_round_id != pending_round.tool_round_id:
                 raise RuntimeError("Pending tool round changed before recovery claimed it.")
             if current_round != pending_round:
                 raise RuntimeError("Pending tool round changed before recovery claimed it.")
@@ -2815,7 +2874,7 @@ class RecoveryCoordinator:
                 "claimed_at": claimed_at.isoformat(),
                 "claim_expires_at": claim_expires_at.isoformat(),
                 "operation": "manual_tool_round_recovery",
-                "tool_round_id": pending_round.round_id,
+                **tool_round_recovery.pending_tool_round_identity(pending_round).payload(),
                 "tool_call_id": pending_tool_call.tool_call_id,
             }
             return updated
@@ -2860,7 +2919,7 @@ class RecoveryCoordinator:
                         "claimed_at": claimed_at.isoformat(),
                         "claim_expires_at": claim_expires_at.isoformat(),
                         "operation": "manual_tool_round_interruption_fence",
-                        "tool_round_id": pending_round.round_id,
+                        **tool_round_recovery.pending_tool_round_identity(pending_round).payload(),
                         "tool_call_id": pending_tool_call.tool_call_id,
                     }
                     return updated
@@ -3429,7 +3488,7 @@ class RecoveryCoordinator:
                     registered_environment=registered_environment,
                     payload={
                         "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
-                        "tool_round_id": pending_round.round_id,
+                        **tool_round_recovery.pending_tool_round_identity(pending_round).payload(),
                         **_environment_factory_resolution_error_payload(
                             factory_resolution.error,
                             redactor=self._secret_redactor,
@@ -3446,11 +3505,11 @@ class RecoveryCoordinator:
                     environment_name=environment_name,
                     tool_name=pending_tool_call.tool_name,
                     payload={
-                        "tool_round_id": pending_round.round_id,
+                        **tool_round_recovery.pending_tool_round_identity(pending_round).payload(),
                         "tool_call_id": pending_tool_call.tool_call_id,
                         "idempotency_key": tool_execution.tool_idempotency_key(
                             session_id=session.id,
-                            tool_round_id=pending_round.round_id,
+                            tool_round_id=pending_round.tool_round_id,
                             tool_call_id=pending_tool_call.tool_call_id,
                         ),
                         "manual_recovery": True,
@@ -3472,7 +3531,7 @@ class RecoveryCoordinator:
                     environment_name=environment_name,
                     payload={
                         "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
-                        "tool_round_id": pending_round.round_id,
+                        **tool_round_recovery.pending_tool_round_identity(pending_round).payload(),
                         "tool_call_id": pending_tool_call.tool_call_id,
                         "resolved_by": resolution_actor_payload(request.resolved_by),
                     },
@@ -3524,7 +3583,7 @@ class RecoveryCoordinator:
                     payload={
                         "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
                         "manual_recovery_required": True,
-                        "tool_round_id": pending_round.round_id,
+                        **tool_round_recovery.pending_tool_round_identity(pending_round).payload(),
                         "tool_call_id": next_call.tool_call_id,
                         "tool_name": next_call.tool_name,
                     },
@@ -3607,7 +3666,9 @@ class RecoveryCoordinator:
                         registered_environment=registered_environment,
                         payload={
                             "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
-                            "tool_round_id": pending_round.round_id,
+                            **tool_round_recovery.pending_tool_round_identity(
+                                pending_round
+                            ).payload(),
                             "tool_call_id": pending_tool_call.tool_call_id,
                             "manual_recovery_stale_live_failure": True,
                             **diagnostic.payload_fields(),
@@ -3663,7 +3724,7 @@ class RecoveryCoordinator:
                 registered_environment=registered_environment,
                 payload={
                     "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
-                    "tool_round_id": pending_round.round_id,
+                    **tool_round_recovery.pending_tool_round_identity(pending_round).payload(),
                     "tool_call_id": pending_tool_call.tool_call_id,
                     **persistence_payload,
                     **diagnostic.payload_fields(),
@@ -3757,6 +3818,7 @@ class RecoveryCoordinator:
             self._session_store,
             request.session.id,
             request.tool_calls,
+            tool_round_identity=request.tool_round_identity,
         ):
             return
         terminal_event_exists = (
@@ -3765,13 +3827,13 @@ class RecoveryCoordinator:
         interrupted_results = _interrupted_tool_round_results(
             tool_calls=request.tool_calls,
             completed_outcomes=request.tool_outcomes,
-            tool_round_id=request.tool_round_id,
+            tool_round_identity=request.tool_round_identity,
             cancellation_artifacts=request.cancellation_artifacts,
             cancellation_artifacts_by_id=request.cancellation_artifacts_by_id,
         )
         interrupted_results = await self.reattach_subagent_children_in_outcomes(
             session_id=request.session.id,
-            tool_round_id=request.tool_round_id,
+            tool_round_id=request.tool_round_identity.tool_round_id,
             outcomes=interrupted_results,
         )
         tool_outcomes = tool_results.redact_tool_call_outcomes(
@@ -3796,7 +3858,7 @@ class RecoveryCoordinator:
                         registered_agent=request.registered_agent,
                         registered_environment=request.registered_environment,
                         tool_call_outcome=interrupted_result,
-                        tool_round_id=request.tool_round_id,
+                        tool_round_identity=request.tool_round_identity,
                     )
                 )
         tool_outcomes.extend(interrupted_results)
@@ -3804,6 +3866,7 @@ class RecoveryCoordinator:
             request.tool_calls,
             tool_outcomes,
             parallel=True,
+            tool_round_identity=request.tool_round_identity,
         )
         request.messages.extend(interrupted_messages)
         cleared_checkpoint = await self._tool_round_executor.checkpoint_without_pending_tool_round(
@@ -3878,10 +3941,12 @@ class RecoveryCoordinator:
             )
 
         pending_tool_calls = tool_round_recovery.pending_round_tool_calls(pending_round)
+        tool_round_identity = tool_round_recovery.pending_tool_round_identity(pending_round)
         if await transcript_helpers.tool_round_has_result_messages(
             self._session_store,
             session.id,
             pending_tool_calls,
+            tool_round_identity=tool_round_identity,
         ):
             await self._clear_pending_tool_round_if_matches(session.id, pending_round)
             yield await self._event_writer.emit(
@@ -3892,7 +3957,7 @@ class RecoveryCoordinator:
                     environment_name=environment_name,
                     payload={
                         "checkpoint": tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY,
-                        "tool_round_id": pending_round.round_id,
+                        **tool_round_recovery.pending_tool_round_identity(pending_round).payload(),
                         "cleared": True,
                     },
                 )
@@ -3923,7 +3988,7 @@ class RecoveryCoordinator:
             )
             expected_idempotency_key = tool_execution.tool_idempotency_key(
                 session_id=session.id,
-                tool_round_id=pending_round.round_id,
+                tool_round_id=pending_round.tool_round_id,
                 tool_call_id=pending_tool_call.tool_call_id,
             )
             result = self._reattached_subagent_result(
@@ -3931,7 +3996,7 @@ class RecoveryCoordinator:
                 expected_idempotency_key,
                 tool_call_id=pending_tool_call.tool_call_id,
                 tool_name=pending_tool_call.tool_name,
-                tool_round_id=pending_round.round_id,
+                tool_round_id=pending_round.tool_round_id,
             )
             if result is None:
                 result = tool_round_recovery.unknown_recovered_tool_result(
@@ -3950,7 +4015,7 @@ class RecoveryCoordinator:
                     environment_name=environment_name,
                     tool_name=tool_call.name,
                     payload={
-                        "tool_round_id": pending_round.round_id,
+                        **tool_round_recovery.pending_tool_round_identity(pending_round).payload(),
                         "tool_call_id": tool_call.id,
                         "idempotency_key": expected_idempotency_key,
                         "recovered": True,
@@ -3968,7 +4033,10 @@ class RecoveryCoordinator:
                 if outcome is not None:
                     tool_outcomes.append(outcome)
 
-        tool_result_messages = transcript_helpers.tool_result_messages(tool_outcomes)
+        tool_result_messages = transcript_helpers.tool_result_messages(
+            tool_outcomes,
+            tool_round_identity=tool_round_identity,
+        )
         insert_at = len(messages) - tail_message_count
         if insert_at < 0:
             raise RuntimeError("Pending tool round recovery received an invalid tail size.")
@@ -3989,7 +4057,7 @@ class RecoveryCoordinator:
                 environment_name=environment_name,
                 payload={
                     "checkpoint": tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY,
-                    "tool_round_id": pending_round.round_id,
+                    **tool_round_recovery.pending_tool_round_identity(pending_round).payload(),
                     "cleared": True,
                     "recovered_tool_calls": len(tool_outcomes),
                 },
@@ -4955,6 +5023,9 @@ class RecoveryCoordinator:
         if session.status in {SessionStatus.PENDING, SessionStatus.RUNNING}:
             if pending_approval is not None:
                 interrupt_payload = {
+                    "model_step_id": pending_approval.model_step_id,
+                    "model_attempt_id": pending_approval.model_attempt_id,
+                    "tool_round_id": pending_approval.tool_round_id,
                     "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
                     "approval": pending_approval.model_dump(mode="json"),
                     "recovered": True,
@@ -4963,11 +5034,22 @@ class RecoveryCoordinator:
                 }
             elif pending_user_input is not None:
                 interrupt_payload = {
+                    "model_step_id": pending_user_input.model_step_id,
+                    "model_attempt_id": pending_user_input.model_attempt_id,
+                    "tool_round_id": pending_user_input.tool_round_id,
                     "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
                     "user_input": pending_user_input.model_dump(mode="json"),
                     "recovered": True,
                     "reason": reason,
                     "metadata": metadata,
+                }
+            elif pending_tool_round is not None:
+                interrupt_payload = {
+                    **tool_round_recovery.pending_tool_round_identity(pending_tool_round).payload(),
+                    "reason": reason,
+                    "metadata": metadata,
+                    "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                    "recovered": True,
                 }
             else:
                 interrupt_payload = {
@@ -5138,7 +5220,7 @@ class RecoveryCoordinator:
             redactor=self._secret_redactor,
             consume_on_rejection=True,
         )
-        if current is None or current.round_id != pending_round.round_id:
+        if current is None or current.tool_round_id != pending_round.tool_round_id:
             return
         copied_checkpoint.pop(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY, None)
         await self._session_store.transform_checkpoint(
@@ -5215,7 +5297,7 @@ def _interrupted_tool_round_results(
     *,
     tool_calls: list[runtime_records.ToolCallRequest],
     completed_outcomes: list[runtime_records.ToolCallOutcome],
-    tool_round_id: str | None = None,
+    tool_round_identity: ToolRoundIdentity,
     cancellation_artifacts: list[dict[str, Any]] | None = None,
     cancellation_artifacts_by_id: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[runtime_records.ToolCallOutcome]:
@@ -5237,8 +5319,7 @@ def _interrupted_tool_round_results(
             "tool_call_id": tool_call.id,
             "tool_name": tool_call.name,
         }
-        if tool_round_id is not None:
-            structured["tool_round_id"] = tool_round_id
+        structured.update(tool_round_identity.payload())
         interrupted_outcomes.append(
             runtime_records.ToolCallOutcome(
                 call=tool_call,
@@ -5259,19 +5340,18 @@ def _interrupted_tool_call_event(
     registered_agent: runtime_records.RegisteredAgentState,
     registered_environment: runtime_records.RegisteredEnvironment | None,
     tool_call_outcome: runtime_records.ToolCallOutcome,
-    tool_round_id: str | None = None,
+    tool_round_identity: ToolRoundIdentity,
 ) -> Event:
     payload = {
         "tool_call_id": tool_call_outcome.call.id,
         "idempotency_key": tool_execution.tool_idempotency_key(
             session_id=session.id,
-            tool_round_id=tool_round_id,
+            tool_round_id=tool_round_identity.tool_round_id,
             tool_call_id=tool_call_outcome.call.id,
         ),
         "result": tool_call_outcome.result.model_dump(),
+        **tool_round_identity.payload(),
     }
-    if tool_round_id is not None:
-        payload["tool_round_id"] = tool_round_id
     return Event(
         type=(
             EventType.TOOL_CALL_FAILED

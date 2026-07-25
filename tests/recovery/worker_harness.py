@@ -717,7 +717,7 @@ async def _run_ordinary_tool(config: dict[str, Any]) -> dict[str, Any]:
             async for _ in app.recover_tool_round(
                 ToolRoundRecoveryRequest(
                     session_id=session_id,
-                    round_id=pending["round_id"],
+                    round_id=pending["tool_round_id"],
                     tool_call_id="call_side_effect",
                     outcome=ToolApprovalRecoveryOutcome.COMPLETED,
                     message="External marker verified the side effect.",

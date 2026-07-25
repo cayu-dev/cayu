@@ -30,6 +30,7 @@ from cayu.runtime import (
     SessionQuery,
     SessionStatus,
     SessionStore,
+    ToolRoundIdentity,
     TranscriptQuery,
     TranscriptRecord,
     session_usage_summary,
@@ -723,6 +724,8 @@ async def _session_tools(args: argparse.Namespace, store: SessionStore) -> int:
             "sequence",
             "tool",
             "tool_call_id",
+            "model_step_id",
+            "model_attempt_id",
             "tool_round_id",
             "parallel_round_width",
             "argument_summary",
@@ -742,14 +745,14 @@ async def _session_tools(args: argparse.Namespace, store: SessionStore) -> int:
 
 
 def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
-    starts: dict[str, EventRecord] = {}
-    terminals: dict[str, EventRecord] = {}
-    approval_requests: dict[str, EventRecord] = {}
-    approval_calls: dict[str, dict[str, Any]] = {}
-    input_requests: dict[str, EventRecord] = {}
-    input_calls: dict[str, dict[str, Any]] = {}
-    decision_records: dict[str, EventRecord] = {}
-    approval_states: dict[str, str] = {}
+    starts: dict[_ToolCallKey, EventRecord] = {}
+    terminals: dict[_ToolCallKey, EventRecord] = {}
+    approval_requests: dict[_ToolCallKey, EventRecord] = {}
+    approval_calls: dict[_ToolCallKey, dict[str, Any]] = {}
+    input_requests: dict[_ToolCallKey, EventRecord] = {}
+    input_calls: dict[_ToolCallKey, dict[str, Any]] = {}
+    decision_records: dict[_ToolCallKey, EventRecord] = {}
+    approval_states: dict[_ToolCallKey, str] = {}
     for record in records:
         event = record.event
         if event.type == EventType.SESSION_AWAITING_USER_INPUT:
@@ -763,8 +766,9 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
                 call_id = call.get("tool_call_id")
                 if type(call_id) is not str:
                     continue
-                input_requests.setdefault(call_id, record)
-                input_calls.setdefault(call_id, call)
+                call_key = _tool_call_key(record, call_id)
+                input_requests.setdefault(call_key, record)
+                input_calls.setdefault(call_key, call)
             continue
         if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED:
             approval = _tool_approval_payload(record)
@@ -780,28 +784,30 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
                 call_id = call.get("tool_call_id")
                 if type(call_id) is not str:
                     continue
-                approval_requests.setdefault(call_id, record)
-                approval_calls.setdefault(call_id, call)
-                approval_states[call_id] = "requested"
+                call_key = _tool_call_key(record, call_id)
+                approval_requests.setdefault(call_key, record)
+                approval_calls.setdefault(call_key, call)
+                approval_states[call_key] = "requested"
             continue
         call_id = _tool_event_call_id(record)
         if call_id is None:
             continue
+        call_key = _tool_call_key(record, call_id)
         if event.type == EventType.TOOL_CALL_STARTED:
-            starts.setdefault(call_id, record)
+            starts.setdefault(call_key, record)
         elif event.type in _TOOL_TERMINAL_TYPES:
-            terminals.setdefault(call_id, record)
+            terminals.setdefault(call_key, record)
         elif event.type == EventType.TOOL_CALL_APPROVED:
-            approval_states[call_id] = "approved"
-            decision_records.setdefault(call_id, record)
+            approval_states[call_key] = "approved"
+            decision_records.setdefault(call_key, record)
         elif event.type == EventType.TOOL_CALL_APPROVAL_DENIED:
-            approval_states[call_id] = "denied"
-            decision_records.setdefault(call_id, record)
+            approval_states[call_key] = "denied"
+            decision_records.setdefault(call_key, record)
         elif event.type == EventType.TOOL_CALL_APPROVAL_EXPIRED:
-            approval_states[call_id] = "expired"
-            decision_records.setdefault(call_id, record)
+            approval_states[call_key] = "expired"
+            decision_records.setdefault(call_key, record)
 
-    call_id_set = (
+    call_keys = (
         starts.keys()
         | terminals.keys()
         | approval_requests.keys()
@@ -809,45 +815,46 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
         | decision_records.keys()
     )
     anchors = {
-        call_id: (
-            starts.get(call_id)
-            or approval_requests.get(call_id)
-            or input_requests.get(call_id)
-            or terminals.get(call_id)
-            or decision_records[call_id]
+        call_key: (
+            starts.get(call_key)
+            or approval_requests.get(call_key)
+            or input_requests.get(call_key)
+            or terminals.get(call_key)
+            or decision_records[call_key]
         )
-        for call_id in call_id_set
+        for call_key in call_keys
     }
-    group_ids = {
-        call_id: _tool_event_group_id(
-            starts.get(call_id),
-            terminals.get(call_id),
-            approval_requests.get(call_id),
-            input_requests.get(call_id),
-            decision_records.get(call_id),
-        )
-        for call_id in call_id_set
-    }
-    round_widths: dict[str, int] = {}
-    for round_id in group_ids.values():
-        if round_id is not None:
-            round_widths[round_id] = round_widths.get(round_id, 0) + 1
+    round_widths: dict[tuple[str, str, str], int] = {}
+    for model_step_id, model_attempt_id, round_id, _, invalid_event_id in call_keys:
+        if round_id is None or invalid_event_id is not None:
+            continue
+        round_key = (model_step_id or "", model_attempt_id or "", round_id)
+        round_widths[round_key] = round_widths.get(round_key, 0) + 1
 
     rows: list[dict[str, Any]] = []
-    call_ids = sorted(
-        call_id_set,
-        key=lambda call_id: (anchors[call_id].sequence, call_id),
+    ordered_call_keys = sorted(
+        call_keys,
+        key=lambda call_key: (
+            anchors[call_key].sequence,
+            call_key[3],
+            anchors[call_key].event.id,
+        ),
     )
-    for call_id in call_ids:
-        started = starts.get(call_id)
-        approval_request = approval_requests.get(call_id)
-        approval_call = approval_calls.get(call_id)
-        input_request = input_requests.get(call_id)
-        input_call = input_calls.get(call_id)
-        anchor = anchors[call_id]
-        terminal = terminals.get(call_id)
-        round_id = group_ids[call_id]
-        approval_state = approval_states.get(call_id, "none")
+    for call_key in ordered_call_keys:
+        model_step_id, model_attempt_id, round_id, call_id, invalid_event_id = call_key
+        started = starts.get(call_key)
+        approval_request = approval_requests.get(call_key)
+        approval_call = approval_calls.get(call_key)
+        input_request = input_requests.get(call_key)
+        input_call = input_calls.get(call_key)
+        anchor = anchors[call_key]
+        terminal = terminals.get(call_key)
+        approval_state = approval_states.get(call_key, "none")
+        round_key = (
+            None
+            if round_id is None or invalid_event_id is not None
+            else (model_step_id or "", model_attempt_id or "", round_id)
+        )
         result = None
         inspection_result = None
         if terminal is not None:
@@ -894,8 +901,10 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
                 "sequence": anchor.sequence,
                 "tool": tool_name,
                 "tool_call_id": call_id,
+                "model_step_id": model_step_id,
+                "model_attempt_id": model_attempt_id,
                 "tool_round_id": round_id,
-                "parallel_round_width": (1 if round_id is None else round_widths[round_id]),
+                "parallel_round_width": 1 if round_key is None else round_widths[round_key],
                 "argument_summary": argument_summary,
                 "started_at": (None if started is None else started.event.timestamp.isoformat()),
                 "completed_at": (
@@ -950,26 +959,36 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
     return rows
 
 
-def _tool_event_group_id(*records: EventRecord | None) -> str | None:
-    for record in records:
-        if record is None:
-            continue
-        round_id = _tool_event_round_id(record)
-        if round_id is not None:
-            return round_id
-    for record in records:
-        if record is None:
-            continue
-        approval_id = record.event.payload.get("approval_id")
-        if type(approval_id) is not str:
-            approval = _tool_approval_payload(record)
-            approval_id = None if approval is None else approval.get("approval_id")
-        if type(approval_id) is str:
-            return f"approval:{approval_id}"
-        input_id = record.event.payload.get("input_id")
-        if type(input_id) is str:
-            return f"input:{input_id}"
-    return None
+_ToolCallKey = tuple[str | None, str | None, str | None, str, str | None]
+
+
+def _tool_call_key(record: EventRecord, call_id: str) -> _ToolCallKey:
+    """Return an exact round/call join key, isolating malformed evidence."""
+
+    identity = _tool_event_identity(record)
+    if identity is None:
+        return None, None, None, call_id, record.event.id
+    return (
+        identity.model_step_id,
+        identity.model_attempt_id,
+        identity.tool_round_id,
+        call_id,
+        None,
+    )
+
+
+def _tool_event_identity(record: EventRecord) -> ToolRoundIdentity | None:
+    payload = record.event.payload
+    try:
+        return ToolRoundIdentity.model_validate(
+            {
+                "model_step_id": payload.get("model_step_id"),
+                "model_attempt_id": payload.get("model_attempt_id"),
+                "tool_round_id": payload.get("tool_round_id"),
+            }
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 def _tool_event_call_id(record: EventRecord) -> str | None:
@@ -981,11 +1000,6 @@ def _tool_event_call_id(record: EventRecord) -> str | None:
         return None
     nested_call_id = approval.get("tool_call_id")
     return nested_call_id if type(nested_call_id) is str else None
-
-
-def _tool_event_round_id(record: EventRecord) -> str | None:
-    round_id = record.event.payload.get("tool_round_id")
-    return round_id if type(round_id) is str else None
 
 
 def _tool_approval_payload(record: EventRecord | None) -> dict[str, Any] | None:
@@ -1346,7 +1360,14 @@ def _usage_inspection_record(record: EventRecord) -> EventRecord:
 def _tool_inspection_record(record: EventRecord) -> EventRecord:
     event = record.event
     payload: dict[str, Any] = {}
-    for key in ("tool_call_id", "tool_round_id", "approval_id", "input_id"):
+    for key in (
+        "tool_call_id",
+        "model_step_id",
+        "model_attempt_id",
+        "tool_round_id",
+        "approval_id",
+        "input_id",
+    ):
         if key in event.payload:
             payload[key] = event.payload[key]
     if event.type == EventType.TOOL_CALL_STARTED:

@@ -35,6 +35,7 @@ from cayu.runtime import (
     ToolPolicyDecision,
     ToolPolicyRequest,
     ToolPolicyResult,
+    ToolRoundIdentity,
     UserInputRecoveryRequest,
     UserInputResponse,
 )
@@ -250,6 +251,13 @@ async def _collect(app: CayuApp, request: RunRequest) -> list[Event]:
     return [event async for event in app.run(request)]
 
 
+def _tool_round_identity_payload(events: list[Event]) -> dict[str, str]:
+    pause = next(event for event in events if event.type == EventType.SESSION_AWAITING_USER_INPUT)
+    return {
+        key: pause.payload[key] for key in ("model_step_id", "model_attempt_id", "tool_round_id")
+    }
+
+
 def _tool_result_parts(transcript) -> list[ToolResultPart]:
     tool_message = next(message for message in transcript if message.role == "tool")
     return [part for part in tool_message.content if isinstance(part, ToolResultPart)]
@@ -359,6 +367,7 @@ def test_resolve_user_input_injects_answer_and_continues() -> None:
     )
     assert completed.payload["idempotency_key"] == tool_execution.tool_idempotency_key(
         session_id="s_resume",
+        tool_round_id=completed.payload["tool_round_id"],
         tool_call_id="call_1",
         pause_id=input_id,
     )
@@ -868,6 +877,7 @@ def test_mixed_round_executes_other_tools_and_keeps_model_order() -> None:
         assert event.payload["input_id"] == input_id
         assert event.payload["idempotency_key"] == tool_execution.tool_idempotency_key(
             session_id="s_mixed",
+            tool_round_id=event.payload["tool_round_id"],
             tool_call_id=call_id,
             pause_id=input_id,
         )
@@ -1401,7 +1411,10 @@ def test_retry_after_crashed_sibling_flags_manual_recovery_not_re_execute() -> N
                 session_id="s_crash",
                 agent_name="assistant",
                 tool_name="count",
-                payload={"tool_call_id": "call_1"},
+                payload={
+                    **_tool_round_identity_payload(pause),
+                    "tool_call_id": "call_1",
+                },
             ),
         )
     )
@@ -1460,7 +1473,10 @@ def test_recover_user_input_rejects_native_structured_output_for_unsupported_pro
                 session_id="s_rec_native",
                 agent_name="assistant",
                 tool_name="count",
-                payload={"tool_call_id": "call_1"},
+                payload={
+                    **_tool_round_identity_payload(pause),
+                    "tool_call_id": "call_1",
+                },
             ),
         )
     )
@@ -1527,9 +1543,10 @@ def test_recover_user_input_rejects_secret_structured_output_before_transition()
             ),
         )
     )
-    input_id = next(
+    awaiting_input = next(
         event for event in pause if event.type == EventType.SESSION_AWAITING_USER_INPUT
-    ).payload["input_id"]
+    )
+    input_id = awaiting_input.payload["input_id"]
     asyncio.run(
         store.append_event(
             session_id,
@@ -1538,7 +1555,12 @@ def test_recover_user_input_rejects_secret_structured_output_before_transition()
                 session_id=session_id,
                 agent_name="assistant",
                 tool_name="count",
-                payload={"tool_call_id": "call_1"},
+                payload={
+                    "tool_call_id": "call_1",
+                    "model_step_id": awaiting_input.payload["model_step_id"],
+                    "model_attempt_id": awaiting_input.payload["model_attempt_id"],
+                    "tool_round_id": awaiting_input.payload["tool_round_id"],
+                },
             ),
         )
     )
@@ -1613,7 +1635,10 @@ def test_recover_user_input_supplies_outcome_and_completes() -> None:
                 session_id="s_rec",
                 agent_name="assistant",
                 tool_name="count",
-                payload={"tool_call_id": "call_1"},
+                payload={
+                    **_tool_round_identity_payload(pause),
+                    "tool_call_id": "call_1",
+                },
             ),
         )
     )
@@ -1648,6 +1673,7 @@ def test_recover_user_input_supplies_outcome_and_completes() -> None:
     )
     assert recovered_tool_event.payload["idempotency_key"] == tool_execution.tool_idempotency_key(
         session_id="s_rec",
+        tool_round_id=recovered_tool_event.payload["tool_round_id"],
         tool_call_id="call_1",
         pause_id=input_id,
     )
@@ -1709,7 +1735,10 @@ def test_recover_user_input_reconciles_ambiguous_append_acknowledgement() -> Non
                 session_id=session_id,
                 agent_name="assistant",
                 tool_name="count",
-                payload={"tool_call_id": "call_1"},
+                payload={
+                    **_tool_round_identity_payload(paused),
+                    "tool_call_id": "call_1",
+                },
             ),
         )
         stuck = await _drain(
@@ -1798,7 +1827,10 @@ def test_recover_user_input_post_persist_fanout_failure_stays_resumable(
                 session_id=session_id,
                 agent_name="assistant",
                 tool_name="count",
-                payload={"tool_call_id": "call_1"},
+                payload={
+                    **_tool_round_identity_payload(paused),
+                    "tool_call_id": "call_1",
+                },
             ),
         )
         stuck = await _drain(
@@ -1909,7 +1941,10 @@ def test_recover_user_input_post_persist_cleanup_failure_is_not_suppressed() -> 
                 session_id=session_id,
                 agent_name="assistant",
                 tool_name="count",
-                payload={"tool_call_id": "call_1"},
+                payload={
+                    **_tool_round_identity_payload(paused),
+                    "tool_call_id": "call_1",
+                },
             ),
         )
         stuck = await _drain(
@@ -1992,7 +2027,10 @@ def test_recover_user_input_closes_continuation_before_aclose_returns() -> None:
                 session_id=session_id,
                 agent_name="assistant",
                 tool_name="count",
-                payload={"tool_call_id": "call_1"},
+                payload={
+                    **_tool_round_identity_payload(pause),
+                    "tool_call_id": "call_1",
+                },
             ),
         )
         stuck = await _drain(
@@ -2066,7 +2104,10 @@ def test_recover_user_input_task_cancellation_finalizes_continuation() -> None:
                 session_id=session_id,
                 agent_name="assistant",
                 tool_name="count",
-                payload={"tool_call_id": "call_count"},
+                payload={
+                    **_tool_round_identity_payload(pause),
+                    "tool_call_id": "call_count",
+                },
             ),
         )
         stuck = await _drain(
@@ -2283,7 +2324,10 @@ def test_recover_after_reused_id_prior_round_is_not_wrongly_rejected() -> None:
                 session_id="s_reuse_rec",
                 agent_name="assistant",
                 tool_name="count",
-                payload={"tool_call_id": "call_1"},
+                payload={
+                    **_tool_round_identity_payload(pause),
+                    "tool_call_id": "call_1",
+                },
             ),
         )
     )
@@ -2317,13 +2361,20 @@ def test_recover_after_reused_id_prior_round_is_not_wrongly_rejected() -> None:
 
 
 def test_recorded_round_outcomes_anchors_from_recovered_interrupted_event() -> None:
-    # Regression: if the awaiting event was never durably appended (crash after the pending
-    # checkpoint), the resume window must anchor from the recovered session.interrupted event so a
-    # retry sees the sibling already ran — not re-run it (duplicate side effect).
+    # Direct round identity scopes retry evidence even when the awaiting event was
+    # never durably appended after checkpoint publication.
     from cayu.runtime._approval_support import recorded_round_tool_outcomes
     from cayu.runtime.approvals import PendingToolCallApproval
 
     pending_calls = [PendingToolCallApproval(tool_call_id="call_1", tool_name="count")]
+    model_step_id = f"mstep_{'1' * 32}"
+    model_attempt_id = f"matt_{'2' * 32}"
+    tool_round_id = f"tround_{'3' * 32}"
+    identity_payload = {
+        "model_step_id": model_step_id,
+        "model_attempt_id": model_attempt_id,
+        "tool_round_id": tool_round_id,
+    }
     events = [
         # A prior round reused call_1 and produced a terminal — must be excluded (before boundary).
         Event(
@@ -2338,15 +2389,30 @@ def test_recorded_round_outcomes_anchors_from_recovered_interrupted_event() -> N
             payload={"interruption_type": "user_input_required", "user_input": {"input_id": "X"}},
         ),
         # A resume attempt started+completed call_1 before failing to close the transcript.
-        Event(type=EventType.TOOL_CALL_STARTED, session_id="s", payload={"tool_call_id": "call_1"}),
+        Event(
+            type=EventType.TOOL_CALL_STARTED,
+            session_id="s",
+            payload={"tool_call_id": "call_1", **identity_payload},
+        ),
         Event(
             type=EventType.TOOL_CALL_COMPLETED,
             session_id="s",
-            payload={"tool_call_id": "call_1", "result": ToolResult(content="fresh").model_dump()},
+            payload={
+                "tool_call_id": "call_1",
+                **identity_payload,
+                "result": ToolResult(content="fresh").model_dump(),
+            },
         ),
     ]
     recorded = recorded_round_tool_outcomes(
-        events=events, pending_calls=pending_calls, input_id="X"
+        events=events,
+        pending_calls=pending_calls,
+        input_id="X",
+        tool_round_identity=ToolRoundIdentity(
+            model_step_id=model_step_id,
+            model_attempt_id=model_attempt_id,
+            tool_round_id=tool_round_id,
+        ),
     )
     assert "call_1" in recorded  # window is anchored (the awaiting-only code returned {})
     assert recorded["call_1"].result.content == "fresh"  # not the stale prior-round outcome

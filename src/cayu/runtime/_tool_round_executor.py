@@ -72,6 +72,11 @@ from cayu.runtime._session_control import (
 from cayu.runtime._session_queries import query_all_event_records
 from cayu.runtime.approvals import PendingToolApproval, copy_pending_tool_approval
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
+from cayu.runtime.execution_units import (
+    ModelAttemptIdentity,
+    ToolRoundIdentity,
+    copy_tool_round_identity,
+)
 from cayu.runtime.hooks import (
     AfterToolCallDecision,
     BeforeToolCallDecision,
@@ -146,7 +151,7 @@ class ToolRoundLimitRequest:
     messages: list[Message]
     tool_calls: list[runtime_records.ToolCallRequest]
     completed_tool_outcomes: list[runtime_records.ToolCallOutcome]
-    tool_round_id: str | None
+    tool_round_identity: ToolRoundIdentity
     run_started_at: float
     turn_usage_tracker: SessionUsageTracker | None
     active_run: ActiveSessionRun[SessionUsageTracker] | None
@@ -160,7 +165,7 @@ class InterruptedToolRoundRequest:
     messages: list[Message]
     tool_calls: list[runtime_records.ToolCallRequest]
     tool_outcomes: list[runtime_records.ToolCallOutcome]
-    tool_round_id: str | None
+    tool_round_identity: ToolRoundIdentity
     cancellation_artifacts: list[dict[str, Any]] | None
     cancellation_artifacts_by_id: dict[str, list[dict[str, Any]]] | None
     cancellation_redactors_by_id: dict[str, SecretRedactor] | None = None
@@ -408,7 +413,9 @@ class ToolRoundExecutor:
         limits: RunLimits | None,
         budget_limits: tuple[BudgetLimit, ...] | None,
         retry_policy: RetryPolicy | None,
+        tool_round_identity: ToolRoundIdentity,
     ) -> tuple[PendingToolApproval, Event]:
+        tool_round_identity = copy_tool_round_identity(tool_round_identity)
         redactor = _redactor_for_tool_calls(
             self._secret_redactor,
             registered_agent=registered_agent,
@@ -441,6 +448,7 @@ class ToolRoundExecutor:
             expires_at = self._clock() + timedelta(seconds=min(bounded_ttls))
         approval = PendingToolApproval(
             approval_id=str(uuid4()),
+            **tool_round_identity.payload(),
             tool_call_id=tool_call.id,
             tool_name=tool_call.name,
             arguments=copy_json_value(tool_call.arguments, "arguments"),
@@ -493,6 +501,7 @@ class ToolRoundExecutor:
                     "checkpoint": approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,
                     "approval_id": approval.approval_id,
                     "tool_call_id": approval.tool_call_id,
+                    **tool_round_identity.payload(),
                 },
             ),
         )
@@ -516,7 +525,9 @@ class ToolRoundExecutor:
         retry_policy: RetryPolicy | None,
         question: str,
         options: list[str],
+        tool_round_identity: ToolRoundIdentity,
     ) -> tuple[PendingUserInput, Event]:
+        tool_round_identity = copy_tool_round_identity(tool_round_identity)
         redactor = _redactor_for_tool_calls(
             self._secret_redactor,
             registered_agent=registered_agent,
@@ -546,6 +557,7 @@ class ToolRoundExecutor:
 
         pending = PendingUserInput(
             input_id=str(uuid4()),
+            **tool_round_identity.payload(),
             tool_call_id=tool_call.id,
             tool_name=tool_call.name,
             question=question,
@@ -597,6 +609,7 @@ class ToolRoundExecutor:
                     "checkpoint": PENDING_USER_INPUT_CHECKPOINT_KEY,
                     "input_id": pending.input_id,
                     "tool_call_id": pending.tool_call_id,
+                    **tool_round_identity.payload(),
                 },
             ),
         )
@@ -611,6 +624,7 @@ class ToolRoundExecutor:
         policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] | None,
         task_id: str | None,
         structured_output: StructuredOutputSpec | None,
+        tool_round_identity: ToolRoundIdentity,
     ) -> tuple[dict[str, Any], tool_round_recovery.PendingToolRound]:
         checkpoint = await self._session_store.load_checkpoint(session.id)
         redactor = _redactor_for_tool_calls(
@@ -626,6 +640,7 @@ class ToolRoundExecutor:
             tool_calls=tool_calls,
             policy_outcomes=policy_outcomes,
             structured_output=structured_output,
+            tool_round_identity=tool_round_identity,
             redactor=redactor,
         )
 
@@ -674,10 +689,13 @@ class ToolRoundExecutor:
         emit_started: bool = True,
         policy_result: ToolPolicyResult | None = None,
         approval_id: str | None = None,
-        tool_round_id: str | None = None,
+        tool_round_identity: ToolRoundIdentity,
         input_id: str | None = None,
         taint_labels: frozenset[str] | None = None,
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
+        tool_round_identity = copy_tool_round_identity(tool_round_identity)
+        identity_payload = tool_round_identity.payload()
+        tool_round_id = tool_round_identity.tool_round_id
         environment_name = _environment_name(registered_environment)
         invocation_redactor = _redactor_for_tool_calls(
             self._secret_redactor,
@@ -706,11 +724,10 @@ class ToolRoundExecutor:
                 "tool_call_id": tool_call.id,
                 "idempotency_key": idempotency_key,
                 "arguments": deepcopy(tool_call.arguments),
+                **identity_payload,
             }
             if registered_tool is not None:
                 payload["effect"] = registered_tool.effect.value
-            if tool_round_id is not None:
-                payload["tool_round_id"] = tool_round_id
             if approval_id is not None:
                 payload["approval_id"] = approval_id
             if input_id is not None:
@@ -740,9 +757,8 @@ class ToolRoundExecutor:
                 "tool_call_id": tool_call.id,
                 "idempotency_key": idempotency_key,
                 "result": result.model_dump(),
+                **identity_payload,
             }
-            if tool_round_id is not None:
-                payload["tool_round_id"] = tool_round_id
             if approval_id is not None:
                 payload["approval_id"] = approval_id
             if input_id is not None:
@@ -793,9 +809,8 @@ class ToolRoundExecutor:
                         metadata=resolved_policy_result.metadata,
                     ),
                     "result": result.model_dump(),
+                    **identity_payload,
                 }
-                if tool_round_id is not None:
-                    payload["tool_round_id"] = tool_round_id
                 if approval_id is not None:
                     payload["approval_id"] = approval_id
                 if input_id is not None:
@@ -836,6 +851,7 @@ class ToolRoundExecutor:
                     limits=None,
                     budget_limits=None,
                     retry_policy=None,
+                    tool_round_identity=tool_round_identity,
                 )
                 yield (
                     await self._event_writer.emit(
@@ -855,7 +871,12 @@ class ToolRoundExecutor:
                                 agent_name=registered_agent.spec.name,
                                 environment_name=environment_name,
                                 tool_name=tool_call.name,
-                                payload={"approval": approval.model_dump(mode="json")},
+                                payload={
+                                    **identity_payload,
+                                    "approval_id": approval.approval_id,
+                                    "tool_call_id": approval.tool_call_id,
+                                    "approval": approval.model_dump(mode="json"),
+                                },
                             ),
                             redactor=invocation_redactor,
                         )
@@ -874,7 +895,7 @@ class ToolRoundExecutor:
             agent_name=registered_agent.spec.name,
             environment_name=environment_name,
             tool_name=tool_call.name,
-            payload={"tool_call_id": tool_call.id},
+            payload={"tool_call_id": tool_call.id, **identity_payload},
         )
         before_resolution = _BeforeToolCallResolution(arguments=deepcopy(tool_call.arguments))
         async for hook_event in self._run_before_tool_call_hooks(
@@ -913,7 +934,7 @@ class ToolRoundExecutor:
                     **effective_arguments_payload,
                 },
                 task_id=task_id,
-                tool_round_id=tool_round_id,
+                tool_round_identity=tool_round_identity,
                 approval_id=approval_id,
                 input_id=input_id,
                 allow_modification=False,
@@ -940,7 +961,7 @@ class ToolRoundExecutor:
                     **effective_arguments_payload,
                 },
                 task_id=task_id,
-                tool_round_id=tool_round_id,
+                tool_round_identity=tool_round_identity,
                 approval_id=approval_id,
                 input_id=input_id,
                 allow_modification=True,
@@ -989,7 +1010,7 @@ class ToolRoundExecutor:
                         "idempotency_key": idempotency_key,
                     },
                     task_id=task_id,
-                    tool_round_id=tool_round_id,
+                    tool_round_identity=tool_round_identity,
                     approval_id=approval_id,
                     input_id=input_id,
                     allow_modification=False,
@@ -1058,7 +1079,7 @@ class ToolRoundExecutor:
                     registered_environment=registered_environment,
                     tool_call=tool_call,
                     records=proxy_authorizations,
-                    tool_round_id=tool_round_id,
+                    tool_round_identity=tool_round_identity,
                     approval_id=approval_id,
                     input_id=input_id,
                     idempotency_key=idempotency_key,
@@ -1081,9 +1102,8 @@ class ToolRoundExecutor:
                 "result": result.model_dump(),
                 **effective_arguments_payload,
                 **execution_outcome.terminal_payload_fields(),
+                **identity_payload,
             }
-            if tool_round_id is not None:
-                payload["tool_round_id"] = tool_round_id
             if approval_id is not None:
                 payload["approval_id"] = approval_id
             if input_id is not None:
@@ -1113,7 +1133,7 @@ class ToolRoundExecutor:
             registered_environment=registered_environment,
             tool_call=tool_call,
             records=proxy_authorizations,
-            tool_round_id=tool_round_id,
+            tool_round_identity=tool_round_identity,
             approval_id=approval_id,
             input_id=input_id,
             idempotency_key=idempotency_key,
@@ -1143,7 +1163,7 @@ class ToolRoundExecutor:
                     ),
                 },
                 task_id=task_id,
-                tool_round_id=tool_round_id,
+                tool_round_identity=tool_round_identity,
                 approval_id=approval_id,
                 input_id=input_id,
                 allow_modification=False,
@@ -1538,12 +1558,13 @@ class ToolRoundExecutor:
         registered_environment: runtime_records.RegisteredEnvironment | None,
         tool_call: runtime_records.ToolCallRequest,
         records: list[invocation_secrets.ProxyAuthorizationRecord],
-        tool_round_id: str | None,
+        tool_round_identity: ToolRoundIdentity,
         approval_id: str | None,
         input_id: str | None,
         redactor: SecretRedactor,
         idempotency_key: str | None = None,
     ) -> AsyncIterator[Event]:
+        identity_payload = copy_tool_round_identity(tool_round_identity).payload()
         for record in records:
             payload: dict[str, Any] = {
                 "tool_call_id": tool_call.id,
@@ -1554,11 +1575,10 @@ class ToolRoundExecutor:
                 "allowed": record.result.allowed,
                 "reason": record.result.reason,
                 "result_metadata": copy_json_value(record.result.metadata, "result_metadata"),
+                **identity_payload,
             }
             if idempotency_key is not None:
                 payload["idempotency_key"] = idempotency_key
-            if tool_round_id is not None:
-                payload["tool_round_id"] = tool_round_id
             if approval_id is not None:
                 payload["approval_id"] = approval_id
             if input_id is not None:
@@ -1588,7 +1608,7 @@ class ToolRoundExecutor:
         result: ToolResult,
         extra_payload: dict[str, Any],
         task_id: str | None,
-        tool_round_id: str | None,
+        tool_round_identity: ToolRoundIdentity,
         approval_id: str | None,
         input_id: str | None,
         allow_modification: bool,
@@ -1598,9 +1618,8 @@ class ToolRoundExecutor:
             "tool_call_id": tool_call.id,
             **extra_payload,
             "result": result.model_dump(),
+            **copy_tool_round_identity(tool_round_identity).payload(),
         }
-        if tool_round_id is not None:
-            payload["tool_round_id"] = tool_round_id
         if approval_id is not None:
             payload["approval_id"] = approval_id
         if input_id is not None:
@@ -2007,8 +2026,13 @@ class ToolRoundRun:
         *,
         messages: list[Message],
         tool_calls: list[runtime_records.ToolCallRequest],
-        tool_round_id: str | None,
+        tool_round_identity: ToolRoundIdentity,
     ) -> AsyncIterator[Event]:
+        tool_round_identity = copy_tool_round_identity(tool_round_identity)
+        model_attempt_identity = ModelAttemptIdentity(
+            model_step_id=tool_round_identity.model_step_id,
+            model_attempt_id=tool_round_identity.model_attempt_id,
+        )
         self.stopped_for_limit = False
         executor = self._executor
         session = self._session
@@ -2029,19 +2053,20 @@ class ToolRoundRun:
                 messages=messages,
                 tool_calls=tool_calls,
                 tool_outcomes=tool_outcomes,
-                tool_round_id=tool_round_id,
+                tool_round_identity=tool_round_identity,
             ):
                 yield event
             raise
 
         limit_evaluation = await self._limit_gate.evaluate_limits(
             pending_tool_calls=len(tool_calls),
+            execution_identity=model_attempt_identity,
         )
         async for event in self._apply_limit_evaluation(
             limit_evaluation,
             messages=messages,
             tool_calls=tool_calls,
-            tool_round_id=tool_round_id,
+            tool_round_identity=tool_round_identity,
         ):
             yield event
         if limit_evaluation.decision is not None:
@@ -2067,6 +2092,7 @@ class ToolRoundRun:
                     limits=self._limits,
                     budget_limits=self._budget_limits,
                     retry_policy=self._retry_policy,
+                    tool_round_identity=tool_round_identity,
                 )
                 yield await executor._event_writer.emit(checkpoint_event)
                 yield await executor._event_writer.emit(
@@ -2076,7 +2102,12 @@ class ToolRoundRun:
                         agent_name=self._registered_agent.spec.name,
                         environment_name=self._environment_name,
                         tool_name=approval.tool_name,
-                        payload={"approval": approval.model_dump(mode="json")},
+                        payload={
+                            **tool_round_identity.payload(),
+                            "approval_id": approval.approval_id,
+                            "tool_call_id": approval.tool_call_id,
+                            "approval": approval.model_dump(mode="json"),
+                        },
                     )
                 )
             except (SessionInterruptedByRequest, asyncio.CancelledError) as exc:
@@ -2085,7 +2116,7 @@ class ToolRoundRun:
                     messages=messages,
                     tool_calls=tool_calls,
                     tool_outcomes=tool_outcomes,
-                    tool_round_id=tool_round_id,
+                    tool_round_identity=tool_round_identity,
                     clear_pending_approval=True,
                 ):
                     yield event
@@ -2117,6 +2148,7 @@ class ToolRoundRun:
                 retry_policy=self._retry_policy,
                 question=question,
                 options=options,
+                tool_round_identity=tool_round_identity,
             )
             yield await executor._event_writer.emit(checkpoint_event)
             yield await executor._event_writer.emit(
@@ -2127,6 +2159,7 @@ class ToolRoundRun:
                     environment_name=self._environment_name,
                     tool_name=user_input_call.name,
                     payload={
+                        **tool_round_identity.payload(),
                         "input_id": pending_input.input_id,
                         "tool_call_id": pending_input.tool_call_id,
                         "question": pending_input.question,
@@ -2148,7 +2181,7 @@ class ToolRoundRun:
                         tool_calls=segment_calls,
                         tool_outcomes=tool_outcomes,
                         policy_results_by_id=policy_results_by_id,
-                        tool_round_id=tool_round_id,
+                        tool_round_identity=tool_round_identity,
                         taint_labels_by_id=policy_plan.active_taint_labels,
                     )
                 else:
@@ -2158,7 +2191,7 @@ class ToolRoundRun:
                         round_tool_calls=tool_calls,
                         tool_outcomes=tool_outcomes,
                         policy_results_by_id=policy_results_by_id,
-                        tool_round_id=tool_round_id,
+                        tool_round_identity=tool_round_identity,
                         taint_labels_by_id=policy_plan.active_taint_labels,
                     )
                 async for event, outcome in call_stream:
@@ -2175,7 +2208,7 @@ class ToolRoundRun:
                 messages=messages,
                 tool_calls=tool_calls,
                 tool_outcomes=tool_outcomes,
-                tool_round_id=tool_round_id,
+                tool_round_identity=tool_round_identity,
             ):
                 yield event
             raise
@@ -2184,6 +2217,7 @@ class ToolRoundRun:
             tool_calls,
             tool_outcomes,
             parallel=any_parallel,
+            tool_round_identity=tool_round_identity,
         )
         messages.extend(tool_result_messages)
         cleared_checkpoint = await executor.checkpoint_without_pending_tool_round(session.id)
@@ -2210,7 +2244,7 @@ class ToolRoundRun:
         messages: list[Message],
         tool_calls: list[runtime_records.ToolCallRequest],
         completed_tool_outcomes: list[runtime_records.ToolCallOutcome] | None = None,
-        tool_round_id: str | None,
+        tool_round_identity: ToolRoundIdentity,
     ) -> AsyncIterator[Event]:
         request = ToolRoundLimitRequest(
             evaluation=evaluation,
@@ -2223,7 +2257,7 @@ class ToolRoundRun:
             completed_tool_outcomes=(
                 [] if completed_tool_outcomes is None else completed_tool_outcomes
             ),
-            tool_round_id=tool_round_id,
+            tool_round_identity=copy_tool_round_identity(tool_round_identity),
             run_started_at=self._run_started_at,
             turn_usage_tracker=self._turn_usage_tracker,
             active_run=self._active_run,
@@ -2238,7 +2272,7 @@ class ToolRoundRun:
         messages: list[Message],
         tool_calls: list[runtime_records.ToolCallRequest],
         tool_outcomes: list[runtime_records.ToolCallOutcome],
-        tool_round_id: str | None,
+        tool_round_identity: ToolRoundIdentity,
         clear_pending_approval: bool = False,
     ) -> AsyncIterator[Event]:
         cancellation_artifacts: list[dict[str, Any]] | None = None
@@ -2285,7 +2319,7 @@ class ToolRoundRun:
             messages=messages,
             tool_calls=tool_calls,
             tool_outcomes=tool_outcomes,
-            tool_round_id=tool_round_id,
+            tool_round_identity=copy_tool_round_identity(tool_round_identity),
             cancellation_artifacts=cancellation_artifacts,
             cancellation_artifacts_by_id=cancellation_artifacts_by_id,
             cancellation_redactors_by_id=cancellation_redactors_by_id,
@@ -2320,21 +2354,28 @@ class ToolRoundRun:
         tool_calls: list[runtime_records.ToolCallRequest],
         tool_outcomes: list[runtime_records.ToolCallOutcome],
         policy_results_by_id: dict[str, ToolPolicyResult | None],
-        tool_round_id: str | None,
+        tool_round_identity: ToolRoundIdentity,
         round_tool_calls: list[runtime_records.ToolCallRequest] | None = None,
         taint_labels_by_id: Mapping[str, frozenset[str]] = MappingProxyType({}),
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
         if round_tool_calls is None:
             round_tool_calls = tool_calls
+        model_attempt_identity = ModelAttemptIdentity(
+            model_step_id=tool_round_identity.model_step_id,
+            model_attempt_id=tool_round_identity.model_attempt_id,
+        )
         for tool_call in tool_calls:
             await self._executor._session_control.raise_if_interrupted(self._session.id)
-            limit_evaluation = await self._limit_gate.evaluate_limits(pending_tool_calls=1)
+            limit_evaluation = await self._limit_gate.evaluate_limits(
+                pending_tool_calls=1,
+                execution_identity=model_attempt_identity,
+            )
             async for event in self._apply_limit_evaluation(
                 limit_evaluation,
                 messages=messages,
                 tool_calls=round_tool_calls,
                 completed_tool_outcomes=tool_outcomes,
-                tool_round_id=tool_round_id,
+                tool_round_identity=tool_round_identity,
             ):
                 yield event, None
             if limit_evaluation.decision is not None:
@@ -2348,7 +2389,7 @@ class ToolRoundRun:
                 request_metadata=self._request_metadata,
                 task_id=self._task_id,
                 policy_result=policy_results_by_id.get(tool_call.id),
-                tool_round_id=tool_round_id,
+                tool_round_identity=tool_round_identity,
                 taint_labels=taint_labels_by_id.get(tool_call.id, frozenset()),
             ):
                 yield event, outcome
@@ -2360,7 +2401,7 @@ class ToolRoundRun:
         tool_calls: list[runtime_records.ToolCallRequest],
         tool_outcomes: list[runtime_records.ToolCallOutcome],
         policy_results_by_id: dict[str, ToolPolicyResult | None],
-        tool_round_id: str | None,
+        tool_round_identity: ToolRoundIdentity,
         taint_labels_by_id: Mapping[str, frozenset[str]] = MappingProxyType({}),
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
         semaphore = asyncio.Semaphore(self._executor._max_parallel_tool_calls)
@@ -2381,7 +2422,7 @@ class ToolRoundRun:
                         request_metadata=self._request_metadata,
                         task_id=self._task_id,
                         policy_result=policy_results_by_id.get(tool_call.id),
-                        tool_round_id=tool_round_id,
+                        tool_round_identity=tool_round_identity,
                         taint_labels=taint_labels_by_id.get(tool_call.id, frozenset()),
                     ):
                         buffers[index].append(item)
@@ -2434,7 +2475,7 @@ class ToolRoundRun:
                 buffers[index].append(
                     self._abnormal_tool_termination_item(
                         tool_call=tool_call,
-                        tool_round_id=tool_round_id,
+                        tool_round_identity=tool_round_identity,
                     )
                 )
         for buffer in buffers:
@@ -2445,7 +2486,7 @@ class ToolRoundRun:
         self,
         *,
         tool_call: runtime_records.ToolCallRequest,
-        tool_round_id: str | None,
+        tool_round_identity: ToolRoundIdentity,
     ) -> tuple[Event, runtime_records.ToolCallOutcome]:
         result = ToolResult(
             content="Tool call did not complete: the parallel task terminated abnormally.",
@@ -2461,13 +2502,12 @@ class ToolRoundRun:
             "idempotency_key": tool_execution.tool_idempotency_key(
                 session_id=self._session.id,
                 tool_call_id=tool_call.id,
-                tool_round_id=tool_round_id,
+                tool_round_id=tool_round_identity.tool_round_id,
             ),
             "abnormal_termination": True,
             "result": result.model_dump(),
+            **copy_tool_round_identity(tool_round_identity).payload(),
         }
-        if tool_round_id is not None:
-            payload["tool_round_id"] = tool_round_id
         return (
             Event(
                 type=EventType.TOOL_CALL_FAILED,
@@ -2486,11 +2526,15 @@ def ordered_tool_result_messages(
     outcomes: list[runtime_records.ToolCallOutcome],
     *,
     parallel: bool,
+    tool_round_identity: ToolRoundIdentity,
 ) -> list[Message]:
     if parallel:
         order = {tool_call.id: index for index, tool_call in enumerate(tool_calls)}
         outcomes = sorted(outcomes, key=lambda outcome: order.get(outcome.call.id, len(order)))
-    return transcript_helpers.tool_result_messages(outcomes)
+    return transcript_helpers.tool_result_messages(
+        outcomes,
+        tool_round_identity=tool_round_identity,
+    )
 
 
 def _first_user_input_tool_call(
@@ -3278,6 +3322,8 @@ _POLICY_DENIAL_CONTROL_PAYLOAD_FIELDS = frozenset(
         "denied_by",
         "idempotency_key",
         "input_id",
+        "model_attempt_id",
+        "model_step_id",
         "tool_call_id",
         "tool_name",
         "tool_round_id",

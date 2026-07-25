@@ -26,6 +26,7 @@ from cayu.runtime._recovery_coordinator import (
 from cayu.runtime.approvals import PendingToolApproval, PendingToolCallApproval
 from cayu.runtime.budgets import BudgetLimit
 from cayu.runtime.costs import ModelPrice, PriceBook
+from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.sessions import CheckpointTransform, Session, SessionStatus
 from cayu.runtime.stop_policy import RunLimits
@@ -34,6 +35,9 @@ from cayu.runtime.stop_policy import RunLimits
 def _pending_approval(**kwargs) -> PendingToolApproval:
     return PendingToolApproval(
         approval_id="appr_1",
+        model_step_id=f"mstep_{'1' * 32}",
+        model_attempt_id=f"matt_{'2' * 32}",
+        tool_round_id=f"tround_{'3' * 32}",
         tool_call_id="call_1",
         tool_name="side_effect",
         agent_name="assistant",
@@ -55,6 +59,14 @@ def _budget_limit(max_estimated_cost: str) -> BudgetLimit:
                 ),
             )
         ),
+    )
+
+
+def _tool_round_identity() -> ToolRoundIdentity:
+    return ToolRoundIdentity(
+        model_step_id=f"mstep_{'1' * 32}",
+        model_attempt_id=f"matt_{'2' * 32}",
+        tool_round_id=f"tround_{'3' * 32}",
     )
 
 
@@ -137,6 +149,7 @@ def test_interrupted_tool_round_results_attaches_artifacts_by_tool_call_id() -> 
     keyed = _interrupted_tool_round_results(
         tool_calls=[a, b],
         completed_outcomes=[],
+        tool_round_identity=_tool_round_identity(),
         cancellation_artifacts_by_id={"B": [{"producer": "B"}]},
     )
     by_id = {outcome.call.id: outcome for outcome in keyed}
@@ -146,6 +159,7 @@ def test_interrupted_tool_round_results_attaches_artifacts_by_tool_call_id() -> 
     fallback = _interrupted_tool_round_results(
         tool_calls=[a, b],
         completed_outcomes=[],
+        tool_round_identity=_tool_round_identity(),
         cancellation_artifacts=[{"producer": "unknown"}],
     )
     by_id = {outcome.call.id: outcome for outcome in fallback}

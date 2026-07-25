@@ -425,6 +425,7 @@ def test_thinking_only_step_is_think_only() -> None:
         step=0,
         model_step_id=model_attempt_identity.model_step_id,
         model_attempt_id=model_attempt_identity.model_attempt_id,
+        tool_round_identity=None,
         assistant_message=None,
         tool_calls=[],
         completion=ModelCompletion(finish_reason=ModelFinishReason.STOP),
@@ -654,6 +655,9 @@ def test_thinking_threads_through_request_copies() -> None:
 
     pending = PendingToolApproval(
         approval_id="a",
+        model_step_id=f"mstep_{'1' * 32}",
+        model_attempt_id=f"matt_{'2' * 32}",
+        tool_round_id=f"tround_{'3' * 32}",
         tool_call_id="t",
         tool_name="x",
         agent_name="ag",

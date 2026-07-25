@@ -331,9 +331,22 @@ def test_g2b_tool_approval_pause_then_resume() -> None:
     interrupted = pause_events[-1]
     assert interrupted.payload["interruption_type"] == "tool_approval_required"
 
-    approval_id = next(
+    approval_event = next(
         event for event in pause_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
-    ).payload["approval"]["approval_id"]
+    )
+    approval_id = approval_event.payload["approval"]["approval_id"]
+    assert approval_event.payload["approval_id"] == approval_id
+    assert approval_event.payload["tool_call_id"] == "call_1"
+    completed_event = next(
+        event for event in pause_events if event.type == EventType.MODEL_COMPLETED
+    )
+    assert {
+        key: approval_event.payload[key]
+        for key in ("model_step_id", "model_attempt_id", "tool_round_id")
+    } == {
+        key: completed_event.payload[key]
+        for key in ("model_step_id", "model_attempt_id", "tool_round_id")
+    }
 
     resume_events = asyncio.run(
         _collect(

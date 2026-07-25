@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from typing import Any
-from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from cayu._validation import (
     copy_durable_json_value,
@@ -20,8 +19,9 @@ from cayu.runtime._checkpoint_redaction import (
 )
 from cayu.runtime.approvals import (
     PendingToolCallApproval,
-    copy_pending_tool_call_approval,
+    copy_distinct_pending_tool_call_approvals,
 )
+from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.runtime.sessions import Session, SessionStatus
 from cayu.runtime.structured_output import (
     StructuredOutputSpec,
@@ -46,20 +46,31 @@ class PendingToolRound(BaseModel):
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
-    round_id: str = Field(default_factory=lambda: str(uuid4()))
+    tool_round_id: str
+    model_step_id: str
+    model_attempt_id: str
     agent_name: str
     environment_name: str | None = None
     task_id: str | None = None
     tool_calls: list[PendingToolCallApproval]
     structured_output: StructuredOutputSpec | None = None
 
-    @field_validator("round_id", "agent_name")
+    @field_validator("agent_name")
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
         return require_clean_nonblank(
             require_durable_text(value, info.field_name),
             info.field_name,
         )
+
+    @model_validator(mode="after")
+    def validate_tool_round_identity(self) -> PendingToolRound:
+        ToolRoundIdentity(
+            tool_round_id=self.tool_round_id,
+            model_step_id=self.model_step_id,
+            model_attempt_id=self.model_attempt_id,
+        )
+        return self
 
     @field_validator("environment_name", "task_id")
     @classmethod
@@ -81,10 +92,10 @@ class PendingToolRound(BaseModel):
         cls,
         value: list[PendingToolCallApproval],
     ) -> list[PendingToolCallApproval]:
-        copied = [copy_pending_tool_call_approval(call) for call in value]
-        if not copied:
-            raise ValueError("Pending tool round must include tool calls.")
-        return copied
+        return copy_distinct_pending_tool_call_approvals(
+            value,
+            owner="Pending tool round",
+        )
 
     @field_validator("structured_output")
     @classmethod
@@ -93,6 +104,16 @@ class PendingToolRound(BaseModel):
         value: StructuredOutputSpec | None,
     ) -> StructuredOutputSpec | None:
         return copy_structured_output_spec(value)
+
+
+def pending_tool_round_identity(pending_round: PendingToolRound) -> ToolRoundIdentity:
+    if type(pending_round) is not PendingToolRound:
+        raise TypeError("Pending tool round must be a PendingToolRound.")
+    return ToolRoundIdentity(
+        tool_round_id=pending_round.tool_round_id,
+        model_step_id=pending_round.model_step_id,
+        model_attempt_id=pending_round.model_attempt_id,
+    )
 
 
 def pending_tool_round_from_checkpoint(
@@ -159,6 +180,7 @@ def checkpoint_with_pending_tool_round(
     tool_calls: list[runtime_records.ToolCallRequest],
     policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] | None,
     structured_output: StructuredOutputSpec | None,
+    tool_round_identity: ToolRoundIdentity,
     redactor: SecretRedactor | None = None,
 ) -> tuple[dict[str, Any], PendingToolRound]:
     copied_checkpoint = (
@@ -175,7 +197,9 @@ def checkpoint_with_pending_tool_round(
     ):
         raise RuntimeError("Session already has a pending tool round.")
 
+    identity = copy_tool_round_identity(tool_round_identity)
     pending_round = PendingToolRound(
+        **identity.payload(),
         agent_name=agent_name,
         environment_name=environment_name,
         task_id=task_id,
@@ -283,10 +307,11 @@ def recorded_tool_outcomes(
     events: list[Event],
     pending_round: PendingToolRound,
 ) -> tuple[dict[str, runtime_records.ToolCallOutcome], set[str]]:
+    identity = pending_tool_round_identity(pending_round)
     ledger = resume_ledger.scan_tool_call_events(
         events=events,
         pending_calls=pending_round.tool_calls,
-        in_scope=lambda event: event.payload.get("tool_round_id") == pending_round.round_id,
+        in_scope=lambda event: identity.matches_payload(event.payload),
         terminal_event_types=_TOOL_ROUND_TERMINAL_EVENT_TYPES,
     )
     return ledger.outcomes, ledger.started_ids
@@ -305,10 +330,11 @@ def validate_tool_round_recovery_target(
     accepts is exactly one the automatic close would otherwise synthesize an
     unknown outcome for.
     """
+    identity = pending_tool_round_identity(pending_round)
     state = resume_ledger.tool_call_recovery_state(
         events=events,
         tool_call_id=tool_call_id,
-        in_scope=lambda event: event.payload.get("tool_round_id") == pending_round.round_id,
+        in_scope=lambda event: identity.matches_payload(event.payload),
         terminal_event_types=_TOOL_ROUND_TERMINAL_EVENT_TYPES,
     )
 
@@ -339,7 +365,7 @@ def unknown_recovered_tool_result(
             structured={
                 "recovered": True,
                 "recovery_reason": "pending_tool_round_not_started",
-                "tool_round_id": pending_round.round_id,
+                **pending_tool_round_identity(pending_round).payload(),
                 "tool_call_id": pending_tool_call.tool_call_id,
                 "tool_name": pending_tool_call.tool_name,
                 "started": False,
@@ -359,7 +385,7 @@ def unknown_recovered_tool_result(
         structured={
             "recovered": True,
             "recovery_reason": "pending_tool_round_missing_terminal_event",
-            "tool_round_id": pending_round.round_id,
+            **pending_tool_round_identity(pending_round).payload(),
             "tool_call_id": pending_tool_call.tool_call_id,
             "tool_name": pending_tool_call.tool_name,
             "started": True,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs this at runtime.
 
 from cayu._validation import (
@@ -16,10 +16,12 @@ from cayu.runtime.approvals import (
     PendingToolCallApproval,
     ResolutionActor,
     ToolApprovalRecoveryOutcome,
+    copy_distinct_pending_tool_call_approvals,
     copy_pending_tool_call_approval,
     copy_resolution_actor,
 )
 from cayu.runtime.budgets import BudgetLimit, copy_budget_limits, copy_request_budget_limits
+from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
@@ -121,6 +123,9 @@ class PendingUserInput(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     input_id: str
+    tool_round_id: str
+    model_step_id: str
+    model_attempt_id: str
     tool_call_id: str
     tool_name: str
     question: str
@@ -142,6 +147,21 @@ class PendingUserInput(BaseModel):
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
         return require_durable_clean_nonblank(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_tool_round_identity(self) -> PendingUserInput:
+        ToolRoundIdentity(
+            tool_round_id=self.tool_round_id,
+            model_step_id=self.model_step_id,
+            model_attempt_id=self.model_attempt_id,
+        )
+        gating_calls = [call for call in self.tool_calls if call.tool_call_id == self.tool_call_id]
+        if len(gating_calls) != 1:
+            raise ValueError("Pending user input must identify exactly one call in its tool round.")
+        gating_call = gating_calls[0]
+        if gating_call.tool_name != self.tool_name or gating_call.arguments != self.arguments:
+            raise ValueError("Pending user-input call details do not match its tool-round record.")
+        return self
 
     @field_validator("question")
     @classmethod
@@ -183,10 +203,10 @@ class PendingUserInput(BaseModel):
         cls,
         value: list[PendingToolCallApproval],
     ) -> list[PendingToolCallApproval]:
-        copied = [copy_pending_tool_call_approval(call) for call in value]
-        if not copied:
-            raise ValueError("Pending user input must include tool calls.")
-        return copied
+        return copy_distinct_pending_tool_call_approvals(
+            value,
+            owner="Pending user input",
+        )
 
     @field_validator("limits")
     @classmethod
@@ -240,6 +260,9 @@ def copy_pending_user_input(pending: PendingUserInput) -> PendingUserInput:
         raise TypeError("Pending user input must be a PendingUserInput.")
     return PendingUserInput(
         input_id=pending.input_id,
+        tool_round_id=pending.tool_round_id,
+        model_step_id=pending.model_step_id,
+        model_attempt_id=pending.model_attempt_id,
         tool_call_id=pending.tool_call_id,
         tool_name=pending.tool_name,
         question=pending.question,

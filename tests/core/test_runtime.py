@@ -189,6 +189,7 @@ from cayu.runtime import (
     ToolPolicyDecision,
     ToolPolicyRequest,
     ToolPolicyResult,
+    ToolRoundIdentity,
     ToolRoundRecoveryRequest,
     TranscriptDigestCompactor,
     UsageTriggeredContextPolicy,
@@ -1251,6 +1252,20 @@ class FailBeforeStopPolicy(LoopPolicy):
 
 async def collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
     return [event async for event in app.run(request)]
+
+
+def tool_round_identity_payload(event: Event) -> dict[str, str]:
+    return {
+        key: event.payload[key] for key in ("model_step_id", "model_attempt_id", "tool_round_id")
+    }
+
+
+def _tool_round_identity() -> ToolRoundIdentity:
+    return ToolRoundIdentity(
+        model_step_id=f"mstep_{'1' * 32}",
+        model_attempt_id=f"matt_{'2' * 32}",
+        tool_round_id=f"tround_{'3' * 32}",
+    )
 
 
 async def collect_resume_events(app: CayuApp, request: ResumeRequest) -> list[Event]:
@@ -6750,6 +6765,7 @@ def test_cayu_app_validates_tool_approval_retry_before_binding(tmp_path):
                 environment_name="local",
                 tool_name="workspace_id",
                 payload={
+                    **tool_round_identity_payload(approval_event),
                     "approval_id": approval_id,
                     "tool_call_id": "call_1",
                     "result": ToolResult(content="denied").model_dump(),
@@ -6851,6 +6867,7 @@ def test_cayu_app_validates_tool_approval_retry_before_factory_resolution(tmp_pa
                 environment_name="dynamic",
                 tool_name="workspace_id",
                 payload={
+                    **tool_round_identity_payload(approval_event),
                     "approval_id": approval_id,
                     "tool_call_id": "call_1",
                     "result": ToolResult(content="denied").model_dump(),
@@ -13261,6 +13278,7 @@ def test_cayu_app_rejects_completed_session_with_pending_tool_round():
         ],
         policy_outcomes=None,
         structured_output=None,
+        tool_round_identity=_tool_round_identity(),
     )
 
     async def seed() -> None:
@@ -13294,7 +13312,7 @@ def test_cayu_app_rejects_completed_session_with_pending_tool_round():
     session = asyncio.run(store.load("completed_pending_round"))
     assert session is not None and session.status == SessionStatus.COMPLETED
     assert asyncio.run(store.load_checkpoint("completed_pending_round")) == checkpoint
-    assert pending_round.round_id == checkpoint["pending_tool_round"]["round_id"]
+    assert pending_round.tool_round_id == checkpoint["pending_tool_round"]["tool_round_id"]
 
 
 def test_cayu_app_forks_completed_session_and_preserves_source():
@@ -21253,7 +21271,7 @@ def test_cayu_app_executes_tool_call_and_records_result():
         "idempotency_key": events[3].payload["idempotency_key"],
         "effect": "external",
         "arguments": {"text": "from tool"},
-        "tool_round_id": events[3].payload["tool_round_id"],
+        **tool_round_identity_payload(events[3]),
     }
     assert events[4].payload["tool_round_id"] == events[3].payload["tool_round_id"]
     assert events[4].payload["result"]["content"] == "from tool"
@@ -21353,7 +21371,9 @@ def test_cayu_app_recovers_pending_tool_round_from_recorded_terminal_event():
         and event.payload
         == {
             "checkpoint": "pending_tool_round",
-            "tool_round_id": checkpoint["pending_tool_round"]["round_id"],
+            "model_step_id": checkpoint["pending_tool_round"]["model_step_id"],
+            "model_attempt_id": checkpoint["pending_tool_round"]["model_attempt_id"],
+            "tool_round_id": checkpoint["pending_tool_round"]["tool_round_id"],
             "cleared": True,
             "recovered_tool_calls": 1,
         }
@@ -21481,6 +21501,7 @@ def test_recorded_tool_outcomes_rejects_terminal_event_without_result_payload():
         ],
         policy_outcomes=None,
         structured_output=None,
+        tool_round_identity=_tool_round_identity(),
     )
 
     with pytest.raises(ValueError, match="Terminal tool event is missing result payload"):
@@ -21490,7 +21511,9 @@ def test_recorded_tool_outcomes_rejects_terminal_event_without_result_payload():
                     type=EventType.TOOL_CALL_COMPLETED,
                     session_id="sess_1",
                     payload={
-                        "tool_round_id": pending_round.round_id,
+                        "model_step_id": pending_round.model_step_id,
+                        "model_attempt_id": pending_round.model_attempt_id,
+                        "tool_round_id": pending_round.tool_round_id,
                         "tool_call_id": "call_1",
                     },
                 )
@@ -21561,13 +21584,15 @@ def test_cayu_app_recovers_pending_tool_round_before_tool_started():
     assert len(recovered_failures) == 1
     assert recovered_failures[0].payload["idempotency_key"] == tool_execution.tool_idempotency_key(
         session_id="sess_tool_round_recover_not_started",
-        tool_round_id=checkpoint["pending_tool_round"]["round_id"],
+        tool_round_id=checkpoint["pending_tool_round"]["tool_round_id"],
         tool_call_id="call_1",
     )
     assert recovered_failures[0].payload["result"]["structured"] == {
         "recovered": True,
         "recovery_reason": "pending_tool_round_not_started",
-        "tool_round_id": checkpoint["pending_tool_round"]["round_id"],
+        "model_step_id": checkpoint["pending_tool_round"]["model_step_id"],
+        "model_attempt_id": checkpoint["pending_tool_round"]["model_attempt_id"],
+        "tool_round_id": checkpoint["pending_tool_round"]["tool_round_id"],
         "tool_call_id": "call_1",
         "tool_name": "side_effect",
         "started": False,
@@ -21651,13 +21676,15 @@ def test_cayu_app_recovers_pending_tool_round_with_unknown_tool_outcome():
     assert len(recovered_failures) == 1
     assert recovered_failures[0].payload["idempotency_key"] == tool_execution.tool_idempotency_key(
         session_id="sess_tool_round_recover_unknown",
-        tool_round_id=checkpoint["pending_tool_round"]["round_id"],
+        tool_round_id=checkpoint["pending_tool_round"]["tool_round_id"],
         tool_call_id="call_1",
     )
     assert recovered_failures[0].payload["result"]["structured"] == {
         "recovered": True,
         "recovery_reason": "pending_tool_round_missing_terminal_event",
-        "tool_round_id": checkpoint["pending_tool_round"]["round_id"],
+        "model_step_id": checkpoint["pending_tool_round"]["model_step_id"],
+        "model_attempt_id": checkpoint["pending_tool_round"]["model_attempt_id"],
+        "tool_round_id": checkpoint["pending_tool_round"]["tool_round_id"],
         "tool_call_id": "call_1",
         "tool_name": "side_effect",
         "started": True,
@@ -21715,12 +21742,15 @@ async def _seed_crashed_spawn_parent(
         ],
         policy_outcomes=None,
         structured_output=None,
+        tool_round_identity=_tool_round_identity(),
     )
 
     subagent_meta = {"agent": "reviewer", "mode": mode, "tool_call_id": "call_spawn"}
     if linkage == "correct":
         subagent_meta["idempotency_key"] = tool_execution.tool_idempotency_key(
-            session_id="parent", tool_round_id=pending_round.round_id, tool_call_id="call_spawn"
+            session_id="parent",
+            tool_round_id=pending_round.tool_round_id,
+            tool_call_id="call_spawn",
         )
     elif linkage == "wrong_round":
         subagent_meta["idempotency_key"] = tool_execution.tool_idempotency_key(
@@ -21749,7 +21779,12 @@ async def _seed_crashed_spawn_parent(
             Event(
                 type=EventType.TOOL_CALL_STARTED,
                 session_id="parent",
-                payload={"tool_round_id": pending_round.round_id, "tool_call_id": "call_spawn"},
+                payload={
+                    "model_step_id": pending_round.model_step_id,
+                    "model_attempt_id": pending_round.model_attempt_id,
+                    "tool_round_id": pending_round.tool_round_id,
+                    "tool_call_id": "call_spawn",
+                },
             )
         ],
     )
@@ -21952,8 +21987,11 @@ async def _close_interrupted_spawn_and_collect_events(child_status):
         RunRequest(agent_name="parent", session_id="parent", messages=[Message.text("user", "go")]),
         identity=identity,
     )
+    round_identity = _tool_round_identity()
     key = tool_execution.tool_idempotency_key(
-        session_id="parent", tool_round_id="round-1", tool_call_id="call_spawn"
+        session_id="parent",
+        tool_round_id=round_identity.tool_round_id,
+        tool_call_id="call_spawn",
     )
     await store.create(
         RunRequest(
@@ -21988,7 +22026,7 @@ async def _close_interrupted_spawn_and_collect_events(child_status):
                 runtime_records.ToolCallRequest(id="call_spawn", name="subagent", arguments={})
             ],
             tool_outcomes=[],
-            tool_round_id="round-1",
+            tool_round_identity=round_identity,
             cancellation_artifacts=None,
             cancellation_artifacts_by_id=None,
         )
@@ -22078,7 +22116,7 @@ def test_cayu_app_recovers_pending_tool_round_without_reusing_old_tool_call_id()
         if event.type == EventType.TOOL_CALL_STARTED
     ] == [
         initial_events[3].payload["tool_round_id"],
-        checkpoint["pending_tool_round"]["round_id"],
+        checkpoint["pending_tool_round"]["tool_round_id"],
     ]
     assert any(event.type == EventType.TOOL_CALL_COMPLETED for event in initial_events)
     assert initial_events[-1].type == EventType.SESSION_FAILED
@@ -22103,17 +22141,19 @@ def test_cayu_app_recovers_pending_tool_round_without_reusing_old_tool_call_id()
     assert len(recovered_failures) == 1
     assert (
         recovered_failures[0].payload["tool_round_id"]
-        == checkpoint["pending_tool_round"]["round_id"]
+        == checkpoint["pending_tool_round"]["tool_round_id"]
     )
     assert recovered_failures[0].payload["idempotency_key"] == tool_execution.tool_idempotency_key(
         session_id="sess_tool_round_recover_reused_id",
-        tool_round_id=checkpoint["pending_tool_round"]["round_id"],
+        tool_round_id=checkpoint["pending_tool_round"]["tool_round_id"],
         tool_call_id="call_1",
     )
     assert recovered_failures[0].payload["result"]["structured"] == {
         "recovered": True,
         "recovery_reason": "pending_tool_round_missing_terminal_event",
-        "tool_round_id": checkpoint["pending_tool_round"]["round_id"],
+        "model_step_id": checkpoint["pending_tool_round"]["model_step_id"],
+        "model_attempt_id": checkpoint["pending_tool_round"]["model_attempt_id"],
+        "tool_round_id": checkpoint["pending_tool_round"]["tool_round_id"],
         "tool_call_id": "call_1",
         "tool_name": "side_effect",
         "started": True,
@@ -22404,7 +22444,7 @@ def test_approved_tool_policy_then_command_policy_denial_emits_one_command_block
 def test_cayu_app_recover_tool_round_completed_outcome_resumes_without_unknown():
     session_id = "sess_tool_round_manual_completed"
     app, store, tool, checkpoint = _crashed_tool_round_app(session_id)
-    round_id = checkpoint["pending_tool_round"]["round_id"]
+    round_id = checkpoint["pending_tool_round"]["tool_round_id"]
 
     recovery_events = asyncio.run(
         collect_tool_round_recovery_events(
@@ -22506,7 +22546,7 @@ def test_tool_round_recovery_reconciles_ambiguous_append_acknowledgement() -> No
         session_id,
         store=AmbiguousRecoveryAppendStore(),
     )
-    round_id = checkpoint["pending_tool_round"]["round_id"]
+    round_id = checkpoint["pending_tool_round"]["tool_round_id"]
 
     recovery = asyncio.run(
         collect_tool_round_recovery_events(
@@ -22577,7 +22617,7 @@ def test_tool_round_recovery_interrupts_when_append_reconciliation_is_unavailabl
         session_id,
         store=UnreconcilableRecoveryAppendStore(),
     )
-    round_id = checkpoint["pending_tool_round"]["round_id"]
+    round_id = checkpoint["pending_tool_round"]["tool_round_id"]
 
     recovery = asyncio.run(
         collect_tool_round_recovery_events(
@@ -22631,7 +22671,7 @@ def test_tool_round_recovery_restores_status_when_append_did_not_commit() -> Non
                 app,
                 ToolRoundRecoveryRequest(
                     session_id=session_id,
-                    round_id=checkpoint["pending_tool_round"]["round_id"],
+                    round_id=checkpoint["pending_tool_round"]["tool_round_id"],
                     tool_call_id="call_1",
                     outcome=ToolApprovalRecoveryOutcome.COMPLETED,
                     message="side effect verified externally",
@@ -22658,7 +22698,7 @@ def test_tool_round_recovery_post_persist_fanout_failure_stays_resumable(
     failure_kind = "grouped" if grouped_cancellation else "ordinary"
     session_id = f"sess_tool_round_post_persist_failure_{failure_kind}"
     app, store, tool, checkpoint = _crashed_tool_round_app(session_id)
-    round_id = checkpoint["pending_tool_round"]["round_id"]
+    round_id = checkpoint["pending_tool_round"]["tool_round_id"]
     original_fan_out = app._event_writer.fan_out_persisted
     failed = {"value": False}
     fan_out_failure: BaseException = (
@@ -22774,7 +22814,7 @@ def test_tool_round_recovery_post_persist_failure_preserves_operator_interrupt()
     session_id = "sess_tool_round_post_persist_operator_interrupt"
     store = OperatorInterruptStore()
     app, _store, tool, checkpoint = _crashed_tool_round_app(session_id, store=store)
-    round_id = checkpoint["pending_tool_round"]["round_id"]
+    round_id = checkpoint["pending_tool_round"]["tool_round_id"]
     operator_app = CayuApp(session_store=store, enable_logging=False)
     operator_app.register_provider(FakeProvider([]), default=True)
     operator_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -22879,7 +22919,7 @@ def test_cayu_app_recover_tool_round_task_cancellation_finalizes_session():
         assert initial_events[-1].type == EventType.SESSION_FAILED
         checkpoint = await store.load_checkpoint(session_id)
         assert checkpoint is not None
-        round_id = checkpoint["pending_tool_round"]["round_id"]
+        round_id = checkpoint["pending_tool_round"]["tool_round_id"]
 
         recovery_task = asyncio.create_task(
             collect_tool_round_recovery_events(
@@ -22964,7 +23004,7 @@ def test_cayu_app_recover_tool_round_operator_interrupts_blocked_continuation() 
                 app,
                 ToolRoundRecoveryRequest(
                     session_id=session_id,
-                    round_id=checkpoint["pending_tool_round"]["round_id"],
+                    round_id=checkpoint["pending_tool_round"]["tool_round_id"],
                     tool_call_id="call_1",
                     outcome=ToolApprovalRecoveryOutcome.COMPLETED,
                     message="side effect verified externally",
@@ -23067,7 +23107,7 @@ def test_cayu_app_recover_tool_round_heartbeat_loss_stops_continuation_before_re
         assert initial_events[-1].type == EventType.SESSION_FAILED
         checkpoint = await store.load_checkpoint(session_id)
         assert checkpoint is not None
-        round_id = checkpoint["pending_tool_round"]["round_id"]
+        round_id = checkpoint["pending_tool_round"]["tool_round_id"]
         cleanup_order.clear()
 
         async def fail_heartbeat(**_kwargs) -> None:
@@ -23165,7 +23205,7 @@ def test_cayu_app_recover_tool_round_heartbeat_loss_cleans_up_while_consumer_is_
     app, store, tool, checkpoint = _crashed_tool_round_app(session_id, store=store)
     request = ToolRoundRecoveryRequest(
         session_id=session_id,
-        round_id=checkpoint["pending_tool_round"]["round_id"],
+        round_id=checkpoint["pending_tool_round"]["tool_round_id"],
         tool_call_id="call_1",
         outcome=ToolApprovalRecoveryOutcome.COMPLETED,
         message="side effect verified externally",
@@ -23221,7 +23261,7 @@ def test_cayu_app_recover_tool_round_heartbeat_loss_cleans_up_while_consumer_is_
         assert interrupted is not None and interrupted.status == SessionStatus.INTERRUPTED
         checkpoint_after_cleanup = await store.load_checkpoint(session_id)
         assert checkpoint_after_cleanup is not None
-        assert checkpoint_after_cleanup["pending_tool_round"]["round_id"] == request.round_id
+        assert checkpoint_after_cleanup["pending_tool_round"]["tool_round_id"] == request.round_id
         assert "incomplete_session_recovery_claim" not in checkpoint_after_cleanup
         assert cleanup_order[0] == "heartbeat_lost"
         assert cleanup_order.count("abandoned_finalization") >= 1
@@ -23251,7 +23291,7 @@ def test_cayu_app_recover_tool_round_remains_interruptible_while_consumer_is_pau
     app, store, tool, checkpoint = _crashed_tool_round_app(session_id)
     request = ToolRoundRecoveryRequest(
         session_id=session_id,
-        round_id=checkpoint["pending_tool_round"]["round_id"],
+        round_id=checkpoint["pending_tool_round"]["tool_round_id"],
         tool_call_id="call_1",
         outcome=ToolApprovalRecoveryOutcome.COMPLETED,
         message="side effect verified externally",
@@ -23291,7 +23331,7 @@ def test_cayu_app_recover_tool_round_remains_interruptible_while_consumer_is_pau
         assert interrupted is not None and interrupted.status == SessionStatus.INTERRUPTED
         checkpoint_after_interrupt = await store.load_checkpoint(session_id)
         assert checkpoint_after_interrupt is not None
-        assert checkpoint_after_interrupt["pending_tool_round"]["round_id"] == request.round_id
+        assert checkpoint_after_interrupt["pending_tool_round"]["tool_round_id"] == request.round_id
         assert "incomplete_session_recovery_claim" not in checkpoint_after_interrupt
         terminal_interruptions = [
             event
@@ -23324,7 +23364,7 @@ def test_cayu_app_recover_tool_round_observes_cross_worker_interrupt_while_pause
     other_worker.register_agent(AgentSpec(name="assistant", model="fake-model"))
     request = ToolRoundRecoveryRequest(
         session_id=session_id,
-        round_id=checkpoint["pending_tool_round"]["round_id"],
+        round_id=checkpoint["pending_tool_round"]["tool_round_id"],
         tool_call_id="call_1",
         outcome=ToolApprovalRecoveryOutcome.COMPLETED,
         message="side effect verified externally",
@@ -23367,7 +23407,7 @@ def test_cayu_app_recover_tool_round_observes_cross_worker_interrupt_while_pause
         assert interrupted is not None and interrupted.status == SessionStatus.INTERRUPTED
         checkpoint_after_interrupt = await store.load_checkpoint(session_id)
         assert checkpoint_after_interrupt is not None
-        assert checkpoint_after_interrupt["pending_tool_round"]["round_id"] == request.round_id
+        assert checkpoint_after_interrupt["pending_tool_round"]["tool_round_id"] == request.round_id
         assert "incomplete_session_recovery_claim" not in checkpoint_after_interrupt
         terminal_interruptions = [
             event
@@ -23421,7 +23461,7 @@ def test_cayu_app_recover_tool_round_preserves_cross_worker_interrupt_during_res
     other_worker.register_agent(AgentSpec(name="assistant", model="fake-model"))
     request = ToolRoundRecoveryRequest(
         session_id=session_id,
-        round_id=checkpoint["pending_tool_round"]["round_id"],
+        round_id=checkpoint["pending_tool_round"]["tool_round_id"],
         tool_call_id="call_1",
         outcome=ToolApprovalRecoveryOutcome.COMPLETED,
         message="side effect verified externally",
@@ -23474,7 +23514,7 @@ def test_cayu_app_recover_tool_round_preserves_cross_worker_interrupt_during_res
         assert interrupted is not None and interrupted.status == SessionStatus.INTERRUPTED
         checkpoint_after_interrupt = await store.load_checkpoint(session_id)
         assert checkpoint_after_interrupt is not None
-        assert checkpoint_after_interrupt["pending_tool_round"]["round_id"] == request.round_id
+        assert checkpoint_after_interrupt["pending_tool_round"]["tool_round_id"] == request.round_id
         assert "pending_session_interrupt" not in checkpoint_after_interrupt
         assert "incomplete_session_recovery_claim" not in checkpoint_after_interrupt
         terminal_interruptions = [
@@ -23508,7 +23548,7 @@ def test_cayu_app_recover_tool_round_aclose_reports_cleanup_failure() -> None:
     app, store, tool, checkpoint = _crashed_tool_round_app(session_id, store=store)
     request = ToolRoundRecoveryRequest(
         session_id=session_id,
-        round_id=checkpoint["pending_tool_round"]["round_id"],
+        round_id=checkpoint["pending_tool_round"]["tool_round_id"],
         tool_call_id="call_1",
         outcome=ToolApprovalRecoveryOutcome.COMPLETED,
         message="side effect verified externally",
@@ -23531,7 +23571,7 @@ def test_cayu_app_recover_tool_round_aclose_reports_cleanup_failure() -> None:
         checkpoint_after_close = await store.load_checkpoint(session_id)
         assert checkpoint_after_close is not None
         assert "incomplete_session_recovery_claim" not in checkpoint_after_close
-        assert checkpoint_after_close["pending_tool_round"]["round_id"] == request.round_id
+        assert checkpoint_after_close["pending_tool_round"]["tool_round_id"] == request.round_id
         assert tool.calls == [{}]
         assert app._session_control.has_active_tasks(session_id) is False
 
@@ -23543,7 +23583,7 @@ def test_cayu_app_recover_tool_round_athrow_finalizes_before_return() -> None:
     app, store, tool, checkpoint = _crashed_tool_round_app(session_id)
     request = ToolRoundRecoveryRequest(
         session_id=session_id,
-        round_id=checkpoint["pending_tool_round"]["round_id"],
+        round_id=checkpoint["pending_tool_round"]["tool_round_id"],
         tool_call_id="call_1",
         outcome=ToolApprovalRecoveryOutcome.COMPLETED,
         message="side effect completed externally",
@@ -23571,7 +23611,7 @@ def test_cayu_app_recover_tool_round_athrow_finalizes_before_return() -> None:
         assert interrupted is not None and interrupted.status == SessionStatus.INTERRUPTED
         checkpoint_after_throw = await store.load_checkpoint(session_id)
         assert checkpoint_after_throw is not None
-        assert checkpoint_after_throw["pending_tool_round"]["round_id"] == request.round_id
+        assert checkpoint_after_throw["pending_tool_round"]["tool_round_id"] == request.round_id
         assert "incomplete_session_recovery_claim" not in checkpoint_after_throw
         assert app._session_control.has_active_tasks(session_id) is False
         assert sessions_module._current_session_run_epoch(session_id) is None
@@ -23603,7 +23643,7 @@ def test_cayu_app_recover_tool_round_athrow_preserves_cleanup_failure() -> None:
     app, store, tool, checkpoint = _crashed_tool_round_app(session_id, store=store)
     request = ToolRoundRecoveryRequest(
         session_id=session_id,
-        round_id=checkpoint["pending_tool_round"]["round_id"],
+        round_id=checkpoint["pending_tool_round"]["tool_round_id"],
         tool_call_id="call_1",
         outcome=ToolApprovalRecoveryOutcome.COMPLETED,
         message="side effect completed externally",
@@ -23706,7 +23746,7 @@ def test_cayu_app_recover_tool_round_cancellation_after_claim_commit_releases_fe
         assert initial_events[-1].type == EventType.SESSION_FAILED
         checkpoint = await store.load_checkpoint(session_id)
         assert checkpoint is not None
-        round_id = checkpoint["pending_tool_round"]["round_id"]
+        round_id = checkpoint["pending_tool_round"]["tool_round_id"]
         releases_before_recovery = store.release_calls
 
         recovery_task = asyncio.create_task(
@@ -23733,7 +23773,7 @@ def test_cayu_app_recover_tool_round_cancellation_after_claim_commit_releases_fe
         assert session.status == SessionStatus.INTERRUPTED
         checkpoint = await store.load_checkpoint(session_id)
         assert checkpoint is not None
-        assert checkpoint["pending_tool_round"]["round_id"] == round_id
+        assert checkpoint["pending_tool_round"]["tool_round_id"] == round_id
         events = await store.load_events(session_id)
         assert events[-1].type == EventType.SESSION_INTERRUPTED
         assert events[-1].payload["abandoned"] is True
@@ -23782,7 +23822,7 @@ def test_cayu_app_recover_tool_round_reconciles_ambiguous_claim_commit() -> None
     app, store, tool, checkpoint = _crashed_tool_round_app(session_id, store=store)
     request = ToolRoundRecoveryRequest(
         session_id=session_id,
-        round_id=checkpoint["pending_tool_round"]["round_id"],
+        round_id=checkpoint["pending_tool_round"]["tool_round_id"],
         tool_call_id="call_1",
         outcome=ToolApprovalRecoveryOutcome.COMPLETED,
         message="verified externally",
@@ -23857,7 +23897,7 @@ def test_cayu_app_recover_tool_round_preserves_cancellation_during_claim_reconci
     app, store, tool, checkpoint = _crashed_tool_round_app(session_id, store=store)
     request = ToolRoundRecoveryRequest(
         session_id=session_id,
-        round_id=checkpoint["pending_tool_round"]["round_id"],
+        round_id=checkpoint["pending_tool_round"]["tool_round_id"],
         tool_call_id="call_1",
         outcome=ToolApprovalRecoveryOutcome.COMPLETED,
         message="verified externally",
@@ -23895,7 +23935,7 @@ def test_cayu_app_recover_tool_round_preserves_cancellation_during_claim_reconci
 def test_cayu_app_recover_tool_round_failed_outcome_resumes():
     session_id = "sess_tool_round_manual_failed"
     app, store, tool, checkpoint = _crashed_tool_round_app(session_id)
-    round_id = checkpoint["pending_tool_round"]["round_id"]
+    round_id = checkpoint["pending_tool_round"]["tool_round_id"]
 
     recovery_events = asyncio.run(
         collect_tool_round_recovery_events(
@@ -23927,7 +23967,7 @@ def test_cayu_app_recover_tool_round_failed_outcome_resumes():
 def test_cayu_app_recover_tool_round_rejects_invalid_targets():
     session_id = "sess_tool_round_manual_invalid"
     app, store, tool, checkpoint = _crashed_tool_round_app(session_id)
-    round_id = checkpoint["pending_tool_round"]["round_id"]
+    round_id = checkpoint["pending_tool_round"]["tool_round_id"]
 
     def recover(**overrides):
         request_kwargs = {
@@ -24003,7 +24043,7 @@ def test_cayu_app_recover_tool_round_rejects_never_started_call():
                 app,
                 ToolRoundRecoveryRequest(
                     session_id="sess_tool_round_manual_not_started",
-                    round_id=checkpoint["pending_tool_round"]["round_id"],
+                    round_id=checkpoint["pending_tool_round"]["tool_round_id"],
                     tool_call_id="call_1",
                     outcome=ToolApprovalRecoveryOutcome.COMPLETED,
                     message="verified",
@@ -24018,7 +24058,7 @@ def test_cayu_app_recover_tool_round_rejects_never_started_call():
 def test_cayu_app_recover_tool_round_rejects_concurrent_recovery():
     session_id = "sess_tool_round_manual_concurrent"
     app, store, tool, checkpoint = _crashed_tool_round_app(session_id)
-    round_id = checkpoint["pending_tool_round"]["round_id"]
+    round_id = checkpoint["pending_tool_round"]["tool_round_id"]
 
     def recovery_request(message: str) -> ToolRoundRecoveryRequest:
         return ToolRoundRecoveryRequest(
@@ -24076,7 +24116,7 @@ def test_cayu_app_recover_tool_round_serializes_across_apps(
         store=store,
         clock=clock,
     )
-    round_id = checkpoint["pending_tool_round"]["round_id"]
+    round_id = checkpoint["pending_tool_round"]["tool_round_id"]
 
     provider_b = FakeProvider([])
     tool_b = SideEffectTool()
@@ -24186,7 +24226,7 @@ def test_cayu_app_recover_tool_round_claims_before_status_transition():
     session_id = "sess_tool_round_manual_claim_race"
     store = PausingFirstRecoveryTransitionStore()
     app, store, tool, checkpoint = _crashed_tool_round_app(session_id, store=store)
-    round_id = checkpoint["pending_tool_round"]["round_id"]
+    round_id = checkpoint["pending_tool_round"]["tool_round_id"]
     store.pause_recovery_transition = True
 
     def recovery_request(message: str) -> ToolRoundRecoveryRequest:
@@ -24301,7 +24341,7 @@ def test_operator_interrupt_wins_race_with_manual_tool_round_recovery_claim(
         operator_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
     request = ToolRoundRecoveryRequest(
         session_id=session_id,
-        round_id=checkpoint["pending_tool_round"]["round_id"],
+        round_id=checkpoint["pending_tool_round"]["tool_round_id"],
         tool_call_id="call_1",
         outcome=ToolApprovalRecoveryOutcome.COMPLETED,
         message="side effect verified externally",
@@ -24361,7 +24401,7 @@ def test_operator_interrupt_wins_race_with_manual_tool_round_recovery_claim(
         assert interrupted is not None and interrupted.status == SessionStatus.INTERRUPTED
         interrupted_checkpoint = await store.load_checkpoint(session_id)
         assert interrupted_checkpoint is not None
-        assert interrupted_checkpoint["pending_tool_round"]["round_id"] == request.round_id
+        assert interrupted_checkpoint["pending_tool_round"]["tool_round_id"] == request.round_id
         assert "incomplete_session_recovery_claim" not in interrupted_checkpoint
         # Both application instances observe the same terminal interruption and
         # may race to claim its durable cascade. Draining only the operator's
@@ -24417,7 +24457,7 @@ def test_manual_tool_round_recovery_finalizes_pending_operator_interrupt_before_
     app, store, tool, checkpoint = _crashed_tool_round_app(session_id, store=store)
     request = ToolRoundRecoveryRequest(
         session_id=session_id,
-        round_id=checkpoint["pending_tool_round"]["round_id"],
+        round_id=checkpoint["pending_tool_round"]["tool_round_id"],
         tool_call_id="call_1",
         outcome=ToolApprovalRecoveryOutcome.COMPLETED,
         message="side effect verified externally",
@@ -24468,7 +24508,7 @@ def test_manual_tool_round_recovery_finalizes_pending_operator_interrupt_before_
         assert interrupted is not None and interrupted.status == SessionStatus.INTERRUPTED
         interrupted_checkpoint = await store.load_checkpoint(session_id)
         assert interrupted_checkpoint is not None
-        assert interrupted_checkpoint["pending_tool_round"]["round_id"] == request.round_id
+        assert interrupted_checkpoint["pending_tool_round"]["tool_round_id"] == request.round_id
         assert "pending_session_interrupt" not in interrupted_checkpoint
         assert "pending_interruption_cascade" not in interrupted_checkpoint
         assert "incomplete_session_recovery_claim" not in interrupted_checkpoint
@@ -24499,7 +24539,7 @@ def test_manual_tool_round_recovery_rejects_pending_interruption_cascade_atomica
     app, store, tool, checkpoint = _crashed_tool_round_app(session_id)
     request = ToolRoundRecoveryRequest(
         session_id=session_id,
-        round_id=checkpoint["pending_tool_round"]["round_id"],
+        round_id=checkpoint["pending_tool_round"]["tool_round_id"],
         tool_call_id="call_1",
         outcome=ToolApprovalRecoveryOutcome.COMPLETED,
         message="side effect verified externally",
@@ -24561,7 +24601,7 @@ def test_cayu_app_recover_tool_round_post_persist_failure_closes_to_interrupted(
     session_id = "sess_tool_round_manual_post_persist"
     store = FailingPostPersistEventsLoadStore()
     app, store, tool, checkpoint = _crashed_tool_round_app(session_id, store=store)
-    round_id = checkpoint["pending_tool_round"]["round_id"]
+    round_id = checkpoint["pending_tool_round"]["tool_round_id"]
 
     store.arm_post_persist_load_failure = True
     recovery_events = asyncio.run(
@@ -24636,7 +24676,7 @@ def test_cayu_app_recover_tool_round_closes_stale_live_claim_failure_to_interrup
     session_id = f"sess_tool_round_manual_stale_live_claim_{stale_status}"
     app, store, original_tool, checkpoint = _crashed_tool_round_app(session_id)
     del app
-    round_id = checkpoint["pending_tool_round"]["round_id"]
+    round_id = checkpoint["pending_tool_round"]["tool_round_id"]
 
     provider = FakeProvider(
         [
@@ -24700,6 +24740,8 @@ def test_cayu_app_recover_tool_round_closes_stale_live_claim_failure_to_interrup
                     agent_name="assistant",
                     tool_name="side_effect",
                     payload={
+                        "model_step_id": checkpoint["pending_tool_round"]["model_step_id"],
+                        "model_attempt_id": checkpoint["pending_tool_round"]["model_attempt_id"],
                         "tool_round_id": round_id,
                         "tool_call_id": "call_1",
                         "manual_recovery": True,
@@ -24773,7 +24815,7 @@ def test_cayu_app_recover_tool_round_rejects_native_structured_output_preflight(
                 app,
                 ToolRoundRecoveryRequest(
                     session_id=session_id,
-                    round_id=checkpoint["pending_tool_round"]["round_id"],
+                    round_id=checkpoint["pending_tool_round"]["tool_round_id"],
                     tool_call_id="call_1",
                     outcome=ToolApprovalRecoveryOutcome.COMPLETED,
                     message="verified",
@@ -24804,7 +24846,7 @@ def test_cayu_app_recover_tool_round_rejects_secret_structured_output_preflight(
                 app,
                 ToolRoundRecoveryRequest(
                     session_id=session_id,
-                    round_id=checkpoint["pending_tool_round"]["round_id"],
+                    round_id=checkpoint["pending_tool_round"]["tool_round_id"],
                     tool_call_id="call_1",
                     outcome=ToolApprovalRecoveryOutcome.COMPLETED,
                     message="verified",
@@ -24854,7 +24896,7 @@ def test_cayu_app_recover_tool_round_multi_call_recovers_iteratively():
     assert initial_events[-1].type == EventType.SESSION_FAILED
     checkpoint = asyncio.run(store.load_checkpoint(session_id))
     assert checkpoint is not None and "pending_tool_round" in checkpoint
-    round_id = checkpoint["pending_tool_round"]["round_id"]
+    round_id = checkpoint["pending_tool_round"]["tool_round_id"]
     assert len(tool.calls) == 2
     started_ids = {
         event.payload["tool_call_id"]
@@ -24972,7 +25014,7 @@ def test_cayu_app_recovery_watcher_ignores_its_owned_interrupted_transition(
     assert checkpoint is not None
     request = ToolRoundRecoveryRequest(
         session_id=session_id,
-        round_id=checkpoint["pending_tool_round"]["round_id"],
+        round_id=checkpoint["pending_tool_round"]["tool_round_id"],
         tool_call_id="call_1",
         outcome=ToolApprovalRecoveryOutcome.COMPLETED,
         message="call_1 verified externally",
@@ -25088,7 +25130,7 @@ def test_cayu_app_recover_tool_round_taints_follow_up_rounds():
             app,
             ToolRoundRecoveryRequest(
                 session_id=session_id,
-                round_id=checkpoint["pending_tool_round"]["round_id"],
+                round_id=checkpoint["pending_tool_round"]["tool_round_id"],
                 tool_call_id="call_read_web",
                 outcome=ToolApprovalRecoveryOutcome.COMPLETED,
                 message="untrusted page content",
@@ -25454,7 +25496,7 @@ def test_concurrent_incomplete_recovery_claims_tool_round_once() -> None:
         )
         checkpoint = await store.load_checkpoint(session_id)
         assert checkpoint is not None
-        round_id = checkpoint["pending_tool_round"]["round_id"]
+        round_id = checkpoint["pending_tool_round"]["tool_round_id"]
         await store.update_status(session_id, SessionStatus.INTERRUPTED)
 
         request = IncompleteSessionRecoveryRequest(session_id=session_id)
@@ -26251,7 +26293,7 @@ def test_cayu_app_blocks_tool_call_before_execution_with_tool_policy():
     assert blocked_event.payload == {
         "tool_call_id": "call_1",
         "idempotency_key": blocked_event.payload["idempotency_key"],
-        "tool_round_id": blocked_event.payload["tool_round_id"],
+        **tool_round_identity_payload(blocked_event),
         "tool_name": "side_effect",
         "denied_by": "tool_policy",
         "decision": "deny",
@@ -26757,9 +26799,10 @@ def test_tool_approval_resolution_events_carry_resolved_by_actor():
             ),
         )
     )
-    approval_id = next(
+    approval_event = next(
         event for event in interrupt_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
-    ).payload["approval"]["approval_id"]
+    )
+    approval_id = approval_event.payload["approval"]["approval_id"]
 
     events = asyncio.run(
         collect_tool_approval_events(
@@ -27211,9 +27254,10 @@ def test_expired_approval_retry_after_recorded_grant_is_not_coerced():
             ),
         )
     )
-    approval_id = next(
+    approval_event = next(
         event for event in interrupt_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
-    ).payload["approval"]["approval_id"]
+    )
+    approval_id = approval_event.payload["approval"]["approval_id"]
 
     # A prior in-window resolve crashed after recording the grant.
     asyncio.run(
@@ -27224,7 +27268,11 @@ def test_expired_approval_retry_after_recorded_grant_is_not_coerced():
                 session_id="sess_expiry_retry",
                 agent_name="assistant",
                 tool_name="side_effect",
-                payload={"approval_id": approval_id, "tool_call_id": "call_1"},
+                payload={
+                    **tool_round_identity_payload(approval_event),
+                    "approval_id": approval_id,
+                    "tool_call_id": "call_1",
+                },
             ),
         )
     )
@@ -28806,6 +28854,7 @@ def test_cayu_app_resolves_denied_tool_call_and_continues_session():
     ]
     assert events[1].payload["idempotency_key"] == tool_execution.tool_idempotency_key(
         session_id="sess_tool_approval_deny",
+        tool_round_id=events[1].payload["tool_round_id"],
         tool_call_id="call_1",
         approval_id=approval_id,
     )
@@ -29522,6 +29571,7 @@ def test_cayu_app_requires_manual_recovery_for_started_tool_without_terminal_eve
     assert recovery_events[1].payload["approval_id"] == approval_id
     assert recovery_events[1].payload["idempotency_key"] == tool_execution.tool_idempotency_key(
         session_id="sess_approval_started_without_terminal",
+        tool_round_id=recovery_events[1].payload["tool_round_id"],
         tool_call_id="call_1",
         approval_id=approval_id,
     )
@@ -48072,7 +48122,7 @@ def test_interrupt_session_stops_in_flight_tool_call():
         "interrupted": True,
         "tool_call_id": "call_1",
         "tool_name": "blocking_tool",
-        "tool_round_id": failed_tool_events[0].payload["tool_round_id"],
+        **tool_round_identity_payload(failed_tool_events[0]),
     }
     stored_event_types = [event.type for event in stored_events]
     assert stored_event_types.index(EventType.TOOL_CALL_FAILED) < stored_event_types.index(
@@ -49145,6 +49195,8 @@ def test_interrupt_session_closes_tool_round_when_interrupted_after_assistant_to
         "interrupted": True,
         "tool_call_id": "call_echo",
         "tool_name": "echo",
+        "model_step_id": transcript[-1].content[0].model_step_id,
+        "model_attempt_id": transcript[-1].content[0].model_attempt_id,
         "tool_round_id": transcript[-1].content[0].structured["tool_round_id"],
     }
     assert transcript[-1].content[0].is_error is True
@@ -50013,6 +50065,7 @@ def test_pending_tool_approval_run_config_round_trips_json_checkpoint():
 
     pending = PendingToolApproval(
         approval_id="appr_1",
+        **_tool_round_identity().payload(),
         tool_call_id="call_1",
         tool_name="side_effect",
         agent_name="assistant",
@@ -50046,6 +50099,7 @@ def test_pending_tool_approval_loads_legacy_checkpoint_without_run_config():
 
     legacy = PendingToolApproval(
         approval_id="appr_legacy",
+        **_tool_round_identity().payload(),
         tool_call_id="call_1",
         tool_name="side_effect",
         agent_name="assistant",

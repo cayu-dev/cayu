@@ -728,8 +728,15 @@ async def test_provider_conformance_seeded_duplicate_tool_reports_failure() -> N
         if event.type in {EventType.TOOL_CALL_STARTED, EventType.TOOL_CALL_COMPLETED}
     ]
 
-    assert tool_events
-    assert {event.payload.get("tool_call_id") for event in tool_events} == {"call-conformance"}
+    assert tool_events == []
+    assert provider.calls == 1
+    completed = next(event for event in events if event.type == EventType.MODEL_COMPLETED)
+    assert completed.payload["completion_outcome"] == "invalid_transcript_state"
+    assert completed.payload["completion_error"]["provider_error_code"] == (
+        "invalid_model_completion_transcript"
+    )
+    assert "tool_round_id" not in completed.payload
+    assert events[-1].type == EventType.SESSION_FAILED
 
     with pytest.raises(
         ProviderConformanceFailure,

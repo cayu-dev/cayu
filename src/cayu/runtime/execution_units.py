@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -45,6 +46,36 @@ class ModelAttemptIdentity(ModelStepIdentity):
             "model_attempt_id": self.model_attempt_id,
         }
 
+    def new_tool_round(self) -> ToolRoundIdentity:
+        return ToolRoundIdentity(
+            model_step_id=self.model_step_id,
+            model_attempt_id=self.model_attempt_id,
+            tool_round_id=f"tround_{uuid4().hex}",
+        )
+
+
+class ToolRoundIdentity(ModelAttemptIdentity):
+    """Runtime-owned identity of one tool group requested by a model attempt."""
+
+    tool_round_id: str = Field(max_length=EXECUTION_UNIT_ID_MAX_CHARS)
+
+    @field_validator("tool_round_id")
+    @classmethod
+    def validate_tool_round_id(cls, value: str) -> str:
+        return require_execution_unit_id(value, "tool_round_id")
+
+    def payload(self) -> dict[str, str]:
+        return {
+            "model_step_id": self.model_step_id,
+            "model_attempt_id": self.model_attempt_id,
+            "tool_round_id": self.tool_round_id,
+        }
+
+    def matches_payload(self, payload: Mapping[str, object]) -> bool:
+        """Return whether a payload carries this complete, unmodified identity."""
+
+        return all(payload.get(key) == value for key, value in self.payload().items())
+
 
 class BudgetLimitIdentity(BaseModel):
     """Opaque runtime identity of one effective configured budget limit."""
@@ -80,4 +111,14 @@ def copy_model_attempt_identity(identity: ModelAttemptIdentity) -> ModelAttemptI
     return ModelAttemptIdentity(
         model_step_id=identity.model_step_id,
         model_attempt_id=identity.model_attempt_id,
+    )
+
+
+def copy_tool_round_identity(identity: ToolRoundIdentity) -> ToolRoundIdentity:
+    if type(identity) is not ToolRoundIdentity:
+        raise TypeError("Tool round identity must be a ToolRoundIdentity.")
+    return ToolRoundIdentity(
+        model_step_id=identity.model_step_id,
+        model_attempt_id=identity.model_attempt_id,
+        tool_round_id=identity.tool_round_id,
     )

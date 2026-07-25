@@ -9,15 +9,28 @@ from cayu.vaults import SecretRedactor
 _MESSAGE_ROOT_STRUCTURE_KEYS = frozenset({"content", "role"})
 _MESSAGE_PART_STRUCTURE_KEYS = {
     "text": frozenset({"text", "type"}),
-    "tool_call": frozenset({"arguments", "tool_call_id", "tool_name", "type"}),
+    "tool_call": frozenset(
+        {
+            "arguments",
+            "model_attempt_id",
+            "model_step_id",
+            "tool_call_id",
+            "tool_name",
+            "tool_round_id",
+            "type",
+        }
+    ),
     "tool_result": frozenset(
         {
             "artifacts",
             "content",
             "is_error",
+            "model_attempt_id",
+            "model_step_id",
             "structured",
             "tool_call_id",
             "tool_name",
+            "tool_round_id",
             "type",
         }
     ),
@@ -79,9 +92,12 @@ _APPROVAL_DENIAL_RESULT_STRUCTURE_KEYS = frozenset(
 )
 _MESSAGE_AUTHORITY_STRING_FIELDS = frozenset(
     {
+        "model_attempt_id",
+        "model_step_id",
         "provider",
         "tool_call_id",
         "tool_name",
+        "tool_round_id",
     }
 )
 _MESSAGE_PRESERVED_STRING_FIELDS = _MESSAGE_AUTHORITY_STRING_FIELDS | {

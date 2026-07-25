@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from tests.core._execution_unit_fixtures import tool_round_identity
 from tests.core._workload_secret_support import (
     FakeProvider,
     RequireApprovalPolicy,
@@ -45,6 +46,7 @@ def test_pending_tool_round_recovery_rejects_redaction_marker_arguments() -> Non
         ],
         policy_outcomes=None,
         structured_output=None,
+        tool_round_identity=tool_round_identity(),
     )
     checkpoint["pending_tool_round"]["tool_calls"][0]["arguments"]["value"] = REDACTED_SECRET
 
@@ -179,6 +181,7 @@ def test_resolve_tool_approval_never_executes_legacy_redaction_marker() -> None:
     checkpoint = asyncio.run(store.load_checkpoint("sess_legacy_approval_marker"))
     assert checkpoint is not None
     checkpoint["pending_tool_approval"]["arguments"]["value"] = REDACTED_SECRET
+    checkpoint["pending_tool_approval"]["tool_calls"][0]["arguments"]["value"] = REDACTED_SECRET
     asyncio.run(store.checkpoint("sess_legacy_approval_marker", checkpoint))
 
     with pytest.raises(ValueError, match="redaction marker"):

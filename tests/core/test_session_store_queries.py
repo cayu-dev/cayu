@@ -47,6 +47,14 @@ def _identity() -> SessionIdentity:
     return SessionIdentity(provider_name="fake", model="fake-model")
 
 
+def _tool_round_identity_payload() -> dict[str, str]:
+    return {
+        "model_step_id": f"mstep_{'1' * 32}",
+        "model_attempt_id": f"matt_{'2' * 32}",
+        "tool_round_id": f"tround_{'3' * 32}",
+    }
+
+
 def test_session_store_lifecycle_methods_are_not_abstract() -> None:
     # delete/update_labels/update_metadata are concrete (NotImplementedError) defaults,
     # not @abstractmethod, so existing out-of-tree SessionStore subclasses still instantiate.
@@ -114,6 +122,46 @@ def test_pending_action_event_projection_rejects_oversized_selected_payload() ->
     assert projection_bytes == MAX_PENDING_ACTION_RESULT_BYTES + 1
 
 
+def test_pending_approval_projection_retains_direct_execution_identity() -> None:
+    identity = _tool_round_identity_payload()
+    event = Event(
+        type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+        session_id="pending_approval_projection",
+        payload={
+            **identity,
+            "approval_id": "approval_1",
+            "tool_call_id": "call_1",
+            "approval": {
+                **identity,
+                "approval_id": "approval_1",
+                "tool_call_id": "call_1",
+                "tool_name": "deploy",
+            },
+        },
+    )
+
+    lookup_key, projection, projection_bytes = pending_action_event_storage_values(event)
+
+    assert lookup_key == pending_action_lookup_key("approval_1")
+    assert projection is not None
+    assert projection_bytes is not None
+    projected_event = Event.model_validate_json(projection)
+    assert {
+        key: projected_event.payload[key]
+        for key in (
+            "approval_id",
+            "tool_call_id",
+            "model_step_id",
+            "model_attempt_id",
+            "tool_round_id",
+        )
+    } == {
+        "approval_id": "approval_1",
+        "tool_call_id": "call_1",
+        **identity,
+    }
+
+
 @pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
 def test_pending_action_store_conformance(store_factory: StoreFactory, tmp_path) -> None:
     store = _make_store(store_factory, tmp_path)
@@ -154,12 +202,17 @@ def test_pending_action_queries_use_latest_matching_event_and_bound_bytes(
                         session_id=session.id,
                         tool_name="deploy",
                         payload={
+                            **_tool_round_identity_payload(),
+                            "approval_id": approval_id,
+                            "tool_call_id": "bounded_call",
                             "approval": {
                                 "approval_id": approval_id,
+                                **_tool_round_identity_payload(),
+                                "tool_call_id": "bounded_call",
                                 "tool_name": "deploy",
                                 "reason": f"request {index}",
                                 "arguments": {"blob": "x" * 4096},
-                            }
+                            },
                         },
                     ),
                 )
@@ -168,6 +221,7 @@ def test_pending_action_queries_use_latest_matching_event_and_bound_bytes(
                 {
                     "pending_tool_approval": {
                         "approval_id": approval_id,
+                        **_tool_round_identity_payload(),
                         "tool_call_id": "bounded_call",
                         "tool_name": "deploy",
                         "arguments": {"blob": "x" * 4096},
@@ -194,6 +248,8 @@ def test_pending_action_queries_use_latest_matching_event_and_bound_bytes(
             assert len(result.actions) == 1
             assert result.actions[0].event.event.id == "approval_event_49"
             assert result.actions[0].detail == "request 49"
+            assert result.actions[0].round_id == _tool_round_identity_payload()["tool_round_id"]
+            assert result.actions[0].tool_call_id == "bounded_call"
 
             oversized = await store.query_pending_actions(
                 PendingActionQuery(session_id=session.id, max_result_bytes=1024)
@@ -226,7 +282,16 @@ def test_in_memory_pending_action_index_is_pruned_after_resolution() -> None:
                 id="pruned_approval_event",
                 type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
                 session_id=session.id,
-                payload={"approval": {"approval_id": "pruned_approval"}},
+                payload={
+                    **_tool_round_identity_payload(),
+                    "approval_id": "pruned_approval",
+                    "tool_call_id": "pruned_call",
+                    "approval": {
+                        "approval_id": "pruned_approval",
+                        **_tool_round_identity_payload(),
+                        "tool_call_id": "pruned_call",
+                    },
+                },
             ),
         )
         assert session.id in store._pending_action_event_records
@@ -280,11 +345,16 @@ def test_session_stores_query_pending_actions_without_unrelated_history(
                         session_id=session_id,
                         tool_name="deploy",
                         payload={
+                            **_tool_round_identity_payload(),
+                            "approval_id": f"approval_{index}",
+                            "tool_call_id": f"call_{index}",
                             "approval": {
                                 "approval_id": f"approval_{index}",
+                                **_tool_round_identity_payload(),
+                                "tool_call_id": f"call_{index}",
                                 "tool_name": "deploy",
                                 "arguments": {"slot": index},
-                            }
+                            },
                         },
                     )
                 ],
@@ -295,6 +365,7 @@ def test_session_stores_query_pending_actions_without_unrelated_history(
                     "unrelated": {"large": "x" * 100_000},
                     "pending_tool_approval": {
                         "approval_id": f"approval_{index}",
+                        **_tool_round_identity_payload(),
                         "tool_call_id": f"call_{index}",
                         "tool_name": "deploy",
                         "arguments": {"slot": index},
@@ -392,6 +463,7 @@ def test_session_stores_bound_sparse_pending_action_candidate_pages(
         for index in range(10):
             session_id = f"sparse_pending_{index:02d}"
             approval_id = f"sparse_approval_{index:02d}"
+            tool_call_id = f"sparse_call_{index:02d}"
             await store.create(
                 RunRequest(
                     agent_name="assistant",
@@ -407,11 +479,16 @@ def test_session_stores_bound_sparse_pending_action_candidate_pages(
                     type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
                     session_id=session_id,
                     payload={
+                        **_tool_round_identity_payload(),
+                        "approval_id": approval_id,
+                        "tool_call_id": tool_call_id,
                         "approval": {
                             "approval_id": approval_id,
+                            **_tool_round_identity_payload(),
+                            "tool_call_id": tool_call_id,
                             "tool_name": "deploy",
                             "arguments": {},
-                        }
+                        },
                     },
                 ),
             )
@@ -420,13 +497,14 @@ def test_session_stores_bound_sparse_pending_action_candidate_pages(
                 {
                     "pending_tool_approval": {
                         "approval_id": approval_id,
-                        "tool_call_id": f"sparse_call_{index:02d}",
+                        **_tool_round_identity_payload(),
+                        "tool_call_id": tool_call_id,
                         "tool_name": "deploy",
                         "arguments": {},
                         "agent_name": "assistant",
                         "tool_calls": [
                             {
-                                "tool_call_id": f"sparse_call_{index:02d}",
+                                "tool_call_id": tool_call_id,
                                 "tool_name": "deploy",
                                 "arguments": {},
                                 "policy_decision": None,
@@ -467,6 +545,7 @@ def test_session_stores_page_pending_actions_beyond_legacy_candidate_cap(
         for index in range(251):
             session_id = f"pending_many_{index:03d}"
             approval_id = f"approval_many_{index:03d}"
+            tool_call_id = f"call_many_{index:03d}"
             await store.create(
                 RunRequest(
                     agent_name="assistant",
@@ -483,11 +562,16 @@ def test_session_stores_page_pending_actions_beyond_legacy_candidate_cap(
                     session_id=session_id,
                     tool_name="deploy",
                     payload={
+                        **_tool_round_identity_payload(),
+                        "approval_id": approval_id,
+                        "tool_call_id": tool_call_id,
                         "approval": {
                             "approval_id": approval_id,
+                            **_tool_round_identity_payload(),
+                            "tool_call_id": tool_call_id,
                             "tool_name": "deploy",
                             "arguments": {},
-                        }
+                        },
                     },
                 ),
             )
@@ -496,13 +580,14 @@ def test_session_stores_page_pending_actions_beyond_legacy_candidate_cap(
                 {
                     "pending_tool_approval": {
                         "approval_id": approval_id,
-                        "tool_call_id": f"call_many_{index:03d}",
+                        **_tool_round_identity_payload(),
+                        "tool_call_id": tool_call_id,
                         "tool_name": "deploy",
                         "arguments": {},
                         "agent_name": "assistant",
                         "tool_calls": [
                             {
-                                "tool_call_id": f"call_many_{index:03d}",
+                                "tool_call_id": tool_call_id,
                                 "tool_name": "deploy",
                                 "arguments": {},
                                 "policy_decision": None,

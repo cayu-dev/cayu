@@ -5939,6 +5939,9 @@ def _strip_file_attachments_from_tool_result(part: ToolResultPart) -> ToolResult
             structured=copy_json_value(part.structured, "structured"),
             artifacts=kept_artifacts,
             is_error=part.is_error,
+            tool_round_id=part.tool_round_id,
+            model_step_id=part.model_step_id,
+            model_attempt_id=part.model_attempt_id,
         )
 
     content = _content_with_stripped_file_attachment_note(part.content, stripped_attachments)
@@ -5962,6 +5965,9 @@ def _strip_file_attachments_from_tool_result(part: ToolResultPart) -> ToolResult
         structured=structured,
         artifacts=kept_artifacts,
         is_error=part.is_error,
+        tool_round_id=part.tool_round_id,
+        model_step_id=part.model_step_id,
+        model_attempt_id=part.model_attempt_id,
     )
 
 

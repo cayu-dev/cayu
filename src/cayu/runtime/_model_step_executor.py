@@ -151,8 +151,10 @@ from cayu.runtime.context_counting import ContextCountingConfig, ContextCounting
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
     ModelStepIdentity,
+    ToolRoundIdentity,
     copy_model_attempt_identity,
     copy_model_step_identity,
+    copy_tool_round_identity,
 )
 from cayu.runtime.model_steps import (
     AssistantStepResult,
@@ -1261,6 +1263,7 @@ class ModelStepExecutor:
                     classification = None
                     if completion_terminal_error is None:
                         try:
+                            _require_unique_tool_call_ids(tool_calls)
                             provider_state_parts = transcript_helpers.provider_state_parts(
                                 stream_event.payload
                             )
@@ -1305,6 +1308,9 @@ class ModelStepExecutor:
                         attempt=attempt,
                         max_attempts=max_attempts,
                         model_attempt_identity=model_attempt_identity,
+                        tool_round_identity=(
+                            step_result.tool_round_identity if step_result is not None else None
+                        ),
                         classification=(
                             classification.payload() if classification is not None else None
                         ),
@@ -4555,6 +4561,7 @@ def _model_stream_event_to_runtime_event(
     attempt: int,
     max_attempts: int,
     model_attempt_identity: ModelAttemptIdentity,
+    tool_round_identity: ToolRoundIdentity | None = None,
     classification: dict[str, str] | None = None,
     context_pressure_estimate: ContextPressureEstimate | None = None,
     transcript_cursor_after_completion: int | None = None,
@@ -4679,6 +4686,8 @@ def _model_stream_event_to_runtime_event(
         max_attempts=max_attempts,
         model_attempt_identity=model_attempt_identity,
     )
+    if tool_round_identity is not None:
+        payload.update(copy_tool_round_identity(tool_round_identity).payload())
     if event_type == EventType.MODEL_COMPLETED:
         payload = durable_model_completed_payload(
             payload,
@@ -4690,6 +4699,11 @@ def _model_stream_event_to_runtime_event(
                 "attempt": attempt,
                 "max_attempts": max_attempts,
                 **model_attempt_identity.payload(),
+                **(
+                    {}
+                    if tool_round_identity is None
+                    else copy_tool_round_identity(tool_round_identity).payload()
+                ),
             },
             unavailable_reason="invalid model completion usage telemetry",
         )
@@ -4737,12 +4751,19 @@ def _assistant_step_result(
     completion: ModelCompletion,
 ) -> AssistantStepResult:
     model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
+    tool_round_identity = model_attempt_identity.new_tool_round() if tool_calls else None
+    if assistant_message is not None and tool_round_identity is not None:
+        assistant_message = transcript_helpers.assistant_message_with_tool_round(
+            assistant_message,
+            tool_round_identity,
+        )
     text_content = assistant_text_content(assistant_message)
     return AssistantStepResult(
         session_id=session_id,
         step=step,
         model_step_id=model_attempt_identity.model_step_id,
         model_attempt_id=model_attempt_identity.model_attempt_id,
+        tool_round_identity=tool_round_identity,
         assistant_message=assistant_message,
         tool_calls=list(tool_calls),
         completion=completion,
@@ -4751,6 +4772,14 @@ def _assistant_step_result(
         provider_state_count=provider_state_count(assistant_message),
         thinking_count=thinking_count(assistant_message),
     )
+
+
+def _require_unique_tool_call_ids(
+    tool_calls: list[runtime_records.ToolCallRequest],
+) -> None:
+    tool_call_ids = [tool_call.id for tool_call in tool_calls]
+    if len(tool_call_ids) != len(set(tool_call_ids)):
+        raise ValueError("Model provider emitted duplicate tool-call identifiers.")
 
 
 def _typed_retry_fields(

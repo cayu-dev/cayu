@@ -10,6 +10,21 @@ from cayu.runtime.sessions import (
     PendingActionQuery,
 )
 
+_MODEL_STEP_ID = f"mstep_{'1' * 32}"
+_MODEL_ATTEMPT_ID = f"matt_{'2' * 32}"
+_TOOL_ROUND_ID = f"tround_{'3' * 32}"
+_MALFORMED_TERMINAL_ROUND_ID = f"tround_{'4' * 32}"
+_OVERSIZED_ROUND_ID = f"tround_{'5' * 32}"
+_OVERCOMPLEX_ROUND_ID = f"tround_{'6' * 32}"
+
+
+def _tool_round_identity_payload(tool_round_id: str = _TOOL_ROUND_ID) -> dict[str, str]:
+    return {
+        "model_step_id": _MODEL_STEP_ID,
+        "model_attempt_id": _MODEL_ATTEMPT_ID,
+        "tool_round_id": tool_round_id,
+    }
+
 
 def _identity() -> SessionIdentity:
     return SessionIdentity(provider_name="fake", model="fake-model")
@@ -42,6 +57,7 @@ def _approval_checkpoint(
     return {
         "pending_tool_approval": {
             "approval_id": approval_id,
+            **_tool_round_identity_payload(),
             "tool_call_id": tool_call_id,
             "tool_name": tool_name,
             "arguments": arguments or {},
@@ -59,6 +75,7 @@ def _input_checkpoint(
     return {
         "pending_user_input": {
             "input_id": input_id,
+            **_tool_round_identity_payload(),
             "tool_call_id": tool_call_id,
             "tool_name": "ask_user",
             "question": question,
@@ -73,7 +90,7 @@ def _input_checkpoint(
 def _round_checkpoint(round_id: str, tool_call_id: str) -> dict[str, Any]:
     return {
         "pending_tool_round": {
-            "round_id": round_id,
+            **_tool_round_identity_payload(round_id),
             "agent_name": "assistant",
             "tool_calls": [_pending_call(tool_call_id, "charge")],
         }
@@ -109,11 +126,16 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
                 type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
                 session_id="conformance_approval",
                 payload={
+                    **_tool_round_identity_payload(),
+                    "approval_id": "conformance_approval_id",
+                    "tool_call_id": "conformance_approval_call",
                     "approval": {
                         "approval_id": "conformance_approval_id",
+                        **_tool_round_identity_payload(),
+                        "tool_call_id": "conformance_approval_call",
                         "tool_name": "deploy",
                         "arguments": {},
-                    }
+                    },
                 },
             ),
             Event(
@@ -121,11 +143,16 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
                 type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
                 session_id="conformance_approval",
                 payload={
+                    **_tool_round_identity_payload(),
+                    "approval_id": "conformance_alternate_approval_id",
+                    "tool_call_id": "conformance_alternate_approval_call",
                     "approval": {
                         "approval_id": "conformance_alternate_approval_id",
+                        **_tool_round_identity_payload(),
+                        "tool_call_id": "conformance_alternate_approval_call",
                         "tool_name": "rollback",
                         "arguments": {},
-                    }
+                    },
                 },
             ),
         ],
@@ -144,6 +171,7 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
                 type=EventType.SESSION_AWAITING_USER_INPUT,
                 session_id="conformance_input",
                 payload={
+                    **_tool_round_identity_payload(),
                     "input_id": "conformance_input_id",
                     "tool_call_id": "conformance_input_call",
                     "question": "Deploy?",
@@ -166,6 +194,7 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
                 type=EventType.SESSION_INTERRUPTED,
                 session_id="conformance_approval_recovery",
                 payload={
+                    **_tool_round_identity_payload(),
                     "manual_recovery_required": True,
                     "approval_id": "conformance_recovery_approval_id",
                     "tool_call_id": "conformance_recovery_approval_call",
@@ -188,9 +217,11 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
                 type=EventType.SESSION_INTERRUPTED,
                 session_id="conformance_input_recovery",
                 payload={
+                    **_tool_round_identity_payload(),
                     "manual_recovery_required": True,
                     "user_input": {
                         "input_id": "conformance_recovery_input_id",
+                        **_tool_round_identity_payload(),
                         "tool_call_id": "conformance_recovery_input_call",
                     },
                     "tool_call_id": "conformance_recovery_input_call",
@@ -213,7 +244,7 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
                 type=EventType.TOOL_CALL_STARTED,
                 session_id="conformance_round_recovery",
                 payload={
-                    "tool_round_id": "conformance_round_id",
+                    **_tool_round_identity_payload(),
                     "tool_call_id": "conformance_round_call",
                 },
             ),
@@ -222,13 +253,13 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
                 type=EventType.SESSION_FAILED,
                 session_id="conformance_round_recovery",
                 payload={
+                    **_tool_round_identity_payload(),
                     "manual_recovery_required": True,
-                    "tool_round_id": "conformance_round_id",
                     "tool_call_id": "conformance_round_call",
                 },
             ),
         ],
-        checkpoint=_round_checkpoint("conformance_round_id", "conformance_round_call"),
+        checkpoint=_round_checkpoint(_TOOL_ROUND_ID, "conformance_round_call"),
     )
     await create(
         "conformance_stale_approval",
@@ -239,16 +270,22 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
                 type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
                 session_id="conformance_stale_approval",
                 payload={
+                    **_tool_round_identity_payload(),
+                    "approval_id": "conformance_stale_approval_id",
+                    "tool_call_id": "conformance_stale_approval_call",
                     "approval": {
                         "approval_id": "conformance_stale_approval_id",
+                        **_tool_round_identity_payload(),
+                        "tool_call_id": "conformance_stale_approval_call",
                         "tool_name": "deploy",
-                    }
+                    },
                 },
             ),
             Event(
                 id="conformance_stale_barrier",
                 type=EventType.SESSION_RESUMED,
                 session_id="conformance_stale_approval",
+                payload=_tool_round_identity_payload(),
             ),
         ],
         checkpoint=_approval_checkpoint(
@@ -281,7 +318,7 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
         events=[],
         checkpoint={
             "pending_tool_round": {
-                "round_id": "   ",
+                "tool_round_id": "   ",
                 "agent_name": "assistant",
                 "tool_calls": [],
             }
@@ -296,7 +333,7 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
                 type=EventType.TOOL_CALL_STARTED,
                 session_id="conformance_malformed_terminal",
                 payload={
-                    "tool_round_id": "conformance_malformed_terminal_round",
+                    **_tool_round_identity_payload(_MALFORMED_TERMINAL_ROUND_ID),
                     "tool_call_id": "conformance_malformed_terminal_call",
                 },
             ),
@@ -305,7 +342,7 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
                 type=EventType.TOOL_CALL_COMPLETED,
                 session_id="conformance_malformed_terminal",
                 payload={
-                    "tool_round_id": "conformance_malformed_terminal_round",
+                    **_tool_round_identity_payload(_MALFORMED_TERMINAL_ROUND_ID),
                     "tool_call_id": "conformance_malformed_terminal_call",
                 },
             ),
@@ -314,14 +351,14 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
                 type=EventType.TOOL_CALL_STARTED,
                 session_id="conformance_malformed_terminal",
                 payload={
-                    "tool_round_id": "conformance_malformed_terminal_round",
+                    **_tool_round_identity_payload(_MALFORMED_TERMINAL_ROUND_ID),
                     "tool_call_id": "conformance_malformed_terminal_other_call",
                 },
             ),
         ],
         checkpoint={
             "pending_tool_round": {
-                "round_id": "conformance_malformed_terminal_round",
+                **_tool_round_identity_payload(_MALFORMED_TERMINAL_ROUND_ID),
                 "agent_name": "assistant",
                 "tool_calls": [
                     _pending_call("conformance_malformed_terminal_call", "charge"),
@@ -339,9 +376,13 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
                 type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
                 session_id="conformance_normalized_lookup",
                 payload={
+                    **_tool_round_identity_payload(),
                     "approval_id": "   ",
+                    "tool_call_id": "conformance_normalized_lookup_call",
                     "approval": {
                         "approval_id": "conformance_normalized_lookup_id",
+                        **_tool_round_identity_payload(),
+                        "tool_call_id": "conformance_normalized_lookup_call",
                         "tool_name": "deploy",
                     },
                 },
@@ -354,6 +395,99 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
         ),
     )
     await create(
+        "conformance_conflicting_input_identity",
+        status=SessionStatus.INTERRUPTED,
+        events=[
+            Event(
+                id="conformance_conflicting_input_event",
+                type=EventType.SESSION_AWAITING_USER_INPUT,
+                session_id="conformance_conflicting_input_identity",
+                payload={
+                    **_tool_round_identity_payload(),
+                    "model_attempt_id": f"matt_{'9' * 32}",
+                    "input_id": "conformance_conflicting_input_id",
+                    "tool_call_id": "conformance_conflicting_input_call",
+                    "question": "Deploy?",
+                },
+            )
+        ],
+        checkpoint=_input_checkpoint(
+            "conformance_conflicting_input_id",
+            "conformance_conflicting_input_call",
+            "Deploy?",
+        ),
+    )
+    await create(
+        "conformance_sibling_approval_call",
+        status=SessionStatus.INTERRUPTED,
+        events=[
+            Event(
+                id="conformance_sibling_approval_event",
+                type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                session_id="conformance_sibling_approval_call",
+                payload={
+                    **_tool_round_identity_payload(),
+                    "approval_id": "conformance_sibling_approval_id",
+                    "tool_call_id": "conformance_sibling_call",
+                    "approval": {
+                        "approval_id": "conformance_sibling_approval_id",
+                        **_tool_round_identity_payload(),
+                        "tool_call_id": "conformance_sibling_call",
+                        "tool_name": "rollback",
+                        "arguments": {},
+                    },
+                },
+            )
+        ],
+        checkpoint={
+            "pending_tool_approval": {
+                "approval_id": "conformance_sibling_approval_id",
+                **_tool_round_identity_payload(),
+                "tool_call_id": "conformance_gating_approval_call",
+                "tool_name": "deploy",
+                "arguments": {},
+                "agent_name": "assistant",
+                "tool_calls": [
+                    _pending_call("conformance_gating_approval_call", "deploy"),
+                    _pending_call("conformance_sibling_call", "rollback"),
+                ],
+            }
+        },
+    )
+    await create(
+        "conformance_sibling_input_call",
+        status=SessionStatus.INTERRUPTED,
+        events=[
+            Event(
+                id="conformance_sibling_input_event",
+                type=EventType.SESSION_AWAITING_USER_INPUT,
+                session_id="conformance_sibling_input_call",
+                payload={
+                    **_tool_round_identity_payload(),
+                    "input_id": "conformance_sibling_input_id",
+                    "tool_call_id": "conformance_input_sibling_call",
+                    "question": "Wrong question?",
+                },
+            )
+        ],
+        checkpoint={
+            "pending_user_input": {
+                "input_id": "conformance_sibling_input_id",
+                **_tool_round_identity_payload(),
+                "tool_call_id": "conformance_gating_input_call",
+                "tool_name": "ask_user",
+                "question": "Deploy?",
+                "options": ["yes", "no"],
+                "arguments": {},
+                "agent_name": "assistant",
+                "tool_calls": [
+                    _pending_call("conformance_gating_input_call", "ask_user"),
+                    _pending_call("conformance_input_sibling_call", "read_file"),
+                ],
+            }
+        },
+    )
+    await create(
         "conformance_completed_with_pending_state",
         status=SessionStatus.COMPLETED,
         events=[
@@ -362,10 +496,15 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
                 type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
                 session_id="conformance_completed_with_pending_state",
                 payload={
+                    **_tool_round_identity_payload(),
+                    "approval_id": "conformance_completed_approval_id",
+                    "tool_call_id": "conformance_completed_approval_call",
                     "approval": {
                         "approval_id": "conformance_completed_approval_id",
+                        **_tool_round_identity_payload(),
+                        "tool_call_id": "conformance_completed_approval_call",
                         "tool_name": "deploy",
-                    }
+                    },
                 },
             )
         ],
@@ -393,14 +532,16 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
         "conformance_approval_recovery",
         "conformance_input_recovery",
         "conformance_round_recovery",
-        "conformance_normalized_lookup",
     }
     assert by_session["conformance_approval"].kind == PendingActionKind.TOOL_APPROVAL
+    assert by_session["conformance_approval"].round_id == _TOOL_ROUND_ID
+    assert by_session["conformance_approval"].tool_call_id == "conformance_approval_call"
     assert by_session["conformance_input"].kind == PendingActionKind.USER_INPUT
+    assert by_session["conformance_input"].round_id == _TOOL_ROUND_ID
+    assert by_session["conformance_input"].tool_call_id == "conformance_input_call"
     assert by_session["conformance_approval_recovery"].kind == PendingActionKind.MANUAL_RECOVERY
     assert by_session["conformance_input_recovery"].kind == PendingActionKind.MANUAL_RECOVERY
     assert by_session["conformance_round_recovery"].kind == PendingActionKind.MANUAL_RECOVERY
-    assert by_session["conformance_normalized_lookup"].kind == PendingActionKind.TOOL_APPROVAL
     assert len({action.id for action in actions}) == len(actions)
     assert all(action.event.event.payload == {} for action in actions)
 
@@ -414,6 +555,10 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
         "conformance_blank_approval_id",
         "conformance_blank_input_id",
         "conformance_blank_round_id",
+        "conformance_normalized_lookup",
+        "conformance_conflicting_input_identity",
+        "conformance_sibling_approval_call",
+        "conformance_sibling_input_call",
     ):
         blank_identifier = await store.query_pending_actions(
             PendingActionQuery(session_id=session_id)
@@ -491,7 +636,7 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
                 type=EventType.TOOL_CALL_STARTED,
                 session_id="conformance_oversized_resolved",
                 payload={
-                    "tool_round_id": "conformance_oversized_round",
+                    "tool_round_id": _OVERSIZED_ROUND_ID,
                     "tool_call_id": "conformance_oversized_call",
                 },
             ),
@@ -500,7 +645,7 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
                 type=EventType.TOOL_CALL_COMPLETED,
                 session_id="conformance_oversized_resolved",
                 payload={
-                    "tool_round_id": "conformance_oversized_round",
+                    "tool_round_id": _OVERSIZED_ROUND_ID,
                     "tool_call_id": "conformance_oversized_call",
                     "result": {"content": "x" * 4096},
                 },
@@ -513,7 +658,7 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
             ),
         ],
         checkpoint=_round_checkpoint(
-            "conformance_oversized_round",
+            _OVERSIZED_ROUND_ID,
             "conformance_oversized_call",
         ),
     )
@@ -535,7 +680,7 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
         events=[],
         checkpoint={
             "pending_tool_round": {
-                "round_id": "conformance_overcomplex_round_id",
+                **_tool_round_identity_payload(_OVERCOMPLEX_ROUND_ID),
                 "agent_name": "assistant",
                 "tool_calls": [
                     _pending_call(f"conformance_overcomplex_call_{index}", "charge")
@@ -568,11 +713,16 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
                     type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
                     session_id=session_id,
                     payload={
+                        **_tool_round_identity_payload(),
+                        "approval_id": approval_id,
+                        "tool_call_id": call_id,
                         "approval": {
                             "approval_id": approval_id,
+                            **_tool_round_identity_payload(),
+                            "tool_call_id": call_id,
                             "tool_name": "deploy",
                             "arguments": arguments,
-                        }
+                        },
                     },
                 )
             ],

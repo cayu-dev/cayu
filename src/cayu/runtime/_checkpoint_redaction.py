@@ -14,6 +14,8 @@ _DURABLE_STRUCTURE_STRING_FIELDS = frozenset(
         "environment_name",
         "expires_at",
         "input_id",
+        "model_attempt_id",
+        "model_step_id",
         "name",
         "policy_decision",
         "role",
@@ -22,6 +24,7 @@ _DURABLE_STRUCTURE_STRING_FIELDS = frozenset(
         "task_id",
         "tool_call_id",
         "tool_name",
+        "tool_round_id",
         "type",
         "workspace_id",
     }

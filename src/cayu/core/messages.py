@@ -18,6 +18,7 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     require_durable_nonblank,
     require_durable_text,
+    require_execution_unit_id,
 )
 from cayu.artifacts.attachments import FileAttachment
 
@@ -48,6 +49,9 @@ class ToolCallPart(BaseModel):
     tool_call_id: str
     tool_name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
+    tool_round_id: str | None = None
+    model_step_id: str | None = None
+    model_attempt_id: str | None = None
 
     @field_validator("arguments", mode="before")
     @classmethod
@@ -58,6 +62,22 @@ class ToolCallPart(BaseModel):
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
         return _require_clean_nonblank(info.field_name, value)
+
+    @field_validator("tool_round_id", "model_step_id", "model_attempt_id")
+    @classmethod
+    def validate_optional_identity(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_execution_unit_id(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_complete_identity(self) -> ToolCallPart:
+        _require_complete_tool_round_identity(
+            self.tool_round_id,
+            self.model_step_id,
+            self.model_attempt_id,
+        )
+        return self
 
 
 class ToolResultPart(BaseModel):
@@ -70,6 +90,9 @@ class ToolResultPart(BaseModel):
     structured: dict[str, Any] | None = None
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
     is_error: StrictBool = False
+    tool_round_id: str | None = None
+    model_step_id: str | None = None
+    model_attempt_id: str | None = None
 
     @field_validator("structured", "artifacts", mode="before")
     @classmethod
@@ -85,6 +108,22 @@ class ToolResultPart(BaseModel):
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
         return _require_clean_nonblank(info.field_name, value)
+
+    @field_validator("tool_round_id", "model_step_id", "model_attempt_id")
+    @classmethod
+    def validate_optional_identity(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_execution_unit_id(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_complete_identity(self) -> ToolResultPart:
+        _require_complete_tool_round_identity(
+            self.tool_round_id,
+            self.model_step_id,
+            self.model_attempt_id,
+        )
+        return self
 
 
 class ProviderStatePart(BaseModel):
@@ -230,16 +269,27 @@ class Message(BaseModel):
         tool_call_id: str | None = None,
         tool_name: str | None = None,
         arguments: dict[str, Any] | None = None,
+        tool_round_id: str | None = None,
+        model_step_id: str | None = None,
+        model_attempt_id: str | None = None,
         calls: list[ToolCallPart] | None = None,
     ) -> Message:
         content: list[
             TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart
         ]
         if calls is not None:
-            if tool_call_id is not None or tool_name is not None or arguments is not None:
-                raise ValueError(
-                    "`calls` cannot be combined with `tool_call_id`, `tool_name`, or `arguments`."
+            if any(
+                value is not None
+                for value in (
+                    tool_call_id,
+                    tool_name,
+                    arguments,
+                    tool_round_id,
+                    model_step_id,
+                    model_attempt_id,
                 )
+            ):
+                raise ValueError("`calls` cannot be combined with individual tool-call fields.")
             if not calls:
                 raise ValueError("`calls` cannot be empty.")
             content = list(calls)
@@ -249,6 +299,9 @@ class Message(BaseModel):
                     tool_call_id=_require_value("tool_call_id", tool_call_id),
                     tool_name=_require_value("tool_name", tool_name),
                     arguments={} if arguments is None else arguments,
+                    tool_round_id=tool_round_id,
+                    model_step_id=model_step_id,
+                    model_attempt_id=model_attempt_id,
                 )
             ]
         return cls(
@@ -266,6 +319,9 @@ class Message(BaseModel):
         structured: dict[str, Any] | None = None,
         artifacts: list[dict[str, Any]] | None = None,
         is_error: bool = False,
+        tool_round_id: str | None = None,
+        model_step_id: str | None = None,
+        model_attempt_id: str | None = None,
         results: list[ToolResultPart] | None = None,
     ) -> Message:
         result_parts: list[
@@ -283,6 +339,9 @@ class Message(BaseModel):
                 or structured is not None
                 or artifacts is not None
                 or is_error is not False
+                or tool_round_id is not None
+                or model_step_id is not None
+                or model_attempt_id is not None
             ):
                 raise ValueError("`results` cannot be combined with scalar result fields.")
             if not results:
@@ -297,6 +356,9 @@ class Message(BaseModel):
                     structured=structured,
                     artifacts=[] if artifacts is None else artifacts,
                     is_error=is_error,
+                    tool_round_id=tool_round_id,
+                    model_step_id=model_step_id,
+                    model_attempt_id=model_attempt_id,
                 )
             ]
         return cls(
@@ -401,3 +463,16 @@ def _require_nonblank(name: str, value: str) -> str:
 
 def _require_clean_nonblank(name: str, value: str) -> str:
     return require_durable_clean_nonblank(value, name)
+
+
+def _require_complete_tool_round_identity(
+    tool_round_id: str | None,
+    model_step_id: str | None,
+    model_attempt_id: str | None,
+) -> None:
+    present = sum(value is not None for value in (tool_round_id, model_step_id, model_attempt_id))
+    if present not in {0, 3}:
+        raise ValueError(
+            "Tool round identity requires tool_round_id, model_step_id, "
+            "and model_attempt_id together."
+        )

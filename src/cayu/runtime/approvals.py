@@ -15,6 +15,7 @@ from cayu._validation import (
 from cayu.core.events import Event, EventType
 from cayu.core.thinking import ThinkingConfig
 from cayu.runtime.budgets import BudgetLimit, copy_budget_limits, copy_request_budget_limits
+from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
@@ -367,6 +368,9 @@ class PendingToolApproval(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     approval_id: str
+    tool_round_id: str
+    model_step_id: str
+    model_attempt_id: str
     tool_call_id: str
     tool_name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
@@ -398,10 +402,9 @@ class PendingToolApproval(BaseModel):
     def from_event(cls, event: Event) -> PendingToolApproval:
         """Build a ``PendingToolApproval`` from a ``tool.call.approval_requested`` event.
 
-        The event payload nests the approval under an ``"approval"`` key, so
-        ``event.payload["approval_id"]`` is ``None``. Use this accessor instead of
-        guessing the shape. Raises ``ValueError`` on the wrong event type or a
-        missing approval payload.
+        The complete approval remains nested under ``"approval"`` while its
+        lookup and execution-unit identities are repeated as first-class fields.
+        Both representations must agree.
         """
         if event.type != EventType.TOOL_CALL_APPROVAL_REQUESTED:
             raise ValueError(
@@ -414,12 +417,41 @@ class PendingToolApproval(BaseModel):
                 "Event payload has no 'approval' object; expected a "
                 "tool.call.approval_requested event payload."
             )
-        return cls.model_validate(approval)
+        pending = cls.model_validate(approval)
+        expected = {
+            "approval_id": pending.approval_id,
+            "tool_call_id": pending.tool_call_id,
+            "model_step_id": pending.model_step_id,
+            "model_attempt_id": pending.model_attempt_id,
+            "tool_round_id": pending.tool_round_id,
+        }
+        if any(event.payload.get(key) != value for key, value in expected.items()):
+            raise ValueError("Approval-request event identity does not match its nested approval.")
+        return pending
 
     @field_validator("approval_id", "tool_call_id", "tool_name", "agent_name")
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
         return require_durable_clean_nonblank(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_tool_round_identity(self) -> PendingToolApproval:
+        ToolRoundIdentity(
+            tool_round_id=self.tool_round_id,
+            model_step_id=self.model_step_id,
+            model_attempt_id=self.model_attempt_id,
+        )
+        gating_calls = [call for call in self.tool_calls if call.tool_call_id == self.tool_call_id]
+        if len(gating_calls) != 1:
+            raise ValueError(
+                "Pending tool approval must identify exactly one call in its tool round."
+            )
+        gating_call = gating_calls[0]
+        if gating_call.tool_name != self.tool_name or gating_call.arguments != self.arguments:
+            raise ValueError(
+                "Pending tool approval call details do not match its tool-round record."
+            )
+        return self
 
     @field_validator("environment_name", "workspace_id", "task_id", "reason")
     @classmethod
@@ -453,10 +485,10 @@ class PendingToolApproval(BaseModel):
         cls,
         value: list[PendingToolCallApproval],
     ) -> list[PendingToolCallApproval]:
-        copied = [copy_pending_tool_call_approval(call) for call in value]
-        if not copied:
-            raise ValueError("Pending tool approval must include tool calls.")
-        return copied
+        return copy_distinct_pending_tool_call_approvals(
+            value,
+            owner="Pending tool approval",
+        )
 
     @field_validator("limits")
     @classmethod
@@ -539,6 +571,9 @@ def copy_pending_tool_approval(approval: PendingToolApproval) -> PendingToolAppr
         raise TypeError("Pending tool approval must be a PendingToolApproval.")
     return PendingToolApproval(
         approval_id=approval.approval_id,
+        tool_round_id=approval.tool_round_id,
+        model_step_id=approval.model_step_id,
+        model_attempt_id=approval.model_attempt_id,
         tool_call_id=approval.tool_call_id,
         tool_name=approval.tool_name,
         arguments=copy_durable_json_value(approval.arguments, "arguments"),
@@ -577,3 +612,17 @@ def copy_pending_tool_call_approval(
         metadata=copy_durable_json_value(call.metadata, "metadata"),
         active_taint_labels=list(call.active_taint_labels),
     )
+
+
+def copy_distinct_pending_tool_call_approvals(
+    calls: list[PendingToolCallApproval],
+    *,
+    owner: str,
+) -> list[PendingToolCallApproval]:
+    copied = [copy_pending_tool_call_approval(call) for call in calls]
+    if not copied:
+        raise ValueError(f"{owner} must include tool calls.")
+    tool_call_ids = [call.tool_call_id for call in copied]
+    if len(tool_call_ids) != len(set(tool_call_ids)):
+        raise ValueError(f"{owner} contains duplicate tool-call identities.")
+    return copied

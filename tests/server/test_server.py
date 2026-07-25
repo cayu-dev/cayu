@@ -3248,6 +3248,16 @@ def test_server_sessions_summary_filters_debug_states_before_pagination() -> Non
 
 def test_server_pending_actions_lists_blocking_session_work() -> None:
     app = CayuApp()
+    approval_round_id = f"tround_{'3' * 32}"
+    user_input_round_id = f"tround_{'4' * 32}"
+    recovery_round_id = f"tround_{'5' * 32}"
+
+    def execution_identity(tool_round_id: str) -> dict[str, str]:
+        return {
+            "model_step_id": f"mstep_{'1' * 32}",
+            "model_attempt_id": f"matt_{'2' * 32}",
+            "tool_round_id": tool_round_id,
+        }
 
     def pending_tool_call(tool_call_id: str, tool_name: str) -> dict[str, object]:
         return {
@@ -3269,6 +3279,7 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
     ) -> dict[str, object]:
         return {
             "pending_tool_approval": {
+                **execution_identity(approval_round_id),
                 "approval_id": approval_id,
                 "tool_call_id": tool_call_id,
                 "tool_name": tool_name,
@@ -3293,6 +3304,7 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
     ) -> dict[str, object]:
         return {
             "pending_user_input": {
+                **execution_identity(user_input_round_id),
                 "input_id": input_id,
                 "tool_call_id": tool_call_id,
                 "tool_name": tool_name,
@@ -3313,7 +3325,7 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
     ) -> dict[str, object]:
         return {
             "pending_tool_round": {
-                "round_id": round_id,
+                **execution_identity(round_id),
                 "agent_name": "assistant",
                 "tool_calls": [
                     {
@@ -3354,12 +3366,17 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
                     session_id="pending_approval",
                     tool_name="deploy",
                     payload={
+                        **execution_identity(approval_round_id),
+                        "approval_id": "approval_1",
+                        "tool_call_id": "call_deploy",
                         "approval": {
+                            **execution_identity(approval_round_id),
                             "approval_id": "approval_1",
+                            "tool_call_id": "call_deploy",
                             "tool_name": "deploy",
                             "reason": "production write",
                             "arguments": {"service": "api"},
-                        }
+                        },
                     },
                 )
             ],
@@ -3379,6 +3396,7 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
                     type=EventType.SESSION_AWAITING_USER_INPUT,
                     session_id="pending_user_input",
                     payload={
+                        **execution_identity(user_input_round_id),
                         "input_id": "input_1",
                         "tool_call_id": "call_ask",
                         "question": "Deploy now?",
@@ -3403,6 +3421,7 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
                     type=EventType.SESSION_INTERRUPTED,
                     session_id="manual_recovery",
                     payload={
+                        **execution_identity(approval_round_id),
                         "interruption_type": "tool_approval_required",
                         "manual_recovery_required": True,
                         "approval_id": "approval_2",
@@ -3429,7 +3448,7 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
                     session_id="manual_tool_round_recovery",
                     tool_name="charge_card",
                     payload={
-                        "tool_round_id": "round_crashed",
+                        **execution_identity(recovery_round_id),
                         "tool_call_id": "call_charge",
                     },
                 ),
@@ -3438,9 +3457,9 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
                     type=EventType.SESSION_FAILED,
                     session_id="manual_tool_round_recovery",
                     payload={
+                        **execution_identity(recovery_round_id),
                         "interruption_type": "runtime_interrupted",
                         "manual_recovery_required": True,
-                        "tool_round_id": "round_crashed",
                         "tool_call_id": "call_charge",
                         "tool_name": "charge_card",
                         "error": "tool outcome unknown",
@@ -3448,7 +3467,7 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
                 ),
             ],
             checkpoint=tool_round_checkpoint(
-                round_id="round_crashed",
+                round_id=recovery_round_id,
                 tool_call_id="call_charge",
                 tool_name="charge_card",
                 arguments={"amount": 42},
@@ -3519,7 +3538,7 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
     assert user_input["options"] == ["yes", "no"]
     tool_round = actions_by_session["manual_tool_round_recovery"]
     assert tool_round["kind"] == "manual_recovery"
-    assert tool_round["round_id"] == "round_crashed"
+    assert tool_round["round_id"] == recovery_round_id
     assert tool_round["tool_call_id"] == "call_charge"
     assert tool_round["approval_id"] is None
     assert tool_round["input_id"] is None
@@ -3546,7 +3565,7 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
     tool_round_exact_body = tool_round_exact.json()
     assert tool_round_exact_body["inspected_candidate_count"] == 1
     assert tool_round_exact_body["total_count"] == 1
-    assert tool_round_exact_body["actions"][0]["round_id"] == "round_crashed"
+    assert tool_round_exact_body["actions"][0]["round_id"] == recovery_round_id
 
     stale_exact = client.get("/api/pending-actions?session_id=missing_checkpoint")
     assert stale_exact.status_code == 200
@@ -3564,6 +3583,9 @@ def test_control_plane_redacts_legacy_session_event_transcript_pending_and_task_
         enable_logging=False,
     )
     session_id = "legacy_control_plane_secret"
+    model_step_id = f"mstep_{'1' * 32}"
+    model_attempt_id = f"matt_{'2' * 32}"
+    tool_round_id = f"tround_{'3' * 32}"
 
     async def seed() -> None:
         await app.session_store.create(
@@ -3586,11 +3608,32 @@ def test_control_plane_redacts_legacy_session_event_transcript_pending_and_task_
                     agent_name="assistant",
                     tool_name="deploy",
                     payload={
+                        "approval_id": "legacy_approval",
+                        "tool_call_id": "legacy_call",
+                        "model_step_id": model_step_id,
+                        "model_attempt_id": model_attempt_id,
+                        "tool_round_id": tool_round_id,
                         "approval": {
                             "approval_id": "legacy_approval",
+                            "tool_round_id": tool_round_id,
+                            "model_step_id": model_step_id,
+                            "model_attempt_id": model_attempt_id,
+                            "tool_call_id": "legacy_call",
                             "tool_name": "deploy",
-                            "arguments": {secret: f"event value {secret}"},
-                        }
+                            "arguments": {secret: f"checkpoint value {secret}"},
+                            "agent_name": "assistant",
+                            "tool_calls": [
+                                {
+                                    "tool_call_id": "legacy_call",
+                                    "tool_name": "deploy",
+                                    "arguments": {secret: f"checkpoint value {secret}"},
+                                    "policy_decision": None,
+                                    "reason": None,
+                                    "metadata": {},
+                                    "active_taint_labels": [],
+                                }
+                            ],
+                        },
                     },
                 )
             ],
@@ -3615,6 +3658,9 @@ def test_control_plane_redacts_legacy_session_event_transcript_pending_and_task_
             {
                 "pending_tool_approval": {
                     "approval_id": "legacy_approval",
+                    "tool_round_id": tool_round_id,
+                    "model_step_id": model_step_id,
+                    "model_attempt_id": model_attempt_id,
                     "tool_call_id": "legacy_call",
                     "tool_name": "deploy",
                     "arguments": {secret: f"checkpoint value {secret}"},
@@ -5258,6 +5304,9 @@ def test_server_exposes_paginated_session_transcript() -> None:
                     tool_call_id="call_1",
                     tool_name="read_file",
                     content="file contents",
+                    model_step_id=f"mstep_{'1' * 32}",
+                    model_attempt_id=f"matt_{'2' * 32}",
+                    tool_round_id=f"tround_{'3' * 32}",
                 ),
                 Message.text("assistant", "done"),
             ],
@@ -5297,6 +5346,10 @@ def test_server_exposes_paginated_session_transcript() -> None:
     assert second_body["next_offset"] == 4
     assert second_body["has_more"] is False
     assert [message["role"] for message in second_body["messages"]] == ["tool", "assistant"]
+    result_content = second_body["messages"][0]["content"][0]
+    assert result_content["model_step_id"] == f"mstep_{'1' * 32}"
+    assert result_content["model_attempt_id"] == f"matt_{'2' * 32}"
+    assert result_content["tool_round_id"] == f"tround_{'3' * 32}"
 
 
 def test_server_filters_session_transcript_by_role() -> None:

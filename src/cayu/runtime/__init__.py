@@ -175,8 +175,10 @@ from cayu.runtime.execution_units import (
     BudgetLimitIdentity,
     ModelAttemptIdentity,
     ModelStepIdentity,
+    ToolRoundIdentity,
     copy_model_attempt_identity,
     copy_model_step_identity,
+    copy_tool_round_identity,
     new_model_step_identity,
 )
 from cayu.runtime.hooks import (
@@ -617,6 +619,7 @@ __all__ = [
     "ToolPolicyDecision",
     "ToolPolicyRequest",
     "ToolPolicyResult",
+    "ToolRoundIdentity",
     "ToolRoundRecoveryRequest",
     "TranscriptDigestCompactor",
     "TranscriptPage",
@@ -661,6 +664,7 @@ __all__ = [
     "copy_retry_policy",
     "copy_run_limits",
     "copy_session_user_metadata",
+    "copy_tool_round_identity",
     "default_compaction_prompt",
     "default_model_catalog",
     "default_price_book",

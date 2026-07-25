@@ -180,8 +180,10 @@ from cayu.runtime.costs import (
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
     ModelStepIdentity,
+    ToolRoundIdentity,
     copy_model_attempt_identity,
     copy_model_step_identity,
+    copy_tool_round_identity,
     new_model_step_identity,
 )
 from cayu.runtime.hooks import (
@@ -1429,8 +1431,9 @@ def _limit_reached_tool_round_results(
     *,
     tool_calls: list[runtime_records.ToolCallRequest],
     decision: StopDecision,
-    tool_round_id: str | None = None,
+    tool_round_identity: ToolRoundIdentity,
 ) -> list[runtime_records.ToolCallOutcome]:
+    identity = copy_tool_round_identity(tool_round_identity)
     outcomes: list[runtime_records.ToolCallOutcome] = []
     for tool_call in tool_calls:
         structured = {
@@ -1441,9 +1444,8 @@ def _limit_reached_tool_round_results(
             "actual": _limit_value_for_payload(decision.actual),
             "tool_call_id": tool_call.id,
             "tool_name": tool_call.name,
+            **identity.payload(),
         }
-        if tool_round_id is not None:
-            structured["tool_round_id"] = tool_round_id
         outcomes.append(
             runtime_records.ToolCallOutcome(
                 call=tool_call,
@@ -1464,21 +1466,21 @@ def _limit_reached_tool_call_event(
     registered_environment: runtime_records.RegisteredEnvironment | None,
     tool_call_outcome: runtime_records.ToolCallOutcome,
     decision: StopDecision,
-    tool_round_id: str | None = None,
+    tool_round_identity: ToolRoundIdentity,
 ) -> Event:
+    identity = copy_tool_round_identity(tool_round_identity)
     payload = {
         "tool_call_id": tool_call_outcome.call.id,
         "idempotency_key": tool_execution.tool_idempotency_key(
             session_id=session.id,
-            tool_round_id=tool_round_id,
+            tool_round_id=identity.tool_round_id,
             tool_call_id=tool_call_outcome.call.id,
         ),
         "reason": "limit_reached",
         "limit": decision.limit.value,
         "result": tool_call_outcome.result.model_dump(),
+        **identity.payload(),
     }
-    if tool_round_id is not None:
-        payload["tool_round_id"] = tool_round_id
     return Event(
         type=EventType.TOOL_CALL_FAILED,
         session_id=session.id,
@@ -1670,6 +1672,7 @@ def _structured_output_event(
     validation: StructuredOutputValidation,
     step: int,
     attempt: int,
+    execution_identity: ModelAttemptIdentity | ToolRoundIdentity,
     redactor: SecretRedactor | None = None,
 ) -> Event:
     if event_type not in {
@@ -1690,6 +1693,7 @@ def _structured_output_event(
         "max_retries": spec.max_retries,
         "valid": validation.valid,
         "errors": [error.model_dump(mode="json") for error in validation.errors],
+        **_structured_output_execution_identity_payload(execution_identity),
     }
     if validation.valid:
         payload["output"] = copy_json_value(validation.output, "output")
@@ -1710,6 +1714,7 @@ def _structured_output_validating_event(
     spec: StructuredOutputSpec,
     step: int,
     attempt: int,
+    execution_identity: ModelAttemptIdentity | ToolRoundIdentity,
 ) -> Event:
     if type(spec) is not StructuredOutputSpec:
         raise TypeError("Structured output spec must be a StructuredOutputSpec instance.")
@@ -1724,8 +1729,19 @@ def _structured_output_validating_event(
             "step": step,
             "attempt": attempt,
             "max_retries": spec.max_retries,
+            **_structured_output_execution_identity_payload(execution_identity),
         },
     )
+
+
+def _structured_output_execution_identity_payload(
+    identity: ModelAttemptIdentity | ToolRoundIdentity,
+) -> dict[str, str]:
+    if type(identity) is ToolRoundIdentity:
+        return copy_tool_round_identity(identity).payload()
+    if type(identity) is ModelAttemptIdentity:
+        return copy_model_attempt_identity(identity).payload()
+    raise TypeError("Structured-output execution identity has an unsupported type.")
 
 
 def _redact_structured_output_validation(
@@ -7008,8 +7024,8 @@ class SessionEngine:
                     else None
                 )
                 tool_calls = assistant_step_result.tool_calls
+                tool_round_identity = assistant_step_result.tool_round_identity
 
-                pending_tool_round: tool_round_recovery.PendingToolRound | None = None
                 if assistant_message is not None:
                     messages.append(assistant_message)
                     if tool_calls and not (
@@ -7017,9 +7033,11 @@ class SessionEngine:
                         and structured_output.strategy == StructuredOutputStrategy.TOOL
                         and _has_structured_output_tool_call(tool_calls)
                     ):
+                        if tool_round_identity is None:
+                            raise RuntimeError("Tool calls require a tool-round identity.")
                         (
                             checkpoint,
-                            pending_tool_round,
+                            _pending_tool_round,
                         ) = await self._tool_round_executor.checkpoint_with_pending_tool_round(
                             session=session,
                             registered_agent=registered_agent,
@@ -7028,6 +7046,7 @@ class SessionEngine:
                             policy_outcomes=None,
                             task_id=task_id,
                             structured_output=structured_output,
+                            tool_round_identity=tool_round_identity,
                         )
                         await (
                             self.session_store.append_transcript_messages_and_transform_checkpoint(
@@ -7041,10 +7060,6 @@ class SessionEngine:
                             session.id,
                             [assistant_message],
                         )
-                tool_round_id = (
-                    pending_tool_round.round_id if pending_tool_round is not None else None
-                )
-
                 limit_evaluation = await limit_gate.evaluate_limits(
                     pending_tool_calls=_user_tool_call_count(tool_calls),
                     execution_identity=completed_model_attempt_identity,
@@ -7057,7 +7072,7 @@ class SessionEngine:
                     environment_name=environment_name,
                     messages=messages,
                     tool_calls=tool_calls,
-                    tool_round_id=tool_round_id,
+                    tool_round_identity=tool_round_identity,
                     run_started_at=run_started_at,
                     turn_usage_tracker=turn_usage_tracker,
                     active_run=active_run,
@@ -7078,7 +7093,7 @@ class SessionEngine:
                     environment_name=environment_name,
                     messages=messages,
                     tool_calls=tool_calls,
-                    tool_round_id=tool_round_id,
+                    tool_round_identity=tool_round_identity,
                     run_started_at=run_started_at,
                     turn_usage_tracker=turn_usage_tracker,
                     active_run=active_run,
@@ -7097,6 +7112,10 @@ class SessionEngine:
                     and structured_output.strategy == StructuredOutputStrategy.TOOL
                     and _has_structured_output_tool_call(tool_calls)
                 ):
+                    if tool_round_identity is None:
+                        raise RuntimeError(
+                            "Structured-output tool calls require a tool-round identity."
+                        )
                     yield await self._event_writer.emit(
                         _structured_output_validating_event(
                             session=session,
@@ -7105,6 +7124,7 @@ class SessionEngine:
                             spec=structured_output,
                             step=step,
                             attempt=structured_output_retries + 1,
+                            execution_identity=tool_round_identity,
                         )
                     )
                     validation = _validate_structured_output_tool_round(
@@ -7121,7 +7141,8 @@ class SessionEngine:
                         self._secret_redactor,
                     )
                     tool_result_messages = transcript_helpers.tool_result_messages(
-                        structured_tool_outcomes
+                        structured_tool_outcomes,
+                        tool_round_identity=tool_round_identity,
                     )
                     messages.extend(tool_result_messages)
                     await self.session_store.append_transcript_messages(
@@ -7143,6 +7164,7 @@ class SessionEngine:
                                 validation=validation,
                                 step=step,
                                 attempt=structured_output_retries + 1,
+                                execution_identity=tool_round_identity,
                                 redactor=self._secret_redactor,
                             )
                         )
@@ -7180,6 +7202,7 @@ class SessionEngine:
                             validation=validation,
                             step=step,
                             attempt=structured_output_retries + 1,
+                            execution_identity=tool_round_identity,
                             redactor=self._secret_redactor,
                         )
                     )
@@ -7205,6 +7228,7 @@ class SessionEngine:
                             validation=validation,
                             step=step,
                             attempt=structured_output_retries,
+                            execution_identity=tool_round_identity,
                             redactor=self._secret_redactor,
                         )
                     )
@@ -7220,6 +7244,7 @@ class SessionEngine:
                                 spec=structured_output,
                                 step=step,
                                 attempt=structured_output_retries + 1,
+                                execution_identity=completed_model_attempt_identity,
                             )
                         )
                         if structured_output.strategy == StructuredOutputStrategy.NATIVE:
@@ -7247,6 +7272,7 @@ class SessionEngine:
                                         validation=validation,
                                         step=step,
                                         attempt=structured_output_retries + 1,
+                                        execution_identity=completed_model_attempt_identity,
                                         redactor=self._secret_redactor,
                                     )
                                 )
@@ -7288,6 +7314,7 @@ class SessionEngine:
                                 validation=validation,
                                 step=step,
                                 attempt=structured_output_retries + 1,
+                                execution_identity=completed_model_attempt_identity,
                                 redactor=self._secret_redactor,
                             )
                         )
@@ -7329,6 +7356,7 @@ class SessionEngine:
                                 validation=validation,
                                 step=step,
                                 attempt=structured_output_retries,
+                                execution_identity=completed_model_attempt_identity,
                                 redactor=self._secret_redactor,
                             )
                         )
@@ -7434,10 +7462,12 @@ class SessionEngine:
                         continue
                     break
 
+                if tool_round_identity is None:
+                    raise RuntimeError("Ordinary tool calls require a tool-round identity.")
                 async for event in tool_round_runner.run(
                     messages=messages,
                     tool_calls=tool_calls,
-                    tool_round_id=tool_round_id,
+                    tool_round_identity=tool_round_identity,
                 ):
                     yield event
                 if tool_round_runner.stopped_for_limit:
@@ -7506,6 +7536,9 @@ class SessionEngine:
                     environment_name=environment_name,
                     payload={
                         "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
+                        "model_step_id": exc.approval.model_step_id,
+                        "model_attempt_id": exc.approval.model_attempt_id,
+                        "tool_round_id": exc.approval.tool_round_id,
                         "approval": exc.approval.model_dump(mode="json"),
                     },
                 ),
@@ -7534,6 +7567,9 @@ class SessionEngine:
                     environment_name=environment_name,
                     payload={
                         "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
+                        "model_step_id": exc.pending.model_step_id,
+                        "model_attempt_id": exc.pending.model_attempt_id,
+                        "tool_round_id": exc.pending.tool_round_id,
                         "user_input": exc.pending.model_dump(mode="json"),
                     },
                 ),
@@ -7972,7 +8008,7 @@ class SessionEngine:
             messages=request.messages,
             tool_calls=request.tool_calls,
             completed_tool_outcomes=request.completed_tool_outcomes,
-            tool_round_id=request.tool_round_id,
+            tool_round_identity=request.tool_round_identity,
             run_started_at=request.run_started_at,
             turn_usage_tracker=request.turn_usage_tracker,
             active_run=request.active_run,
@@ -7990,7 +8026,7 @@ class SessionEngine:
         messages: list[Message],
         tool_calls: list[runtime_records.ToolCallRequest] | None = None,
         completed_tool_outcomes: list[runtime_records.ToolCallOutcome] | None = None,
-        tool_round_id: str | None = None,
+        tool_round_identity: ToolRoundIdentity | None = None,
         run_started_at: float | None = None,
         turn_usage_tracker: SessionUsageTracker | None = None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
@@ -8012,7 +8048,7 @@ class SessionEngine:
             completed_tool_outcomes=(
                 completed_tool_outcomes if completed_tool_outcomes is not None else []
             ),
-            tool_round_id=tool_round_id,
+            tool_round_identity=tool_round_identity,
             run_started_at=run_started_at,
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
@@ -8029,7 +8065,7 @@ class SessionEngine:
         environment_name: str | None,
         messages: list[Message],
         tool_calls: list[runtime_records.ToolCallRequest] | None = None,
-        tool_round_id: str | None = None,
+        tool_round_identity: ToolRoundIdentity | None = None,
         run_started_at: float | None = None,
         turn_usage_tracker: SessionUsageTracker | None = None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
@@ -8047,7 +8083,7 @@ class SessionEngine:
             messages=messages,
             tool_calls=tool_calls if tool_calls is not None else [],
             completed_tool_outcomes=[],
-            tool_round_id=tool_round_id,
+            tool_round_identity=tool_round_identity,
             run_started_at=run_started_at,
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
@@ -8068,11 +8104,17 @@ class SessionEngine:
         tool_calls: list[runtime_records.ToolCallRequest],
         completed_tool_outcomes: list[runtime_records.ToolCallOutcome],
         pending_approval_to_clear: PendingToolApproval | None = None,
-        tool_round_id: str | None = None,
+        tool_round_identity: ToolRoundIdentity | None = None,
         run_started_at: float | None = None,
         turn_usage_tracker: SessionUsageTracker | None = None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
     ) -> AsyncGenerator[Event, None]:
+        if tool_round_identity is None and pending_approval_to_clear is not None:
+            tool_round_identity = ToolRoundIdentity(
+                tool_round_id=pending_approval_to_clear.tool_round_id,
+                model_step_id=pending_approval_to_clear.model_step_id,
+                model_attempt_id=pending_approval_to_clear.model_attempt_id,
+            )
         limit_payload = _limit_reached_payload(
             decision=decision,
             usage_summary=usage_summary,
@@ -8097,7 +8139,7 @@ class SessionEngine:
                 completed_tool_outcomes=completed_tool_outcomes,
                 decision=decision,
                 pending_approval_to_clear=pending_approval_to_clear,
-                tool_round_id=tool_round_id,
+                tool_round_identity=tool_round_identity,
             ):
                 yield event
 
@@ -8109,6 +8151,8 @@ class SessionEngine:
             "interruption_type": _INTERRUPTION_TYPE_LIMIT_REACHED,
             **limit_payload,
         }
+        if tool_round_identity is not None:
+            terminal_payload.update(tool_round_identity.payload())
         if run_started_at is not None and turn_usage_tracker is not None:
             yield await self._emit_turn_completed_once(
                 session=interrupted_session,
@@ -8237,7 +8281,7 @@ class SessionEngine:
         messages: list[Message],
         tool_calls: list[runtime_records.ToolCallRequest],
         completed_tool_outcomes: list[runtime_records.ToolCallOutcome],
-        tool_round_id: str | None = None,
+        tool_round_identity: ToolRoundIdentity | None = None,
         run_started_at: float | None = None,
         turn_usage_tracker: SessionUsageTracker | None = None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
@@ -8271,7 +8315,7 @@ class SessionEngine:
             messages=messages,
             tool_calls=tool_calls,
             completed_tool_outcomes=completed_tool_outcomes,
-            tool_round_id=tool_round_id,
+            tool_round_identity=tool_round_identity,
             run_started_at=run_started_at,
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
@@ -8289,13 +8333,22 @@ class SessionEngine:
         completed_tool_outcomes: list[runtime_records.ToolCallOutcome],
         decision: StopDecision,
         pending_approval_to_clear: PendingToolApproval | None = None,
-        tool_round_id: str | None = None,
+        tool_round_identity: ToolRoundIdentity | None = None,
     ) -> AsyncGenerator[Event, None]:
+        if tool_round_identity is None and pending_approval_to_clear is not None:
+            tool_round_identity = ToolRoundIdentity(
+                tool_round_id=pending_approval_to_clear.tool_round_id,
+                model_step_id=pending_approval_to_clear.model_step_id,
+                model_attempt_id=pending_approval_to_clear.model_attempt_id,
+            )
+        if tool_round_identity is None:
+            raise RuntimeError("Closing a tool round requires its durable identity.")
         expected_tool_calls = [*tool_calls, *(outcome.call for outcome in completed_tool_outcomes)]
         if await transcript_helpers.tool_round_has_result_messages(
             self.session_store,
             session.id,
             expected_tool_calls,
+            tool_round_identity=tool_round_identity,
         ):
             if pending_approval_to_clear is not None:
                 cleared_checkpoint = await approval_support.checkpoint_without_pending_approval(
@@ -8311,7 +8364,7 @@ class SessionEngine:
                         session=session,
                         agent_name=registered_agent.spec.name,
                         environment_name=_environment_name(registered_environment),
-                        approval_id=pending_approval_to_clear.approval_id,
+                        approval=pending_approval_to_clear,
                     )
                 )
             return
@@ -8322,7 +8375,7 @@ class SessionEngine:
         skipped_outcomes = _limit_reached_tool_round_results(
             tool_calls=remaining_tool_calls,
             decision=decision,
-            tool_round_id=tool_round_id,
+            tool_round_identity=tool_round_identity,
         )
         completed_tool_outcomes = tool_results.redact_tool_call_outcomes(
             completed_tool_outcomes,
@@ -8340,13 +8393,14 @@ class SessionEngine:
                     registered_environment=registered_environment,
                     tool_call_outcome=skipped_outcome,
                     decision=decision,
-                    tool_round_id=tool_round_id,
+                    tool_round_identity=tool_round_identity,
                 )
             )
         tool_result_messages = ordered_tool_result_messages(
             tool_calls,
             [*completed_tool_outcomes, *skipped_outcomes],
             parallel=True,
+            tool_round_identity=tool_round_identity,
         )
         messages.extend(tool_result_messages)
         if pending_approval_to_clear is not None:
@@ -8364,7 +8418,7 @@ class SessionEngine:
                     session=session,
                     agent_name=registered_agent.spec.name,
                     environment_name=_environment_name(registered_environment),
-                    approval_id=pending_approval_to_clear.approval_id,
+                    approval=pending_approval_to_clear,
                 )
             )
         else:
@@ -8391,7 +8445,7 @@ class SessionEngine:
             redactor=self._secret_redactor,
             consume_on_rejection=True,
         )
-        if current is None or current.round_id != pending_round.round_id:
+        if current is None or current.tool_round_id != pending_round.tool_round_id:
             return
         copied_checkpoint.pop(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY, None)
         await self.session_store.transform_checkpoint(

@@ -33,6 +33,13 @@ def _model_attempt_identity(value: int) -> dict[str, str]:
     }
 
 
+def _tool_round_identity(value: int) -> dict[str, str]:
+    return {
+        **_model_attempt_identity(value),
+        "tool_round_id": f"tround_{value:032x}",
+    }
+
+
 def _write_project(root: Path, database: str = "data/cayu.db") -> Path:
     (root / "pyproject.toml").write_text(
         """
@@ -731,6 +738,11 @@ def test_session_show_reports_approval_and_user_input_pending_actions(
     capsys,
 ) -> None:
     database = _write_project(tmp_path)
+    execution_identity = {
+        "model_step_id": f"mstep_{'1' * 32}",
+        "model_attempt_id": f"matt_{'2' * 32}",
+        "tool_round_id": f"tround_{'3' * 32}",
+    }
 
     def pending_call(call_id: str, tool_name: str) -> dict[str, object]:
         return {
@@ -763,14 +775,18 @@ def test_session_show_reports_approval_and_user_input_pending_actions(
                     session_id="sess_approval",
                     tool_name="deploy",
                     payload={
+                        **execution_identity,
+                        "approval_id": "approval-1",
+                        "tool_call_id": "call-approval",
                         "approval": {
+                            **execution_identity,
                             "approval_id": "approval-1",
                             "tool_call_id": "call-approval",
                             "tool_name": "deploy",
                             "arguments": {},
                             "agent_name": "operator",
                             "tool_calls": [pending_call("call-approval", "deploy")],
-                        }
+                        },
                     },
                 ),
             )
@@ -778,6 +794,7 @@ def test_session_show_reports_approval_and_user_input_pending_actions(
                 "sess_approval",
                 {
                     "pending_tool_approval": {
+                        **execution_identity,
                         "approval_id": "approval-1",
                         "tool_call_id": "call-approval",
                         "tool_name": "deploy",
@@ -796,6 +813,7 @@ def test_session_show_reports_approval_and_user_input_pending_actions(
                     session_id="sess_input",
                     tool_name="ask_user",
                     payload={
+                        **execution_identity,
                         "input_id": "input-1",
                         "tool_call_id": "call-input",
                         "question": "Deploy?",
@@ -807,6 +825,7 @@ def test_session_show_reports_approval_and_user_input_pending_actions(
                 "sess_input",
                 {
                     "pending_user_input": {
+                        **execution_identity,
                         "input_id": "input-1",
                         "tool_call_id": "call-input",
                         "tool_name": "ask_user",
@@ -1363,7 +1382,7 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
                     timestamp=started_at,
                     payload={
                         "tool_call_id": "call-1",
-                        "tool_round_id": "round-1",
+                        **_tool_round_identity(1),
                         "arguments": {"path": "one.txt", "api_key": secret},
                     },
                 ),
@@ -1374,7 +1393,7 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
                     timestamp=started_at,
                     payload={
                         "tool_call_id": "call-2",
-                        "tool_round_id": "round-1",
+                        **_tool_round_identity(1),
                         "arguments": {"query": "Cayu"},
                     },
                 ),
@@ -1385,7 +1404,7 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
                     timestamp=started_at + timedelta(milliseconds=250),
                     payload={
                         "tool_call_id": "call-2",
-                        "tool_round_id": "round-1",
+                        **_tool_round_identity(1),
                         "result": {
                             "content": large_result,
                             "structured": {"returned": 2, "truncated": True},
@@ -1403,6 +1422,7 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
                     tool_name="deploy",
                     timestamp=started_at + timedelta(seconds=1),
                     payload={
+                        **_tool_round_identity(2),
                         "approval": {
                             "approval_id": "approval-3",
                             "tool_call_id": "call-3",
@@ -1410,7 +1430,7 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
                             "arguments": {},
                             "agent_name": "builder",
                             "tool_calls": [],
-                        }
+                        },
                     },
                 ),
                 Event(
@@ -1418,7 +1438,7 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
                     session_id="sess_tools",
                     tool_name="deploy",
                     timestamp=started_at + timedelta(seconds=2),
-                    payload={"tool_call_id": "call-3", "tool_round_id": "round-2"},
+                    payload={"tool_call_id": "call-3", **_tool_round_identity(2)},
                 ),
                 Event(
                     type=EventType.TOOL_CALL_STARTED,
@@ -1427,7 +1447,7 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
                     timestamp=started_at + timedelta(seconds=3),
                     payload={
                         "tool_call_id": "call-3",
-                        "tool_round_id": "round-2",
+                        **_tool_round_identity(2),
                         "arguments": {},
                     },
                 ),
@@ -1438,7 +1458,7 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
                     timestamp=started_at + timedelta(seconds=4),
                     payload={
                         "tool_call_id": "call-3",
-                        "tool_round_id": "round-2",
+                        **_tool_round_identity(2),
                         "result": {
                             "content": "blocked",
                             "structured": None,
@@ -1453,6 +1473,7 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
                     tool_name="publish",
                     timestamp=started_at + timedelta(seconds=5),
                     payload={
+                        **_tool_round_identity(3),
                         "approval": {
                             "approval_id": "approval-4",
                             "tool_call_id": "call-4",
@@ -1472,7 +1493,7 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
                                     "policy_decision": "deny",
                                 },
                             ],
-                        }
+                        },
                     },
                 ),
                 Event(
@@ -1483,6 +1504,7 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
                     payload={
                         "approval_id": "approval-4",
                         "tool_call_id": "call-5",
+                        **_tool_round_identity(3),
                         "result": {
                             "content": "blocked",
                             "structured": None,
@@ -1498,6 +1520,7 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
                     timestamp=started_at + timedelta(seconds=7),
                     payload={
                         "tool_call_id": "call-6",
+                        **_tool_round_identity(4),
                         "result": {
                             "content": "failed",
                             "structured": {
@@ -1515,6 +1538,7 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
                     tool_name="read_file",
                     timestamp=started_at + timedelta(seconds=8),
                     payload={
+                        **_tool_round_identity(5),
                         "approval": {
                             "approval_id": "approval-7",
                             "tool_call_id": "call-7",
@@ -1533,7 +1557,7 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
                                     "arguments": {"path": "two"},
                                 },
                             ],
-                        }
+                        },
                     },
                 ),
                 *[
@@ -1545,6 +1569,7 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
                         payload={
                             "approval_id": "approval-7",
                             "tool_call_id": call_id,
+                            **_tool_round_identity(5),
                             **(
                                 {"arguments": {"path": call_id}}
                                 if event_type == EventType.TOOL_CALL_STARTED
@@ -1574,6 +1599,7 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
                     payload={
                         "input_id": "input-9",
                         "tool_call_id": "call-9",
+                        **_tool_round_identity(6),
                         "question": "Continue?",
                         "options": ["yes", "no"],
                         "tool_calls": [
@@ -1650,12 +1676,12 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
     assert by_id["call-6"]["status"] == "error"
     assert by_id["call-6"]["returned"] is None
     assert by_id["call-6"]["truncated"] is None
-    assert by_id["call-7"]["tool_round_id"] == "approval:approval-7"
+    assert by_id["call-7"]["tool_round_id"] == _tool_round_identity(5)["tool_round_id"]
     assert by_id["call-7"]["parallel_round_width"] == 2
-    assert by_id["call-8"]["tool_round_id"] == "approval:approval-7"
+    assert by_id["call-8"]["tool_round_id"] == _tool_round_identity(5)["tool_round_id"]
     assert by_id["call-8"]["parallel_round_width"] == 2
     assert by_id["call-9"]["status"] == "awaiting_input"
-    assert by_id["call-9"]["tool_round_id"] == "input:input-9"
+    assert by_id["call-9"]["tool_round_id"] == _tool_round_identity(6)["tool_round_id"]
     assert by_id["call-9"]["parallel_round_width"] == 2
     assert by_id["call-10"]["status"] == "awaiting_input"
 
@@ -1681,6 +1707,88 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
         "truncated",
     ):
         assert field in table_header
+
+
+def test_session_tool_rows_keep_provider_reused_call_ids_in_distinct_rounds() -> None:
+    from cayu.cli.session import _tool_call_rows, _tool_inspection_record
+    from cayu.runtime import EventRecord
+
+    records: list[EventRecord] = []
+    sequence = 1
+    for round_number in (1, 2):
+        for event_type in (EventType.TOOL_CALL_STARTED, EventType.TOOL_CALL_COMPLETED):
+            payload: dict[str, object] = {
+                "tool_call_id": "provider-reused-call-id",
+                **_tool_round_identity(round_number),
+            }
+            if event_type == EventType.TOOL_CALL_COMPLETED:
+                payload["result"] = {
+                    "content": "done",
+                    "structured": None,
+                    "artifacts": [],
+                    "is_error": False,
+                }
+            records.append(
+                _tool_inspection_record(
+                    EventRecord(
+                        sequence=sequence,
+                        event=Event(
+                            type=event_type,
+                            session_id="sess_reused_call_id",
+                            tool_name="lookup",
+                            payload=payload,
+                        ),
+                    )
+                )
+            )
+            sequence += 1
+
+    rows = _tool_call_rows(records)
+
+    assert len(rows) == 2
+    assert [row["tool_call_id"] for row in rows] == [
+        "provider-reused-call-id",
+        "provider-reused-call-id",
+    ]
+    assert [row["tool_round_id"] for row in rows] == [
+        _tool_round_identity(1)["tool_round_id"],
+        _tool_round_identity(2)["tool_round_id"],
+    ]
+    assert [row["model_attempt_id"] for row in rows] == [
+        _tool_round_identity(1)["model_attempt_id"],
+        _tool_round_identity(2)["model_attempt_id"],
+    ]
+    assert all(row["status"] == "success" for row in rows)
+
+
+def test_session_tool_rows_do_not_guess_missing_execution_identity() -> None:
+    from cayu.cli.session import _tool_call_rows, _tool_inspection_record
+    from cayu.runtime import EventRecord
+
+    records = [
+        _tool_inspection_record(
+            EventRecord(
+                sequence=sequence,
+                event=Event(
+                    type=event_type,
+                    session_id="sess_missing_tool_identity",
+                    tool_name="lookup",
+                    payload={"tool_call_id": "reused-call-id"},
+                ),
+            )
+        )
+        for sequence, event_type in enumerate(
+            (EventType.TOOL_CALL_STARTED, EventType.TOOL_CALL_COMPLETED),
+            start=1,
+        )
+    ]
+
+    rows = _tool_call_rows(records)
+
+    assert len(rows) == 2
+    assert all(row["tool_round_id"] is None for row in rows)
+    assert all(row["model_attempt_id"] is None for row in rows)
+    assert all(row["parallel_round_width"] == 1 for row in rows)
 
 
 def test_session_events_filters_paginates_and_bounds_explicit_payloads(
