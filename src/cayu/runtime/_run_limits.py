@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Generic, TypeVar
+from typing import Generic, Literal, TypeVar
 
 from cayu._exception_groups import exception_cause
 from cayu._validation import copy_json_value, require_clean_nonblank
@@ -16,6 +16,7 @@ from cayu.core.billing import (
     BillingIdentity,
     BillingIdentityState,
     ResolvedBillingIdentity,
+    completed_billing_identity,
     resolved_billing_identity,
 )
 from cayu.core.events import Event, EventType
@@ -33,6 +34,7 @@ from cayu.runtime.budgets import (
     BudgetStore,
     _effective_budget_limits,
     _EffectiveBudgetLimit,
+    _is_expired_reservation_reason,
     budget_actual_cost_for_event,
     budget_check_from_events,
     budget_check_payload,
@@ -46,6 +48,12 @@ from cayu.runtime.budgets import (
     request_budget_limits_for_session,
 )
 from cayu.runtime.costs import SessionCostSummary, estimate_session_cost
+from cayu.runtime.execution_units import (
+    ModelAttemptIdentity,
+    ModelStepIdentity,
+    copy_model_attempt_identity,
+    copy_model_step_identity,
+)
 from cayu.runtime.sessions import EventQuery, EventRecord, Session, SessionStore
 from cayu.runtime.stop_policy import (
     RunLimits,
@@ -81,6 +89,120 @@ def _merge_events_by_id(*groups: list[Event]) -> list[Event]:
             seen.add(event.id)
             merged.append(event)
     return merged
+
+
+def _execution_identity_payload(
+    identity: ModelStepIdentity | ModelAttemptIdentity | None,
+) -> dict[str, str]:
+    if identity is None:
+        return {}
+    if type(identity) is ModelAttemptIdentity:
+        return copy_model_attempt_identity(identity).payload()
+    if type(identity) is ModelStepIdentity:
+        return copy_model_step_identity(identity).payload()
+    raise TypeError("Execution identity must be a ModelStepIdentity or ModelAttemptIdentity.")
+
+
+def _validate_ledger_reservation_result(
+    result: BudgetReservationResult,
+    *,
+    limit: _EffectiveBudgetLimit,
+    model_attempt_identity: ModelAttemptIdentity,
+    session_id: str,
+    agent_name: str,
+    provider_name: str,
+    model: str,
+    billing_identity: BillingIdentity | None,
+) -> None:
+    """Reject a custom ledger response that changes the requested reservation identity."""
+
+    if type(result) is not BudgetReservationResult:
+        raise TypeError("Budget ledger reserve() must return a BudgetReservationResult.")
+    expected_identity = copy_model_attempt_identity(model_attempt_identity)
+    if (
+        result.budget_limit_id != limit.budget_limit_id
+        or result.model_step_id != expected_identity.model_step_id
+        or result.model_attempt_id != expected_identity.model_attempt_id
+        or result.scope != limit.scope
+        or result.key != limit.key
+        or result.window != limit.window
+        or result.currency != limit.currency
+        or result.maximum != limit.max_estimated_cost
+        or result.action != limit.action
+    ):
+        raise RuntimeError("Budget ledger reservation result changed its requested identity.")
+    if not result.accepted:
+        if result.record is not None:
+            raise RuntimeError("Rejected budget reservation unexpectedly returned a record.")
+        return
+    record = result.record
+    if record is None:
+        raise RuntimeError("Accepted budget reservation did not return a record.")
+    if (
+        record.budget_limit_id != limit.budget_limit_id
+        or record.model_step_id != expected_identity.model_step_id
+        or record.model_attempt_id != expected_identity.model_attempt_id
+        or record.scope != limit.scope
+        or record.key != limit.key
+        or record.window != limit.window
+        or record.currency != limit.currency
+        or record.session_id != session_id
+        or record.agent_name != agent_name
+        or record.provider_name != provider_name
+        or record.model != model
+        or record.billing_identity != billing_identity
+        or record.reserved_amount != result.requested
+        or record.status != "active"
+        or record.actual_amount is not None
+    ):
+        raise RuntimeError("Budget ledger reservation record changed its requested identity.")
+
+
+def _validate_ledger_reconciliation(
+    reconciliation: BudgetReconciliation,
+    *,
+    reservation: BudgetStepReservation,
+    expected_status: Literal["reconciled", "released"],
+    expected_actual_amount: Decimal | None,
+    expected_reason: str | None,
+    expected_billing_identity: BillingIdentity | None,
+) -> None:
+    """Reject settlement evidence that does not exactly close the reservation."""
+
+    if type(reconciliation) is not BudgetReconciliation:
+        raise TypeError("Budget ledger settlement must return a BudgetReconciliation.")
+    record = reservation.record
+    expected_released_amount = (
+        record.reserved_amount
+        if expected_status == "released"
+        else max(record.reserved_amount - (expected_actual_amount or Decimal("0")), Decimal("0"))
+    )
+    reason_matches = reconciliation.reason == expected_reason or (
+        expected_status == "released" and _is_expired_reservation_reason(reconciliation.reason)
+    )
+    if (
+        reconciliation.reservation_id != record.reservation_id
+        or reconciliation.budget_limit_id != record.budget_limit_id
+        or reconciliation.model_step_id != record.model_step_id
+        or reconciliation.model_attempt_id != record.model_attempt_id
+        or reconciliation.reserved_amount != record.reserved_amount
+        or reconciliation.status != expected_status
+        or reconciliation.actual_amount != expected_actual_amount
+        or reconciliation.released_amount != expected_released_amount
+        or not reason_matches
+        or reconciliation.billing_identity != expected_billing_identity
+    ):
+        raise RuntimeError("Budget ledger settlement changed its requested outcome.")
+
+
+def _expected_reconciliation_billing_identity(
+    reservation: BudgetStepReservation,
+    completed_identity: BillingIdentity | None,
+) -> BillingIdentity | None:
+    requested_identity = reservation.record.billing_identity
+    if completed_identity is None:
+        return requested_identity
+    return completed_billing_identity(requested_identity, completed_identity)
 
 
 class BudgetReservationLeaseLost(RuntimeError):
@@ -149,12 +271,13 @@ async def _next_model_step_item(
 
 @dataclass(frozen=True)
 class BudgetStepReservation:
-    limit: BudgetLimit
+    limit: _EffectiveBudgetLimit
     record: BudgetReservationRecord
 
 
 @dataclass
 class BudgetProviderDispatch:
+    model_attempt_identity: ModelAttemptIdentity
     reservations: tuple[BudgetStepReservation, ...]
     completion: Event | None = None
     settled_reservation_ids: set[str] = field(default_factory=set)
@@ -170,6 +293,7 @@ class BudgetProviderDispatch:
 class BudgetModelStepLifecycle:
     dispatches: list[BudgetProviderDispatch] = field(default_factory=list)
     pending_reservations: tuple[BudgetStepReservation, ...] | None = None
+    pending_model_attempt_identity: ModelAttemptIdentity | None = None
     reservation_transition_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     @property
@@ -178,23 +302,52 @@ class BudgetModelStepLifecycle:
 
     def prepare_provider_dispatch(
         self,
+        model_attempt_identity: ModelAttemptIdentity,
         reservations: list[BudgetStepReservation],
     ) -> None:
-        if self.pending_reservations is not None:
+        model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
+        if self.pending_reservations is not None or self.pending_model_attempt_identity is not None:
             raise RuntimeError("Provider dispatch already has prepared budget reservations.")
+        for reservation in reservations:
+            if (
+                reservation.record.model_step_id != model_attempt_identity.model_step_id
+                or reservation.record.model_attempt_id != model_attempt_identity.model_attempt_id
+            ):
+                raise ValueError(
+                    "Prepared budget reservation belongs to a different model attempt."
+                )
         self.pending_reservations = tuple(reservations)
+        self.pending_model_attempt_identity = model_attempt_identity
 
-    def mark_provider_dispatch(self) -> None:
-        if self.pending_reservations is None:
+    def mark_provider_dispatch(
+        self,
+        model_attempt_identity: ModelAttemptIdentity,
+    ) -> None:
+        model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
+        if self.pending_reservations is None or self.pending_model_attempt_identity is None:
             raise RuntimeError("Provider dispatch has no prepared budget reservations.")
-        self.dispatches.append(BudgetProviderDispatch(self.pending_reservations))
+        if self.pending_model_attempt_identity != model_attempt_identity:
+            raise ValueError("Provider dispatch identity differs from its budget reservations.")
+        self.dispatches.append(
+            BudgetProviderDispatch(
+                model_attempt_identity=model_attempt_identity,
+                reservations=self.pending_reservations,
+            )
+        )
         self.pending_reservations = None
+        self.pending_model_attempt_identity = None
 
     def record_model_completion(self, event: Event) -> None:
         if not self.dispatches:
             raise RuntimeError("Model completed before provider dispatch was recorded.")
         if self.dispatches[-1].completion is not None:
             raise RuntimeError("Provider dispatch produced more than one model completion.")
+        identity = self.dispatches[-1].model_attempt_identity
+        if (
+            event.payload.get("model_step_id") != identity.model_step_id
+            or event.payload.get("model_attempt_id") != identity.model_attempt_id
+        ):
+            raise ValueError("Model completion identity differs from its provider dispatch.")
         self.dispatches[-1].completion = event
 
 
@@ -451,6 +604,7 @@ class RunLimitController:
         pricing_provider_name: str | None = None,
         model: str | None = None,
         additional_usage_events: list[Event] | None = None,
+        execution_identity: ModelStepIdentity | ModelAttemptIdentity | None = None,
     ) -> LimitEvaluation:
         budget_limits = request_budget_limits_for_session(
             limits=budget_limits,
@@ -577,6 +731,7 @@ class RunLimitController:
                         agent_name=agent_name,
                         environment_name=environment_name,
                         check=budget_outcome.check,
+                        execution_identity=execution_identity,
                     )
                     emitted_events.append(event)
                     if budget_notify_events is not None:
@@ -606,6 +761,7 @@ class RunLimitController:
         pricing_provider_name: str | None = None,
         model: str | None = None,
         additional_usage_events: list[Event] | None = None,
+        execution_identity: ModelStepIdentity | ModelAttemptIdentity | None = None,
     ) -> BudgetEvaluation:
         limits = budget_limits_for_session(
             policy=budget_policy,
@@ -652,7 +808,10 @@ class RunLimitController:
                             session_id=session.id,
                             agent_name=agent_name,
                             environment_name=environment_name,
-                            payload=budget_check_payload(check),
+                            payload={
+                                **budget_check_payload(check),
+                                **_execution_identity_payload(execution_identity),
+                            },
                         )
                     )
                 )
@@ -666,6 +825,7 @@ class RunLimitController:
                             agent_name=agent_name,
                             environment_name=environment_name,
                             check=check,
+                            execution_identity=execution_identity,
                         )
                     )
                 continue
@@ -718,6 +878,7 @@ class RunLimitController:
         agent_name: str,
         environment_name: str | None,
         check: BudgetCheck,
+        execution_identity: ModelStepIdentity | ModelAttemptIdentity | None = None,
     ) -> Event:
         return await self._event_writer.emit(
             Event(
@@ -725,7 +886,10 @@ class RunLimitController:
                 session_id=session.id,
                 agent_name=agent_name,
                 environment_name=environment_name,
-                payload=budget_limit_reached_payload(check),
+                payload={
+                    **budget_limit_reached_payload(check),
+                    **_execution_identity_payload(execution_identity),
+                },
             )
         )
 
@@ -736,10 +900,12 @@ class RunLimitController:
         agent_name: str,
         provider_name: str,
         environment_name: str | None,
+        model_attempt_identity: ModelAttemptIdentity,
         budget_policy: BudgetPolicy | None,
         request_budget_limits: tuple[BudgetLimit, ...] = (),
         billing_identity: BillingIdentity | None = None,
     ) -> BudgetReservationSetup:
+        model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
         limits = self.provider_reservation_limits(
             session=session,
             agent_name=agent_name,
@@ -762,6 +928,7 @@ class RunLimitController:
                         agent_name=agent_name,
                         provider_name=provider_name,
                         model=session.model,
+                        model_attempt_identity=model_attempt_identity,
                     )
                 else:
                     result = await self._budget_ledger.reserve(
@@ -770,11 +937,21 @@ class RunLimitController:
                         agent_name=agent_name,
                         provider_name=provider_name,
                         model=session.model,
+                        model_attempt_identity=model_attempt_identity,
                         billing_identity=billing_identity,
                     )
+                _validate_ledger_reservation_result(
+                    result,
+                    limit=limit,
+                    model_attempt_identity=model_attempt_identity,
+                    session_id=session.id,
+                    agent_name=agent_name,
+                    provider_name=provider_name,
+                    model=session.model,
+                    billing_identity=billing_identity,
+                )
                 if result.accepted:
-                    if result.record is None:
-                        raise RuntimeError("Accepted budget reservation did not return a record.")
+                    assert result.record is not None
                     reservations.append(BudgetStepReservation(limit=limit, record=result.record))
                 emitted_events.append(
                     await self._event_writer.emit(
@@ -837,7 +1014,7 @@ class RunLimitController:
         agent_name: str,
         budget_policy: BudgetPolicy | None,
         request_budget_limits: tuple[BudgetLimit, ...] = (),
-    ) -> tuple[BudgetLimit, ...]:
+    ) -> tuple[_EffectiveBudgetLimit, ...]:
         return tuple(
             limit
             for limit in self.provider_budget_limits(
@@ -856,7 +1033,7 @@ class RunLimitController:
         agent_name: str,
         budget_policy: BudgetPolicy | None,
         request_budget_limits: tuple[BudgetLimit, ...] = (),
-    ) -> tuple[BudgetLimit, ...]:
+    ) -> tuple[_EffectiveBudgetLimit, ...]:
         effective_request_limits = request_budget_limits_for_session(
             limits=request_budget_limits,
             agent_name=agent_name,
@@ -953,6 +1130,17 @@ class RunLimitController:
                                 occurred_at=reconciled_at,
                                 billing_identity=reconciliation_identity,
                             )
+                        _validate_ledger_reconciliation(
+                            reconciliation,
+                            reservation=reservation,
+                            expected_status="reconciled",
+                            expected_actual_amount=actual_amount,
+                            expected_reason=reason,
+                            expected_billing_identity=_expected_reconciliation_billing_identity(
+                                reservation,
+                                reconciliation_identity,
+                            ),
+                        )
                         if priced_actual is not None:
                             reconciliation = budget_reconciliation_with_pricing(
                                 reconciliation,
@@ -1037,7 +1225,9 @@ class RunLimitController:
         reservations: list[BudgetStepReservation],
         *,
         lifecycle: BudgetModelStepLifecycle,
+        model_attempt_identity: ModelAttemptIdentity,
     ) -> None:
+        model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
         async with lifecycle.reservation_transition_lock:
             if reservations and self._budget_ledger.reservation_ttl_seconds is not None:
                 try:
@@ -1048,7 +1238,7 @@ class RunLimitController:
                             "Budget reservation lease was lost before model dispatch."
                         ) from exc
                     raise
-            lifecycle.mark_provider_dispatch()
+            lifecycle.mark_provider_dispatch(model_attempt_identity)
 
     async def model_step_events_with_heartbeat(
         self,
@@ -1320,6 +1510,7 @@ class RunLimitController:
         environment_name: str | None,
         provider_name: str,
         model: str,
+        model_attempt_identity: ModelAttemptIdentity,
         authoritative_failure_types: tuple[type[BaseException], ...],
         billing_identity: BillingIdentity | None = None,
         pricing_provider_name: str | None = None,
@@ -1330,6 +1521,7 @@ class RunLimitController:
     ):
         """Run one observable compactor dispatch under strict budget accounting."""
 
+        model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
         budget_limits = request_budget_limits_for_session(
             limits=budget_limits,
             agent_name=agent_name,
@@ -1360,6 +1552,8 @@ class RunLimitController:
                 failure = BudgetReservationResult(
                     accepted=False,
                     budget_limit_id=resolved.check.budget_limit_id,
+                    model_step_id=model_attempt_identity.model_step_id,
+                    model_attempt_id=model_attempt_identity.model_attempt_id,
                     scope=resolved.limit.scope,
                     key=resolved.limit.key,
                     window=resolved.limit.window,
@@ -1393,6 +1587,7 @@ class RunLimitController:
                 agent_name=agent_name,
                 provider_name=provider_name,
                 model=model,
+                model_attempt_identity=model_attempt_identity,
                 billing_identity=billing_identity,
                 rejection_release_reason="reservation failed",
                 accepted_record_error=(
@@ -1706,6 +1901,17 @@ class RunLimitController:
                         occurred_at=occurred_at,
                         billing_identity=completed_billing_identity,
                     )
+                _validate_ledger_reconciliation(
+                    reconciliation,
+                    reservation=reservation,
+                    expected_status="reconciled",
+                    expected_actual_amount=actual_amount,
+                    expected_reason=reason,
+                    expected_billing_identity=_expected_reconciliation_billing_identity(
+                        reservation,
+                        completed_billing_identity,
+                    ),
+                )
                 if len(completed_events) == 1 and len(priced_actuals) == 1:
                     reconciliation = budget_reconciliation_with_pricing(
                         reconciliation,
@@ -1735,10 +1941,12 @@ class RunLimitController:
         agent_name: str,
         provider_name: str | None,
         model: str | None,
+        model_attempt_identity: ModelAttemptIdentity,
         rejection_release_reason: str,
         accepted_record_error: str,
         billing_identity: BillingIdentity | None = None,
     ) -> OperationReservationSetup:
+        model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
         effective_limits = _effective_budget_limits(
             budget_limits,
             identity_namespace="operation",
@@ -1759,6 +1967,7 @@ class RunLimitController:
                         agent_name=agent_name,
                         provider_name=provider_name,
                         model=model,
+                        model_attempt_identity=model_attempt_identity,
                     )
                 else:
                     result = await self._budget_ledger.reserve(
@@ -1767,8 +1976,19 @@ class RunLimitController:
                         agent_name=agent_name,
                         provider_name=provider_name,
                         model=model,
+                        model_attempt_identity=model_attempt_identity,
                         billing_identity=billing_identity,
                     )
+                _validate_ledger_reservation_result(
+                    result,
+                    limit=limit,
+                    model_attempt_identity=model_attempt_identity,
+                    session_id=session_id,
+                    agent_name=agent_name,
+                    provider_name=provider_name,
+                    model=model,
+                    billing_identity=billing_identity,
+                )
                 results.append(result)
                 if not result.accepted:
                     async for reconciliation in self.release_operation_reservations(
@@ -1783,7 +2003,7 @@ class RunLimitController:
                         failure=result,
                         error=None,
                     )
-                if result.record is None:
+                if result.record is None:  # pragma: no cover - validated above
                     raise RuntimeError(accepted_record_error)
                 reservations.append(BudgetStepReservation(limit=limit, record=result.record))
             except BaseException as exc:
@@ -1872,6 +2092,17 @@ class RunLimitController:
                 occurred_at=occurred_at,
                 billing_identity=completed_billing_identity,
             )
+        _validate_ledger_reconciliation(
+            reconciliation,
+            reservation=reservation,
+            expected_status="reconciled",
+            expected_actual_amount=actual_amount,
+            expected_reason=reason,
+            expected_billing_identity=_expected_reconciliation_billing_identity(
+                reservation,
+                completed_billing_identity,
+            ),
+        )
         if len(priced_actuals) == 1:
             reconciliation = budget_reconciliation_with_pricing(
                 reconciliation,
@@ -1892,6 +2123,14 @@ class RunLimitController:
                 reason=reason,
                 occurred_at=self._clock(),
             )
+            _validate_ledger_reconciliation(
+                reconciliation,
+                reservation=reservation,
+                expected_status="reconciled",
+                expected_actual_amount=reservation.record.reserved_amount,
+                expected_reason=reason,
+                expected_billing_identity=reservation.record.billing_identity,
+            )
             _remove_reservation(reservations, reservation)
             yield reconciliation
 
@@ -1905,6 +2144,14 @@ class RunLimitController:
             reconciliation = await self._budget_ledger.release(
                 reservation_id=reservation.record.reservation_id,
                 reason=reason,
+            )
+            _validate_ledger_reconciliation(
+                reconciliation,
+                reservation=reservation,
+                expected_status="released",
+                expected_actual_amount=None,
+                expected_reason=reason,
+                expected_billing_identity=reservation.record.billing_identity,
             )
             _remove_reservation(reservations, reservation)
             yield reconciliation
@@ -1922,6 +2169,14 @@ class RunLimitController:
             reconciliation = await self._budget_ledger.release(
                 reservation_id=reservation.record.reservation_id,
                 reason=reason,
+            )
+            _validate_ledger_reconciliation(
+                reconciliation,
+                reservation=reservation,
+                expected_status="released",
+                expected_actual_amount=None,
+                expected_reason=reason,
+                expected_billing_identity=reservation.record.billing_identity,
             )
             event = await self._event_writer.emit(
                 Event(
@@ -1976,6 +2231,7 @@ class RunLimitGate:
         model: str | None = None,
         additional_usage_events: list[Event] | None = None,
         budget_limits: tuple[BudgetLimit, ...] | None = None,
+        execution_identity: ModelStepIdentity | ModelAttemptIdentity | None = None,
     ) -> LimitEvaluation:
         return await self._controller.evaluate_request_limits(
             session=self._session,
@@ -1993,6 +2249,7 @@ class RunLimitGate:
             pricing_provider_name=pricing_provider_name or self._pricing_provider_name,
             model=model,
             additional_usage_events=additional_usage_events,
+            execution_identity=execution_identity,
         )
 
     async def evaluate_budget(
@@ -2003,6 +2260,7 @@ class RunLimitGate:
         pricing_provider_name: str | None = None,
         model: str | None = None,
         additional_usage_events: list[Event] | None = None,
+        execution_identity: ModelStepIdentity | ModelAttemptIdentity | None = None,
     ) -> BudgetEvaluation:
         return await self._controller.evaluate_policy_budgets(
             session=self._session,
@@ -2013,6 +2271,7 @@ class RunLimitGate:
             pricing_provider_name=pricing_provider_name or self._pricing_provider_name,
             model=model,
             additional_usage_events=additional_usage_events,
+            execution_identity=execution_identity,
         )
 
     def has_run_limits(self) -> bool:

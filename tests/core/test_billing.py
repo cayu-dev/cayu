@@ -7,6 +7,7 @@ from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
+from tests.core._execution_unit_fixtures import model_attempt_identity
 
 from cayu import (
     BillingIdentity,
@@ -373,6 +374,7 @@ def test_contextual_identity_uses_generic_cache_rate_for_cost_and_reservation() 
             agent_name="assistant",
             provider_name="renamed-commercial-cloud",
             model=identity.resource_id,
+            model_attempt_identity=model_attempt_identity(),
             billing_identity=identity,
         )
     )

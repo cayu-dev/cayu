@@ -34,6 +34,7 @@ from cayu.runtime import (
     StructuredOutputSpec,
     estimate_session_cost,
 )
+from cayu.runtime.execution_units import new_model_step_identity
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.runtime.usage import session_usage_summary
@@ -551,13 +552,16 @@ def test_model_step_executor_retries_synchronous_stream_construction_failure() -
         preparation_calls = 0
         dispatch_calls = 0
         completed_events: list[Event] = []
+        observed_model_attempt_ids = []
+        model_step_identity = new_model_step_identity()
+        initial_model_attempt_identity = model_step_identity.new_attempt()
 
-        async def prepare_provider_dispatch():
+        async def prepare_provider_dispatch(_model_attempt_identity):
             nonlocal preparation_calls
             preparation_calls += 1
             return [], None, None
 
-        async def before_provider_dispatch() -> None:
+        async def before_provider_dispatch(_model_attempt_identity) -> None:
             nonlocal dispatch_calls
             dispatch_calls += 1
 
@@ -571,11 +575,14 @@ def test_model_step_executor_retries_synchronous_stream_construction_failure() -
             registered_provider=registered_provider,
             environment_name=None,
             step=1,
+            model_step_identity=model_step_identity,
+            initial_model_attempt_identity=initial_model_attempt_identity,
             retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
             transcript_cursor_before_request=1,
             record_model_completion=completed_events.append,
             prepare_provider_dispatch=prepare_provider_dispatch,
             before_provider_dispatch=before_provider_dispatch,
+            record_model_attempt_identity=observed_model_attempt_ids.append,
         ):
             if event is not None:
                 events.append(event)
@@ -587,6 +594,8 @@ def test_model_step_executor_retries_synchronous_stream_construction_failure() -
             events,
             result,
             completed_events,
+            observed_model_attempt_ids,
+            model_step_identity,
             preparation_calls,
             dispatch_calls,
             await store.load_transcript(session.id),
@@ -597,6 +606,8 @@ def test_model_step_executor_retries_synchronous_stream_construction_failure() -
         events,
         result,
         completed_events,
+        observed_model_attempt_ids,
+        model_step_identity,
         preparation_calls,
         dispatch_calls,
         transcript,
@@ -609,8 +620,37 @@ def test_model_step_executor_retries_synchronous_stream_construction_failure() -
     assert EventType.MODEL_RETRY in [event.type for event in events]
     assert EventType.MODEL_ATTEMPT_DISCARDED in [event.type for event in events]
     assert len(completed_events) == 1
+    assert len(observed_model_attempt_ids) == 2
+    first_attempt, second_attempt = observed_model_attempt_ids
+    assert first_attempt.model_step_id == second_attempt.model_step_id
+    assert first_attempt.model_step_id == model_step_identity.model_step_id
+    assert first_attempt.model_attempt_id != second_attempt.model_attempt_id
+    first_attempt_event_types = {
+        EventType.MODEL_STARTED,
+        EventType.MODEL_ERROR,
+        EventType.MODEL_RETRY,
+        EventType.MODEL_ATTEMPT_DISCARDED,
+    }
+    second_attempt_event_types = {
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+    }
+    for event in events:
+        if event.type not in first_attempt_event_types | second_attempt_event_types:
+            continue
+        expected_attempt = (
+            first_attempt
+            if event.type in first_attempt_event_types and event.payload.get("attempt") == 1
+            else second_attempt
+        )
+        assert event.payload["model_step_id"] == expected_attempt.model_step_id
+        assert event.payload["model_attempt_id"] == expected_attempt.model_attempt_id
     assert result is not None
     assert result.text_content == "done"
+    assert result.model_step_id == second_attempt.model_step_id
+    assert result.model_attempt_id == second_attempt.model_attempt_id
+    assert completed_events[0].payload["model_attempt_id"] == second_attempt.model_attempt_id
     assert transcript == [Message.text("user", "hello")]
 
 

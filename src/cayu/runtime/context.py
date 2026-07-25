@@ -86,6 +86,10 @@ from cayu.runtime._model_errors import (
     resolve_completion_billing_identity,
     resolve_request_billing_identity,
 )
+from cayu.runtime.execution_units import (
+    ModelAttemptIdentity,
+    copy_model_attempt_identity,
+)
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy, retry_decision
 from cayu.runtime.sessions import Session
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
@@ -2530,6 +2534,10 @@ _AUTOMATIC_COMPACTION_DISPATCH_RUNNER: ContextVar[_AutomaticCompactionDispatchRu
         default=None,
     )
 )
+_COMPACTION_MODEL_ATTEMPT_IDENTITY: ContextVar[ModelAttemptIdentity | None] = ContextVar(
+    "compaction_model_attempt_identity",
+    default=None,
+)
 _DEFER_BILLING_IDENTITY_CANCELLATION: ContextVar[bool] = ContextVar(
     "defer_billing_identity_cancellation",
     default=False,
@@ -2571,6 +2579,20 @@ def _automatic_compaction_dispatch_runner_scope(
         yield
     finally:
         _AUTOMATIC_COMPACTION_DISPATCH_RUNNER.reset(token)
+
+
+@contextmanager
+def _compaction_model_attempt_identity_scope(
+    identity: ModelAttemptIdentity,
+) -> Iterator[None]:
+    """Expose one runtime-owned identity only across its provider dispatch."""
+
+    copied = copy_model_attempt_identity(identity)
+    token = _COMPACTION_MODEL_ATTEMPT_IDENTITY.set(copied)
+    try:
+        yield
+    finally:
+        _COMPACTION_MODEL_ATTEMPT_IDENTITY.reset(token)
 
 
 @contextmanager
@@ -3533,13 +3555,18 @@ def _record_compaction_model_completed_payloads(
 ) -> list[dict[str, Any]]:
     """Record provider completions immediately in their observed order."""
 
+    active_identity = _COMPACTION_MODEL_ATTEMPT_IDENTITY.get()
+    identified_payloads = copy_durable_json_value(payloads, "model_completed_payloads")
+    if active_identity is not None:
+        identity_payload = copy_model_attempt_identity(active_identity).payload()
+        for payload in identified_payloads:
+            payload.update(identity_payload)
     ledger = _COMPACTION_COMPLETION_LEDGER.get()
     if ledger is None:
-        public_payloads = copy_durable_json_value(payloads, "model_completed_payloads")
-        for payload in public_payloads:
+        for payload in identified_payloads:
             payload.pop(_COMPACTION_ATTEMPT_ID_KEY, None)
-        return public_payloads
-    return [ledger.upsert(payload) for payload in payloads]
+        return identified_payloads
+    return [ledger.upsert(payload) for payload in identified_payloads]
 
 
 async def _publish_compaction_completion_payloads(
@@ -4187,6 +4214,10 @@ def _compaction_completion_observer(
         attempt_id = registered_payload.get(_COMPACTION_ATTEMPT_ID_KEY)
         if type(attempt_id) is str:
             observed_metadata[_COMPACTION_ATTEMPT_ID_KEY] = attempt_id
+        for key in ("model_step_id", "model_attempt_id"):
+            value = registered_payload.get(key)
+            if type(value) is str:
+                observed_metadata[key] = value
         if accounting_usage_error is not None:
             raise _CompactionCompletionValueError(
                 error=accounting_usage_error.error,
@@ -4281,6 +4312,50 @@ def _detach_compaction_model_request(request: ModelRequest) -> ModelRequest:
         tools=request.tools,
         options=request.options,
     )
+
+
+def _compaction_metadata_with_model_attempt_identity(
+    completed_metadata: dict[str, Any],
+    identity: ModelAttemptIdentity | None,
+) -> dict[str, Any]:
+    detached = copy_durable_json_object(completed_metadata, "completed_metadata")
+    if identity is not None:
+        detached.update(copy_model_attempt_identity(identity).payload())
+    return detached
+
+
+def _identify_compaction_dispatch_failure(
+    error: BaseException,
+    identity: ModelAttemptIdentity | None,
+) -> None:
+    """Retain exact execution identity on runtime-owned terminal metadata."""
+
+    if identity is None:
+        return
+    identity_payload = copy_model_attempt_identity(identity).payload()
+    if type(error) in {
+        _CompactionCompletionValueError,
+        _CompactionCompletionObservationError,
+        _CompactionToolCallError,
+        _ProviderDispatchFailed,
+    } or isinstance(error, asyncio.CancelledError):
+        completed_metadata = error.__dict__.get("completed_metadata")
+        if type(completed_metadata) is dict:
+            identified_metadata = copy_durable_json_object(
+                completed_metadata,
+                "completed_metadata",
+            )
+            identified_metadata.update(identity_payload)
+            error.__dict__["completed_metadata"] = identified_metadata
+    if type(error) is _CompactionCompletionValueError:
+        rejected_usage_payload = error.__dict__.get("rejected_usage_payload")
+        if type(rejected_usage_payload) is dict:
+            identified_payload = copy_durable_json_object(
+                rejected_usage_payload,
+                "rejected_usage_payload",
+            )
+            identified_payload.update(identity_payload)
+            error.__dict__["rejected_usage_payload"] = identified_payload
 
 
 async def _run_compaction_model(
@@ -4405,18 +4480,25 @@ async def _run_compaction_model(
 
     dispatch_started = False
     dispatch_cancellation_requests = 0
+    dispatch_model_attempt_identity: ModelAttemptIdentity | None = None
 
     async def dispatch() -> tuple[str, dict[str, Any]]:
-        nonlocal dispatch_cancellation_requests, dispatch_started
+        nonlocal dispatch_cancellation_requests
+        nonlocal dispatch_model_attempt_identity
+        nonlocal dispatch_started
         dispatch_counter = _COMPACTION_DISPATCH_COUNTER.get()
         if dispatch_counter is not None:
             dispatch_counter.before_dispatch()
+        active_identity = _COMPACTION_MODEL_ATTEMPT_IDENTITY.get()
+        dispatch_model_attempt_identity = (
+            None if active_identity is None else copy_model_attempt_identity(active_identity)
+        )
         current_task = asyncio.current_task()
         dispatch_cancellation_requests = 0 if current_task is None else current_task.cancelling()
         dispatch_started = True
         provider_failure: ProviderExceptionControl | None = None
         try:
-            return await _stream_compaction_model(
+            summary, completed_metadata = await _stream_compaction_model(
                 provider=provider,
                 provider_name=provider_name,
                 model_request=_detach_compaction_model_request(request_template),
@@ -4428,12 +4510,30 @@ async def _run_compaction_model(
             _CompactionCompletionObservationError,
             _CompactionToolCallError,
             _ProviderDispatchFailed,
-        ):
+        ) as exc:
+            _identify_compaction_dispatch_failure(
+                exc,
+                dispatch_model_attempt_identity,
+            )
+            raise
+        except asyncio.CancelledError as exc:
+            _identify_compaction_dispatch_failure(
+                exc,
+                dispatch_model_attempt_identity,
+            )
             raise
         except Exception as exc:
             provider_failure = _compaction_provider_failure_control(
                 exc,
                 fallback_provider=provider_name,
+            )
+        else:
+            return (
+                summary,
+                _compaction_metadata_with_model_attempt_identity(
+                    completed_metadata,
+                    dispatch_model_attempt_identity,
+                ),
             )
         if provider_failure is None:  # pragma: no cover - every Exception is captured above
             raise RuntimeError("Provider dispatch lost its failure state.")
@@ -4453,6 +4553,7 @@ async def _run_compaction_model(
         terminal_dispatch_error: BaseException | None = None
         while True:
             dispatch_started = False
+            dispatch_model_attempt_identity = None
             attempt_completion_index = len(completion_ledger.completed_payloads)
             billing_dispatch_cancellation: asyncio.CancelledError | None = None
             try:
@@ -4527,6 +4628,12 @@ async def _run_compaction_model(
                         else:
                             failed_payload["compaction_outcome"] = "provider_error_after_completion"
                             failed_payload["error_type"] = failure_type
+                        if dispatch_model_attempt_identity is not None:
+                            failed_payload.update(
+                                copy_model_attempt_identity(
+                                    dispatch_model_attempt_identity
+                                ).payload()
+                            )
                         finalized_attempt_payloads.extend(
                             _record_compaction_model_completed_payloads([failed_payload])
                         )
@@ -4549,6 +4656,10 @@ async def _run_compaction_model(
                             usage_dialect=usage_dialect,
                         )
                     )
+                    if dispatch_model_attempt_identity is not None:
+                        failed_attempt_payload.update(
+                            copy_model_attempt_identity(dispatch_model_attempt_identity).payload()
+                        )
                     finalized_attempt_payloads = _record_compaction_model_completed_payloads(
                         [failed_attempt_payload]
                     )
@@ -5016,6 +5127,18 @@ def _durable_compaction_completion_evidence(
             pass
         else:
             fallback_fields[_COMPACTION_ATTEMPT_ID_KEY] = attempt_id
+    if "model_step_id" in copied or "model_attempt_id" in copied:
+        try:
+            model_attempt_identity = ModelAttemptIdentity.model_validate(
+                {
+                    "model_step_id": copied.get("model_step_id"),
+                    "model_attempt_id": copied.get("model_attempt_id"),
+                }
+            )
+        except (TypeError, ValueError):
+            pass
+        else:
+            fallback_fields.update(model_attempt_identity.payload())
     source = copied
     if force_projection:
         projection_fields = (

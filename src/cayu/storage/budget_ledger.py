@@ -36,11 +36,15 @@ from cayu.runtime.budgets import (
     _validate_amount,
     _validate_reservation_ttl,
 )
+from cayu.runtime.execution_units import (
+    ModelAttemptIdentity,
+    copy_model_attempt_identity,
+)
 
 from . import _sqlite_support as sqlite_support
 from . import migrations as schema
 
-_SQLITE_MIN_REQUIRED_REVISION = 22
+_SQLITE_MIN_REQUIRED_REVISION = 24
 
 
 class SQLiteBudgetLedger(BudgetLedger):
@@ -91,6 +95,7 @@ class SQLiteBudgetLedger(BudgetLedger):
         agent_name: str,
         provider_name: str,
         model: str,
+        model_attempt_identity: ModelAttemptIdentity,
         billing_identity: BillingIdentity | None = None,
     ) -> BudgetReservationResult:
         limit = _ensure_effective_budget_limit(
@@ -101,6 +106,7 @@ class SQLiteBudgetLedger(BudgetLedger):
         agent_name = require_clean_nonblank(agent_name, "agent_name")
         provider_name = require_clean_nonblank(provider_name, "provider_name")
         model = require_clean_nonblank(model, "model")
+        model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
@@ -119,6 +125,7 @@ class SQLiteBudgetLedger(BudgetLedger):
                     self._connection.rollback()
                     return _reservation_result(
                         limit=limit,
+                        model_attempt_identity=model_attempt_identity,
                         accepted=False,
                         requested=requested,
                         actual=projected,
@@ -130,6 +137,8 @@ class SQLiteBudgetLedger(BudgetLedger):
 
                 record = BudgetReservationRecord(
                     budget_limit_id=limit.budget_limit_id,
+                    model_step_id=model_attempt_identity.model_step_id,
+                    model_attempt_id=model_attempt_identity.model_attempt_id,
                     scope=limit.scope,
                     key=limit.key,
                     window=limit.window,
@@ -147,6 +156,7 @@ class SQLiteBudgetLedger(BudgetLedger):
                 self._connection.commit()
                 return _reservation_result(
                     limit=limit,
+                    model_attempt_identity=model_attempt_identity,
                     accepted=True,
                     requested=requested,
                     actual=projected,
@@ -359,6 +369,8 @@ class SQLiteBudgetLedger(BudgetLedger):
             INSERT INTO cayu_budget_reservations (
                 reservation_id,
                 budget_limit_id,
+                model_step_id,
+                model_attempt_id,
                 scope,
                 budget_key,
                 budget_window,
@@ -375,11 +387,13 @@ class SQLiteBudgetLedger(BudgetLedger):
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.reservation_id,
                 record.budget_limit_id,
+                record.model_step_id,
+                record.model_attempt_id,
                 record.scope,
                 record.key,
                 record.window.storage_key,
@@ -433,7 +447,8 @@ class SQLiteBudgetLedger(BudgetLedger):
     def _load_record_unlocked(self, reservation_id: str) -> BudgetReservationRecord:
         row = self._connection.execute(
             """
-            SELECT reservation_id, budget_limit_id, scope, budget_key, budget_window,
+            SELECT reservation_id, budget_limit_id, model_step_id, model_attempt_id,
+                   scope, budget_key, budget_window,
                    currency, session_id,
                    agent_name, provider_name, model, billing_identity_json,
                    reserved_amount, actual_amount,
@@ -450,9 +465,16 @@ class SQLiteBudgetLedger(BudgetLedger):
                 "Budget reservation predates durable budget-limit identity and "
                 "cannot be reconciled safely."
             )
+        if row["model_step_id"] is None or row["model_attempt_id"] is None:
+            raise RuntimeError(
+                "Budget reservation predates durable model-attempt identity and "
+                "cannot be reconciled safely."
+            )
         return BudgetReservationRecord(
             reservation_id=row["reservation_id"],
             budget_limit_id=row["budget_limit_id"],
+            model_step_id=row["model_step_id"],
+            model_attempt_id=row["model_attempt_id"],
             scope=row["scope"],
             key=row["budget_key"],
             window=row["budget_window"],

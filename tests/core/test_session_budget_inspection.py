@@ -16,6 +16,13 @@ def _budget_limit_id(value: int) -> str:
     return f"blim_{value:064x}"
 
 
+def _model_attempt_identity(value: int) -> dict[str, str]:
+    return {
+        "model_step_id": f"mstep_{value:032x}",
+        "model_attempt_id": f"matt_{value:032x}",
+    }
+
+
 def test_budget_inspection_uses_latest_fully_priced_checks_without_reservations() -> None:
     def checked_event(actual: str) -> Event:
         amount = Decimal(actual)
@@ -80,6 +87,7 @@ def test_budget_inspection_does_not_double_count_parallel_limit_ledgers() -> Non
                         payload={
                             "reservation_id": reservation_id,
                             "budget_limit_id": budget_limit_id,
+                            **_model_attempt_identity(1),
                             "scope": "session",
                             "key": "sess_parallel_limits",
                             "window": "all_time",
@@ -95,6 +103,7 @@ def test_budget_inspection_does_not_double_count_parallel_limit_ledgers() -> Non
                         payload={
                             "reservation_id": reservation_id,
                             "budget_limit_id": budget_limit_id,
+                            **_model_attempt_identity(1),
                             "actual_amount": "0.25",
                             "pricing": {"provider_name": "fake", "model": "model"},
                         },
@@ -109,6 +118,51 @@ def test_budget_inspection_does_not_double_count_parallel_limit_ledgers() -> Non
         assert inspection.currency == "USD"
 
 
+def test_budget_inspection_does_not_leak_a_currency_for_mixed_attempts() -> None:
+    events: list[Event] = []
+    for index, currency in enumerate(("USD", "EUR"), start=1):
+        reservation_id = f"reservation-{index}"
+        budget_limit_id = _budget_limit_id(index)
+        identity = _model_attempt_identity(index)
+        events.extend(
+            [
+                Event(
+                    type=EventType.BUDGET_RESERVED,
+                    session_id="sess_mixed_attempt_currencies",
+                    payload={
+                        "reservation_id": reservation_id,
+                        "budget_limit_id": budget_limit_id,
+                        **identity,
+                        "scope": "session",
+                        "key": "sess_mixed_attempt_currencies",
+                        "window": "all_time",
+                        "currency": currency,
+                        "maximum": "1",
+                        "action": "interrupt",
+                        "requested": "0.50",
+                    },
+                ),
+                Event(
+                    type=EventType.BUDGET_RECONCILED,
+                    session_id="sess_mixed_attempt_currencies",
+                    payload={
+                        "reservation_id": reservation_id,
+                        "budget_limit_id": budget_limit_id,
+                        **identity,
+                        "actual_amount": "0.25",
+                        "pricing": {"provider_name": "fake", "model": "model"},
+                    },
+                ),
+            ]
+        )
+
+    inspection = session_budget_inspection(events)
+
+    assert inspection.cost_state == "mixed_currency"
+    assert inspection.amount is None
+    assert inspection.currency is None
+
+
 def test_budget_inspection_marks_malformed_reservation_evidence_partial() -> None:
     budget_limit_id = _budget_limit_id(1)
     valid_events = [
@@ -118,6 +172,7 @@ def test_budget_inspection_marks_malformed_reservation_evidence_partial() -> Non
             payload={
                 "reservation_id": "reservation-valid",
                 "budget_limit_id": budget_limit_id,
+                **_model_attempt_identity(1),
                 "scope": "session",
                 "key": "sess_malformed_evidence",
                 "window": "all_time",
@@ -133,6 +188,7 @@ def test_budget_inspection_marks_malformed_reservation_evidence_partial() -> Non
             payload={
                 "reservation_id": "reservation-valid",
                 "budget_limit_id": budget_limit_id,
+                **_model_attempt_identity(1),
                 "actual_amount": "0.25",
                 "pricing": {"provider_name": "fake", "model": "model"},
             },
@@ -175,6 +231,7 @@ def test_budget_inspection_rejects_cross_limit_settlement() -> None:
                 payload={
                     "reservation_id": "reservation-cross-limit",
                     "budget_limit_id": reservation_limit_id,
+                    **_model_attempt_identity(1),
                     "scope": "session",
                     "key": "sess_cross_limit",
                     "window": "all_time",
@@ -190,12 +247,182 @@ def test_budget_inspection_rejects_cross_limit_settlement() -> None:
                 payload={
                     "reservation_id": "reservation-cross-limit",
                     "budget_limit_id": settlement_limit_id,
+                    **_model_attempt_identity(1),
                     "actual_amount": "0.25",
                     "pricing": {"provider_name": "fake", "model": "model"},
                 },
             ),
         ]
     )
+
+    assert inspection.cost_state == "partial"
+    assert inspection.amount is None
+
+
+def test_budget_inspection_sums_distinct_attempts_without_amount_heuristics() -> None:
+    events: list[Event] = []
+    reservations = (
+        (1, 1, "0.25"),
+        (1, 2, "0.25"),
+        (2, 3, "0.50"),
+    )
+    for limit_number, attempt_number, amount in reservations:
+        reservation_id = f"reservation-{limit_number}-{attempt_number}"
+        budget_limit_id = _budget_limit_id(limit_number)
+        identity = _model_attempt_identity(attempt_number)
+        events.extend(
+            [
+                Event(
+                    type=EventType.BUDGET_RESERVED,
+                    session_id="sess_distinct_attempts",
+                    payload={
+                        "reservation_id": reservation_id,
+                        "budget_limit_id": budget_limit_id,
+                        **identity,
+                        "scope": "session",
+                        "key": "sess_distinct_attempts",
+                        "window": "all_time",
+                        "currency": "USD",
+                        "maximum": str(limit_number),
+                        "action": "interrupt",
+                        "requested": "0.50",
+                    },
+                ),
+                Event(
+                    type=EventType.BUDGET_RECONCILED,
+                    session_id="sess_distinct_attempts",
+                    payload={
+                        "reservation_id": reservation_id,
+                        "budget_limit_id": budget_limit_id,
+                        **identity,
+                        "actual_amount": amount,
+                        "pricing": {"provider_name": "fake", "model": "model"},
+                    },
+                ),
+            ]
+        )
+
+    inspection = session_budget_inspection(events)
+
+    assert inspection.cost_state == "priced"
+    assert inspection.amount == "1.00"
+    assert inspection.currency == "USD"
+
+
+def test_budget_inspection_rejects_conflicting_costs_for_one_attempt() -> None:
+    events: list[Event] = []
+    identity = _model_attempt_identity(1)
+    for limit_number, amount in ((1, "0.25"), (2, "0.30")):
+        reservation_id = f"reservation-{limit_number}"
+        budget_limit_id = _budget_limit_id(limit_number)
+        events.extend(
+            [
+                Event(
+                    type=EventType.BUDGET_RESERVED,
+                    session_id="sess_conflicting_attempt_cost",
+                    payload={
+                        "reservation_id": reservation_id,
+                        "budget_limit_id": budget_limit_id,
+                        **identity,
+                        "scope": "session",
+                        "key": "sess_conflicting_attempt_cost",
+                        "window": "all_time",
+                        "currency": "USD",
+                        "maximum": str(limit_number),
+                        "action": "interrupt",
+                        "requested": "0.50",
+                    },
+                ),
+                Event(
+                    type=EventType.BUDGET_RECONCILED,
+                    session_id="sess_conflicting_attempt_cost",
+                    payload={
+                        "reservation_id": reservation_id,
+                        "budget_limit_id": budget_limit_id,
+                        **identity,
+                        "actual_amount": amount,
+                        "pricing": {"provider_name": "fake", "model": "model"},
+                    },
+                ),
+            ]
+        )
+
+    inspection = session_budget_inspection(events)
+
+    assert inspection.cost_state == "partial"
+    assert inspection.amount is None
+
+
+def test_budget_inspection_rejects_one_attempt_id_attached_to_two_steps() -> None:
+    events: list[Event] = []
+    shared_attempt_id = f"matt_{1:032x}"
+    for value in (1, 2):
+        reservation_id = f"reservation-{value}"
+        budget_limit_id = _budget_limit_id(value)
+        identity = {
+            "model_step_id": f"mstep_{value:032x}",
+            "model_attempt_id": shared_attempt_id,
+        }
+        events.extend(
+            [
+                Event(
+                    type=EventType.BUDGET_RESERVED,
+                    session_id="sess_conflicting_attempt_parent",
+                    payload={
+                        "reservation_id": reservation_id,
+                        "budget_limit_id": budget_limit_id,
+                        **identity,
+                        "scope": "session",
+                        "key": "sess_conflicting_attempt_parent",
+                        "window": "all_time",
+                        "currency": "USD",
+                        "maximum": str(value),
+                        "action": "interrupt",
+                    },
+                ),
+                Event(
+                    type=EventType.BUDGET_RECONCILED,
+                    session_id="sess_conflicting_attempt_parent",
+                    payload={
+                        "reservation_id": reservation_id,
+                        "budget_limit_id": budget_limit_id,
+                        **identity,
+                        "actual_amount": "0.25",
+                        "pricing": {"provider_name": "fake", "model": "model"},
+                    },
+                ),
+            ]
+        )
+
+    inspection = session_budget_inspection(events)
+
+    assert inspection.cost_state == "partial"
+    assert inspection.amount is None
+
+
+def test_budget_inspection_requires_attempt_identity_on_reservation_failure() -> None:
+    failure = Event(
+        type=EventType.BUDGET_RESERVATION_FAILED,
+        session_id="sess_failed_reservation",
+        payload={
+            "budget_limit_id": _budget_limit_id(1),
+            **_model_attempt_identity(1),
+            "scope": "session",
+            "key": "sess_failed_reservation",
+            "window": "all_time",
+            "currency": "USD",
+            "maximum": "1",
+            "action": "interrupt",
+        },
+    )
+
+    projected = project_budget_inspection_event(failure)
+    assert projected.payload["model_step_id"] == failure.payload["model_step_id"]
+    assert projected.payload["model_attempt_id"] == failure.payload["model_attempt_id"]
+    assert session_budget_inspection([projected]).cost_state == "priced"
+
+    projected.payload.pop("model_attempt_id")
+    inspection = session_budget_inspection([projected])
 
     assert inspection.cost_state == "partial"
     assert inspection.amount is None

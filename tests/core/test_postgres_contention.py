@@ -12,6 +12,7 @@ from postgres_contention_support import (
     hold_advisory_xact_lock,
     recorded_revisions,
 )
+from tests.core._execution_unit_fixtures import model_attempt_identity
 
 from cayu import (
     Event,
@@ -95,6 +96,7 @@ async def _reserve(ledger: PostgresBudgetLedger, limit: BudgetLimit, session_id:
         agent_name="assistant",
         provider_name="fake",
         model="fake-model",
+        model_attempt_identity=model_attempt_identity(),
     )
 
 
@@ -546,6 +548,7 @@ def test_postgres_budget_ledger_preserves_bedrock_identity_across_reopen(
                 agent_name="assistant",
                 provider_name="bedrock",
                 model=requested_identity.resource_id,
+                model_attempt_identity=model_attempt_identity(),
                 billing_identity=requested_identity,
             )
         finally:

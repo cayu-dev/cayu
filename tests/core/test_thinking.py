@@ -37,6 +37,7 @@ from cayu.providers.openai import (
     openai_response_events,
 )
 from cayu.runtime._transcript import AssistantThinkingPart, _materialize_thinking
+from cayu.runtime.execution_units import new_model_step_identity
 from cayu.runtime.model_steps import (
     AssistantStepResult,
     StepClassificationType,
@@ -418,9 +419,12 @@ def test_usage_surfaces_anthropic_thinking_tokens() -> None:
 # Step classification: thinking-only step is THINK_ONLY, not INVALID
 # --------------------------------------------------------------------------- #
 def test_thinking_only_step_is_think_only() -> None:
+    model_attempt_identity = new_model_step_identity().new_attempt()
     result = AssistantStepResult(
         session_id="s",
         step=0,
+        model_step_id=model_attempt_identity.model_step_id,
+        model_attempt_id=model_attempt_identity.model_attempt_id,
         assistant_message=None,
         tool_calls=[],
         completion=ModelCompletion(finish_reason=ModelFinishReason.STOP),

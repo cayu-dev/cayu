@@ -157,6 +157,10 @@ REVISIONS: tuple[Revision, ...] = (
     # effective-limit identity. Older writers omit that identity and can merge
     # independent ledgers, so mixed-version budget workers are unsafe.
     Revision(revision=23, kind=RevisionKind.BREAKING, compatible_from=23),
+    # Every reservation now belongs to one exact logical model step and provider
+    # attempt. Older writers cannot supply those identities, so allowing them to
+    # share the ledger would make settlement attribution ambiguous.
+    Revision(revision=24, kind=RevisionKind.BREAKING, compatible_from=24),
 )
 
 #: The revision an empty database is initialized to.

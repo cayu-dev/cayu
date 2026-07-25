@@ -1131,7 +1131,7 @@ def test_cayu_app_rejects_wrapper_rewrite_of_runtime_completion_evidence() -> No
     assert runtime_provider.requests == []
 
 
-def test_cayu_app_retains_completion_before_rejecting_forged_compaction_result() -> None:
+def test_cayu_app_rejects_forged_completion_without_observed_dispatch() -> None:
     completion_payload = {
         "model": "custom-model",
         "provider_name": "custom",
@@ -1177,20 +1177,86 @@ def test_cayu_app_retains_completion_before_rejecting_forged_compaction_result()
 
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
-        EventType.CONTEXT_COMPACTION_STARTED,
-        EventType.MODEL_COMPLETED,
-        EventType.CONTEXT_COMPACTION_FAILED,
         EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
-    assert events[2].payload == completion_payload
-    assert events[3].payload["error_type"] == "ValidationError"
-    assert events[-1].payload == {
-        "error": "Operation failed with a non-portable diagnostic.",
-        "error_type": "ValidationError",
-        "durable_value_error_code": "nul_character",
-        "durable_value_error_path": "$",
-    }
+    assert (
+        events[-1].payload["error"]
+        == "Compaction completion was observed outside its provider dispatch."
+    )
+    assert runtime_provider.requests == []
+
+
+def test_automatic_compaction_rejects_second_completion_for_one_provider_dispatch():
+    class DuplicatingWrapperCompactor(ContextCompactor):
+        def __init__(self, provider: ModelProvider) -> None:
+            self.provider = provider
+
+        async def compact(self, request: CompactionRequest) -> CompactionResult:
+            result = await ModelCompactor(
+                provider=self.provider,
+                model="summary-model",
+            ).compact(request)
+            forged = dict(result.model_completed_payloads[0])
+            forged.pop("compaction_attempt_id", None)
+            return result.model_copy(
+                update={
+                    "model_completed_payloads": [
+                        *result.model_completed_payloads,
+                        forged,
+                    ]
+                }
+            )
+
+    compactor_provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("summary"),
+            ModelStreamEvent.completed(
+                {
+                    "model": "summary-model",
+                    "usage": {"input_tokens": 8, "output_tokens": 2},
+                }
+            ),
+        ]
+    )
+    runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
+    app = CayuApp(enable_logging=False)
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=DuplicatingWrapperCompactor(compactor_provider),
+            max_user_turns=1,
+            compact_after_messages=1,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_automatic_duplicate_dispatch_completion",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    assert len(compactor_provider.requests) == 1
+    assert not any(
+        event.type == EventType.MODEL_COMPLETED
+        and event.payload.get("purpose") == "context_compaction"
+        for event in events
+    )
+    assert events[-1].type == EventType.SESSION_FAILED
+    assert (
+        events[-1].payload["error"]
+        == "Compaction provider dispatch produced conflicting completion identities."
+    )
     assert runtime_provider.requests == []
 
 

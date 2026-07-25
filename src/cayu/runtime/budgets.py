@@ -49,7 +49,11 @@ from cayu.runtime.costs import (
     estimate_session_cost,
     resolve_price_book,
 )
-from cayu.runtime.execution_units import BudgetLimitIdentity
+from cayu.runtime.execution_units import (
+    BudgetLimitIdentity,
+    ModelAttemptIdentity,
+    copy_model_attempt_identity,
+)
 
 BudgetScope = Literal["app", "agent", "causal", "session", "run"]
 BudgetWindowKind = Literal["all_time", "rolling", "calendar"]
@@ -119,16 +123,20 @@ def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
             contradictory_limit_identity = True
 
     reservation_ids: set[str] = set()
-    reservation_ids_by_limit: dict[str, set[str]] = {}
+    reservation_ids_by_attempt: dict[ModelAttemptIdentity, set[str]] = {}
     limit_ids_by_reservation: dict[str, str] = {}
+    attempt_identities_by_reservation: dict[str, ModelAttemptIdentity] = {}
+    step_ids_by_attempt_id: dict[str, str] = {}
+    reservation_ids_by_limit_attempt: dict[tuple[str, str], str] = {}
     currencies_by_reservation: dict[str, str] = {}
     invalid_reservation_limit_identity = False
     invalid_reservation_evidence = False
     for event in reservations:
         reservation_id = event.payload.get("reservation_id")
         budget_limit_id = _inspection_budget_limit_id(event.payload.get("budget_limit_id"))
+        model_attempt_identity = _inspection_model_attempt_identity(event.payload)
         currency = event.payload.get("currency")
-        if type(reservation_id) is not str:
+        if type(reservation_id) is not str or not reservation_id:
             invalid_reservation_evidence = True
             continue
         if reservation_id in reservation_ids:
@@ -141,6 +149,7 @@ def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
         action = event.payload.get("action")
         if (
             budget_limit_id is not None
+            and model_attempt_identity is not None
             and type(scope) is str
             and (key is None or type(key) is str)
             and type(window) is str
@@ -150,12 +159,37 @@ def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
             and type(currency) is str
             and bool(currency.strip())
         ):
-            reservation_ids_by_limit.setdefault(budget_limit_id, set()).add(reservation_id)
             previous_limit_id = limit_ids_by_reservation.setdefault(
                 reservation_id,
                 budget_limit_id,
             )
             if previous_limit_id != budget_limit_id:
+                invalid_reservation_evidence = True
+            previous_attempt_identity = attempt_identities_by_reservation.setdefault(
+                reservation_id,
+                model_attempt_identity,
+            )
+            if previous_attempt_identity != model_attempt_identity:
+                invalid_reservation_evidence = True
+            previous_step_id = step_ids_by_attempt_id.setdefault(
+                model_attempt_identity.model_attempt_id,
+                model_attempt_identity.model_step_id,
+            )
+            if previous_step_id != model_attempt_identity.model_step_id:
+                invalid_reservation_evidence = True
+            reservation_ids_by_attempt.setdefault(
+                model_attempt_identity,
+                set(),
+            ).add(reservation_id)
+            limit_attempt_key = (
+                budget_limit_id,
+                model_attempt_identity.model_attempt_id,
+            )
+            previous_reservation_id = reservation_ids_by_limit_attempt.setdefault(
+                limit_attempt_key,
+                reservation_id,
+            )
+            if previous_reservation_id != reservation_id:
                 invalid_reservation_evidence = True
         else:
             invalid_reservation_limit_identity = True
@@ -169,10 +203,13 @@ def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
     for event in reconciliations:
         reservation_id = event.payload.get("reservation_id")
         budget_limit_id = _inspection_budget_limit_id(event.payload.get("budget_limit_id"))
+        model_attempt_identity = _inspection_model_attempt_identity(event.payload)
         if (
             type(reservation_id) is not str
             or budget_limit_id is None
+            or model_attempt_identity is None
             or limit_ids_by_reservation.get(reservation_id) != budget_limit_id
+            or attempt_identities_by_reservation.get(reservation_id) != model_attempt_identity
         ):
             invalid_reservation_evidence = True
             continue
@@ -200,10 +237,13 @@ def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
     for event in releases:
         reservation_id = event.payload.get("reservation_id")
         budget_limit_id = _inspection_budget_limit_id(event.payload.get("budget_limit_id"))
+        model_attempt_identity = _inspection_model_attempt_identity(event.payload)
         if (
             type(reservation_id) is not str
             or budget_limit_id is None
+            or model_attempt_identity is None
             or limit_ids_by_reservation.get(reservation_id) != budget_limit_id
+            or attempt_identities_by_reservation.get(reservation_id) != model_attempt_identity
         ):
             invalid_reservation_evidence = True
             continue
@@ -230,35 +270,44 @@ def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
     if contradictory_limit_identity:
         cost_state = "partial"
     elif complete_priced_coverage:
-        limit_totals: set[tuple[Decimal, str]] = set()
+        attempt_costs: list[tuple[Decimal, str]] = []
         mixed_currency = False
-        for limit_reservation_ids in reservation_ids_by_limit.values():
+        contradictory_attempt_cost = False
+        for attempt_reservation_ids in reservation_ids_by_attempt.values():
+            attempt_reconciled_ids = attempt_reservation_ids & reconciled_reservation_ids
+            attempt_released_ids = attempt_reservation_ids & released_reservation_ids
+            if attempt_reconciled_ids and attempt_released_ids:
+                contradictory_attempt_cost = True
+                continue
             currencies = {
                 currencies_by_reservation[reservation_id]
-                for reservation_id in limit_reservation_ids
+                for reservation_id in attempt_reservation_ids
                 if reservation_id in currencies_by_reservation
             }
             if len(currencies) != 1:
                 mixed_currency = True
                 continue
-            limit_total = sum(
-                (
-                    priced_amount_by_reservation.get(reservation_id, Decimal("0"))
-                    for reservation_id in limit_reservation_ids
-                ),
-                Decimal("0"),
-            )
-            limit_totals.add((limit_total, next(iter(currencies))))
-        if mixed_currency or len({item_currency for _, item_currency in limit_totals}) > 1:
+            attempt_currency = next(iter(currencies))
+            if attempt_released_ids:
+                attempt_costs.append((Decimal("0"), attempt_currency))
+                continue
+            priced_amounts = {
+                priced_amount_by_reservation[reservation_id]
+                for reservation_id in attempt_reconciled_ids
+            }
+            if len(priced_amounts) != 1:
+                contradictory_attempt_cost = True
+                continue
+            attempt_costs.append((next(iter(priced_amounts)), attempt_currency))
+        if contradictory_attempt_cost:
+            cost_state = "partial"
+        elif mixed_currency or len({item_currency for _, item_currency in attempt_costs}) > 1:
             cost_state = "mixed_currency"
-        elif len(limit_totals) == 1:
-            priced_amount, priced_currency = next(iter(limit_totals))
+        elif attempt_costs:
             cost_state = "priced"
-            amount = str(priced_amount)
-            currency = priced_currency
+            amount = str(sum((item_amount for item_amount, _ in attempt_costs), Decimal("0")))
+            currency = attempt_costs[0][1]
         else:
-            # Parallel budget-limit ledgers must agree on the session's actual
-            # spend. Divergent totals are evidence we cannot safely collapse.
             cost_state = "partial"
     elif invalid_reservation_evidence:
         cost_state = "partial"
@@ -318,13 +367,29 @@ def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
             else:
                 cost_state = "partial"
     elif not reservation_ids and failures:
-        valid_failure_limit_ids = [
-            _inspection_budget_limit_id(event.payload.get("budget_limit_id")) for event in failures
-        ]
+        failure_keys: set[tuple[str, ModelAttemptIdentity]] = set()
+        failure_step_ids_by_attempt_id: dict[str, str] = {}
+        invalid_failure_identity = False
+        for event in failures:
+            budget_limit_id = _inspection_budget_limit_id(event.payload.get("budget_limit_id"))
+            model_attempt_identity = _inspection_model_attempt_identity(event.payload)
+            if budget_limit_id is None or model_attempt_identity is None:
+                invalid_failure_identity = True
+                continue
+            failure_key = (budget_limit_id, model_attempt_identity)
+            if failure_key in failure_keys:
+                invalid_failure_identity = True
+            failure_keys.add(failure_key)
+            previous_step_id = failure_step_ids_by_attempt_id.setdefault(
+                model_attempt_identity.model_attempt_id,
+                model_attempt_identity.model_step_id,
+            )
+            if previous_step_id != model_attempt_identity.model_step_id:
+                invalid_failure_identity = True
         failure_currencies = {
             currency for event in failures if type(currency := event.payload.get("currency")) is str
         }
-        if any(limit_id is None for limit_id in valid_failure_limit_ids):
+        if invalid_failure_identity:
             cost_state = "partial"
         elif len(failure_currencies) == 1 and len(failure_currencies) == len(
             {event.payload.get("currency") for event in failures}
@@ -373,6 +438,20 @@ def _inspection_budget_limit_id(value: Any) -> str | None:
     try:
         return BudgetLimitIdentity(budget_limit_id=value).budget_limit_id
     except ValueError:
+        return None
+
+
+def _inspection_model_attempt_identity(
+    payload: Mapping[str, Any],
+) -> ModelAttemptIdentity | None:
+    try:
+        return ModelAttemptIdentity.model_validate(
+            {
+                "model_step_id": payload.get("model_step_id"),
+                "model_attempt_id": payload.get("model_attempt_id"),
+            }
+        )
+    except (TypeError, ValueError):
         return None
 
 
@@ -427,6 +506,8 @@ def project_budget_inspection_event(event: Event) -> Event:
         retained_keys = (
             "reservation_id",
             "budget_limit_id",
+            "model_step_id",
+            "model_attempt_id",
             "scope",
             "key",
             "window",
@@ -435,12 +516,25 @@ def project_budget_inspection_event(event: Event) -> Event:
             "action",
         )
     elif event.type == EventType.BUDGET_RECONCILED:
-        retained_keys = ("reservation_id", "budget_limit_id", "actual_amount")
+        retained_keys = (
+            "reservation_id",
+            "budget_limit_id",
+            "model_step_id",
+            "model_attempt_id",
+            "actual_amount",
+        )
     elif event.type == EventType.BUDGET_RESERVATION_RELEASED:
-        retained_keys = ("reservation_id", "budget_limit_id")
+        retained_keys = (
+            "reservation_id",
+            "budget_limit_id",
+            "model_step_id",
+            "model_attempt_id",
+        )
     elif event.type == EventType.BUDGET_RESERVATION_FAILED:
         retained_keys = (
             "budget_limit_id",
+            "model_step_id",
+            "model_attempt_id",
             "scope",
             "key",
             "window",
@@ -735,6 +829,8 @@ class BudgetReservationRecord(BaseModel):
 
     reservation_id: str = Field(default_factory=lambda: f"bres_{uuid4().hex}")
     budget_limit_id: str
+    model_step_id: str
+    model_attempt_id: str
     scope: BudgetScope
     key: str | None = None
     window: BudgetWindow = Field(default_factory=BudgetWindow.all_time)
@@ -798,6 +894,14 @@ class BudgetReservationRecord(BaseModel):
     def validate_record_timestamp(cls, value: datetime, info) -> datetime:
         return _utc_datetime(value, info.field_name)
 
+    @model_validator(mode="after")
+    def validate_model_attempt_identity(self) -> BudgetReservationRecord:
+        ModelAttemptIdentity(
+            model_step_id=self.model_step_id,
+            model_attempt_id=self.model_attempt_id,
+        )
+        return self
+
 
 class BudgetReservationResult(BaseModel):
     """Result of attempting to reserve budget before a model step."""
@@ -806,6 +910,8 @@ class BudgetReservationResult(BaseModel):
 
     accepted: StrictBool
     budget_limit_id: str
+    model_step_id: str
+    model_attempt_id: str
     scope: BudgetScope
     key: str | None = None
     window: BudgetWindow = Field(default_factory=BudgetWindow.all_time)
@@ -847,6 +953,22 @@ class BudgetReservationResult(BaseModel):
             raise ValueError(f"{info.field_name} must be finite.")
         return value
 
+    @model_validator(mode="after")
+    def validate_model_attempt_identity(self) -> BudgetReservationResult:
+        identity = ModelAttemptIdentity(
+            model_step_id=self.model_step_id,
+            model_attempt_id=self.model_attempt_id,
+        )
+        if self.record is not None and (
+            self.record.budget_limit_id != self.budget_limit_id
+            or self.record.model_step_id != identity.model_step_id
+            or self.record.model_attempt_id != identity.model_attempt_id
+        ):
+            raise ValueError(
+                "Budget reservation result identity does not match its reservation record."
+            )
+        return self
+
 
 class BudgetReconciliation(BaseModel):
     """Result of reconciling a reservation after the model step completes."""
@@ -855,6 +977,8 @@ class BudgetReconciliation(BaseModel):
 
     reservation_id: str
     budget_limit_id: str
+    model_step_id: str
+    model_attempt_id: str
     status: BudgetReservationStatus
     reserved_amount: Decimal = Field(ge=0)
     actual_amount: Decimal | None = Field(default=None, ge=0)
@@ -890,6 +1014,10 @@ class BudgetReconciliation(BaseModel):
 
     @model_validator(mode="after")
     def validate_pricing_evidence(self) -> BudgetReconciliation:
+        ModelAttemptIdentity(
+            model_step_id=self.model_step_id,
+            model_attempt_id=self.model_attempt_id,
+        )
         identity = (
             self.pricing_provider_name,
             self.pricing_model,
@@ -980,6 +1108,7 @@ class BudgetLedger(ABC):
         agent_name: str,
         provider_name: str,
         model: str,
+        model_attempt_identity: ModelAttemptIdentity,
         billing_identity: BillingIdentity | None = None,
     ) -> BudgetReservationResult:
         """Reserve budget for one provider dispatch if capacity remains."""
@@ -1144,6 +1273,7 @@ class InMemoryBudgetLedger(BudgetLedger):
         agent_name: str,
         provider_name: str,
         model: str,
+        model_attempt_identity: ModelAttemptIdentity,
         billing_identity: BillingIdentity | None = None,
     ) -> BudgetReservationResult:
         limit = _ensure_effective_budget_limit(
@@ -1154,6 +1284,7 @@ class InMemoryBudgetLedger(BudgetLedger):
         agent_name = require_clean_nonblank(agent_name, "agent_name")
         provider_name = require_clean_nonblank(provider_name, "provider_name")
         model = require_clean_nonblank(model, "model")
+        model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
         async with self._lock:
             now = self._clock()
             request = _budget_reservation_amount(
@@ -1173,6 +1304,7 @@ class InMemoryBudgetLedger(BudgetLedger):
             if projected > limit.max_estimated_cost:
                 return _reservation_result(
                     limit=limit,
+                    model_attempt_identity=model_attempt_identity,
                     accepted=False,
                     requested=request,
                     actual=projected,
@@ -1183,6 +1315,8 @@ class InMemoryBudgetLedger(BudgetLedger):
                 )
             record = BudgetReservationRecord(
                 budget_limit_id=limit.budget_limit_id,
+                model_step_id=model_attempt_identity.model_step_id,
+                model_attempt_id=model_attempt_identity.model_attempt_id,
                 scope=limit.scope,
                 key=limit.key,
                 window=limit.window,
@@ -1199,6 +1333,7 @@ class InMemoryBudgetLedger(BudgetLedger):
             self._records[record.reservation_id] = record
             return _reservation_result(
                 limit=limit,
+                model_attempt_identity=model_attempt_identity,
                 accepted=True,
                 requested=request,
                 actual=projected,
@@ -1789,6 +1924,8 @@ def budget_reservation_payload(result: BudgetReservationResult) -> dict[str, Any
     payload: dict[str, Any] = {
         "accepted": result.accepted,
         "budget_limit_id": result.budget_limit_id,
+        "model_step_id": result.model_step_id,
+        "model_attempt_id": result.model_attempt_id,
         "scope": result.scope,
         "key": result.key,
         "window": result.window.storage_key,
@@ -1838,6 +1975,8 @@ def budget_reconciliation_payload(reconciliation: BudgetReconciliation) -> dict[
     return {
         "reservation_id": reconciliation.reservation_id,
         "budget_limit_id": reconciliation.budget_limit_id,
+        "model_step_id": reconciliation.model_step_id,
+        "model_attempt_id": reconciliation.model_attempt_id,
         "status": reconciliation.status,
         "reserved_amount": str(reconciliation.reserved_amount),
         "actual_amount": (
@@ -2072,15 +2211,19 @@ def _is_expired_reservation_reason(reason: str | None) -> bool:
 def _reservation_result(
     *,
     limit: _EffectiveBudgetLimit,
+    model_attempt_identity: ModelAttemptIdentity,
     accepted: bool,
     requested: Decimal,
     actual: Decimal,
     message: str,
     record: BudgetReservationRecord | None = None,
 ) -> BudgetReservationResult:
+    model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
     return BudgetReservationResult(
         accepted=accepted,
         budget_limit_id=limit.budget_limit_id,
+        model_step_id=model_attempt_identity.model_step_id,
+        model_attempt_id=model_attempt_identity.model_attempt_id,
         scope=limit.scope,
         key=limit.key,
         window=limit.window,
@@ -2167,6 +2310,8 @@ def _reconciliation_from_record(record: BudgetReservationRecord) -> BudgetReconc
     return BudgetReconciliation(
         reservation_id=record.reservation_id,
         budget_limit_id=record.budget_limit_id,
+        model_step_id=record.model_step_id,
+        model_attempt_id=record.model_attempt_id,
         status=record.status,
         reserved_amount=record.reserved_amount,
         actual_amount=actual_amount,

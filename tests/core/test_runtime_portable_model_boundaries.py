@@ -637,6 +637,8 @@ def test_cayu_app_terminalizes_nonportable_model_stream_values_without_retry_or_
         "step": 1,
         "attempt": 1,
         "max_attempts": 2,
+        "model_step_id": events[1].payload["model_step_id"],
+        "model_attempt_id": events[1].payload["model_attempt_id"],
     }
     rendered = json.dumps(
         [event.model_dump(mode="json") for event in events],
@@ -715,6 +717,8 @@ def test_cayu_app_terminalizes_nonportable_raised_provider_error_without_retry_o
         "step": 1,
         "attempt": 1,
         "max_attempts": 2,
+        "model_step_id": events[1].payload["model_step_id"],
+        "model_attempt_id": events[1].payload["model_attempt_id"],
     }
     assert EventType.MODEL_RETRY not in [event.type for event in events]
     assert EventType.MODEL_ATTEMPT_DISCARDED not in [event.type for event in events]

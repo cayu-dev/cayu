@@ -177,7 +177,7 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 23"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 22"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -225,12 +225,27 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
             )
             assert await cur.fetchone() == ("breaking", 23)
             await cur.execute(
+                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 24"
+            )
+            assert await cur.fetchone() == ("breaking", 24)
+            await cur.execute(
                 "SELECT column_name FROM information_schema.columns "
                 "WHERE table_schema = current_schema() "
                 "AND table_name = 'cayu_budget_reservations' "
                 "AND column_name = 'budget_limit_id'"
             )
             assert await cur.fetchone() == ("budget_limit_id",)
+            await cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'cayu_budget_reservations' "
+                "AND column_name IN ('model_step_id', 'model_attempt_id') "
+                "ORDER BY column_name"
+            )
+            assert await cur.fetchall() == [
+                ("model_attempt_id",),
+                ("model_step_id",),
+            ]
             await cur.execute(
                 "SELECT EXISTS(SELECT 1 FROM pg_trigger "
                 "WHERE tgname = 'cayu_events_enqueue_persisted_side_effect' "
@@ -259,7 +274,7 @@ def test_validate_mode_rejects_pre_insert_xid_postgres_schema(postgres_dsn: str)
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 23"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 22"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -286,7 +301,7 @@ def test_revision_fourteen_requires_cascade_index_migration(postgres_dsn: str) -
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 23"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 22"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -330,7 +345,7 @@ def test_revision_fifteen_requires_session_sequence_index_migration(postgres_dsn
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 23"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 22"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -479,7 +494,7 @@ def test_revision_seventeen_requires_pending_action_index_migration(
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 23"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 22"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -630,7 +645,7 @@ def test_revision_seventeen_requires_session_operation_migration(postgres_dsn: s
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 23"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 22"):
                 await validator.ensure_schema()
         finally:
             await validator.close()

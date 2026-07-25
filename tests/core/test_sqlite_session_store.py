@@ -1097,7 +1097,7 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 23"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 22"):
         SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
     task_store = SQLiteTaskStore(
@@ -1186,7 +1186,7 @@ def test_sqlite_session_store_revision_thirteen_requires_run_fencing_migration(t
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 23"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 22"):
         SQLiteSessionStore(db_path)
 
     reopened = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
@@ -1225,7 +1225,7 @@ def test_sqlite_session_store_revision_fourteen_requires_cascade_index_migration
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 23"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 22"):
         SQLiteSessionStore(db_path)
 
     reopened = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
@@ -1320,7 +1320,7 @@ def test_sqlite_session_store_revision_sixteen_requires_pending_action_index(tmp
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 23"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 22"):
         SQLiteSessionStore(db_path)
 
     reopened = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
@@ -1506,7 +1506,7 @@ def test_sqlite_revision_seventeen_requires_session_operation_migration(tmp_path
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 23"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 22"):
         SQLiteSessionStore(db_path)
 
     migrated = SQLiteSessionStore(
@@ -1872,7 +1872,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         "status_reason",
         "status_payload_json",
     }.issubset(task_columns)
-    # Revisions 2-7, 11-16, and 20 are additive. Revisions 17-19 and 21-23
+    # Revisions 2-7, 11-16, and 20 are additive. Revisions 17-19 and 21-24
     # change durable writer/reader contracts and therefore raise the
     # compatibility floor.
     assert revisions == [(rev.revision, rev.compatible_from) for rev in schema_migrations.REVISIONS]
@@ -1899,6 +1899,8 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (20, 19),
         (21, 21),
         (22, 22),
+        (23, 23),
+        (24, 24),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

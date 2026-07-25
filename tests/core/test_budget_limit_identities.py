@@ -4,6 +4,8 @@ import asyncio
 from decimal import Decimal
 from typing import Literal
 
+from tests.core._execution_unit_fixtures import model_attempt_identity
+
 from cayu.runtime import (
     BudgetLimit,
     BudgetPolicy,
@@ -104,6 +106,7 @@ def test_in_memory_ledger_partitions_identical_limits_by_exact_id() -> None:
     async def scenario() -> None:
         limits = _resolve_policy(BudgetPolicy(limits=(_limit(), _limit())))
         ledger = InMemoryBudgetLedger()
+        shared_attempt = model_attempt_identity()
 
         first = await ledger.reserve(
             limit=limits[0],
@@ -111,6 +114,7 @@ def test_in_memory_ledger_partitions_identical_limits_by_exact_id() -> None:
             agent_name="assistant",
             provider_name="fake",
             model="fake-model",
+            model_attempt_identity=shared_attempt,
         )
         second = await ledger.reserve(
             limit=limits[1],
@@ -118,6 +122,7 @@ def test_in_memory_ledger_partitions_identical_limits_by_exact_id() -> None:
             agent_name="assistant",
             provider_name="fake",
             model="fake-model",
+            model_attempt_identity=shared_attempt,
         )
         repeated_first = await ledger.reserve(
             limit=limits[0],
@@ -125,6 +130,7 @@ def test_in_memory_ledger_partitions_identical_limits_by_exact_id() -> None:
             agent_name="assistant",
             provider_name="fake",
             model="fake-model",
+            model_attempt_identity=model_attempt_identity(),
         )
 
         assert first.accepted is True
@@ -154,6 +160,7 @@ def test_sqlite_ledger_reconstructs_exact_limit_and_separates_semantic_change(
                 agent_name="assistant",
                 provider_name="fake",
                 model="fake-model",
+                model_attempt_identity=model_attempt_identity(),
             )
         finally:
             await first_ledger.close()
@@ -170,6 +177,7 @@ def test_sqlite_ledger_reconstructs_exact_limit_and_separates_semantic_change(
                 agent_name="assistant",
                 provider_name="fake",
                 model="fake-model",
+                model_attempt_identity=model_attempt_identity(),
             )
             independently_accepted = await second_ledger.reserve(
                 limit=changed,
@@ -177,6 +185,7 @@ def test_sqlite_ledger_reconstructs_exact_limit_and_separates_semantic_change(
                 agent_name="assistant",
                 provider_name="fake",
                 model="fake-model",
+                model_attempt_identity=model_attempt_identity(),
             )
         finally:
             await second_ledger.close()

@@ -6,6 +6,7 @@ from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
+from tests.core._execution_unit_fixtures import model_attempt_identity
 
 from cayu import (
     BillingIdentity,
@@ -379,6 +380,7 @@ def test_bedrock_reserved_budget_preflight_checks_both_possible_effective_tiers(
             agent_name="assistant",
             provider_name="bedrock",
             model=identity.resource_id,
+            model_attempt_identity=model_attempt_identity(),
             billing_identity=identity,
         )
     )
@@ -423,6 +425,7 @@ def test_bedrock_cache_write_reservation_requires_declared_ttl_rate() -> None:
                 agent_name="assistant",
                 provider_name="bedrock",
                 model=identity.resource_id,
+                model_attempt_identity=model_attempt_identity(),
                 billing_identity=identity,
             )
         )
@@ -457,6 +460,7 @@ def test_budget_reservation_preserves_a_zero_cache_read_rate() -> None:
             agent_name="assistant",
             provider_name="gateway",
             model="frontier",
+            model_attempt_identity=model_attempt_identity(),
         )
     )
 
@@ -504,6 +508,7 @@ def test_non_bedrock_cache_write_reservation_matches_cost_engine_rate() -> None:
             agent_name="assistant",
             provider_name="anthropic",
             model="claude-sonnet-4-6",
+            model_attempt_identity=model_attempt_identity(),
         )
     )
 
@@ -791,6 +796,7 @@ def test_budget_reservation_uses_the_ledgers_injected_clock() -> None:
             agent_name="agent",
             provider_name="gateway",
             model="frontier",
+            model_attempt_identity=model_attempt_identity(),
         )
     )
 
@@ -838,6 +844,7 @@ def test_default_app_budget_ledger_inherits_the_runtime_clock() -> None:
             agent_name="agent",
             provider_name="gateway",
             model="frontier",
+            model_attempt_identity=model_attempt_identity(),
         )
     )
 

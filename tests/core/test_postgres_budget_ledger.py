@@ -15,6 +15,7 @@ from tests.core._budget_ledger_contract import (
     assert_idempotent_terminal_settlements,
     assert_portable_text_boundaries,
 )
+from tests.core._execution_unit_fixtures import model_attempt_identity
 
 from cayu.runtime import (
     BudgetLimit,
@@ -133,6 +134,7 @@ async def _reserve(ledger, limit, session_id: str):
         agent_name="assistant",
         provider_name="fake",
         model="fake-model",
+        model_attempt_identity=model_attempt_identity(),
     )
 
 
@@ -291,7 +293,7 @@ def test_postgres_budget_ledger_does_not_infer_identity_for_existing_rows(
                 await cur.execute(
                     "ALTER TABLE cayu_budget_reservations DROP COLUMN budget_limit_id"
                 )
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 22")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 22")
             await conn.commit()
 
         migrated = PostgresBudgetLedger(
@@ -324,6 +326,65 @@ def test_postgres_budget_ledger_does_not_infer_identity_for_existing_rows(
                 (reservation_id,),
             )
             assert await cur.fetchone() == (None, "active")
+
+    asyncio.run(runner())
+
+
+def test_postgres_budget_ledger_does_not_infer_legacy_attempt_identity(
+    postgres_dsn,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        from cayu import PostgresBudgetLedger
+        from cayu.storage.migrations import SchemaMode
+
+        await _drop_all(postgres_dsn)
+        limit = _reservation_budget_limit(max_cost="0.25")
+        creator = _new_ledger(postgres_dsn)
+        try:
+            existing = await _reserve(creator, limit, "sess_legacy_attempt")
+            assert existing.record is not None
+            reservation_id = existing.record.reservation_id
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE cayu_budget_reservations "
+                    "SET model_step_id = NULL, model_attempt_id = NULL "
+                    "WHERE reservation_id = %s",
+                    (reservation_id,),
+                )
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 24")
+            await conn.commit()
+
+        migrated = PostgresBudgetLedger(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.MIGRATE,
+        )
+        try:
+            with pytest.raises(RuntimeError, match="predates durable model-attempt identity"):
+                await migrated.reconcile(
+                    reservation_id=reservation_id,
+                    actual_amount=Decimal("0.01"),
+                )
+        finally:
+            await migrated.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute(
+                "SELECT model_step_id, model_attempt_id, status "
+                "FROM cayu_budget_reservations WHERE reservation_id = %s",
+                (reservation_id,),
+            )
+            assert await cur.fetchone() == (None, None, "active")
 
     asyncio.run(runner())
 

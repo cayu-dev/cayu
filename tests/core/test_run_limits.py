@@ -53,6 +53,10 @@ from cayu.runtime.budgets import (
     has_deferred_contextual_price,
 )
 from cayu.runtime.costs import ModelPrice, PriceBook
+from cayu.runtime.execution_units import (
+    ModelAttemptIdentity,
+    new_model_step_identity,
+)
 from cayu.runtime.sessions import (
     EventQuery,
     InMemorySessionStore,
@@ -107,6 +111,10 @@ def _reserved_limit(maximum: str) -> BudgetLimit:
             max_output_tokens=0,
         ),
     )
+
+
+def _model_attempt_identity() -> ModelAttemptIdentity:
+    return new_model_step_identity().new_attempt()
 
 
 def test_deferred_bedrock_price_does_not_shadow_direct_gateway_price() -> None:
@@ -216,6 +224,7 @@ class _CancelSecondReservationLedger(InMemoryBudgetLedger):
         agent_name: str,
         provider_name: str,
         model: str,
+        model_attempt_identity: ModelAttemptIdentity,
     ) -> BudgetReservationResult:
         self.reserve_calls += 1
         if self.reserve_calls == 2:
@@ -226,6 +235,7 @@ class _CancelSecondReservationLedger(InMemoryBudgetLedger):
             agent_name=agent_name,
             provider_name=provider_name,
             model=model,
+            model_attempt_identity=model_attempt_identity,
         )
         if result.record is not None:
             self.reservation_ids.append(result.record.reservation_id)
@@ -258,6 +268,7 @@ class _CancelFirstHeartbeatLedger(InMemoryBudgetLedger):
         agent_name: str,
         provider_name: str,
         model: str,
+        model_attempt_identity: ModelAttemptIdentity,
     ) -> BudgetReservationResult:
         result = await super().reserve(
             limit=limit,
@@ -265,6 +276,7 @@ class _CancelFirstHeartbeatLedger(InMemoryBudgetLedger):
             agent_name=agent_name,
             provider_name=provider_name,
             model=model,
+            model_attempt_identity=model_attempt_identity,
         )
         if result.record is not None:
             self.reservation_ids.append(result.record.reservation_id)
@@ -795,6 +807,7 @@ def test_controller_releases_prior_operation_reservations_when_later_limit_rejec
             agent_name="assistant",
             provider_name="fake",
             model="fake-model",
+            model_attempt_identity=_model_attempt_identity(),
             rejection_release_reason="later reservation rejected",
             accepted_record_error="accepted reservation missing record",
         )
@@ -827,6 +840,7 @@ def test_controller_returns_partial_reservations_when_setup_is_cancelled():
             agent_name="assistant",
             provider_name="fake",
             model="fake-model",
+            model_attempt_identity=_model_attempt_identity(),
             rejection_release_reason="reservation rejected",
             accepted_record_error="accepted reservation missing record",
         )
@@ -865,6 +879,7 @@ def test_controller_releases_model_reservations_before_propagating_cancellation(
                 environment_name=None,
                 budget_policy=BudgetPolicy(limits=(_reserved_limit("3"),)),
                 request_budget_limits=(_reserved_limit("3"),),
+                model_attempt_identity=_model_attempt_identity(),
             )
         assert len(ledger.reservation_ids) == 1
         renewed = await ledger.heartbeat(reservation_id=ledger.reservation_ids[0])
@@ -897,6 +912,7 @@ def test_controller_preserves_partial_release_progress_after_later_failure():
             agent_name="assistant",
             provider_name="fake",
             model="fake-model",
+            model_attempt_identity=_model_attempt_identity(),
             rejection_release_reason="later reservation rejected",
             accepted_record_error="accepted reservation missing record",
         )
@@ -941,6 +957,7 @@ def test_controller_preserves_partial_model_release_progress_after_later_failure
                 _reserved_limit("4"),
                 _reserved_limit("0.5"),
             ),
+            model_attempt_identity=_model_attempt_identity(),
         )
         records = await store.query_events(EventQuery(session_id=session.id, limit=100))
         events = [record.event for record in records]
@@ -997,6 +1014,7 @@ def test_controller_reconciles_operation_reservations_with_priced_actuals():
             agent_name="assistant",
             provider_name="fake",
             model="fake-model",
+            model_attempt_identity=_model_attempt_identity(),
             rejection_release_reason="reservation rejected",
             accepted_record_error="accepted reservation missing record",
         )
@@ -1055,6 +1073,7 @@ def test_controller_arbitrates_operation_heartbeat_lease_loss():
             agent_name="assistant",
             provider_name="fake",
             model="fake-model",
+            model_attempt_identity=_model_attempt_identity(),
             rejection_release_reason="reservation rejected",
             accepted_record_error="accepted reservation missing record",
         )
@@ -1097,6 +1116,7 @@ def test_controller_preserves_completed_metadata_when_caller_cancellation_wins(
             agent_name="assistant",
             provider_name="fake",
             model="fake-model",
+            model_attempt_identity=_model_attempt_identity(),
             rejection_release_reason="reservation rejected",
             accepted_record_error="accepted reservation missing record",
         )
@@ -1154,6 +1174,7 @@ def test_controller_preserves_completed_metadata_when_heartbeat_lease_loss_wins(
             agent_name="assistant",
             provider_name="fake",
             model="fake-model",
+            model_attempt_identity=_model_attempt_identity(),
             rejection_release_reason="reservation rejected",
             accepted_record_error="accepted reservation missing record",
         )
@@ -1225,6 +1246,7 @@ def test_controller_returns_typed_success_for_budgeted_compactor_dispatch():
             environment_name=None,
             provider_name="fake",
             model="fake-model",
+            model_attempt_identity=_model_attempt_identity(),
             authoritative_failure_types=(),
         )
 
@@ -1265,6 +1287,7 @@ def test_controller_returns_typed_rejection_without_dispatching_compactor():
             environment_name=None,
             provider_name="fake",
             model="fake-model",
+            model_attempt_identity=_model_attempt_identity(),
             authoritative_failure_types=(),
         )
 
@@ -1332,6 +1355,7 @@ def test_controller_returns_typed_rejection_for_unreservable_bedrock_tier():
             environment_name=None,
             provider_name="bedrock",
             model=model,
+            model_attempt_identity=_model_attempt_identity(),
             billing_identity=identity,
             authoritative_failure_types=(),
         )
@@ -1361,6 +1385,7 @@ def test_controller_settles_partial_setup_before_returning_typed_cancellation():
             environment_name=None,
             provider_name="fake",
             model="fake-model",
+            model_attempt_identity=_model_attempt_identity(),
             authoritative_failure_types=(),
         )
 
@@ -1411,6 +1436,7 @@ def test_controller_attempts_every_compactor_settlement_after_one_limit_fails():
             environment_name=None,
             provider_name="fake",
             model="fake-model",
+            model_attempt_identity=_model_attempt_identity(),
             authoritative_failure_types=(),
         )
 

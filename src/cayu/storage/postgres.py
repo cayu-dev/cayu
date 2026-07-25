@@ -76,6 +76,10 @@ from cayu.runtime.event_watchers import (
     copy_event_watcher_claim,
     copy_event_watcher_record,
 )
+from cayu.runtime.execution_units import (
+    ModelAttemptIdentity,
+    copy_model_attempt_identity,
+)
 from cayu.runtime.sessions import (
     DELETE_BLOCKED_SESSION_STATUSES,
     FORK_TRANSCRIPT_VALIDATION_ERROR,
@@ -692,6 +696,14 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "ADD COLUMN IF NOT EXISTS budget_limit_id TEXT",
         "CREATE INDEX IF NOT EXISTS idx_cayu_budget_reservations_limit "
         "ON cayu_budget_reservations(budget_limit_id, status, updated_at)",
+    ),
+    24: (
+        "ALTER TABLE IF EXISTS cayu_budget_reservations "
+        "ADD COLUMN IF NOT EXISTS model_step_id TEXT",
+        "ALTER TABLE IF EXISTS cayu_budget_reservations "
+        "ADD COLUMN IF NOT EXISTS model_attempt_id TEXT",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_budget_reservations_model_attempt "
+        "ON cayu_budget_reservations(model_attempt_id, budget_limit_id, status)",
     ),
 }
 
@@ -2041,7 +2053,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
     machinery (ADR 0001 revision 8).
     """
 
-    _min_required_revision = 22
+    _min_required_revision = 24
 
     def __init__(
         self,
@@ -2076,6 +2088,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         agent_name: str,
         provider_name: str,
         model: str,
+        model_attempt_identity: ModelAttemptIdentity,
         billing_identity: BillingIdentity | None = None,
     ) -> BudgetReservationResult:
         limit = _ensure_effective_budget_limit(
@@ -2086,6 +2099,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         agent_name = require_clean_nonblank(agent_name, "agent_name")
         provider_name = require_clean_nonblank(provider_name, "provider_name")
         model = require_clean_nonblank(model, "model")
+        model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             try:
@@ -2109,6 +2123,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                         await conn.rollback()
                         return _reservation_result(
                             limit=limit,
+                            model_attempt_identity=model_attempt_identity,
                             accepted=False,
                             requested=requested,
                             actual=projected,
@@ -2119,6 +2134,8 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                         )
                     record = BudgetReservationRecord(
                         budget_limit_id=limit.budget_limit_id,
+                        model_step_id=model_attempt_identity.model_step_id,
+                        model_attempt_id=model_attempt_identity.model_attempt_id,
                         scope=limit.scope,
                         key=limit.key,
                         window=limit.window,
@@ -2139,6 +2156,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                 raise
         return _reservation_result(
             limit=limit,
+            model_attempt_identity=model_attempt_identity,
             accepted=True,
             requested=requested,
             actual=projected,
@@ -2338,6 +2356,8 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
             INSERT INTO cayu_budget_reservations (
                 reservation_id,
                 budget_limit_id,
+                model_step_id,
+                model_attempt_id,
                 scope,
                 budget_key,
                 budget_window,
@@ -2356,12 +2376,14 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
             )
             VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, %s, %s, %s
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
             )
             """,
             (
                 record.reservation_id,
                 record.budget_limit_id,
+                record.model_step_id,
+                record.model_attempt_id,
                 record.scope,
                 record.key,
                 record.window.storage_key,
@@ -2418,7 +2440,8 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
     ) -> BudgetReservationRecord:
         await cur.execute(
             """
-            SELECT reservation_id, budget_limit_id, scope, budget_key, budget_window,
+            SELECT reservation_id, budget_limit_id, model_step_id, model_attempt_id,
+                   scope, budget_key, budget_window,
                    currency, session_id,
                    agent_name, provider_name, model, billing_identity,
                    reserved_amount, actual_amount,
@@ -2437,26 +2460,33 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                 "Budget reservation predates durable budget-limit identity and "
                 "cannot be reconciled safely."
             )
+        if row[2] is None or row[3] is None:
+            raise RuntimeError(
+                "Budget reservation predates durable model-attempt identity and "
+                "cannot be reconciled safely."
+            )
         return BudgetReservationRecord(
             reservation_id=row[0],
             budget_limit_id=row[1],
-            scope=row[2],
-            key=row[3],
-            window=row[4],
-            currency=row[5],
-            session_id=row[6],
-            agent_name=row[7],
-            provider_name=row[8],
-            model=row[9],
+            model_step_id=row[2],
+            model_attempt_id=row[3],
+            scope=row[4],
+            key=row[5],
+            window=row[6],
+            currency=row[7],
+            session_id=row[8],
+            agent_name=row[9],
+            provider_name=row[10],
+            model=row[11],
             billing_identity=(
-                None if row[10] is None else BillingIdentity.model_validate(_json_obj(row[10]))
+                None if row[12] is None else BillingIdentity.model_validate(_json_obj(row[12]))
             ),
-            reserved_amount=row[11],
-            actual_amount=row[12],
-            status=row[13],
-            reason=row[14],
-            created_at=pg_support.to_utc(row[15]),
-            updated_at=pg_support.to_utc(row[16]),
+            reserved_amount=row[13],
+            actual_amount=row[14],
+            status=row[15],
+            reason=row[16],
+            created_at=pg_support.to_utc(row[17]),
+            updated_at=pg_support.to_utc(row[18]),
         )
 
     async def _active_record_for_update(

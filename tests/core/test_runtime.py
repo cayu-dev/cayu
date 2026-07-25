@@ -17,6 +17,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from pydantic import ValidationError
+from tests.core._execution_unit_fixtures import model_attempt_identity
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
 import cayu.runtime._environment_lifecycle as environment_lifecycle_module
@@ -2132,12 +2133,14 @@ def test_knowledge_injection_fail_closed_preserves_completed_compaction_checkpoi
         EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
+    model_step_id = events[1].payload["model_step_id"]
     assert events[5].payload == {
         "checkpoint": "context_compaction",
         "compacted_transcript_cursor": 2,
         "previous_compacted_transcript_cursor": 0,
         "newly_compacted_message_count": 2,
         "recent_message_count": 1,
+        "model_step_id": model_step_id,
     }
     checkpoint = asyncio.run(store.load_checkpoint("sess_knowledge_fail_closed_after_compaction"))
     assert checkpoint == {
@@ -7190,7 +7193,16 @@ def test_cayu_app_runs_text_only_session_and_persists_events():
         EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
-    assert events[2].payload == {"delta": "hello"}
+    assert events[2].payload["delta"] == "hello"
+    for key in (
+        "step",
+        "attempt",
+        "max_attempts",
+        "model_step_id",
+        "model_attempt_id",
+    ):
+        assert events[2].payload[key] == events[1].payload[key]
+        assert events[3].payload[key] == events[1].payload[key]
     assert provider.requests[0].model == "fake-model"
     assert provider.requests[0].messages[0].content[0].text == "hi"
     assert provider.requests[0].tools == []
@@ -8864,6 +8876,7 @@ def test_cayu_app_heartbeats_silent_live_budget_reservation() -> None:
             agent_name="assistant",
             provider_name="fake",
             model="fake-model",
+            model_attempt_identity=model_attempt_identity(),
         )
         provider.release.set()
         events = await run_task
@@ -8921,6 +8934,7 @@ def test_cayu_app_does_not_start_model_after_reservation_expires_during_event_pa
             agent_name="assistant",
             provider_name="fake",
             model="fake-model",
+            model_attempt_identity=model_attempt_identity(),
         )
         async for event in stream:
             events.append(event)
@@ -8989,6 +9003,7 @@ def test_cayu_app_validates_budget_lease_immediately_before_provider_dispatch(
             agent_name="assistant",
             provider_name="fake",
             model="fake-model",
+            model_attempt_identity=model_attempt_identity(),
         )
         async for event in stream:
             events.append(event)
@@ -9119,6 +9134,7 @@ def test_cayu_app_reconciles_all_limits_before_yielding_reconciliation_events() 
             agent_name="assistant",
             provider_name="fake",
             model="fake-model",
+            model_attempt_identity=model_attempt_identity(),
         )
         async for event in stream:
             events.append(event)
@@ -20782,6 +20798,8 @@ def test_cayu_app_retries_typed_http_sse_idle_timeout_and_keeps_transcript_clean
         "step": 1,
         "attempt": 1,
         "max_attempts": 2,
+        "model_step_id": events[1].payload["model_step_id"],
+        "model_attempt_id": events[1].payload["model_attempt_id"],
     }
     retry = events[4]
     assert retry.payload["reason"] == "connection"
@@ -20796,7 +20814,11 @@ def test_cayu_app_retries_typed_http_sse_idle_timeout_and_keeps_transcript_clean
         "step": 1,
         "attempt": 2,
         "max_attempts": 2,
+        "model_step_id": events[6].payload["model_step_id"],
+        "model_attempt_id": events[6].payload["model_attempt_id"],
     }
+    assert events[1].payload["model_step_id"] == events[6].payload["model_step_id"]
+    assert events[1].payload["model_attempt_id"] != events[6].payload["model_attempt_id"]
     assert [message.role for message in transcript] == ["user", "assistant"]
     assert transcript[1].content[0].text == "ok"
 
@@ -20850,6 +20872,8 @@ def test_cayu_app_tags_failed_attempt_stream_events_and_keeps_transcript_clean()
         "step": 1,
         "attempt": 1,
         "max_attempts": 2,
+        "model_step_id": events[1].payload["model_step_id"],
+        "model_attempt_id": events[1].payload["model_attempt_id"],
     }
     assert events[3].payload["attempt"] == 1
     assert events[3].payload["max_attempts"] == 2
@@ -20861,7 +20885,11 @@ def test_cayu_app_tags_failed_attempt_stream_events_and_keeps_transcript_clean()
         "step": 1,
         "attempt": 2,
         "max_attempts": 2,
+        "model_step_id": events[6].payload["model_step_id"],
+        "model_attempt_id": events[6].payload["model_attempt_id"],
     }
+    assert events[1].payload["model_step_id"] == events[6].payload["model_step_id"]
+    assert events[1].payload["model_attempt_id"] != events[6].payload["model_attempt_id"]
     assert events[8].payload["attempt"] == 2
     assert events[8].payload["max_attempts"] == 2
     assert [message.role for message in transcript] == ["user", "assistant"]
@@ -20916,6 +20944,8 @@ def test_cayu_app_emits_model_error_for_final_failed_exception_attempt():
         "step": 1,
         "attempt": 1,
         "max_attempts": 2,
+        "model_step_id": events[1].payload["model_step_id"],
+        "model_attempt_id": events[1].payload["model_attempt_id"],
     }
     assert events[4].payload["attempt"] == 1
     assert events[4].payload["reason"] == "timeout"
@@ -20925,7 +20955,11 @@ def test_cayu_app_emits_model_error_for_final_failed_exception_attempt():
         "step": 1,
         "attempt": 2,
         "max_attempts": 2,
+        "model_step_id": events[5].payload["model_step_id"],
+        "model_attempt_id": events[5].payload["model_attempt_id"],
     }
+    assert events[1].payload["model_step_id"] == events[5].payload["model_step_id"]
+    assert events[1].payload["model_attempt_id"] != events[5].payload["model_attempt_id"]
 
 
 def test_cayu_app_retries_using_typed_provider_status_code_without_http_text():
@@ -32523,12 +32557,16 @@ def test_usage_triggered_context_policy_stays_triggered_after_previous_actual_us
         event for event in second_events if event.type == EventType.SESSION_CHECKPOINTED
     ]
     assert len(checkpoint_events) == 1
+    second_model_started = next(
+        event for event in second_events if event.type == EventType.MODEL_STARTED
+    )
     assert checkpoint_events[0].payload == {
         "checkpoint": "usage_triggered_context",
         "min_input_tokens": 50,
         "min_total_tokens": None,
         "last_input_tokens": 100,
         "last_total_tokens": 104,
+        "model_step_id": second_model_started.payload["model_step_id"],
     }
     checkpoint = asyncio.run(app.session_store.load_checkpoint("usage_triggered_policy"))
     assert checkpoint == {
@@ -32808,6 +32846,7 @@ def test_context_overflow_policy_rebuilds_context_and_retries_once():
         EventType.CONTEXT_OVERFLOW_RECOVERING,
         EventType.SESSION_COMPLETED,
     ]
+    first_started = next(event for event in events if event.type == EventType.MODEL_STARTED)
     detected = next(event for event in events if event.type == EventType.CONTEXT_OVERFLOW_DETECTED)
     assert detected.payload == {
         "step": 1,
@@ -32818,6 +32857,8 @@ def test_context_overflow_policy_rebuilds_context_and_retries_once():
         "original_message_count": 2,
         "status_code": 400,
         "provider_error_code": "context_length_exceeded",
+        "model_step_id": first_started.payload["model_step_id"],
+        "model_attempt_id": first_started.payload["model_attempt_id"],
     }
     recovering = next(
         event for event in events if event.type == EventType.CONTEXT_OVERFLOW_RECOVERING
@@ -32827,6 +32868,8 @@ def test_context_overflow_policy_rebuilds_context_and_retries_once():
         "original_message_count": 2,
         "recovery_message_count": 1,
         "policy": "RecentTurnsContextPolicy",
+        "model_step_id": first_started.payload["model_step_id"],
+        "model_attempt_id": first_started.payload["model_attempt_id"],
     }
     transcript = asyncio.run(app.session_store.load_transcript("context_overflow_recovery"))
     assert [message.content[0].text for message in transcript if message.role == "user"] == [
@@ -32878,6 +32921,7 @@ def test_context_overflow_recovery_from_error_stream_event():
         EventType.CONTEXT_OVERFLOW_RECOVERING,
         EventType.SESSION_COMPLETED,
     ]
+    first_started = next(event for event in events if event.type == EventType.MODEL_STARTED)
     detected = next(event for event in events if event.type == EventType.CONTEXT_OVERFLOW_DETECTED)
     assert detected.payload == {
         "step": 1,
@@ -32888,6 +32932,8 @@ def test_context_overflow_recovery_from_error_stream_event():
         "original_message_count": 2,
         "status_code": 400,
         "provider_error_code": "context_length_exceeded",
+        "model_step_id": first_started.payload["model_step_id"],
+        "model_attempt_id": first_started.payload["model_attempt_id"],
     }
 
 
@@ -33429,6 +33475,7 @@ def test_context_overflow_policy_fails_cleanly_when_recovery_overflows():
         EventType.CONTEXT_OVERFLOW_RECOVERING,
         EventType.CONTEXT_OVERFLOW_FAILED,
     ]
+    recovery_started = [event for event in events if event.type == EventType.MODEL_STARTED][-1]
     failed = next(event for event in events if event.type == EventType.CONTEXT_OVERFLOW_FAILED)
     assert failed.payload == {
         "step": 1,
@@ -33440,6 +33487,8 @@ def test_context_overflow_policy_fails_cleanly_when_recovery_overflows():
         "status_code": 400,
         "provider_error_code": "context_length_exceeded",
         "recovery_message_count": 1,
+        "model_step_id": recovery_started.payload["model_step_id"],
+        "model_attempt_id": recovery_started.payload["model_attempt_id"],
     }
     assert events[-1].type == EventType.SESSION_FAILED
 
@@ -36502,7 +36551,7 @@ def test_automatic_compaction_lost_completion_ack_fails_closed_without_retry() -
     asyncio.run(run())
 
 
-def test_automatic_compaction_sanitizes_custom_telemetry_end_to_end():
+def test_automatic_compaction_rejects_unattributed_custom_telemetry_without_leaking():
     class AdversarialAutomaticCompactor(ContextCompactor):
         async def compact(self, request: CompactionRequest) -> CompactionResult:
             identity = BillingIdentity(
@@ -36564,20 +36613,17 @@ def test_automatic_compaction_sanitizes_custom_telemetry_end_to_end():
             ),
         )
         events = await store.load_events(session_id)
-        compaction_completion = next(
-            event
-            for event in events
-            if event.type == EventType.MODEL_COMPLETED
+        assert not any(
+            event.type == EventType.MODEL_COMPLETED
             and event.payload.get("purpose") == "context_compaction"
+            for event in events
         )
-        assert compaction_completion.payload["usage_metrics"]["total_tokens"] == 10
-        assert compaction_completion.payload["provider_name"] == "adversarial-compactor"
-        assert compaction_completion.payload["requested_model"] == "summary-model"
-        assert compaction_completion.payload["model"] == "summary-model-v1"
-        completed = next(
-            event for event in events if event.type == EventType.CONTEXT_COMPACTION_COMPLETED
+        assert not any(event.type == EventType.CONTEXT_COMPACTION_COMPLETED for event in events)
+        assert events[-1].type == EventType.SESSION_FAILED
+        assert (
+            events[-1].payload["error"]
+            == "Compaction completion was observed outside its provider dispatch."
         )
-        assert completed.payload["chunk_mode"] == "custom"
         serialized = json.dumps(
             [event.model_dump(mode="json") for event in events],
             ensure_ascii=False,
@@ -38123,6 +38169,7 @@ def test_cayu_app_checkpoint_compacts_model_context_without_rewriting_transcript
         "represented_message_count": 0,
         "coverage_mode": "pending",
         "chunk_count": 0,
+        "model_step_id": events[4].payload["model_step_id"],
     }
     assert events[2].payload == {
         "checkpoint": "context_compaction",
@@ -38142,6 +38189,7 @@ def test_cayu_app_checkpoint_compacts_model_context_without_rewriting_transcript
         "chunk_mode": "single_request",
         "bounded_input": False,
         "compaction_failed": False,
+        "model_step_id": events[4].payload["model_step_id"],
     }
     assert "summary" not in events[2].payload
     assert events[3].payload == {
@@ -38150,6 +38198,7 @@ def test_cayu_app_checkpoint_compacts_model_context_without_rewriting_transcript
         "previous_compacted_transcript_cursor": 1,
         "newly_compacted_message_count": 4,
         "recent_message_count": 1,
+        "model_step_id": events[4].payload["model_step_id"],
     }
     assert len(compactor.requests) == 1
     assert [message.content[0].text for message in compactor.requests[0].messages] == [
@@ -38266,6 +38315,7 @@ def test_cayu_app_checkpoint_compaction_can_use_model_compactor():
         "coverage_mode": "pending",
         "chunk_count": 0,
         "bounded_input": True,
+        "model_step_id": events[5].payload["model_step_id"],
     }
     assert events[2].payload == {
         "finish_reason": "stop",
@@ -38274,6 +38324,8 @@ def test_cayu_app_checkpoint_compaction_can_use_model_compactor():
         "requested_model": "summary-model",
         "purpose": "context_compaction",
         "compactor": "ModelCompactor",
+        "model_step_id": events[5].payload["model_step_id"],
+        "model_attempt_id": events[2].payload["model_attempt_id"],
     }
     assert events[3].payload == {
         "checkpoint": "context_compaction",
@@ -38293,6 +38345,7 @@ def test_cayu_app_checkpoint_compaction_can_use_model_compactor():
         "chunk_mode": "single_request",
         "bounded_input": False,
         "compaction_failed": False,
+        "model_step_id": events[5].payload["model_step_id"],
     }
     assert "model summary" not in str(events[3].payload)
 
@@ -38315,7 +38368,11 @@ def test_cayu_app_checkpoint_compaction_can_use_model_compactor():
                 "model": "summary-model",
                 "input_truncated": False,
                 "max_input_chars": 120000,
-                "completed": {"finish_reason": "stop"},
+                "completed": {
+                    "finish_reason": "stop",
+                    "model_step_id": events[2].payload["model_step_id"],
+                    "model_attempt_id": events[2].payload["model_attempt_id"],
+                },
             },
         }
     }
@@ -40604,7 +40661,7 @@ def test_cayu_app_model_compaction_policy_without_compaction_keeps_normal_bounda
     assert len(runtime_provider.requests) == 1
 
 
-def test_cayu_app_keeps_invalid_summary_spend_when_custom_compactor_recovers():
+def test_cayu_app_keeps_invalid_summary_spend_before_rejecting_custom_recovery():
     class RecoveringCompactor(ContextCompactor):
         def __init__(self, provider: ModelProvider) -> None:
             self.provider = provider
@@ -40690,21 +40747,28 @@ def test_cayu_app_keeps_invalid_summary_spend_when_custom_compactor_recovers():
         )
     )
 
-    completed_events = [event for event in events if event.type == EventType.MODEL_COMPLETED]
-    assert len(completed_events) == 3
-    invalid_attempt, fallback_attempt, runtime_completed = completed_events
+    durable_events = asyncio.run(store.load_events("sess_recovered_invalid_compaction_summary"))
+    completed_events = [
+        event for event in durable_events if event.type == EventType.MODEL_COMPLETED
+    ]
+    assert len(completed_events) == 1
+    invalid_attempt = completed_events[0]
     assert invalid_attempt.payload["compaction_outcome"] == "invalid_summary"
     assert invalid_attempt.payload["usage_metrics"]["input_tokens"] == 100
-    assert fallback_attempt.payload["requested_model"] == "fallback-summary-model"
-    assert fallback_attempt.payload["usage_metrics"]["input_tokens"] == 40
     assert "compaction_attempt_id" not in invalid_attempt.payload
-    assert "compaction_attempt_id" not in fallback_attempt.payload
-    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert invalid_attempt.payload["model_step_id"].startswith("mstep_")
+    assert invalid_attempt.payload["model_attempt_id"].startswith("matt_")
+    assert events[-1].type == EventType.SESSION_FAILED
+    assert (
+        events[-1].payload["error"]
+        == "Compaction completion was observed outside its provider dispatch."
+    )
+    assert runtime_provider.requests == []
 
     usage = asyncio.run(app.get_session_usage("sess_recovered_invalid_compaction_summary"))
-    assert usage.model_steps == 3
-    assert usage.usage.input_tokens == 143
-    assert usage.usage.output_tokens == 3
+    assert usage.model_steps == 1
+    assert usage.usage.input_tokens == 100
+    assert usage.usage.output_tokens == 0
     budget_events = asyncio.run(
         budget_store.load_events_for_budget(
             scope="app",
@@ -40712,11 +40776,7 @@ def test_cayu_app_keeps_invalid_summary_spend_when_custom_compactor_recovers():
             window=BudgetWindow.all_time(),
         )
     )
-    assert [event.id for event in budget_events] == [
-        invalid_attempt.id,
-        fallback_attempt.id,
-        runtime_completed.id,
-    ]
+    assert [event.id for event in budget_events] == [invalid_attempt.id]
 
 
 def test_cayu_app_keeps_successful_inner_compaction_spend_when_wrapper_fails():
@@ -40962,7 +41022,7 @@ def test_cayu_app_preserves_provider_order_when_wrapper_recovers_earlier_draft()
     assert [event.id for event in budget_events] == [event.id for event in completed_events]
 
 
-def test_cayu_app_inserts_returned_only_completion_before_anchored_inner_call():
+def test_cayu_app_rejects_returned_only_completion_and_keeps_anchored_inner_call():
     class ReturnedFirstCompactor(ContextCompactor):
         def __init__(self, provider: ModelProvider) -> None:
             self.provider = provider
@@ -41046,18 +41106,28 @@ def test_cayu_app_inserts_returned_only_completion_before_anchored_inner_call():
         )
     )
 
-    completed_events = [event for event in events if event.type == EventType.MODEL_COMPLETED]
-    assert len(completed_events) == 3
-    returned_only, inner, runtime_completed = completed_events
-    assert returned_only.payload["requested_model"] == "custom-model"
-    assert returned_only.payload["usage_metrics"]["input_tokens"] == 10
+    durable_events = asyncio.run(
+        app.session_store.load_events("sess_returned_completion_before_inner")
+    )
+    completed_events = [
+        event for event in durable_events if event.type == EventType.MODEL_COMPLETED
+    ]
+    assert len(completed_events) == 1
+    inner = completed_events[0]
     assert inner.payload["requested_model"] == "inner-model"
     assert inner.payload["usage_metrics"]["input_tokens"] == 20
-    assert runtime_completed.payload["usage_metrics"]["input_tokens"] == 3
+    assert inner.payload["model_step_id"].startswith("mstep_")
+    assert inner.payload["model_attempt_id"].startswith("matt_")
+    assert events[-1].type == EventType.SESSION_FAILED
+    assert (
+        events[-1].payload["error"]
+        == "Compaction completion was observed outside its provider dispatch."
+    )
+    assert runtime_provider.requests == []
     usage = asyncio.run(app.get_session_usage("sess_returned_completion_before_inner"))
-    assert usage.model_steps == 3
-    assert usage.usage.input_tokens == 33
-    assert usage.usage.output_tokens == 4
+    assert usage.model_steps == 1
+    assert usage.usage.input_tokens == 20
+    assert usage.usage.output_tokens == 2
     budget_events = asyncio.run(
         budget_store.load_events_for_budget(
             scope="app",
@@ -41065,7 +41135,7 @@ def test_cayu_app_inserts_returned_only_completion_before_anchored_inner_call():
             window=BudgetWindow.all_time(),
         )
     )
-    assert [event.id for event in budget_events] == [event.id for event in completed_events]
+    assert [event.id for event in budget_events] == [inner.id]
 
 
 @pytest.mark.parametrize(
@@ -41944,6 +42014,7 @@ def test_cayu_app_emits_compaction_failed_event_before_session_failure():
         "chunk_count": 0,
         "chunk_mode": "failed",
         "compaction_failed": True,
+        "model_step_id": events[1].payload["model_step_id"],
     }
     assert events[4].payload == {
         "error": "compaction unavailable",
@@ -42106,6 +42177,7 @@ def test_cayu_app_checkpoint_compaction_ignores_cursor_without_valid_summary():
         "previous_compacted_transcript_cursor": 0,
         "newly_compacted_message_count": 3,
         "recent_message_count": 1,
+        "model_step_id": events[4].payload["model_step_id"],
     }
 
 
@@ -42197,6 +42269,7 @@ def test_cayu_app_checkpoint_compaction_ignores_summary_without_valid_cursor():
         "previous_compacted_transcript_cursor": 0,
         "newly_compacted_message_count": 3,
         "recent_message_count": 1,
+        "model_step_id": events[4].payload["model_step_id"],
     }
 
 

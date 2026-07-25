@@ -10,6 +10,7 @@ from tests.core._budget_ledger_contract import (
     assert_idempotent_terminal_settlements,
     assert_portable_text_boundaries,
 )
+from tests.core._execution_unit_fixtures import model_attempt_identity
 
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.core import Event, EventType, Message
@@ -78,6 +79,11 @@ class MutableClock:
 
     def __call__(self) -> datetime:
         return self.value
+
+
+async def _reserve(ledger, **kwargs):
+    kwargs.setdefault("model_attempt_identity", model_attempt_identity())
+    return await ledger.reserve(**kwargs)
 
 
 @pytest.mark.parametrize(
@@ -1135,7 +1141,8 @@ def test_in_memory_budget_ledger_reserves_reconciles_and_releases() -> None:
     async def run():
         ledger = InMemoryBudgetLedger()
         limit = _reservation_budget_limit(max_cost="0.50")
-        first = await ledger.reserve(
+        first = await _reserve(
+            ledger,
             limit=limit,
             session_id="sess_1",
             agent_name="assistant",
@@ -1145,7 +1152,8 @@ def test_in_memory_budget_ledger_reserves_reconciles_and_releases() -> None:
         assert first.accepted is True
         assert first.requested == Decimal("0.22")
         assert first.record is not None
-        second = await ledger.reserve(
+        second = await _reserve(
+            ledger,
             limit=limit,
             session_id="sess_2",
             agent_name="assistant",
@@ -1153,7 +1161,8 @@ def test_in_memory_budget_ledger_reserves_reconciles_and_releases() -> None:
             model="fake-model",
         )
         assert second.accepted is True
-        third = await ledger.reserve(
+        third = await _reserve(
+            ledger,
             limit=limit,
             session_id="sess_3",
             agent_name="assistant",
@@ -1168,7 +1177,8 @@ def test_in_memory_budget_ledger_reserves_reconciles_and_releases() -> None:
         )
         assert reconciled.status == "reconciled"
         assert reconciled.released_amount == Decimal("0.17")
-        retry = await ledger.reserve(
+        retry = await _reserve(
+            ledger,
             limit=limit,
             session_id="sess_3",
             agent_name="assistant",
@@ -1223,14 +1233,16 @@ def test_in_memory_budget_ledger_window_bounds_active_reservations() -> None:
             window=BudgetWindow.rolling(seconds=60),
         )
         all_time_limit = _reservation_budget_limit(max_cost="0.25")
-        rolling_first = await ledger.reserve(
+        rolling_first = await _reserve(
+            ledger,
             limit=rolling_limit,
             session_id="sess_rolling_1",
             agent_name="assistant",
             provider_name="fake",
             model="fake-model",
         )
-        all_time_first = await ledger.reserve(
+        all_time_first = await _reserve(
+            ledger,
             limit=all_time_limit,
             session_id="sess_all_time_1",
             agent_name="assistant",
@@ -1238,7 +1250,8 @@ def test_in_memory_budget_ledger_window_bounds_active_reservations() -> None:
             model="fake-model",
         )
         clock.value = datetime(2026, 1, 1, 12, 0, 30, tzinfo=UTC)
-        blocked_now = await ledger.reserve(
+        blocked_now = await _reserve(
+            ledger,
             limit=rolling_limit,
             session_id="sess_rolling_blocked",
             agent_name="assistant",
@@ -1246,14 +1259,16 @@ def test_in_memory_budget_ledger_window_bounds_active_reservations() -> None:
             model="fake-model",
         )
         clock.value = datetime(2026, 1, 1, 12, 2, tzinfo=UTC)
-        rolling_second = await ledger.reserve(
+        rolling_second = await _reserve(
+            ledger,
             limit=rolling_limit,
             session_id="sess_rolling_2",
             agent_name="assistant",
             provider_name="fake",
             model="fake-model",
         )
-        all_time_second = await ledger.reserve(
+        all_time_second = await _reserve(
+            ledger,
             limit=all_time_limit,
             session_id="sess_all_time_2",
             agent_name="assistant",
@@ -1282,7 +1297,8 @@ def test_in_memory_budget_ledger_uses_reconciliation_time_for_rolling_window() -
             max_cost="0.25",
             window=BudgetWindow.rolling(seconds=60),
         )
-        first = await ledger.reserve(
+        first = await _reserve(
+            ledger,
             limit=limit,
             session_id="sess_1",
             agent_name="assistant",
@@ -1296,7 +1312,8 @@ def test_in_memory_budget_ledger_uses_reconciliation_time_for_rolling_window() -
             occurred_at=datetime(2026, 1, 1, 12, 2, tzinfo=UTC),
         )
         clock.value = datetime(2026, 1, 1, 12, 2, 30, tzinfo=UTC)
-        blocked = await ledger.reserve(
+        blocked = await _reserve(
+            ledger,
             limit=limit,
             session_id="sess_2",
             agent_name="assistant",
@@ -1304,7 +1321,8 @@ def test_in_memory_budget_ledger_uses_reconciliation_time_for_rolling_window() -
             model="fake-model",
         )
         clock.value = datetime(2026, 1, 1, 12, 3, 1, tzinfo=UTC)
-        accepted = await ledger.reserve(
+        accepted = await _reserve(
+            ledger,
             limit=limit,
             session_id="sess_3",
             agent_name="assistant",
@@ -1329,7 +1347,8 @@ def test_in_memory_budget_ledger_uses_reconciliation_time_for_calendar_window() 
             max_cost="0.25",
             window=BudgetWindow.calendar(period="day", timezone="UTC"),
         )
-        first = await ledger.reserve(
+        first = await _reserve(
+            ledger,
             limit=limit,
             session_id="sess_1",
             agent_name="assistant",
@@ -1343,14 +1362,16 @@ def test_in_memory_budget_ledger_uses_reconciliation_time_for_calendar_window() 
             occurred_at=datetime(2026, 1, 1, 23, 59, tzinfo=UTC),
         )
         clock.value = datetime(2026, 1, 2, 0, 1, tzinfo=UTC)
-        next_day = await ledger.reserve(
+        next_day = await _reserve(
+            ledger,
             limit=limit,
             session_id="sess_2",
             agent_name="assistant",
             provider_name="fake",
             model="fake-model",
         )
-        active = await ledger.reserve(
+        active = await _reserve(
+            ledger,
             limit=limit,
             session_id="sess_3",
             agent_name="assistant",
@@ -1383,7 +1404,8 @@ def test_budget_ledgers_keep_active_reservation_across_calendar_boundary(
                 max_cost="0.25",
                 window=BudgetWindow.calendar(period="day", timezone="UTC"),
             )
-            first = await ledger.reserve(
+            first = await _reserve(
+                ledger,
                 limit=limit,
                 session_id="sess_before_midnight",
                 agent_name="assistant",
@@ -1391,7 +1413,8 @@ def test_budget_ledgers_keep_active_reservation_across_calendar_boundary(
                 model="fake-model",
             )
             clock.value = datetime(2026, 1, 2, 0, 1, tzinfo=UTC)
-            blocked = await ledger.reserve(
+            blocked = await _reserve(
+                ledger,
                 limit=limit,
                 session_id="sess_after_midnight",
                 agent_name="assistant",
@@ -1416,7 +1439,8 @@ def test_sqlite_budget_ledger_reserves_reconciles_and_releases(tmp_path) -> None
         ledger = SQLiteBudgetLedger(tmp_path / "budget.sqlite")
         try:
             limit = _reservation_budget_limit(max_cost="0.25")
-            first = await ledger.reserve(
+            first = await _reserve(
+                ledger,
                 limit=limit,
                 session_id="sess_1",
                 agent_name="assistant",
@@ -1425,7 +1449,8 @@ def test_sqlite_budget_ledger_reserves_reconciles_and_releases(tmp_path) -> None
             )
             assert first.accepted is True
             assert first.record is not None
-            blocked = await ledger.reserve(
+            blocked = await _reserve(
+                ledger,
                 limit=limit,
                 session_id="sess_2",
                 agent_name="assistant",
@@ -1438,7 +1463,8 @@ def test_sqlite_budget_ledger_reserves_reconciles_and_releases(tmp_path) -> None
                 actual_amount=Decimal("0.01"),
                 reason="actual usage",
             )
-            retry = await ledger.reserve(
+            retry = await _reserve(
+                ledger,
                 limit=limit,
                 session_id="sess_2",
                 agent_name="assistant",
@@ -1507,21 +1533,24 @@ def test_sqlite_budget_ledger_persists_rolling_window_key(tmp_path) -> None:
                 window=BudgetWindow.rolling(seconds=60),
             )
             all_time_limit = _reservation_budget_limit(max_cost="0.25")
-            first = await ledger.reserve(
+            first = await _reserve(
+                ledger,
                 limit=rolling_limit,
                 session_id="sess_1",
                 agent_name="assistant",
                 provider_name="fake",
                 model="fake-model",
             )
-            blocked = await ledger.reserve(
+            blocked = await _reserve(
+                ledger,
                 limit=rolling_limit,
                 session_id="sess_2",
                 agent_name="assistant",
                 provider_name="fake",
                 model="fake-model",
             )
-            all_time = await ledger.reserve(
+            all_time = await _reserve(
+                ledger,
                 limit=all_time_limit,
                 session_id="sess_3",
                 agent_name="assistant",
@@ -1552,14 +1581,16 @@ def test_sqlite_budget_ledger_window_bounds_active_reservations(tmp_path) -> Non
                 window=BudgetWindow.rolling(seconds=60),
             )
             all_time_limit = _reservation_budget_limit(max_cost="0.25")
-            rolling_first = await ledger.reserve(
+            rolling_first = await _reserve(
+                ledger,
                 limit=rolling_limit,
                 session_id="sess_rolling_1",
                 agent_name="assistant",
                 provider_name="fake",
                 model="fake-model",
             )
-            all_time_first = await ledger.reserve(
+            all_time_first = await _reserve(
+                ledger,
                 limit=all_time_limit,
                 session_id="sess_all_time_1",
                 agent_name="assistant",
@@ -1567,7 +1598,8 @@ def test_sqlite_budget_ledger_window_bounds_active_reservations(tmp_path) -> Non
                 model="fake-model",
             )
             clock.value = datetime(2026, 1, 1, 12, 0, 30, tzinfo=UTC)
-            blocked_now = await ledger.reserve(
+            blocked_now = await _reserve(
+                ledger,
                 limit=rolling_limit,
                 session_id="sess_rolling_blocked",
                 agent_name="assistant",
@@ -1575,14 +1607,16 @@ def test_sqlite_budget_ledger_window_bounds_active_reservations(tmp_path) -> Non
                 model="fake-model",
             )
             clock.value = datetime(2026, 1, 1, 12, 2, tzinfo=UTC)
-            rolling_second = await ledger.reserve(
+            rolling_second = await _reserve(
+                ledger,
                 limit=rolling_limit,
                 session_id="sess_rolling_2",
                 agent_name="assistant",
                 provider_name="fake",
                 model="fake-model",
             )
-            all_time_second = await ledger.reserve(
+            all_time_second = await _reserve(
+                ledger,
                 limit=all_time_limit,
                 session_id="sess_all_time_2",
                 agent_name="assistant",
@@ -1614,7 +1648,8 @@ def test_sqlite_budget_ledger_uses_reconciliation_time_for_rolling_window(tmp_pa
                 max_cost="0.25",
                 window=BudgetWindow.rolling(seconds=60),
             )
-            first = await ledger.reserve(
+            first = await _reserve(
+                ledger,
                 limit=limit,
                 session_id="sess_1",
                 agent_name="assistant",
@@ -1628,7 +1663,8 @@ def test_sqlite_budget_ledger_uses_reconciliation_time_for_rolling_window(tmp_pa
                 occurred_at=datetime(2026, 1, 1, 12, 2, tzinfo=UTC),
             )
             clock.value = datetime(2026, 1, 1, 12, 2, 30, tzinfo=UTC)
-            blocked = await ledger.reserve(
+            blocked = await _reserve(
+                ledger,
                 limit=limit,
                 session_id="sess_2",
                 agent_name="assistant",
@@ -1636,7 +1672,8 @@ def test_sqlite_budget_ledger_uses_reconciliation_time_for_rolling_window(tmp_pa
                 model="fake-model",
             )
             clock.value = datetime(2026, 1, 1, 12, 3, 1, tzinfo=UTC)
-            accepted = await ledger.reserve(
+            accepted = await _reserve(
+                ledger,
                 limit=limit,
                 session_id="sess_3",
                 agent_name="assistant",
@@ -1664,7 +1701,8 @@ def test_sqlite_budget_ledger_uses_reconciliation_time_for_calendar_window(tmp_p
                 max_cost="0.25",
                 window=BudgetWindow.calendar(period="day", timezone="UTC"),
             )
-            first = await ledger.reserve(
+            first = await _reserve(
+                ledger,
                 limit=limit,
                 session_id="sess_1",
                 agent_name="assistant",
@@ -1678,14 +1716,16 @@ def test_sqlite_budget_ledger_uses_reconciliation_time_for_calendar_window(tmp_p
                 occurred_at=datetime(2026, 1, 1, 23, 59, tzinfo=UTC),
             )
             clock.value = datetime(2026, 1, 2, 0, 1, tzinfo=UTC)
-            next_day = await ledger.reserve(
+            next_day = await _reserve(
+                ledger,
                 limit=limit,
                 session_id="sess_2",
                 agent_name="assistant",
                 provider_name="fake",
                 model="fake-model",
             )
-            active = await ledger.reserve(
+            active = await _reserve(
+                ledger,
                 limit=limit,
                 session_id="sess_3",
                 agent_name="assistant",
@@ -1709,7 +1749,8 @@ def test_in_memory_budget_ledger_reaps_expired_active_reservations() -> None:
         clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
         ledger = InMemoryBudgetLedger(clock=clock, reservation_ttl_seconds=60)
         limit = _reservation_budget_limit(max_cost="0.25")
-        orphaned = await ledger.reserve(
+        orphaned = await _reserve(
+            ledger,
             limit=limit,
             session_id="sess_orphaned",
             agent_name="assistant",
@@ -1719,7 +1760,8 @@ def test_in_memory_budget_ledger_reaps_expired_active_reservations() -> None:
         assert orphaned.accepted is True
         assert orphaned.record is not None
         clock.value = datetime(2026, 1, 1, 12, 1, tzinfo=UTC)
-        recovered = await ledger.reserve(
+        recovered = await _reserve(
+            ledger,
             limit=limit,
             session_id="sess_recovered",
             agent_name="assistant",
@@ -1747,7 +1789,8 @@ def test_in_memory_budget_ledger_heartbeat_keeps_live_reservation_active() -> No
         clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
         ledger = InMemoryBudgetLedger(clock=clock, reservation_ttl_seconds=60)
         limit = _reservation_budget_limit(max_cost="0.25")
-        first = await ledger.reserve(
+        first = await _reserve(
+            ledger,
             limit=limit,
             session_id="sess_live",
             agent_name="assistant",
@@ -1758,7 +1801,8 @@ def test_in_memory_budget_ledger_heartbeat_keeps_live_reservation_active() -> No
         clock.value = datetime(2026, 1, 1, 12, 0, 30, tzinfo=UTC)
         assert await ledger.heartbeat(reservation_id=first.record.reservation_id) is True
         clock.value = datetime(2026, 1, 1, 12, 1, 1, tzinfo=UTC)
-        blocked = await ledger.reserve(
+        blocked = await _reserve(
+            ledger,
             limit=limit,
             session_id="sess_blocked",
             agent_name="assistant",
@@ -1767,7 +1811,8 @@ def test_in_memory_budget_ledger_heartbeat_keeps_live_reservation_active() -> No
         )
         clock.value = datetime(2026, 1, 1, 12, 1, 30, tzinfo=UTC)
         late_heartbeat = await ledger.heartbeat(reservation_id=first.record.reservation_id)
-        recovered = await ledger.reserve(
+        recovered = await _reserve(
+            ledger,
             limit=limit,
             session_id="sess_recovered",
             agent_name="assistant",
@@ -1799,14 +1844,16 @@ def test_budget_ledgers_reap_only_the_matching_budget(tmp_path, backend: str) ->
         try:
             first_limit = _reservation_budget_limit(max_cost="0.25", key="first")
             second_limit = _reservation_budget_limit(max_cost="0.25", key="second")
-            first = await ledger.reserve(
+            first = await _reserve(
+                ledger,
                 limit=first_limit,
                 session_id="sess_first_expired",
                 agent_name="assistant",
                 provider_name="fake",
                 model="fake-model",
             )
-            second = await ledger.reserve(
+            second = await _reserve(
+                ledger,
                 limit=second_limit,
                 session_id="sess_second_expired",
                 agent_name="assistant",
@@ -1816,7 +1863,8 @@ def test_budget_ledgers_reap_only_the_matching_budget(tmp_path, backend: str) ->
             assert first.record is not None
             assert second.record is not None
             clock.value = datetime(2026, 1, 1, 12, 1, tzinfo=UTC)
-            replacement = await ledger.reserve(
+            replacement = await _reserve(
+                ledger,
                 limit=first_limit,
                 session_id="sess_first_replacement",
                 agent_name="assistant",
@@ -1844,7 +1892,8 @@ def test_in_memory_budget_ledger_release_tolerates_ttl_reaped_reservation() -> N
         clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
         ledger = InMemoryBudgetLedger(clock=clock, reservation_ttl_seconds=60)
         limit = _reservation_budget_limit(max_cost="0.25")
-        orphaned = await ledger.reserve(
+        orphaned = await _reserve(
+            ledger,
             limit=limit,
             session_id="sess_orphaned",
             agent_name="assistant",
@@ -1854,7 +1903,8 @@ def test_in_memory_budget_ledger_release_tolerates_ttl_reaped_reservation() -> N
         assert orphaned.accepted is True
         assert orphaned.record is not None
         clock.value = datetime(2026, 1, 1, 12, 1, tzinfo=UTC)
-        recovered = await ledger.reserve(
+        recovered = await _reserve(
+            ledger,
             limit=limit,
             session_id="sess_recovered",
             agent_name="assistant",
@@ -1881,7 +1931,8 @@ def test_in_memory_budget_ledger_reservation_ttl_none_disables_reap() -> None:
         clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
         ledger = InMemoryBudgetLedger(clock=clock, reservation_ttl_seconds=None)
         limit = _reservation_budget_limit(max_cost="0.25")
-        first = await ledger.reserve(
+        first = await _reserve(
+            ledger,
             limit=limit,
             session_id="sess_1",
             agent_name="assistant",
@@ -1890,7 +1941,8 @@ def test_in_memory_budget_ledger_reservation_ttl_none_disables_reap() -> None:
         )
         assert first.accepted is True
         clock.value = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
-        blocked = await ledger.reserve(
+        blocked = await _reserve(
+            ledger,
             limit=limit,
             session_id="sess_2",
             agent_name="assistant",
@@ -1922,7 +1974,8 @@ def test_sqlite_budget_ledger_reaps_expired_active_reservations(tmp_path) -> Non
         )
         try:
             limit = _reservation_budget_limit(max_cost="0.25")
-            orphaned = await ledger.reserve(
+            orphaned = await _reserve(
+                ledger,
                 limit=limit,
                 session_id="sess_orphaned",
                 agent_name="assistant",
@@ -1932,7 +1985,8 @@ def test_sqlite_budget_ledger_reaps_expired_active_reservations(tmp_path) -> Non
             assert orphaned.accepted is True
             assert orphaned.record is not None
             clock.value = datetime(2026, 1, 1, 12, 1, tzinfo=UTC)
-            recovered = await ledger.reserve(
+            recovered = await _reserve(
+                ledger,
                 limit=limit,
                 session_id="sess_recovered",
                 agent_name="assistant",
@@ -1967,7 +2021,8 @@ def test_sqlite_budget_ledger_heartbeat_keeps_live_reservation_active(tmp_path) 
         )
         try:
             limit = _reservation_budget_limit(max_cost="0.25")
-            first = await ledger.reserve(
+            first = await _reserve(
+                ledger,
                 limit=limit,
                 session_id="sess_live",
                 agent_name="assistant",
@@ -1978,7 +2033,8 @@ def test_sqlite_budget_ledger_heartbeat_keeps_live_reservation_active(tmp_path) 
             clock.value = datetime(2026, 1, 1, 12, 0, 30, tzinfo=UTC)
             assert await ledger.heartbeat(reservation_id=first.record.reservation_id) is True
             clock.value = datetime(2026, 1, 1, 12, 1, 1, tzinfo=UTC)
-            blocked = await ledger.reserve(
+            blocked = await _reserve(
+                ledger,
                 limit=limit,
                 session_id="sess_blocked",
                 agent_name="assistant",
@@ -1987,7 +2043,8 @@ def test_sqlite_budget_ledger_heartbeat_keeps_live_reservation_active(tmp_path) 
             )
             clock.value = datetime(2026, 1, 1, 12, 1, 30, tzinfo=UTC)
             late_heartbeat = await ledger.heartbeat(reservation_id=first.record.reservation_id)
-            recovered = await ledger.reserve(
+            recovered = await _reserve(
+                ledger,
                 limit=limit,
                 session_id="sess_recovered",
                 agent_name="assistant",
@@ -2015,7 +2072,8 @@ def test_sqlite_budget_ledger_release_tolerates_ttl_reaped_reservation(tmp_path)
         )
         try:
             limit = _reservation_budget_limit(max_cost="0.25")
-            orphaned = await ledger.reserve(
+            orphaned = await _reserve(
+                ledger,
                 limit=limit,
                 session_id="sess_orphaned",
                 agent_name="assistant",
@@ -2025,7 +2083,8 @@ def test_sqlite_budget_ledger_release_tolerates_ttl_reaped_reservation(tmp_path)
             assert orphaned.accepted is True
             assert orphaned.record is not None
             clock.value = datetime(2026, 1, 1, 12, 1, tzinfo=UTC)
-            recovered = await ledger.reserve(
+            recovered = await _reserve(
+                ledger,
                 limit=limit,
                 session_id="sess_recovered",
                 agent_name="assistant",
@@ -2113,7 +2172,8 @@ def test_sqlite_budget_ledger_preserves_bedrock_identity_across_reopen(tmp_path)
     async def run():
         first = SQLiteBudgetLedger(path)
         try:
-            reserved = await first.reserve(
+            reserved = await _reserve(
+                first,
                 limit=limit,
                 session_id="sess_bedrock",
                 agent_name="assistant",
@@ -2146,7 +2206,9 @@ def test_sqlite_budget_ledger_preserves_bedrock_identity_across_reopen(tmp_path)
     assert reconciled.actual_amount == Decimal("9")
 
 
-def test_sqlite_budget_ledger_revisions_21_and_23_add_identity_columns(tmp_path) -> None:
+def test_sqlite_budget_ledger_revisions_21_through_24_add_identity_columns(
+    tmp_path,
+) -> None:
     path = tmp_path / "bedrock-budget-migration.sqlite"
 
     async def create_current_schema() -> None:
@@ -2156,7 +2218,10 @@ def test_sqlite_budget_ledger_revisions_21_and_23_add_identity_columns(tmp_path)
     asyncio.run(create_current_schema())
     connection = sqlite3.connect(path)
     try:
+        connection.execute("DROP INDEX IF EXISTS idx_cayu_budget_reservations_model_attempt")
         connection.execute("DROP INDEX IF EXISTS idx_cayu_budget_reservations_limit")
+        connection.execute("ALTER TABLE cayu_budget_reservations DROP COLUMN model_attempt_id")
+        connection.execute("ALTER TABLE cayu_budget_reservations DROP COLUMN model_step_id")
         connection.execute("ALTER TABLE cayu_budget_reservations DROP COLUMN budget_limit_id")
         connection.execute("ALTER TABLE cayu_budget_reservations DROP COLUMN billing_identity_json")
         connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 21")
@@ -2165,7 +2230,7 @@ def test_sqlite_budget_ledger_revisions_21_and_23_add_identity_columns(tmp_path)
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 23"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 24"):
         SQLiteBudgetLedger(path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
     async def migrate() -> None:
@@ -2186,11 +2251,74 @@ def test_sqlite_budget_ledger_revisions_21_and_23_add_identity_columns(tmp_path)
         connection.close()
     assert "billing_identity_json" in columns
     assert "budget_limit_id" in columns
+    assert "model_step_id" in columns
+    assert "model_attempt_id" in columns
     assert revisions == [
         (21, "breaking", 21),
         (22, "breaking", 22),
         (23, "breaking", 23),
+        (24, "breaking", 24),
     ]
+
+
+def test_sqlite_budget_ledger_revision_24_does_not_infer_legacy_attempt_identity(
+    tmp_path,
+) -> None:
+    path = tmp_path / "budget-attempt-identity-migration.sqlite"
+
+    async def create_reservation() -> str:
+        ledger = SQLiteBudgetLedger(path)
+        try:
+            result = await _reserve(
+                ledger,
+                limit=_reservation_budget_limit(max_cost="0.25"),
+                session_id="sess_legacy_attempt",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            assert result.record is not None
+            return result.record.reservation_id
+        finally:
+            await ledger.close()
+
+    reservation_id = asyncio.run(create_reservation())
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "UPDATE cayu_budget_reservations "
+            "SET model_step_id = NULL, model_attempt_id = NULL "
+            "WHERE reservation_id = ?",
+            (reservation_id,),
+        )
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 24")
+        connection.execute("PRAGMA user_version = 23")
+        connection.commit()
+    finally:
+        connection.close()
+
+    async def migrate_and_reconcile() -> None:
+        ledger = SQLiteBudgetLedger(path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
+        try:
+            with pytest.raises(RuntimeError, match="predates durable model-attempt identity"):
+                await ledger.reconcile(
+                    reservation_id=reservation_id,
+                    actual_amount=Decimal("0.01"),
+                )
+        finally:
+            await ledger.close()
+
+    asyncio.run(migrate_and_reconcile())
+    connection = sqlite3.connect(path)
+    try:
+        row = connection.execute(
+            "SELECT model_step_id, model_attempt_id, status "
+            "FROM cayu_budget_reservations WHERE reservation_id = ?",
+            (reservation_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row == (None, None, "active")
 
 
 def test_sqlite_budget_ledger_migrates_legacy_unprefixed_table(tmp_path) -> None:
@@ -2235,7 +2363,8 @@ def test_sqlite_budget_ledger_migrates_legacy_unprefixed_table(tmp_path) -> None
         try:
             limit = _reservation_budget_limit(max_cost="0.25")
             with pytest.raises(RuntimeError, match="pre-identity reservations"):
-                await ledger.reserve(
+                await _reserve(
+                    ledger,
                     limit=limit,
                     session_id="sess_1",
                     agent_name="assistant",

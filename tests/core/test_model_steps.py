@@ -12,6 +12,7 @@ from cayu.providers import (
     normalize_model_completion,
 )
 from cayu.runtime._runtime_records import ToolCallRequest
+from cayu.runtime.execution_units import new_model_step_identity
 from cayu.runtime.model_steps import (
     AssistantStepResult,
     StepClassificationType,
@@ -31,9 +32,12 @@ def _step_result(
     if message is not None:
         text_content = "".join(part.text for part in message.content if type(part) is TextPart)
         provider_state_count = sum(1 for part in message.content if type(part) is ProviderStatePart)
+    model_attempt_identity = new_model_step_identity().new_attempt()
     return AssistantStepResult(
         session_id="sess_1",
         step=1,
+        model_step_id=model_attempt_identity.model_step_id,
+        model_attempt_id=model_attempt_identity.model_attempt_id,
         assistant_message=message,
         tool_calls=[] if tool_calls is None else tool_calls,
         completion=ModelCompletion(finish_reason=finish_reason, end_turn=end_turn),

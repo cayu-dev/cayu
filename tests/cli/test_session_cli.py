@@ -26,6 +26,13 @@ def _budget_limit_id(value: int) -> str:
     return f"blim_{value:064x}"
 
 
+def _model_attempt_identity(value: int) -> dict[str, str]:
+    return {
+        "model_step_id": f"mstep_{value:032x}",
+        "model_attempt_id": f"matt_{value:032x}",
+    }
+
+
 def _write_project(root: Path, database: str = "data/cayu.db") -> Path:
     (root / "pyproject.toml").write_text(
         """
@@ -499,6 +506,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                 ):
                     reservation_id = f"{session_id}-reservation-{index}"
                     budget_limit_id = _budget_limit_id(index)
+                    attempt_identity = _model_attempt_identity(index)
                     await store.append_event(
                         session_id,
                         Event(
@@ -507,6 +515,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                             payload={
                                 "reservation_id": reservation_id,
                                 "budget_limit_id": budget_limit_id,
+                                **attempt_identity,
                                 "scope": "session",
                                 "key": session_id,
                                 "window": "lifetime",
@@ -525,6 +534,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                             payload={
                                 "reservation_id": reservation_id,
                                 "budget_limit_id": budget_limit_id,
+                                **attempt_identity,
                                 "actual_amount": "0.25",
                                 **(
                                     {"pricing": {"provider_name": "fake", "model": "model"}}
@@ -542,6 +552,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                 budget_limit_id = _budget_limit_id(1)
                 for index in (1, 2):
                     reservation_id = f"{session_id}-reservation-{index}"
+                    attempt_identity = _model_attempt_identity(index)
                     await store.append_event(
                         session_id,
                         Event(
@@ -550,6 +561,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                             payload={
                                 "reservation_id": reservation_id,
                                 "budget_limit_id": budget_limit_id,
+                                **attempt_identity,
                                 "scope": "session",
                                 "key": session_id,
                                 "window": "lifetime",
@@ -569,6 +581,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                                 payload={
                                     "reservation_id": reservation_id,
                                     "budget_limit_id": budget_limit_id,
+                                    **attempt_identity,
                                     "actual_amount": "0.25",
                                     "pricing": {
                                         "provider_name": "fake",
@@ -586,10 +599,12 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                                 payload={
                                     "reservation_id": reservation_id,
                                     "budget_limit_id": budget_limit_id,
+                                    **attempt_identity,
                                 },
                             ),
                         )
 
+            parallel_attempt_identity = _model_attempt_identity(1)
             for index, scope in enumerate(("app", "agent"), start=1):
                 reservation_id = f"sess_parallel_limits-{scope}"
                 budget_limit_id = _budget_limit_id(index)
@@ -601,6 +616,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                         payload={
                             "reservation_id": reservation_id,
                             "budget_limit_id": budget_limit_id,
+                            **parallel_attempt_identity,
                             "scope": scope,
                             "key": "runtime" if scope == "app" else "operator",
                             "window": "lifetime",
@@ -619,6 +635,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                         payload={
                             "reservation_id": reservation_id,
                             "budget_limit_id": budget_limit_id,
+                            **parallel_attempt_identity,
                             "actual_amount": "0.25",
                             "pricing": {"provider_name": "fake", "model": "model"},
                         },
@@ -633,6 +650,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                     payload={
                         "reservation_id": "sess_unpriced_cost-reservation",
                         "budget_limit_id": _budget_limit_id(1),
+                        **_model_attempt_identity(1),
                         "scope": "session",
                         "key": "sess_unpriced_cost",
                         "window": "lifetime",
@@ -651,6 +669,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                     payload={
                         "accepted": False,
                         "budget_limit_id": _budget_limit_id(1),
+                        **_model_attempt_identity(1),
                         "scope": "session",
                         "key": "sess_failed_reservation_cost",
                         "window": "lifetime",
@@ -669,6 +688,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                     payload={
                         "reservation_id": "sess_unpriced_cost-reservation",
                         "budget_limit_id": _budget_limit_id(1),
+                        **_model_attempt_identity(1),
                         "actual_amount": "0.25",
                     },
                 ),

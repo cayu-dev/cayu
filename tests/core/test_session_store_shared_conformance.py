@@ -22,6 +22,7 @@ from cayu.core import AgentSpec, Event, EventType, Message, ToolCallPart
 from cayu.core.billing import BillingIdentity
 from cayu.providers import (
     ModelProvider,
+    ModelRequest,
     ModelStreamEvent,
     UsageDialect,
     bedrock_billing_identity,
@@ -38,6 +39,7 @@ from cayu.runtime import (
     EventQuery,
     InMemorySessionStore,
     McpManifestBaseline,
+    ModelCompactor,
     PersistedEventSideEffectClaimLost,
     PersistedEventSideEffectStatus,
     ResolutionActor,
@@ -162,26 +164,40 @@ class _ConformanceCompactor(ContextCompactor):
 
 class _ConformanceOverlappingCompactor(ContextCompactor):
     def __init__(self) -> None:
+        self.provider = _ConformanceOverlappingCompactionProvider()
+        self.started = self.provider.started
+        self.release = self.provider.release
+        self.calls = 0
+
+    async def compact(self, request: CompactionRequest) -> CompactionResult:
+        self.calls += 1
+        return await ModelCompactor(
+            provider=self.provider,
+            model="summary-model",
+            max_input_chars=100_000,
+        ).compact(request)
+
+
+class _ConformanceOverlappingCompactionProvider(ModelProvider):
+    name = "overlap-compactor"
+
+    def __init__(self) -> None:
         self.started = [asyncio.Event(), asyncio.Event()]
         self.release = [asyncio.Event(), asyncio.Event()]
         self.calls = 0
 
-    async def compact(self, request: CompactionRequest) -> CompactionResult:
+    async def stream(self, request: ModelRequest):
+        del request
         call = self.calls
         self.calls += 1
         self.started[call].set()
         await self.release[call].wait()
-        return CompactionResult(
-            summary=_summary_with_existing(request, f"summary from attempt {call + 1}"),
-            covered_message_count=len(request.messages),
-            represented_existing_summary_sha256=(_represented_existing_summary_sha256(request)),
-            model_completed_payloads=[
-                {
-                    "provider_name": "overlap-compactor",
-                    "model": "summary-model",
-                    "usage": {"input_tokens": call + 1, "output_tokens": 1},
-                }
-            ],
+        yield ModelStreamEvent.text_delta(f"summary from attempt {call + 1}")
+        yield ModelStreamEvent.completed(
+            {
+                "model": "summary-model",
+                "usage": {"input_tokens": call + 1, "output_tokens": 1},
+            }
         )
 
 

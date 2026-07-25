@@ -6,6 +6,7 @@ from enum import StrEnum
 from cayu.core.messages import Message, MessageRole, ProviderStatePart, TextPart, ThinkingPart
 from cayu.providers import ModelCompletion, ModelFinishReason
 from cayu.runtime._runtime_records import ToolCallRequest
+from cayu.runtime.execution_units import ModelAttemptIdentity
 
 
 class StepClassificationType(StrEnum):
@@ -22,6 +23,8 @@ class StepClassificationType(StrEnum):
 class AssistantStepResult:
     session_id: str
     step: int
+    model_step_id: str
+    model_attempt_id: str
     assistant_message: Message | None
     tool_calls: list[ToolCallRequest]
     completion: ModelCompletion
@@ -29,6 +32,12 @@ class AssistantStepResult:
     has_user_visible_content: bool
     provider_state_count: int
     thinking_count: int = 0
+
+    def __post_init__(self) -> None:
+        ModelAttemptIdentity(
+            model_step_id=self.model_step_id,
+            model_attempt_id=self.model_attempt_id,
+        )
 
 
 @dataclass(frozen=True)

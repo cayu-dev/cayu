@@ -635,6 +635,7 @@ _MIGRATION_STEPS: dict[int, str] = {
 
     """,
     23: "",
+    24: "",
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -860,6 +861,31 @@ def _add_budget_limit_identity_if_present(connection: sqlite3.Connection) -> Non
         )
 
 
+def _add_budget_model_attempt_identity_if_present(connection: sqlite3.Connection) -> None:
+    """Add revision-24 linkage without guessing identities for legacy rows."""
+
+    exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cayu_budget_reservations'"
+    ).fetchone()
+    if exists is not None:
+        _add_column_if_missing(
+            connection,
+            "cayu_budget_reservations",
+            "model_step_id",
+            "TEXT",
+        )
+        _add_column_if_missing(
+            connection,
+            "cayu_budget_reservations",
+            "model_attempt_id",
+            "TEXT",
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cayu_budget_reservations_model_attempt "
+            "ON cayu_budget_reservations(model_attempt_id, budget_limit_id, status)"
+        )
+
+
 # Per-revision Python follow-ups that cannot be expressed as unconditional DDL
 # (e.g. conditionally carrying data out of a legacy ad-hoc table). Each hook runs
 # after its revision's DDL and before the revision is recorded.
@@ -868,6 +894,7 @@ _MIGRATION_HOOKS: dict[int, Callable[[sqlite3.Connection], None]] = {
     14: _backfill_session_activity,
     21: _add_budget_billing_identity_if_present,
     23: _add_budget_limit_identity_if_present,
+    24: _add_budget_model_attempt_identity_if_present,
 }
 
 _REVISION_17_INDEX_NAMES = frozenset(

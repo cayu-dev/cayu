@@ -14,7 +14,7 @@ import contextlib
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, cast
 from uuid import uuid4
 
@@ -135,6 +135,7 @@ from cayu.runtime.context import (
     _automatic_compaction_runner_scope,
     _AutomaticCompactionRunner,
     _compaction_completion_publisher_scope,
+    _compaction_model_attempt_identity_scope,
     _context_secret_redactor_scope,
     _defer_billing_identity_cancellation_scope,
     context_build_termination_compaction_telemetry,
@@ -147,6 +148,12 @@ from cayu.runtime.context import (
     sanitize_context_compaction_telemetry,
 )
 from cayu.runtime.context_counting import ContextCountingConfig, ContextCountingMode
+from cayu.runtime.execution_units import (
+    ModelAttemptIdentity,
+    ModelStepIdentity,
+    copy_model_attempt_identity,
+    copy_model_step_identity,
+)
 from cayu.runtime.model_steps import (
     AssistantStepResult,
     assistant_text_content,
@@ -226,6 +233,114 @@ class _ModelStreamBoundaryValue:
 class _ContextPressureObservation:
     estimate: ContextPressureEstimate
     observation_id: str
+
+
+@dataclass
+class _CompactionExecutionIdentityLedger:
+    """Bind internal compaction evidence to pre-dispatch runtime identities."""
+
+    model_step_identity: ModelStepIdentity
+    active_model_attempt_identity: ModelAttemptIdentity | None = None
+    model_attempts_by_compaction_id: dict[str, ModelAttemptIdentity] = field(default_factory=dict)
+    compaction_ids_by_model_attempt_id: dict[str, str] = field(default_factory=dict)
+    issued_model_attempts_by_id: dict[str, ModelAttemptIdentity] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.model_step_identity = copy_model_step_identity(self.model_step_identity)
+
+    def begin_dispatch(self) -> ModelAttemptIdentity:
+        if self.active_model_attempt_identity is not None:
+            raise RuntimeError("Compaction provider dispatches cannot overlap.")
+        identity = self.model_step_identity.new_attempt()
+        self.active_model_attempt_identity = identity
+        self.issued_model_attempts_by_id[identity.model_attempt_id] = identity
+        return copy_model_attempt_identity(identity)
+
+    def end_dispatch(self, identity: ModelAttemptIdentity) -> None:
+        identity = copy_model_attempt_identity(identity)
+        if self.active_model_attempt_identity != identity:
+            raise RuntimeError("Compaction provider dispatch identity was not active.")
+        self.active_model_attempt_identity = None
+
+    def identify_payloads(
+        self,
+        payloads: list[dict[str, Any]],
+        *,
+        expected_identity: ModelAttemptIdentity | None = None,
+    ) -> list[dict[str, Any]]:
+        expected = (
+            None if expected_identity is None else copy_model_attempt_identity(expected_identity)
+        )
+        identified_payloads: list[dict[str, Any]] = []
+        for raw_payload in payloads:
+            payload = copy_durable_json_object(
+                raw_payload,
+                "compaction_model_completed_payload",
+            )
+            compaction_id = payload.get(_COMPACTION_ATTEMPT_ID_KEY)
+            if type(compaction_id) is not str:
+                raise RuntimeError("Compaction completion evidence lost its attempt identity.")
+            identity = self.model_attempts_by_compaction_id.get(compaction_id)
+            candidate = expected or self.active_model_attempt_identity
+            payload_identity: ModelAttemptIdentity | None = None
+            if "model_step_id" in payload or "model_attempt_id" in payload:
+                try:
+                    payload_identity = ModelAttemptIdentity.model_validate(
+                        {
+                            "model_step_id": payload.get("model_step_id"),
+                            "model_attempt_id": payload.get("model_attempt_id"),
+                        }
+                    )
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        "Compaction completion carries an invalid model attempt identity."
+                    ) from None
+                issued_identity = self.issued_model_attempts_by_id.get(
+                    payload_identity.model_attempt_id
+                )
+                if issued_identity != payload_identity:
+                    raise ValueError(
+                        "Compaction completion carries a model attempt identity that "
+                        "was not issued for this logical step."
+                    )
+            if (
+                candidate is not None
+                and payload_identity is not None
+                and candidate != payload_identity
+            ):
+                raise ValueError(
+                    "Compaction completion identity conflicts with its provider dispatch."
+                )
+            candidate = candidate or payload_identity
+            if identity is None:
+                if candidate is None:
+                    raise RuntimeError(
+                        "Compaction completion was observed outside its provider dispatch."
+                    )
+                existing_compaction_id = self.compaction_ids_by_model_attempt_id.get(
+                    candidate.model_attempt_id
+                )
+                if existing_compaction_id is not None and existing_compaction_id != compaction_id:
+                    raise ValueError(
+                        "Compaction provider dispatch produced conflicting completion identities."
+                    )
+                identity = copy_model_attempt_identity(candidate)
+                self.model_attempts_by_compaction_id[compaction_id] = identity
+            elif candidate is not None and identity != candidate:
+                raise ValueError(
+                    "Compaction completion identity conflicts with its provider dispatch."
+                )
+            existing_compaction_id = self.compaction_ids_by_model_attempt_id.setdefault(
+                identity.model_attempt_id,
+                compaction_id,
+            )
+            if existing_compaction_id != compaction_id:
+                raise ValueError(
+                    "Compaction provider dispatch produced conflicting completion identities."
+                )
+            payload.update(identity.payload())
+            identified_payloads.append(payload)
+        return identified_payloads
 
 
 @dataclass(frozen=True)
@@ -599,25 +714,47 @@ class ModelStepExecutor:
         registered_provider: runtime_records.RegisteredProvider,
         environment_name: str | None,
         step: int,
+        model_step_identity: ModelStepIdentity,
+        initial_model_attempt_identity: ModelAttemptIdentity | None,
         retry_policy: RetryPolicy,
         transcript_cursor_before_request: int,
         record_model_completion: Callable[[Event], None],
         prepare_provider_dispatch: Callable[
-            [], Awaitable[tuple[list[Event], BudgetReservationResult | None, Exception | None]]
+            [ModelAttemptIdentity],
+            Awaitable[tuple[list[Event], BudgetReservationResult | None, Exception | None]],
         ],
-        before_provider_dispatch: Callable[[], Awaitable[None]],
+        before_provider_dispatch: Callable[[ModelAttemptIdentity], Awaitable[None]],
+        record_model_attempt_identity: Callable[[ModelAttemptIdentity], None],
         billing_identity: BillingIdentity | None = None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         retry_policy = copy_retry_policy(retry_policy)
+        model_step_identity = copy_model_step_identity(model_step_identity)
+        next_model_attempt_identity = (
+            None
+            if initial_model_attempt_identity is None
+            else copy_model_attempt_identity(initial_model_attempt_identity)
+        )
+        if (
+            next_model_attempt_identity is not None
+            and next_model_attempt_identity.model_step_id != model_step_identity.model_step_id
+        ):
+            raise ValueError("Initial model attempt belongs to a different logical step.")
         attempt = 1
         prior_retry_failure: ModelAttemptFailed | None = None
         while True:
+            model_attempt_identity = (
+                model_step_identity.new_attempt()
+                if next_model_attempt_identity is None
+                else next_model_attempt_identity
+            )
+            next_model_attempt_identity = None
+            record_model_attempt_identity(copy_model_attempt_identity(model_attempt_identity))
             try:
                 (
                     reservation_events,
                     reservation_failure,
                     preparation_error,
-                ) = await prepare_provider_dispatch()
+                ) = await prepare_provider_dispatch(model_attempt_identity)
             except Exception as accounting_exc:
                 reservation_events = []
                 reservation_failure = None
@@ -657,6 +794,7 @@ class ModelStepExecutor:
                 step=step,
                 attempt=attempt,
                 max_attempts=retry_policy.max_attempts,
+                model_attempt_identity=model_attempt_identity,
             )
             if context_pressure_event is not None:
                 yield context_pressure_event, None
@@ -670,6 +808,7 @@ class ModelStepExecutor:
                 step=step,
                 attempt=attempt,
                 max_attempts=retry_policy.max_attempts,
+                model_attempt_identity=model_attempt_identity,
             )
             if context_count_event is not None:
                 yield context_count_event, None
@@ -685,6 +824,7 @@ class ModelStepExecutor:
                             "step": step,
                             "attempt": attempt,
                             "max_attempts": retry_policy.max_attempts,
+                            **model_attempt_identity.payload(),
                         },
                         environment_name=environment_name,
                     )
@@ -701,6 +841,7 @@ class ModelStepExecutor:
                 step=step,
                 attempt=attempt,
                 max_attempts=retry_policy.max_attempts,
+                model_attempt_identity=model_attempt_identity,
                 transcript_cursor_before_request=transcript_cursor_before_request,
                 before_provider_dispatch=before_provider_dispatch,
                 billing_identity=billing_identity,
@@ -728,6 +869,7 @@ class ModelStepExecutor:
                                         step=step,
                                         attempt=attempt,
                                         max_attempts=retry_policy.max_attempts,
+                                        model_attempt_identity=model_attempt_identity,
                                     )
                                 ),
                                 None,
@@ -748,6 +890,7 @@ class ModelStepExecutor:
                                         step=step,
                                         attempt=attempt,
                                         max_attempts=retry_policy.max_attempts,
+                                        model_attempt_identity=model_attempt_identity,
                                     )
                                 ),
                                 None,
@@ -781,6 +924,7 @@ class ModelStepExecutor:
                                     step=step,
                                     attempt=attempt,
                                     max_attempts=retry_policy.max_attempts,
+                                    model_attempt_identity=model_attempt_identity,
                                 ),
                             )
                         ),
@@ -800,6 +944,7 @@ class ModelStepExecutor:
                             step=step,
                             decision=decision,
                             error=exc.message,
+                            model_attempt_identity=model_attempt_identity,
                         )
                     ),
                     None,
@@ -813,6 +958,7 @@ class ModelStepExecutor:
                             registered_provider=registered_provider,
                             step=step,
                             decision=decision,
+                            model_attempt_identity=model_attempt_identity,
                         )
                     ),
                     None,
@@ -834,6 +980,7 @@ class ModelStepExecutor:
         step: int,
         attempt: int,
         max_attempts: int,
+        model_attempt_identity: ModelAttemptIdentity,
     ) -> tuple[_ContextPressureObservation | None, Event | None]:
         if self._context_counting.mode == ContextCountingMode.OFF:
             return None, None
@@ -866,6 +1013,7 @@ class ModelStepExecutor:
                         attempt=attempt,
                         max_attempts=max_attempts,
                         observation_id=observation_id,
+                        model_attempt_identity=model_attempt_identity,
                     ),
                     "estimate": estimate.model_dump(mode="json"),
                 },
@@ -885,6 +1033,7 @@ class ModelStepExecutor:
         step: int,
         attempt: int,
         max_attempts: int,
+        model_attempt_identity: ModelAttemptIdentity,
     ) -> tuple[_ContextCountObservation | None, Event | None]:
         if self._context_counting.mode == ContextCountingMode.OFF:
             return None, None
@@ -896,6 +1045,7 @@ class ModelStepExecutor:
             attempt=attempt,
             max_attempts=max_attempts,
             observation_id=observation_id,
+            model_attempt_identity=model_attempt_identity,
         )
         try:
             provider_result = await provider.count_input_tokens(
@@ -977,8 +1127,9 @@ class ModelStepExecutor:
         step: int,
         attempt: int,
         max_attempts: int,
+        model_attempt_identity: ModelAttemptIdentity,
         transcript_cursor_before_request: int,
-        before_provider_dispatch: Callable[[], Awaitable[None]],
+        before_provider_dispatch: Callable[[ModelAttemptIdentity], Awaitable[None]],
         billing_identity: BillingIdentity | None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         assistant_parts: list[
@@ -1010,7 +1161,8 @@ class ModelStepExecutor:
         interrupt_poll = self._session_control.stream_interrupt_poll(session.id)
         # This is the accounting boundary: after the callback returns, the next
         # expression enters provider-controlled code and billable work may occur.
-        await before_provider_dispatch()
+        model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
+        await before_provider_dispatch(model_attempt_identity)
         provider_events: AsyncIterator[ModelStreamEvent] | None = None
         provider_exhausted = False
         durable_stream_failure: ModelAttemptFailed | None = None
@@ -1137,6 +1289,7 @@ class ModelStepExecutor:
                         step_result = _assistant_step_result(
                             session_id=session.id,
                             step=step,
+                            model_attempt_identity=model_attempt_identity,
                             assistant_message=assistant_message,
                             tool_calls=tool_calls,
                             completion=_stream_event_completion(completed_stream_event),
@@ -1151,6 +1304,7 @@ class ModelStepExecutor:
                         step=step,
                         attempt=attempt,
                         max_attempts=max_attempts,
+                        model_attempt_identity=model_attempt_identity,
                         classification=(
                             classification.payload() if classification is not None else None
                         ),
@@ -1192,6 +1346,7 @@ class ModelStepExecutor:
                     step=step,
                     attempt=attempt,
                     max_attempts=max_attempts,
+                    model_attempt_identity=model_attempt_identity,
                     usage_dialect=registered_provider.usage_dialect,
                 )
                 emitted_event = await self._event_writer.emit(event)
@@ -1287,6 +1442,7 @@ class ModelStepExecutor:
                                 step=step,
                                 attempt=attempt,
                                 max_attempts=max_attempts,
+                                model_attempt_identity=model_attempt_identity,
                             ),
                         )
                     ),
@@ -1389,12 +1545,15 @@ class ModelStepRun:
         *,
         step: int,
         messages: list[Message],
+        model_step_identity: ModelStepIdentity,
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
+        model_step_identity = copy_model_step_identity(model_step_identity)
         context_messages: list[Message]
         compaction_budget_events: list[Event] = []
         published_compaction_attempt_ids: set[str] = set()
         compaction_start_events: list[Event] = []
         compaction_completion_events: dict[str, Event] = {}
+        compaction_identity_ledger = _CompactionExecutionIdentityLedger(model_step_identity)
 
         async def run_automatic_compaction(
             compactor: ContextCompactor,
@@ -1407,11 +1566,12 @@ class ModelStepRun:
                 compaction_started,
                 published_events=compaction_budget_events,
                 start_events=compaction_start_events,
+                model_step_identity=model_step_identity,
             )
 
             async def publish_completions(payloads: list[dict[str, Any]]) -> None:
                 await self._persist_automatic_compaction_completions(
-                    payloads,
+                    compaction_identity_ledger.identify_payloads(payloads),
                     published_attempt_ids=published_compaction_attempt_ids,
                     published_events=compaction_budget_events,
                     completion_events=compaction_completion_events,
@@ -1425,10 +1585,10 @@ class ModelStepRun:
                     completed_payloads=completed_payloads,
                     budget_events=compaction_budget_events,
                     messages=messages,
+                    model_step_identity=model_step_identity,
+                    compaction_identity_ledger=compaction_identity_ledger,
                 )
 
-            if not compactor._uses_runtime_provider_dispatch_runner_for_request(compaction_request):
-                return await run()
             with _compaction_completion_publisher_scope(publish_completions):
                 return await run()
 
@@ -1475,6 +1635,8 @@ class ModelStepRun:
                 context_failure_persistence,
             ) = await self._context_build_failure_events(
                 exc,
+                model_step_identity=model_step_identity,
+                compaction_identity_ledger=compaction_identity_ledger,
                 published_compaction_attempt_ids=published_compaction_attempt_ids,
                 compaction_completion_events=compaction_completion_events,
                 compaction_start_event=(
@@ -1515,6 +1677,8 @@ class ModelStepRun:
         except BaseException as exc:
             await self._persist_context_build_termination_events(
                 exc,
+                model_step_identity=model_step_identity,
+                compaction_identity_ledger=compaction_identity_ledger,
                 published_compaction_attempt_ids=published_compaction_attempt_ids,
                 compaction_completion_events=compaction_completion_events,
                 compaction_start_event=(
@@ -1529,6 +1693,8 @@ class ModelStepRun:
             raise
 
         context_success_events, context_success_persistence = await self._context_success_events(
+            model_step_identity=model_step_identity,
+            compaction_identity_ledger=compaction_identity_ledger,
             checkpoint_update=checkpoint_update,
             checkpoint_event_payload=checkpoint_event_payload,
             compaction_telemetry=context_compaction_telemetry,
@@ -1553,7 +1719,10 @@ class ModelStepRun:
 
         if _has_provider_backed_context_compaction(context_compaction_telemetry):
             should_stop: bool | None = None
-            gate_events = self._post_compaction_gate(messages=messages)
+            gate_events = self._post_compaction_gate(
+                messages=messages,
+                model_step_identity=model_step_identity,
+            )
             try:
                 async for event, gate_outcome in gate_events:
                     if event is not None:
@@ -1581,6 +1750,7 @@ class ModelStepRun:
             model_request=model_request,
             step=step,
             messages=messages,
+            model_step_identity=model_step_identity,
         )
         try:
             async for event, outcome in request_events:
@@ -1594,7 +1764,10 @@ class ModelStepRun:
         model_request: ModelRequest,
         step: int,
         messages: list[Message],
+        model_step_identity: ModelStepIdentity,
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
+        model_step_identity = copy_model_step_identity(model_step_identity)
+        initial_model_attempt_identity = model_step_identity.new_attempt()
         controller = self._executor._run_limit_controller
         try:
             billing_identity = await resolve_request_billing_identity(
@@ -1623,6 +1796,7 @@ class ModelStepRun:
                             step=step,
                             attempt=1,
                             max_attempts=self._retry_policy.max_attempts,
+                            model_attempt_identity=initial_model_attempt_identity,
                         ),
                     )
                 ),
@@ -1634,6 +1808,7 @@ class ModelStepRun:
             gate_events = self._billing_identity_budget_gate(
                 messages=messages,
                 billing_identity=billing_identity,
+                model_attempt_identity=initial_model_attempt_identity,
             )
             try:
                 async for event, gate_outcome in gate_events:
@@ -1653,6 +1828,7 @@ class ModelStepRun:
             agent_name=self._registered_agent.spec.name,
             provider_name=self._registered_provider.name,
             environment_name=self._environment_name,
+            model_attempt_identity=initial_model_attempt_identity,
             budget_policy=self._budget_policy,
             request_budget_limits=self._request_budget_limits,
             billing_identity=billing_identity,
@@ -1717,7 +1893,10 @@ class ModelStepRun:
                 raise
 
         lifecycle = BudgetModelStepLifecycle()
-        lifecycle.prepare_provider_dispatch(budget_reservations)
+        lifecycle.prepare_provider_dispatch(
+            initial_model_attempt_identity,
+            budget_reservations,
+        )
 
         async def settle_provider_dispatch() -> tuple[list[Event], Exception | None]:
             if lifecycle.pending_reservations is not None:
@@ -1737,12 +1916,18 @@ class ModelStepRun:
                 return settlement_events, settlement_error
             return settlement_events, None
 
-        async def prepare_provider_dispatch() -> tuple[
+        async def prepare_provider_dispatch(
+            model_attempt_identity: ModelAttemptIdentity,
+        ) -> tuple[
             list[Event],
             BudgetReservationResult | None,
             Exception | None,
         ]:
             if lifecycle.pending_reservations is not None:
+                if lifecycle.pending_model_attempt_identity != model_attempt_identity:
+                    raise ValueError(
+                        "Prepared provider dispatch has a different model attempt identity."
+                    )
                 return [], None, None
             settlement_events, settlement_error = await settle_provider_dispatch()
             if settlement_error is not None:
@@ -1752,6 +1937,7 @@ class ModelStepRun:
                 agent_name=self._registered_agent.spec.name,
                 provider_name=self._registered_provider.name,
                 environment_name=self._environment_name,
+                model_attempt_identity=model_attempt_identity,
                 budget_policy=self._budget_policy,
                 request_budget_limits=self._request_budget_limits,
                 billing_identity=billing_identity,
@@ -1762,13 +1948,19 @@ class ModelStepRun:
                 return settlement_events + list(retry_setup.events), retry_setup.failure, None
             retry_reservations = list(retry_setup.reservations)
             budget_reservations.extend(retry_reservations)
-            lifecycle.prepare_provider_dispatch(retry_reservations)
+            lifecycle.prepare_provider_dispatch(
+                model_attempt_identity,
+                retry_reservations,
+            )
             return settlement_events + list(retry_setup.events), None, None
 
-        async def before_provider_dispatch() -> None:
+        async def before_provider_dispatch(
+            model_attempt_identity: ModelAttemptIdentity,
+        ) -> None:
             await controller.before_provider_dispatch(
                 budget_reservations,
                 lifecycle=lifecycle,
+                model_attempt_identity=model_attempt_identity,
             )
 
         flow_outcome: ModelStepFlowOutcome | None = None
@@ -1777,6 +1969,8 @@ class ModelStepRun:
             model_request=model_request,
             messages=messages,
             step=step,
+            model_step_identity=model_step_identity,
+            initial_model_attempt_identity=initial_model_attempt_identity,
             transcript_cursor_before_request=len(messages),
             record_model_completion=lifecycle.record_model_completion,
             settle_provider_dispatch=settle_provider_dispatch,
@@ -1927,23 +2121,38 @@ class ModelStepRun:
         model_request: ModelRequest,
         messages: list[Message],
         step: int,
+        model_step_identity: ModelStepIdentity,
+        initial_model_attempt_identity: ModelAttemptIdentity,
         transcript_cursor_before_request: int,
         record_model_completion: Callable[[Event], None],
         settle_provider_dispatch: Callable[[], Awaitable[tuple[list[Event], Exception | None]]],
         prepare_provider_dispatch: Callable[
-            [], Awaitable[tuple[list[Event], BudgetReservationResult | None, Exception | None]]
+            [ModelAttemptIdentity],
+            Awaitable[tuple[list[Event], BudgetReservationResult | None, Exception | None]],
         ],
-        before_provider_dispatch: Callable[[], Awaitable[None]],
+        before_provider_dispatch: Callable[[ModelAttemptIdentity], Awaitable[None]],
         billing_identity: BillingIdentity | None,
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
+        model_step_identity = copy_model_step_identity(model_step_identity)
+        initial_model_attempt_identity = copy_model_attempt_identity(initial_model_attempt_identity)
+        if initial_model_attempt_identity.model_step_id != model_step_identity.model_step_id:
+            raise ValueError("Initial provider attempt belongs to a different model step.")
         overflow_policy = self._registered_agent.context_overflow_policy
         compaction_budget_events: list[Event] = []
         published_compaction_attempt_ids: set[str] = set()
         compaction_start_events: list[Event] = []
         compaction_completion_events: dict[str, Event] = {}
+        compaction_identity_ledger = _CompactionExecutionIdentityLedger(model_step_identity)
+        latest_model_attempt_identity: ModelAttemptIdentity | None = None
+
+        def record_model_attempt_identity(identity: ModelAttemptIdentity) -> None:
+            nonlocal latest_model_attempt_identity
+            latest_model_attempt_identity = copy_model_attempt_identity(identity)
 
         def run_attempt(
             request: ModelRequest,
+            *,
+            initial_identity: ModelAttemptIdentity | None = None,
         ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
             return self._executor.run_with_retries(
                 provider=provider,
@@ -1953,15 +2162,21 @@ class ModelStepRun:
                 registered_provider=self._registered_provider,
                 environment_name=self._environment_name,
                 step=step,
+                model_step_identity=model_step_identity,
+                initial_model_attempt_identity=initial_identity,
                 retry_policy=self._retry_policy,
                 transcript_cursor_before_request=transcript_cursor_before_request,
                 record_model_completion=record_model_completion,
                 prepare_provider_dispatch=prepare_provider_dispatch,
                 before_provider_dispatch=before_provider_dispatch,
+                record_model_attempt_identity=record_model_attempt_identity,
                 billing_identity=billing_identity,
             )
 
-        attempt_events = run_attempt(model_request)
+        attempt_events = run_attempt(
+            model_request,
+            initial_identity=initial_model_attempt_identity,
+        )
         try:
             try:
                 async for event, result in attempt_events:
@@ -1987,6 +2202,8 @@ class ModelStepRun:
                                 step=step,
                                 phase="initial",
                                 original_message_count=len(model_request.messages),
+                                model_step_identity=model_step_identity,
+                                model_attempt_identity=latest_model_attempt_identity,
                             ),
                         )
                     ),
@@ -2006,11 +2223,12 @@ class ModelStepRun:
                 compaction_started,
                 published_events=compaction_budget_events,
                 start_events=compaction_start_events,
+                model_step_identity=model_step_identity,
             )
 
             async def publish_completions(payloads: list[dict[str, Any]]) -> None:
                 await self._persist_automatic_compaction_completions(
-                    payloads,
+                    compaction_identity_ledger.identify_payloads(payloads),
                     published_attempt_ids=published_compaction_attempt_ids,
                     published_events=compaction_budget_events,
                     completion_events=compaction_completion_events,
@@ -2024,10 +2242,10 @@ class ModelStepRun:
                     completed_payloads=completed_payloads,
                     budget_events=compaction_budget_events,
                     messages=messages,
+                    model_step_identity=model_step_identity,
+                    compaction_identity_ledger=compaction_identity_ledger,
                 )
 
-            if not compactor._uses_runtime_provider_dispatch_runner_for_request(compaction_request):
-                return await run()
             with _compaction_completion_publisher_scope(publish_completions):
                 return await run()
 
@@ -2075,6 +2293,8 @@ class ModelStepRun:
                 context_failure_persistence,
             ) = await self._context_build_failure_events(
                 exc,
+                model_step_identity=model_step_identity,
+                compaction_identity_ledger=compaction_identity_ledger,
                 published_compaction_attempt_ids=published_compaction_attempt_ids,
                 compaction_completion_events=compaction_completion_events,
                 compaction_start_event=(
@@ -2134,6 +2354,7 @@ class ModelStepRun:
                             "error": str(exc.cause),
                             "error_type": type(exc.cause).__name__,
                             "policy": type(overflow_policy).__name__,
+                            **model_step_identity.payload(),
                         },
                     )
                 ),
@@ -2143,6 +2364,8 @@ class ModelStepRun:
         except BaseException as exc:
             await self._persist_context_build_termination_events(
                 exc,
+                model_step_identity=model_step_identity,
+                compaction_identity_ledger=compaction_identity_ledger,
                 published_compaction_attempt_ids=published_compaction_attempt_ids,
                 compaction_completion_events=compaction_completion_events,
                 compaction_start_event=(
@@ -2157,6 +2380,8 @@ class ModelStepRun:
             raise
 
         context_success_events, context_success_persistence = await self._context_success_events(
+            model_step_identity=model_step_identity,
+            compaction_identity_ledger=compaction_identity_ledger,
             checkpoint_update=checkpoint_update,
             checkpoint_event_payload=checkpoint_event_payload,
             compaction_telemetry=compaction_telemetry,
@@ -2185,7 +2410,10 @@ class ModelStepRun:
             if settlement_error is not None:
                 raise settlement_error
             should_stop: bool | None = None
-            gate_events = self._post_compaction_gate(messages=messages)
+            gate_events = self._post_compaction_gate(
+                messages=messages,
+                model_step_identity=model_step_identity,
+            )
             try:
                 async for event, gate_outcome in gate_events:
                     if event is not None:
@@ -2221,6 +2449,12 @@ class ModelStepRun:
                         "original_message_count": len(model_request.messages),
                         "recovery_message_count": len(recovery_request.messages),
                         "policy": type(overflow_policy).__name__,
+                        **model_step_identity.payload(),
+                        **(
+                            {}
+                            if latest_model_attempt_identity is None
+                            else latest_model_attempt_identity.payload()
+                        ),
                     },
                 )
             ),
@@ -2250,6 +2484,8 @@ class ModelStepRun:
                                 phase="recovery",
                                 original_message_count=len(model_request.messages),
                                 recovery_message_count=len(recovery_request.messages),
+                                model_step_identity=model_step_identity,
+                                model_attempt_identity=latest_model_attempt_identity,
                             ),
                         )
                     ),
@@ -2376,6 +2612,7 @@ class ModelStepRun:
         *,
         published_events: list[Event],
         start_events: list[Event],
+        model_step_identity: ModelStepIdentity,
     ) -> None:
         """Make the causal start durable before the first provider dispatch."""
 
@@ -2391,6 +2628,7 @@ class ModelStepRun:
                 session=self._session,
                 registered_agent=self._registered_agent,
                 environment_name=self._environment_name,
+                execution_identity=model_step_identity,
             )
             start_events.append(event.model_copy(deep=True))
         persistence_task = asyncio.create_task(
@@ -2502,6 +2740,17 @@ class ModelStepRun:
                 continue
             event = completion_events.get(attempt_id)
             if event is None:
+                try:
+                    execution_identity = ModelAttemptIdentity.model_validate(
+                        {
+                            "model_step_id": payload.get("model_step_id"),
+                            "model_attempt_id": payload.get("model_attempt_id"),
+                        }
+                    )
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        "Compaction completion carries an invalid model attempt identity."
+                    ) from None
                 event = _context_compaction_telemetry_event(
                     telemetry=ContextCompactionTelemetry(
                         event_type=EventType.MODEL_COMPLETED,
@@ -2510,6 +2759,7 @@ class ModelStepRun:
                     session=self._session,
                     registered_agent=self._registered_agent,
                     environment_name=self._environment_name,
+                    execution_identity=execution_identity,
                 )
                 completion_events[attempt_id] = event.model_copy(deep=True)
             pending.append(
@@ -2713,6 +2963,8 @@ class ModelStepRun:
     async def _persist_context_events(
         self,
         *,
+        model_step_identity: ModelStepIdentity,
+        compaction_identity_ledger: _CompactionExecutionIdentityLedger,
         compaction_telemetry: list[ContextCompactionTelemetry],
         knowledge_telemetry: list[ContextKnowledgeTelemetry],
         checkpoint_update: dict[str, Any] | None,
@@ -2725,6 +2977,7 @@ class ModelStepRun:
     ) -> tuple[list[Event], BaseException | None]:
         """Persist one context outcome completely before exposing its first event."""
 
+        model_step_identity = copy_model_step_identity(model_step_identity)
         reconciled_start_events: list[Event] = []
         compaction_start_durable = compaction_started_published
         if not compaction_start_durable and compaction_start_event is not None:
@@ -2774,11 +3027,27 @@ class ModelStepRun:
                 )
             )
             if event is None:
+                execution_identity: ModelStepIdentity | ModelAttemptIdentity = model_step_identity
+                if telemetry.event_type == EventType.MODEL_COMPLETED:
+                    identified_payload = compaction_identity_ledger.identify_payloads(
+                        [telemetry.payload]
+                    )[0]
+                    telemetry = ContextCompactionTelemetry(
+                        event_type=telemetry.event_type,
+                        payload=identified_payload,
+                    )
+                    execution_identity = ModelAttemptIdentity.model_validate(
+                        {
+                            "model_step_id": identified_payload.get("model_step_id"),
+                            "model_attempt_id": identified_payload.get("model_attempt_id"),
+                        }
+                    )
                 event = _context_compaction_telemetry_event(
                     telemetry=telemetry,
                     session=self._session,
                     registered_agent=self._registered_agent,
                     environment_name=self._environment_name,
+                    execution_identity=execution_identity,
                 )
                 if (
                     telemetry.event_type == EventType.MODEL_COMPLETED
@@ -2794,6 +3063,7 @@ class ModelStepRun:
                 session=self._session,
                 registered_agent=self._registered_agent,
                 environment_name=self._environment_name,
+                model_step_identity=model_step_identity,
             )
             for telemetry in knowledge_telemetry
         )
@@ -2818,7 +3088,10 @@ class ModelStepRun:
                 session_id=self._session.id,
                 agent_name=self._registered_agent.spec.name,
                 environment_name=self._environment_name,
-                payload=checkpoint_event_payload,
+                payload={
+                    **checkpoint_event_payload,
+                    **model_step_identity.payload(),
+                },
             )
             atomic_events = self._executor._event_writer.prepare_many(
                 [*prepared_events, checkpoint_event]
@@ -2915,12 +3188,16 @@ class ModelStepRun:
         self,
         error: ContextBuildError,
         *,
+        model_step_identity: ModelStepIdentity,
+        compaction_identity_ledger: _CompactionExecutionIdentityLedger,
         published_compaction_attempt_ids: set[str],
         compaction_completion_events: dict[str, Event],
         compaction_start_event: Event | None,
         compaction_started_published: bool,
     ) -> tuple[list[Event], BaseException | None]:
         return await self._persist_context_events(
+            model_step_identity=model_step_identity,
+            compaction_identity_ledger=compaction_identity_ledger,
             compaction_telemetry=list(error.compaction_telemetry),
             knowledge_telemetry=list(error.knowledge_telemetry),
             checkpoint_update=error.checkpoint,
@@ -2936,6 +3213,8 @@ class ModelStepRun:
         self,
         error: BaseException,
         *,
+        model_step_identity: ModelStepIdentity,
+        compaction_identity_ledger: _CompactionExecutionIdentityLedger,
         published_compaction_attempt_ids: set[str],
         compaction_completion_events: dict[str, Event],
         compaction_start_event: Event | None,
@@ -2944,6 +3223,7 @@ class ModelStepRun:
     ) -> None:
         """Persist completed compaction evidence without replacing a fatal signal."""
 
+        model_step_identity = copy_model_step_identity(model_step_identity)
         telemetry = context_build_termination_compaction_telemetry(error)
         compaction_start_durable = compaction_started_published
         if not compaction_start_durable and compaction_start_event is not None:
@@ -2997,26 +3277,48 @@ class ModelStepRun:
             return
 
         async def persist() -> None:
-            events = [
-                (
-                    compaction_completion_events[
-                        cast("str", item.payload.get(_COMPACTION_ATTEMPT_ID_KEY))
-                    ].model_copy(deep=True)
-                    if item.event_type == EventType.MODEL_COMPLETED
-                    and type(item.payload.get(_COMPACTION_ATTEMPT_ID_KEY)) is str
-                    and item.payload.get(_COMPACTION_ATTEMPT_ID_KEY) in compaction_completion_events
-                    else compaction_start_event.model_copy(deep=True)
-                    if item.event_type == EventType.CONTEXT_COMPACTION_STARTED
+            events: list[Event] = []
+            for item in unpublished_telemetry:
+                compaction_attempt_id = item.payload.get(_COMPACTION_ATTEMPT_ID_KEY)
+                if (
+                    item.event_type == EventType.MODEL_COMPLETED
+                    and type(compaction_attempt_id) is str
+                    and compaction_attempt_id in compaction_completion_events
+                ):
+                    events.append(
+                        compaction_completion_events[compaction_attempt_id].model_copy(deep=True)
+                    )
+                    continue
+                if (
+                    item.event_type == EventType.CONTEXT_COMPACTION_STARTED
                     and compaction_start_event is not None
-                    else _context_compaction_telemetry_event(
+                ):
+                    events.append(compaction_start_event.model_copy(deep=True))
+                    continue
+                execution_identity: ModelStepIdentity | ModelAttemptIdentity = model_step_identity
+                if item.event_type == EventType.MODEL_COMPLETED:
+                    identified_payload = compaction_identity_ledger.identify_payloads(
+                        [item.payload]
+                    )[0]
+                    item = ContextCompactionTelemetry(
+                        event_type=item.event_type,
+                        payload=identified_payload,
+                    )
+                    execution_identity = ModelAttemptIdentity.model_validate(
+                        {
+                            "model_step_id": identified_payload.get("model_step_id"),
+                            "model_attempt_id": identified_payload.get("model_attempt_id"),
+                        }
+                    )
+                events.append(
+                    _context_compaction_telemetry_event(
                         telemetry=item,
                         session=self._session,
                         registered_agent=self._registered_agent,
                         environment_name=self._environment_name,
+                        execution_identity=execution_identity,
                     )
                 )
-                for item in unpublished_telemetry
-            ]
             await self._emit_context_events_reconciling_late_start(
                 events,
                 compaction_start_event=compaction_start_event,
@@ -3073,6 +3375,8 @@ class ModelStepRun:
     async def _context_success_events(
         self,
         *,
+        model_step_identity: ModelStepIdentity,
+        compaction_identity_ledger: _CompactionExecutionIdentityLedger,
         checkpoint_update: dict[str, Any] | None,
         checkpoint_event_payload: dict[str, Any] | None,
         compaction_telemetry: list[ContextCompactionTelemetry],
@@ -3083,6 +3387,8 @@ class ModelStepRun:
         compaction_started_published: bool,
     ) -> tuple[list[Event], BaseException | None]:
         return await self._persist_context_events(
+            model_step_identity=model_step_identity,
+            compaction_identity_ledger=compaction_identity_ledger,
             compaction_telemetry=compaction_telemetry,
             knowledge_telemetry=knowledge_telemetry,
             checkpoint_update=checkpoint_update,
@@ -3097,8 +3403,13 @@ class ModelStepRun:
         self,
         *,
         messages: list[Message],
+        model_step_identity: ModelStepIdentity,
     ) -> AsyncIterator[tuple[Event | None, bool | None]]:
-        budget_evaluation = await self._limit_gate.evaluate_budget(self._budget_policy)
+        model_step_identity = copy_model_step_identity(model_step_identity)
+        budget_evaluation = await self._limit_gate.evaluate_budget(
+            self._budget_policy,
+            execution_identity=model_step_identity,
+        )
         request = ModelStepBudgetEvaluationRequest(
             evaluation=budget_evaluation,
             session=self._session,
@@ -3119,7 +3430,9 @@ class ModelStepRun:
         if budget_evaluation.check is not None:
             yield None, True
             return
-        limit_evaluation = await self._limit_gate.evaluate_limits()
+        limit_evaluation = await self._limit_gate.evaluate_limits(
+            execution_identity=model_step_identity,
+        )
         request = ModelStepLimitEvaluationRequest(
             evaluation=limit_evaluation,
             session=self._session,
@@ -3144,10 +3457,13 @@ class ModelStepRun:
         *,
         messages: list[Message],
         billing_identity: BillingIdentity | None,
+        model_attempt_identity: ModelAttemptIdentity,
     ) -> AsyncIterator[tuple[Event | None, bool | None]]:
+        model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
         budget_evaluation = await self._limit_gate.evaluate_budget(
             self._budget_policy,
             billing_identity_state=resolved_billing_identity(billing_identity),
+            execution_identity=model_attempt_identity,
         )
         request = ModelStepBudgetEvaluationRequest(
             evaluation=budget_evaluation,
@@ -3171,6 +3487,7 @@ class ModelStepRun:
             return
         limit_evaluation = await self._limit_gate.evaluate_limits(
             billing_identity_state=resolved_billing_identity(billing_identity),
+            execution_identity=model_attempt_identity,
         )
         request = ModelStepLimitEvaluationRequest(
             evaluation=limit_evaluation,
@@ -3265,7 +3582,13 @@ class ModelStepRun:
         completed_payloads: Callable[[], list[dict[str, Any]]],
         budget_events: list[Event],
         messages: list[Message],
+        model_step_identity: ModelStepIdentity,
+        compaction_identity_ledger: _CompactionExecutionIdentityLedger,
     ) -> CompactionResult:
+        del messages
+        model_step_identity = copy_model_step_identity(model_step_identity)
+        if compaction_identity_ledger.model_step_identity != model_step_identity:
+            raise ValueError("Compaction identity ledger belongs to a different model step.")
         controller = self._executor._run_limit_controller
         all_limits = controller.provider_budget_limits(
             session=self._session,
@@ -3273,8 +3596,7 @@ class ModelStepRun:
             budget_policy=self._budget_policy,
             request_budget_limits=self._request_budget_limits,
         )
-        if not all_limits and not self._limit_gate.has_run_limits():
-            return await execute()
+        has_accounting_limits = bool(all_limits) or self._limit_gate.has_run_limits()
         strict_contextual_candidates = tuple(
             limit
             for limit in all_limits
@@ -3282,9 +3604,35 @@ class ModelStepRun:
             and not limit.allow_unpriced
             and any(price.pricing_context is not None for price in limit.pricing.prices)
         )
+
+        async def run_identity_only_dispatch(
+            actual_pricing_provider_name: str,
+            actual_model: str,
+            actual_usage_dialect: UsageDialect,
+            billing_identity: BillingIdentity | None,
+            dispatch: Callable[[], Awaitable[tuple[str, dict[str, Any]]]],
+        ) -> tuple[str, dict[str, Any]]:
+            """Identify a built-in dispatch reached through an opaque wrapper."""
+
+            del (
+                actual_pricing_provider_name,
+                actual_model,
+                actual_usage_dialect,
+                billing_identity,
+            )
+            model_attempt_identity = compaction_identity_ledger.begin_dispatch()
+            try:
+                with _compaction_model_attempt_identity_scope(model_attempt_identity):
+                    return await dispatch()
+            finally:
+                compaction_identity_ledger.end_dispatch(model_attempt_identity)
+
         try:
             identity = compactor._provider_budget_identity_for_request(compaction_request)
         except NotImplementedError as exc:
+            if not has_accounting_limits:
+                with _automatic_compaction_dispatch_runner_scope(run_identity_only_dispatch):
+                    return await execute()
             raise RuntimeError(
                 "Automatic provider-backed compaction under run or budget limits requires the "
                 "ContextCompactor to declare provider_budget_identity(session), "
@@ -3299,7 +3647,8 @@ class ModelStepRun:
                     "Provider-backed compaction cannot declare a deterministic budget "
                     "identity under run or cost limits."
                 )
-            return await execute()
+            with _automatic_compaction_dispatch_runner_scope(run_identity_only_dispatch):
+                return await execute()
         if type(identity) is not tuple or len(identity) != 2:
             raise TypeError(
                 "ContextCompactor.provider_budget_identity must return a "
@@ -3327,14 +3676,19 @@ class ModelStepRun:
             for limit in all_limits
             if limit.reservation is not None or limit in contextual_limits
         )
-        if not uses_dispatch_boundary:
+        if not uses_dispatch_boundary and has_accounting_limits:
             raise RuntimeError(
-                "Automatic provider-backed compaction under run or budget limits cannot safely run "
-                f"opaque provider-backed compactor {type(compactor).__name__}: "
+                "Automatic provider-backed compaction under run or budget limits cannot "
+                f"safely run opaque provider-backed compactor {type(compactor).__name__}: "
                 "Cayu cannot admit each provider dispatch independently. Use an "
                 "unmodified built-in provider compactor or remove the applicable "
                 "run and budget limits."
             )
+        # A wrapper around a built-in compactor is opaque for admission: Cayu
+        # cannot prove that it exposes *every* provider call. When no accounting
+        # limit needs that proof, the inner runner below still identifies built-in
+        # calls reached through the wrapper. Custom completion payloads with no
+        # observed dispatch continue to fail closed.
 
         policy_limits = budget_limits_for_session(
             policy=self._budget_policy,
@@ -3370,74 +3724,89 @@ class ModelStepRun:
                 raise RuntimeError(
                     "Compaction dispatch model identity differs from its admitted identity."
                 )
+            model_attempt_identity = compaction_identity_ledger.begin_dispatch()
             before_count = len(completed_payloads())
+            try:
 
-            def completion_events(payloads: list[dict[str, Any]]) -> list[Event]:
-                return [
-                    Event(
-                        type=EventType.MODEL_COMPLETED,
-                        session_id=self._session.id,
-                        agent_name=self._registered_agent.spec.name,
-                        environment_name=self._environment_name,
-                        payload=payload,
+                async def identified_dispatch() -> tuple[str, dict[str, Any]]:
+                    with _compaction_model_attempt_identity_scope(model_attempt_identity):
+                        return await dispatch()
+
+                def completion_events(payloads: list[dict[str, Any]]) -> list[Event]:
+                    identified = compaction_identity_ledger.identify_payloads(
+                        payloads,
+                        expected_identity=model_attempt_identity,
                     )
-                    for payload in payloads
+                    return [
+                        Event(
+                            type=EventType.MODEL_COMPLETED,
+                            session_id=self._session.id,
+                            agent_name=self._registered_agent.spec.name,
+                            environment_name=self._environment_name,
+                            payload=payload,
+                        )
+                        for payload in identified
+                    ]
+
+                prior_completion_events = [
+                    event.model_copy(deep=True)
+                    for event in budget_events
+                    if event.type == EventType.MODEL_COMPLETED
                 ]
 
-            prior_completion_events = [
-                event.model_copy(deep=True)
-                for event in budget_events
-                if event.type == EventType.MODEL_COMPLETED
-            ]
+                def completed_events() -> list[Event]:
+                    return completion_events(completed_payloads()[before_count:])
 
-            def completed_events() -> list[Event]:
-                return completion_events(completed_payloads()[before_count:])
-
-            billing_identity_state = resolved_billing_identity(billing_identity)
-            budget_evaluation = await self._limit_gate.evaluate_budget(
-                BudgetPolicy(limits=dispatch_policy_limits),
-                billing_identity_state=billing_identity_state,
-                pricing_provider_name=actual_pricing_provider_name,
-                model=actual_model,
-                additional_usage_events=prior_completion_events,
-            )
-            if budget_evaluation.check is not None:
-                raise _AutomaticCompactionAdmissionStopped(budget_evaluation=budget_evaluation)
-            budget_events.extend(budget_evaluation.events)
-            limit_evaluation = await self._limit_gate.evaluate_limits(
-                billing_identity_state=billing_identity_state,
-                pricing_provider_name=actual_pricing_provider_name,
-                model=actual_model,
-                additional_usage_events=prior_completion_events,
-                budget_limits=dispatch_request_limits,
-            )
-            if limit_evaluation.decision is not None:
-                raise _AutomaticCompactionAdmissionStopped(limit_evaluation=limit_evaluation)
-            budget_events.extend(limit_evaluation.events)
-            if not limits:
-                return await dispatch()
-            outcome = await controller.run_automatic_compaction_dispatch(
-                dispatch,
-                completed_events=completed_events,
-                prior_completion_events=prior_completion_events,
-                budget_limits=limits,
-                session=self._session,
-                agent_name=self._registered_agent.spec.name,
-                environment_name=self._environment_name,
-                provider_name=actual_pricing_provider_name,
-                model=require_clean_nonblank(actual_model, "compactor_model"),
-                billing_identity=billing_identity,
-                pricing_provider_name=pricing_provider_name,
-                authoritative_failure_types=(ContextBuildError,),
-            )
-            budget_events.extend(outcome.events)
-            if isinstance(outcome, BudgetedOperationSucceeded):
-                return cast("tuple[str, dict[str, Any]]", outcome.result)
-            if isinstance(outcome, BudgetedOperationRejected):
-                raise _AutomaticCompactionBudgetReservationFailed(outcome.failure)
-            if outcome.cause is not None:
-                raise outcome.error from outcome.cause
-            raise outcome.error
+                billing_identity_state = resolved_billing_identity(billing_identity)
+                budget_evaluation = await self._limit_gate.evaluate_budget(
+                    BudgetPolicy(limits=dispatch_policy_limits),
+                    billing_identity_state=billing_identity_state,
+                    pricing_provider_name=actual_pricing_provider_name,
+                    model=actual_model,
+                    additional_usage_events=prior_completion_events,
+                    execution_identity=model_attempt_identity,
+                )
+                if budget_evaluation.check is not None:
+                    raise _AutomaticCompactionAdmissionStopped(budget_evaluation=budget_evaluation)
+                budget_events.extend(budget_evaluation.events)
+                limit_evaluation = await self._limit_gate.evaluate_limits(
+                    billing_identity_state=billing_identity_state,
+                    pricing_provider_name=actual_pricing_provider_name,
+                    model=actual_model,
+                    additional_usage_events=prior_completion_events,
+                    budget_limits=dispatch_request_limits,
+                    execution_identity=model_attempt_identity,
+                )
+                if limit_evaluation.decision is not None:
+                    raise _AutomaticCompactionAdmissionStopped(limit_evaluation=limit_evaluation)
+                budget_events.extend(limit_evaluation.events)
+                if not limits:
+                    return await identified_dispatch()
+                outcome = await controller.run_automatic_compaction_dispatch(
+                    identified_dispatch,
+                    completed_events=completed_events,
+                    prior_completion_events=prior_completion_events,
+                    budget_limits=limits,
+                    session=self._session,
+                    agent_name=self._registered_agent.spec.name,
+                    environment_name=self._environment_name,
+                    provider_name=actual_pricing_provider_name,
+                    model=require_clean_nonblank(actual_model, "compactor_model"),
+                    model_attempt_identity=model_attempt_identity,
+                    billing_identity=billing_identity,
+                    pricing_provider_name=pricing_provider_name,
+                    authoritative_failure_types=(ContextBuildError,),
+                )
+                budget_events.extend(outcome.events)
+                if isinstance(outcome, BudgetedOperationSucceeded):
+                    return cast("tuple[str, dict[str, Any]]", outcome.result)
+                if isinstance(outcome, BudgetedOperationRejected):
+                    raise _AutomaticCompactionBudgetReservationFailed(outcome.failure)
+                if outcome.cause is not None:
+                    raise outcome.error from outcome.cause
+                raise outcome.error
+            finally:
+                compaction_identity_ledger.end_dispatch(model_attempt_identity)
 
         with _automatic_compaction_dispatch_runner_scope(run_provider_dispatch):
             return await execute()
@@ -3683,18 +4052,28 @@ def _context_compaction_telemetry_event(
     session: Session,
     registered_agent: runtime_records.RegisteredAgentState,
     environment_name: str | None,
+    execution_identity: ModelStepIdentity | ModelAttemptIdentity | None = None,
 ) -> Event:
     if type(telemetry) is not ContextCompactionTelemetry:
         raise TypeError(
             "Context compaction telemetry must be ContextCompactionTelemetry instances."
         )
     sanitized = sanitize_context_compaction_telemetry(telemetry)
+    payload = copy_json_value(sanitized.payload, "payload")
+    for key in ("model_step_id", "model_attempt_id", "tool_round_id"):
+        payload.pop(key, None)
+    if type(execution_identity) is ModelAttemptIdentity:
+        payload.update(copy_model_attempt_identity(execution_identity).payload())
+    elif type(execution_identity) is ModelStepIdentity:
+        payload.update(copy_model_step_identity(execution_identity).payload())
+    elif execution_identity is not None:
+        raise TypeError("Context compaction execution identity has an unsupported type.")
     return Event(
         type=sanitized.event_type,
         session_id=session.id,
         agent_name=registered_agent.spec.name,
         environment_name=environment_name,
-        payload=copy_json_value(sanitized.payload, "payload"),
+        payload=payload,
     )
 
 
@@ -3704,15 +4083,20 @@ def _context_knowledge_telemetry_event(
     session: Session,
     registered_agent: runtime_records.RegisteredAgentState,
     environment_name: str | None,
+    model_step_identity: ModelStepIdentity,
 ) -> Event:
     if type(telemetry) is not ContextKnowledgeTelemetry:
         raise TypeError("Context knowledge telemetry must be ContextKnowledgeTelemetry instances.")
+    payload = copy_json_value(telemetry.payload, "payload")
+    for key in ("model_step_id", "model_attempt_id", "tool_round_id"):
+        payload.pop(key, None)
+    payload.update(copy_model_step_identity(model_step_identity).payload())
     return Event(
         type=telemetry.event_type,
         session_id=session.id,
         agent_name=registered_agent.spec.name,
         environment_name=environment_name,
-        payload=copy_json_value(telemetry.payload, "payload"),
+        payload=payload,
     )
 
 
@@ -3723,7 +4107,10 @@ def _context_overflow_event_payload(
     phase: str,
     original_message_count: int,
     recovery_message_count: int | None = None,
+    model_step_identity: ModelStepIdentity,
+    model_attempt_identity: ModelAttemptIdentity | None,
 ) -> dict[str, Any]:
+    model_step_identity = copy_model_step_identity(model_step_identity)
     payload: dict[str, Any] = {
         "step": step,
         "phase": require_clean_nonblank(phase, "phase"),
@@ -3731,7 +4118,13 @@ def _context_overflow_event_payload(
         "error_type": type(error).__name__,
         "provider": error.provider,
         "original_message_count": original_message_count,
+        **model_step_identity.payload(),
     }
+    if model_attempt_identity is not None:
+        copied_attempt = copy_model_attempt_identity(model_attempt_identity)
+        if copied_attempt.model_step_id != model_step_identity.model_step_id:
+            raise ValueError("Context overflow attempt belongs to a different model step.")
+        payload.update(copied_attempt.payload())
     if error.status_code is not None:
         payload["status_code"] = error.status_code
     if error.error_type is not None:
@@ -4024,7 +4417,9 @@ def _context_count_base_payload(
     attempt: int,
     max_attempts: int,
     observation_id: str,
+    model_attempt_identity: ModelAttemptIdentity,
 ) -> dict[str, Any]:
+    model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
     roles = [
         message.role.value if isinstance(message.role, MessageRole) else str(message.role)
         for message in model_request.messages
@@ -4039,6 +4434,7 @@ def _context_count_base_payload(
         "messages": {"count": len(model_request.messages), "roles": roles},
         "tools": {"count": len(model_request.tools)},
         "options": {"keys": sorted(model_request.options.keys())},
+        **model_attempt_identity.payload(),
     }
 
 
@@ -4053,6 +4449,7 @@ def _context_count_reconciled_event(
     step: int,
     attempt: int,
     max_attempts: int,
+    model_attempt_identity: ModelAttemptIdentity,
 ) -> Event:
     if model_completed_event.type != EventType.MODEL_COMPLETED:
         raise ValueError("Context count reconciliation requires a model.completed event.")
@@ -4085,6 +4482,7 @@ def _context_count_reconciled_event(
             "delta_tokens": delta_tokens,
             "relative_error": relative_error,
             "reconciled": actual_input_tokens is not None and estimated_input_tokens is not None,
+            **copy_model_attempt_identity(model_attempt_identity).payload(),
         },
     )
 
@@ -4100,6 +4498,7 @@ def _context_pressure_reconciled_event(
     step: int,
     attempt: int,
     max_attempts: int,
+    model_attempt_identity: ModelAttemptIdentity,
 ) -> Event:
     if model_completed_event.type != EventType.MODEL_COMPLETED:
         raise ValueError("Context pressure reconciliation requires a model.completed event.")
@@ -4130,6 +4529,7 @@ def _context_pressure_reconciled_event(
             "delta_tokens": delta_tokens,
             "relative_error": relative_error,
             "reconciled": actual_input_tokens is not None,
+            **copy_model_attempt_identity(model_attempt_identity).payload(),
         },
     )
 
@@ -4154,6 +4554,7 @@ def _model_stream_event_to_runtime_event(
     step: int,
     attempt: int,
     max_attempts: int,
+    model_attempt_identity: ModelAttemptIdentity,
     classification: dict[str, str] | None = None,
     context_pressure_estimate: ContextPressureEstimate | None = None,
     transcript_cursor_after_completion: int | None = None,
@@ -4276,6 +4677,7 @@ def _model_stream_event_to_runtime_event(
         step=step,
         attempt=attempt,
         max_attempts=max_attempts,
+        model_attempt_identity=model_attempt_identity,
     )
     if event_type == EventType.MODEL_COMPLETED:
         payload = durable_model_completed_payload(
@@ -4287,6 +4689,7 @@ def _model_stream_event_to_runtime_event(
                 "step": step,
                 "attempt": attempt,
                 "max_attempts": max_attempts,
+                **model_attempt_identity.payload(),
             },
             unavailable_reason="invalid model completion usage telemetry",
         )
@@ -4328,14 +4731,18 @@ def _assistant_step_result(
     *,
     session_id: str,
     step: int,
+    model_attempt_identity: ModelAttemptIdentity,
     assistant_message: Message | None,
     tool_calls: list[runtime_records.ToolCallRequest],
     completion: ModelCompletion,
 ) -> AssistantStepResult:
+    model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
     text_content = assistant_text_content(assistant_message)
     return AssistantStepResult(
         session_id=session_id,
         step=step,
+        model_step_id=model_attempt_identity.model_step_id,
+        model_attempt_id=model_attempt_identity.model_attempt_id,
         assistant_message=assistant_message,
         tool_calls=list(tool_calls),
         completion=completion,
@@ -4371,19 +4778,23 @@ def _model_retry_event(
     step: int,
     decision: RetryDecision,
     error: str,
+    model_attempt_identity: ModelAttemptIdentity,
 ) -> Event:
+    model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
+    payload = retry_event_payload(
+        decision=decision,
+        provider_name=registered_provider.name,
+        model=session.model,
+        step=step,
+        error=error,
+    )
+    payload.update(model_attempt_identity.payload())
     return Event(
         type=EventType.MODEL_RETRY,
         session_id=session.id,
         agent_name=registered_agent.spec.name,
         environment_name=environment_name,
-        payload=retry_event_payload(
-            decision=decision,
-            provider_name=registered_provider.name,
-            model=session.model,
-            step=step,
-            error=error,
-        ),
+        payload=payload,
     )
 
 
@@ -4395,6 +4806,7 @@ def _model_attempt_discarded_event(
     registered_provider: runtime_records.RegisteredProvider,
     step: int,
     decision: RetryDecision,
+    model_attempt_identity: ModelAttemptIdentity,
 ) -> Event:
     return Event(
         type=EventType.MODEL_ATTEMPT_DISCARDED,
@@ -4410,6 +4822,7 @@ def _model_attempt_discarded_event(
             "max_attempts": decision.max_attempts,
             "reason": None if decision.reason is None else decision.reason.value,
             "status_code": decision.status_code,
+            **copy_model_attempt_identity(model_attempt_identity).payload(),
         },
     )
 
@@ -4420,13 +4833,16 @@ def _retry_attempt_payload(
     step: int,
     attempt: int,
     max_attempts: int,
+    model_attempt_identity: ModelAttemptIdentity,
 ) -> dict[str, Any]:
-    if max_attempts <= 1:
-        return payload
     enriched = dict(payload)
+    enriched.pop("model_step_id", None)
+    enriched.pop("model_attempt_id", None)
+    enriched.pop("tool_round_id", None)
     enriched["step"] = step
     enriched["attempt"] = attempt
     enriched["max_attempts"] = max_attempts
+    enriched.update(copy_model_attempt_identity(model_attempt_identity).payload())
     return enriched
 
 

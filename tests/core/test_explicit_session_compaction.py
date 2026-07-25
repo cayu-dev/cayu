@@ -1729,25 +1729,40 @@ class BlockingCompactionProvider(ModelProvider):
 
 class OverlappingCompactor(ContextCompactor):
     def __init__(self) -> None:
+        self.provider = OverlappingCompactionProvider()
+        self.started = self.provider.started
+        self.release = self.provider.release
+        self.calls = 0
+
+    async def compact(self, request: CompactionRequest) -> CompactionResult:
+        self.calls += 1
+        return await ModelCompactor(
+            provider=self.provider,
+            model="summary-model",
+            max_input_chars=100_000,
+        ).compact(request)
+
+
+class OverlappingCompactionProvider(ModelProvider):
+    name = "overlap-compactor"
+
+    def __init__(self) -> None:
         self.started = [asyncio.Event(), asyncio.Event()]
         self.release = [asyncio.Event(), asyncio.Event()]
         self.calls = 0
 
-    async def compact(self, request: CompactionRequest) -> CompactionResult:
+    async def stream(self, request: ModelRequest):
+        del request
         call = self.calls
         self.calls += 1
         self.started[call].set()
         await self.release[call].wait()
-        return CompactionResult(
-            summary=f"summary from attempt {call + 1}",
-            covered_message_count=len(request.messages),
-            model_completed_payloads=[
-                {
-                    "provider_name": "overlap-compactor",
-                    "model": "summary-model",
-                    "usage": {"input_tokens": call + 1, "output_tokens": 1},
-                }
-            ],
+        yield ModelStreamEvent.text_delta(f"summary from attempt {call + 1}")
+        yield ModelStreamEvent.completed(
+            {
+                "model": "summary-model",
+                "usage": {"input_tokens": call + 1, "output_tokens": 1},
+            }
         )
 
 
@@ -2142,6 +2157,8 @@ def test_compact_session_preserves_transcript_and_replays_original_outcome() -> 
         ]
         assert [event.id for event in replay] == [event.id for event in first]
         assert [event.id for event in durable_events] == [event.id for event in first]
+        assert len({event.payload["model_step_id"] for event in first}) == 1
+        assert all("model_attempt_id" not in event.payload for event in first)
         assert len(compactor.requests) == 1
         assert compactor.requests[0].instructions == "Keep the decisions and file names."
         assert await store.load_transcript(created.id) == transcript
@@ -2783,7 +2800,7 @@ def test_compact_session_replays_legacy_terminal_record_before_later_pending_sta
     asyncio.run(run())
 
 
-def test_compact_session_events_allowlist_adversarial_compactor_telemetry() -> None:
+def test_compact_session_rejects_unobserved_adversarial_completion_telemetry() -> None:
     async def run() -> None:
         store = InMemorySessionStore()
         app = CayuApp(session_store=store, enable_logging=False)
@@ -2812,9 +2829,11 @@ def test_compact_session_events_allowlist_adversarial_compactor_telemetry() -> N
         await store.append_transcript_messages(created.id, transcript)
         completed = await store.update_status(created.id, SessionStatus.COMPLETED)
 
-        events = [
-            event
-            async for event in app.compact_session(
+        with pytest.raises(
+            RuntimeError,
+            match="Compaction completion was observed outside its provider dispatch",
+        ):
+            async for _event in app.compact_session(
                 CompactSessionRequest(
                     session_id=created.id,
                     idempotency_key="compact-private-events",
@@ -2822,8 +2841,10 @@ def test_compact_session_events_allowlist_adversarial_compactor_telemetry() -> N
                     expected_transcript_cursor=len(transcript),
                     instructions="private caller instructions",
                 )
-            )
-        ]
+            ):
+                pass
+
+        events = await store.load_events(created.id)
 
         serialized_events = json.dumps(
             [event.model_dump(mode="json") for event in events],
@@ -2843,21 +2864,83 @@ def test_compact_session_events_allowlist_adversarial_compactor_telemetry() -> N
             assert secret not in serialized_events
         assert len(serialized_events.encode("utf-8")) < 10_000
         assert all(event.payload["mode"] == "bounded" for event in events)
+        assert [event.type for event in events] == [
+            EventType.CONTEXT_COMPACTION_STARTED,
+            EventType.CONTEXT_COMPACTION_FAILED,
+        ]
+        assert events[0].payload["model_step_id"] == events[1].payload["model_step_id"]
+        assert "model_attempt_id" not in events[1].payload
 
-        usage_event = next(event for event in events if event.type == EventType.MODEL_COMPLETED)
-        assert usage_event.payload["purpose"] == "context_compaction"
-        assert usage_event.payload["provider_name"] == "fake-compactor"
-        assert usage_event.payload["usage_metrics"]["total_tokens"] == 10
-        assert usage_event.payload["billing_identity"] == compactor.billing_identity.model_dump(
-            mode="json"
+    asyncio.run(run())
+
+
+def test_compact_session_rejects_second_completion_for_one_provider_dispatch() -> None:
+    class DuplicatingWrapperCompactor(ContextCompactor):
+        def __init__(self, provider: ModelProvider) -> None:
+            self.provider = provider
+
+        async def compact(self, request: CompactionRequest) -> CompactionResult:
+            result = await ModelCompactor(
+                provider=self.provider,
+                model="summary-model",
+            ).compact(request)
+            forged = dict(result.model_completed_payloads[0])
+            forged.pop("compaction_attempt_id", None)
+            return result.model_copy(
+                update={
+                    "model_completed_payloads": [
+                        *result.model_completed_payloads,
+                        forged,
+                    ]
+                }
+            )
+
+    async def run() -> None:
+        store = InMemorySessionStore()
+        provider = UsageCompactionProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=DuplicatingWrapperCompactor(provider),
+                max_user_turns=1,
+            ),
         )
-        assert "billing_identity" not in usage_event.payload["usage_metrics"]
-        assert "usage" not in usage_event.payload
-        assert "provider_state" not in usage_event.payload
-        completed_event = next(
-            event for event in events if event.type == EventType.CONTEXT_COMPACTION_COMPLETED
+        created = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_explicit_duplicate_dispatch_completion",
+                messages=[Message.text("user", "create only")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
         )
-        assert "metadata" not in completed_event.payload
+        transcript = [
+            Message.text("user", "old request"),
+            Message.text("assistant", "old answer"),
+            Message.text("user", "current request"),
+            Message.text("assistant", "current answer"),
+        ]
+        await store.append_transcript_messages(created.id, transcript)
+        completed = await store.update_status(created.id, SessionStatus.COMPLETED)
+
+        with pytest.raises(
+            ValueError,
+            match="Compaction provider dispatch produced conflicting completion identities",
+        ):
+            async for _event in app.compact_session(
+                CompactSessionRequest(
+                    session_id=created.id,
+                    idempotency_key="explicit-duplicate-dispatch-completion",
+                    expected_run_epoch=completed.run_epoch,
+                    expected_transcript_cursor=len(transcript),
+                )
+            ):
+                pass
+
+        events = await store.load_events(created.id)
+        assert provider.calls == 1
+        assert sum(event.type == EventType.MODEL_COMPLETED for event in events) == 1
+        assert events[-1].type == EventType.CONTEXT_COMPACTION_FAILED
 
     asyncio.run(run())
 
@@ -5350,27 +5433,41 @@ def test_compact_session_claim_loss_waits_for_completed_dispatch_settlement(monk
 
 
 def test_compact_session_claim_loss_retains_concurrent_result_telemetry(monkeypatch) -> None:
-    class CompletionReportingCompactor(ContextCompactor):
+    class CompletionReportingProvider(ModelProvider):
+        name = "reported-provider"
+
         def __init__(self) -> None:
             self.calls = 0
             self.result_ready = asyncio.Event()
             self.release_result = asyncio.Event()
 
-        async def compact(self, request: CompactionRequest) -> CompactionResult:
+        async def stream(self, request: ModelRequest):
+            del request
             self.calls += 1
             self.result_ready.set()
             await self.release_result.wait()
-            return CompactionResult(
-                summary="completed before claim loss",
-                covered_message_count=len(request.messages),
-                model_completed_payloads=[
-                    {
-                        "provider_name": "reported-provider",
-                        "model": "summary-model",
-                        "usage": {"input_tokens": 8, "output_tokens": 2},
-                    }
-                ],
+            yield ModelStreamEvent.text_delta("completed before claim loss")
+            yield ModelStreamEvent.completed(
+                {
+                    "model": "summary-model",
+                    "usage": {"input_tokens": 8, "output_tokens": 2},
+                }
             )
+
+    class CompletionReportingCompactor(ContextCompactor):
+        def __init__(self) -> None:
+            self.provider = CompletionReportingProvider()
+            self.calls = 0
+            self.result_ready = self.provider.result_ready
+            self.release_result = self.provider.release_result
+
+        async def compact(self, request: CompactionRequest) -> CompactionResult:
+            self.calls += 1
+            return await ModelCompactor(
+                provider=self.provider,
+                model="summary-model",
+                max_input_chars=100_000,
+            ).compact(request)
 
     class ConcurrentClaimLossStore(InMemorySessionStore):
         def __init__(self, compactor: CompletionReportingCompactor) -> None:
@@ -6010,11 +6107,30 @@ def test_compact_session_recovery_fences_a_late_attempt_and_preserves_its_usage(
         assert sum(event.type == EventType.SESSION_CHECKPOINTED for event in durable_events) == 1
         assert sum(event.type == EventType.MODEL_COMPLETED for event in durable_events) == 2
         assert first_events[-1].type == EventType.CONTEXT_COMPACTION_FAILED
-        assert first_events[-1].payload["error_type"] == "SessionCompactionAttemptSuperseded"
+        assert first_events[-1].payload["error_type"] == "ContextBuildError"
         assert recovered_events[-1].type == EventType.SESSION_CHECKPOINTED
         assert [event.id for event in replay] == [event.id for event in durable_events]
         assert len({event.payload["operation_id"] for event in durable_events}) == 1
         assert len({event.payload["attempt_id"] for event in durable_events}) == 2
+        model_step_ids = {
+            event.payload["model_step_id"]
+            for event in durable_events
+            if event.type
+            in {
+                EventType.MODEL_COMPLETED,
+                EventType.CONTEXT_COMPACTION_STARTED,
+                EventType.CONTEXT_COMPACTION_COMPLETED,
+                EventType.CONTEXT_COMPACTION_FAILED,
+                EventType.SESSION_CHECKPOINTED,
+            }
+        }
+        model_attempt_ids = {
+            event.payload["model_attempt_id"]
+            for event in durable_events
+            if event.type == EventType.MODEL_COMPLETED
+        }
+        assert len(model_step_ids) == 1
+        assert len(model_attempt_ids) == 2
         checkpoint = await store.load_checkpoint(created.id)
         assert checkpoint is not None
         assert checkpoint["context_compaction"]["summary"] == "summary from attempt 2"
@@ -6563,6 +6679,21 @@ def test_compact_session_attributes_provider_usage_and_honors_run_limits() -> No
         assert usage_event.payload["operation_id"]
         assert usage_event.payload["reason"] == "application_requested"
         assert usage_event.payload["usage_metrics"]["total_tokens"] == 10
+        terminal_context_events = [
+            event
+            for event in first
+            if event.type
+            in {
+                EventType.CONTEXT_COMPACTION_COMPLETED,
+                EventType.SESSION_CHECKPOINTED,
+            }
+        ]
+        assert usage_event.payload["model_attempt_id"].startswith("matt_")
+        assert all(
+            event.payload["model_step_id"] == usage_event.payload["model_step_id"]
+            for event in terminal_context_events
+        )
+        assert all("model_attempt_id" not in event.payload for event in terminal_context_events)
 
         tail = [
             Message.text("user", "later request"),
