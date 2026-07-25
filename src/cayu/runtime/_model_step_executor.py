@@ -155,6 +155,7 @@ from cayu.runtime.execution_units import (
     copy_model_attempt_identity,
     copy_model_step_identity,
     copy_tool_round_identity,
+    strip_runtime_owned_execution_identity,
 )
 from cayu.runtime.model_steps import (
     AssistantStepResult,
@@ -1529,6 +1530,9 @@ class ModelStepRun:
         self._run_started_at = run_started_at
         self._turn_usage_tracker = turn_usage_tracker
         self._active_run = active_run
+        self._reservation_identity_guard = (
+            self._executor._run_limit_controller.reservation_identity_guard()
+        )
         contextual_limits = (
             *budget_limits_for_session(
                 policy=self._budget_policy,
@@ -1838,6 +1842,7 @@ class ModelStepRun:
             budget_policy=self._budget_policy,
             request_budget_limits=self._request_budget_limits,
             billing_identity=billing_identity,
+            reservation_identity_guard=self._reservation_identity_guard,
         )
         budget_reservations = list(reservation_setup.reservations)
         try:
@@ -1947,6 +1952,8 @@ class ModelStepRun:
                 budget_policy=self._budget_policy,
                 request_budget_limits=self._request_budget_limits,
                 billing_identity=billing_identity,
+                existing_reservation_ids=lifecycle.observed_reservation_ids,
+                reservation_identity_guard=self._reservation_identity_guard,
             )
             if retry_setup.error is not None:
                 return settlement_events + list(retry_setup.events), None, retry_setup.error
@@ -3802,6 +3809,7 @@ class ModelStepRun:
                     billing_identity=billing_identity,
                     pricing_provider_name=pricing_provider_name,
                     authoritative_failure_types=(ContextBuildError,),
+                    reservation_identity_guard=self._reservation_identity_guard,
                 )
                 budget_events.extend(outcome.events)
                 if isinstance(outcome, BudgetedOperationSucceeded):
@@ -4066,8 +4074,7 @@ def _context_compaction_telemetry_event(
         )
     sanitized = sanitize_context_compaction_telemetry(telemetry)
     payload = copy_json_value(sanitized.payload, "payload")
-    for key in ("model_step_id", "model_attempt_id", "tool_round_id"):
-        payload.pop(key, None)
+    strip_runtime_owned_execution_identity(payload)
     if type(execution_identity) is ModelAttemptIdentity:
         payload.update(copy_model_attempt_identity(execution_identity).payload())
     elif type(execution_identity) is ModelStepIdentity:
@@ -4094,8 +4101,7 @@ def _context_knowledge_telemetry_event(
     if type(telemetry) is not ContextKnowledgeTelemetry:
         raise TypeError("Context knowledge telemetry must be ContextKnowledgeTelemetry instances.")
     payload = copy_json_value(telemetry.payload, "payload")
-    for key in ("model_step_id", "model_attempt_id", "tool_round_id"):
-        payload.pop(key, None)
+    strip_runtime_owned_execution_identity(payload)
     payload.update(copy_model_step_identity(model_step_identity).payload())
     return Event(
         type=telemetry.event_type,
@@ -4865,9 +4871,7 @@ def _retry_attempt_payload(
     model_attempt_identity: ModelAttemptIdentity,
 ) -> dict[str, Any]:
     enriched = dict(payload)
-    enriched.pop("model_step_id", None)
-    enriched.pop("model_attempt_id", None)
-    enriched.pop("tool_round_id", None)
+    strip_runtime_owned_execution_identity(enriched)
     enriched["step"] = step
     enriched["attempt"] = attempt
     enriched["max_attempts"] = max_attempts

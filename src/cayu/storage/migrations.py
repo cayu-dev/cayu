@@ -153,14 +153,13 @@ REVISIONS: tuple[Revision, ...] = (
     # baseline. Pre-22 workers do not maintain that state, so mixed-version
     # session workers could silently bypass drift policy.
     Revision(revision=22, kind=RevisionKind.BREAKING, compatible_from=22),
-    # Budget reservations are now partitioned and attributed by a durable
-    # effective-limit identity. Older writers omit that identity and can merge
-    # independent ledgers, so mixed-version budget workers are unsafe.
+    # Execution-unit identities make budget reservations attributable to one
+    # exact effective limit, logical model step, and provider attempt. Reservation
+    # ids also become permanent ledger-wide reconciliation keys: a non-cascading
+    # ownership registry claims each id before publication, while a unique event
+    # index prevents concurrent sessions from publishing the same id. All writers
+    # must maintain these invariants, so mixed-version workers are unsafe.
     Revision(revision=23, kind=RevisionKind.BREAKING, compatible_from=23),
-    # Every reservation now belongs to one exact logical model step and provider
-    # attempt. Older writers cannot supply those identities, so allowing them to
-    # share the ledger would make settlement attribution ambiguous.
-    Revision(revision=24, kind=RevisionKind.BREAKING, compatible_from=24),
 )
 
 #: The revision an empty database is initialized to.

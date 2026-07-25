@@ -76,6 +76,7 @@ from cayu.runtime.approvals import (
 )
 from cayu.runtime.budgets import (
     BudgetLimit,
+    BudgetReservationIdentityConflict,
     SessionBudgetInspection,
     copy_request_budget_limits,
     is_budget_inspection_event,
@@ -2652,6 +2653,23 @@ class SessionStore(ABC):
         """Revoke this task's epoch after all trailing writes finish."""
         _deactivate_session_run_fence(require_clean_nonblank(session_id, "session_id"))
 
+    @abstractmethod
+    async def claim_budget_reservation_identity(
+        self,
+        *,
+        reservation_id: str,
+        publication_session_id: str,
+        publication_id: str,
+    ) -> None:
+        """Durably bind one ledger-wide reservation id to an exact session event.
+
+        Claims are idempotent only for the same session/event pair and must not
+        be removed when a session is deleted. ``append_events`` atomically marks
+        the matching claim published when it stores ``budget.reserved``. The
+        claim is a session-scoped mutation: the publication session must exist
+        and an active run fence must still own its current epoch.
+        """
+
     async def append_event(self, session_id: str, event: Event) -> None:
         """Append one event to a session."""
         await self.append_events(session_id, [event])
@@ -3143,6 +3161,10 @@ class InMemorySessionStore(SessionStore):
         self._event_records_by_id: dict[tuple[str, str], EventRecord] = {}
         self._type_event_records: dict[str, list[EventRecord]] = {}
         self._event_ids: dict[str, set[str]] = {}
+        # Store-wide ownership registry. It intentionally outlives session
+        # deletion: reservation ids are ledger reconciliation keys, not
+        # session-local event attributes.
+        self._budget_reservation_identities: dict[str, tuple[str, str, bool]] = {}
         self._persisted_event_side_effect_deliveries: dict[
             tuple[str, str], PersistedEventSideEffectDelivery
         ] = {}
@@ -3777,6 +3799,37 @@ class InMemorySessionStore(SessionStore):
     async def append_event(self, session_id: str, event: Event) -> None:
         await self.append_events(session_id, [event])
 
+    async def claim_budget_reservation_identity(
+        self,
+        *,
+        reservation_id: str,
+        publication_session_id: str,
+        publication_id: str,
+    ) -> None:
+        reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
+        publication_session_id = require_clean_nonblank(
+            publication_session_id,
+            "publication_session_id",
+        )
+        publication_id = require_clean_nonblank(publication_id, "publication_id")
+        async with self._lock:
+            session = self._sessions.get(publication_session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {publication_session_id}")
+            _assert_session_run_epoch(publication_session_id, session)
+            existing = self._budget_reservation_identities.get(reservation_id)
+            if existing is None:
+                self._budget_reservation_identities[reservation_id] = (
+                    publication_session_id,
+                    publication_id,
+                    False,
+                )
+                return
+            if existing[:2] != (publication_session_id, publication_id):
+                raise BudgetReservationIdentityConflict(
+                    "Budget ledger reused a reservation identity."
+                )
+
     def _append_events_unlocked(
         self,
         session: Session,
@@ -3793,6 +3846,30 @@ class InMemorySessionStore(SessionStore):
         for event in events:
             if event.id in existing_ids:
                 raise ValueError(f"Event already exists for session {session_id}: {event.id}")
+
+        budget_reservation_publications: dict[str, str] = {}
+        for event in events:
+            if event.type != EventType.BUDGET_RESERVED:
+                continue
+            raw_reservation_id = event.payload.get("reservation_id")
+            if type(raw_reservation_id) is not str:
+                continue
+            reservation_id = raw_reservation_id
+            existing = self._budget_reservation_identities.get(reservation_id)
+            if existing is not None and (
+                existing[:2] != (event.session_id, event.id) or existing[2]
+            ):
+                raise BudgetReservationIdentityConflict(
+                    "Budget ledger reused a reservation identity."
+                )
+            previous_publication_id = budget_reservation_publications.setdefault(
+                reservation_id,
+                event.id,
+            )
+            if previous_publication_id != event.id:
+                raise BudgetReservationIdentityConflict(
+                    "Budget ledger reused a reservation identity."
+                )
 
         prepared: list[tuple[EventRecord, str, EventRecord | None, str | None]] = []
         next_sequence = self._next_event_sequence
@@ -3835,6 +3912,12 @@ class InMemorySessionStore(SessionStore):
                         status=PersistedEventSideEffectStatus.PENDING,
                     )
                 )
+        self._budget_reservation_identities.update(
+            {
+                reservation_id: (session_id, publication_id, True)
+                for reservation_id, publication_id in budget_reservation_publications.items()
+            }
+        )
         self._next_event_sequence = next_sequence
         if not events:
             return session

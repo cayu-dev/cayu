@@ -4,18 +4,65 @@ import asyncio
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Protocol
+from unittest.mock import patch
+from uuid import UUID
 
 import pytest
 from tests.core._execution_unit_fixtures import model_attempt_identity
 
 from cayu._validation import DurableValueError
 from cayu.runtime import BudgetLedger, BudgetLimit
+from cayu.runtime.budgets import BudgetReservationIdentityConflict
 
 
 class MutableClock(Protocol):
     value: datetime
 
     def __call__(self) -> datetime: ...
+
+
+async def assert_reservation_identity_collision_is_rejected(
+    ledger: BudgetLedger,
+    limit: BudgetLimit,
+) -> None:
+    first_identity = model_attempt_identity()
+    second_identity = model_attempt_identity()
+    fixed_uuid = UUID("11111111-1111-1111-1111-111111111111")
+    reserve_kwargs = {
+        "limit": limit,
+        "agent_name": "assistant",
+        "provider_name": "fake",
+        "model": "fake-model",
+    }
+
+    with patch("cayu.runtime.budgets.uuid4", return_value=fixed_uuid):
+        first = await ledger.reserve(
+            session_id="sess_reservation_identity_winner",
+            model_attempt_identity=first_identity,
+            **reserve_kwargs,
+        )
+        assert first.accepted is True
+        assert first.record is not None
+
+        with pytest.raises(
+            BudgetReservationIdentityConflict,
+            match="reused a reservation identity",
+        ):
+            await ledger.reserve(
+                session_id="sess_reservation_identity_collision",
+                model_attempt_identity=second_identity,
+                **reserve_kwargs,
+            )
+
+    reconciled = await ledger.reconcile(
+        reservation_id=first.record.reservation_id,
+        actual_amount=Decimal("0.01"),
+        reason="winner retained after collision",
+    )
+    assert (reconciled.model_step_id, reconciled.model_attempt_id) == (
+        first_identity.model_step_id,
+        first_identity.model_attempt_id,
+    )
 
 
 async def assert_portable_text_boundaries(

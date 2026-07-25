@@ -63,6 +63,7 @@ from cayu.runtime.budgets import (
     _released_record,
     _reservation_is_expired,
     _reservation_result,
+    _utc_datetime,
     _validate_amount,
     _validate_reservation_ttl,
 )
@@ -87,6 +88,7 @@ from cayu.runtime.sessions import (
     MAX_PENDING_ACTION_TOOL_CALLS,
     SESSION_INSPECTION_LABEL_LIMIT,
     SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
+    BudgetReservationIdentityConflict,
     CheckpointTransform,
     EnqueueSessionMessageRequest,
     EnqueueSessionMessageResult,
@@ -241,7 +243,7 @@ from cayu.storage.memory import (
 _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 _SCHEMA_ADVISORY_LOCK_POLL_SECONDS = 0.25
 _POSTGRES_MIN_REQUIRED_REVISION = 18
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 22
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 23
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="%s",
@@ -696,14 +698,20 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "ADD COLUMN IF NOT EXISTS budget_limit_id TEXT",
         "CREATE INDEX IF NOT EXISTS idx_cayu_budget_reservations_limit "
         "ON cayu_budget_reservations(budget_limit_id, status, updated_at)",
-    ),
-    24: (
         "ALTER TABLE IF EXISTS cayu_budget_reservations "
         "ADD COLUMN IF NOT EXISTS model_step_id TEXT",
         "ALTER TABLE IF EXISTS cayu_budget_reservations "
         "ADD COLUMN IF NOT EXISTS model_attempt_id TEXT",
         "CREATE INDEX IF NOT EXISTS idx_cayu_budget_reservations_model_attempt "
         "ON cayu_budget_reservations(model_attempt_id, budget_limit_id, status)",
+        """
+        CREATE TABLE IF NOT EXISTS cayu_budget_reservation_identities (
+            reservation_id TEXT PRIMARY KEY,
+            publication_session_id TEXT NOT NULL,
+            publication_id TEXT NOT NULL,
+            published BOOLEAN NOT NULL
+        )
+        """,
     ),
 }
 
@@ -995,6 +1003,7 @@ class _ConcurrentIndexMigration:
     predicate_definition: str | None
     create_statement: str
     drop_statement: str
+    unique: bool = False
 
 
 _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] = {
@@ -1093,6 +1102,28 @@ _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] =
             drop_statement=(
                 "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_events_pending_action_lookup"
             ),
+        ),
+    ),
+    23: (
+        _ConcurrentIndexMigration(
+            index_name="idx_cayu_events_budget_reservation_identity",
+            table_name="cayu_events",
+            key_definitions=("payload ->> 'reservation_id'",),
+            predicate_definition="""
+                event_type = 'budget.reserved'
+                AND jsonb_typeof(payload -> 'reservation_id') = 'string'
+            """,
+            create_statement="""
+                CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS
+                    idx_cayu_events_budget_reservation_identity
+                ON cayu_events ((payload ->> 'reservation_id'))
+                WHERE event_type = 'budget.reserved'
+                  AND jsonb_typeof(payload -> 'reservation_id') = 'string'
+            """,
+            drop_statement=(
+                "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_events_budget_reservation_identity"
+            ),
+            unique=True,
         ),
     ),
 }
@@ -1326,6 +1357,11 @@ class _PostgresStoreBase:
                             app_min_supported=self._min_required_revision,
                         )
                         self._validate_postgres_revision(current_state)
+                        if current_state.revision >= 23:
+                            await self._validate_budget_reservation_identity_registry(
+                                cur,
+                                require=True,
+                            )
                         recorded_indexes = _required_concurrent_indexes(current_state.revision)
                     else:
                         revision = pending[0]
@@ -1450,6 +1486,11 @@ class _PostgresStoreBase:
 
     async def _validate_postgres_schema(self, cur: Any, state: schema.SchemaState) -> None:
         self._validate_postgres_revision(state)
+        if state.revision >= 23:
+            await self._validate_budget_reservation_identity_registry(
+                cur,
+                require=True,
+            )
         for index in _required_concurrent_indexes(state.revision):
             existing = await self._concurrent_index_state(cur, index)
             if existing is None:
@@ -1463,6 +1504,63 @@ class _PostgresStoreBase:
                     f"Required Cayu Postgres index is not ready: {index.index_name}. "
                     "Run `cayu storage migrate` to repair the schema."
                 )
+
+    async def _validate_budget_reservation_identity_registry(
+        self,
+        cur: Any,
+        *,
+        require: bool,
+    ) -> bool:
+        table_name = "cayu_budget_reservation_identities"
+        await cur.execute("SELECT to_regclass(%s)", (table_name,))
+        registered = await cur.fetchone()
+        if registered is None or registered[0] is None:
+            if require:
+                raise RuntimeError(
+                    f"Required Cayu Postgres table is missing: {table_name}. "
+                    "Restore the permanent reservation ownership registry from "
+                    "a known-good backup."
+                )
+            return False
+        await cur.execute(
+            """
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = %s
+            ORDER BY ordinal_position
+            """,
+            (table_name,),
+        )
+        columns = tuple(await cur.fetchall())
+        await cur.execute(
+            """
+            SELECT pg_get_constraintdef(constraint_record.oid)
+            FROM pg_catalog.pg_constraint AS constraint_record
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = constraint_record.conrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_record.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND table_record.relname = %s
+              AND constraint_record.contype = 'p'
+            """,
+            (table_name,),
+        )
+        primary_keys = tuple(row[0] for row in await cur.fetchall())
+        expected_columns = (
+            ("reservation_id", "text", "NO"),
+            ("publication_session_id", "text", "NO"),
+            ("publication_id", "text", "NO"),
+            ("published", "boolean", "NO"),
+        )
+        if columns != expected_columns or primary_keys != ("PRIMARY KEY (reservation_id)",):
+            raise RuntimeError(
+                f"Postgres schema object {table_name!r} conflicts with Cayu's "
+                "reservation identity contract. Restore the required ownership "
+                "registry from a known-good backup."
+            )
+        return True
 
     async def _read_schema_state(self, cur: Any) -> schema.SchemaState:
         return await read_schema_state(cur)
@@ -1521,8 +1619,15 @@ class _PostgresStoreBase:
                         await cur.execute(index.drop_statement)
                     try:
                         await cur.execute(index.create_statement)
-                    except (DeadlockDetected, DuplicateTable, UniqueViolation):
+                    except (DeadlockDetected, DuplicateTable):
                         continue
+                    except UniqueViolation as exc:
+                        if not index.unique:
+                            continue
+                        raise RuntimeError(
+                            f"Postgres migration cannot create required unique index "
+                            f"{index.index_name}: durable rows contain duplicate identities."
+                        ) from exc
                     created = await self._concurrent_index_state(
                         cur,
                         index,
@@ -1575,6 +1680,7 @@ class _PostgresStoreBase:
                     index_definition.indrelid,
                     FALSE
                 ),
+                COALESCE(index_definition.indisunique, FALSE),
                 EXISTS (
                     SELECT 1
                     FROM pg_catalog.pg_stat_progress_create_index AS progress
@@ -1611,15 +1717,17 @@ class _PostgresStoreBase:
             and bool(row[3])
             and key_definitions == expected_keys
             and predicate == expected_predicate
+            and bool(row[6]) is index.unique
         )
         if not expected_definition:
             columns = ", ".join(index.key_definitions)
+            index_kind = "unique B-tree" if index.unique else "B-tree"
             raise RuntimeError(
                 f"Postgres schema object {index.index_name!r} conflicts with the required "
-                f"B-tree index on {index.table_name}({columns}). Remove or rename the "
+                f"{index_kind} index on {index.table_name}({columns}). Remove or rename the "
                 "conflicting object, then rerun `cayu storage migrate`."
             )
-        return bool(row[1]), bool(row[6])
+        return bool(row[1]), bool(row[7])
 
     async def _record_revision(self, cur: Any, rev: schema.Revision) -> None:
         await cur.execute(
@@ -2053,7 +2161,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
     machinery (ADR 0001 revision 8).
     """
 
-    _min_required_revision = 24
+    _min_required_revision = 23
 
     def __init__(
         self,
@@ -2080,6 +2188,64 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
     def reservation_ttl_seconds(self) -> int | None:
         return self._reservation_ttl_seconds
 
+    async def claim_reservation_identity(
+        self,
+        *,
+        reservation_id: str,
+        publication_session_id: str,
+        publication_id: str,
+    ) -> None:
+        reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
+        publication_session_id = require_clean_nonblank(
+            publication_session_id,
+            "publication_session_id",
+        )
+        publication_id = require_clean_nonblank(publication_id, "publication_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        INSERT INTO cayu_budget_reservation_identities (
+                            reservation_id,
+                            publication_session_id,
+                            publication_id,
+                            published
+                        )
+                        VALUES (%s, %s, %s, FALSE)
+                        ON CONFLICT (reservation_id) DO NOTHING
+                        RETURNING reservation_id
+                        """,
+                        (reservation_id, publication_session_id, publication_id),
+                    )
+                    inserted = await cur.fetchone()
+                    if inserted is None:
+                        await cur.execute(
+                            """
+                            SELECT publication_session_id, publication_id
+                            FROM cayu_budget_reservation_identities
+                            WHERE reservation_id = %s
+                            """,
+                            (reservation_id,),
+                        )
+                        existing = await cur.fetchone()
+                        if existing is None:
+                            raise RuntimeError(
+                                "Budget reservation identity claim disappeared during conflict."
+                            )
+                        if (existing[0], existing[1]) != (
+                            publication_session_id,
+                            publication_id,
+                        ):
+                            raise BudgetReservationIdentityConflict(
+                                "Budget ledger reused a reservation identity."
+                            )
+                await conn.commit()
+            except BaseException:
+                await conn.rollback()
+                raise
+
     async def reserve(
         self,
         *,
@@ -2090,6 +2256,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         model: str,
         model_attempt_identity: ModelAttemptIdentity,
         billing_identity: BillingIdentity | None = None,
+        effective_at: datetime | None = None,
     ) -> BudgetReservationResult:
         limit = _ensure_effective_budget_limit(
             limit,
@@ -2109,11 +2276,14 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                         (_budget_advisory_lock_key(limit),),
                     )
                     now = self._clock()
+                    pricing_effective_at = (
+                        now if effective_at is None else _utc_datetime(effective_at, "effective_at")
+                    )
                     requested = _budget_reservation_amount(
                         limit=limit,
                         provider_name=provider_name,
                         model=model,
-                        effective_at=now,
+                        effective_at=pricing_effective_at,
                         billing_identity=billing_identity,
                     )
                     await self._reap_expired(cur, now, limit=limit)
@@ -2149,7 +2319,17 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                         created_at=now,
                         updated_at=now,
                     )
-                    await self._insert_record(cur, record)
+                    try:
+                        await self._insert_record(cur, record)
+                    except UniqueViolation as exc:
+                        if (
+                            getattr(exc.diag, "constraint_name", None)
+                            == "cayu_budget_reservations_pkey"
+                        ):
+                            raise BudgetReservationIdentityConflict(
+                                "Budget ledger reused a reservation identity."
+                            ) from exc
+                        raise
                 await conn.commit()
             except Exception:
                 await conn.rollback()
@@ -4997,6 +5177,139 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     async def append_event(self, session_id: str, event: Event) -> None:
         await self.append_events(session_id, [event])
 
+    async def claim_budget_reservation_identity(
+        self,
+        *,
+        reservation_id: str,
+        publication_session_id: str,
+        publication_id: str,
+    ) -> None:
+        reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
+        publication_session_id = require_clean_nonblank(
+            publication_session_id,
+            "publication_session_id",
+        )
+        publication_id = require_clean_nonblank(publication_id, "publication_id")
+        expected_run_epoch = _current_session_run_epoch(publication_session_id)
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    # Serialize the claim with run-epoch takeover and session
+                    # deletion until this transaction commits.
+                    await cur.execute(
+                        "SELECT run_epoch FROM cayu_sessions WHERE id = %s FOR SHARE",
+                        (publication_session_id,),
+                    )
+                    session_row = await cur.fetchone()
+                    if session_row is None:
+                        raise KeyError(f"Session not found: {publication_session_id}")
+                    if expected_run_epoch is not None and session_row[0] != expected_run_epoch:
+                        await _raise_session_write_conflict(
+                            cur,
+                            publication_session_id,
+                            expected_run_epoch,
+                        )
+                    await cur.execute(
+                        """
+                        INSERT INTO cayu_budget_reservation_identities (
+                            reservation_id,
+                            publication_session_id,
+                            publication_id,
+                            published
+                        )
+                        VALUES (%s, %s, %s, FALSE)
+                        ON CONFLICT (reservation_id) DO NOTHING
+                        """,
+                        (reservation_id, publication_session_id, publication_id),
+                    )
+                    if cur.rowcount == 0:
+                        await cur.execute(
+                            """
+                            SELECT publication_session_id, publication_id
+                            FROM cayu_budget_reservation_identities
+                            WHERE reservation_id = %s
+                            """,
+                            (reservation_id,),
+                        )
+                        existing = await cur.fetchone()
+                        if existing is None or existing != (
+                            publication_session_id,
+                            publication_id,
+                        ):
+                            raise BudgetReservationIdentityConflict(
+                                "Budget ledger reused a reservation identity."
+                            )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+
+    @staticmethod
+    async def _publish_budget_reservation_identities(
+        cur: Any,
+        events: list[Event],
+    ) -> None:
+        for event in events:
+            if event.type != EventType.BUDGET_RESERVED:
+                continue
+            raw_reservation_id = event.payload.get("reservation_id")
+            if type(raw_reservation_id) is not str:
+                continue
+            await cur.execute(
+                """
+                UPDATE cayu_budget_reservation_identities
+                SET published = TRUE
+                WHERE reservation_id = %s
+                  AND publication_session_id = %s
+                  AND publication_id = %s
+                  AND NOT published
+                """,
+                (raw_reservation_id, event.session_id, event.id),
+            )
+            if cur.rowcount == 1:
+                continue
+            await cur.execute(
+                """
+                INSERT INTO cayu_budget_reservation_identities (
+                    reservation_id,
+                    publication_session_id,
+                    publication_id,
+                    published
+                )
+                VALUES (%s, %s, %s, TRUE)
+                ON CONFLICT (reservation_id) DO NOTHING
+                """,
+                (raw_reservation_id, event.session_id, event.id),
+            )
+            if cur.rowcount == 0:
+                await cur.execute(
+                    """
+                    SELECT publication_session_id, publication_id, published
+                    FROM cayu_budget_reservation_identities
+                    WHERE reservation_id = %s
+                    """,
+                    (raw_reservation_id,),
+                )
+                existing = await cur.fetchone()
+                if existing == (event.session_id, event.id, True):
+                    await cur.execute(
+                        """
+                        SELECT 1
+                        FROM cayu_events
+                        WHERE session_id = %s AND event_id = %s
+                        """,
+                        (event.session_id, event.id),
+                    )
+                    if await cur.fetchone() is not None:
+                        # The reservation belongs to this exact persisted event.
+                        # Let the event insert below classify the replay as a
+                        # duplicate event.
+                        continue
+                raise BudgetReservationIdentityConflict(
+                    "Budget ledger reused a reservation identity."
+                )
+
     async def append_events(self, session_id: str, events: list[Event]) -> None:
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
@@ -5049,6 +5362,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         await conn.commit()
                         return
 
+                    await self._publish_budget_reservation_identities(cur, copied_events)
                     # RETURNING yields the post-increment counter, i.e. the order
                     # of the last event in this batch; walk back to the first.
                     next_order = order_row[0] - len(copied_events)
@@ -5105,6 +5419,13 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 if existing is not None:
                     raise ValueError(
                         f"Event already exists for session {session_id}: {existing}"
+                    ) from exc
+                if (
+                    getattr(exc.diag, "constraint_name", None)
+                    == "idx_cayu_events_budget_reservation_identity"
+                ):
+                    raise BudgetReservationIdentityConflict(
+                        "Budget ledger reused a reservation identity."
                     ) from exc
                 raise
             except Exception:
@@ -6162,6 +6483,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             raise ValueError("Checkpoint transform must return a checkpoint.")
                         transformed = copy_durable_json_object(transformed, "checkpoint")
 
+                    await self._publish_budget_reservation_identities(cur, copied_events)
                     await cur.execute(
                         """
                         UPDATE cayu_sessions

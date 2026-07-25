@@ -34,6 +34,7 @@ from cayu.vaults import REDACTED_SECRET, SecretRedactor
 _POSTGRES_TABLES = (
     "cayu_event_watcher_dead_letters",
     "cayu_event_watcher_state",
+    "cayu_budget_reservation_identities",
     "cayu_events",
     "cayu_session_labels",
     "cayu_transcript_messages",

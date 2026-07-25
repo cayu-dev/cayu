@@ -31,6 +31,7 @@ _EVENT_CONTROL_STRING_FIELDS = frozenset(
         "action",
         "agent_name",
         "approval_id",
+        "budget_limit_id",
         "checkpoint",
         "decision",
         "denied_by",
@@ -53,6 +54,7 @@ _EVENT_CONTROL_STRING_FIELDS = frozenset(
         "policy",
         "policy_name",
         "provider",
+        "reservation_id",
         "role",
         "scope",
         "session_id",
@@ -79,6 +81,7 @@ _EVENT_IDENTITY_STRING_FIELDS = frozenset(
 _EVENT_SECRET_FREE_AUTHORITY_FIELDS = frozenset(
     {
         "approval_id",
+        "budget_limit_id",
         "checkpoint",
         "event_id",
         "input_id",
@@ -87,6 +90,7 @@ _EVENT_SECRET_FREE_AUTHORITY_FIELDS = frozenset(
         "model",
         "policy_name",
         "provider",
+        "reservation_id",
         "session_id",
         "task_id",
         "tool_call_id",

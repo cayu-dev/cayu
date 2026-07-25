@@ -18,7 +18,11 @@ from cayu.core.messages import (
     copy_message_part,
 )
 from cayu.runtime._runtime_records import ToolCallOutcome, ToolCallRequest
-from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
+from cayu.runtime.execution_units import (
+    ToolRoundIdentity,
+    copy_tool_round_identity,
+    strip_runtime_owned_execution_identity,
+)
 from cayu.runtime.sessions import SessionStore
 from cayu.runtime.usage import strip_provider_billing_identity
 
@@ -206,6 +210,7 @@ def model_completed_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
     copied = copy_json_value(payload, "payload")
     if type(copied) is not dict:
         raise ValueError("Model completed payload must be an object.")
+    strip_runtime_owned_execution_identity(copied)
     copied.pop("provider_state", None)
     strip_provider_billing_identity(copied)
     return copied

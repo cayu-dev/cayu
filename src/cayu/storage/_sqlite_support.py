@@ -135,6 +135,13 @@ _BASELINE_DDL = """
         UNIQUE(session_id, event_id)
     );
 
+    CREATE TABLE IF NOT EXISTS cayu_budget_reservation_identities (
+        reservation_id TEXT PRIMARY KEY,
+        publication_session_id TEXT NOT NULL,
+        publication_id TEXT NOT NULL,
+        published INTEGER NOT NULL CHECK (published IN (0, 1))
+    );
+
     CREATE TABLE IF NOT EXISTS cayu_mcp_manifest_baselines (
         history_key TEXT PRIMARY KEY,
         generation INTEGER NOT NULL CHECK (generation >= 1),
@@ -295,6 +302,10 @@ _BASELINE_DDL = """
         ON cayu_session_labels(key, value, session_id);
     CREATE INDEX IF NOT EXISTS idx_cayu_events_session_sequence
         ON cayu_events(session_id, sequence);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_cayu_events_budget_reservation_identity
+        ON cayu_events(json_extract(payload_json, '$.reservation_id'))
+        WHERE event_type = 'budget.reserved'
+          AND json_type(payload_json, '$.reservation_id') = 'text';
     CREATE INDEX IF NOT EXISTS idx_cayu_events_pending_action_barrier
         ON cayu_events(session_id, sequence)
         WHERE event_type = 'session.resumed'
@@ -634,8 +645,19 @@ _MIGRATION_STEPS: dict[int, str] = {
         );
 
     """,
-    23: "",
-    24: "",
+    23: """
+        CREATE TABLE IF NOT EXISTS cayu_budget_reservation_identities (
+            reservation_id TEXT PRIMARY KEY,
+            publication_session_id TEXT NOT NULL,
+            publication_id TEXT NOT NULL,
+            published INTEGER NOT NULL CHECK (published IN (0, 1))
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_cayu_events_budget_reservation_identity
+            ON cayu_events(json_extract(payload_json, '$.reservation_id'))
+            WHERE event_type = 'budget.reserved'
+              AND json_type(payload_json, '$.reservation_id') = 'text';
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -842,7 +864,7 @@ def _add_budget_billing_identity_if_present(connection: sqlite3.Connection) -> N
         )
 
 
-def _add_budget_limit_identity_if_present(connection: sqlite3.Connection) -> None:
+def _add_budget_execution_identity_if_present(connection: sqlite3.Connection) -> None:
     """Add revision-23 identity without fabricating attribution for old rows."""
 
     exists = connection.execute(
@@ -855,19 +877,6 @@ def _add_budget_limit_identity_if_present(connection: sqlite3.Connection) -> Non
             "budget_limit_id",
             "TEXT",
         )
-        connection.execute(
-            "CREATE INDEX IF NOT EXISTS idx_cayu_budget_reservations_limit "
-            "ON cayu_budget_reservations(budget_limit_id, status, updated_at)"
-        )
-
-
-def _add_budget_model_attempt_identity_if_present(connection: sqlite3.Connection) -> None:
-    """Add revision-24 linkage without guessing identities for legacy rows."""
-
-    exists = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cayu_budget_reservations'"
-    ).fetchone()
-    if exists is not None:
         _add_column_if_missing(
             connection,
             "cayu_budget_reservations",
@@ -879,6 +888,10 @@ def _add_budget_model_attempt_identity_if_present(connection: sqlite3.Connection
             "cayu_budget_reservations",
             "model_attempt_id",
             "TEXT",
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cayu_budget_reservations_limit "
+            "ON cayu_budget_reservations(budget_limit_id, status, updated_at)"
         )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_cayu_budget_reservations_model_attempt "
@@ -893,8 +906,7 @@ _MIGRATION_HOOKS: dict[int, Callable[[sqlite3.Connection], None]] = {
     8: _migrate_legacy_budget_reservations,
     14: _backfill_session_activity,
     21: _add_budget_billing_identity_if_present,
-    23: _add_budget_limit_identity_if_present,
-    24: _add_budget_model_attempt_identity_if_present,
+    23: _add_budget_execution_identity_if_present,
 }
 
 _REVISION_17_INDEX_NAMES = frozenset(
@@ -904,6 +916,8 @@ _REVISION_17_INDEX_NAMES = frozenset(
         "idx_cayu_events_pending_action_lookup",
     }
 )
+_RESERVATION_EVENT_INDEX_NAME = "idx_cayu_events_budget_reservation_identity"
+_RESERVATION_IDENTITY_TABLE_NAME = "cayu_budget_reservation_identities"
 
 
 def _normalize_sqlite_schema_definition(definition: str) -> str:
@@ -978,6 +992,102 @@ def _repair_missing_revision_17_indexes(connection: sqlite3.Connection) -> None:
         _validate_revision_17_indexes(connection, require_all=True)
 
 
+def _reservation_event_index_definition() -> str:
+    statements = tuple(
+        statement
+        for statement in _iter_statements(_MIGRATION_STEPS[23])
+        if _RESERVATION_EVENT_INDEX_NAME in statement
+    )
+    if len(statements) != 1:
+        raise RuntimeError("Cayu reservation event index definition is incomplete.")
+    return statements[0]
+
+
+def _validate_reservation_event_index(
+    connection: sqlite3.Connection,
+    *,
+    require: bool,
+) -> None:
+    row = connection.execute(
+        "SELECT type, tbl_name, sql FROM sqlite_master WHERE name = ?",
+        (_RESERVATION_EVENT_INDEX_NAME,),
+    ).fetchone()
+    if row is None:
+        if require:
+            raise RuntimeError(
+                f"Required Cayu SQLite index is missing: {_RESERVATION_EVENT_INDEX_NAME}. "
+                "Run with schema_mode='migrate' to repair the schema."
+            )
+        return
+    actual_type, table_name, actual_definition = row
+    if (
+        actual_type != "index"
+        or table_name != "cayu_events"
+        or actual_definition is None
+        or (
+            _normalize_sqlite_schema_definition(actual_definition)
+            != _normalize_sqlite_schema_definition(_reservation_event_index_definition())
+        )
+    ):
+        raise RuntimeError(
+            f"SQLite schema object {_RESERVATION_EVENT_INDEX_NAME!r} conflicts with "
+            "Cayu's reservation identity contract. Rename or remove the conflicting object, then run "
+            "with schema_mode='migrate' to create the required unique index."
+        )
+
+
+def _repair_missing_reservation_event_index(connection: sqlite3.Connection) -> None:
+    with _transaction(connection):
+        _validate_reservation_event_index(connection, require=False)
+        row = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (_RESERVATION_EVENT_INDEX_NAME,),
+        ).fetchone()
+        if row is None:
+            connection.execute(_reservation_event_index_definition())
+        _validate_reservation_event_index(connection, require=True)
+
+
+def _validate_reservation_identity_registry(
+    connection: sqlite3.Connection,
+    *,
+    require: bool,
+) -> None:
+    row = connection.execute(
+        "SELECT type FROM sqlite_master WHERE name = ?",
+        (_RESERVATION_IDENTITY_TABLE_NAME,),
+    ).fetchone()
+    if row is None:
+        if require:
+            raise RuntimeError(
+                f"Required Cayu SQLite table is missing: "
+                f"{_RESERVATION_IDENTITY_TABLE_NAME}. Restore the permanent "
+                "reservation ownership registry from a known-good backup."
+            )
+        return
+    columns = connection.execute(
+        f"PRAGMA table_info({_RESERVATION_IDENTITY_TABLE_NAME})"
+    ).fetchall()
+    actual = tuple(
+        (column[1], column[2].upper(), bool(column[3]), int(column[5])) for column in columns
+    )
+    expected = (
+        ("reservation_id", "TEXT", False, 1),
+        ("publication_session_id", "TEXT", True, 0),
+        ("publication_id", "TEXT", True, 0),
+        ("published", "INTEGER", True, 0),
+    )
+    foreign_keys = connection.execute(
+        f"PRAGMA foreign_key_list({_RESERVATION_IDENTITY_TABLE_NAME})"
+    ).fetchall()
+    if row[0] != "table" or actual != expected or foreign_keys:
+        raise RuntimeError(
+            f"SQLite schema object {_RESERVATION_IDENTITY_TABLE_NAME!r} conflicts "
+            "with Cayu's reservation identity contract. Restore the required "
+            "ownership registry from a known-good backup."
+        )
+
+
 def reconcile_schema(
     connection: sqlite3.Connection,
     schema_mode: schema.SchemaMode = schema.SchemaMode.CREATE,
@@ -1018,6 +1128,12 @@ def reconcile_schema(
             _repair_missing_revision_17_indexes(connection)
         else:
             _validate_revision_17_indexes(connection, require_all=True)
+    if current.revision >= 23:
+        if schema_mode is schema.SchemaMode.MIGRATE:
+            _repair_missing_reservation_event_index(connection)
+        else:
+            _validate_reservation_event_index(connection, require=True)
+        _validate_reservation_identity_registry(connection, require=True)
 
 
 def initialize_schema(connection: sqlite3.Connection) -> None:
@@ -1114,6 +1230,18 @@ def _apply_pending(connection: sqlite3.Connection, state: schema.SchemaState) ->
 def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> None:
     if rev.revision == 17:
         _apply_revision_seventeen(connection, rev)
+        return
+    if rev.revision == 23:
+        with _transaction(connection):
+            _validate_reservation_event_index(connection, require=False)
+            for statement in _iter_statements(_MIGRATION_STEPS[23]):
+                connection.execute(statement)
+            hook = _MIGRATION_HOOKS[23]
+            hook(connection)
+            _validate_reservation_event_index(connection, require=True)
+            _validate_reservation_identity_registry(connection, require=True)
+            _record_revision(connection, rev)
+            connection.execute(f"PRAGMA user_version = {rev.revision}")
         return
     with _transaction(connection):
         for table, column, decl in _MIGRATION_ADD_COLUMNS.get(rev.revision, ()):

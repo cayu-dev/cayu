@@ -89,6 +89,7 @@ from cayu.runtime._model_errors import (
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
     copy_model_attempt_identity,
+    strip_runtime_owned_execution_identity,
 )
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy, retry_decision
 from cayu.runtime.sessions import Session
@@ -4191,6 +4192,7 @@ def _compaction_completion_observer(
         # This correlation key is runtime-owned; provider metadata cannot select or
         # overwrite another compaction attempt's ledger entry.
         observed_metadata.pop(_COMPACTION_ATTEMPT_ID_KEY, None)
+        strip_runtime_owned_execution_identity(observed_metadata)
         accounting_usage_error: _CompactionAccountingUsageError | None = None
         try:
             payload = _compaction_model_completed_payload(
@@ -4239,6 +4241,7 @@ def _completion_metadata_with_billing_identity(
         completed_metadata,
         "completed_metadata",
     )
+    strip_runtime_owned_execution_identity(observed_metadata)
     strip_provider_billing_identity(observed_metadata)
     if identity is not None:
         observed_metadata["billing_identity"] = identity.model_dump(mode="json")
@@ -4411,6 +4414,7 @@ async def _run_compaction_model(
             completed_metadata,
             "completed_metadata",
         )
+        strip_runtime_owned_execution_identity(provider_metadata)
         strip_provider_billing_identity(provider_metadata)
         best_known_metadata = _completion_metadata_with_billing_identity(
             provider_metadata,
@@ -6461,6 +6465,7 @@ def _provider_completed_metadata(
     copied = copy_json_value(payload, "completed")
     if type(copied) is not dict:
         raise ValueError("Provider completed payload must be an object.")
+    strip_runtime_owned_execution_identity(copied)
     copied.pop("provider_state", None)
     strip_provider_billing_identity(copied)
     normalization_failed = copied.pop("usage_normalization_failed", None)

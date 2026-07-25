@@ -7,6 +7,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 from itertools import chain
+from threading import Lock
 from typing import Any, Literal, NamedTuple, cast
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -66,6 +67,8 @@ _ALL_TIME_WINDOW = "all_time"
 _ROLLING_PREFIX = "rolling:"
 _ROLLING_SUFFIX = "s"
 _CALENDAR_PREFIX = "calendar:"
+_BUDGET_LEDGER_IDENTITY_STATE_ATTRIBUTE = "_cayu_runtime_budget_reservation_identity_state_v1"
+_BUDGET_LEDGER_IDENTITY_STATE_INIT_LOCK = Lock()
 
 _BUDGET_INSPECTION_EVENT_TYPES = frozenset(
     {
@@ -77,6 +80,34 @@ _BUDGET_INSPECTION_EVENT_TYPES = frozenset(
         EventType.BUDGET_RESERVATION_RELEASED,
     }
 )
+
+
+class BudgetReservationIdentityConflict(RuntimeError):
+    """A reservation identity was already linked to another durable event."""
+
+
+class _BudgetLedgerReservationIdentityState:
+    """Process-local fallback ownership registry for one ledger instance."""
+
+    def __init__(self) -> None:
+        self.lock = Lock()
+        self.claims: dict[str, tuple[str, str]] = {}
+
+
+def _budget_ledger_reservation_identity_state(
+    ledger: BudgetLedger,
+) -> _BudgetLedgerReservationIdentityState:
+    """Return the runtime-owned fallback registry attached to ``ledger``."""
+
+    with _BUDGET_LEDGER_IDENTITY_STATE_INIT_LOCK:
+        attributes = object.__getattribute__(ledger, "__dict__")
+        state = attributes.get(_BUDGET_LEDGER_IDENTITY_STATE_ATTRIBUTE)
+        if state is None:
+            state = _BudgetLedgerReservationIdentityState()
+            attributes[_BUDGET_LEDGER_IDENTITY_STATE_ATTRIBUTE] = state
+        elif type(state) is not _BudgetLedgerReservationIdentityState:
+            raise RuntimeError("Budget ledger reservation identity state is invalid.")
+        return state
 
 
 class SessionBudgetInspection(BaseModel):
@@ -736,12 +767,55 @@ class BudgetLimit(BaseModel):
 class _EffectiveBudgetLimit(BudgetLimit):
     """A configured limit after the runtime assigns its durable ledger identity."""
 
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+    )
+
     budget_limit_id: str
+    identity_namespace: str = Field(exclude=True, repr=False)
+    identity_definition_sha256: str = Field(exclude=True, repr=False)
+    identity_occurrences: StrictInt = Field(ge=1, exclude=True, repr=False)
+    identity_occurrence: StrictInt = Field(ge=0, exclude=True, repr=False)
 
     @field_validator("budget_limit_id")
     @classmethod
     def validate_budget_limit_id(cls, value: str) -> str:
         return BudgetLimitIdentity(budget_limit_id=value).budget_limit_id
+
+    @field_validator("identity_namespace")
+    @classmethod
+    def validate_identity_namespace(cls, value: str) -> str:
+        return require_clean_nonblank(value, "identity_namespace")
+
+    @field_validator("identity_definition_sha256")
+    @classmethod
+    def validate_identity_definition_sha256(cls, value: str) -> str:
+        if (
+            type(value) is not str
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError("identity_definition_sha256 must be a lowercase SHA-256 digest.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_runtime_identity(self) -> _EffectiveBudgetLimit:
+        if self.identity_occurrence >= self.identity_occurrences:
+            raise ValueError("Budget limit identity occurrence is outside its duplicate set.")
+        definition_digest = _budget_limit_definition_digest(self)
+        if definition_digest != self.identity_definition_sha256:
+            raise ValueError("Budget limit identity does not match its configured definition.")
+        expected_id = _budget_limit_id_from_material(
+            namespace=self.identity_namespace,
+            definition_digest=definition_digest,
+            definition_occurrences=self.identity_occurrences,
+            occurrence=self.identity_occurrence,
+        )
+        if self.budget_limit_id != expected_id:
+            raise ValueError("Budget limit identity does not match its runtime-owned material.")
+        return self
 
 
 class BudgetPolicy(BaseModel):
@@ -825,7 +899,7 @@ class BudgetCheck(BaseModel):
 class BudgetReservationRecord(BaseModel):
     """One reserved budget amount for a model step."""
 
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     reservation_id: str = Field(default_factory=lambda: f"bres_{uuid4().hex}")
     budget_limit_id: str
@@ -906,7 +980,7 @@ class BudgetReservationRecord(BaseModel):
 class BudgetReservationResult(BaseModel):
     """Result of attempting to reserve budget before a model step."""
 
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     accepted: StrictBool
     budget_limit_id: str
@@ -973,7 +1047,7 @@ class BudgetReservationResult(BaseModel):
 class BudgetReconciliation(BaseModel):
     """Result of reconciling a reservation after the model step completes."""
 
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     reservation_id: str
     budget_limit_id: str
@@ -1078,6 +1152,35 @@ class BudgetStore(ABC):
 class BudgetLedger(ABC):
     """Atomic reservation ledger for strict budget enforcement."""
 
+    async def claim_reservation_identity(
+        self,
+        *,
+        reservation_id: str,
+        publication_session_id: str,
+        publication_id: str,
+    ) -> None:
+        """Permanently bind one reservation id to its exact event publication.
+
+        The default protects all apps sharing this ledger instance in one
+        process. Durable multi-worker ledgers must override this method and
+        enforce the same idempotent claim in their shared storage.
+        """
+
+        reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
+        publication_session_id = require_clean_nonblank(
+            publication_session_id,
+            "publication_session_id",
+        )
+        publication_id = require_clean_nonblank(publication_id, "publication_id")
+        state = _budget_ledger_reservation_identity_state(self)
+        publication = (publication_session_id, publication_id)
+        with state.lock:
+            existing = state.claims.setdefault(reservation_id, publication)
+            if existing != publication:
+                raise BudgetReservationIdentityConflict(
+                    "Budget ledger reused a reservation identity."
+                )
+
     @property
     def reservation_ttl_seconds(self) -> int | None:
         """Active-reservation lease duration, or ``None`` for non-expiring ledgers.
@@ -1110,8 +1213,15 @@ class BudgetLedger(ABC):
         model: str,
         model_attempt_identity: ModelAttemptIdentity,
         billing_identity: BillingIdentity | None = None,
+        effective_at: datetime | None = None,
     ) -> BudgetReservationResult:
-        """Reserve budget for one provider dispatch if capacity remains."""
+        """Reserve budget for one provider dispatch if capacity remains.
+
+        ``effective_at`` fixes the pricing instant selected by the runtime.
+        Direct ledger callers may omit it to use the ledger's current clock.
+        Implementations must reject a generated ``reservation_id`` that is
+        already owned by another record before mutating the existing record.
+        """
 
     @abstractmethod
     async def reconcile(
@@ -1275,6 +1385,7 @@ class InMemoryBudgetLedger(BudgetLedger):
         model: str,
         model_attempt_identity: ModelAttemptIdentity,
         billing_identity: BillingIdentity | None = None,
+        effective_at: datetime | None = None,
     ) -> BudgetReservationResult:
         limit = _ensure_effective_budget_limit(
             limit,
@@ -1287,11 +1398,14 @@ class InMemoryBudgetLedger(BudgetLedger):
         model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
         async with self._lock:
             now = self._clock()
+            pricing_effective_at = (
+                now if effective_at is None else _utc_datetime(effective_at, "effective_at")
+            )
             request = _budget_reservation_amount(
                 limit=limit,
                 provider_name=provider_name,
                 model=model,
-                effective_at=now,
+                effective_at=pricing_effective_at,
                 billing_identity=billing_identity,
             )
             self._reap_expired_unlocked(now, limit=limit)
@@ -1330,6 +1444,10 @@ class InMemoryBudgetLedger(BudgetLedger):
                 created_at=now,
                 updated_at=now,
             )
+            if record.reservation_id in self._records:
+                raise BudgetReservationIdentityConflict(
+                    "Budget ledger reused a reservation identity."
+                )
             self._records[record.reservation_id] = record
             return _reservation_result(
                 limit=limit,
@@ -1591,7 +1709,49 @@ def request_budget_limits_for_session(
         copied,
         identity_namespace="request",
     )
-    for limit in effective_limits:
+    _validate_budget_limit_session_keys(
+        effective_limits,
+        agent_name=agent_name,
+        causal_budget_id=causal_budget_id,
+    )
+    return effective_limits
+
+
+def _operation_budget_limits_for_session(
+    *,
+    limits: Iterable[BudgetLimit | Mapping[str, Any]] | None,
+    agent_name: str,
+    causal_budget_id: str,
+) -> tuple[_EffectiveBudgetLimit, ...]:
+    """Verify resolved identities while assigning raw internal operation limits."""
+
+    copied = copy_request_budget_limits(limits)
+    agent_name = require_clean_nonblank(agent_name, "agent_name")
+    causal_budget_id = require_clean_nonblank(causal_budget_id, "causal_budget_id")
+    effective_limits = _effective_budget_limits(
+        copied,
+        identity_namespace="operation",
+        preserve_effective=True,
+    )
+    _validate_budget_limit_session_keys(
+        effective_limits,
+        agent_name=agent_name,
+        causal_budget_id=causal_budget_id,
+    )
+    return effective_limits
+
+
+def _validate_budget_limit_session_keys(
+    limits: Iterable[_EffectiveBudgetLimit],
+    *,
+    agent_name: str,
+    causal_budget_id: str,
+) -> None:
+    """Ensure keyed limits cannot be applied to a different runtime scope."""
+
+    agent_name = require_clean_nonblank(agent_name, "agent_name")
+    causal_budget_id = require_clean_nonblank(causal_budget_id, "causal_budget_id")
+    for limit in limits:
         if limit.scope == "agent" and limit.key != agent_name:
             raise ValueError(
                 f"Request agent budget limit key {limit.key!r} does not match "
@@ -1602,7 +1762,6 @@ def request_budget_limits_for_session(
                 f"Request causal budget limit key {limit.key!r} does not match "
                 f"session causal_budget_id {causal_budget_id!r}."
             )
-    return effective_limits
 
 
 def budget_check_from_events(
@@ -1722,6 +1881,10 @@ def _copy_effective_budget_limit(limit: _EffectiveBudgetLimit) -> _EffectiveBudg
     return _EffectiveBudgetLimit(
         **copied,
         budget_limit_id=limit.budget_limit_id,
+        identity_namespace=limit.identity_namespace,
+        identity_definition_sha256=limit.identity_definition_sha256,
+        identity_occurrences=limit.identity_occurrences,
+        identity_occurrence=limit.identity_occurrence,
     )
 
 
@@ -1745,6 +1908,7 @@ def _effective_budget_limits(
     limits: Iterable[BudgetLimit],
     *,
     identity_namespace: str,
+    preserve_effective: bool = False,
 ) -> tuple[_EffectiveBudgetLimit, ...]:
     """Assign stable opaque identities while keeping identical entries distinct."""
 
@@ -1752,15 +1916,15 @@ def _effective_budget_limits(
     prepared: list[tuple[BudgetLimit, str | None]] = []
     definition_counts: dict[str, int] = {}
     for limit in limits:
-        if type(limit) is _EffectiveBudgetLimit:
+        if type(limit) is _EffectiveBudgetLimit and preserve_effective:
             prepared.append((_copy_effective_budget_limit(limit), None))
             continue
-        copied_limit = _copy_budget_limit(limit)
-        definition = canonical_durable_json_bytes(
-            copied_limit.model_dump(mode="json"),
-            "budget_limit",
+        copied_limit = (
+            BudgetLimit(**_copy_budget_limit_fields(limit))
+            if type(limit) is _EffectiveBudgetLimit
+            else _copy_budget_limit(limit)
         )
-        definition_digest = sha256(definition).hexdigest()
+        definition_digest = _budget_limit_definition_digest(copied_limit)
         definition_counts[definition_digest] = definition_counts.get(definition_digest, 0) + 1
         prepared.append((copied_limit, definition_digest))
 
@@ -1775,28 +1939,95 @@ def _effective_budget_limits(
                 raise AssertionError("Configured budget limit is missing its definition digest.")
             occurrence = occurrences.get(definition_digest, 0)
             occurrences[definition_digest] = occurrence + 1
-            identity_material = canonical_durable_json_bytes(
-                {
-                    "namespace": namespace,
-                    "definition_sha256": definition_digest,
-                    # Membership is part of an indistinguishable duplicate
-                    # set's identity. Adding or removing one duplicate therefore
-                    # creates a new set instead of letting a survivor silently
-                    # assume the removed sibling's ledger identity.
-                    "definition_occurrences": definition_counts[definition_digest],
-                    "occurrence": occurrence,
-                },
-                "budget_limit_identity",
+            definition_occurrences = definition_counts[definition_digest]
+            budget_limit_id = _budget_limit_id_from_material(
+                namespace=namespace,
+                definition_digest=definition_digest,
+                definition_occurrences=definition_occurrences,
+                occurrence=occurrence,
             )
             copied = _EffectiveBudgetLimit(
                 **_copy_budget_limit_fields(limit),
-                budget_limit_id=f"blim_{sha256(identity_material).hexdigest()}",
+                budget_limit_id=budget_limit_id,
+                identity_namespace=namespace,
+                identity_definition_sha256=definition_digest,
+                identity_occurrences=definition_occurrences,
+                identity_occurrence=occurrence,
             )
         if copied.budget_limit_id in seen_ids:
             raise ValueError("Effective budget limits must have distinct identities.")
         seen_ids.add(copied.budget_limit_id)
         effective.append(copied)
     return tuple(effective)
+
+
+def _budget_limit_definition_digest(limit: BudgetLimit) -> str:
+    """Hash budget semantics independently of Decimal input spelling."""
+
+    configured = BudgetLimit(**_copy_budget_limit_fields(limit))
+    python_value = configured.model_dump(mode="python")
+    json_value = configured.model_dump(mode="json")
+    semantic_value = _semantic_budget_identity_value(python_value, json_value)
+    return sha256(canonical_durable_json_bytes(semantic_value, "budget_limit")).hexdigest()
+
+
+def _semantic_budget_identity_value(python_value: Any, json_value: Any) -> Any:
+    if type(python_value) is Decimal:
+        return {"decimal": _canonical_decimal_identity(python_value)}
+    if type(python_value) is dict and type(json_value) is dict:
+        if python_value.keys() != json_value.keys():
+            raise RuntimeError("Budget identity serialization changed object fields.")
+        return {
+            key: _semantic_budget_identity_value(python_value[key], json_value[key])
+            for key in python_value
+        }
+    if isinstance(python_value, list | tuple) and type(json_value) is list:
+        if len(python_value) != len(json_value):
+            raise RuntimeError("Budget identity serialization changed collection length.")
+        return [
+            _semantic_budget_identity_value(item, serialized)
+            for item, serialized in zip(python_value, json_value, strict=True)
+        ]
+    return json_value
+
+
+def _canonical_decimal_identity(value: Decimal) -> str:
+    if not value.is_finite():
+        raise ValueError("Budget identity decimals must be finite.")
+    sign, raw_digits, raw_exponent = value.as_tuple()
+    if not isinstance(raw_exponent, int):
+        raise ValueError("Budget identity decimal exponent must be finite.")
+    digits = list(raw_digits)
+    exponent = raw_exponent
+    while digits and digits[-1] == 0:
+        digits.pop()
+        exponent += 1
+    if not digits:
+        return "0"
+    coefficient = "".join(str(digit) for digit in digits)
+    return f"{'-' if sign else ''}{coefficient}e{exponent}"
+
+
+def _budget_limit_id_from_material(
+    *,
+    namespace: str,
+    definition_digest: str,
+    definition_occurrences: int,
+    occurrence: int,
+) -> str:
+    identity_material = canonical_durable_json_bytes(
+        {
+            "namespace": namespace,
+            "definition_sha256": definition_digest,
+            # Membership is part of an indistinguishable duplicate set's
+            # identity. Adding or removing one duplicate therefore creates a
+            # new set instead of letting a survivor inherit a sibling's ledger.
+            "definition_occurrences": definition_occurrences,
+            "occurrence": occurrence,
+        },
+        "budget_limit_identity",
+    )
+    return f"blim_{sha256(identity_material).hexdigest()}"
 
 
 def _ensure_effective_budget_limit(

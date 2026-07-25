@@ -157,7 +157,7 @@ def test_revision_twenty_two_rejects_workers_without_manifest_baselines() -> Non
     )
 
 
-def test_revision_twenty_three_rejects_pre_budget_limit_identity_workers() -> None:
+def test_revision_twenty_three_rejects_pre_execution_identity_workers() -> None:
     state = m.SchemaState(revision=23, compatible_from=23)
 
     with pytest.raises(m.SchemaTooNew, match="understands revision >= 23"):
@@ -178,28 +178,4 @@ def test_revision_twenty_three_rejects_pre_budget_limit_identity_workers() -> No
         state,
         app_latest=23,
         app_min_supported=23,
-    )
-
-
-def test_revision_twenty_four_rejects_pre_model_attempt_identity_workers() -> None:
-    state = m.SchemaState(revision=24, compatible_from=24)
-
-    with pytest.raises(m.SchemaTooNew, match="understands revision >= 24"):
-        m.validate(
-            state,
-            app_latest=23,
-            app_min_supported=23,
-        )
-
-    with pytest.raises(m.SchemaTooOld, match="requires >= 24"):
-        m.validate(
-            m.SchemaState(revision=23, compatible_from=23),
-            app_latest=24,
-            app_min_supported=24,
-        )
-
-    m.validate(
-        state,
-        app_latest=24,
-        app_min_supported=24,
     )

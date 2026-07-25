@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import io
 from datetime import UTC, datetime, timedelta
@@ -63,7 +64,9 @@ from cayu.runtime.budgets import BudgetLimit, BudgetPolicy, BudgetReservation
 from cayu.runtime.costs import ModelPrice, PriceBook
 from cayu.runtime.sessions import (
     PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES,
+    BudgetReservationIdentityConflict,
     PersistedEventSideEffectDelivery,
+    SessionRunFenced,
     _mcp_authoritative_manifest_hash,
     _mcp_manifest_session_ref,
 )
@@ -79,6 +82,7 @@ _POSTGRES_TABLES = (
     "cayu_event_watcher_state",
     "cayu_persisted_event_side_effects",
     "cayu_mcp_manifest_baselines",
+    "cayu_budget_reservation_identities",
     "cayu_events",
     "cayu_session_labels",
     "cayu_transcript_messages",
@@ -291,6 +295,421 @@ def test_session_store_conformance_declares_usage_aggregate_support(
         store = await _open_store(session_store_case)
         try:
             assert store.supports_usage_aggregates is True
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_rejects_store_wide_budget_reservation_reuse(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            first = await store.create(
+                RunRequest(
+                    session_id=f"reservation-identity-first-{session_store_case[0]}",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "first")],
+                ),
+                identity=_identity(),
+            )
+            second = await store.create(
+                RunRequest(
+                    session_id=f"reservation-identity-second-{session_store_case[0]}",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "second")],
+                ),
+                identity=_identity(),
+            )
+            reservation_id = "bres_shared_conformance_identity"
+            await store.append_event(
+                first.id,
+                Event(
+                    type=EventType.BUDGET_RESERVED,
+                    session_id=first.id,
+                    payload={"reservation_id": reservation_id},
+                ),
+            )
+
+            with pytest.raises(
+                BudgetReservationIdentityConflict,
+                match="Budget ledger reused a reservation identity",
+            ):
+                await store.append_event(
+                    second.id,
+                    Event(
+                        type=EventType.BUDGET_RESERVED,
+                        session_id=second.id,
+                        payload={"reservation_id": reservation_id},
+                    ),
+                )
+
+            assert [event.type for event in await store.load_events(first.id)] == [
+                EventType.BUDGET_RESERVED
+            ]
+            assert await store.load_events(second.id) == []
+
+            concurrent_sessions = [
+                await store.create(
+                    RunRequest(
+                        session_id=(f"reservation-identity-race-{index}-{session_store_case[0]}"),
+                        agent_name="assistant",
+                        messages=[Message.text("user", f"race {index}")],
+                    ),
+                    identity=_identity(),
+                )
+                for index in range(2)
+            ]
+            concurrent_reservation_id = "bres_shared_conformance_race_identity"
+            results = await asyncio.gather(
+                *(
+                    store.append_event(
+                        session.id,
+                        Event(
+                            type=EventType.BUDGET_RESERVED,
+                            session_id=session.id,
+                            payload={"reservation_id": concurrent_reservation_id},
+                        ),
+                    )
+                    for session in concurrent_sessions
+                ),
+                return_exceptions=True,
+            )
+
+            assert sum(result is None for result in results) == 1
+            conflicts = [
+                result
+                for result in results
+                if isinstance(result, BudgetReservationIdentityConflict)
+            ]
+            assert len(conflicts) == 1
+            concurrent_event_counts = [
+                len(await store.load_events(session.id)) for session in concurrent_sessions
+            ]
+            assert sum(concurrent_event_counts) == 1
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_retains_reservation_identity_after_session_deletion(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            first = await store.create(
+                RunRequest(
+                    session_id=f"reservation-delete-first-{session_store_case[0]}",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "first")],
+                ),
+                identity=_identity(),
+            )
+            reservation_id = "bres_shared_conformance_deleted_session"
+            await store.append_event(
+                first.id,
+                Event(
+                    type=EventType.BUDGET_RESERVED,
+                    session_id=first.id,
+                    payload={"reservation_id": reservation_id},
+                ),
+            )
+            await store.delete_session(first.id)
+            store = await _reopen_store(session_store_case, store)
+
+            second = await store.create(
+                RunRequest(
+                    session_id=f"reservation-delete-second-{session_store_case[0]}",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "second")],
+                ),
+                identity=_identity(),
+            )
+            with pytest.raises(
+                BudgetReservationIdentityConflict,
+                match="Budget ledger reused a reservation identity",
+            ):
+                await store.append_event(
+                    second.id,
+                    Event(
+                        type=EventType.BUDGET_RESERVED,
+                        session_id=second.id,
+                        payload={"reservation_id": reservation_id},
+                    ),
+                )
+            assert await store.load_events(second.id) == []
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_claims_reservation_publication_idempotently(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session = await store.create(
+                RunRequest(
+                    session_id=f"reservation-claim-{session_store_case[0]}",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "claim")],
+                ),
+                identity=_identity(),
+            )
+            event = Event(
+                type=EventType.BUDGET_RESERVED,
+                session_id=session.id,
+                payload={"reservation_id": "bres_shared_conformance_claim"},
+            )
+            await store.claim_budget_reservation_identity(
+                reservation_id="bres_shared_conformance_claim",
+                publication_session_id=session.id,
+                publication_id=event.id,
+            )
+            await store.claim_budget_reservation_identity(
+                reservation_id="bres_shared_conformance_claim",
+                publication_session_id=session.id,
+                publication_id=event.id,
+            )
+            with pytest.raises(
+                BudgetReservationIdentityConflict,
+                match="Budget ledger reused a reservation identity",
+            ):
+                await store.claim_budget_reservation_identity(
+                    reservation_id="bres_shared_conformance_claim",
+                    publication_session_id=session.id,
+                    publication_id="evt_conflicting_reservation_publication",
+                )
+            conflicting_session = await store.create(
+                RunRequest(
+                    session_id=f"reservation-claim-conflict-{session_store_case[0]}",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "conflict")],
+                ),
+                identity=_identity(),
+            )
+            with pytest.raises(
+                BudgetReservationIdentityConflict,
+                match="Budget ledger reused a reservation identity",
+            ):
+                await store.claim_budget_reservation_identity(
+                    reservation_id="bres_shared_conformance_claim",
+                    publication_session_id=conflicting_session.id,
+                    publication_id=event.id,
+                )
+            with pytest.raises(KeyError, match="Session not found"):
+                await store.claim_budget_reservation_identity(
+                    reservation_id="bres_shared_conformance_missing_session",
+                    publication_session_id="sess_missing_reservation_publication",
+                    publication_id=event.id,
+                )
+
+            await store.append_event(session.id, event)
+            assert [stored.id for stored in await store.load_events(session.id)] == [event.id]
+
+            concurrent_results = await asyncio.gather(
+                *(
+                    store.claim_budget_reservation_identity(
+                        reservation_id="bres_shared_conformance_concurrent_claim",
+                        publication_session_id=session.id,
+                        publication_id=publication_id,
+                    )
+                    for publication_id in (
+                        "evt_concurrent_claim_first",
+                        "evt_concurrent_claim_second",
+                    )
+                ),
+                return_exceptions=True,
+            )
+            assert sum(result is None for result in concurrent_results) == 1
+            assert (
+                sum(
+                    isinstance(result, BudgetReservationIdentityConflict)
+                    for result in concurrent_results
+                )
+                == 1
+            )
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_classifies_exact_budget_event_replay_as_duplicate(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session = await store.create(
+                RunRequest(
+                    session_id=f"reservation-event-replay-{session_store_case[0]}",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "publish")],
+                ),
+                identity=_identity(),
+            )
+            event = Event(
+                id="evt_shared_conformance_reservation_replay",
+                type=EventType.BUDGET_RESERVED,
+                session_id=session.id,
+                payload={"reservation_id": "bres_shared_conformance_reservation_replay"},
+            )
+
+            await store.append_event(session.id, event)
+
+            with pytest.raises(ValueError, match="Event already exists for session"):
+                await store.append_event(session.id, event)
+
+            assert [stored.id for stored in await store.load_events(session.id)] == [event.id]
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_enforces_reservation_claims_in_atomic_publication(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session = await store.create(
+                RunRequest(
+                    session_id=f"reservation-atomic-publication-{session_store_case[0]}",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "publish")],
+                ),
+                identity=_identity(),
+            )
+            await store.checkpoint(session.id, {"state": "before"})
+
+            reservation_id = "bres_shared_conformance_atomic_publication"
+            rightful_event = Event(
+                type=EventType.BUDGET_RESERVED,
+                session_id=session.id,
+                payload={"reservation_id": reservation_id},
+            )
+            conflicting_event = Event(
+                type=EventType.BUDGET_RESERVED,
+                session_id=session.id,
+                payload={"reservation_id": reservation_id},
+            )
+            await store.claim_budget_reservation_identity(
+                reservation_id=reservation_id,
+                publication_session_id=session.id,
+                publication_id=rightful_event.id,
+            )
+
+            with pytest.raises(
+                BudgetReservationIdentityConflict,
+                match="Budget ledger reused a reservation identity",
+            ):
+                await store.publish_checkpoint_and_events(
+                    session.id,
+                    checkpoint_transform=lambda _session, _checkpoint: {"state": "conflicting"},
+                    events=[conflicting_event],
+                )
+
+            assert await store.load_checkpoint(session.id) == {"state": "before"}
+            assert await store.load_events(session.id) == []
+
+            await store.publish_checkpoint_and_events(
+                session.id,
+                checkpoint_transform=lambda _session, _checkpoint: {"state": "published"},
+                events=[rightful_event],
+            )
+
+            assert await store.load_checkpoint(session.id) == {"state": "published"}
+            assert [event.id for event in await store.load_events(session.id)] == [
+                rightful_event.id
+            ]
+            with pytest.raises(ValueError, match="Event already exists for session"):
+                await store.publish_checkpoint_and_events(
+                    session.id,
+                    checkpoint_transform=lambda _session, _checkpoint: {"state": "duplicate"},
+                    events=[rightful_event],
+                )
+
+            assert await store.load_checkpoint(session.id) == {"state": "published"}
+            assert [event.id for event in await store.load_events(session.id)] == [
+                rightful_event.id
+            ]
+            await store.claim_budget_reservation_identity(
+                reservation_id=reservation_id,
+                publication_session_id=session.id,
+                publication_id=rightful_event.id,
+            )
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_fences_stale_reservation_claims(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        replacement_ready = asyncio.Event()
+        allow_replacement_claim = asyncio.Event()
+        try:
+            created = await store.create(
+                RunRequest(
+                    session_id=f"reservation-claim-fence-{session_store_case[0]}",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "claim")],
+                ),
+                identity=_identity(),
+            )
+            owned = await store.transition_status(
+                created.id,
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.RUNNING,
+            )
+
+            async def replace_owner_and_claim() -> Session:
+                replacement = await store.fence_stalled_run(
+                    created.id,
+                    statuses={SessionStatus.RUNNING},
+                    inactive_before=datetime.max.replace(tzinfo=UTC),
+                )
+                assert replacement is not None
+                assert replacement.run_epoch == owned.run_epoch + 1
+                replacement_ready.set()
+                await allow_replacement_claim.wait()
+                await store.claim_budget_reservation_identity(
+                    reservation_id="bres_shared_conformance_fenced_claim",
+                    publication_session_id=created.id,
+                    publication_id="evt_replacement_reservation_publication",
+                )
+                await store.release_run_fence(created.id)
+                return replacement
+
+            replacement_task = asyncio.create_task(
+                replace_owner_and_claim(),
+                context=contextvars.Context(),
+            )
+            await asyncio.wait_for(replacement_ready.wait(), timeout=5)
+            try:
+                with pytest.raises(
+                    SessionRunFenced,
+                    match="Session run epoch no longer owns",
+                ):
+                    await store.claim_budget_reservation_identity(
+                        reservation_id="bres_shared_conformance_fenced_claim",
+                        publication_session_id=created.id,
+                        publication_id="evt_stale_reservation_publication",
+                    )
+            finally:
+                allow_replacement_claim.set()
+            await replacement_task
         finally:
             await _close_store(store)
 

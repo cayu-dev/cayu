@@ -1,11 +1,31 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import Any
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from cayu._validation import EXECUTION_UNIT_ID_MAX_CHARS, require_execution_unit_id
+
+RUNTIME_OWNED_EXECUTION_IDENTITY_FIELDS = frozenset(
+    {
+        "model_step_id",
+        "model_attempt_id",
+        "tool_round_id",
+        "budget_limit_id",
+        "reservation_id",
+    }
+)
+
+
+def strip_runtime_owned_execution_identity(payload: dict[str, Any]) -> None:
+    """Remove identity authority that an extension or provider cannot supply."""
+
+    if type(payload) is not dict:
+        raise TypeError("Runtime identity payload must be an object.")
+    for field_name in RUNTIME_OWNED_EXECUTION_IDENTITY_FIELDS:
+        payload.pop(field_name, None)
 
 
 class ModelStepIdentity(BaseModel):

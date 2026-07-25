@@ -65,6 +65,14 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS cayu_budget_reservation_identities (
+        reservation_id TEXT PRIMARY KEY,
+        publication_session_id TEXT NOT NULL,
+        publication_id TEXT NOT NULL,
+        published BOOLEAN NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS cayu_persisted_event_side_effects (
         session_id TEXT NOT NULL,
         event_id TEXT NOT NULL,
@@ -212,6 +220,12 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     "ON cayu_session_labels(key, value, session_id)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_session_order "
     "ON cayu_events(session_id, session_order)",
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_cayu_events_budget_reservation_identity
+    ON cayu_events ((payload ->> 'reservation_id'))
+    WHERE event_type = 'budget.reserved'
+      AND jsonb_typeof(payload -> 'reservation_id') = 'string'
+    """,
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_session_sequence "
     "ON cayu_events(session_id, sequence)",
     """

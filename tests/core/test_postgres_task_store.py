@@ -23,6 +23,7 @@ pytestmark = pytest.mark.usefixtures("postgres_dsn")
 
 _TABLES = (
     "cayu_event_watcher_state",
+    "cayu_budget_reservation_identities",
     "cayu_events",
     "cayu_transcript_messages",
     "cayu_session_message_queue",

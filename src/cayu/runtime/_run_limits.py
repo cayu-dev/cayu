@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -17,6 +17,7 @@ from cayu.core.billing import (
     BillingIdentityState,
     ResolvedBillingIdentity,
     completed_billing_identity,
+    copy_billing_identity,
     resolved_billing_identity,
 )
 from cayu.core.events import Event, EventType
@@ -29,12 +30,16 @@ from cayu.runtime.budgets import (
     BudgetLimit,
     BudgetPolicy,
     BudgetReconciliation,
+    BudgetReservationIdentityConflict,
     BudgetReservationRecord,
     BudgetReservationResult,
     BudgetStore,
+    _budget_reservation_amount,
+    _copy_effective_budget_limit,
     _effective_budget_limits,
     _EffectiveBudgetLimit,
     _is_expired_reservation_reason,
+    _operation_budget_limits_for_session,
     budget_actual_cost_for_event,
     budget_check_from_events,
     budget_check_payload,
@@ -54,7 +59,13 @@ from cayu.runtime.execution_units import (
     copy_model_attempt_identity,
     copy_model_step_identity,
 )
-from cayu.runtime.sessions import EventQuery, EventRecord, Session, SessionStore
+from cayu.runtime.sessions import (
+    EventQuery,
+    EventRecord,
+    Session,
+    SessionRunFenced,
+    SessionStore,
+)
 from cayu.runtime.stop_policy import (
     RunLimits,
     StopDecision,
@@ -113,11 +124,17 @@ def _validate_ledger_reservation_result(
     provider_name: str,
     model: str,
     billing_identity: BillingIdentity | None,
-) -> None:
-    """Reject a custom ledger response that changes the requested reservation identity."""
+    expected_requested_amount: Decimal,
+) -> BudgetReservationResult:
+    """Detach and validate one untrusted custom-ledger reservation response."""
 
     if type(result) is not BudgetReservationResult:
         raise TypeError("Budget ledger reserve() must return a BudgetReservationResult.")
+    if result.record is not None and type(result.record) is not BudgetReservationRecord:
+        raise TypeError(
+            "Budget ledger reservation records must be BudgetReservationRecord instances."
+        )
+    result = BudgetReservationResult.model_validate(result.model_dump(mode="python"))
     expected_identity = copy_model_attempt_identity(model_attempt_identity)
     if (
         result.budget_limit_id != limit.budget_limit_id
@@ -131,10 +148,16 @@ def _validate_ledger_reservation_result(
         or result.action != limit.action
     ):
         raise RuntimeError("Budget ledger reservation result changed its requested identity.")
+    if result.requested != expected_requested_amount:
+        raise RuntimeError("Budget ledger reservation result changed its requested amount.")
     if not result.accepted:
         if result.record is not None:
             raise RuntimeError("Rejected budget reservation unexpectedly returned a record.")
-        return
+        if result.actual <= result.maximum:
+            raise RuntimeError("Rejected budget reservation did not exceed its configured maximum.")
+        return result
+    if result.actual < result.requested or result.actual > result.maximum:
+        raise RuntimeError("Accepted budget reservation violated its configured maximum.")
     record = result.record
     if record is None:
         raise RuntimeError("Accepted budget reservation did not return a record.")
@@ -156,6 +179,24 @@ def _validate_ledger_reservation_result(
         or record.actual_amount is not None
     ):
         raise RuntimeError("Budget ledger reservation record changed its requested identity.")
+    return result
+
+
+def _validate_ledger_limit_unchanged(
+    limit: _EffectiveBudgetLimit,
+    *,
+    expected: _EffectiveBudgetLimit,
+) -> None:
+    """Fail closed if a custom ledger mutates its detached limit argument."""
+
+    try:
+        detached = _copy_effective_budget_limit(limit)
+    except Exception:
+        raise RuntimeError(
+            "Budget ledger reservation result changed its requested identity."
+        ) from None
+    if detached != expected:
+        raise RuntimeError("Budget ledger reservation result changed its requested identity.")
 
 
 def _validate_ledger_reconciliation(
@@ -166,11 +207,25 @@ def _validate_ledger_reconciliation(
     expected_actual_amount: Decimal | None,
     expected_reason: str | None,
     expected_billing_identity: BillingIdentity | None,
-) -> None:
-    """Reject settlement evidence that does not exactly close the reservation."""
+) -> BudgetReconciliation:
+    """Detach and validate one untrusted custom-ledger settlement response."""
 
     if type(reconciliation) is not BudgetReconciliation:
         raise TypeError("Budget ledger settlement must return a BudgetReconciliation.")
+    reconciliation = BudgetReconciliation.model_validate(reconciliation.model_dump(mode="python"))
+    if any(
+        value is not None
+        for value in (
+            reconciliation.pricing_provider_name,
+            reconciliation.pricing_model,
+            reconciliation.pricing_match,
+            reconciliation.pricing_provenance,
+            reconciliation.pricing_effective_from,
+            reconciliation.pricing_effective_through,
+            reconciliation.pricing_tier_max_input_tokens,
+        )
+    ):
+        raise RuntimeError("Budget ledger settlement returned runtime-owned pricing evidence.")
     record = reservation.record
     expected_released_amount = (
         record.reserved_amount
@@ -193,6 +248,7 @@ def _validate_ledger_reconciliation(
         or reconciliation.billing_identity != expected_billing_identity
     ):
         raise RuntimeError("Budget ledger settlement changed its requested outcome.")
+    return reconciliation
 
 
 def _expected_reconciliation_billing_identity(
@@ -294,6 +350,7 @@ class BudgetModelStepLifecycle:
     dispatches: list[BudgetProviderDispatch] = field(default_factory=list)
     pending_reservations: tuple[BudgetStepReservation, ...] | None = None
     pending_model_attempt_identity: ModelAttemptIdentity | None = None
+    observed_reservation_ids: set[str] = field(default_factory=set)
     reservation_transition_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     @property
@@ -308,6 +365,11 @@ class BudgetModelStepLifecycle:
         model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
         if self.pending_reservations is not None or self.pending_model_attempt_identity is not None:
             raise RuntimeError("Provider dispatch already has prepared budget reservations.")
+        reservation_ids = {reservation.record.reservation_id for reservation in reservations}
+        if len(reservation_ids) != len(reservations) or (
+            reservation_ids & self.observed_reservation_ids
+        ):
+            raise RuntimeError("Budget ledger reused a reservation identity.")
         for reservation in reservations:
             if (
                 reservation.record.model_step_id != model_attempt_identity.model_step_id
@@ -316,6 +378,7 @@ class BudgetModelStepLifecycle:
                 raise ValueError(
                     "Prepared budget reservation belongs to a different model attempt."
                 )
+        self.observed_reservation_ids.update(reservation_ids)
         self.pending_reservations = tuple(reservations)
         self.pending_model_attempt_identity = model_attempt_identity
 
@@ -377,6 +440,7 @@ class BudgetReservationSetup:
 class OperationReservationSetup:
     reservations: tuple[BudgetStepReservation, ...]
     results: tuple[BudgetReservationResult, ...]
+    events: tuple[Event, ...]
     releases: tuple[BudgetReconciliation, ...]
     failure: BudgetReservationResult | None
     error: BaseException | None
@@ -456,6 +520,39 @@ class SessionUsageTracker:
         return self._events
 
 
+class BudgetReservationIdentityGuard:
+    """Atomically bind reservation identities in both shared durability domains."""
+
+    def __init__(self, session_store: SessionStore, budget_ledger: BudgetLedger) -> None:
+        self._session_store = session_store
+        self._budget_ledger = budget_ledger
+
+    async def claim(
+        self,
+        reservation_id: str,
+        *,
+        publication_session_id: str,
+        publication_id: str,
+    ) -> None:
+        """Claim one id before adding it to cleanup or provider-dispatch state."""
+        reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
+        publication_session_id = require_clean_nonblank(
+            publication_session_id,
+            "publication_session_id",
+        )
+        publication_id = require_clean_nonblank(publication_id, "publication_id")
+        claim = {
+            "reservation_id": reservation_id,
+            "publication_session_id": publication_session_id,
+            "publication_id": publication_id,
+        }
+        # Claim the publication store first so a stale session owner cannot
+        # poison the shared ledger registry. The ledger-domain claim then
+        # closes split-store topologies before provider-controlled work starts.
+        await self._session_store.claim_budget_reservation_identity(**claim)
+        await self._budget_ledger.claim_reservation_identity(**claim)
+
+
 class RunLimitController:
     """Evaluate run limits and own durable budget-accounting lifecycle."""
 
@@ -473,9 +570,18 @@ class RunLimitController:
         self._budget_ledger = budget_ledger
         self._event_writer = event_writer
         self._clock = clock
+        self._reservation_identity_guard = BudgetReservationIdentityGuard(
+            session_store,
+            budget_ledger,
+        )
 
     def usage_tracker(self, session_id: str) -> SessionUsageTracker:
         return SessionUsageTracker(self._session_store, session_id=session_id)
+
+    def reservation_identity_guard(self) -> BudgetReservationIdentityGuard:
+        """Return the controller's store-wide live identity guard."""
+
+        return self._reservation_identity_guard
 
     @property
     def reservation_ttl_seconds(self) -> int | None:
@@ -536,7 +642,7 @@ class RunLimitController:
     ) -> tuple[OperationBudgetCheck, ...]:
         """Evaluate scopes while including an operation's uncommitted events."""
 
-        budget_limits = request_budget_limits_for_session(
+        budget_limits = _operation_budget_limits_for_session(
             limits=budget_limits,
             agent_name=session.agent_name,
             causal_budget_id=session.causal_budget_id,
@@ -904,6 +1010,8 @@ class RunLimitController:
         budget_policy: BudgetPolicy | None,
         request_budget_limits: tuple[BudgetLimit, ...] = (),
         billing_identity: BillingIdentity | None = None,
+        existing_reservation_ids: Collection[str] = (),
+        reservation_identity_guard: BudgetReservationIdentityGuard | None = None,
     ) -> BudgetReservationSetup:
         model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
         limits = self.provider_reservation_limits(
@@ -916,58 +1024,99 @@ class RunLimitController:
             return BudgetReservationSetup((), None, (), None)
 
         reservations: list[BudgetStepReservation] = []
+        reservation_ids = set(existing_reservation_ids)
         emitted_events: list[Event] = []
         reservation_failure: BudgetReservationResult | None = None
         release_reason = "reservation setup failed"
+        expected_billing_identity = copy_billing_identity(billing_identity)
+        identity_guard = reservation_identity_guard or self.reservation_identity_guard()
         try:
             for limit in limits:
-                if billing_identity is None:
-                    result = await self._budget_ledger.reserve(
-                        limit=limit,
-                        session_id=session.id,
-                        agent_name=agent_name,
-                        provider_name=provider_name,
-                        model=session.model,
-                        model_attempt_identity=model_attempt_identity,
+                expected_limit = _copy_effective_budget_limit(limit)
+                ledger_limit = _copy_effective_budget_limit(limit)
+                ledger_model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
+                ledger_billing_identity = copy_billing_identity(expected_billing_identity)
+                reservation_effective_at = self._clock()
+                expected_requested_amount = _budget_reservation_amount(
+                    limit=expected_limit,
+                    provider_name=provider_name,
+                    model=session.model,
+                    effective_at=reservation_effective_at,
+                    billing_identity=expected_billing_identity,
+                )
+                try:
+                    if ledger_billing_identity is None:
+                        result = await self._budget_ledger.reserve(
+                            limit=ledger_limit,
+                            session_id=session.id,
+                            agent_name=agent_name,
+                            provider_name=provider_name,
+                            model=session.model,
+                            model_attempt_identity=ledger_model_attempt_identity,
+                            effective_at=reservation_effective_at,
+                        )
+                    else:
+                        result = await self._budget_ledger.reserve(
+                            limit=ledger_limit,
+                            session_id=session.id,
+                            agent_name=agent_name,
+                            provider_name=provider_name,
+                            model=session.model,
+                            model_attempt_identity=ledger_model_attempt_identity,
+                            billing_identity=ledger_billing_identity,
+                            effective_at=reservation_effective_at,
+                        )
+                finally:
+                    _validate_ledger_limit_unchanged(
+                        ledger_limit,
+                        expected=expected_limit,
                     )
-                else:
-                    result = await self._budget_ledger.reserve(
-                        limit=limit,
-                        session_id=session.id,
-                        agent_name=agent_name,
-                        provider_name=provider_name,
-                        model=session.model,
-                        model_attempt_identity=model_attempt_identity,
-                        billing_identity=billing_identity,
-                    )
-                _validate_ledger_reservation_result(
+                result = _validate_ledger_reservation_result(
                     result,
-                    limit=limit,
+                    limit=expected_limit,
                     model_attempt_identity=model_attempt_identity,
                     session_id=session.id,
                     agent_name=agent_name,
                     provider_name=provider_name,
                     model=session.model,
-                    billing_identity=billing_identity,
+                    billing_identity=expected_billing_identity,
+                    expected_requested_amount=expected_requested_amount,
+                )
+                reservation_event = Event(
+                    type=(
+                        EventType.BUDGET_RESERVED
+                        if result.accepted
+                        else EventType.BUDGET_RESERVATION_FAILED
+                    ),
+                    session_id=session.id,
+                    agent_name=agent_name,
+                    environment_name=environment_name,
+                    payload=budget_reservation_payload(result),
                 )
                 if result.accepted:
                     assert result.record is not None
-                    reservations.append(BudgetStepReservation(limit=limit, record=result.record))
-                emitted_events.append(
-                    await self._event_writer.emit(
-                        Event(
-                            type=(
-                                EventType.BUDGET_RESERVED
-                                if result.accepted
-                                else EventType.BUDGET_RESERVATION_FAILED
-                            ),
-                            session_id=session.id,
-                            agent_name=agent_name,
-                            environment_name=environment_name,
-                            payload=budget_reservation_payload(result),
-                        )
+                    if result.record.reservation_id in reservation_ids:
+                        raise RuntimeError("Budget ledger reused a reservation identity.")
+                    reservation = BudgetStepReservation(
+                        limit=expected_limit,
+                        record=result.record,
                     )
-                )
+                    # Stage the accepted record for cleanup before either durable
+                    # ownership claim can fail or lose its acknowledgement.
+                    # Exclude known ownership rejection: a collision could
+                    # settle the winner, and a fenced run has no release authority.
+                    reservations.append(reservation)
+                    try:
+                        await identity_guard.claim(
+                            result.record.reservation_id,
+                            publication_session_id=reservation_event.session_id,
+                            publication_id=reservation_event.id,
+                        )
+                    except (BudgetReservationIdentityConflict, SessionRunFenced):
+                        _remove_reservation(reservations, reservation)
+                        raise
+                    reservation_ids.add(result.record.reservation_id)
+                emitted_events.append(await self._event_writer.emit(reservation_event))
                 if not result.accepted:
                     reservation_failure = result
                     release_reason = "reservation failed"
@@ -1115,7 +1264,12 @@ class RunLimitController:
                             if priced_actual is not None
                             else completed_billing_identity
                         )
-                        if reconciliation_identity is None:
+                        expected_billing_identity = _expected_reconciliation_billing_identity(
+                            reservation,
+                            reconciliation_identity,
+                        )
+                        ledger_billing_identity = copy_billing_identity(reconciliation_identity)
+                        if ledger_billing_identity is None:
                             reconciliation = await self._budget_ledger.reconcile(
                                 reservation_id=reservation_id,
                                 actual_amount=actual_amount,
@@ -1128,18 +1282,15 @@ class RunLimitController:
                                 actual_amount=actual_amount,
                                 reason=reason,
                                 occurred_at=reconciled_at,
-                                billing_identity=reconciliation_identity,
+                                billing_identity=ledger_billing_identity,
                             )
-                        _validate_ledger_reconciliation(
+                        reconciliation = _validate_ledger_reconciliation(
                             reconciliation,
                             reservation=reservation,
                             expected_status="reconciled",
                             expected_actual_amount=actual_amount,
                             expected_reason=reason,
-                            expected_billing_identity=_expected_reconciliation_billing_identity(
-                                reservation,
-                                reconciliation_identity,
-                            ),
+                            expected_billing_identity=expected_billing_identity,
                         )
                         if priced_actual is not None:
                             reconciliation = budget_reconciliation_with_pricing(
@@ -1514,6 +1665,7 @@ class RunLimitController:
         authoritative_failure_types: tuple[type[BaseException], ...],
         billing_identity: BillingIdentity | None = None,
         pricing_provider_name: str | None = None,
+        reservation_identity_guard: BudgetReservationIdentityGuard | None = None,
     ) -> (
         BudgetedOperationSucceeded[_OperationResultT]
         | BudgetedOperationRejected
@@ -1522,12 +1674,13 @@ class RunLimitController:
         """Run one observable compactor dispatch under strict budget accounting."""
 
         model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
-        budget_limits = request_budget_limits_for_session(
+        budget_limits = _operation_budget_limits_for_session(
             limits=budget_limits,
             agent_name=agent_name,
             causal_budget_id=session.causal_budget_id,
         )
         lifecycle = _BudgetedOperationLifecycle()
+        identity_guard = reservation_identity_guard or self.reservation_identity_guard()
         prior_completion_events = (
             []
             if prior_completion_events is None
@@ -1589,28 +1742,26 @@ class RunLimitController:
                 model=model,
                 model_attempt_identity=model_attempt_identity,
                 billing_identity=billing_identity,
+                reservation_identity_guard=identity_guard,
                 rejection_release_reason="reservation failed",
                 accepted_record_error=(
                     "Accepted automatic compaction budget reservation has no record."
                 ),
+                reservation_event_factory=lambda reservation_result: Event(
+                    type=(
+                        EventType.BUDGET_RESERVED
+                        if reservation_result.accepted
+                        else EventType.BUDGET_RESERVATION_FAILED
+                    ),
+                    session_id=session.id,
+                    agent_name=agent_name,
+                    environment_name=environment_name,
+                    payload=budget_reservation_payload(reservation_result),
+                ),
             )
             lifecycle.reservations.extend(setup.reservations)
-            for reservation_result in setup.results:
-                lifecycle.events.append(
-                    await self._event_writer.emit(
-                        Event(
-                            type=(
-                                EventType.BUDGET_RESERVED
-                                if reservation_result.accepted
-                                else EventType.BUDGET_RESERVATION_FAILED
-                            ),
-                            session_id=session.id,
-                            agent_name=agent_name,
-                            environment_name=environment_name,
-                            payload=budget_reservation_payload(reservation_result),
-                        )
-                    )
-                )
+            for reservation_event in setup.events:
+                lifecycle.events.append(await self._event_writer.emit(reservation_event))
             for reconciliation in setup.releases:
                 lifecycle.events.append(
                     await self._event_writer.emit(
@@ -1886,7 +2037,12 @@ class RunLimitController:
                         priced_actuals[0].line_item.billing_identity or completed_billing_identity
                     )
                 occurred_at = completed_events[-1].timestamp if completed_events else self._clock()
-                if completed_billing_identity is None:
+                expected_billing_identity = _expected_reconciliation_billing_identity(
+                    reservation,
+                    completed_billing_identity,
+                )
+                ledger_billing_identity = copy_billing_identity(completed_billing_identity)
+                if ledger_billing_identity is None:
                     reconciliation = await self._budget_ledger.reconcile(
                         reservation_id=reservation.record.reservation_id,
                         actual_amount=actual_amount,
@@ -1899,18 +2055,15 @@ class RunLimitController:
                         actual_amount=actual_amount,
                         reason=reason,
                         occurred_at=occurred_at,
-                        billing_identity=completed_billing_identity,
+                        billing_identity=ledger_billing_identity,
                     )
-                _validate_ledger_reconciliation(
+                reconciliation = _validate_ledger_reconciliation(
                     reconciliation,
                     reservation=reservation,
                     expected_status="reconciled",
                     expected_actual_amount=actual_amount,
                     expected_reason=reason,
-                    expected_billing_identity=_expected_reconciliation_billing_identity(
-                        reservation,
-                        completed_billing_identity,
-                    ),
+                    expected_billing_identity=expected_billing_identity,
                 )
                 if len(completed_events) == 1 and len(priced_actuals) == 1:
                     reconciliation = budget_reconciliation_with_pricing(
@@ -1944,53 +2097,124 @@ class RunLimitController:
         model_attempt_identity: ModelAttemptIdentity,
         rejection_release_reason: str,
         accepted_record_error: str,
+        reservation_event_factory: Callable[[BudgetReservationResult], Event] | None = None,
         billing_identity: BillingIdentity | None = None,
+        reservation_identity_guard: BudgetReservationIdentityGuard | None = None,
     ) -> OperationReservationSetup:
         model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
         effective_limits = _effective_budget_limits(
             budget_limits,
             identity_namespace="operation",
+            preserve_effective=True,
         )
         limits = [limit for limit in effective_limits if limit.reservation is not None]
         if not limits or provider_name is None or model is None:
-            return OperationReservationSetup((), (), (), None, None)
+            return OperationReservationSetup((), (), (), (), None, None)
 
         reservations: list[BudgetStepReservation] = []
+        reservation_ids: set[str] = set()
         results: list[BudgetReservationResult] = []
+        events: list[Event] = []
         releases: list[BudgetReconciliation] = []
+        expected_billing_identity = copy_billing_identity(billing_identity)
+        identity_guard = reservation_identity_guard or self.reservation_identity_guard()
+        if reservation_event_factory is None:
+
+            def default_reservation_event_factory(
+                result: BudgetReservationResult,
+            ) -> Event:
+                return Event(
+                    type=(
+                        EventType.BUDGET_RESERVED
+                        if result.accepted
+                        else EventType.BUDGET_RESERVATION_FAILED
+                    ),
+                    session_id=session_id,
+                    agent_name=agent_name,
+                    payload=budget_reservation_payload(result),
+                )
+
+            event_factory = default_reservation_event_factory
+        else:
+            event_factory = reservation_event_factory
         for limit in limits:
             try:
-                if billing_identity is None:
-                    result = await self._budget_ledger.reserve(
-                        limit=limit,
-                        session_id=session_id,
-                        agent_name=agent_name,
-                        provider_name=provider_name,
-                        model=model,
-                        model_attempt_identity=model_attempt_identity,
+                expected_limit = _copy_effective_budget_limit(limit)
+                ledger_limit = _copy_effective_budget_limit(limit)
+                ledger_model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
+                ledger_billing_identity = copy_billing_identity(expected_billing_identity)
+                reservation_effective_at = self._clock()
+                expected_requested_amount = _budget_reservation_amount(
+                    limit=expected_limit,
+                    provider_name=provider_name,
+                    model=model,
+                    effective_at=reservation_effective_at,
+                    billing_identity=expected_billing_identity,
+                )
+                try:
+                    if ledger_billing_identity is None:
+                        result = await self._budget_ledger.reserve(
+                            limit=ledger_limit,
+                            session_id=session_id,
+                            agent_name=agent_name,
+                            provider_name=provider_name,
+                            model=model,
+                            model_attempt_identity=ledger_model_attempt_identity,
+                            effective_at=reservation_effective_at,
+                        )
+                    else:
+                        result = await self._budget_ledger.reserve(
+                            limit=ledger_limit,
+                            session_id=session_id,
+                            agent_name=agent_name,
+                            provider_name=provider_name,
+                            model=model,
+                            model_attempt_identity=ledger_model_attempt_identity,
+                            billing_identity=ledger_billing_identity,
+                            effective_at=reservation_effective_at,
+                        )
+                finally:
+                    _validate_ledger_limit_unchanged(
+                        ledger_limit,
+                        expected=expected_limit,
                     )
-                else:
-                    result = await self._budget_ledger.reserve(
-                        limit=limit,
-                        session_id=session_id,
-                        agent_name=agent_name,
-                        provider_name=provider_name,
-                        model=model,
-                        model_attempt_identity=model_attempt_identity,
-                        billing_identity=billing_identity,
-                    )
-                _validate_ledger_reservation_result(
+                result = _validate_ledger_reservation_result(
                     result,
-                    limit=limit,
+                    limit=expected_limit,
                     model_attempt_identity=model_attempt_identity,
                     session_id=session_id,
                     agent_name=agent_name,
                     provider_name=provider_name,
                     model=model,
-                    billing_identity=billing_identity,
+                    billing_identity=expected_billing_identity,
+                    expected_requested_amount=expected_requested_amount,
                 )
-                results.append(result)
+                reservation_event = event_factory(result)
+                if type(reservation_event) is not Event:
+                    raise TypeError("Reservation event factory must return an Event.")
+                expected_event_type = (
+                    EventType.BUDGET_RESERVED
+                    if result.accepted
+                    else EventType.BUDGET_RESERVATION_FAILED
+                )
+                if (
+                    reservation_event.type != expected_event_type
+                    or reservation_event.session_id != session_id
+                ):
+                    raise ValueError(
+                        "Reservation event factory returned an event for a different result."
+                    )
+                expected_payload = budget_reservation_payload(result)
+                if any(
+                    key not in reservation_event.payload or reservation_event.payload[key] != value
+                    for key, value in expected_payload.items()
+                ):
+                    raise ValueError(
+                        "Reservation event factory changed runtime-owned budget evidence."
+                    )
                 if not result.accepted:
+                    results.append(result)
+                    events.append(reservation_event)
                     async for reconciliation in self.release_operation_reservations(
                         reservations,
                         reason=rejection_release_reason,
@@ -1999,17 +2223,42 @@ class RunLimitController:
                     return OperationReservationSetup(
                         reservations=(),
                         results=tuple(results),
+                        events=tuple(events),
                         releases=tuple(releases),
                         failure=result,
                         error=None,
                     )
                 if result.record is None:  # pragma: no cover - validated above
                     raise RuntimeError(accepted_record_error)
-                reservations.append(BudgetStepReservation(limit=limit, record=result.record))
+                if result.record.reservation_id in reservation_ids:
+                    raise RuntimeError("Budget ledger reused a reservation identity.")
+                reservation = BudgetStepReservation(
+                    limit=expected_limit,
+                    record=result.record,
+                )
+                # Keep an accepted, uniquely identified reservation reachable by
+                # the caller's pre-dispatch cleanup if either ownership domain
+                # fails or loses its acknowledgement. Exclude known ownership
+                # rejection: a collision could settle the winner, and a fenced
+                # run has no release authority.
+                reservations.append(reservation)
+                try:
+                    await identity_guard.claim(
+                        result.record.reservation_id,
+                        publication_session_id=reservation_event.session_id,
+                        publication_id=reservation_event.id,
+                    )
+                except (BudgetReservationIdentityConflict, SessionRunFenced):
+                    _remove_reservation(reservations, reservation)
+                    raise
+                reservation_ids.add(result.record.reservation_id)
+                results.append(result)
+                events.append(reservation_event)
             except BaseException as exc:
                 return OperationReservationSetup(
                     reservations=tuple(reservations),
                     results=tuple(results),
+                    events=tuple(events),
                     releases=tuple(releases),
                     failure=(results[-1] if results and not results[-1].accepted else None),
                     error=exc,
@@ -2017,6 +2266,7 @@ class RunLimitController:
         return OperationReservationSetup(
             reservations=tuple(reservations),
             results=tuple(results),
+            events=tuple(events),
             releases=(),
             failure=None,
             error=None,
@@ -2077,7 +2327,12 @@ class RunLimitController:
         occurred_at = (
             model_completed_events[-1].timestamp if model_completed_events else self._clock()
         )
-        if completed_billing_identity is None:
+        expected_billing_identity = _expected_reconciliation_billing_identity(
+            reservation,
+            completed_billing_identity,
+        )
+        ledger_billing_identity = copy_billing_identity(completed_billing_identity)
+        if ledger_billing_identity is None:
             reconciliation = await self._budget_ledger.reconcile(
                 reservation_id=reservation.record.reservation_id,
                 actual_amount=actual_amount,
@@ -2090,18 +2345,15 @@ class RunLimitController:
                 actual_amount=actual_amount,
                 reason=reason,
                 occurred_at=occurred_at,
-                billing_identity=completed_billing_identity,
+                billing_identity=ledger_billing_identity,
             )
-        _validate_ledger_reconciliation(
+        reconciliation = _validate_ledger_reconciliation(
             reconciliation,
             reservation=reservation,
             expected_status="reconciled",
             expected_actual_amount=actual_amount,
             expected_reason=reason,
-            expected_billing_identity=_expected_reconciliation_billing_identity(
-                reservation,
-                completed_billing_identity,
-            ),
+            expected_billing_identity=expected_billing_identity,
         )
         if len(priced_actuals) == 1:
             reconciliation = budget_reconciliation_with_pricing(
@@ -2123,7 +2375,7 @@ class RunLimitController:
                 reason=reason,
                 occurred_at=self._clock(),
             )
-            _validate_ledger_reconciliation(
+            reconciliation = _validate_ledger_reconciliation(
                 reconciliation,
                 reservation=reservation,
                 expected_status="reconciled",
@@ -2145,7 +2397,7 @@ class RunLimitController:
                 reservation_id=reservation.record.reservation_id,
                 reason=reason,
             )
-            _validate_ledger_reconciliation(
+            reconciliation = _validate_ledger_reconciliation(
                 reconciliation,
                 reservation=reservation,
                 expected_status="released",
@@ -2170,7 +2422,7 @@ class RunLimitController:
                 reservation_id=reservation.record.reservation_id,
                 reason=reason,
             )
-            _validate_ledger_reconciliation(
+            reconciliation = _validate_ledger_reconciliation(
                 reconciliation,
                 reservation=reservation,
                 expected_status="released",

@@ -64,6 +64,7 @@ _TABLES = (
     "cayu_knowledge_entries",
     "cayu_event_watcher_dead_letters",
     "cayu_event_watcher_state",
+    "cayu_budget_reservation_identities",
     "cayu_events",
     "cayu_session_labels",
     "cayu_transcript_messages",
@@ -177,7 +178,7 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 22"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 23"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -225,10 +226,6 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
             )
             assert await cur.fetchone() == ("breaking", 23)
             await cur.execute(
-                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 24"
-            )
-            assert await cur.fetchone() == ("breaking", 24)
-            await cur.execute(
                 "SELECT column_name FROM information_schema.columns "
                 "WHERE table_schema = current_schema() "
                 "AND table_name = 'cayu_budget_reservations' "
@@ -274,7 +271,7 @@ def test_validate_mode_rejects_pre_insert_xid_postgres_schema(postgres_dsn: str)
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 22"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 23"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -301,7 +298,7 @@ def test_revision_fourteen_requires_cascade_index_migration(postgres_dsn: str) -
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 22"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 23"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -345,7 +342,7 @@ def test_revision_fifteen_requires_session_sequence_index_migration(postgres_dsn
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 22"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 23"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -494,7 +491,7 @@ def test_revision_seventeen_requires_pending_action_index_migration(
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 22"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 23"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -645,7 +642,7 @@ def test_revision_seventeen_requires_session_operation_migration(postgres_dsn: s
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 22"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 23"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -762,6 +759,134 @@ def test_recorded_revision_seventeen_validates_and_repairs_missing_index(
             await validated.ensure_schema()
         finally:
             await validated.close()
+
+    asyncio.run(runner())
+
+
+def test_recorded_revision_twenty_three_requires_the_unique_reservation_index(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DROP INDEX idx_cayu_events_budget_reservation_identity")
+                await cur.execute(
+                    "CREATE INDEX idx_cayu_events_budget_reservation_identity "
+                    "ON cayu_events ((payload ->> 'reservation_id')) "
+                    "WHERE event_type = 'budget.reserved'"
+                )
+            await conn.commit()
+
+        validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
+        try:
+            with pytest.raises(RuntimeError, match="required unique B-tree index"):
+                await validator.ensure_schema()
+        finally:
+            await validator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DROP INDEX idx_cayu_events_budget_reservation_identity")
+            await conn.commit()
+
+        migrator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            await migrator.ensure_schema()
+        finally:
+            await migrator.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute(
+                "SELECT index_definition.indisunique "
+                "FROM pg_catalog.pg_class AS index_class "
+                "JOIN pg_catalog.pg_namespace AS namespace "
+                "ON namespace.oid = index_class.relnamespace "
+                "JOIN pg_catalog.pg_index AS index_definition "
+                "ON index_definition.indexrelid = index_class.oid "
+                "WHERE namespace.nspname = current_schema() "
+                "AND index_class.relname = "
+                "'idx_cayu_events_budget_reservation_identity'"
+            )
+            assert await cur.fetchone() == (True,)
+
+    asyncio.run(runner())
+
+
+def test_recorded_revision_twenty_three_fails_closed_without_reservation_registry(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            session = await creator.create(
+                RunRequest(
+                    session_id="sess_registry_repair",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "seed")],
+                ),
+                identity=_identity(),
+            )
+            await creator.append_event(
+                session.id,
+                Event(
+                    type=EventType.BUDGET_RESERVED,
+                    session_id=session.id,
+                    payload={"reservation_id": "bres_registry_repair"},
+                ),
+            )
+            await creator.delete_session(session.id)
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DROP TABLE cayu_budget_reservation_identities")
+                await cur.execute(
+                    "CREATE TABLE cayu_budget_reservation_identities ("
+                    "reservation_id TEXT PRIMARY KEY, publication_id TEXT NOT NULL)"
+                )
+            await conn.commit()
+
+        validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
+        try:
+            with pytest.raises(RuntimeError, match="reservation identity contract"):
+                await validator.ensure_schema()
+        finally:
+            await validator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DROP TABLE cayu_budget_reservation_identities")
+            await conn.commit()
+
+        migrator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            with pytest.raises(RuntimeError, match="permanent reservation ownership registry"):
+                await migrator.ensure_schema()
+        finally:
+            await migrator.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute("SELECT to_regclass('cayu_budget_reservation_identities')")
+            assert (await cur.fetchone())[0] is None
 
     asyncio.run(runner())
 

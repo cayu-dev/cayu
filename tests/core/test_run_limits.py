@@ -225,6 +225,7 @@ class _CancelSecondReservationLedger(InMemoryBudgetLedger):
         provider_name: str,
         model: str,
         model_attempt_identity: ModelAttemptIdentity,
+        effective_at: datetime | None = None,
     ) -> BudgetReservationResult:
         self.reserve_calls += 1
         if self.reserve_calls == 2:
@@ -236,6 +237,7 @@ class _CancelSecondReservationLedger(InMemoryBudgetLedger):
             provider_name=provider_name,
             model=model,
             model_attempt_identity=model_attempt_identity,
+            effective_at=effective_at,
         )
         if result.record is not None:
             self.reservation_ids.append(result.record.reservation_id)
@@ -269,6 +271,7 @@ class _CancelFirstHeartbeatLedger(InMemoryBudgetLedger):
         provider_name: str,
         model: str,
         model_attempt_identity: ModelAttemptIdentity,
+        effective_at: datetime | None = None,
     ) -> BudgetReservationResult:
         result = await super().reserve(
             limit=limit,
@@ -277,6 +280,7 @@ class _CancelFirstHeartbeatLedger(InMemoryBudgetLedger):
             provider_name=provider_name,
             model=model,
             model_attempt_identity=model_attempt_identity,
+            effective_at=effective_at,
         )
         if result.record is not None:
             self.reservation_ids.append(result.record.reservation_id)
@@ -801,6 +805,7 @@ def test_controller_releases_prior_operation_reservations_when_later_limit_rejec
     controller = _controller(store, ledger=ledger)
 
     async def scenario():
+        await _running_session(store, "sess_operation_rejection")
         setup = await controller.reserve_operation_budgets(
             budget_limits=(_reserved_limit("2"), _reserved_limit("0.5")),
             session_id="sess_operation_rejection",
@@ -828,12 +833,184 @@ def test_controller_releases_prior_operation_reservations_when_later_limit_rejec
     assert renewed is False
 
 
+def test_controller_rejects_duplicate_operation_reservation_ids():
+    class DuplicateReservationIdLedger(InMemoryBudgetLedger):
+        first_reservation_id: str | None = None
+
+        async def reserve(self, **kwargs):
+            result = await super().reserve(**kwargs)
+            assert result.record is not None
+            if self.first_reservation_id is None:
+                self.first_reservation_id = result.record.reservation_id
+                return result
+            return result.model_copy(
+                update={
+                    "record": result.record.model_copy(
+                        update={"reservation_id": self.first_reservation_id}
+                    )
+                }
+            )
+
+    store = InMemorySessionStore()
+    ledger = DuplicateReservationIdLedger()
+    controller = _controller(store, ledger=ledger)
+
+    async def scenario():
+        await _running_session(store, "sess_duplicate_operation_reservation_identity")
+        setup = await controller.reserve_operation_budgets(
+            budget_limits=(_reserved_limit("3"), _reserved_limit("3")),
+            session_id="sess_duplicate_operation_reservation_identity",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+            model_attempt_identity=_model_attempt_identity(),
+            rejection_release_reason="reservation rejected",
+            accepted_record_error="accepted reservation missing record",
+        )
+        reservations = list(setup.reservations)
+        releases = [
+            reconciliation
+            async for reconciliation in controller.release_operation_reservations(
+                reservations,
+                reason="duplicate reservation identity",
+            )
+        ]
+        return setup, reservations, releases
+
+    setup, reservations, releases = asyncio.run(scenario())
+
+    assert len(setup.results) == 1
+    assert len(setup.reservations) == 1
+    assert isinstance(setup.error, RuntimeError)
+    assert str(setup.error) == "Budget ledger reused a reservation identity."
+    assert reservations == []
+    assert len(releases) == 1
+    assert releases[0].status == "released"
+
+
+def test_controller_returns_uniquely_accepted_reservation_when_identity_claim_fails():
+    class RecordingLedger(InMemoryBudgetLedger):
+        reservation_id: str | None = None
+
+        async def reserve(self, **kwargs):
+            result = await super().reserve(**kwargs)
+            assert result.record is not None
+            self.reservation_id = result.record.reservation_id
+            return result
+
+    class FailingIdentityGuard:
+        async def claim(self, *args, **kwargs):
+            del args, kwargs
+            raise ConnectionError("reservation identity claim acknowledgement lost")
+
+    store = InMemorySessionStore()
+    ledger = RecordingLedger()
+    controller = _controller(store, ledger=ledger)
+
+    async def scenario():
+        await _running_session(store, "sess_operation_identity_claim_failure")
+        setup = await controller.reserve_operation_budgets(
+            budget_limits=(_reserved_limit("3"),),
+            session_id="sess_operation_identity_claim_failure",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+            model_attempt_identity=_model_attempt_identity(),
+            rejection_release_reason="reservation rejected",
+            accepted_record_error="accepted reservation missing record",
+            reservation_identity_guard=FailingIdentityGuard(),
+        )
+        assert ledger.reservation_id is not None
+        active = await ledger.heartbeat(reservation_id=ledger.reservation_id)
+        reservations = list(setup.reservations)
+        releases = [
+            reconciliation
+            async for reconciliation in controller.release_operation_reservations(
+                reservations,
+                reason="identity claim failed before provider dispatch",
+            )
+        ]
+        still_active = await ledger.heartbeat(reservation_id=ledger.reservation_id)
+        return setup, active, still_active, reservations, releases
+
+    setup, active, still_active, reservations, releases = asyncio.run(scenario())
+
+    assert isinstance(setup.error, ConnectionError)
+    assert setup.results == ()
+    assert setup.events == ()
+    assert len(setup.reservations) == 1
+    assert active is True
+    assert still_active is False
+    assert reservations == []
+    assert len(releases) == 1
+    assert releases[0].status == "released"
+
+
+@pytest.mark.parametrize("failure_type", [ConnectionError, asyncio.CancelledError])
+def test_model_reservation_claim_failure_releases_before_dispatch(failure_type):
+    class RecordingLedger(InMemoryBudgetLedger):
+        reservation_id: str | None = None
+
+        async def reserve(self, **kwargs):
+            result = await super().reserve(**kwargs)
+            assert result.record is not None
+            self.reservation_id = result.record.reservation_id
+            return result
+
+    class FailingIdentityGuard:
+        async def claim(self, *args, **kwargs):
+            del args, kwargs
+            raise failure_type("reservation identity claim failed")
+
+    store = InMemorySessionStore()
+    ledger = RecordingLedger()
+    controller = _controller(store, ledger=ledger)
+
+    async def scenario():
+        session = await _running_session(store, "sess_model_identity_claim_failure")
+        setup = None
+        cancellation = None
+        try:
+            setup = await controller.reserve_for_model_step(
+                session=session,
+                agent_name="assistant",
+                provider_name="fake",
+                environment_name=None,
+                model_attempt_identity=_model_attempt_identity(),
+                budget_policy=BudgetPolicy(limits=(_reserved_limit("3"),)),
+                reservation_identity_guard=FailingIdentityGuard(),
+            )
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+        assert ledger.reservation_id is not None
+        active = await ledger.heartbeat(reservation_id=ledger.reservation_id)
+        records = await store.query_events(
+            EventQuery(session_id=session.id, limit=100),
+        )
+        return setup, cancellation, active, [record.event.type for record in records]
+
+    setup, cancellation, active, event_types = asyncio.run(scenario())
+
+    assert active is False
+    assert EventType.BUDGET_RESERVED not in event_types
+    assert EventType.BUDGET_RESERVATION_RELEASED in event_types
+    if failure_type is asyncio.CancelledError:
+        assert setup is None
+        assert isinstance(cancellation, asyncio.CancelledError)
+    else:
+        assert cancellation is None
+        assert setup is not None
+        assert isinstance(setup.error, ConnectionError)
+        assert setup.reservations == ()
+
+
 def test_controller_returns_partial_reservations_when_setup_is_cancelled():
     store = InMemorySessionStore()
     ledger = _CancelSecondReservationLedger()
     controller = _controller(store, ledger=ledger)
 
     async def scenario():
+        await _running_session(store, "sess_operation_setup_cancelled")
         setup = await controller.reserve_operation_budgets(
             budget_limits=(_reserved_limit("3"), _reserved_limit("3")),
             session_id="sess_operation_setup_cancelled",
@@ -901,6 +1078,7 @@ def test_controller_preserves_partial_release_progress_after_later_failure():
     controller = _controller(store, ledger=ledger)
 
     async def scenario():
+        await _running_session(store, "sess_partial_operation_release")
         setup = await controller.reserve_operation_budgets(
             budget_limits=(
                 _reserved_limit("4"),
@@ -1008,6 +1186,7 @@ def test_controller_reconciles_operation_reservations_with_priced_actuals():
     )
 
     async def scenario():
+        await _running_session(store, "sess_operation_reconcile")
         setup = await controller.reserve_operation_budgets(
             budget_limits=(_reserved_limit("2"),),
             session_id="sess_operation_reconcile",
@@ -1067,6 +1246,7 @@ def test_controller_arbitrates_operation_heartbeat_lease_loss():
     controller = _controller(store, ledger=ledger)
 
     async def scenario() -> None:
+        await _running_session(store, "sess_operation_heartbeat")
         setup = await controller.reserve_operation_budgets(
             budget_limits=(_reserved_limit("2"),),
             session_id="sess_operation_heartbeat",
@@ -1110,6 +1290,7 @@ def test_controller_preserves_completed_metadata_when_caller_cancellation_wins(
     }
 
     async def scenario() -> None:
+        await _running_session(store, "sess_operation_caller_cancel_metadata")
         setup = await controller.reserve_operation_budgets(
             budget_limits=(_reserved_limit("2"),),
             session_id="sess_operation_caller_cancel_metadata",
@@ -1168,6 +1349,7 @@ def test_controller_preserves_completed_metadata_when_heartbeat_lease_loss_wins(
     }
 
     async def scenario() -> None:
+        await _running_session(store, "sess_operation_lease_loss_metadata")
         setup = await controller.reserve_operation_budgets(
             budget_limits=(_reserved_limit("2"),),
             session_id="sess_operation_lease_loss_metadata",
@@ -1206,8 +1388,18 @@ def test_controller_preserves_completed_metadata_when_heartbeat_lease_loss_wins(
 
 
 def test_controller_returns_typed_success_for_budgeted_compactor_dispatch():
+    class PricingInstantLedger(InMemoryBudgetLedger):
+        def __init__(self) -> None:
+            super().__init__()
+            self.effective_at: list[datetime | None] = []
+
+        async def reserve(self, **kwargs):
+            self.effective_at.append(kwargs.get("effective_at"))
+            return await super().reserve(**kwargs)
+
     store = InMemorySessionStore()
-    controller = _controller(store)
+    ledger = PricingInstantLedger()
+    controller = _controller(store, ledger=ledger)
 
     async def scenario():
         session = await _running_session(store, "sess_budgeted_dispatch_success")
@@ -1254,6 +1446,7 @@ def test_controller_returns_typed_success_for_budgeted_compactor_dispatch():
 
     assert isinstance(outcome, BudgetedOperationSucceeded)
     assert outcome.result == "summary"
+    assert ledger.effective_at == [datetime(2026, 1, 1, tzinfo=UTC)]
     assert [event.type for event in outcome.events] == [
         EventType.BUDGET_RESERVED,
         EventType.BUDGET_RECONCILED,
@@ -1263,6 +1456,252 @@ def test_controller_returns_typed_success_for_budgeted_compactor_dispatch():
         "automatic context compaction completed with partially uncertain usage; "
         "charged known cost plus reserved amount per uncertain completion"
     )
+
+
+def test_controller_rejects_rewritten_compactor_reservation_amount_before_dispatch():
+    class UnderReservingLedger(InMemoryBudgetLedger):
+        async def reserve(self, **kwargs):
+            result = await super().reserve(**kwargs)
+            assert result.record is not None
+            rewritten_record = result.record.model_copy(update={"reserved_amount": Decimal("0")})
+            return result.model_copy(
+                update={
+                    "requested": Decimal("0"),
+                    "record": rewritten_record,
+                }
+            )
+
+    store = InMemorySessionStore()
+    controller = _controller(store, ledger=UnderReservingLedger())
+    dispatches = 0
+
+    async def scenario():
+        nonlocal dispatches
+        session = await _running_session(store, "sess_under_reserved_compactor_dispatch")
+
+        async def operation() -> str:
+            nonlocal dispatches
+            dispatches += 1
+            return "summary"
+
+        return await controller.run_automatic_compaction_dispatch(
+            operation,
+            completed_events=list,
+            budget_limits=(_reserved_limit("3"),),
+            session=session,
+            agent_name="assistant",
+            environment_name=None,
+            provider_name="fake",
+            model="fake-model",
+            model_attempt_identity=_model_attempt_identity(),
+            authoritative_failure_types=(),
+        )
+
+    outcome = asyncio.run(scenario())
+
+    assert isinstance(outcome, BudgetedOperationFailed)
+    assert dispatches == 0
+    assert outcome.events == ()
+    assert str(outcome.error) == "Budget ledger reservation result changed its requested amount."
+
+
+def test_controller_rejects_reservation_id_reuse_across_compactor_dispatches():
+    class ReusingReservationIdLedger(InMemoryBudgetLedger):
+        first_reservation_id: str | None = None
+
+        def __init__(self) -> None:
+            super().__init__(reservation_ttl_seconds=None)
+
+        async def reserve(self, **kwargs):
+            result = await super().reserve(**kwargs)
+            assert result.record is not None
+            if self.first_reservation_id is None:
+                self.first_reservation_id = result.record.reservation_id
+                return result
+            return result.model_copy(
+                update={
+                    "record": result.record.model_copy(
+                        update={"reservation_id": self.first_reservation_id}
+                    )
+                }
+            )
+
+    store = InMemorySessionStore()
+    controller = _controller(store, ledger=ReusingReservationIdLedger())
+    dispatches = 0
+
+    async def scenario():
+        nonlocal dispatches
+        session = await _running_session(store, "sess_reused_compactor_reservation_identity")
+
+        async def operation() -> str:
+            nonlocal dispatches
+            dispatches += 1
+            return "summary"
+
+        def completed_events() -> list[Event]:
+            return [
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id=session.id,
+                    agent_name="assistant",
+                    payload={
+                        "provider_name": "fake",
+                        "model": "fake-model",
+                        "usage": {
+                            "input_tokens": 250_000,
+                            "output_tokens": 0,
+                            "total_tokens": 250_000,
+                        },
+                    },
+                )
+            ]
+
+        first = await controller.run_automatic_compaction_dispatch(
+            operation,
+            completed_events=completed_events,
+            budget_limits=(_reserved_limit("3"),),
+            session=session,
+            agent_name="assistant",
+            environment_name=None,
+            provider_name="fake",
+            model="fake-model",
+            model_attempt_identity=_model_attempt_identity(),
+            authoritative_failure_types=(),
+        )
+        second = await controller.run_automatic_compaction_dispatch(
+            operation,
+            completed_events=completed_events,
+            budget_limits=(_reserved_limit("3"),),
+            session=session,
+            agent_name="assistant",
+            environment_name=None,
+            provider_name="fake",
+            model="fake-model",
+            model_attempt_identity=_model_attempt_identity(),
+            authoritative_failure_types=(),
+        )
+        return first, second
+
+    first, second = asyncio.run(scenario())
+
+    assert isinstance(first, BudgetedOperationSucceeded)
+    assert isinstance(second, BudgetedOperationFailed)
+    assert dispatches == 1
+    assert second.events == ()
+    assert str(second.error) == "Budget ledger reused a reservation identity."
+
+
+def test_concurrent_compactor_collision_does_not_release_the_winner():
+    class CoordinatedDuplicateLedger(InMemoryBudgetLedger):
+        def __init__(self) -> None:
+            super().__init__(reservation_ttl_seconds=None)
+            self.first_reservation_id: str | None = None
+            self.second_reserved = asyncio.Event()
+            self.release_second_result = asyncio.Event()
+
+        async def reserve(self, **kwargs):
+            result = await super().reserve(**kwargs)
+            assert result.record is not None
+            if kwargs["session_id"] == "sess_compactor_collision_winner":
+                self.first_reservation_id = result.record.reservation_id
+                await self.second_reserved.wait()
+                return result
+            self.second_reserved.set()
+            await self.release_second_result.wait()
+            assert self.first_reservation_id is not None
+            return result.model_copy(
+                update={
+                    "record": result.record.model_copy(
+                        update={"reservation_id": self.first_reservation_id}
+                    )
+                }
+            )
+
+    async def scenario():
+        store = InMemorySessionStore()
+        ledger = CoordinatedDuplicateLedger()
+        winner_controller = _controller(store, ledger=ledger)
+        loser_controller = _controller(store, ledger=ledger)
+        winner = await _running_session(store, "sess_compactor_collision_winner")
+        loser = await _running_session(store, "sess_compactor_collision_loser")
+        operation_started = asyncio.Event()
+        finish_operation = asyncio.Event()
+
+        async def winner_operation() -> str:
+            operation_started.set()
+            await finish_operation.wait()
+            return "summary"
+
+        async def loser_operation() -> str:
+            raise AssertionError("colliding compactor dispatch must not start")
+
+        def completed_events(session: Session) -> list[Event]:
+            return [
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id=session.id,
+                    agent_name="assistant",
+                    payload={
+                        "provider_name": "fake",
+                        "model": "fake-model",
+                        "usage": {
+                            "input_tokens": 250_000,
+                            "output_tokens": 0,
+                            "total_tokens": 250_000,
+                        },
+                    },
+                )
+            ]
+
+        winner_task = asyncio.create_task(
+            winner_controller.run_automatic_compaction_dispatch(
+                winner_operation,
+                completed_events=lambda: completed_events(winner),
+                budget_limits=(_reserved_limit("3"),),
+                session=winner,
+                agent_name="assistant",
+                environment_name=None,
+                provider_name="fake",
+                model="fake-model",
+                model_attempt_identity=_model_attempt_identity(),
+                authoritative_failure_types=(),
+            )
+        )
+        loser_task = asyncio.create_task(
+            loser_controller.run_automatic_compaction_dispatch(
+                loser_operation,
+                completed_events=lambda: completed_events(loser),
+                budget_limits=(_reserved_limit("3"),),
+                session=loser,
+                agent_name="assistant",
+                environment_name=None,
+                provider_name="fake",
+                model="fake-model",
+                model_attempt_identity=_model_attempt_identity(),
+                authoritative_failure_types=(),
+            )
+        )
+        await asyncio.wait_for(operation_started.wait(), timeout=5)
+        ledger.release_second_result.set()
+        loser_outcome = await asyncio.wait_for(loser_task, timeout=5)
+        assert ledger.first_reservation_id is not None
+        winner_still_active = await ledger.heartbeat(reservation_id=ledger.first_reservation_id)
+        finish_operation.set()
+        winner_outcome = await asyncio.wait_for(winner_task, timeout=5)
+        return winner_outcome, loser_outcome, winner_still_active
+
+    winner, loser, winner_still_active = asyncio.run(scenario())
+
+    assert winner_still_active is True
+    assert isinstance(winner, BudgetedOperationSucceeded)
+    assert isinstance(loser, BudgetedOperationFailed)
+    assert [event.type for event in winner.events] == [
+        EventType.BUDGET_RESERVED,
+        EventType.BUDGET_RECONCILED,
+    ]
+    assert loser.events == ()
+    assert str(loser.error) == "Budget ledger reused a reservation identity."
 
 
 def test_controller_returns_typed_rejection_without_dispatching_compactor():

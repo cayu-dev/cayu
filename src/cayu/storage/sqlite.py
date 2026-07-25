@@ -31,6 +31,7 @@ from cayu.runtime.sessions import (
     MAX_PENDING_ACTION_TOOL_CALLS,
     SESSION_INSPECTION_LABEL_LIMIT,
     SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
+    BudgetReservationIdentityConflict,
     CheckpointTransform,
     EnqueueSessionMessageRequest,
     EnqueueSessionMessageResult,
@@ -148,7 +149,7 @@ from cayu.storage import migrations as schema
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = 22
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = 23
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
     contains_style="sqlite_nocase_like",
@@ -225,6 +226,114 @@ def _session_exists(connection: sqlite3.Connection, session_id: str) -> bool:
         (session_id,),
     ).fetchone()
     return row is not None
+
+
+def _claim_budget_reservation_identity(
+    connection: sqlite3.Connection,
+    *,
+    reservation_id: str,
+    publication_session_id: str,
+    publication_id: str,
+) -> None:
+    inserted = connection.execute(
+        """
+        INSERT OR IGNORE INTO cayu_budget_reservation_identities (
+            reservation_id,
+            publication_session_id,
+            publication_id,
+            published
+        )
+        VALUES (?, ?, ?, 0)
+        """,
+        (reservation_id, publication_session_id, publication_id),
+    )
+    if inserted.rowcount == 1:
+        return
+    existing = connection.execute(
+        """
+        SELECT publication_session_id, publication_id
+        FROM cayu_budget_reservation_identities
+        WHERE reservation_id = ?
+        """,
+        (reservation_id,),
+    ).fetchone()
+    assert existing is not None
+    if (
+        existing["publication_session_id"],
+        existing["publication_id"],
+    ) != (publication_session_id, publication_id):
+        raise BudgetReservationIdentityConflict("Budget ledger reused a reservation identity.")
+
+
+def _publish_budget_reservation_identities(
+    connection: sqlite3.Connection,
+    events: list[Event],
+) -> None:
+    for event in events:
+        if event.type != EventType.BUDGET_RESERVED:
+            continue
+        raw_reservation_id = event.payload.get("reservation_id")
+        if type(raw_reservation_id) is not str:
+            continue
+        updated = connection.execute(
+            """
+            UPDATE cayu_budget_reservation_identities
+            SET published = 1
+            WHERE reservation_id = ?
+              AND publication_session_id = ?
+              AND publication_id = ?
+              AND published = 0
+            """,
+            (raw_reservation_id, event.session_id, event.id),
+        )
+        if updated.rowcount == 1:
+            continue
+        try:
+            connection.execute(
+                """
+                INSERT INTO cayu_budget_reservation_identities (
+                    reservation_id,
+                    publication_session_id,
+                    publication_id,
+                    published
+                )
+                VALUES (?, ?, ?, 1)
+                """,
+                (raw_reservation_id, event.session_id, event.id),
+            )
+        except sqlite3.IntegrityError:
+            existing = connection.execute(
+                """
+                SELECT publication_session_id, publication_id, published
+                FROM cayu_budget_reservation_identities
+                WHERE reservation_id = ?
+                """,
+                (raw_reservation_id,),
+            ).fetchone()
+            if (
+                existing is not None
+                and (
+                    existing["publication_session_id"],
+                    existing["publication_id"],
+                    existing["published"],
+                )
+                == (event.session_id, event.id, 1)
+                and connection.execute(
+                    """
+                    SELECT 1
+                    FROM cayu_events
+                    WHERE session_id = ? AND event_id = ?
+                    """,
+                    (event.session_id, event.id),
+                ).fetchone()
+                is not None
+            ):
+                # The reservation belongs to this exact persisted event. Let the
+                # event insert below classify the replay as a duplicate event.
+                continue
+            raise BudgetReservationIdentityConflict(
+                "Budget ledger reused a reservation identity."
+            ) from None
 
 
 def _raise_session_write_conflict(
@@ -1524,6 +1633,54 @@ class SQLiteSessionStore(SessionStore):
     async def append_event(self, session_id: str, event: Event) -> None:
         await self.append_events(session_id, [event])
 
+    async def claim_budget_reservation_identity(
+        self,
+        *,
+        reservation_id: str,
+        publication_session_id: str,
+        publication_id: str,
+    ) -> None:
+        reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
+        publication_session_id = require_clean_nonblank(
+            publication_session_id,
+            "publication_session_id",
+        )
+        publication_id = require_clean_nonblank(publication_id, "publication_id")
+        expected_run_epoch = _current_session_run_epoch(publication_session_id)
+
+        def statement(connection: sqlite3.Connection) -> None:
+            with connection:
+                # The conditional no-op acquires SQLite's writer lock while it
+                # validates the session epoch, so a takeover cannot interleave
+                # between this check and the registry claim below.
+                if expected_run_epoch is None:
+                    cursor = connection.execute(
+                        "UPDATE cayu_sessions SET run_epoch = run_epoch WHERE id = ?",
+                        (publication_session_id,),
+                    )
+                else:
+                    cursor = connection.execute(
+                        "UPDATE cayu_sessions SET run_epoch = run_epoch "
+                        "WHERE id = ? AND run_epoch = ?",
+                        (publication_session_id, expected_run_epoch),
+                    )
+                if cursor.rowcount != 1:
+                    if expected_run_epoch is not None:
+                        _raise_session_write_conflict(
+                            connection,
+                            publication_session_id,
+                            expected_run_epoch,
+                        )
+                    raise KeyError(f"Session not found: {publication_session_id}")
+                _claim_budget_reservation_identity(
+                    connection,
+                    reservation_id=reservation_id,
+                    publication_session_id=publication_session_id,
+                    publication_id=publication_id,
+                )
+
+        await self._run_write(statement)
+
     async def append_events(self, session_id: str, events: list[Event]) -> None:
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
@@ -1538,6 +1695,7 @@ class SQLiteSessionStore(SessionStore):
             try:
                 with connection:
                     _touch_session_activity(connection, session_id, datetime.now(UTC))
+                    _publish_budget_reservation_identities(connection, copied_events)
                     rows = []
                     for event in copied_events:
                         lookup_key, projection, projection_bytes = (
@@ -1593,6 +1751,10 @@ class SQLiteSessionStore(SessionStore):
                 if existing_event_id is not None:
                     raise ValueError(
                         f"Event already exists for session {session_id}: {existing_event_id}"
+                    ) from exc
+                if "idx_cayu_events_budget_reservation_identity" in str(exc):
+                    raise BudgetReservationIdentityConflict(
+                        "Budget ledger reused a reservation identity."
                     ) from exc
                 raise
 
@@ -2568,6 +2730,7 @@ class SQLiteSessionStore(SessionStore):
                             projection_bytes,
                         )
                     )
+                _publish_budget_reservation_identities(connection, copied_events)
                 _touch_session_activity(connection, session_id, updated_at)
                 connection.execute(
                     """

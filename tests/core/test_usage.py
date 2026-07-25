@@ -9,6 +9,7 @@ import pytest
 from tests.core._budget_ledger_contract import (
     assert_idempotent_terminal_settlements,
     assert_portable_text_boundaries,
+    assert_reservation_identity_collision_is_rejected,
 )
 from tests.core._execution_unit_fixtures import model_attempt_identity
 
@@ -51,6 +52,7 @@ from cayu.runtime.costs import (
     estimate_causal_budget_cost,
     estimate_session_cost,
 )
+from cayu.runtime.sessions import BudgetReservationIdentityConflict
 from cayu.runtime.stop_policy import (
     RunLimits,
     StopDecision,
@@ -1215,6 +1217,15 @@ def test_in_memory_budget_ledger_terminal_settlements_are_idempotent() -> None:
     )
 
 
+def test_in_memory_budget_ledger_rejects_reservation_identity_collision() -> None:
+    asyncio.run(
+        assert_reservation_identity_collision_is_rejected(
+            InMemoryBudgetLedger(),
+            _reservation_budget_limit(max_cost="1"),
+        )
+    )
+
+
 def test_in_memory_budget_ledger_rejects_nonportable_text() -> None:
     asyncio.run(
         assert_portable_text_boundaries(
@@ -1510,6 +1521,20 @@ def test_sqlite_budget_ledger_terminal_settlements_are_idempotent(tmp_path) -> N
     asyncio.run(run())
 
 
+def test_sqlite_budget_ledger_rejects_reservation_identity_collision(tmp_path) -> None:
+    async def run() -> None:
+        ledger = SQLiteBudgetLedger(tmp_path / "budget-identity-collision.sqlite")
+        try:
+            await assert_reservation_identity_collision_is_rejected(
+                ledger,
+                _reservation_budget_limit(max_cost="1"),
+            )
+        finally:
+            await ledger.close()
+
+    asyncio.run(run())
+
+
 def test_sqlite_budget_ledger_rejects_nonportable_text(tmp_path) -> None:
     async def run() -> None:
         ledger = SQLiteBudgetLedger(tmp_path / "budget-portable-text.sqlite")
@@ -1520,6 +1545,37 @@ def test_sqlite_budget_ledger_rejects_nonportable_text(tmp_path) -> None:
             )
         finally:
             await ledger.close()
+
+    asyncio.run(run())
+
+
+def test_sqlite_budget_ledger_persists_reservation_identity_claims_across_instances(
+    tmp_path,
+) -> None:
+    async def run() -> None:
+        path = tmp_path / "budget-identity-claims.sqlite"
+        first = SQLiteBudgetLedger(path)
+        second = SQLiteBudgetLedger(path)
+        claim = {
+            "reservation_id": "bres_shared_identity",
+            "publication_session_id": "sess_owner",
+            "publication_id": "event_owner",
+        }
+        try:
+            await first.claim_reservation_identity(**claim)
+            await second.claim_reservation_identity(**claim)
+            with pytest.raises(
+                BudgetReservationIdentityConflict,
+                match="reused a reservation identity",
+            ):
+                await second.claim_reservation_identity(
+                    reservation_id=claim["reservation_id"],
+                    publication_session_id="sess_colliding",
+                    publication_id="event_colliding",
+                )
+        finally:
+            await first.close()
+            await second.close()
 
     asyncio.run(run())
 
@@ -2206,7 +2262,7 @@ def test_sqlite_budget_ledger_preserves_bedrock_identity_across_reopen(tmp_path)
     assert reconciled.actual_amount == Decimal("9")
 
 
-def test_sqlite_budget_ledger_revisions_21_through_24_add_identity_columns(
+def test_sqlite_budget_ledger_revisions_21_through_23_add_identity_columns(
     tmp_path,
 ) -> None:
     path = tmp_path / "bedrock-budget-migration.sqlite"
@@ -2230,7 +2286,7 @@ def test_sqlite_budget_ledger_revisions_21_through_24_add_identity_columns(
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 24"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 23"):
         SQLiteBudgetLedger(path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
     async def migrate() -> None:
@@ -2257,11 +2313,10 @@ def test_sqlite_budget_ledger_revisions_21_through_24_add_identity_columns(
         (21, "breaking", 21),
         (22, "breaking", 22),
         (23, "breaking", 23),
-        (24, "breaking", 24),
     ]
 
 
-def test_sqlite_budget_ledger_revision_24_does_not_infer_legacy_attempt_identity(
+def test_sqlite_budget_ledger_fails_closed_on_missing_attempt_identity(
     tmp_path,
 ) -> None:
     path = tmp_path / "budget-attempt-identity-migration.sqlite"
@@ -2291,8 +2346,6 @@ def test_sqlite_budget_ledger_revision_24_does_not_infer_legacy_attempt_identity
             "WHERE reservation_id = ?",
             (reservation_id,),
         )
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 24")
-        connection.execute("PRAGMA user_version = 23")
         connection.commit()
     finally:
         connection.close()

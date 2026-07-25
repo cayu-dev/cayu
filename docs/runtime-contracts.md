@@ -1994,13 +1994,48 @@ Terminal ledger operations are idempotent by reservation id and outcome. An
 identical reconciliation or release retry returns the first stored result without
 changing its accounting timestamp. A retry that changes the terminal action,
 charged amount, or reason is rejected rather than rewriting financial history.
-The built-in in-memory, SQLite, and Postgres ledgers implement this same contract.
+Reservation ids are ledger-wide reconciliation keys, not session-local ids.
+Every accepted reservation must therefore return a previously unused id.
+Before provider dispatch, the runtime claims each id in both the publication
+session store and the budget ledger's identity domain. Session stores enforce
+the same uniqueness when publishing `budget.reserved`;
+the SQLite and PostgreSQL implementations install the atomic cross-session
+constraint and a non-cascading ownership registry at schema revision 23. The
+runtime claims the id for one exact publication before the reservation becomes
+releasable or any associated provider dispatch can start. The publication
+identity is the full session/event pair, and deleting the owning session does
+not make the reservation id reusable. A recorded revision-23 schema fails closed
+if its permanent ownership registry is missing or malformed. A custom ledger
+that reuses an id fails closed even when the colliding reservations belong to
+different sessions or workers.
+
+Schema revision 23 is a breaking deployment boundary. Stop every revision-22
+and older session or budget worker, run `cayu storage migrate` against every
+SQLite or PostgreSQL session-store and budget-ledger database, and only then
+deploy revision-23 workers. Mixed-version rolling deployment is rejected because
+older workers do not claim the permanent cross-session reservation identity.
+App-only rollback is also unsupported after migration; restoring an older
+application requires restoring or exporting to a compatible pre-revision-23
+database state first.
+
+The built-in SQLite and PostgreSQL ledgers persist the same claim in the ledger
+database, so workers with distinct session stores still share one authoritative
+identity registry. The in-memory ledger and the base custom-ledger implementation
+enforce claims across all apps sharing that exact ledger instance. A custom
+ledger used by separate worker processes must override
+`claim_reservation_identity()` and implement the idempotent permanent claim in
+its shared backend.
 
 `InMemoryBudgetLedger` is the default and is only strict inside one process.
 Multi-worker apps that need hard shared caps should pass `SQLiteBudgetLedger`
 or their own `BudgetLedger` implementation. Reservation amounts are
 application-provided upper bounds; Cayu does not infer how large a future model
-step will be. Reservation limits require matching pricing and cannot use
+step will be. Cayu fixes one pricing instant before calling `reserve()` and
+rejects a ledger response unless its requested amount exactly matches that
+configuration and an accepted result remains within the configured maximum.
+Custom `reserve()` implementations must use the provided `effective_at` value
+when selecting a price schedule.
+Reservation limits require matching pricing and cannot use
 `allow_unpriced=True`. Reservation limits also require `action="interrupt"`
 because reservations are hard-cap accounting, not observe-only alerts.
 `InMemoryBudgetStore` only supports simple app/agent event filtering. Causal

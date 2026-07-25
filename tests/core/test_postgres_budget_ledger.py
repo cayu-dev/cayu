@@ -14,6 +14,7 @@ import pytest
 from tests.core._budget_ledger_contract import (
     assert_idempotent_terminal_settlements,
     assert_portable_text_boundaries,
+    assert_reservation_identity_collision_is_rejected,
 )
 from tests.core._execution_unit_fixtures import model_attempt_identity
 
@@ -26,6 +27,7 @@ from cayu.runtime import (
     PriceBook,
 )
 from cayu.runtime.budgets import budget_limits_for_session
+from cayu.runtime.sessions import BudgetReservationIdentityConflict
 
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
 
@@ -37,6 +39,7 @@ _TABLES = (
     "cayu_knowledge_chunks",
     "cayu_knowledge_entries",
     "cayu_event_watcher_state",
+    "cayu_budget_reservation_identities",
     "cayu_events",
     "cayu_session_labels",
     "cayu_transcript_messages",
@@ -183,6 +186,16 @@ def test_postgres_budget_ledger_terminal_settlements_are_idempotent(postgres_dsn
     _run(postgres_dsn, ops, clock=clock)
 
 
+def test_postgres_budget_ledger_rejects_reservation_identity_collision(postgres_dsn) -> None:
+    async def ops(ledger):
+        await assert_reservation_identity_collision_is_rejected(
+            ledger,
+            _reservation_budget_limit(max_cost="1"),
+        )
+
+    _run(postgres_dsn, ops)
+
+
 def test_postgres_budget_ledger_rejects_nonportable_text(postgres_dsn) -> None:
     async def ops(ledger):
         await assert_portable_text_boundaries(
@@ -191,6 +204,37 @@ def test_postgres_budget_ledger_rejects_nonportable_text(postgres_dsn) -> None:
         )
 
     _run(postgres_dsn, ops)
+
+
+def test_postgres_budget_ledger_persists_reservation_identity_claims_across_instances(
+    postgres_dsn,
+) -> None:
+    async def runner() -> None:
+        await _drop_all(postgres_dsn)
+        first = _new_ledger(postgres_dsn)
+        second = _new_ledger(postgres_dsn)
+        claim = {
+            "reservation_id": "bres_shared_identity",
+            "publication_session_id": "sess_owner",
+            "publication_id": "event_owner",
+        }
+        try:
+            await first.claim_reservation_identity(**claim)
+            await second.claim_reservation_identity(**claim)
+            with pytest.raises(
+                BudgetReservationIdentityConflict,
+                match="reused a reservation identity",
+            ):
+                await second.claim_reservation_identity(
+                    reservation_id=claim["reservation_id"],
+                    publication_session_id="sess_colliding",
+                    publication_id="event_colliding",
+                )
+        finally:
+            await first.close()
+            await second.close()
+
+    asyncio.run(runner())
 
 
 def test_postgres_budget_ledger_survives_ledger_restart(postgres_dsn) -> None:
@@ -330,7 +374,7 @@ def test_postgres_budget_ledger_does_not_infer_identity_for_existing_rows(
     asyncio.run(runner())
 
 
-def test_postgres_budget_ledger_does_not_infer_legacy_attempt_identity(
+def test_postgres_budget_ledger_fails_closed_on_missing_attempt_identity(
     postgres_dsn,
 ) -> None:
     async def runner() -> None:
@@ -357,7 +401,6 @@ def test_postgres_budget_ledger_does_not_infer_legacy_attempt_identity(
                     "WHERE reservation_id = %s",
                     (reservation_id,),
                 )
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 24")
             await conn.commit()
 
         migrated = PostgresBudgetLedger(

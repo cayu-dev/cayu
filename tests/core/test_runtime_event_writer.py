@@ -403,6 +403,31 @@ def test_emit_rejects_workload_secret_in_durable_authority_value() -> None:
     assert asyncio.run(scenario()) == []
 
 
+@pytest.mark.parametrize("field_name", ["budget_limit_id", "reservation_id"])
+def test_emit_rejects_workload_secret_in_financial_authority_value(field_name: str) -> None:
+    secret = f"writer-{field_name}-authority-canary"
+
+    async def scenario() -> list[Event]:
+        store = await _session_store("writer_secret_financial_authority")
+        writer = RuntimeEventWriter(
+            session_store=store,
+            budget_store=InMemoryBudgetStore(),
+            event_sinks=[],
+            secret_redactor=SecretRedactor(secret),
+        )
+        with pytest.raises(ValueError, match="durable event authority"):
+            await writer.emit(
+                Event(
+                    type=EventType.BUDGET_RESERVED,
+                    session_id="writer_secret_financial_authority",
+                    payload={field_name: secret},
+                )
+            )
+        return await store.load_events("writer_secret_financial_authority")
+
+    assert asyncio.run(scenario()) == []
+
+
 def test_emit_defensively_redacts_canonical_policy_denial_payload() -> None:
     secret = "writer-policy-denial-canary"
 

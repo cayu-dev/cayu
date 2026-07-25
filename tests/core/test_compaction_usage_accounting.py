@@ -48,6 +48,25 @@ async def collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
     return [event async for event in app.run(request)]
 
 
+def test_compaction_provider_metadata_strips_runtime_owned_execution_identity() -> None:
+    provider_identity = {
+        "model_step_id": f"mstep_{'a' * 32}",
+        "model_attempt_id": f"matt_{'b' * 32}",
+        "tool_round_id": f"tround_{'c' * 32}",
+        "budget_limit_id": f"blim_{'d' * 64}",
+        "reservation_id": f"bres_{'e' * 32}",
+    }
+
+    sanitized = runtime_context_module._provider_completed_metadata(
+        {
+            **provider_identity,
+            "usage": {"input_tokens": 8, "output_tokens": 2},
+        }
+    )
+
+    assert sanitized == {"usage": {"input_tokens": 8, "output_tokens": 2}}
+
+
 def test_compaction_preserves_normalized_usage_when_raw_usage_is_null() -> None:
     payload = runtime_context_module._compaction_model_completed_payload(
         completed_payload={

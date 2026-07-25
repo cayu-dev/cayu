@@ -106,6 +106,7 @@ from cayu.runtime._recovery_coordinator import (
 )
 from cayu.runtime._run_limits import (
     BudgetEvaluation,
+    BudgetReservationIdentityGuard,
     BudgetReservationLeaseLost,
     BudgetReservationLeaseLostBeforeModelDispatch,
     BudgetStepReservation,
@@ -185,6 +186,7 @@ from cayu.runtime.execution_units import (
     copy_model_step_identity,
     copy_tool_round_identity,
     new_model_step_identity,
+    strip_runtime_owned_execution_identity,
 )
 from cayu.runtime.hooks import (
     RuntimeHook,
@@ -822,8 +824,7 @@ def _application_compaction_event(
 ) -> Event:
     sanitized = sanitize_context_compaction_telemetry(telemetry)
     payload = copy_json_value(sanitized.payload, "compaction_telemetry_payload")
-    for key in ("model_step_id", "model_attempt_id", "tool_round_id"):
-        payload.pop(key, None)
+    strip_runtime_owned_execution_identity(payload)
     if sanitized.event_type == EventType.CONTEXT_COMPACTION_FAILED:
         payload.pop("compacted_transcript_cursor", None)
     if execution_identity is not None:
@@ -2939,6 +2940,7 @@ class SessionEngine:
                 )
             stored_model_step_identity = candidate_identity
         model_step_identity = stored_model_step_identity or new_model_step_identity()
+        reservation_identity_guard = self._run_limit_controller.reservation_identity_guard()
         started_event = self._event_writer.prepare(
             Event(
                 type=EventType.CONTEXT_COMPACTION_STARTED,
@@ -3319,6 +3321,7 @@ class SessionEngine:
                 compactor=compactor_name,
                 reservations=budget_reservations,
                 events=attempt_events,
+                reservation_identity_guard=reservation_identity_guard,
             )
             reservation_error: RuntimeError | None = None
             if reservation_failure is not None:
@@ -3462,6 +3465,7 @@ class SessionEngine:
                     raise ValueError(
                         "Compaction provider dispatch produced conflicting completion identities."
                     )
+                strip_runtime_owned_execution_identity(copied_payload)
                 copied_payload.update(identity.payload())
                 return copied_payload
 
@@ -3779,6 +3783,7 @@ class SessionEngine:
                     reservations=budget_reservations,
                     events=attempt_events,
                     billing_identity=billing_identity,
+                    reservation_identity_guard=reservation_identity_guard,
                 )
                 dispatch_reservations = budget_reservations[reservation_start:]
                 if reservation_failure is not None:
@@ -5769,6 +5774,7 @@ class SessionEngine:
         compactor: str,
         reservations: list[BudgetStepReservation],
         events: list[Event],
+        reservation_identity_guard: BudgetReservationIdentityGuard,
         billing_identity: BillingIdentity | None = None,
     ) -> BudgetReservationResult | None:
         model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
@@ -5780,28 +5786,27 @@ class SessionEngine:
             model=model,
             model_attempt_identity=model_attempt_identity,
             billing_identity=billing_identity,
+            reservation_identity_guard=reservation_identity_guard,
             rejection_release_reason="compaction budget reservation failed",
             accepted_record_error="Accepted compaction budget reservation has no record.",
+            reservation_event_factory=lambda result: _application_compaction_ledger_event(
+                event_type=(
+                    EventType.BUDGET_RESERVED
+                    if result.accepted
+                    else EventType.BUDGET_RESERVATION_FAILED
+                ),
+                payload=budget_reservation_payload(result),
+                request=request,
+                operation_id=operation_id,
+                attempt_id=attempt_id,
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                compactor=compactor,
+            ),
         )
         reservations.extend(setup.reservations)
-        for result in setup.results:
-            events.append(
-                _application_compaction_ledger_event(
-                    event_type=(
-                        EventType.BUDGET_RESERVED
-                        if result.accepted
-                        else EventType.BUDGET_RESERVATION_FAILED
-                    ),
-                    payload=budget_reservation_payload(result),
-                    request=request,
-                    operation_id=operation_id,
-                    attempt_id=attempt_id,
-                    session=session,
-                    registered_agent=registered_agent,
-                    environment_name=environment_name,
-                    compactor=compactor,
-                )
-            )
+        events.extend(setup.events)
         events.extend(
             _application_compaction_ledger_event(
                 event_type=EventType.BUDGET_RESERVATION_RELEASED,

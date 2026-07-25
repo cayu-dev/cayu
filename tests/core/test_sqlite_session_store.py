@@ -32,7 +32,10 @@ from cayu.runtime import (
 )
 from cayu.runtime.aggregates import AggregateUsageMetrics
 from cayu.runtime.pending_actions import pending_action_lookup_key
-from cayu.runtime.sessions import PendingActionQuery
+from cayu.runtime.sessions import (
+    BudgetReservationIdentityConflict,
+    PendingActionQuery,
+)
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema_migrations
 
@@ -1110,7 +1113,7 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 22"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 23"):
         SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
     task_store = SQLiteTaskStore(
@@ -1199,7 +1202,7 @@ def test_sqlite_session_store_revision_thirteen_requires_run_fencing_migration(t
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 22"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 23"):
         SQLiteSessionStore(db_path)
 
     reopened = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
@@ -1238,7 +1241,7 @@ def test_sqlite_session_store_revision_fourteen_requires_cascade_index_migration
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 22"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 23"):
         SQLiteSessionStore(db_path)
 
     reopened = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
@@ -1333,7 +1336,7 @@ def test_sqlite_session_store_revision_sixteen_requires_pending_action_index(tmp
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 22"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 23"):
         SQLiteSessionStore(db_path)
 
     reopened = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
@@ -1519,7 +1522,7 @@ def test_sqlite_revision_seventeen_requires_session_operation_migration(tmp_path
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 22"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 23"):
         SQLiteSessionStore(db_path)
 
     migrated = SQLiteSessionStore(
@@ -1770,6 +1773,172 @@ def test_sqlite_revision_seventeen_migrate_repairs_missing_recorded_index(tmp_pa
     assert "IS NOT NULL" in definition[0]
 
 
+def test_sqlite_revision_twenty_three_requires_the_unique_reservation_index(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "sessions.sqlite"
+    store = SQLiteSessionStore(db_path)
+    asyncio.run(_close(store))
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DROP INDEX idx_cayu_events_budget_reservation_identity")
+        connection.execute(
+            "CREATE INDEX idx_cayu_events_budget_reservation_identity "
+            "ON cayu_events(json_extract(payload_json, '$.reservation_id')) "
+            "WHERE event_type = 'budget.reserved'"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="reservation identity contract"):
+        SQLiteSessionStore(db_path)
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DROP INDEX idx_cayu_events_budget_reservation_identity")
+        connection.commit()
+    finally:
+        connection.close()
+
+    repaired = SQLiteSessionStore(
+        db_path,
+        schema_mode=schema_migrations.SchemaMode.MIGRATE,
+    )
+    asyncio.run(_close(repaired))
+
+    connection = sqlite3.connect(db_path)
+    try:
+        definition = connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'index' "
+            "AND name = 'idx_cayu_events_budget_reservation_identity'"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert definition is not None
+    assert "CREATE UNIQUE INDEX" in definition[0]
+    assert "reservation_id" in definition[0]
+    assert "budget.reserved" in definition[0]
+
+
+def test_sqlite_recorded_revision_twenty_three_fails_closed_without_registry(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "sessions.sqlite"
+
+    async def seed() -> None:
+        store = SQLiteSessionStore(db_path)
+        session = await store.create(
+            RunRequest(
+                session_id="sess_registry_repair",
+                agent_name="assistant",
+                messages=[Message.text("user", "seed")],
+            ),
+            identity=_identity(),
+        )
+        await store.append_event(
+            session.id,
+            Event(
+                type=EventType.BUDGET_RESERVED,
+                session_id=session.id,
+                payload={"reservation_id": "bres_registry_repair"},
+            ),
+        )
+        await store.delete_session(session.id)
+        await _close(store)
+
+    asyncio.run(seed())
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DROP TABLE cayu_budget_reservation_identities")
+        connection.execute(
+            "CREATE TABLE cayu_budget_reservation_identities ("
+            "reservation_id TEXT PRIMARY KEY, publication_id TEXT NOT NULL)"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="reservation identity contract"):
+        SQLiteSessionStore(db_path)
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DROP TABLE cayu_budget_reservation_identities")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="permanent reservation ownership registry"):
+        SQLiteSessionStore(
+            db_path,
+            schema_mode=schema_migrations.SchemaMode.MIGRATE,
+        )
+
+    connection = sqlite3.connect(db_path)
+    try:
+        registry = connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'cayu_budget_reservation_identities'"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert registry is None
+
+
+def test_sqlite_reservation_claim_is_atomic_across_store_instances(tmp_path) -> None:
+    db_path = tmp_path / "sessions.sqlite"
+
+    async def exercise() -> None:
+        first = SQLiteSessionStore(db_path)
+        second = SQLiteSessionStore(db_path)
+        stores = (first, second)
+        publication_ids = ("evt_first_publication", "evt_second_publication")
+        try:
+            session = await first.create(
+                RunRequest(
+                    session_id="sess_cross_store_claim",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "claim")],
+                ),
+                identity=_identity(),
+            )
+            results = await asyncio.gather(
+                *(
+                    store.claim_budget_reservation_identity(
+                        reservation_id="bres_cross_store_claim",
+                        publication_session_id=session.id,
+                        publication_id=publication_id,
+                    )
+                    for store, publication_id in zip(stores, publication_ids, strict=True)
+                ),
+                return_exceptions=True,
+            )
+
+            winners = [index for index, result in enumerate(results) if result is None]
+            conflicts = [
+                result
+                for result in results
+                if isinstance(result, BudgetReservationIdentityConflict)
+            ]
+            assert len(winners) == 1
+            assert len(conflicts) == 1
+
+            winner = winners[0]
+            await stores[winner].claim_budget_reservation_identity(
+                reservation_id="bres_cross_store_claim",
+                publication_session_id=session.id,
+                publication_id=publication_ids[winner],
+            )
+        finally:
+            await asyncio.gather(first.close(), second.close())
+
+    asyncio.run(exercise())
+
+
 def test_sqlite_session_store_coexists_with_foreign_app_tables(tmp_path):
     # The cayu_ prefix (ADR 0001 Decision 5) means an app's own unprefixed tables in
     # the same database no longer block initialization — they simply coexist.
@@ -1885,7 +2054,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         "status_reason",
         "status_payload_json",
     }.issubset(task_columns)
-    # Revisions 2-7, 11-16, and 20 are additive. Revisions 17-19 and 21-24
+    # Revisions 2-7, 11-16, and 20 are additive. Revisions 17-19 and 21-23
     # change durable writer/reader contracts and therefore raise the
     # compatibility floor.
     assert revisions == [(rev.revision, rev.compatible_from) for rev in schema_migrations.REVISIONS]
@@ -1913,7 +2082,6 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (21, 21),
         (22, 22),
         (23, 23),
-        (24, 24),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

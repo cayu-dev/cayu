@@ -4,6 +4,8 @@ import asyncio
 from decimal import Decimal
 from typing import Literal
 
+import pytest
+from pydantic import ValidationError
 from tests.core._execution_unit_fixtures import model_attempt_identity
 
 from cayu.runtime import (
@@ -15,20 +17,22 @@ from cayu.runtime import (
     PriceBook,
 )
 from cayu.runtime.budgets import (
+    _copy_effective_budget_limit,
+    _operation_budget_limits_for_session,
     budget_limits_for_session,
     request_budget_limits_for_session,
 )
 from cayu.storage import SQLiteBudgetLedger
 
 
-def _price_book() -> PriceBook:
+def _price_book(*, rate: str = "1000000") -> PriceBook:
     return PriceBook(
         prices=(
             ModelPrice.fixed(
                 provider_name="fake",
                 model="fake-model",
-                input_per_million=Decimal("1000000"),
-                output_per_million=Decimal("1000000"),
+                input_per_million=Decimal(rate),
+                output_per_million=Decimal(rate),
             ),
         )
     )
@@ -37,12 +41,13 @@ def _price_book() -> PriceBook:
 def _limit(
     *,
     maximum: str = "1.5",
+    rate: str = "1000000",
     action: Literal["interrupt", "notify"] = "interrupt",
 ) -> BudgetLimit:
     return BudgetLimit(
         scope="app",
         max_estimated_cost=Decimal(maximum),
-        pricing=_price_book(),
+        pricing=_price_book(rate=rate),
         action=action,
         reservation=BudgetReservation(max_input_tokens=1, max_output_tokens=0),
     )
@@ -98,8 +103,56 @@ def test_app_and_request_limit_namespaces_do_not_alias() -> None:
         agent_name="assistant",
         causal_budget_id="job_1",
     )[0]
+    request_from_resolved_app_limit = request_budget_limits_for_session(
+        limits=(app_limit,),
+        agent_name="assistant",
+        causal_budget_id="job_1",
+    )[0]
 
     assert app_limit.budget_limit_id != request_limit.budget_limit_id
+    assert request_from_resolved_app_limit.budget_limit_id == request_limit.budget_limit_id
+
+
+def test_effective_limit_identity_uses_decimal_value_not_input_spelling() -> None:
+    maximum_from_short_spelling = _resolve_policy(BudgetPolicy(limits=(_limit(maximum="1.0"),)))[0]
+    maximum_from_long_spelling = _resolve_policy(BudgetPolicy(limits=(_limit(maximum="1.00"),)))[0]
+    rate_from_integer_spelling = _resolve_policy(BudgetPolicy(limits=(_limit(rate="1000000"),)))[0]
+    rate_from_exponent_spelling = _resolve_policy(BudgetPolicy(limits=(_limit(rate="1E+6"),)))[0]
+    changed_rate = _resolve_policy(BudgetPolicy(limits=(_limit(rate="1000001"),)))[0]
+
+    assert maximum_from_short_spelling.budget_limit_id == maximum_from_long_spelling.budget_limit_id
+    assert rate_from_integer_spelling.budget_limit_id == rate_from_exponent_spelling.budget_limit_id
+    assert changed_rate.budget_limit_id != rate_from_integer_spelling.budget_limit_id
+
+
+def test_effective_limit_is_frozen_and_rejects_tampered_identity_material() -> None:
+    effective = _resolve_policy(BudgetPolicy(limits=(_limit(),)))[0]
+
+    with pytest.raises(ValidationError, match="frozen"):
+        effective.max_estimated_cost = Decimal("9")
+
+    tampered = effective.model_copy(update={"max_estimated_cost": Decimal("9")})
+    with pytest.raises(ValidationError, match="configured definition"):
+        _copy_effective_budget_limit(tampered)
+
+
+def test_internal_operation_preserves_verified_effective_identity() -> None:
+    configured = _limit()
+    app_limit = _resolve_policy(BudgetPolicy(limits=(configured,)))[0]
+
+    preserved = _operation_budget_limits_for_session(
+        limits=(app_limit,),
+        agent_name="assistant",
+        causal_budget_id="job_1",
+    )[0]
+    assigned = _operation_budget_limits_for_session(
+        limits=(configured,),
+        agent_name="assistant",
+        causal_budget_id="job_1",
+    )[0]
+
+    assert preserved.budget_limit_id == app_limit.budget_limit_id
+    assert assigned.budget_limit_id != app_limit.budget_limit_id
 
 
 def test_in_memory_ledger_partitions_identical_limits_by_exact_id() -> None:

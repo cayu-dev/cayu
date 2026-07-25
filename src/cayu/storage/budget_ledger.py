@@ -20,6 +20,7 @@ from cayu.runtime.budgets import (
     BudgetLedger,
     BudgetLimit,
     BudgetReconciliation,
+    BudgetReservationIdentityConflict,
     BudgetReservationRecord,
     BudgetReservationResult,
     _budget_reservation_amount,
@@ -33,6 +34,7 @@ from cayu.runtime.budgets import (
     _released_record,
     _reservation_is_expired,
     _reservation_result,
+    _utc_datetime,
     _validate_amount,
     _validate_reservation_ttl,
 )
@@ -44,7 +46,7 @@ from cayu.runtime.execution_units import (
 from . import _sqlite_support as sqlite_support
 from . import migrations as schema
 
-_SQLITE_MIN_REQUIRED_REVISION = 24
+_SQLITE_MIN_REQUIRED_REVISION = 23
 
 
 class SQLiteBudgetLedger(BudgetLedger):
@@ -87,6 +89,59 @@ class SQLiteBudgetLedger(BudgetLedger):
     def reservation_ttl_seconds(self) -> int | None:
         return self._reservation_ttl_seconds
 
+    async def claim_reservation_identity(
+        self,
+        *,
+        reservation_id: str,
+        publication_session_id: str,
+        publication_id: str,
+    ) -> None:
+        reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
+        publication_session_id = require_clean_nonblank(
+            publication_session_id,
+            "publication_session_id",
+        )
+        publication_id = require_clean_nonblank(publication_id, "publication_id")
+        async with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                inserted = self._connection.execute(
+                    """
+                    INSERT OR IGNORE INTO cayu_budget_reservation_identities (
+                        reservation_id,
+                        publication_session_id,
+                        publication_id,
+                        published
+                    )
+                    VALUES (?, ?, ?, 0)
+                    """,
+                    (reservation_id, publication_session_id, publication_id),
+                )
+                if inserted.rowcount != 1:
+                    existing = self._connection.execute(
+                        """
+                        SELECT publication_session_id, publication_id
+                        FROM cayu_budget_reservation_identities
+                        WHERE reservation_id = ?
+                        """,
+                        (reservation_id,),
+                    ).fetchone()
+                    if existing is None:
+                        raise RuntimeError(
+                            "Budget reservation identity claim disappeared during conflict."
+                        )
+                    if (
+                        existing["publication_session_id"],
+                        existing["publication_id"],
+                    ) != (publication_session_id, publication_id):
+                        raise BudgetReservationIdentityConflict(
+                            "Budget ledger reused a reservation identity."
+                        )
+                self._connection.commit()
+            except BaseException:
+                self._connection.rollback()
+                raise
+
     async def reserve(
         self,
         *,
@@ -97,6 +152,7 @@ class SQLiteBudgetLedger(BudgetLedger):
         model: str,
         model_attempt_identity: ModelAttemptIdentity,
         billing_identity: BillingIdentity | None = None,
+        effective_at: datetime | None = None,
     ) -> BudgetReservationResult:
         limit = _ensure_effective_budget_limit(
             limit,
@@ -111,11 +167,14 @@ class SQLiteBudgetLedger(BudgetLedger):
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
                 now = self._clock()
+                pricing_effective_at = (
+                    now if effective_at is None else _utc_datetime(effective_at, "effective_at")
+                )
                 requested = _budget_reservation_amount(
                     limit=limit,
                     provider_name=provider_name,
                     model=model,
-                    effective_at=now,
+                    effective_at=pricing_effective_at,
                     billing_identity=billing_identity,
                 )
                 self._reap_expired_unlocked(now, limit=limit)
@@ -152,7 +211,14 @@ class SQLiteBudgetLedger(BudgetLedger):
                     created_at=now,
                     updated_at=now,
                 )
-                self._insert_record_unlocked(record)
+                try:
+                    self._insert_record_unlocked(record)
+                except sqlite3.IntegrityError as exc:
+                    if "cayu_budget_reservations.reservation_id" in str(exc):
+                        raise BudgetReservationIdentityConflict(
+                            "Budget ledger reused a reservation identity."
+                        ) from exc
+                    raise
                 self._connection.commit()
                 return _reservation_result(
                     limit=limit,

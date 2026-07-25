@@ -10,6 +10,7 @@ from cayu._validation import (
     require_durable_nonblank,
     require_durable_text,
 )
+from cayu.runtime.execution_units import RUNTIME_OWNED_EXECUTION_IDENTITY_FIELDS
 from cayu.runtime.usage import normalize_usage_metrics
 
 _RUNTIME_OWNED_USAGE_FIELDS = frozenset(
@@ -50,9 +51,10 @@ def portable_model_completion_projection(
 
     projected: dict[str, Any] = {}
     for key, value in source.items():
-        if key in _RUNTIME_OWNED_USAGE_FIELDS:
+        if key in _RUNTIME_OWNED_USAGE_FIELDS or key in RUNTIME_OWNED_EXECUTION_IDENTITY_FIELDS:
             # These namespaces are runtime-owned; providers cannot inject
-            # normalized accounting evidence or its failure classification.
+            # durable identity, normalized accounting evidence, or its failure
+            # classification.
             continue
         if key == "usage":
             try:
