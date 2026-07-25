@@ -1349,6 +1349,10 @@ MAX_PENDING_ACTION_RESULT_BYTES = 16 * 1024 * 1024
 # cap is also a storage-safety boundary: SQL stores inspect the count before
 # expanding checkpoint call identifiers into rows.
 MAX_PENDING_ACTION_TOOL_CALLS = 256
+# A normal call contributes one start and one terminal event. Keep enough room
+# for repeated crashes and explicit reconciliation while bounding corrupted or
+# adversarial evidence independently for every call in the pending round.
+MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL = 16
 
 
 class PendingActionResultTooLarge(RuntimeError):
@@ -1978,6 +1982,26 @@ class PendingActionIssue(BaseModel):
                 "Pending tool-round state for this session exceeds the "
                 f"{max_tool_calls}-call inspection limit. Open the session directly "
                 "to inspect or resolve it."
+            ),
+        )
+
+    @classmethod
+    def ledger_too_complex(
+        cls,
+        session: PendingActionSession,
+        *,
+        max_events_per_call: int,
+    ) -> PendingActionIssue:
+        return cls(
+            code=PendingActionIssueCode.SOURCE_TOO_COMPLEX,
+            session_id=session.id,
+            agent_name=session.agent_name,
+            status=session.status,
+            updated_at=session.updated_at,
+            detail=(
+                "Pending tool-round evidence for this session exceeds the "
+                f"{max_events_per_call}-event per-call inspection limit. "
+                "Open the session directly to inspect or resolve it."
             ),
         )
 
@@ -3153,10 +3177,13 @@ class InMemorySessionStore(SessionStore):
             str,
             dict[str, dict[str, EventRecord]],
         ] = {}
-        # Present only after an identifier map has been pruned. The value lists
-        # identifiers subsequently rebuilt from the complete event log; absence
-        # means the live append index has covered the session since creation.
-        self._pending_action_rebuilt_lookup_ids: dict[str, frozenset[str]] = {}
+        # The identity scope represented by each bounded pending-action index.
+        # A checkpoint can reuse a tool-call id for a later execution, so lookup
+        # keys alone are insufficient to decide whether rebuilding is required.
+        self._pending_action_index_scopes: dict[
+            str,
+            tuple[frozenset[str], str | None, str | None, str | None],
+        ] = {}
         self._pending_action_latest_barrier_records: dict[str, EventRecord] = {}
         self._event_records_by_id: dict[tuple[str, str], EventRecord] = {}
         self._type_event_records: dict[str, list[EventRecord]] = {}
@@ -3190,8 +3217,12 @@ class InMemorySessionStore(SessionStore):
             checkpoint_has_pending_action_candidate,
             pending_action_checkpoint_lookup_ids,
             pending_action_event_lookup_id,
+            pending_action_event_matches_tool_round,
+            pending_action_event_retains_history,
             pending_action_lookup_key,
+            pending_action_tool_round_from_checkpoint,
             project_pending_action_event_record,
+            retain_pending_action_index_record,
         )
 
         self._checkpoints[session_id] = checkpoint
@@ -3200,14 +3231,19 @@ class InMemorySessionStore(SessionStore):
                 pending_action_lookup_key(identifier)
                 for identifier in pending_action_checkpoint_lookup_ids(checkpoint)
             )
-            rebuilt_lookup_ids = self._pending_action_rebuilt_lookup_ids.get(session_id)
-            if rebuilt_lookup_ids is not None and not lookup_keys.issubset(rebuilt_lookup_ids):
-                # A public checkpoint transform may legitimately reintroduce a
-                # previously cleared durable action. SQL stores retain the source
-                # events, so rebuild the bounded identifier/type projection here
-                # to preserve identical behavior across backends.
+            pending_round = pending_action_tool_round_from_checkpoint(checkpoint)
+            index_scope = (
+                lookup_keys,
+                None if pending_round is None else pending_round.model_step_id,
+                None if pending_round is None else pending_round.model_attempt_id,
+                None if pending_round is None else pending_round.tool_round_id,
+            )
+            if self._pending_action_index_scopes.get(session_id) != index_scope:
+                # Public checkpoint transforms may reintroduce a cleared action
+                # or reuse an identifier for a later execution. Rebuild the
+                # bounded, identity-scoped projection to match SQL stores.
                 rebuilt: dict[str, dict[str, EventRecord]] = {}
-                for record in reversed(self._session_event_records.get(session_id, [])):
+                for record in self._session_event_records.get(session_id, []):
                     event_type = str(record.event.type)
                     if (
                         event_type not in PENDING_ACTION_EVENT_TYPE_VALUES
@@ -3220,13 +3256,21 @@ class InMemorySessionStore(SessionStore):
                     lookup_key = pending_action_lookup_key(lookup_id)
                     if lookup_key not in lookup_keys:
                         continue
-                    by_event_type = rebuilt.setdefault(lookup_key, {})
-                    by_event_type.setdefault(
-                        event_type,
+                    if pending_action_event_retains_history(event_type) and (
+                        pending_round is None
+                        or not pending_action_event_matches_tool_round(
+                            record.event,
+                            pending_round,
+                        )
+                    ):
+                        continue
+                    by_record_key = rebuilt.setdefault(lookup_key, {})
+                    retain_pending_action_index_record(
+                        by_record_key,
                         project_pending_action_event_record(record),
                     )
                 self._pending_action_event_records[session_id] = rebuilt
-                self._pending_action_rebuilt_lookup_ids[session_id] = lookup_keys
+                self._pending_action_index_scopes[session_id] = index_scope
             self._pending_action_session_ids.add(session_id)
         else:
             self._pending_action_session_ids.discard(session_id)
@@ -3234,8 +3278,13 @@ class InMemorySessionStore(SessionStore):
             # scoped event history cannot contribute to a future action. Keep the
             # latest lifecycle barrier, but release the potentially growing map.
             removed = self._pending_action_event_records.pop(session_id, None)
-            if removed or session_id in self._pending_action_rebuilt_lookup_ids:
-                self._pending_action_rebuilt_lookup_ids[session_id] = frozenset()
+            if removed or session_id in self._pending_action_index_scopes:
+                self._pending_action_index_scopes[session_id] = (
+                    frozenset(),
+                    None,
+                    None,
+                    None,
+                )
 
     async def create(
         self,
@@ -3531,7 +3580,7 @@ class InMemorySessionStore(SessionStore):
             }
             self._session_event_records.pop(session_id, None)
             self._pending_action_event_records.pop(session_id, None)
-            self._pending_action_rebuilt_lookup_ids.pop(session_id, None)
+            self._pending_action_index_scopes.pop(session_id, None)
             self._pending_action_latest_barrier_records.pop(session_id, None)
             self._transcripts.pop(session_id, None)
             self._checkpoints.pop(session_id, None)
@@ -3837,8 +3886,12 @@ class InMemorySessionStore(SessionStore):
     ) -> Session:
         from cayu.runtime.pending_actions import (
             pending_action_event_lookup_id,
+            pending_action_event_matches_tool_round,
+            pending_action_event_retains_history,
             pending_action_lookup_key,
+            pending_action_tool_round_from_checkpoint,
             project_pending_action_event_record,
+            retain_pending_action_index_record,
         )
 
         session_id = session.id
@@ -3872,6 +3925,9 @@ class InMemorySessionStore(SessionStore):
                 )
 
         prepared: list[tuple[EventRecord, str, EventRecord | None, str | None]] = []
+        pending_round = pending_action_tool_round_from_checkpoint(self._checkpoints.get(session_id))
+        index_scope = self._pending_action_index_scopes.get(session_id)
+        active_lookup_keys = frozenset() if index_scope is None else index_scope[0]
         next_sequence = self._next_event_sequence
         for event in events:
             stored_event = event.model_copy(deep=True)
@@ -3880,10 +3936,14 @@ class InMemorySessionStore(SessionStore):
             projected_record: EventRecord | None = None
             lookup_key: str | None = None
             if event_type in PENDING_ACTION_EVENT_TYPE_VALUES:
-                projected_record = project_pending_action_event_record(record)
                 lookup_id = pending_action_event_lookup_id(stored_event)
                 if lookup_id is not None:
                     lookup_key = pending_action_lookup_key(lookup_id)
+                if (
+                    event_type in PENDING_ACTION_BARRIER_EVENT_TYPE_VALUES
+                    or lookup_key in active_lookup_keys
+                ):
+                    projected_record = project_pending_action_event_record(record)
             prepared.append((record, event_type, projected_record, lookup_key))
             next_sequence += 1
 
@@ -3897,10 +3957,22 @@ class InMemorySessionStore(SessionStore):
             if projected_record is not None:
                 if event_type in PENDING_ACTION_BARRIER_EVENT_TYPE_VALUES:
                     self._pending_action_latest_barrier_records[session_id] = projected_record
-                elif lookup_key is not None:
+                elif lookup_key is not None and not (
+                    pending_action_event_retains_history(event_type)
+                    and (
+                        pending_round is None
+                        or not pending_action_event_matches_tool_round(
+                            projected_record.event,
+                            pending_round,
+                        )
+                    )
+                ):
                     by_lookup_id = self._pending_action_event_records.setdefault(session_id, {})
-                    by_event_type = by_lookup_id.setdefault(lookup_key, {})
-                    by_event_type[event_type] = projected_record
+                    by_record_key = by_lookup_id.setdefault(lookup_key, {})
+                    retain_pending_action_index_record(
+                        by_record_key,
+                        projected_record,
+                    )
             self._type_event_records.setdefault(event_type, []).append(record)
             existing_ids.add(stored_event.id)
             if event_type != str(EventType.RUNTIME_SINK_FAILED):
@@ -4889,16 +4961,23 @@ class InMemorySessionStore(SessionStore):
                 records: list[EventRecord] = []
                 if source_fits:
                     projected_checkpoint = project_pending_action_checkpoint(checkpoint)
-                    records = select_pending_action_indexed_records(
+                    records, ledger_too_complex = select_pending_action_indexed_records(
                         projected_checkpoint,
                         self._pending_action_event_records.get(session.id, {}),
                         self._pending_action_latest_barrier_records.get(session.id),
                     )
-                    source_fits = all(
-                        (projection_bytes := pending_action_event_projection_bytes(record)) is None
-                        or projection_bytes <= query.max_result_bytes
-                        for record in records
-                    ) and all(candidate_size.value(record) for record in records)
+                    source_fits = (
+                        not ledger_too_complex
+                        and all(
+                            (projection_bytes := pending_action_event_projection_bytes(record))
+                            is None
+                            or projection_bytes <= query.max_result_bytes
+                            for record in records
+                        )
+                        and all(candidate_size.value(record) for record in records)
+                    )
+                else:
+                    ledger_too_complex = False
                 candidate_source_bytes = query.max_result_bytes - candidate_size.remaining
                 if source_fits and (
                     materialized_source_bytes + candidate_source_bytes > query.max_result_bytes
@@ -4915,7 +4994,12 @@ class InMemorySessionStore(SessionStore):
                         last_inspected_session = previous_last_inspected_session
                         break
                     issues.append(
-                        PendingActionIssue.source_too_complex(
+                        PendingActionIssue.ledger_too_complex(
+                            projected_session,
+                            max_events_per_call=MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
+                        )
+                        if ledger_too_complex
+                        else PendingActionIssue.source_too_complex(
                             projected_session,
                             max_tool_calls=MAX_PENDING_ACTION_TOOL_CALLS,
                         )

@@ -280,6 +280,9 @@ def recorded_round_tool_outcomes(
         events=user_input_resume_events(events, input_id),
         pending_calls=pending_calls,
         in_scope=lambda event: identity.matches_payload(event.payload),
+        candidate_scope=lambda event: (
+            identity.matches_payload(event.payload) or event.payload.get("input_id") == input_id
+        ),
         terminal_event_types=_USER_INPUT_ROUND_TERMINAL_EVENT_TYPES,
     )
     # A tool that started on a prior resume attempt but has no terminal event (a crash mid-tool)
@@ -307,6 +310,10 @@ def recorded_tool_outcomes(
         in_scope=lambda event: (
             event.payload.get("approval_id") == approval.approval_id
             and identity.matches_payload(event.payload)
+        ),
+        candidate_scope=lambda event: (
+            identity.matches_payload(event.payload)
+            or event.payload.get("approval_id") == approval.approval_id
         ),
         terminal_event_types=_APPROVAL_TERMINAL_EVENT_TYPES,
     )
@@ -386,16 +393,26 @@ def validate_recovery_target(
     tool_call_id: str,
 ) -> None:
     identity = _approval_tool_round_identity(approval)
+    pending_tool_call = pending_tool_call_for_recovery(
+        approval=approval,
+        tool_call_id=tool_call_id,
+    )
     state = resume_ledger.tool_call_recovery_state(
         events=events,
-        tool_call_id=tool_call_id,
+        pending_tool_call=pending_tool_call,
         in_scope=lambda event: (
             event.payload.get("approval_id") == approval.approval_id
             and identity.matches_payload(event.payload)
         ),
+        candidate_scope=lambda event: (
+            identity.matches_payload(event.payload)
+            or event.payload.get("approval_id") == approval.approval_id
+        ),
         terminal_event_types=_APPROVAL_TERMINAL_EVENT_TYPES,
     )
 
+    if state.conflicting:
+        return
     if state.terminal:
         raise RuntimeError(
             f"Tool call already has a terminal event and does not need recovery: {tool_call_id}"
@@ -428,16 +445,23 @@ def validate_round_recovery_target(
     # Round terminal events carry no approval_id (user-input rounds) and tool-call ids are not
     # unique across the session, so scope to the pause's resume window (matching
     # recorded_round_tool_outcomes) — a prior round reusing this id must not be seen here.
-    if tool_call_id not in {call.tool_call_id for call in pending_calls}:
-        raise ValueError(f"Tool call is not part of the paused round: {tool_call_id}")
+    pending_tool_call = round_tool_call_for_recovery(
+        pending_calls=pending_calls,
+        tool_call_id=tool_call_id,
+    )
     identity = copy_tool_round_identity(tool_round_identity)
     state = resume_ledger.tool_call_recovery_state(
         events=user_input_resume_events(events, input_id),
-        tool_call_id=tool_call_id,
+        pending_tool_call=pending_tool_call,
         in_scope=lambda event: identity.matches_payload(event.payload),
+        candidate_scope=lambda event: (
+            identity.matches_payload(event.payload) or event.payload.get("input_id") == input_id
+        ),
         terminal_event_types=_USER_INPUT_ROUND_TERMINAL_EVENT_TYPES,
     )
 
+    if state.conflicting:
+        return
     if state.terminal:
         raise RuntimeError(
             f"Tool call already has a terminal event and does not need recovery: {tool_call_id}"

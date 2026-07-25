@@ -28,6 +28,7 @@ from cayu.runtime.sessions import (
     DELETE_BLOCKED_SESSION_STATUSES,
     FORK_TRANSCRIPT_VALIDATION_ERROR,
     MAX_PENDING_ACTION_RESULT_BYTES,
+    MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
     MAX_PENDING_ACTION_TOOL_CALLS,
     SESSION_INSPECTION_LABEL_LIMIT,
     SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
@@ -3266,12 +3267,12 @@ class SQLiteSessionStore(SessionStore):
                 UNION
                 SELECT id,
                     cayu_pending_action_lookup_key(
-                        json_extract(pending_state_json, '$.pending_tool_round.round_id')
+                        json_extract(pending_state_json, '$.pending_tool_round.tool_round_id')
                     )
                 FROM candidates
                 WHERE json_type(
                     pending_state_json,
-                    '$.pending_tool_round.round_id'
+                    '$.pending_tool_round.tool_round_id'
                 ) = 'text'
                 UNION
                 SELECT candidates.id,
@@ -3298,12 +3299,7 @@ class SQLiteSessionStore(SessionStore):
                 VALUES
                     ('tool.call.approval_requested'),
                     ('session.awaiting_user_input'),
-                    ('session.interrupted'),
-                    ('tool.call.started'),
-                    ('tool.call.completed'),
-                    ('tool.call.failed'),
-                    ('tool.call.blocked'),
-                    ('tool.call.approval_denied')
+                    ('session.interrupted')
             ),
             latest_barriers AS (
                 SELECT candidates.id AS session_id,
@@ -3345,12 +3341,82 @@ class SQLiteSessionStore(SessionStore):
                 FROM candidate_action_keys AS action_keys
                 CROSS JOIN pending_action_event_types AS action_type
             ),
+            matched_ledger_sequences AS (
+                SELECT
+                    action_keys.session_id AS candidate_session_id,
+                    action_keys.action_key,
+                    candidate_event.sequence
+                FROM candidate_action_keys AS action_keys
+                JOIN candidates ON candidates.id = action_keys.session_id
+                JOIN cayu_events AS candidate_event
+                    ON candidate_event.sequence IN (
+                        SELECT scoped_event.sequence
+                        FROM cayu_events AS scoped_event
+                            INDEXED BY idx_cayu_events_pending_action_lookup
+                        WHERE scoped_event.session_id = action_keys.session_id
+                          AND scoped_event.pending_action_lookup_key
+                              = action_keys.action_key
+                          AND scoped_event.event_type IN (
+                              'tool.call.approval_requested',
+                              'session.awaiting_user_input',
+                              'session.interrupted',
+                              'tool.call.started',
+                              'tool.call.completed',
+                              'tool.call.failed',
+                              'tool.call.blocked',
+                              'tool.call.approval_denied'
+                          )
+                          AND scoped_event.event_type IN (
+                              'tool.call.started',
+                              'tool.call.completed',
+                              'tool.call.failed',
+                              'tool.call.blocked',
+                              'tool.call.approval_denied'
+                          )
+                          AND scoped_event.pending_action_lookup_key IS NOT NULL
+                          AND (
+                              json_extract(
+                                  scoped_event.pending_action_projection_json,
+                                  '$.payload.tool_round_id'
+                              ) = json_extract(
+                                  candidates.pending_state_json,
+                                  '$.pending_tool_round.tool_round_id'
+                              )
+                              OR (
+                                  json_extract(
+                                      scoped_event.pending_action_projection_json,
+                                      '$.payload.model_step_id'
+                                  ) = json_extract(
+                                      candidates.pending_state_json,
+                                      '$.pending_tool_round.model_step_id'
+                                  )
+                                  AND json_extract(
+                                      scoped_event.pending_action_projection_json,
+                                      '$.payload.model_attempt_id'
+                                  ) = json_extract(
+                                      candidates.pending_state_json,
+                                      '$.pending_tool_round.model_attempt_id'
+                                  )
+                              )
+                          )
+                        LIMIT {MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL + 1}
+                    )
+                WHERE json_type(
+                    candidates.pending_state_json,
+                    '$.pending_tool_round'
+                ) = 'object'
+            ),
             matched_event_sequences AS (
                 SELECT
                     matched_action.candidate_session_id,
                     matched_action.sequence
                 FROM matched_action_sequences AS matched_action
                 WHERE matched_action.sequence IS NOT NULL
+                UNION
+                SELECT
+                    matched_ledger.candidate_session_id,
+                    matched_ledger.sequence
+                FROM matched_ledger_sequences AS matched_ledger
                 UNION
                 SELECT
                     candidates.id,
@@ -3365,11 +3431,7 @@ class SQLiteSessionStore(SessionStore):
                     source_event.sequence,
                     source_event.pending_action_projection_bytes AS event_bytes,
                     source_event.pending_action_projection_bytes IS NOT NULL
-                        AND (
-                            source_event.pending_action_projection_json IS NOT NULL
-                            OR source_event.pending_action_projection_bytes
-                                > {MAX_PENDING_ACTION_RESULT_BYTES}
-                        )
+                        AND source_event.pending_action_projection_json IS NOT NULL
                         AS projection_ready
                 FROM matched_event_sequences
                 JOIN cayu_events AS source_event
@@ -3402,6 +3464,13 @@ class SQLiteSessionStore(SessionStore):
                     FROM matched_events AS matched_event
                     WHERE matched_event.candidate_session_id = candidates.id
                 ), 1) AS projections_ready,
+                EXISTS (
+                    SELECT 1
+                    FROM matched_ledger_sequences AS matched_ledger
+                    WHERE matched_ledger.candidate_session_id = candidates.id
+                    GROUP BY matched_ledger.action_key
+                    HAVING COUNT(*) > {MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL}
+                ) AS ledger_too_complex,
                 COALESCE((
                     SELECT json_group_array(ordered_sequence.sequence)
                     FROM (
@@ -3501,6 +3570,7 @@ class SQLiteSessionStore(SessionStore):
 
                 source_metadata_by_session_id: dict[str, tuple[int, list[int]]] = {}
                 invalid_ids: set[str] = set()
+                ledger_overcomplex_ids: set[str] = set()
                 if preflight_eligible_ids:
                     for row in connection.execute(
                         source_size_sql,
@@ -3519,6 +3589,8 @@ class SQLiteSessionStore(SessionStore):
                         )
                         if not bool(row["projections_ready"]):
                             invalid_ids.add(row["id"])
+                        if bool(row["ledger_too_complex"]):
+                            ledger_overcomplex_ids.add(row["id"])
 
                 processable_ids: list[str] = []
                 materializable_ids: list[str] = []
@@ -3529,6 +3601,7 @@ class SQLiteSessionStore(SessionStore):
                     if (
                         session_id in oversized_ids
                         or session_id in overcomplex_ids
+                        or session_id in ledger_overcomplex_ids
                         or session_id in invalid_ids
                     ):
                         processable_ids.append(session_id)
@@ -3633,6 +3706,19 @@ class SQLiteSessionStore(SessionStore):
                             PendingActionIssue.source_too_complex(
                                 session,
                                 max_tool_calls=MAX_PENDING_ACTION_TOOL_CALLS,
+                            )
+                        )
+                        inspected_count += 1
+                        last_inspected_session = session
+                        continue
+                    if session_id in ledger_overcomplex_ids:
+                        if len(actions) + len(issues) == query.limit:
+                            more_matching = True
+                            break
+                        issues.append(
+                            PendingActionIssue.ledger_too_complex(
+                                session,
+                                max_events_per_call=(MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL),
                             )
                         )
                         inspected_count += 1

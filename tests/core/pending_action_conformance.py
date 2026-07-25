@@ -5,6 +5,8 @@ from typing import Any
 from cayu.core import Event, EventType, Message
 from cayu.runtime import RunRequest, SessionIdentity, SessionStatus, SessionStore
 from cayu.runtime.sessions import (
+    MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
+    MAX_PENDING_ACTION_RESULT_BYTES,
     MAX_PENDING_ACTION_TOOL_CALLS,
     PendingActionKind,
     PendingActionQuery,
@@ -16,6 +18,8 @@ _TOOL_ROUND_ID = f"tround_{'3' * 32}"
 _MALFORMED_TERMINAL_ROUND_ID = f"tround_{'4' * 32}"
 _OVERSIZED_ROUND_ID = f"tround_{'5' * 32}"
 _OVERCOMPLEX_ROUND_ID = f"tround_{'6' * 32}"
+_DUPLICATE_TERMINAL_ROUND_ID = f"tround_{'7' * 32}"
+_RECONCILED_TERMINAL_ROUND_ID = f"tround_{'8' * 32}"
 
 
 def _tool_round_identity_payload(tool_round_id: str = _TOOL_ROUND_ID) -> dict[str, str]:
@@ -368,6 +372,84 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
         },
     )
     await create(
+        "conformance_duplicate_terminal",
+        status=SessionStatus.FAILED,
+        events=[
+            Event(
+                id="conformance_duplicate_terminal_started",
+                type=EventType.TOOL_CALL_STARTED,
+                session_id="conformance_duplicate_terminal",
+                payload={
+                    **_tool_round_identity_payload(_DUPLICATE_TERMINAL_ROUND_ID),
+                    "tool_call_id": "conformance_duplicate_terminal_call",
+                },
+            ),
+            Event(
+                id="conformance_duplicate_terminal_completed_first",
+                type=EventType.TOOL_CALL_COMPLETED,
+                session_id="conformance_duplicate_terminal",
+                payload={
+                    **_tool_round_identity_payload(_DUPLICATE_TERMINAL_ROUND_ID),
+                    "tool_call_id": "conformance_duplicate_terminal_call",
+                    "result": {"content": "first", "is_error": False},
+                },
+            ),
+            Event(
+                id="conformance_duplicate_terminal_completed_second",
+                type=EventType.TOOL_CALL_COMPLETED,
+                session_id="conformance_duplicate_terminal",
+                payload={
+                    **_tool_round_identity_payload(_DUPLICATE_TERMINAL_ROUND_ID),
+                    "tool_call_id": "conformance_duplicate_terminal_call",
+                    "result": {"content": "second", "is_error": False},
+                },
+            ),
+        ],
+        checkpoint=_round_checkpoint(
+            _DUPLICATE_TERMINAL_ROUND_ID,
+            "conformance_duplicate_terminal_call",
+        ),
+    )
+    await create(
+        "conformance_reconciled_terminal",
+        status=SessionStatus.FAILED,
+        events=[
+            Event(
+                id="conformance_reconciled_terminal_started",
+                type=EventType.TOOL_CALL_STARTED,
+                session_id="conformance_reconciled_terminal",
+                payload={
+                    **_tool_round_identity_payload(_RECONCILED_TERMINAL_ROUND_ID),
+                    "tool_call_id": "conformance_reconciled_terminal_call",
+                },
+            ),
+            Event(
+                id="conformance_reconciled_terminal_malformed",
+                type=EventType.TOOL_CALL_COMPLETED,
+                session_id="conformance_reconciled_terminal",
+                payload={
+                    **_tool_round_identity_payload(_RECONCILED_TERMINAL_ROUND_ID),
+                    "tool_call_id": "conformance_reconciled_terminal_call",
+                },
+            ),
+            Event(
+                id="conformance_reconciled_terminal_manual",
+                type=EventType.TOOL_CALL_COMPLETED,
+                session_id="conformance_reconciled_terminal",
+                payload={
+                    **_tool_round_identity_payload(_RECONCILED_TERMINAL_ROUND_ID),
+                    "tool_call_id": "conformance_reconciled_terminal_call",
+                    "manual_recovery": True,
+                    "result": {"content": "verified", "is_error": False},
+                },
+            ),
+        ],
+        checkpoint=_round_checkpoint(
+            _RECONCILED_TERMINAL_ROUND_ID,
+            "conformance_reconciled_terminal_call",
+        ),
+    )
+    await create(
         "conformance_normalized_lookup",
         status=SessionStatus.INTERRUPTED,
         events=[
@@ -532,6 +614,8 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
         "conformance_approval_recovery",
         "conformance_input_recovery",
         "conformance_round_recovery",
+        "conformance_malformed_terminal",
+        "conformance_duplicate_terminal",
     }
     assert by_session["conformance_approval"].kind == PendingActionKind.TOOL_APPROVAL
     assert by_session["conformance_approval"].round_id == _TOOL_ROUND_ID
@@ -542,6 +626,14 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
     assert by_session["conformance_approval_recovery"].kind == PendingActionKind.MANUAL_RECOVERY
     assert by_session["conformance_input_recovery"].kind == PendingActionKind.MANUAL_RECOVERY
     assert by_session["conformance_round_recovery"].kind == PendingActionKind.MANUAL_RECOVERY
+    assert (
+        by_session["conformance_malformed_terminal"].tool_call_id
+        == "conformance_malformed_terminal_call"
+    )
+    assert (
+        by_session["conformance_duplicate_terminal"].tool_call_id
+        == "conformance_duplicate_terminal_call"
+    )
     assert len({action.id for action in actions}) == len(actions)
     assert all(action.event.event.payload == {} for action in actions)
 
@@ -569,8 +661,22 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
     malformed_terminal = await store.query_pending_actions(
         PendingActionQuery(session_id="conformance_malformed_terminal")
     )
-    assert malformed_terminal.actions == []
-    assert [issue.code for issue in malformed_terminal.issues] == ["source_invalid"]
+    assert len(malformed_terminal.actions) == 1
+    assert malformed_terminal.actions[0].kind == PendingActionKind.MANUAL_RECOVERY
+    assert malformed_terminal.issues == []
+
+    duplicate_terminal = await store.query_pending_actions(
+        PendingActionQuery(session_id="conformance_duplicate_terminal")
+    )
+    assert len(duplicate_terminal.actions) == 1
+    assert duplicate_terminal.actions[0].kind == PendingActionKind.MANUAL_RECOVERY
+    assert duplicate_terminal.issues == []
+
+    reconciled_terminal = await store.query_pending_actions(
+        PendingActionQuery(session_id="conformance_reconciled_terminal")
+    )
+    assert reconciled_terminal.actions == []
+    assert reconciled_terminal.issues == []
 
     completed = await store.query_pending_actions(
         PendingActionQuery(session_id="conformance_completed_with_pending_state")
@@ -592,7 +698,39 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
         "conformance_approval_recovery",
         "conformance_input_recovery",
         "conformance_round_recovery",
+        "conformance_malformed_terminal",
+        "conformance_duplicate_terminal",
     }
+
+    # Resumed tool events carry both their call id and the pause id. Once the
+    # pause checkpoint is cleared, the surviving round must still discover its
+    # ledger through the call identity.
+    for identity_digit, pause_key in zip(("e", "f"), ("approval_id", "input_id"), strict=True):
+        session_id = f"conformance_{pause_key}_tagged_ledger"
+        tool_call_id = f"{session_id}_call"
+        tool_round_id = f"tround_{identity_digit * 32}"
+        await create(
+            session_id,
+            status=SessionStatus.FAILED,
+            events=[
+                Event(
+                    id=f"{session_id}_started",
+                    type=EventType.TOOL_CALL_STARTED,
+                    session_id=session_id,
+                    payload={
+                        **_tool_round_identity_payload(tool_round_id),
+                        "tool_call_id": tool_call_id,
+                        pause_key: f"{session_id}_pause",
+                    },
+                )
+            ],
+            checkpoint=_round_checkpoint(tool_round_id, tool_call_id),
+        )
+        tagged_ledger = await store.query_pending_actions(PendingActionQuery(session_id=session_id))
+        assert len(tagged_ledger.actions) == 1
+        assert tagged_ledger.actions[0].kind == PendingActionKind.MANUAL_RECOVERY
+        assert tagged_ledger.actions[0].tool_call_id == tool_call_id
+        assert tagged_ledger.issues == []
 
     # Checkpoint state is replaceable. Clearing and then reintroducing the same
     # durable identifier must behave identically in memory and in SQL stores.
@@ -695,6 +833,166 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
     assert overcomplex.actions == []
     assert [issue.session_id for issue in overcomplex.issues] == [overcomplex_session_id]
     assert overcomplex.issues[0].code == "source_too_complex"
+
+    # A provider may reuse a tool-call id in a later execution. Historical
+    # evidence for that id must be excluded by execution identity before byte
+    # accounting and per-call complexity limits are applied.
+    reused_call_id = "conformance_reused_call"
+    reused_round_id = f"tround_{'9' * 32}"
+    old_identity = {
+        "model_step_id": f"mstep_{'a' * 32}",
+        "model_attempt_id": f"matt_{'b' * 32}",
+        "tool_round_id": f"tround_{'c' * 32}",
+    }
+    await create(
+        "conformance_reused_call_identity",
+        status=SessionStatus.FAILED,
+        events=[
+            *[
+                Event(
+                    id=f"conformance_old_terminal_{index}",
+                    type=EventType.TOOL_CALL_COMPLETED,
+                    session_id="conformance_reused_call_identity",
+                    payload={
+                        **old_identity,
+                        "tool_call_id": reused_call_id,
+                    },
+                )
+                for index in range(40)
+            ],
+            Event(
+                id="conformance_current_started",
+                type=EventType.TOOL_CALL_STARTED,
+                session_id="conformance_reused_call_identity",
+                payload={
+                    **_tool_round_identity_payload(reused_round_id),
+                    "tool_call_id": reused_call_id,
+                },
+            ),
+        ],
+        checkpoint=_round_checkpoint(reused_round_id, reused_call_id),
+    )
+    reused = await store.query_pending_actions(
+        PendingActionQuery(
+            session_id="conformance_reused_call_identity",
+            max_result_bytes=8192,
+        )
+    )
+    assert len(reused.actions) == 1
+    assert reused.actions[0].kind == PendingActionKind.MANUAL_RECOVERY
+    assert reused.issues == []
+
+    # An oversized event still retains a bounded execution identity. Reusing
+    # the provider call id in a later round must therefore exclude the stale
+    # event before its size can suppress the current recovery action.
+    oversized_reused_call_id = "conformance_oversized_reused_call"
+    oversized_reused_round_id = f"tround_{'e' * 32}"
+    await create(
+        "conformance_oversized_reused_call_identity",
+        status=SessionStatus.FAILED,
+        events=[
+            Event(
+                id="conformance_oversized_old_started",
+                type=EventType.TOOL_CALL_STARTED,
+                session_id="conformance_oversized_reused_call_identity",
+                payload={
+                    **old_identity,
+                    "tool_call_id": oversized_reused_call_id,
+                    "manual_recovery": "x" * MAX_PENDING_ACTION_RESULT_BYTES,
+                },
+            ),
+            Event(
+                id="conformance_oversized_current_started",
+                type=EventType.TOOL_CALL_STARTED,
+                session_id="conformance_oversized_reused_call_identity",
+                payload={
+                    **_tool_round_identity_payload(oversized_reused_round_id),
+                    "tool_call_id": oversized_reused_call_id,
+                },
+            ),
+        ],
+        checkpoint=_round_checkpoint(
+            oversized_reused_round_id,
+            oversized_reused_call_id,
+        ),
+    )
+    oversized_reused = await store.query_pending_actions(
+        PendingActionQuery(session_id="conformance_oversized_reused_call_identity")
+    )
+    assert len(oversized_reused.actions) == 1
+    assert oversized_reused.actions[0].kind == PendingActionKind.MANUAL_RECOVERY
+    assert oversized_reused.actions[0].tool_call_id == oversized_reused_call_id
+    assert oversized_reused.issues == []
+
+    # The same bounded envelope keeps oversized evidence for the active round
+    # visible as an explicit issue instead of silently treating the call as
+    # never started.
+    oversized_current_call_id = "conformance_oversized_current_call"
+    oversized_current_round_id = f"tround_{'f' * 32}"
+    await create(
+        "conformance_oversized_current_identity",
+        status=SessionStatus.FAILED,
+        events=[
+            Event(
+                id="conformance_oversized_current_identity_started",
+                type=EventType.TOOL_CALL_STARTED,
+                session_id="conformance_oversized_current_identity",
+                payload={
+                    **_tool_round_identity_payload(oversized_current_round_id),
+                    "tool_call_id": oversized_current_call_id,
+                    "manual_recovery": "x" * MAX_PENDING_ACTION_RESULT_BYTES,
+                },
+            )
+        ],
+        checkpoint=_round_checkpoint(
+            oversized_current_round_id,
+            oversized_current_call_id,
+        ),
+    )
+    oversized_current = await store.query_pending_actions(
+        PendingActionQuery(session_id="conformance_oversized_current_identity")
+    )
+    assert oversized_current.actions == []
+    assert [issue.session_id for issue in oversized_current.issues] == [
+        "conformance_oversized_current_identity"
+    ]
+    assert oversized_current.issues[0].code == "source_too_large"
+
+    # Current-identity evidence remains bounded even when durable history is
+    # corrupted or adversarial. The query fails closed without materializing an
+    # unbounded ledger.
+    ledger_overcomplex_session_id = "conformance_overcomplex_ledger"
+    ledger_overcomplex_call_id = "conformance_overcomplex_ledger_call"
+    ledger_overcomplex_round_id = f"tround_{'d' * 32}"
+    await create(
+        ledger_overcomplex_session_id,
+        status=SessionStatus.FAILED,
+        events=[
+            Event(
+                id=f"conformance_overcomplex_ledger_{index}",
+                type=EventType.TOOL_CALL_STARTED,
+                session_id=ledger_overcomplex_session_id,
+                payload={
+                    **_tool_round_identity_payload(ledger_overcomplex_round_id),
+                    "tool_call_id": ledger_overcomplex_call_id,
+                },
+            )
+            for index in range(MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL + 1)
+        ],
+        checkpoint=_round_checkpoint(
+            ledger_overcomplex_round_id,
+            ledger_overcomplex_call_id,
+        ),
+    )
+    ledger_overcomplex = await store.query_pending_actions(
+        PendingActionQuery(session_id=ledger_overcomplex_session_id)
+    )
+    assert ledger_overcomplex.actions == []
+    assert [issue.session_id for issue in ledger_overcomplex.issues] == [
+        ledger_overcomplex_session_id
+    ]
+    assert ledger_overcomplex.issues[0].code == "source_too_complex"
+    assert "event per-call" in ledger_overcomplex.issues[0].detail
 
     async def create_approval(
         session_id: str,

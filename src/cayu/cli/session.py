@@ -758,6 +758,8 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
     input_calls: dict[_ToolCallKey, dict[str, Any]] = {}
     decision_records: dict[_ToolCallKey, EventRecord] = {}
     approval_states: dict[_ToolCallKey, str] = {}
+    evidence_conflicts: set[_ToolCallKey] = set()
+    approval_decision_conflicts: set[_ToolCallKey] = set()
     for record in records:
         event = record.event
         if event.type == EventType.SESSION_AWAITING_USER_INPUT:
@@ -799,16 +801,29 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
             continue
         call_key = _tool_call_key(record, call_id)
         if event.type == EventType.TOOL_CALL_STARTED:
+            if call_key in starts or call_key in terminals:
+                evidence_conflicts.add(call_key)
             starts.setdefault(call_key, record)
         elif event.type in _TOOL_TERMINAL_TYPES:
+            if call_key in terminals:
+                evidence_conflicts.add(call_key)
             terminals.setdefault(call_key, record)
         elif event.type == EventType.TOOL_CALL_APPROVED:
+            if call_key in decision_records and decision_records[call_key].event.type != event.type:
+                evidence_conflicts.add(call_key)
+                approval_decision_conflicts.add(call_key)
             approval_states[call_key] = "approved"
             decision_records.setdefault(call_key, record)
         elif event.type == EventType.TOOL_CALL_APPROVAL_DENIED:
+            if call_key in decision_records and decision_records[call_key].event.type != event.type:
+                evidence_conflicts.add(call_key)
+                approval_decision_conflicts.add(call_key)
             approval_states[call_key] = "denied"
             decision_records.setdefault(call_key, record)
         elif event.type == EventType.TOOL_CALL_APPROVAL_EXPIRED:
+            if call_key in decision_records and decision_records[call_key].event.type != event.type:
+                evidence_conflicts.add(call_key)
+                approval_decision_conflicts.add(call_key)
             approval_states[call_key] = "expired"
             decision_records.setdefault(call_key, record)
 
@@ -819,6 +834,7 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
         | input_requests.keys()
         | decision_records.keys()
     )
+    evidence_conflicts.update(_contradictory_tool_call_keys(call_keys))
     anchors = {
         call_key: (
             starts.get(call_key)
@@ -853,8 +869,13 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
         input_request = input_requests.get(call_key)
         input_call = input_calls.get(call_key)
         anchor = anchors[call_key]
-        terminal = terminals.get(call_key)
-        approval_state = approval_states.get(call_key, "none")
+        evidence_conflict = call_key in evidence_conflicts
+        terminal = None if evidence_conflict else terminals.get(call_key)
+        approval_state = (
+            "unavailable"
+            if call_key in approval_decision_conflicts
+            else approval_states.get(call_key, "none")
+        )
         round_key = (
             None
             if round_id is None or invalid_event_id is not None
@@ -915,44 +936,58 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
                 "completed_at": (
                     None if terminal is None else terminal.event.timestamp.isoformat()
                 ),
-                "duration_ms": _duration_ms(started, terminal),
-                "status": _tool_status(
-                    started,
-                    terminal,
-                    approval_state,
-                    awaiting_input=input_request is not None,
+                "duration_ms": (None if evidence_conflict else _duration_ms(started, terminal)),
+                "status": (
+                    "unavailable"
+                    if evidence_conflict
+                    else _tool_status(
+                        started,
+                        terminal,
+                        approval_state,
+                        awaiting_input=input_request is not None,
+                    )
                 ),
                 "approval_state": approval_state,
                 "rendered_content_bytes": (
-                    _optional_nonnegative_int(inspection_result.get("rendered_content_bytes"))
+                    None
+                    if evidence_conflict
+                    else _optional_nonnegative_int(inspection_result.get("rendered_content_bytes"))
                     if inspection_result is not None
                     else len(content.encode("utf-8"))
                     if type(content) is str
                     else 0
                 ),
                 "structured_result_bytes": (
-                    _optional_nonnegative_int(inspection_result.get("structured_result_bytes"))
+                    None
+                    if evidence_conflict
+                    else _optional_nonnegative_int(inspection_result.get("structured_result_bytes"))
                     if inspection_result is not None
                     else compact_json_utf8_size(structured)
                     if structured is not None
                     else 0
                 ),
                 "artifact_bytes": (
-                    _optional_nonnegative_int(inspection_result.get("artifact_bytes"))
+                    None
+                    if evidence_conflict
+                    else _optional_nonnegative_int(inspection_result.get("artifact_bytes"))
                     if inspection_result is not None
                     else compact_json_utf8_size(artifacts)
                     if type(artifacts) is list
                     else 0
                 ),
                 "returned": (
-                    _optional_nonnegative_int(inspection_result.get("returned"))
+                    None
+                    if evidence_conflict
+                    else _optional_nonnegative_int(inspection_result.get("returned"))
                     if inspection_result is not None
                     else None
                     if structured is None
                     else _optional_nonnegative_int(structured.get("returned"))
                 ),
                 "truncated": (
-                    inspection_result.get("truncated")
+                    None
+                    if evidence_conflict
+                    else inspection_result.get("truncated")
                     if inspection_result is not None
                     and type(inspection_result.get("truncated")) is bool
                     else structured.get("truncated")
@@ -980,6 +1015,41 @@ def _tool_call_key(record: EventRecord, call_id: str) -> _ToolCallKey:
         call_id,
         None,
     )
+
+
+def _contradictory_tool_call_keys(
+    call_keys: set[_ToolCallKey],
+) -> set[_ToolCallKey]:
+    """Return rows whose execution-unit identity cannot be true simultaneously."""
+
+    parents_by_round_id: dict[str, set[tuple[str, str]]] = {}
+    rounds_by_attempt_id: dict[str, set[tuple[str, str]]] = {}
+    conflicts = {call_key for call_key in call_keys if call_key[4] is not None}
+    for model_step_id, model_attempt_id, round_id, _, invalid_event_id in call_keys:
+        if (
+            invalid_event_id is not None
+            or model_step_id is None
+            or model_attempt_id is None
+            or round_id is None
+        ):
+            continue
+        parents_by_round_id.setdefault(round_id, set()).add((model_step_id, model_attempt_id))
+        rounds_by_attempt_id.setdefault(model_attempt_id, set()).add((model_step_id, round_id))
+
+    conflicting_round_ids = {
+        round_id for round_id, parents in parents_by_round_id.items() if len(parents) != 1
+    }
+    conflicting_attempt_ids = {
+        model_attempt_id
+        for model_attempt_id, step_rounds in rounds_by_attempt_id.items()
+        if len(step_rounds) != 1
+    }
+    conflicts.update(
+        call_key
+        for call_key in call_keys
+        if call_key[2] in conflicting_round_ids or call_key[1] in conflicting_attempt_ids
+    )
+    return conflicts
 
 
 def _tool_event_identity(record: EventRecord) -> ToolRoundIdentity | None:

@@ -9,13 +9,23 @@ These skip automatically when Postgres is unavailable (see ``conftest.py``).
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
 from cayu import PostgresSessionStore, PostgresTaskStore
 from cayu.core import Event, EventType, Message
-from cayu.runtime import RunRequest, SessionIdentity
-from cayu.runtime.pending_actions import pending_action_lookup_key
+from cayu.runtime import (
+    PendingActionQuery,
+    RunRequest,
+    SessionIdentity,
+    SessionStatus,
+)
+from cayu.runtime.pending_actions import (
+    pending_action_event_storage_values,
+    pending_action_lookup_key,
+)
+from cayu.runtime.sessions import MAX_PENDING_ACTION_RESULT_BYTES
 from cayu.storage import migrations as schema
 from cayu.storage import postgres as postgres_storage
 from cayu.storage.migrations import SchemaMode
@@ -405,7 +415,10 @@ def test_revision_seventeen_requires_pending_action_index_migration(
                 Event(
                     type=EventType.TOOL_CALL_STARTED,
                     session_id=long_id_session.id,
-                    payload={"tool_call_id": "x" * 10_000},
+                    payload={
+                        "tool_call_id": "x" * 10_000,
+                        "approval_id": "revision_17_pause",
+                    },
                 ),
             )
             await creator.append_event(
@@ -456,6 +469,135 @@ def test_revision_seventeen_requires_pending_action_index_migration(
                         },
                     },
                 ),
+            )
+            identity_payload = {
+                "model_step_id": f"mstep_{'1' * 32}",
+                "model_attempt_id": f"matt_{'2' * 32}",
+                "tool_round_id": f"tround_{'3' * 32}",
+            }
+            projected_action_events = [
+                Event(
+                    id="revision_17_projected_approval",
+                    type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                    session_id=long_id_session.id,
+                    tool_name="deploy",
+                    payload={
+                        **identity_payload,
+                        "approval_id": "revision_17_projected_approval_id",
+                        "tool_call_id": "revision_17_projected_approval_call",
+                        "approval": {
+                            "approval_id": "revision_17_projected_approval_id",
+                            "reason": "review",
+                            "tool_name": "deploy",
+                        },
+                    },
+                ),
+                Event(
+                    id="revision_17_projected_input",
+                    type=EventType.SESSION_AWAITING_USER_INPUT,
+                    session_id=long_id_session.id,
+                    tool_name="ask_user",
+                    payload={
+                        **identity_payload,
+                        "input_id": "revision_17_projected_input_id",
+                        "tool_call_id": "revision_17_projected_input_call",
+                        "question": "Deploy?",
+                        "options": ["yes", "no"],
+                    },
+                ),
+                Event(
+                    id="revision_17_projected_interruption",
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=long_id_session.id,
+                    tool_name="deploy",
+                    payload={
+                        **identity_payload,
+                        "interruption_type": "runtime_interrupted",
+                        "manual_recovery_required": True,
+                        "approval_id": "revision_17_projected_approval_id",
+                        "tool_call_id": "revision_17_projected_approval_call",
+                        "message": "reconcile",
+                        "tool_name": "deploy",
+                        "approval": {
+                            "approval_id": "revision_17_projected_approval_id",
+                            "reason": "review",
+                            "tool_name": "deploy",
+                        },
+                        "user_input": {
+                            "input_id": "revision_17_projected_input_id",
+                            "tool_call_id": "revision_17_projected_input_call",
+                            "question": "Deploy?",
+                            "options": ["yes", "no"],
+                        },
+                    },
+                ),
+                Event(
+                    id="revision_17_projected_resume",
+                    type=EventType.SESSION_RESUMED,
+                    session_id=long_id_session.id,
+                    payload=identity_payload,
+                ),
+                Event(
+                    id="revision_17_projected_oversized_input",
+                    type=EventType.SESSION_AWAITING_USER_INPUT,
+                    session_id=long_id_session.id,
+                    payload={
+                        **identity_payload,
+                        "input_id": "revision_17_projected_oversized_input_id",
+                        "tool_call_id": "revision_17_projected_oversized_input_call",
+                        "question": "x" * MAX_PENDING_ACTION_RESULT_BYTES,
+                        "options": [],
+                    },
+                ),
+            ]
+            await creator.append_events(long_id_session.id, projected_action_events)
+            pending_approval_session = await creator.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="revision_17_pending_approval",
+                    messages=[Message.text("user", "hello")],
+                ),
+                identity=_identity(),
+            )
+            await creator.append_event(
+                pending_approval_session.id,
+                Event(
+                    id="revision_17_pending_approval_event",
+                    type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                    session_id=pending_approval_session.id,
+                    tool_name="deploy",
+                    payload={
+                        **identity_payload,
+                        "approval_id": "revision_17_pending_approval_id",
+                        "tool_call_id": "revision_17_pending_approval_call",
+                        "approval": {
+                            "approval_id": "revision_17_pending_approval_id",
+                            "tool_name": "deploy",
+                        },
+                    },
+                ),
+            )
+            await creator.checkpoint(
+                pending_approval_session.id,
+                {
+                    "pending_tool_approval": {
+                        **identity_payload,
+                        "approval_id": "revision_17_pending_approval_id",
+                        "tool_call_id": "revision_17_pending_approval_call",
+                        "tool_name": "deploy",
+                        "agent_name": "assistant",
+                        "tool_calls": [
+                            {
+                                "tool_call_id": "revision_17_pending_approval_call",
+                                "tool_name": "deploy",
+                            }
+                        ],
+                    }
+                },
+            )
+            await creator.update_status(
+                pending_approval_session.id,
+                SessionStatus.INTERRUPTED,
             )
             await creator.checkpoint(
                 long_id_session.id,
@@ -619,6 +761,33 @@ def test_revision_seventeen_requires_pending_action_index_migration(
                 ("tool.call.completed", "true"),
                 ("tool.call.failed", "false"),
             ]
+            await cur.execute(
+                "SELECT event_id, pending_action_projection FROM cayu_events "
+                "WHERE event_id = ANY(%s)",
+                ([event.id for event in projected_action_events],),
+            )
+            migrated_projections = {
+                str(event_id): projection for event_id, projection in await cur.fetchall()
+            }
+            expected_projections = {}
+            for event in projected_action_events:
+                _lookup_key, projection_json, _projection_bytes = (
+                    pending_action_event_storage_values(event)
+                )
+                assert projection_json is not None
+                expected_projections[event.id] = json.loads(projection_json)
+            assert migrated_projections == expected_projections
+
+        reader = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
+        try:
+            pending_actions = await reader.query_pending_actions(
+                PendingActionQuery(session_id="revision_17_pending_approval")
+            )
+        finally:
+            await reader.close()
+        assert len(pending_actions.actions) == 1
+        assert pending_actions.actions[0].approval_id == "revision_17_pending_approval_id"
+        assert pending_actions.issues == []
 
     asyncio.run(runner())
 

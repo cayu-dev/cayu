@@ -529,6 +529,42 @@ def test_postgres_session_store_queries_checkpoint_backed_pending_actions(postgr
             )
             lookup_plan = "\n".join(row[0] for row in await cur.fetchall())
             assert "idx_cayu_events_pending_action_lookup" in lookup_plan
+            await cur.execute(
+                """
+                EXPLAIN (COSTS OFF)
+                WITH action_ids(session_id, action_id) AS (
+                    VALUES ('pending_pg'::text, 'call_pg'::text)
+                )
+                SELECT event.sequence
+                FROM action_ids
+                JOIN cayu_events AS event
+                  ON event.session_id = action_ids.session_id
+                 AND event.pending_action_lookup_key = encode(sha256(convert_to(
+                     action_ids.action_id,
+                     'UTF8'
+                 )), 'hex')
+                WHERE event.event_type IN (
+                    'tool.call.approval_requested',
+                    'session.awaiting_user_input',
+                    'session.interrupted',
+                    'tool.call.started',
+                    'tool.call.completed',
+                    'tool.call.failed',
+                    'tool.call.blocked',
+                    'tool.call.approval_denied'
+                )
+                  AND event.event_type IN (
+                    'tool.call.started',
+                    'tool.call.completed',
+                    'tool.call.failed',
+                    'tool.call.blocked',
+                    'tool.call.approval_denied'
+                )
+                  AND event.pending_action_lookup_key IS NOT NULL
+                """
+            )
+            ledger_plan = "\n".join(row[0] for row in await cur.fetchall())
+            assert "idx_cayu_events_pending_action_lookup" in ledger_plan
 
     _run(postgres_dsn, ops)
 

@@ -21483,7 +21483,7 @@ def test_cayu_app_recovers_legacy_failed_policy_outcome_without_reexecution():
     assert recovered_result.structured["error"] == "command_denied"
 
 
-def test_recorded_tool_outcomes_rejects_terminal_event_without_result_payload():
+def test_recorded_tool_outcomes_treats_terminal_without_result_as_ambiguous():
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime import _tool_round_recovery as tool_round_recovery
 
@@ -21504,22 +21504,24 @@ def test_recorded_tool_outcomes_rejects_terminal_event_without_result_payload():
         tool_round_identity=_tool_round_identity(),
     )
 
-    with pytest.raises(ValueError, match="Terminal tool event is missing result payload"):
-        tool_round_recovery.recorded_tool_outcomes(
-            events=[
-                Event(
-                    type=EventType.TOOL_CALL_COMPLETED,
-                    session_id="sess_1",
-                    payload={
-                        "model_step_id": pending_round.model_step_id,
-                        "model_attempt_id": pending_round.model_attempt_id,
-                        "tool_round_id": pending_round.tool_round_id,
-                        "tool_call_id": "call_1",
-                    },
-                )
-            ],
-            pending_round=pending_round,
-        )
+    outcomes, started_ids = tool_round_recovery.recorded_tool_outcomes(
+        events=[
+            Event(
+                type=EventType.TOOL_CALL_COMPLETED,
+                session_id="sess_1",
+                payload={
+                    "model_step_id": pending_round.model_step_id,
+                    "model_attempt_id": pending_round.model_attempt_id,
+                    "tool_round_id": pending_round.tool_round_id,
+                    "tool_call_id": "call_1",
+                },
+            )
+        ],
+        pending_round=pending_round,
+    )
+
+    assert outcomes == {}
+    assert started_ids == {"call_1"}
 
 
 def test_cayu_app_recovers_pending_tool_round_before_tool_started():

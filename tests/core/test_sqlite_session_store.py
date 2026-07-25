@@ -1285,6 +1285,7 @@ def test_sqlite_session_store_revision_sixteen_requires_pending_action_index(tmp
                 payload={
                     "tool_call_id": "sqlite_revision_17_call",
                     "tool_round_id": "sqlite_revision_17_round",
+                    "input_id": "sqlite_revision_17_pause",
                 },
             ),
         )
@@ -1434,11 +1435,45 @@ def test_sqlite_session_store_revision_sixteen_requires_pending_action_index(tmp
             """,
             (pending_action_lookup_key("approval"),),
         ).fetchall()
+        ledger_plan = connection.execute(
+            """
+            EXPLAIN QUERY PLAN
+            WITH action_keys(session_id, action_key) AS (
+                VALUES ('session', ?)
+            )
+            SELECT event.sequence
+            FROM action_keys
+            JOIN cayu_events AS event
+                INDEXED BY idx_cayu_events_pending_action_lookup
+                ON event.session_id = action_keys.session_id
+               AND event.pending_action_lookup_key = action_keys.action_key
+            WHERE event.event_type IN (
+                'tool.call.approval_requested',
+                'session.awaiting_user_input',
+                'session.interrupted',
+                'tool.call.started',
+                'tool.call.completed',
+                'tool.call.failed',
+                'tool.call.blocked',
+                'tool.call.approval_denied'
+            )
+              AND event.event_type IN (
+                'tool.call.started',
+                'tool.call.completed',
+                'tool.call.failed',
+                'tool.call.blocked',
+                'tool.call.approval_denied'
+            )
+              AND event.pending_action_lookup_key IS NOT NULL
+            """,
+            (pending_action_lookup_key("call"),),
+        ).fetchall()
     finally:
         connection.close()
     assert any("idx_cayu_checkpoints_pending_control_action" in row[3] for row in plan)
     assert any("idx_cayu_events_pending_action_barrier" in row[3] for row in event_plan)
     assert any("idx_cayu_events_pending_action_lookup" in row[3] for row in lookup_plan)
+    assert any("idx_cayu_events_pending_action_lookup" in row[3] for row in ledger_plan)
 
     connection = sqlite3.connect(db_path)
     try:

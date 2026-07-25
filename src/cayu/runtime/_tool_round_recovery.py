@@ -312,6 +312,13 @@ def recorded_tool_outcomes(
         events=events,
         pending_calls=pending_round.tool_calls,
         in_scope=lambda event: identity.matches_payload(event.payload),
+        candidate_scope=lambda event: (
+            event.payload.get("tool_round_id") == pending_round.tool_round_id
+            or (
+                event.payload.get("model_step_id") == pending_round.model_step_id
+                and event.payload.get("model_attempt_id") == pending_round.model_attempt_id
+            )
+        ),
         terminal_event_types=_TOOL_ROUND_TERMINAL_EVENT_TYPES,
     )
     return ledger.outcomes, ledger.started_ids
@@ -331,13 +338,28 @@ def validate_tool_round_recovery_target(
     unknown outcome for.
     """
     identity = pending_tool_round_identity(pending_round)
+    pending_tool_call = next(
+        (call for call in pending_round.tool_calls if call.tool_call_id == tool_call_id),
+        None,
+    )
+    if pending_tool_call is None:
+        raise ValueError(f"Tool call is not part of the pending tool round: {tool_call_id}")
     state = resume_ledger.tool_call_recovery_state(
         events=events,
-        tool_call_id=tool_call_id,
+        pending_tool_call=pending_tool_call,
         in_scope=lambda event: identity.matches_payload(event.payload),
+        candidate_scope=lambda event: (
+            event.payload.get("tool_round_id") == pending_round.tool_round_id
+            or (
+                event.payload.get("model_step_id") == pending_round.model_step_id
+                and event.payload.get("model_attempt_id") == pending_round.model_attempt_id
+            )
+        ),
         terminal_event_types=_TOOL_ROUND_TERMINAL_EVENT_TYPES,
     )
 
+    if state.conflicting:
+        return
     if state.terminal:
         raise RuntimeError(
             f"Tool call already has a terminal event and does not need recovery: {tool_call_id}. "

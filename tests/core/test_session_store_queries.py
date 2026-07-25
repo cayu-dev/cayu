@@ -33,6 +33,7 @@ from cayu.runtime.pending_actions import (
     pending_action_lookup_key,
 )
 from cayu.runtime.sessions import (
+    MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
     MAX_PENDING_ACTION_RESULT_BYTES,
     PendingActionKind,
     PendingActionQuery,
@@ -103,8 +104,12 @@ def test_pending_action_event_projection_rejects_oversized_selected_payload() ->
     lookup_key, projection, projection_bytes = pending_action_event_storage_values(event)
 
     assert lookup_key == pending_action_lookup_key("oversized_approval")
-    assert projection is None
+    assert projection is not None
     assert projection_bytes == MAX_PENDING_ACTION_RESULT_BYTES + 1
+    projected_event = Event.model_validate_json(projection)
+    assert projected_event.payload == {
+        "__cayu_pending_action_projection_bytes__": (MAX_PENDING_ACTION_RESULT_BYTES + 1)
+    }
 
     oversized_identifier = Event(
         type=EventType.SESSION_INTERRUPTED,
@@ -118,8 +123,37 @@ def test_pending_action_event_projection_rejects_oversized_selected_payload() ->
 
     assert lookup_key == pending_action_lookup_key("x" * (MAX_PENDING_ACTION_RESULT_BYTES + 1))
     assert len(lookup_key) == 64
-    assert projection is None
+    assert projection is not None
     assert projection_bytes == MAX_PENDING_ACTION_RESULT_BYTES + 1
+    projected_identifier_event = Event.model_validate_json(projection)
+    assert projected_identifier_event.payload == {
+        "__cayu_pending_action_projection_bytes__": (MAX_PENDING_ACTION_RESULT_BYTES + 1)
+    }
+
+
+def test_oversized_pending_ledger_projection_retains_bounded_execution_identity() -> None:
+    identity = _tool_round_identity_payload()
+    event = Event(
+        type=EventType.TOOL_CALL_STARTED,
+        session_id="oversized_pending_ledger_projection",
+        payload={
+            **identity,
+            "tool_call_id": "oversized_pending_ledger_call",
+            "manual_recovery": "x" * MAX_PENDING_ACTION_RESULT_BYTES,
+        },
+    )
+
+    lookup_key, projection, projection_bytes = pending_action_event_storage_values(event)
+
+    assert lookup_key == pending_action_lookup_key("oversized_pending_ledger_call")
+    assert projection is not None
+    assert projection_bytes == MAX_PENDING_ACTION_RESULT_BYTES + 1
+    projected_event = Event.model_validate_json(projection)
+    assert projected_event.payload == {
+        **identity,
+        "__cayu_pending_action_projection_bytes__": (MAX_PENDING_ACTION_RESULT_BYTES + 1),
+    }
+    assert len(projection.encode("utf-8")) < 1024
 
 
 def test_pending_approval_projection_retains_direct_execution_identity() -> None:
@@ -160,6 +194,34 @@ def test_pending_approval_projection_retains_direct_execution_identity() -> None
         "tool_call_id": "call_1",
         **identity,
     }
+
+
+@pytest.mark.parametrize(
+    ("pause_key", "pause_id"),
+    [
+        ("approval_id", "approval_1"),
+        ("input_id", "input_1"),
+    ],
+)
+def test_pending_action_tool_ledger_projection_uses_call_identity(
+    pause_key: str,
+    pause_id: str,
+) -> None:
+    event = Event(
+        type=EventType.TOOL_CALL_STARTED,
+        session_id="pending_tool_ledger_projection",
+        payload={
+            **_tool_round_identity_payload(),
+            "tool_call_id": "call_1",
+            pause_key: pause_id,
+        },
+    )
+
+    lookup_key, projection, projection_bytes = pending_action_event_storage_values(event)
+
+    assert lookup_key == pending_action_lookup_key("call_1")
+    assert projection is not None
+    assert projection_bytes is not None
 
 
 @pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
@@ -276,6 +338,22 @@ def test_in_memory_pending_action_index_is_pruned_after_resolution() -> None:
             ),
             identity=_identity(),
         )
+        checkpoint = {
+            "pending_tool_approval": {
+                "approval_id": "pruned_approval",
+                **_tool_round_identity_payload(),
+                "tool_call_id": "pruned_call",
+                "tool_name": "deploy",
+                "agent_name": "assistant",
+                "tool_calls": [
+                    {
+                        "tool_call_id": "pruned_call",
+                        "tool_name": "deploy",
+                    }
+                ],
+            }
+        }
+        await store.checkpoint(session.id, checkpoint)
         await store.append_event(
             session.id,
             Event(
@@ -299,6 +377,88 @@ def test_in_memory_pending_action_index_is_pruned_after_resolution() -> None:
         await store.checkpoint(session.id, {})
 
         assert session.id not in store._pending_action_event_records
+        await store.append_event(
+            session.id,
+            Event(
+                id="resolved_approval_event",
+                type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                session_id=session.id,
+                payload={
+                    **_tool_round_identity_payload(),
+                    "approval_id": "resolved_approval",
+                    "tool_call_id": "resolved_call",
+                    "approval": {
+                        "approval_id": "resolved_approval",
+                        **_tool_round_identity_payload(),
+                        "tool_call_id": "resolved_call",
+                    },
+                },
+            ),
+        )
+        assert session.id not in store._pending_action_event_records
+
+        await store.checkpoint(session.id, checkpoint)
+        retained = store._pending_action_event_records[session.id]
+        assert set(retained) == {pending_action_lookup_key("pruned_approval")}
+        await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_in_memory_pending_action_ledger_index_is_bounded_per_call() -> None:
+    store = InMemorySessionStore()
+
+    async def run() -> None:
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="bounded_pending_ledger",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=_identity(),
+        )
+        call_id = "bounded_pending_ledger_call"
+        identity_payload = _tool_round_identity_payload()
+        await store.checkpoint(
+            session.id,
+            {
+                "pending_tool_round": {
+                    **identity_payload,
+                    "agent_name": "assistant",
+                    "tool_calls": [
+                        {
+                            "tool_call_id": call_id,
+                            "tool_name": "charge",
+                            "arguments": {},
+                            "policy_decision": None,
+                            "reason": None,
+                            "metadata": {},
+                            "active_taint_labels": [],
+                        }
+                    ],
+                }
+            },
+        )
+        await store.append_events(
+            session.id,
+            [
+                Event(
+                    id=f"bounded_pending_ledger_event_{index}",
+                    type=EventType.TOOL_CALL_STARTED,
+                    session_id=session.id,
+                    payload={
+                        **identity_payload,
+                        "tool_call_id": call_id,
+                    },
+                )
+                for index in range(MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL * 4)
+            ],
+        )
+
+        retained = store._pending_action_event_records[session.id][
+            pending_action_lookup_key(call_id)
+        ]
+        assert len(retained) == MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL + 1
         await _close_store(store)
 
     asyncio.run(run())

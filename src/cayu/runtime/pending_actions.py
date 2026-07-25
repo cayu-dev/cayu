@@ -7,11 +7,17 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from cayu._validation import JsonUtf8SizeCounter, copy_durable_json_value
+from cayu._validation import (
+    EXECUTION_UNIT_ID_MAX_CHARS,
+    JsonUtf8SizeCounter,
+    copy_durable_json_value,
+)
 from cayu.core.events import Event, EventType
 from cayu.runtime import _approval_support as approval_support
+from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime.sessions import (
+    MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
     MAX_PENDING_ACTION_RESULT_BYTES,
     MAX_PENDING_ACTION_TOOL_CALLS,
     PENDING_ACTION_EVENT_TYPE_VALUES,
@@ -31,6 +37,9 @@ PENDING_ACTION_CHECKPOINT_KEYS = frozenset(
 )
 _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS = frozenset(
     {"model_step_id", "model_attempt_id", "tool_round_id"}
+)
+_TOOL_EVENT_EVIDENCE_PAYLOAD_KEYS = (
+    frozenset({"tool_call_id", "manual_recovery"}) | _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS
 )
 
 _PENDING_ACTION_EVENT_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
@@ -53,16 +62,17 @@ _PENDING_ACTION_EVENT_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
         }
     )
     | _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS,
-    "tool.call.started": frozenset({"tool_call_id"}) | _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS,
-    "tool.call.completed": frozenset({"tool_call_id"}) | _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS,
-    "tool.call.failed": frozenset({"tool_call_id"}) | _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS,
-    "tool.call.blocked": frozenset({"tool_call_id"}) | _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS,
-    "tool.call.approval_denied": frozenset({"tool_call_id"}) | _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS,
+    "tool.call.started": _TOOL_EVENT_EVIDENCE_PAYLOAD_KEYS,
+    "tool.call.completed": _TOOL_EVENT_EVIDENCE_PAYLOAD_KEYS,
+    "tool.call.failed": _TOOL_EVENT_EVIDENCE_PAYLOAD_KEYS,
+    "tool.call.blocked": _TOOL_EVENT_EVIDENCE_PAYLOAD_KEYS,
+    "tool.call.approval_denied": _TOOL_EVENT_EVIDENCE_PAYLOAD_KEYS,
     "session.resumed": _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS,
     "session.completed": frozenset(),
     "session.failed": frozenset(),
 }
 _OVERSIZED_EVENT_PROJECTION_BYTES_KEY = "__cayu_pending_action_projection_bytes__"
+_OVERSIZED_EVENT_PROJECTION_REFERENCE = "cayu_oversized_pending_action_projection"
 _TERMINAL_RESULT_VALID_KEY = "__cayu_terminal_result_valid__"
 _TERMINAL_EVENT_TYPES = frozenset(
     {
@@ -72,6 +82,55 @@ _TERMINAL_EVENT_TYPES = frozenset(
         EventType.TOOL_CALL_APPROVAL_DENIED,
     }
 )
+_LEDGER_EVENT_TYPES = frozenset({EventType.TOOL_CALL_STARTED} | set(_TERMINAL_EVENT_TYPES))
+_LEDGER_EVENT_TYPE_VALUES = frozenset(str(event_type) for event_type in _LEDGER_EVENT_TYPES)
+
+
+def pending_action_event_retains_history(event_type: str) -> bool:
+    """Whether every projected event is needed to classify recovery evidence."""
+    return event_type in _LEDGER_EVENT_TYPE_VALUES
+
+
+def pending_action_tool_round_from_checkpoint(
+    checkpoint: dict[str, Any] | None,
+) -> tool_round_recovery.PendingToolRound | None:
+    try:
+        return tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+    except (TypeError, ValueError, ValidationError):
+        return None
+
+
+def pending_action_event_matches_tool_round(
+    event: Event,
+    pending_round: tool_round_recovery.PendingToolRound,
+) -> bool:
+    return event.payload.get("tool_round_id") == pending_round.tool_round_id or (
+        event.payload.get("model_step_id") == pending_round.model_step_id
+        and event.payload.get("model_attempt_id") == pending_round.model_attempt_id
+    )
+
+
+def retain_pending_action_index_record(
+    records_by_key: dict[str, EventRecord],
+    record: EventRecord,
+) -> None:
+    """Retain one latest action source or a bounded current-ledger history."""
+    event_type = str(record.event.type)
+    if not pending_action_event_retains_history(event_type):
+        records_by_key[event_type] = record
+        return
+
+    records_by_key[f"{event_type}:{record.sequence}"] = record
+    ledger_records = [
+        (key, retained)
+        for key, retained in records_by_key.items()
+        if retained.event.type in _LEDGER_EVENT_TYPES
+    ]
+    maximum = MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL + 1
+    if len(ledger_records) <= maximum:
+        return
+    oldest_key, _ = min(ledger_records, key=lambda item: item[1].sequence)
+    records_by_key.pop(oldest_key)
 
 
 def checkpoint_has_pending_action_candidate(checkpoint: dict[str, Any] | None) -> bool:
@@ -158,10 +217,20 @@ def pending_action_checkpoint_lookup_ids(
 
 
 def pending_action_event_lookup_id(event: Event) -> str | None:
-    """Project the same one event identifier indexed by SQLite and PostgreSQL."""
+    """Project the same one event identifier indexed by SQLite and PostgreSQL.
+
+    Tool ledger evidence is owned by the call even when a resumed call also
+    carries its approval or user-input pause id. Pause checkpoints are cleared
+    before the enclosing tool round, so indexing ledger evidence by the pause
+    would make it unreachable from the surviving round checkpoint.
+    """
     payload = event.payload
     approval = _object_payload(payload.get("approval"))
     user_input = _object_payload(payload.get("user_input"))
+    if event.type in _LEDGER_EVENT_TYPES:
+        tool_call_id = _optional_payload_string(payload, "tool_call_id")
+        if tool_call_id is not None:
+            return tool_call_id
     for value in (
         _optional_payload_string(payload, "approval_id"),
         _optional_payload_string(approval, "approval_id"),
@@ -209,9 +278,16 @@ def pending_action_event_storage_values(
     }
     counter = JsonUtf8SizeCounter(MAX_PENDING_ACTION_RESULT_BYTES)
     if not counter.value(projection_view):
+        projected = _oversized_pending_action_event_projection(event)
+        projection = projected.model_dump(mode="json")
+        projection_json = json.dumps(
+            projection,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         return (
             lookup_key,
-            None,
+            projection_json,
             MAX_PENDING_ACTION_RESULT_BYTES + 1,
         )
     projected = _project_pending_action_event(event, payload_view=payload_view)
@@ -221,6 +297,33 @@ def pending_action_event_storage_values(
         lookup_key,
         projection_json,
         len(projection_json.encode("utf-8")),
+    )
+
+
+def _oversized_pending_action_event_projection(event: Event) -> Event:
+    """Retain only bounded identity needed to scope an oversized event.
+
+    The byte marker prevents callers from materializing the event as a normal
+    action source. Keeping canonical-sized execution identifiers lets every
+    store exclude stale evidence for a reused provider tool-call id before
+    applying that size failure to the current round.
+    """
+
+    identity_payload = {
+        key: value
+        for key in ("model_step_id", "model_attempt_id", "tool_round_id")
+        if type(value := event.payload.get(key)) is str
+        and len(value) <= EXECUTION_UNIT_ID_MAX_CHARS
+    }
+    return Event(
+        type=event.type,
+        session_id=_OVERSIZED_EVENT_PROJECTION_REFERENCE,
+        id=_OVERSIZED_EVENT_PROJECTION_REFERENCE,
+        timestamp=event.timestamp,
+        payload={
+            **identity_payload,
+            _OVERSIZED_EVENT_PROJECTION_BYTES_KEY: (MAX_PENDING_ACTION_RESULT_BYTES + 1),
+        },
     )
 
 
@@ -345,16 +448,32 @@ def select_pending_action_indexed_records(
     checkpoint: dict[str, Any] | None,
     records_by_lookup_key: Mapping[str, Mapping[str, EventRecord]],
     latest_barrier: EventRecord | None,
-) -> list[EventRecord]:
+) -> tuple[list[EventRecord], bool]:
     """Select bounded current-action records from identifier/event-type indexes."""
     selected: dict[int, EventRecord] = {}
+    pending_round = pending_action_tool_round_from_checkpoint(checkpoint)
+    ledger_too_complex = False
     for lookup_id in pending_action_checkpoint_lookup_ids(checkpoint):
         lookup_key = pending_action_lookup_key(lookup_id)
+        ledger_count = 0
         for record in records_by_lookup_key.get(lookup_key, {}).values():
+            if record.event.type in _LEDGER_EVENT_TYPES:
+                if pending_round is None or not pending_action_event_matches_tool_round(
+                    record.event,
+                    pending_round,
+                ):
+                    continue
+                ledger_count += 1
+                if ledger_count > MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL:
+                    ledger_too_complex = True
+                    continue
             selected[record.sequence] = record
     if latest_barrier is not None:
         selected[latest_barrier.sequence] = latest_barrier
-    return [selected[sequence] for sequence in sorted(selected, reverse=True)]
+    return (
+        [selected[sequence] for sequence in sorted(selected, reverse=True)],
+        ledger_too_complex,
+    )
 
 
 def _object_payload(value: Any) -> dict[str, Any] | None:
@@ -561,6 +680,23 @@ def _pending_tool_round_checkpoint_call(
     return None
 
 
+def _pending_tool_round_evidence(
+    records_desc: list[EventRecord],
+    pending_round: tool_round_recovery.PendingToolRound,
+) -> resume_ledger.ToolCallEvidenceLedger:
+    identity = tool_round_recovery.pending_tool_round_identity(pending_round)
+    return resume_ledger.scan_projected_tool_call_evidence(
+        events=(record.event for record in reversed(records_desc)),
+        pending_calls=pending_round.tool_calls,
+        in_scope=lambda event: identity.matches_payload(event.payload),
+        candidate_scope=lambda event: pending_action_event_matches_tool_round(event, pending_round),
+        terminal_event_types=_TERMINAL_EVENT_TYPES,
+        terminal_result_is_valid=lambda event: (
+            event.payload.get(_TERMINAL_RESULT_VALID_KEY) is True
+        ),
+    )
+
+
 def _tool_round_manual_recovery_action(
     session: PendingActionSession,
     records_desc: list[EventRecord],
@@ -574,30 +710,11 @@ def _tool_round_manual_recovery_action(
         return None
 
     identity = tool_round_recovery.pending_tool_round_identity(pending_round)
-    started_ids: set[str] = set()
-    terminal_ids: set[str] = set()
-    terminal_types = {
-        EventType.TOOL_CALL_COMPLETED,
-        EventType.TOOL_CALL_FAILED,
-        EventType.TOOL_CALL_BLOCKED,
-        EventType.TOOL_CALL_APPROVAL_DENIED,
-    }
-    pending_call_ids = {call.tool_call_id for call in pending_round.tool_calls}
-    for record in reversed(records_desc):
-        event = record.event
-        if not identity.matches_payload(event.payload):
-            continue
-        tool_call_id = event.payload.get("tool_call_id")
-        if type(tool_call_id) is not str or tool_call_id not in pending_call_ids:
-            continue
-        if event.type == EventType.TOOL_CALL_STARTED:
-            started_ids.add(tool_call_id)
-        elif event.type in terminal_types:
-            terminal_ids.add(tool_call_id)
+    evidence = _pending_tool_round_evidence(records_desc, pending_round)
     unresolved_calls = [
         call
         for call in pending_round.tool_calls
-        if call.tool_call_id in started_ids and call.tool_call_id not in terminal_ids
+        if call.tool_call_id in evidence.started_without_terminal_ids
     ]
     if not unresolved_calls:
         return None
@@ -617,8 +734,8 @@ def _tool_round_manual_recovery_action(
             (
                 record
                 for record in records_desc
-                if record.event.type == EventType.TOOL_CALL_STARTED
-                and identity.matches_payload(record.event.payload)
+                if record.event.type in _LEDGER_EVENT_TYPES
+                and pending_action_event_matches_tool_round(record.event, pending_round)
                 and record.event.payload.get("tool_call_id") == pending_call.tool_call_id
             ),
             None,
@@ -626,11 +743,17 @@ def _tool_round_manual_recovery_action(
     if source_record is None:
         return None
 
-    detail = (
-        "Tool started but no terminal result was recorded before the session failed."
-        if session.status == SessionStatus.FAILED
-        else "Tool started but no terminal result was recorded."
-    )
+    if pending_call.tool_call_id in evidence.conflicting_ids:
+        detail = (
+            "Tool execution has malformed or contradictory durable evidence; "
+            "its outcome must be reconciled manually."
+        )
+    else:
+        detail = (
+            "Tool started but no terminal result was recorded before the session failed."
+            if session.status == SessionStatus.FAILED
+            else "Tool started but no terminal result was recorded."
+        )
     return _action_from_record(
         session=session,
         record=source_record,
@@ -883,22 +1006,9 @@ def pending_action_source_is_invalid(
     except (TypeError, ValueError, ValidationError):
         return True
     if pending_round is not None:
-        identity = tool_round_recovery.pending_tool_round_identity(pending_round)
-        pending_call_ids = {call.tool_call_id for call in pending_round.tool_calls}
-        checked_terminal_ids: set[str] = set()
-        for record in records_desc:
-            event = record.event
-            if event.type not in _TERMINAL_EVENT_TYPES:
-                continue
-            if not identity.matches_payload(event.payload):
-                continue
-            tool_call_id = event.payload.get("tool_call_id")
-            if tool_call_id not in pending_call_ids or tool_call_id in checked_terminal_ids:
-                continue
-            assert isinstance(tool_call_id, str)
-            checked_terminal_ids.add(tool_call_id)
-            if event.payload.get(_TERMINAL_RESULT_VALID_KEY) is not True:
-                return True
+        evidence = _pending_tool_round_evidence(records_desc, pending_round)
+        if evidence.started_without_terminal_ids:
+            return action is None
     if action is not None:
         return False
     if pending_approval is not None or pending_input is not None:
