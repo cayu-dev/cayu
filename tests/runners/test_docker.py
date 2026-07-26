@@ -226,7 +226,9 @@ def test_build_exec_argv_process():
     )
     assert argv[:6] == ["/usr/bin/docker", "exec", "-w", "/workspace", "a1", "sh"]
     assert argv[6] == "-c"
-    assert "setsid" in argv[7]
+    assert "setsid -w true" in argv[7]
+    assert "exec setsid -w sh -c" in argv[7]
+    assert "else exec sh -c" in argv[7]
     assert "/tmp/cayu-docker-commands/cmd.pid" in argv[7]
     assert "whois x.ai" in argv[7]
     assert " & " not in argv[7]
@@ -257,7 +259,9 @@ def test_build_exec_argv_shell_env_stdin():
     ]
     assert not any("K=v" in item for item in argv)
     assert argv[9] == "-c"
-    assert "setsid" in argv[10]
+    assert "setsid -w true" in argv[10]
+    assert "exec setsid -w sh -c" in argv[10]
+    assert "else exec sh -c" in argv[10]
     assert "/tmp/cayu-docker-commands/cmd.pid" in argv[10]
     assert "echo hi" in argv[10]
     assert " & " not in argv[10]

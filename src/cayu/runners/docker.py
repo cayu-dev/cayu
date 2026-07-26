@@ -153,8 +153,8 @@ def _supervised_command_script(command_script: str, pid_file: str) -> str:
     fallback_body = _supervised_command_body(command_script, pid_file=pid_file, process_group=False)
     return (
         f"mkdir -p {quoted_state_dir}; "
-        "if command -v setsid >/dev/null 2>&1; then "
-        f"exec setsid sh -c {shlex.quote(setsid_body)}; "
+        "if setsid -w true >/dev/null 2>&1; then "
+        f"exec setsid -w sh -c {shlex.quote(setsid_body)}; "
         "else "
         f"exec sh -c {shlex.quote(fallback_body)}; "
         "fi"

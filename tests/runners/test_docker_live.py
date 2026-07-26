@@ -86,6 +86,17 @@ def test_real_docker_runner_executes_and_cleans_up_timed_out_command() -> None:
             assert ok.stdout == "docker-live-ok"
             assert ok.timed_out is False
 
+            shell_failure = await runner.exec(
+                ExecCommand.bash("printf 'validation failed\\n'; exit 23")
+            )
+            assert shell_failure.exit_code == 23
+            assert shell_failure.stdout == "validation failed\n"
+            assert shell_failure.timed_out is False
+
+            process_failure = await runner.exec(ExecCommand.process("sh", "-c", "exit 17"))
+            assert process_failure.exit_code == 17
+            assert process_failure.timed_out is False
+
             await verify_bounded_output_drain(runner, adapter="docker")
 
             timed_out = await runner.exec(ExecCommand.process("sh", "-c", "sleep 30"), timeout_s=1)

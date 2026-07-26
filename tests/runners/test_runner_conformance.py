@@ -42,7 +42,7 @@ from cayu.runners._subprocess import SubprocessCommand, run_subprocess
 
 ORPHAN_WRITE_DELAY_SECONDS = 0.5
 ORPHAN_OBSERVATION_DELAY_SECONDS = 0.6
-SETSID_PROBE = "if command -v setsid >/dev/null 2>&1; then "
+SETSID_PROBE = "if setsid -w true >/dev/null 2>&1; then "
 
 
 async def _local_factory(root: Path, _monkeypatch: pytest.MonkeyPatch) -> RunnerHarness:
