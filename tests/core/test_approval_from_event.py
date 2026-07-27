@@ -33,6 +33,8 @@ def _approval_event() -> Event:
             "approval": pending.model_dump(mode="json"),
         },
         session_id="sess_1",
+        agent_name=pending.agent_name,
+        tool_name=pending.tool_name,
     )
 
 
@@ -60,6 +62,26 @@ def test_from_event_rejects_conflicting_direct_identity(field: str, value: str) 
     event.payload[field] = value
 
     with pytest.raises(ValueError, match="identity"):
+        PendingToolApproval.from_event(event)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("tool_name", "other_tool"),
+        ("tool_name", None),
+        ("agent_name", "other_agent"),
+        ("environment_name", "other_environment"),
+    ],
+)
+def test_from_event_rejects_conflicting_envelope_descriptor(
+    field: str,
+    value: str | None,
+) -> None:
+    event = _approval_event()
+    setattr(event, field, value)
+
+    with pytest.raises(ValueError, match="descriptor"):
         PendingToolApproval.from_event(event)
 
 

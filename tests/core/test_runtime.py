@@ -17416,12 +17416,36 @@ def test_pending_interruption_cascade_blocks_resume_and_fork():
                     )
                 )
             ]
-        return await store.load(session_id), await store.load("sess_pending_cascade_fork")
+        await store.update_status(session_id, SessionStatus.FAILED)
+        with pytest.raises(RuntimeError, match="incomplete background interruption cascade"):
+            _ = [
+                event
+                async for event in app.fork_session(
+                    ForkSessionRequest(
+                        source_session_id=session_id,
+                        session_id="sess_pending_cascade_fork_without_checkpoint",
+                        copy_checkpoint=False,
+                    )
+                )
+            ]
+        return (
+            await store.load(session_id),
+            await store.load("sess_pending_cascade_fork"),
+            await store.load("sess_pending_cascade_fork_without_checkpoint"),
+            await store.load_checkpoint(session_id),
+        )
 
-    source, fork = asyncio.run(run())
+    source, copied_fork, checkpointless_fork, checkpoint = asyncio.run(run())
 
-    assert source.status == SessionStatus.INTERRUPTED
-    assert fork is None
+    assert source.status == SessionStatus.FAILED
+    assert copied_fork is None
+    assert checkpointless_fork is None
+    assert checkpoint == {
+        "pending_interruption_cascade": {
+            "attempt_id": "pending-cascade-attempt",
+            "interrupt_payload": {"interruption_type": "operator_requested"},
+        }
+    }
 
 
 def test_subagent_tool_background_reports_start_failure_as_tool_error():
@@ -29783,7 +29807,7 @@ def test_cayu_app_rejects_message_resume_with_pending_tool_approval():
         )
 
 
-def test_cayu_app_forks_interrupted_session_with_pending_approval_checkpoint():
+def test_cayu_app_rejects_fork_with_pending_approval_checkpoint():
     store = InMemorySessionStore()
     provider = FakeProvider(
         [
@@ -29794,14 +29818,19 @@ def test_cayu_app_forks_interrupted_session_with_pending_approval_checkpoint():
                     arguments={"value": "secret"},
                 ),
                 ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
-            ]
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
         ]
     )
     app = CayuApp(session_store=store)
     app.register_provider(provider, default=True)
+    tool = SideEffectTool()
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
-        tools=[SideEffectTool()],
+        tools=[tool],
         tool_policy=RequireApprovalPolicy(),
     )
 
@@ -29815,36 +29844,46 @@ def test_cayu_app_forks_interrupted_session_with_pending_approval_checkpoint():
             ),
         )
     )
-    approval_id = events[4].payload["approval"]["approval_id"]
+    approval_event = next(
+        event for event in events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+    )
+    approval_id = approval_event.payload["approval"]["approval_id"]
     source_checkpoint = asyncio.run(store.load_checkpoint("sess_interrupted_fork_source"))
     assert source_checkpoint is not None
     source_checkpoint["pending_tool_approval"]["task_id"] = "source_task"
     asyncio.run(store.checkpoint("sess_interrupted_fork_source", source_checkpoint))
 
-    fork_events = asyncio.run(
-        collect_fork_events(
-            app,
-            ForkSessionRequest(
-                source_session_id="sess_interrupted_fork_source",
-                session_id="sess_interrupted_fork_child",
-            ),
+    with pytest.raises(RuntimeError, match="awaiting tool approval cannot be forked"):
+        asyncio.run(
+            collect_fork_events(
+                app,
+                ForkSessionRequest(
+                    source_session_id="sess_interrupted_fork_source",
+                    session_id="sess_interrupted_fork_child",
+                ),
+            )
         )
-    )
 
-    assert [event.type for event in fork_events] == [EventType.SESSION_FORKED]
-    fork = asyncio.run(store.load("sess_interrupted_fork_child"))
-    assert fork is not None
-    assert fork.status == SessionStatus.INTERRUPTED
-    assert fork.parent_session_id == "sess_interrupted_fork_source"
-    fork_checkpoint = asyncio.run(store.load_checkpoint("sess_interrupted_fork_child"))
-    assert fork_checkpoint is not None
-    assert fork_checkpoint["pending_tool_approval"]["approval_id"] == approval_id
-    assert fork_checkpoint["pending_tool_approval"]["task_id"] is None
-
+    assert asyncio.run(store.load("sess_interrupted_fork_child")) is None
     source_checkpoint_after = asyncio.run(store.load_checkpoint("sess_interrupted_fork_source"))
-    assert source_checkpoint_after is not None
-    assert source_checkpoint_after["pending_tool_approval"]["task_id"] == "source_task"
+    assert source_checkpoint_after == source_checkpoint
 
+    asyncio.run(store.update_status("sess_interrupted_fork_source", SessionStatus.FAILED))
+    with pytest.raises(RuntimeError, match="awaiting tool approval cannot be forked"):
+        asyncio.run(
+            collect_fork_events(
+                app,
+                ForkSessionRequest(
+                    source_session_id="sess_interrupted_fork_source",
+                    session_id="sess_failed_fork_without_checkpoint",
+                    copy_checkpoint=False,
+                ),
+            )
+        )
+    assert asyncio.run(store.load("sess_failed_fork_without_checkpoint")) is None
+    assert asyncio.run(store.load_checkpoint("sess_interrupted_fork_source")) == source_checkpoint
+
+    asyncio.run(store.update_status("sess_interrupted_fork_source", SessionStatus.INTERRUPTED))
     with pytest.raises(ValueError, match="without checkpoint state"):
         asyncio.run(
             collect_fork_events(
@@ -29857,18 +29896,17 @@ def test_cayu_app_forks_interrupted_session_with_pending_approval_checkpoint():
             )
         )
 
-    app.register_agent(AgentSpec(name="other", model="fake-model"))
-    with pytest.raises(ValueError, match="different agent"):
-        asyncio.run(
-            collect_fork_events(
-                app,
-                ForkSessionRequest(
-                    source_session_id="sess_interrupted_fork_source",
-                    session_id="sess_interrupted_fork_other_agent",
-                    agent_name="other",
-                ),
-            )
+    asyncio.run(
+        collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id="sess_interrupted_fork_source",
+                approval_id=approval_id,
+                decision=ToolApprovalDecision.APPROVE,
+            ),
         )
+    )
+    assert tool.calls == [{"value": "secret"}]
 
 
 def test_in_memory_session_store_rejects_fork_status_mismatch():

@@ -13,12 +13,19 @@ from cayu.runtime.approvals import PendingToolCallApproval
 from cayu.runtime.tool_policy import ToolPolicyDecision, ToolPolicyResult
 from cayu.vaults import SecretRedactor
 
+TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY = "tool_evidence_conflict"
+
+
+class ToolCallEvidenceConflict(RuntimeError):
+    """Current-round tool evidence cannot be attributed to one pending call."""
+
 
 @dataclass(frozen=True)
 class ToolCallLedger:
     outcomes: dict[str, runtime_records.ToolCallOutcome]
     started_ids: set[str]
     conflicting_ids: set[str]
+    scope_conflicting: bool
 
     @property
     def started_without_terminal_ids(self) -> set[str]:
@@ -30,6 +37,7 @@ class ToolCallEvidenceLedger:
     terminal_ids: set[str]
     started_ids: set[str]
     conflicting_ids: set[str]
+    scope_conflicting: bool
 
     @property
     def started_without_terminal_ids(self) -> set[str]:
@@ -51,6 +59,7 @@ class _ScannedToolCalls(Generic[_TerminalOutcome]):
     outcomes: dict[str, _TerminalOutcome]
     started_ids: set[str]
     conflicting_ids: set[str]
+    scope_conflicting: bool
 
 
 def _scan_tool_call_events(
@@ -69,22 +78,36 @@ def _scan_tool_call_events(
     terminal_event_ids: set[str] = set()
     last_conflict_index: dict[str, int] = {}
     last_manual_recovery_index: dict[str, int] = {}
+    scope_conflicting = False
     relevant_event_types = terminal_event_types | {EventType.TOOL_CALL_STARTED}
     is_candidate = in_scope if candidate_scope is None else candidate_scope
 
     for index, event in enumerate(events):
         if event.type not in relevant_event_types:
             continue
+        if not is_candidate(event):
+            continue
         tool_call_id = event.payload.get("tool_call_id")
         if type(tool_call_id) is not str or tool_call_id not in pending_by_id:
-            continue
-        if not is_candidate(event):
+            scope_conflicting = True
             continue
         if not in_scope(event):
             started_ids.add(tool_call_id)
             last_conflict_index[tool_call_id] = index
             continue
+        pending_call = pending_by_id[tool_call_id]
+        if type(event.tool_name) is not str or event.tool_name != pending_call.tool_name:
+            started_ids.add(tool_call_id)
+            last_conflict_index[tool_call_id] = index
+            outcomes.pop(tool_call_id, None)
+            continue
         if event.type == EventType.TOOL_CALL_STARTED:
+            arguments = event.payload.get("arguments")
+            if type(arguments) is not dict or arguments != pending_call.arguments:
+                started_ids.add(tool_call_id)
+                last_conflict_index[tool_call_id] = index
+                outcomes.pop(tool_call_id, None)
+                continue
             if tool_call_id in started_event_ids or tool_call_id in terminal_event_ids:
                 last_conflict_index[tool_call_id] = index
             started_event_ids.add(tool_call_id)
@@ -133,6 +156,7 @@ def _scan_tool_call_events(
         outcomes=outcomes,
         started_ids=started_ids,
         conflicting_ids=conflicting_ids,
+        scope_conflicting=scope_conflicting,
     )
 
 
@@ -159,6 +183,7 @@ def scan_tool_call_events(
         outcomes=scanned.outcomes,
         started_ids=scanned.started_ids,
         conflicting_ids=scanned.conflicting_ids,
+        scope_conflicting=scanned.scope_conflicting,
     )
 
 
@@ -192,27 +217,35 @@ def scan_projected_tool_call_evidence(
         terminal_ids=set(scanned.outcomes),
         started_ids=scanned.started_ids,
         conflicting_ids=scanned.conflicting_ids,
+        scope_conflicting=scanned.scope_conflicting,
     )
 
 
 def tool_call_recovery_state(
     *,
     events: Iterable[Event],
-    pending_tool_call: PendingToolCallApproval,
+    pending_calls: Iterable[PendingToolCallApproval],
+    tool_call_id: str,
     in_scope: Callable[[Event], bool],
     candidate_scope: Callable[[Event], bool] | None = None,
     terminal_event_types: frozenset[EventType],
 ) -> ToolCallRecoveryState:
-    if type(pending_tool_call) is not PendingToolCallApproval:
-        raise TypeError("pending_tool_call must be a PendingToolCallApproval.")
-    tool_call_id = pending_tool_call.tool_call_id
+    materialized_calls = tuple(pending_calls)
+    if any(type(call) is not PendingToolCallApproval for call in materialized_calls):
+        raise TypeError("pending_calls must contain PendingToolCallApproval values.")
+    if sum(call.tool_call_id == tool_call_id for call in materialized_calls) != 1:
+        raise ValueError("tool_call_id must identify exactly one pending call.")
     ledger = scan_tool_call_events(
         events=events,
-        pending_calls=(pending_tool_call,),
+        pending_calls=materialized_calls,
         in_scope=in_scope,
         candidate_scope=candidate_scope,
         terminal_event_types=terminal_event_types,
     )
+    if ledger.scope_conflicting:
+        raise ToolCallEvidenceConflict(
+            "Tool recovery evidence contains a call outside the pending tool round."
+        )
     return ToolCallRecoveryState(
         started=tool_call_id in ledger.started_ids,
         terminal=tool_call_id in ledger.outcomes,
@@ -254,6 +287,11 @@ def tool_call_outcome_from_terminal_event(
     event: Event,
     pending_tool_call: PendingToolCallApproval,
 ) -> runtime_records.ToolCallOutcome:
+    if type(event.tool_name) is not str or event.tool_name != pending_tool_call.tool_name:
+        raise ValueError(
+            "Terminal tool event names a different pending tool call: "
+            f"{pending_tool_call.tool_call_id}"
+        )
     result_payload = event.payload.get("result")
     if type(result_payload) is not dict:
         raise ValueError(

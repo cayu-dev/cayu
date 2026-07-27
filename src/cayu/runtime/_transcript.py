@@ -60,26 +60,104 @@ async def tool_round_has_result_messages(
 ) -> bool:
     """Return whether one stored tool message closes every call in the round."""
     identity = copy_tool_round_identity(tool_round_identity)
-    expected_ids = {tool_call.id for tool_call in tool_calls}
-    if not expected_ids:
+    expected_by_id: dict[str, ToolCallRequest] = {}
+    for tool_call in tool_calls:
+        existing = expected_by_id.setdefault(tool_call.id, tool_call)
+        if existing.name != tool_call.name or existing.arguments != tool_call.arguments:
+            raise ValueError(
+                "Pending tool round reuses a tool-call identifier for different descriptors."
+            )
+    if not expected_by_id:
         return True
+    expected_ids = set(expected_by_id)
     transcript = await session_store.load_transcript(session_id)
-    for message in reversed(transcript):
-        result_ids = {
-            part.tool_call_id
-            for part in message.content
-            if type(part) is ToolResultPart and _part_matches_tool_round_identity(part, identity)
-        }
-        if expected_ids.issubset(result_ids):
-            return True
-        call_ids = {
-            part.tool_call_id
-            for part in message.content
-            if type(part) is ToolCallPart and _part_matches_tool_round_identity(part, identity)
-        }
-        if expected_ids & call_ids:
-            return False
-    return False
+    call_message_seen = False
+    result_message_seen = False
+    for message in transcript:
+        tool_parts: list[ToolCallPart | ToolResultPart] = []
+        for part in message.content:
+            if not isinstance(part, (ToolCallPart, ToolResultPart)):
+                continue
+            if type(part) not in {ToolCallPart, ToolResultPart}:
+                continue
+            tool_parts.append(part)
+        matching_parts: list[ToolCallPart | ToolResultPart] = []
+        for part in tool_parts:
+            if _part_matches_tool_round_identity(part, identity):
+                matching_parts.append(part)
+        if not matching_parts:
+            if call_message_seen and any(part.tool_call_id in expected_ids for part in tool_parts):
+                raise ValueError(
+                    "Stored transcript contains newer conflicting tool-round evidence."
+                )
+            continue
+        if len(matching_parts) != len(tool_parts):
+            raise ValueError(
+                "Stored transcript message combines conflicting tool-round identities."
+            )
+        call_parts = [part for part in matching_parts if type(part) is ToolCallPart]
+        result_parts = [part for part in matching_parts if type(part) is ToolResultPart]
+        if call_parts and result_parts:
+            raise ValueError(
+                "Stored transcript message combines tool calls and results for one round."
+            )
+        if call_parts:
+            if call_message_seen:
+                raise ValueError("Stored transcript contains duplicate tool-round call messages.")
+            if result_message_seen:
+                raise ValueError(
+                    "Stored transcript contains a tool-round call after its result message."
+                )
+            _validate_tool_round_call_parts(call_parts, expected_by_id)
+            call_message_seen = True
+            continue
+        if result_parts:
+            if not call_message_seen:
+                raise ValueError(
+                    "Stored transcript contains tool results before the pending round call boundary."
+                )
+            if result_message_seen:
+                raise ValueError("Stored transcript contains duplicate tool-round result messages.")
+            _validate_tool_round_result_parts(result_parts, expected_by_id)
+            result_message_seen = True
+    return call_message_seen and result_message_seen
+
+
+def _validate_tool_round_call_parts(
+    parts: list[ToolCallPart],
+    expected_by_id: dict[str, ToolCallRequest],
+) -> None:
+    part_ids = [part.tool_call_id for part in parts]
+    if len(part_ids) != len(set(part_ids)):
+        raise ValueError("Stored transcript contains duplicate calls in one tool-round message.")
+    if set(part_ids) != set(expected_by_id):
+        raise ValueError(
+            "Stored transcript tool-round call message does not match the pending call set."
+        )
+    for part in parts:
+        expected_call = expected_by_id[part.tool_call_id]
+        if part.tool_name != expected_call.name or part.arguments != expected_call.arguments:
+            raise ValueError(
+                "Stored transcript tool-round call descriptor does not match the pending checkpoint."
+            )
+
+
+def _validate_tool_round_result_parts(
+    parts: list[ToolResultPart],
+    expected_by_id: dict[str, ToolCallRequest],
+) -> None:
+    part_ids = [part.tool_call_id for part in parts]
+    if len(part_ids) != len(set(part_ids)):
+        raise ValueError("Stored transcript contains duplicate results in one tool-round message.")
+    if set(part_ids) != set(expected_by_id):
+        raise ValueError(
+            "Stored transcript tool-round result message does not match the pending call set."
+        )
+    for part in parts:
+        if part.tool_name != expected_by_id[part.tool_call_id].name:
+            raise ValueError(
+                "Stored transcript tool-round result descriptor does not match the pending checkpoint."
+            )
 
 
 def _part_matches_tool_round_identity(

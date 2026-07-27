@@ -280,6 +280,8 @@ def test_sqlite_pending_action_query_uses_persisted_projection_not_original_payl
                 id="persisted_pending_projection_event",
                 type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
                 session_id=session_id,
+                agent_name="assistant",
+                tool_name="deploy",
                 payload={
                     **_tool_round_identity_payload(),
                     "approval_id": "persisted_pending_projection_approval",
@@ -288,6 +290,19 @@ def test_sqlite_pending_action_query_uses_persisted_projection_not_original_payl
                         "approval_id": "persisted_pending_projection_approval",
                         **_tool_round_identity_payload(),
                         "tool_name": "deploy",
+                        "arguments": {},
+                        "agent_name": "assistant",
+                        "tool_calls": [
+                            {
+                                "tool_call_id": "persisted_pending_projection_call",
+                                "tool_name": "deploy",
+                                "arguments": {},
+                                "policy_decision": None,
+                                "reason": None,
+                                "metadata": {},
+                                "active_taint_labels": [],
+                            }
+                        ],
                     },
                 },
             ),
@@ -1323,6 +1338,8 @@ def test_sqlite_session_store_revision_sixteen_requires_pending_action_index(tmp
         connection.execute("DROP INDEX idx_cayu_checkpoints_pending_control_action")
         connection.execute("DROP INDEX idx_cayu_events_pending_action_barrier")
         connection.execute("DROP INDEX idx_cayu_events_pending_action_lookup")
+        connection.execute("DROP INDEX idx_cayu_events_pending_action_round_scope")
+        connection.execute("DROP INDEX idx_cayu_events_pending_action_attempt_scope")
         connection.execute("ALTER TABLE cayu_events DROP COLUMN pending_action_lookup_key")
         connection.execute("ALTER TABLE cayu_events DROP COLUMN pending_action_projection_json")
         connection.execute("ALTER TABLE cayu_events DROP COLUMN pending_action_projection_bytes")
@@ -1672,6 +1689,8 @@ def test_sqlite_revision_seventeen_resumes_committed_checkpoint_batches(
     connection.execute("DROP INDEX idx_cayu_checkpoints_pending_control_action")
     connection.execute("DROP INDEX idx_cayu_events_pending_action_barrier")
     connection.execute("DROP INDEX idx_cayu_events_pending_action_lookup")
+    connection.execute("DROP INDEX idx_cayu_events_pending_action_round_scope")
+    connection.execute("DROP INDEX idx_cayu_events_pending_action_attempt_scope")
     connection.execute("ALTER TABLE cayu_events DROP COLUMN pending_action_lookup_key")
     connection.execute("ALTER TABLE cayu_events DROP COLUMN pending_action_projection_json")
     connection.execute("ALTER TABLE cayu_events DROP COLUMN pending_action_projection_bytes")
@@ -1856,6 +1875,97 @@ def test_sqlite_revision_twenty_three_requires_the_unique_reservation_index(
     assert "CREATE UNIQUE INDEX" in definition[0]
     assert "reservation_id" in definition[0]
     assert "budget.reserved" in definition[0]
+
+
+def test_sqlite_revision_twenty_three_preserves_existing_reservation_ownership(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "sessions.sqlite"
+    reservation_id = "bres_revision_23_existing"
+    publication_id = "evt_revision_23_existing"
+
+    async def seed() -> None:
+        store = SQLiteSessionStore(db_path)
+        try:
+            session = await store.create(
+                RunRequest(
+                    session_id="sess_revision_23_existing",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "seed")],
+                ),
+                identity=_identity(),
+            )
+            await store.append_event(
+                session.id,
+                Event(
+                    id=publication_id,
+                    type=EventType.BUDGET_RESERVED,
+                    session_id=session.id,
+                    payload={"reservation_id": reservation_id},
+                ),
+            )
+        finally:
+            await _close(store)
+
+    asyncio.run(seed())
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 23")
+        connection.execute("DROP INDEX idx_cayu_events_budget_reservation_identity")
+        connection.execute("DROP INDEX idx_cayu_events_pending_action_round_scope")
+        connection.execute("DROP INDEX idx_cayu_events_pending_action_attempt_scope")
+        connection.execute("DROP TABLE cayu_budget_reservation_identities")
+        connection.execute("PRAGMA user_version = 22")
+        connection.commit()
+    finally:
+        connection.close()
+
+    async def migrate_and_reject_reuse() -> None:
+        store = SQLiteSessionStore(
+            db_path,
+            schema_mode=schema_migrations.SchemaMode.MIGRATE,
+        )
+        try:
+            connection = sqlite3.connect(db_path)
+            try:
+                ownership = connection.execute(
+                    "SELECT publication_session_id, publication_id, published "
+                    "FROM cayu_budget_reservation_identities "
+                    "WHERE reservation_id = ?",
+                    (reservation_id,),
+                ).fetchone()
+            finally:
+                connection.close()
+            assert ownership == (
+                "sess_revision_23_existing",
+                publication_id,
+                1,
+            )
+
+            await store.delete_session("sess_revision_23_existing")
+            replacement = await store.create(
+                RunRequest(
+                    session_id="sess_revision_23_replacement",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "reuse")],
+                ),
+                identity=_identity(),
+            )
+            with pytest.raises(BudgetReservationIdentityConflict):
+                await store.append_event(
+                    replacement.id,
+                    Event(
+                        id="evt_revision_23_reuse",
+                        type=EventType.BUDGET_RESERVED,
+                        session_id=replacement.id,
+                        payload={"reservation_id": reservation_id},
+                    ),
+                )
+        finally:
+            await _close(store)
+
+    asyncio.run(migrate_and_reject_reuse())
 
 
 def test_sqlite_recorded_revision_twenty_three_fails_closed_without_registry(

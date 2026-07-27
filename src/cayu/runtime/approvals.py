@@ -427,6 +427,10 @@ class PendingToolApproval(BaseModel):
         }
         if any(event.payload.get(key) != value for key, value in expected.items()):
             raise ValueError("Approval-request event identity does not match its nested approval.")
+        pending_tool_call_for_approval_event(
+            event=event,
+            approval=pending,
+        )
         return pending
 
     @field_validator("approval_id", "tool_call_id", "tool_name", "agent_name")
@@ -510,6 +514,9 @@ class PendingToolApproval(BaseModel):
         if value is None:
             return None
         return copy_retry_policy(value)
+
+
+_PENDING_TOOL_APPROVAL_EVENT_PROJECTION_KEYS = tuple(PendingToolApproval.model_fields)
 
 
 def _copy_approval_resume_fields(
@@ -612,6 +619,34 @@ def copy_pending_tool_call_approval(
         metadata=copy_durable_json_value(call.metadata, "metadata"),
         active_taint_labels=list(call.active_taint_labels),
     )
+
+
+def pending_tool_call_for_approval_event(
+    *,
+    event: Event,
+    approval: PendingToolApproval,
+) -> PendingToolCallApproval:
+    """Return the exact pending call described by one approval lifecycle event."""
+
+    tool_call_id = event.payload.get("tool_call_id")
+    pending_call = next(
+        (
+            call
+            for call in approval.tool_calls
+            if type(tool_call_id) is str and call.tool_call_id == tool_call_id
+        ),
+        None,
+    )
+    if (
+        pending_call is None
+        or event.tool_name != pending_call.tool_name
+        or event.agent_name != approval.agent_name
+        or event.environment_name != approval.environment_name
+    ):
+        raise ValueError(
+            "Approval lifecycle event descriptor does not match its pending tool call."
+        )
+    return pending_call
 
 
 def copy_distinct_pending_tool_call_approvals(

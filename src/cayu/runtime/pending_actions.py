@@ -16,6 +16,10 @@ from cayu.core.events import Event, EventType
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
+from cayu.runtime.approvals import (
+    _PENDING_TOOL_APPROVAL_EVENT_PROJECTION_KEYS,
+    PendingToolApproval,
+)
 from cayu.runtime.sessions import (
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
     MAX_PENDING_ACTION_RESULT_BYTES,
@@ -32,12 +36,16 @@ from cayu.runtime.user_input import pending_user_input_from_checkpoint
 PENDING_ACTION_SESSION_STATUSES = frozenset(
     {SessionStatus.INTERRUPTED, SessionStatus.FAILED, SessionStatus.COMPLETED}
 )
-PENDING_ACTION_CHECKPOINT_KEYS = frozenset(
-    {"pending_tool_approval", "pending_user_input", "pending_tool_round"}
+_PENDING_ACTION_TOOL_STATE_KEYS = (
+    "pending_tool_approval",
+    "pending_user_input",
+    "pending_tool_round",
 )
+PENDING_ACTION_CHECKPOINT_KEYS = frozenset(_PENDING_ACTION_TOOL_STATE_KEYS)
 _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS = frozenset(
     {"model_step_id", "model_attempt_id", "tool_round_id"}
 )
+_APPROVAL_EVENT_PROJECTION_KEYS = frozenset(_PENDING_TOOL_APPROVAL_EVENT_PROJECTION_KEYS)
 _TOOL_EVENT_EVIDENCE_PAYLOAD_KEYS = (
     frozenset({"tool_call_id", "manual_recovery"}) | _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS
 )
@@ -59,17 +67,18 @@ _PENDING_ACTION_EVENT_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
             "tool_name",
             "approval",
             "user_input",
+            resume_ledger.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY,
         }
     )
     | _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS,
-    "tool.call.started": _TOOL_EVENT_EVIDENCE_PAYLOAD_KEYS,
+    "tool.call.started": _TOOL_EVENT_EVIDENCE_PAYLOAD_KEYS | frozenset({"arguments"}),
     "tool.call.completed": _TOOL_EVENT_EVIDENCE_PAYLOAD_KEYS,
     "tool.call.failed": _TOOL_EVENT_EVIDENCE_PAYLOAD_KEYS,
     "tool.call.blocked": _TOOL_EVENT_EVIDENCE_PAYLOAD_KEYS,
     "tool.call.approval_denied": _TOOL_EVENT_EVIDENCE_PAYLOAD_KEYS,
     "session.resumed": _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS,
     "session.completed": frozenset(),
-    "session.failed": frozenset(),
+    "session.failed": frozenset({resume_ledger.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY}),
 }
 _OVERSIZED_EVENT_PROJECTION_BYTES_KEY = "__cayu_pending_action_projection_bytes__"
 _OVERSIZED_EVENT_PROJECTION_REFERENCE = "cayu_oversized_pending_action_projection"
@@ -91,13 +100,34 @@ def pending_action_event_retains_history(event_type: str) -> bool:
     return event_type in _LEDGER_EVENT_TYPE_VALUES
 
 
-def pending_action_tool_round_from_checkpoint(
+def pending_action_evidence_round_from_checkpoint(
     checkpoint: dict[str, Any] | None,
 ) -> tool_round_recovery.PendingToolRound | None:
-    try:
-        return tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
-    except (TypeError, ValueError, ValidationError):
+    """Return the one tool round represented by any pending control checkpoint."""
+
+    approval = approval_support.pending_approval_from_checkpoint(checkpoint)
+    pending_input = pending_user_input_from_checkpoint(checkpoint)
+    pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+    candidates = [
+        candidate for candidate in (approval, pending_input, pending_round) if candidate is not None
+    ]
+    if len(candidates) > 1:
+        raise ValueError("Checkpoint contains more than one pending tool-round state.")
+    if not candidates:
         return None
+    candidate = candidates[0]
+    if type(candidate) is tool_round_recovery.PendingToolRound:
+        return candidate.model_copy(deep=True)
+    return tool_round_recovery.PendingToolRound(
+        tool_round_id=candidate.tool_round_id,
+        model_step_id=candidate.model_step_id,
+        model_attempt_id=candidate.model_attempt_id,
+        agent_name=candidate.agent_name,
+        environment_name=candidate.environment_name,
+        task_id=candidate.task_id,
+        tool_calls=candidate.tool_calls,
+        structured_output=candidate.structured_output,
+    )
 
 
 def pending_action_event_matches_tool_round(
@@ -107,6 +137,23 @@ def pending_action_event_matches_tool_round(
     return event.payload.get("tool_round_id") == pending_round.tool_round_id or (
         event.payload.get("model_step_id") == pending_round.model_step_id
         and event.payload.get("model_attempt_id") == pending_round.model_attempt_id
+    )
+
+
+def pending_action_event_has_unknown_round_call(
+    event: Event,
+    pending_round: tool_round_recovery.PendingToolRound,
+) -> bool:
+    """Whether current-round ledger evidence names no known checkpoint call."""
+
+    if event.type not in _LEDGER_EVENT_TYPES or not pending_action_event_matches_tool_round(
+        event,
+        pending_round,
+    ):
+        return False
+    tool_call_id = event.payload.get("tool_call_id")
+    return type(tool_call_id) is not str or all(
+        call.tool_call_id != tool_call_id for call in pending_round.tool_calls
     )
 
 
@@ -152,6 +199,27 @@ def project_pending_action_checkpoint(
     return projected or None
 
 
+def pending_action_checkpoint_tool_call_count(
+    checkpoint: dict[str, Any] | None,
+) -> int:
+    """Return the largest call array that bounded inspection may expand.
+
+    A valid checkpoint contains exactly one pending tool state. Inspect every
+    candidate defensively so malformed multi-state checkpoints cannot hide an
+    over-complex approval or user-input round from SQL preflight.
+    """
+
+    maximum = 0
+    if checkpoint is None:
+        return maximum
+    for key in _PENDING_ACTION_TOOL_STATE_KEYS:
+        state = checkpoint.get(key)
+        tool_calls = state.get("tool_calls") if type(state) is dict else None
+        if type(tool_calls) is list:
+            maximum = max(maximum, len(tool_calls))
+    return maximum
+
+
 def pending_action_checkpoint_metrics(
     checkpoint: dict[str, Any] | None,
 ) -> tuple[int | None, int, int]:
@@ -177,9 +245,7 @@ def pending_action_checkpoint_metrics(
         for key in PENDING_ACTION_CHECKPOINT_KEYS
         if checkpoint.get(key) is not None
     }
-    pending_round = projected.get("pending_tool_round")
-    tool_calls = pending_round.get("tool_calls") if type(pending_round) is dict else None
-    tool_call_count = len(tool_calls) if type(tool_calls) is list else 0
+    tool_call_count = pending_action_checkpoint_tool_call_count(projected)
     if tool_call_count > MAX_PENDING_ACTION_TOOL_CALLS:
         return 0, tool_call_count, flags
     counter = JsonUtf8SizeCounter(2**63 - 1)
@@ -201,18 +267,18 @@ def pending_action_checkpoint_lookup_ids(
     except (TypeError, ValueError, ValidationError):
         pending_input = None
     try:
-        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        evidence_round = pending_action_evidence_round_from_checkpoint(checkpoint)
     except (TypeError, ValueError, ValidationError):
-        pending_round = None
+        evidence_round = None
 
     identifiers: set[str] = set()
     if approval is not None:
         identifiers.add(approval.approval_id)
     if pending_input is not None:
         identifiers.add(pending_input.input_id)
-    if pending_round is not None:
-        identifiers.add(pending_round.tool_round_id)
-        identifiers.update(call.tool_call_id for call in pending_round.tool_calls)
+    if evidence_round is not None:
+        identifiers.add(evidence_round.tool_round_id)
+        identifiers.update(call.tool_call_id for call in evidence_round.tool_calls)
     return frozenset(identifiers)
 
 
@@ -337,7 +403,7 @@ def _pending_action_event_payload_view(event: Event) -> dict[str, Any]:
         if key == "approval":
             projected = _project_payload_object_view(
                 value,
-                frozenset({"approval_id", "reason", "tool_name"}),
+                _APPROVAL_EVENT_PROJECTION_KEYS,
             )
             if projected is not None:
                 payload[key] = projected
@@ -451,16 +517,19 @@ def select_pending_action_indexed_records(
 ) -> tuple[list[EventRecord], bool]:
     """Select bounded current-action records from identifier/event-type indexes."""
     selected: dict[int, EventRecord] = {}
-    pending_round = pending_action_tool_round_from_checkpoint(checkpoint)
+    try:
+        evidence_round = pending_action_evidence_round_from_checkpoint(checkpoint)
+    except (TypeError, ValueError, ValidationError):
+        evidence_round = None
     ledger_too_complex = False
     for lookup_id in pending_action_checkpoint_lookup_ids(checkpoint):
         lookup_key = pending_action_lookup_key(lookup_id)
         ledger_count = 0
         for record in records_by_lookup_key.get(lookup_key, {}).values():
             if record.event.type in _LEDGER_EVENT_TYPES:
-                if pending_round is None or not pending_action_event_matches_tool_round(
+                if evidence_round is None or not pending_action_event_matches_tool_round(
                     record.event,
-                    pending_round,
+                    evidence_round,
                 ):
                     continue
                 ledger_count += 1
@@ -711,6 +780,8 @@ def _tool_round_manual_recovery_action(
 
     identity = tool_round_recovery.pending_tool_round_identity(pending_round)
     evidence = _pending_tool_round_evidence(records_desc, pending_round)
+    if evidence.scope_conflicting:
+        return None
     unresolved_calls = [
         call
         for call in pending_round.tool_calls
@@ -786,13 +857,20 @@ def pending_action_from_records(
 
             if event_type == "tool.call.approval_requested":
                 approval = _object_payload(payload.get("approval"))
-                nested_approval_id = _optional_payload_string(approval, "approval_id")
                 approval_id = _optional_payload_string(payload, "approval_id")
                 tool_call_id = _optional_payload_string(payload, "tool_call_id")
+                try:
+                    event_pending = PendingToolApproval.from_event(event)
+                    checkpoint_pending = approval_support.pending_approval_from_checkpoint(
+                        checkpoint
+                    )
+                except (TypeError, ValueError, ValidationError):
+                    event_pending = None
+                    checkpoint_pending = None
                 if (
-                    approval is not None
+                    event_pending is not None
+                    and event_pending == checkpoint_pending
                     and approval_id is not None
-                    and approval_id == nested_approval_id
                     and tool_call_id is not None
                 ):
                     checkpoint_call = _pending_approval_checkpoint_call(
@@ -997,18 +1075,26 @@ def pending_action_source_is_invalid(
     """
     if not checkpoint_has_pending_action_candidate(checkpoint):
         return False
+    if any(
+        record.event.payload.get(resume_ledger.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY) is True
+        for record in records_desc
+    ):
+        return True
     if session.status == SessionStatus.COMPLETED:
         return True
     try:
         pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
         pending_input = pending_user_input_from_checkpoint(checkpoint)
         pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        evidence_round = pending_action_evidence_round_from_checkpoint(checkpoint)
     except (TypeError, ValueError, ValidationError):
         return True
-    if pending_round is not None:
-        evidence = _pending_tool_round_evidence(records_desc, pending_round)
+    if evidence_round is not None:
+        evidence = _pending_tool_round_evidence(records_desc, evidence_round)
+        if evidence.scope_conflicting:
+            return True
         if evidence.started_without_terminal_ids:
-            return action is None
+            return action is None or action.kind != PendingActionKind.MANUAL_RECOVERY
     if action is not None:
         return False
     if pending_approval is not None or pending_input is not None:

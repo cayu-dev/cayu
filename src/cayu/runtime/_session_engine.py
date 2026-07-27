@@ -55,6 +55,7 @@ from cayu.providers import (
     copy_usage_dialect,
 )
 from cayu.runtime import _approval_support as approval_support
+from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _session_request_boundary as session_request_boundary
 from cayu.runtime import _tool_execution as tool_execution
@@ -6484,99 +6485,84 @@ class SessionEngine:
                 now=claim_now,
             )
 
-        checkpoint_transform = None
-        if request.copy_checkpoint:
+        def checkpoint_transform(
+            current_source: Session,
+            source_checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any] | None:
+            """Validate live checkpoint state even when the fork will discard it."""
 
-            def checkpoint_transform(
-                current_source: Session,
-                source_checkpoint: dict[str, Any] | None,
-            ) -> dict[str, Any] | None:
-                source_checkpoint = reject_active_or_expired_recovery_claim(source_checkpoint)
-                if (
-                    source_checkpoint is not None
-                    and _SESSION_OPERATIONS_CHECKPOINT_KEY in source_checkpoint
-                ):
-                    operations = _session_operation_state(source_checkpoint)
-                    _abandon_expired_session_operation(operations, now=self._clock())
-                    source_checkpoint[_SESSION_OPERATIONS_CHECKPOINT_KEY] = operations
-                active_operation_id = _active_session_operation_id(source_checkpoint)
-                if active_operation_id is not None:
-                    raise RuntimeError(
-                        f"Session has an active durable operation: {active_operation_id}"
-                    )
-                if current_source.status == SessionStatus.INTERRUPTED and source_checkpoint is None:
-                    raise RuntimeError(
-                        "Interrupted session cannot be forked because checkpoint state is missing."
-                    )
-                if (
-                    pending_user_input_from_checkpoint(
-                        source_checkpoint,
-                        redactor=self._secret_redactor,
-                        consume_on_rejection=True,
-                    )
-                    is not None
-                ):
-                    raise RuntimeError(
-                        "Session awaiting user input cannot be forked; answer it with "
-                        "resolve_user_input(...) first."
-                    )
-                if (
-                    source_checkpoint is not None
-                    and _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY in source_checkpoint
-                ):
-                    raise RuntimeError(
-                        "Session has an incomplete background interruption cascade. "
-                        "Retry the interruption before forking it."
-                    )
-                fork_checkpoint = approval_support.checkpoint_for_fork(
-                    checkpoint=source_checkpoint,
-                    agent_name=agent_name,
-                    environment_name=environment_name,
+            source_checkpoint = reject_active_or_expired_recovery_claim(source_checkpoint)
+            if (
+                source_checkpoint is not None
+                and _SESSION_OPERATIONS_CHECKPOINT_KEY in source_checkpoint
+            ):
+                operations = _session_operation_state(source_checkpoint)
+                _abandon_expired_session_operation(operations, now=self._clock())
+                source_checkpoint[_SESSION_OPERATIONS_CHECKPOINT_KEY] = operations
+            active_operation_id = _active_session_operation_id(source_checkpoint)
+            if active_operation_id is not None:
+                raise RuntimeError(
+                    f"Session has an active durable operation: {active_operation_id}"
                 )
-                if fork_checkpoint is not None:
-                    fork_checkpoint.pop(_SESSION_OPERATIONS_CHECKPOINT_KEY, None)
-                if not session_request_boundary.fork_checkpoint_is_secret_free(
-                    fork_checkpoint,
+            if current_source.status == SessionStatus.INTERRUPTED and not request.copy_checkpoint:
+                raise ValueError("Interrupted sessions cannot be forked without checkpoint state.")
+            if current_source.status == SessionStatus.INTERRUPTED and source_checkpoint is None:
+                raise RuntimeError(
+                    "Interrupted session cannot be forked because checkpoint state is missing."
+                )
+            if (
+                pending_user_input_from_checkpoint(
+                    source_checkpoint,
                     redactor=self._secret_redactor,
-                ):
-                    if source_checkpoint is not None:
-                        source_checkpoint.clear()
-                    if fork_checkpoint is not None:
-                        fork_checkpoint.clear()
-                    source_checkpoint = fork_checkpoint = None
-                    raise ValueError(
-                        "source_session.checkpoint contains a workload secret and cannot "
-                        "be copied without changing resumable execution state."
-                    ) from None
-                return fork_checkpoint
-        else:
-
-            def checkpoint_transform(
-                _current_source: Session,
-                source_checkpoint: dict[str, Any] | None,
-            ) -> None:
-                source_checkpoint = reject_active_or_expired_recovery_claim(source_checkpoint)
-                if (
-                    source_checkpoint is not None
-                    and _SESSION_OPERATIONS_CHECKPOINT_KEY in source_checkpoint
-                ):
-                    operations = _session_operation_state(source_checkpoint)
-                    _abandon_expired_session_operation(operations, now=self._clock())
-                    source_checkpoint[_SESSION_OPERATIONS_CHECKPOINT_KEY] = operations
-                active_operation_id = _active_session_operation_id(source_checkpoint)
-                if active_operation_id is not None:
-                    raise RuntimeError(
-                        f"Session has an active durable operation: {active_operation_id}"
-                    )
-                if (
-                    source_checkpoint is not None
-                    and _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY in source_checkpoint
-                ):
-                    raise RuntimeError(
-                        "Session has an incomplete background interruption cascade. "
-                        "Retry the interruption before forking it."
-                    )
+                    consume_on_rejection=True,
+                )
+                is not None
+            ):
+                raise RuntimeError(
+                    "Session awaiting user input cannot be forked; answer it with "
+                    "resolve_user_input(...) first."
+                )
+            if (
+                tool_round_recovery.pending_tool_round_from_checkpoint(
+                    source_checkpoint,
+                    redactor=self._secret_redactor,
+                    consume_on_rejection=True,
+                )
+                is not None
+            ):
+                raise RuntimeError(
+                    "Session with a pending tool round cannot be forked; resume or "
+                    "recover the session first."
+                )
+            if (
+                source_checkpoint is not None
+                and _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY in source_checkpoint
+            ):
+                raise RuntimeError(
+                    "Session has an incomplete background interruption cascade. "
+                    "Retry the interruption before forking it."
+                )
+            fork_checkpoint = approval_support.checkpoint_for_fork(
+                checkpoint=source_checkpoint,
+            )
+            if not request.copy_checkpoint:
                 return None
+            if fork_checkpoint is not None:
+                fork_checkpoint.pop(_SESSION_OPERATIONS_CHECKPOINT_KEY, None)
+            if not session_request_boundary.fork_checkpoint_is_secret_free(
+                fork_checkpoint,
+                redactor=self._secret_redactor,
+            ):
+                if source_checkpoint is not None:
+                    source_checkpoint.clear()
+                if fork_checkpoint is not None:
+                    fork_checkpoint.clear()
+                source_checkpoint = fork_checkpoint = None
+                raise ValueError(
+                    "source_session.checkpoint contains a workload secret and cannot "
+                    "be copied without changing resumable execution state."
+                ) from None
+            return fork_checkpoint
 
         def transcript_validator(messages: tuple[Message, ...]) -> bool:
             return session_request_boundary.fork_transcript_is_secret_free(
@@ -7680,6 +7666,8 @@ class SessionEngine:
                 diagnostic=failure_diagnostic,
                 redactor=self._secret_redactor,
             )
+            if isinstance(exc, resume_ledger.ToolCallEvidenceConflict):
+                payload[resume_ledger.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY] = True
             if task_failure_error is not None:
                 payload.update(
                     task_update_error_payload(

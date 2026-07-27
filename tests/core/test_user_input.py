@@ -1266,7 +1266,7 @@ def test_resolve_user_input_rejects_native_structured_output_for_unsupported_pro
 
 
 def test_fork_of_paused_session_is_rejected() -> None:
-    app, _store = _build([("call_1", "ask_user", {"question": "q"})])
+    app, store = _build([("call_1", "ask_user", {"question": "q"})])
     asyncio.run(
         _collect(
             app,
@@ -1277,6 +1277,7 @@ def test_fork_of_paused_session_is_rejected() -> None:
             ),
         )
     )
+    checkpoint = asyncio.run(store.load_checkpoint("s_forksrc"))
     with pytest.raises(RuntimeError, match="awaiting user input cannot be forked"):
         asyncio.run(
             _drain(
@@ -1285,6 +1286,23 @@ def test_fork_of_paused_session_is_rejected() -> None:
                 )
             )
         )
+
+    asyncio.run(store.update_status("s_forksrc", SessionStatus.FAILED))
+    with pytest.raises(RuntimeError, match="awaiting user input cannot be forked"):
+        asyncio.run(
+            _drain(
+                app.fork_session(
+                    ForkSessionRequest(
+                        source_session_id="s_forksrc",
+                        session_id="s_forkchild_without_checkpoint",
+                        copy_checkpoint=False,
+                    )
+                )
+            )
+        )
+    assert asyncio.run(store.load("s_forkchild")) is None
+    assert asyncio.run(store.load("s_forkchild_without_checkpoint")) is None
+    assert asyncio.run(store.load_checkpoint("s_forksrc")) == checkpoint
 
 
 class _FailOnceAppendStore(InMemorySessionStore):
@@ -2392,11 +2410,17 @@ def test_recorded_round_outcomes_anchors_from_recovered_interrupted_event() -> N
         Event(
             type=EventType.TOOL_CALL_STARTED,
             session_id="s",
-            payload={"tool_call_id": "call_1", **identity_payload},
+            tool_name="count",
+            payload={
+                "tool_call_id": "call_1",
+                "arguments": {},
+                **identity_payload,
+            },
         ),
         Event(
             type=EventType.TOOL_CALL_COMPLETED,
             session_id="s",
+            tool_name="count",
             payload={
                 "tool_call_id": "call_1",
                 **identity_payload,

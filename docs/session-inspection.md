@@ -114,9 +114,11 @@ independently; JSON reports each collection's total, continuation offset, and
 all durable model completions. Summary cost states distinguish `unknown`,
 `unpriced`, `partial`, `mixed_currency`, and fully `priced` evidence. Tool
 `artifact_bytes` measures the serialized artifact metadata carried by the
-durable result, not bytes in an external artifact store. Tool rounds resumed
-from approval or user-input pauses use derived `approval:ID` or `input:ID` group
-identifiers when the original model round identifier is not durable.
+durable result, not bytes in an external artifact store. Tool inspection groups
+paused rounds only by their complete durable model-step, model-attempt, and
+tool-round identity. It never derives synthetic identifiers from approval or
+user-input IDs; missing, malformed, or contradictory identity evidence is
+isolated and reported as unavailable.
 
 ## Diagnostic examples
 

@@ -27,7 +27,6 @@ from cayu.runtime.approvals import ResolutionActor, resolution_actor_payload
 from cayu.runtime.sessions import (
     DELETE_BLOCKED_SESSION_STATUSES,
     FORK_TRANSCRIPT_VALIDATION_ERROR,
-    MAX_PENDING_ACTION_RESULT_BYTES,
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
     MAX_PENDING_ACTION_TOOL_CALLS,
     SESSION_INSPECTION_LABEL_LIMIT,
@@ -3243,6 +3242,57 @@ class SQLiteSessionStore(SessionStore):
         projected_event_sql = "json(source_event.pending_action_projection_json)"
         pending_action_ctes = f"""
             WITH candidates AS ({selected_candidate_sql}),
+            candidate_tool_scopes AS (
+                SELECT candidates.id AS session_id,
+                    CASE
+                        WHEN json_type(
+                            candidates.pending_state_json,
+                            '$.pending_tool_approval'
+                        ) = 'object'
+                        THEN json_extract(
+                            candidates.pending_state_json,
+                            '$.pending_tool_approval'
+                        )
+                        WHEN json_type(
+                            candidates.pending_state_json,
+                            '$.pending_user_input'
+                        ) = 'object'
+                        THEN json_extract(
+                            candidates.pending_state_json,
+                            '$.pending_user_input'
+                        )
+                        WHEN json_type(
+                            candidates.pending_state_json,
+                            '$.pending_tool_round'
+                        ) = 'object'
+                        THEN json_extract(
+                            candidates.pending_state_json,
+                            '$.pending_tool_round'
+                        )
+                        ELSE NULL
+                    END AS pending_tool_state_json
+                FROM candidates
+            ),
+            candidate_tool_calls AS (
+                SELECT
+                    tool_scope.session_id,
+                    json_extract(pending_call.value, '$.tool_call_id') AS tool_call_id
+                FROM candidate_tool_scopes AS tool_scope
+                JOIN json_each(
+                    CASE
+                        WHEN json_type(
+                            tool_scope.pending_tool_state_json,
+                            '$.tool_calls'
+                        ) = 'array'
+                        THEN json_extract(
+                            tool_scope.pending_tool_state_json,
+                            '$.tool_calls'
+                        )
+                        ELSE json('[]')
+                    END
+                ) AS pending_call
+                WHERE json_type(pending_call.value, '$.tool_call_id') = 'text'
+            ),
             candidate_action_keys AS (
                 SELECT id AS session_id,
                     cayu_pending_action_lookup_key(json_extract(
@@ -3265,35 +3315,22 @@ class SQLiteSessionStore(SessionStore):
                     '$.pending_user_input.input_id'
                 ) = 'text'
                 UNION
-                SELECT id,
+                SELECT tool_scope.session_id,
                     cayu_pending_action_lookup_key(
-                        json_extract(pending_state_json, '$.pending_tool_round.tool_round_id')
+                        json_extract(
+                            tool_scope.pending_tool_state_json,
+                            '$.tool_round_id'
+                        )
                     )
-                FROM candidates
+                FROM candidate_tool_scopes AS tool_scope
                 WHERE json_type(
-                    pending_state_json,
-                    '$.pending_tool_round.tool_round_id'
+                    tool_scope.pending_tool_state_json,
+                    '$.tool_round_id'
                 ) = 'text'
                 UNION
-                SELECT candidates.id,
-                    cayu_pending_action_lookup_key(
-                        json_extract(pending_call.value, '$.tool_call_id')
-                    )
-                FROM candidates
-                JOIN json_each(
-                    CASE
-                        WHEN json_type(
-                            candidates.pending_state_json,
-                            '$.pending_tool_round.tool_calls'
-                        ) = 'array'
-                        THEN json_extract(
-                            candidates.pending_state_json,
-                            '$.pending_tool_round.tool_calls'
-                        )
-                        ELSE json('[]')
-                    END
-                ) AS pending_call
-                WHERE json_type(pending_call.value, '$.tool_call_id') = 'text'
+                SELECT pending_call.session_id,
+                    cayu_pending_action_lookup_key(pending_call.tool_call_id)
+                FROM candidate_tool_calls AS pending_call
             ),
             pending_action_event_types(event_type) AS (
                 VALUES
@@ -3348,6 +3385,8 @@ class SQLiteSessionStore(SessionStore):
                     candidate_event.sequence
                 FROM candidate_action_keys AS action_keys
                 JOIN candidates ON candidates.id = action_keys.session_id
+                JOIN candidate_tool_scopes AS tool_scope
+                    ON tool_scope.session_id = action_keys.session_id
                 JOIN cayu_events AS candidate_event
                     ON candidate_event.sequence IN (
                         SELECT scoped_event.sequence
@@ -3379,32 +3418,201 @@ class SQLiteSessionStore(SessionStore):
                                   scoped_event.pending_action_projection_json,
                                   '$.payload.tool_round_id'
                               ) = json_extract(
-                                  candidates.pending_state_json,
-                                  '$.pending_tool_round.tool_round_id'
+                                  tool_scope.pending_tool_state_json,
+                                  '$.tool_round_id'
                               )
                               OR (
                                   json_extract(
                                       scoped_event.pending_action_projection_json,
                                       '$.payload.model_step_id'
                                   ) = json_extract(
-                                      candidates.pending_state_json,
-                                      '$.pending_tool_round.model_step_id'
+                                      tool_scope.pending_tool_state_json,
+                                      '$.model_step_id'
                                   )
                                   AND json_extract(
                                       scoped_event.pending_action_projection_json,
                                       '$.payload.model_attempt_id'
                                   ) = json_extract(
-                                      candidates.pending_state_json,
-                                      '$.pending_tool_round.model_attempt_id'
+                                      tool_scope.pending_tool_state_json,
+                                      '$.model_attempt_id'
                                   )
                               )
                           )
                         LIMIT {MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL + 1}
                     )
                 WHERE json_type(
-                    candidates.pending_state_json,
-                    '$.pending_tool_round'
+                    tool_scope.pending_tool_state_json
                 ) = 'object'
+            ),
+            scope_conflict_sequences AS (
+                SELECT tool_scope.session_id AS candidate_session_id,
+                    COALESCE(
+                    (
+                        SELECT scoped_event.sequence
+                        FROM cayu_events AS scoped_event
+                            INDEXED BY idx_cayu_events_pending_action_round_scope
+                        WHERE scoped_event.session_id = tool_scope.session_id
+                          AND scoped_event.event_type IN (
+                              'tool.call.started',
+                              'tool.call.completed',
+                              'tool.call.failed',
+                              'tool.call.blocked',
+                              'tool.call.approval_denied'
+                          )
+                          AND json_type(
+                              scoped_event.pending_action_projection_json,
+                              '$.payload.tool_round_id'
+                          ) = 'text'
+                          AND length(json_extract(
+                              scoped_event.pending_action_projection_json,
+                              '$.payload.tool_round_id'
+                          )) = 39
+                          AND substr(json_extract(
+                              scoped_event.pending_action_projection_json,
+                              '$.payload.tool_round_id'
+                          ), 1, 7) = 'tround_'
+                          AND substr(json_extract(
+                              scoped_event.pending_action_projection_json,
+                              '$.payload.tool_round_id'
+                          ), 8) NOT GLOB '*[^0-9a-f]*'
+                          AND json_extract(
+                              scoped_event.pending_action_projection_json,
+                              '$.payload.tool_round_id'
+                          ) = json_extract(
+                              tool_scope.pending_tool_state_json,
+                              '$.tool_round_id'
+                          )
+                          AND COALESCE(
+                              json_extract(
+                                  scoped_event.pending_action_projection_json,
+                                  '$.payload.tool_round_id'
+                              ) = json_extract(
+                                  tool_scope.pending_tool_state_json,
+                                  '$.tool_round_id'
+                              )
+                              AND json_extract(
+                                  scoped_event.pending_action_projection_json,
+                                  '$.payload.model_step_id'
+                              ) = json_extract(
+                                  tool_scope.pending_tool_state_json,
+                                  '$.model_step_id'
+                              )
+                              AND json_extract(
+                                  scoped_event.pending_action_projection_json,
+                                  '$.payload.model_attempt_id'
+                              ) = json_extract(
+                                  tool_scope.pending_tool_state_json,
+                                  '$.model_attempt_id'
+                              )
+                              AND EXISTS (
+                                  SELECT 1
+                                  FROM candidate_tool_calls AS pending_call
+                                  WHERE pending_call.session_id = tool_scope.session_id
+                                    AND pending_call.tool_call_id = json_extract(
+                                        scoped_event.pending_action_projection_json,
+                                        '$.payload.tool_call_id'
+                                    )
+                              ),
+                              0
+                          ) = 0
+                        LIMIT 1
+                    ),
+                    (
+                        SELECT scoped_event.sequence
+                        FROM cayu_events AS scoped_event
+                            INDEXED BY idx_cayu_events_pending_action_attempt_scope
+                        WHERE scoped_event.session_id = tool_scope.session_id
+                          AND scoped_event.event_type IN (
+                              'tool.call.started',
+                              'tool.call.completed',
+                              'tool.call.failed',
+                              'tool.call.blocked',
+                              'tool.call.approval_denied'
+                          )
+                          AND json_type(
+                              scoped_event.pending_action_projection_json,
+                              '$.payload.model_step_id'
+                          ) = 'text'
+                          AND json_type(
+                              scoped_event.pending_action_projection_json,
+                              '$.payload.model_attempt_id'
+                          ) = 'text'
+                          AND length(json_extract(
+                              scoped_event.pending_action_projection_json,
+                              '$.payload.model_step_id'
+                          )) = 38
+                          AND substr(json_extract(
+                              scoped_event.pending_action_projection_json,
+                              '$.payload.model_step_id'
+                          ), 1, 6) = 'mstep_'
+                          AND substr(json_extract(
+                              scoped_event.pending_action_projection_json,
+                              '$.payload.model_step_id'
+                          ), 7) NOT GLOB '*[^0-9a-f]*'
+                          AND length(json_extract(
+                              scoped_event.pending_action_projection_json,
+                              '$.payload.model_attempt_id'
+                          )) = 37
+                          AND substr(json_extract(
+                              scoped_event.pending_action_projection_json,
+                              '$.payload.model_attempt_id'
+                          ), 1, 5) = 'matt_'
+                          AND substr(json_extract(
+                              scoped_event.pending_action_projection_json,
+                              '$.payload.model_attempt_id'
+                          ), 6) NOT GLOB '*[^0-9a-f]*'
+                          AND json_extract(
+                              scoped_event.pending_action_projection_json,
+                              '$.payload.model_step_id'
+                          ) = json_extract(
+                              tool_scope.pending_tool_state_json,
+                              '$.model_step_id'
+                          )
+                          AND json_extract(
+                              scoped_event.pending_action_projection_json,
+                              '$.payload.model_attempt_id'
+                          ) = json_extract(
+                              tool_scope.pending_tool_state_json,
+                              '$.model_attempt_id'
+                          )
+                          AND COALESCE(
+                              json_extract(
+                                  scoped_event.pending_action_projection_json,
+                                  '$.payload.tool_round_id'
+                              ) = json_extract(
+                                  tool_scope.pending_tool_state_json,
+                                  '$.tool_round_id'
+                              )
+                              AND json_extract(
+                                  scoped_event.pending_action_projection_json,
+                                  '$.payload.model_step_id'
+                              ) = json_extract(
+                                  tool_scope.pending_tool_state_json,
+                                  '$.model_step_id'
+                              )
+                              AND json_extract(
+                                  scoped_event.pending_action_projection_json,
+                                  '$.payload.model_attempt_id'
+                              ) = json_extract(
+                                  tool_scope.pending_tool_state_json,
+                                  '$.model_attempt_id'
+                              )
+                              AND EXISTS (
+                                  SELECT 1
+                                  FROM candidate_tool_calls AS pending_call
+                                  WHERE pending_call.session_id = tool_scope.session_id
+                                    AND pending_call.tool_call_id = json_extract(
+                                        scoped_event.pending_action_projection_json,
+                                        '$.payload.tool_call_id'
+                                    )
+                              ),
+                              0
+                          ) = 0
+                        LIMIT 1
+                    )
+                    ) AS sequence
+                FROM candidate_tool_scopes AS tool_scope
+                WHERE json_type(tool_scope.pending_tool_state_json) = 'object'
             ),
             matched_event_sequences AS (
                 SELECT
@@ -3417,6 +3625,12 @@ class SQLiteSessionStore(SessionStore):
                     matched_ledger.candidate_session_id,
                     matched_ledger.sequence
                 FROM matched_ledger_sequences AS matched_ledger
+                UNION
+                SELECT
+                    scope_conflict.candidate_session_id,
+                    scope_conflict.sequence
+                FROM scope_conflict_sequences AS scope_conflict
+                WHERE scope_conflict.sequence IS NOT NULL
                 UNION
                 SELECT
                     candidates.id,

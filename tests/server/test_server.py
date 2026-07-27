@@ -3276,6 +3276,7 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
         tool_call_id: str,
         tool_name: str,
         arguments: dict[str, object] | None = None,
+        reason: str | None = None,
     ) -> dict[str, object]:
         return {
             "pending_tool_approval": {
@@ -3285,6 +3286,7 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
                 "tool_name": tool_name,
                 "arguments": arguments or {},
                 "agent_name": "assistant",
+                "reason": reason,
                 "tool_calls": [
                     {
                         **pending_tool_call(tool_call_id, tool_name),
@@ -3364,6 +3366,7 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
                     id="approval_requested",
                     type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
                     session_id="pending_approval",
+                    agent_name="assistant",
                     tool_name="deploy",
                     payload={
                         **execution_identity(approval_round_id),
@@ -3376,6 +3379,13 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
                             "tool_name": "deploy",
                             "reason": "production write",
                             "arguments": {"service": "api"},
+                            "agent_name": "assistant",
+                            "tool_calls": [
+                                {
+                                    **pending_tool_call("call_deploy", "deploy"),
+                                    "arguments": {"service": "api"},
+                                }
+                            ],
                         },
                     },
                 )
@@ -3385,6 +3395,7 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
                 tool_call_id="call_deploy",
                 tool_name="deploy",
                 arguments={"service": "api"},
+                reason="production write",
             ),
         )
         await create(

@@ -56,6 +56,66 @@ def _tool_round_identity_payload() -> dict[str, str]:
     }
 
 
+def _pending_approval_payload(
+    *,
+    approval_id: str,
+    tool_call_id: str,
+    arguments: dict | None = None,
+    reason: str | None = None,
+) -> dict:
+    effective_arguments = {} if arguments is None else arguments
+    return {
+        "approval_id": approval_id,
+        **_tool_round_identity_payload(),
+        "tool_call_id": tool_call_id,
+        "tool_name": "deploy",
+        "arguments": effective_arguments,
+        "agent_name": "assistant",
+        "reason": reason,
+        "tool_calls": [
+            {
+                "tool_call_id": tool_call_id,
+                "tool_name": "deploy",
+                "arguments": effective_arguments,
+                "policy_decision": None,
+                "reason": None,
+                "metadata": {},
+                "active_taint_labels": [],
+            }
+        ],
+    }
+
+
+def _approval_request_event(
+    *,
+    event_id: str,
+    session_id: str,
+    approval_id: str,
+    tool_call_id: str,
+    arguments: dict | None = None,
+    reason: str | None = None,
+) -> Event:
+    approval = _pending_approval_payload(
+        approval_id=approval_id,
+        tool_call_id=tool_call_id,
+        arguments=arguments,
+        reason=reason,
+    )
+    return Event(
+        id=event_id,
+        type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+        session_id=session_id,
+        agent_name="assistant",
+        tool_name="deploy",
+        payload={
+            **_tool_round_identity_payload(),
+            "approval_id": approval_id,
+            "tool_call_id": tool_call_id,
+            "approval": approval,
+        },
+    )
+
+
 def test_session_store_lifecycle_methods_are_not_abstract() -> None:
     # delete/update_labels/update_metadata are concrete (NotImplementedError) defaults,
     # not @abstractmethod, so existing out-of-tree SessionStore subclasses still instantiate.
@@ -213,6 +273,7 @@ def test_pending_action_tool_ledger_projection_uses_call_identity(
         payload={
             **_tool_round_identity_payload(),
             "tool_call_id": "call_1",
+            "arguments": {"target": "production"},
             pause_key: pause_id,
         },
     )
@@ -222,6 +283,7 @@ def test_pending_action_tool_ledger_projection_uses_call_identity(
     assert lookup_key == pending_action_lookup_key("call_1")
     assert projection is not None
     assert projection_bytes is not None
+    assert Event.model_validate_json(projection).payload["arguments"] == {"target": "production"}
 
 
 @pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
@@ -258,48 +320,24 @@ def test_pending_action_queries_use_latest_matching_event_and_bound_bytes(
             for index in range(50):
                 await store.append_event(
                     session.id,
-                    Event(
-                        id=f"approval_event_{index}",
-                        type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                    _approval_request_event(
+                        event_id=f"approval_event_{index}",
                         session_id=session.id,
-                        tool_name="deploy",
-                        payload={
-                            **_tool_round_identity_payload(),
-                            "approval_id": approval_id,
-                            "tool_call_id": "bounded_call",
-                            "approval": {
-                                "approval_id": approval_id,
-                                **_tool_round_identity_payload(),
-                                "tool_call_id": "bounded_call",
-                                "tool_name": "deploy",
-                                "reason": f"request {index}",
-                                "arguments": {"blob": "x" * 4096},
-                            },
-                        },
+                        approval_id=approval_id,
+                        tool_call_id="bounded_call",
+                        arguments={"blob": "x" * 4096},
+                        reason="latest request",
                     ),
                 )
             await store.checkpoint(
                 session.id,
                 {
-                    "pending_tool_approval": {
-                        "approval_id": approval_id,
-                        **_tool_round_identity_payload(),
-                        "tool_call_id": "bounded_call",
-                        "tool_name": "deploy",
-                        "arguments": {"blob": "x" * 4096},
-                        "agent_name": "assistant",
-                        "tool_calls": [
-                            {
-                                "tool_call_id": "bounded_call",
-                                "tool_name": "deploy",
-                                "arguments": {"blob": "x" * 4096},
-                                "policy_decision": None,
-                                "reason": None,
-                                "metadata": {},
-                                "active_taint_labels": [],
-                            }
-                        ],
-                    }
+                    "pending_tool_approval": _pending_approval_payload(
+                        approval_id=approval_id,
+                        tool_call_id="bounded_call",
+                        arguments={"blob": "x" * 4096},
+                        reason="latest request",
+                    )
                 },
             )
             await store.update_status(session.id, SessionStatus.INTERRUPTED)
@@ -309,7 +347,7 @@ def test_pending_action_queries_use_latest_matching_event_and_bound_bytes(
             )
             assert len(result.actions) == 1
             assert result.actions[0].event.event.id == "approval_event_49"
-            assert result.actions[0].detail == "request 49"
+            assert result.actions[0].detail == "latest request"
             assert result.actions[0].round_id == _tool_round_identity_payload()["tool_round_id"]
             assert result.actions[0].tool_call_id == "bounded_call"
 
@@ -499,23 +537,12 @@ def test_session_stores_query_pending_actions_without_unrelated_history(
                     for event_index in range(100)
                 ]
                 + [
-                    Event(
-                        id=f"approval_{index}",
-                        type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                    _approval_request_event(
+                        event_id=f"approval_{index}",
                         session_id=session_id,
-                        tool_name="deploy",
-                        payload={
-                            **_tool_round_identity_payload(),
-                            "approval_id": f"approval_{index}",
-                            "tool_call_id": f"call_{index}",
-                            "approval": {
-                                "approval_id": f"approval_{index}",
-                                **_tool_round_identity_payload(),
-                                "tool_call_id": f"call_{index}",
-                                "tool_name": "deploy",
-                                "arguments": {"slot": index},
-                            },
-                        },
+                        approval_id=f"approval_{index}",
+                        tool_call_id=f"call_{index}",
+                        arguments={"slot": index},
                     )
                 ],
             )
@@ -523,25 +550,11 @@ def test_session_stores_query_pending_actions_without_unrelated_history(
                 session_id,
                 {
                     "unrelated": {"large": "x" * 100_000},
-                    "pending_tool_approval": {
-                        "approval_id": f"approval_{index}",
-                        **_tool_round_identity_payload(),
-                        "tool_call_id": f"call_{index}",
-                        "tool_name": "deploy",
-                        "arguments": {"slot": index},
-                        "agent_name": "assistant",
-                        "tool_calls": [
-                            {
-                                "tool_call_id": f"call_{index}",
-                                "tool_name": "deploy",
-                                "arguments": {"slot": index},
-                                "policy_decision": None,
-                                "reason": None,
-                                "metadata": {},
-                                "active_taint_labels": [],
-                            }
-                        ],
-                    },
+                    "pending_tool_approval": _pending_approval_payload(
+                        approval_id=f"approval_{index}",
+                        tool_call_id=f"call_{index}",
+                        arguments={"slot": index},
+                    ),
                 },
             )
             await store.update_status(session_id, SessionStatus.INTERRUPTED)
@@ -634,46 +647,20 @@ def test_session_stores_bound_sparse_pending_action_candidate_pages(
             )
             await store.append_event(
                 session_id,
-                Event(
-                    id=approval_id,
-                    type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                _approval_request_event(
+                    event_id=approval_id,
                     session_id=session_id,
-                    payload={
-                        **_tool_round_identity_payload(),
-                        "approval_id": approval_id,
-                        "tool_call_id": tool_call_id,
-                        "approval": {
-                            "approval_id": approval_id,
-                            **_tool_round_identity_payload(),
-                            "tool_call_id": tool_call_id,
-                            "tool_name": "deploy",
-                            "arguments": {},
-                        },
-                    },
+                    approval_id=approval_id,
+                    tool_call_id=tool_call_id,
                 ),
             )
             await store.checkpoint(
                 session_id,
                 {
-                    "pending_tool_approval": {
-                        "approval_id": approval_id,
-                        **_tool_round_identity_payload(),
-                        "tool_call_id": tool_call_id,
-                        "tool_name": "deploy",
-                        "arguments": {},
-                        "agent_name": "assistant",
-                        "tool_calls": [
-                            {
-                                "tool_call_id": tool_call_id,
-                                "tool_name": "deploy",
-                                "arguments": {},
-                                "policy_decision": None,
-                                "reason": None,
-                                "metadata": {},
-                                "active_taint_labels": [],
-                            }
-                        ],
-                    }
+                    "pending_tool_approval": _pending_approval_payload(
+                        approval_id=approval_id,
+                        tool_call_id=tool_call_id,
+                    )
                 },
             )
             await store.update_status(session_id, SessionStatus.INTERRUPTED)
@@ -716,47 +703,20 @@ def test_session_stores_page_pending_actions_beyond_legacy_candidate_cap(
             )
             await store.append_event(
                 session_id,
-                Event(
-                    id=approval_id,
-                    type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                _approval_request_event(
+                    event_id=approval_id,
                     session_id=session_id,
-                    tool_name="deploy",
-                    payload={
-                        **_tool_round_identity_payload(),
-                        "approval_id": approval_id,
-                        "tool_call_id": tool_call_id,
-                        "approval": {
-                            "approval_id": approval_id,
-                            **_tool_round_identity_payload(),
-                            "tool_call_id": tool_call_id,
-                            "tool_name": "deploy",
-                            "arguments": {},
-                        },
-                    },
+                    approval_id=approval_id,
+                    tool_call_id=tool_call_id,
                 ),
             )
             await store.checkpoint(
                 session_id,
                 {
-                    "pending_tool_approval": {
-                        "approval_id": approval_id,
-                        **_tool_round_identity_payload(),
-                        "tool_call_id": tool_call_id,
-                        "tool_name": "deploy",
-                        "arguments": {},
-                        "agent_name": "assistant",
-                        "tool_calls": [
-                            {
-                                "tool_call_id": tool_call_id,
-                                "tool_name": "deploy",
-                                "arguments": {},
-                                "policy_decision": None,
-                                "reason": None,
-                                "metadata": {},
-                                "active_taint_labels": [],
-                            }
-                        ],
-                    }
+                    "pending_tool_approval": _pending_approval_payload(
+                        approval_id=approval_id,
+                        tool_call_id=tool_call_id,
+                    )
                 },
             )
             await store.update_status(session_id, SessionStatus.INTERRUPTED)

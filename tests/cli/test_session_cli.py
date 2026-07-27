@@ -782,6 +782,7 @@ def test_session_show_reports_approval_and_user_input_pending_actions(
                 Event(
                     type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
                     session_id="sess_approval",
+                    agent_name="operator",
                     tool_name="deploy",
                     payload={
                         **execution_identity,
@@ -1452,7 +1453,10 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
                     timestamp=started_at + timedelta(seconds=1),
                     payload={
                         **_tool_round_identity(2),
+                        "approval_id": "approval-3",
+                        "tool_call_id": "call-3",
                         "approval": {
+                            **_tool_round_identity(2),
                             "approval_id": "approval-3",
                             "tool_call_id": "call-3",
                             "tool_name": "deploy",
@@ -1467,7 +1471,11 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
                     session_id="sess_tools",
                     tool_name="deploy",
                     timestamp=started_at + timedelta(seconds=2),
-                    payload={"tool_call_id": "call-3", **_tool_round_identity(2)},
+                    payload={
+                        "approval_id": "approval-3",
+                        "tool_call_id": "call-3",
+                        **_tool_round_identity(2),
+                    },
                 ),
                 Event(
                     type=EventType.TOOL_CALL_STARTED,
@@ -1475,6 +1483,7 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
                     tool_name="deploy",
                     timestamp=started_at + timedelta(seconds=3),
                     payload={
+                        "approval_id": "approval-3",
                         "tool_call_id": "call-3",
                         **_tool_round_identity(2),
                         "arguments": {},
@@ -1486,6 +1495,7 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
                     tool_name="deploy",
                     timestamp=started_at + timedelta(seconds=4),
                     payload={
+                        "approval_id": "approval-3",
                         "tool_call_id": "call-3",
                         **_tool_round_identity(2),
                         "result": {
@@ -1503,7 +1513,10 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
                     timestamp=started_at + timedelta(seconds=5),
                     payload={
                         **_tool_round_identity(3),
+                        "approval_id": "approval-4",
+                        "tool_call_id": "call-4",
                         "approval": {
+                            **_tool_round_identity(3),
                             "approval_id": "approval-4",
                             "tool_call_id": "call-4",
                             "tool_name": "publish",
@@ -1514,6 +1527,7 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
                                     "tool_call_id": "call-4",
                                     "tool_name": "publish",
                                     "arguments": {"environment": "production"},
+                                    "policy_decision": "require_approval",
                                 },
                                 {
                                     "tool_call_id": "call-5",
@@ -1568,7 +1582,10 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
                     timestamp=started_at + timedelta(seconds=8),
                     payload={
                         **_tool_round_identity(5),
+                        "approval_id": "approval-7",
+                        "tool_call_id": "call-7",
                         "approval": {
+                            **_tool_round_identity(5),
                             "approval_id": "approval-7",
                             "tool_call_id": "call-7",
                             "tool_name": "read_file",
@@ -1579,11 +1596,13 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
                                     "tool_call_id": "call-7",
                                     "tool_name": "read_file",
                                     "arguments": {"path": "one"},
+                                    "policy_decision": "require_approval",
                                 },
                                 {
                                     "tool_call_id": "call-8",
                                     "tool_name": "read_file",
                                     "arguments": {"path": "two"},
+                                    "policy_decision": "require_approval",
                                 },
                             ],
                         },
@@ -1701,6 +1720,7 @@ def test_session_tools_pairs_parallel_calls_and_omits_results(
     assert by_id["call-4"]["approval_state"] == "requested"
     assert by_id["call-4"]["started_at"] is None
     assert by_id["call-5"]["status"] == "blocked"
+    assert by_id["call-5"]["approval_state"] == "none"
     assert by_id["call-5"]["tool"] == "delete_release"
     assert by_id["call-6"]["status"] == "error"
     assert by_id["call-6"]["returned"] is None

@@ -3216,11 +3216,12 @@ class InMemorySessionStore(SessionStore):
         from cayu.runtime.pending_actions import (
             checkpoint_has_pending_action_candidate,
             pending_action_checkpoint_lookup_ids,
+            pending_action_event_has_unknown_round_call,
             pending_action_event_lookup_id,
             pending_action_event_matches_tool_round,
             pending_action_event_retains_history,
+            pending_action_evidence_round_from_checkpoint,
             pending_action_lookup_key,
-            pending_action_tool_round_from_checkpoint,
             project_pending_action_event_record,
             retain_pending_action_index_record,
         )
@@ -3231,12 +3232,20 @@ class InMemorySessionStore(SessionStore):
                 pending_action_lookup_key(identifier)
                 for identifier in pending_action_checkpoint_lookup_ids(checkpoint)
             )
-            pending_round = pending_action_tool_round_from_checkpoint(checkpoint)
+            try:
+                pending_round = pending_action_evidence_round_from_checkpoint(checkpoint)
+            except (TypeError, ValueError):
+                pending_round = None
             index_scope = (
                 lookup_keys,
                 None if pending_round is None else pending_round.model_step_id,
                 None if pending_round is None else pending_round.model_attempt_id,
                 None if pending_round is None else pending_round.tool_round_id,
+            )
+            round_lookup_key = (
+                None
+                if pending_round is None
+                else pending_action_lookup_key(pending_round.tool_round_id)
             )
             if self._pending_action_index_scopes.get(session_id) != index_scope:
                 # Public checkpoint transforms may reintroduce a cleared action
@@ -3250,25 +3259,39 @@ class InMemorySessionStore(SessionStore):
                         or event_type in PENDING_ACTION_BARRIER_EVENT_TYPE_VALUES
                     ):
                         continue
-                    lookup_id = pending_action_event_lookup_id(record.event)
-                    if lookup_id is None:
-                        continue
-                    lookup_key = pending_action_lookup_key(lookup_id)
-                    if lookup_key not in lookup_keys:
-                        continue
-                    if pending_action_event_retains_history(event_type) and (
-                        pending_round is None
-                        or not pending_action_event_matches_tool_round(
+                    retain_for_scope = (
+                        pending_round is not None
+                        and pending_action_event_has_unknown_round_call(
                             record.event,
                             pending_round,
                         )
-                    ):
-                        continue
-                    by_record_key = rebuilt.setdefault(lookup_key, {})
-                    retain_pending_action_index_record(
-                        by_record_key,
-                        project_pending_action_event_record(record),
                     )
+                    lookup_id = pending_action_event_lookup_id(record.event)
+                    if lookup_id is None and not retain_for_scope:
+                        continue
+                    projected_record = project_pending_action_event_record(record)
+                    if lookup_id is not None:
+                        lookup_key = pending_action_lookup_key(lookup_id)
+                        if lookup_key in lookup_keys and not (
+                            pending_action_event_retains_history(event_type)
+                            and (
+                                pending_round is None
+                                or not pending_action_event_matches_tool_round(
+                                    record.event,
+                                    pending_round,
+                                )
+                            )
+                        ):
+                            retain_pending_action_index_record(
+                                rebuilt.setdefault(lookup_key, {}),
+                                projected_record,
+                            )
+                    if retain_for_scope:
+                        assert round_lookup_key is not None
+                        retain_pending_action_index_record(
+                            rebuilt.setdefault(round_lookup_key, {}),
+                            projected_record,
+                        )
                 self._pending_action_event_records[session_id] = rebuilt
                 self._pending_action_index_scopes[session_id] = index_scope
             self._pending_action_session_ids.add(session_id)
@@ -3885,11 +3908,12 @@ class InMemorySessionStore(SessionStore):
         events: list[Event],
     ) -> Session:
         from cayu.runtime.pending_actions import (
+            pending_action_event_has_unknown_round_call,
             pending_action_event_lookup_id,
             pending_action_event_matches_tool_round,
             pending_action_event_retains_history,
+            pending_action_evidence_round_from_checkpoint,
             pending_action_lookup_key,
-            pending_action_tool_round_from_checkpoint,
             project_pending_action_event_record,
             retain_pending_action_index_record,
         )
@@ -3924,31 +3948,50 @@ class InMemorySessionStore(SessionStore):
                     "Budget ledger reused a reservation identity."
                 )
 
-        prepared: list[tuple[EventRecord, str, EventRecord | None, str | None]] = []
-        pending_round = pending_action_tool_round_from_checkpoint(self._checkpoints.get(session_id))
+        prepared: list[tuple[EventRecord, str, EventRecord | None, tuple[str, ...]]] = []
+        try:
+            pending_round = pending_action_evidence_round_from_checkpoint(
+                self._checkpoints.get(session_id)
+            )
+        except (TypeError, ValueError):
+            pending_round = None
         index_scope = self._pending_action_index_scopes.get(session_id)
         active_lookup_keys = frozenset() if index_scope is None else index_scope[0]
+        round_lookup_key = (
+            None
+            if pending_round is None
+            else pending_action_lookup_key(pending_round.tool_round_id)
+        )
         next_sequence = self._next_event_sequence
         for event in events:
             stored_event = event.model_copy(deep=True)
             record = EventRecord(sequence=next_sequence, event=stored_event)
             event_type = str(stored_event.type)
             projected_record: EventRecord | None = None
-            lookup_key: str | None = None
+            retention_keys: list[str] = []
             if event_type in PENDING_ACTION_EVENT_TYPE_VALUES:
+                retain_for_scope = (
+                    pending_round is not None
+                    and pending_action_event_has_unknown_round_call(
+                        stored_event,
+                        pending_round,
+                    )
+                )
                 lookup_id = pending_action_event_lookup_id(stored_event)
                 if lookup_id is not None:
                     lookup_key = pending_action_lookup_key(lookup_id)
-                if (
-                    event_type in PENDING_ACTION_BARRIER_EVENT_TYPE_VALUES
-                    or lookup_key in active_lookup_keys
-                ):
+                    if lookup_key in active_lookup_keys:
+                        retention_keys.append(lookup_key)
+                if retain_for_scope:
+                    assert round_lookup_key is not None
+                    retention_keys.append(round_lookup_key)
+                if event_type in PENDING_ACTION_BARRIER_EVENT_TYPE_VALUES or retention_keys:
                     projected_record = project_pending_action_event_record(record)
-            prepared.append((record, event_type, projected_record, lookup_key))
+            prepared.append((record, event_type, projected_record, tuple(retention_keys)))
             next_sequence += 1
 
         session_records = self._session_event_records.setdefault(session_id, [])
-        for record, event_type, projected_record, lookup_key in prepared:
+        for record, event_type, projected_record, retained_lookup_keys in prepared:
             stored_event = record.event
             self._events[session_id].append(stored_event)
             self._event_records.append(record)
@@ -3957,22 +4000,22 @@ class InMemorySessionStore(SessionStore):
             if projected_record is not None:
                 if event_type in PENDING_ACTION_BARRIER_EVENT_TYPE_VALUES:
                     self._pending_action_latest_barrier_records[session_id] = projected_record
-                elif lookup_key is not None and not (
-                    pending_action_event_retains_history(event_type)
-                    and (
-                        pending_round is None
-                        or not pending_action_event_matches_tool_round(
-                            projected_record.event,
-                            pending_round,
-                        )
-                    )
-                ):
+                else:
                     by_lookup_id = self._pending_action_event_records.setdefault(session_id, {})
-                    by_record_key = by_lookup_id.setdefault(lookup_key, {})
-                    retain_pending_action_index_record(
-                        by_record_key,
-                        projected_record,
-                    )
+                    for retention_key in retained_lookup_keys:
+                        if (
+                            pending_action_event_retains_history(event_type)
+                            and pending_round is not None
+                            and not pending_action_event_matches_tool_round(
+                                projected_record.event,
+                                pending_round,
+                            )
+                        ):
+                            continue
+                        retain_pending_action_index_record(
+                            by_lookup_id.setdefault(retention_key, {}),
+                            projected_record,
+                        )
             self._type_event_records.setdefault(event_type, []).append(record)
             existing_ids.add(stored_event.id)
             if event_type != str(EventType.RUNTIME_SINK_FAILED):
@@ -4867,6 +4910,7 @@ class InMemorySessionStore(SessionStore):
         from cayu.runtime.pending_actions import (
             PENDING_ACTION_CHECKPOINT_KEYS,
             PENDING_ACTION_SESSION_STATUSES,
+            pending_action_checkpoint_tool_call_count,
             pending_action_event_projection_bytes,
             pending_action_from_records,
             pending_action_matches_query,
@@ -4937,19 +4981,9 @@ class InMemorySessionStore(SessionStore):
                         if checkpoint.get(key) is not None
                     }
                 )
-                pending_round_source = (
-                    pending_checkpoint_source.get("pending_tool_round")
-                    if pending_checkpoint_source is not None
-                    else None
-                )
-                pending_tool_calls = (
-                    pending_round_source.get("tool_calls")
-                    if type(pending_round_source) is dict
-                    else None
-                )
                 source_too_complex = (
-                    type(pending_tool_calls) is list
-                    and len(pending_tool_calls) > MAX_PENDING_ACTION_TOOL_CALLS
+                    pending_action_checkpoint_tool_call_count(pending_checkpoint_source)
+                    > MAX_PENDING_ACTION_TOOL_CALLS
                 )
                 candidate_size = JsonUtf8SizeCounter(query.max_result_bytes)
                 source_fits = (

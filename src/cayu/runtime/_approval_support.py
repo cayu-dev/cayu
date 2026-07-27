@@ -19,6 +19,7 @@ from cayu.runtime.approvals import (
     ToolApprovalRecoveryOutcome,
     ToolApprovalRecoveryRequest,
     ToolApprovalRequest,
+    pending_tool_call_for_approval_event,
     resolution_actor_payload,
 )
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
@@ -40,6 +41,14 @@ _USER_INPUT_ROUND_TERMINAL_EVENT_TYPES = frozenset(
         EventType.TOOL_CALL_COMPLETED,
         EventType.TOOL_CALL_FAILED,
         EventType.TOOL_CALL_BLOCKED,
+    }
+)
+_APPROVAL_HISTORY_EVENT_TYPES = frozenset(
+    {
+        EventType.TOOL_CALL_APPROVED,
+        EventType.TOOL_CALL_APPROVAL_DENIED,
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.TOOL_CALL_FAILED,
     }
 )
 
@@ -157,31 +166,16 @@ def cleared_event(
 def checkpoint_for_fork(
     *,
     checkpoint: dict[str, Any] | None,
-    agent_name: str,
-    environment_name: str | None,
 ) -> dict[str, Any] | None:
     if checkpoint is None:
         return None
     copied_checkpoint = copy_durable_json_value(checkpoint, "checkpoint")
     pending_approval = pending_approval_from_checkpoint(copied_checkpoint)
-    if pending_approval is None:
-        return copied_checkpoint
-    if pending_approval.agent_name != agent_name:
-        raise ValueError(
-            "Cannot fork a pending tool approval to a different agent: "
-            f"{pending_approval.agent_name} -> {agent_name}"
+    if pending_approval is not None:
+        raise RuntimeError(
+            "Session awaiting tool approval cannot be forked; resolve it with "
+            "resolve_tool_approval(...) first."
         )
-    if pending_approval.environment_name != environment_name:
-        raise ValueError(
-            "Cannot fork a pending tool approval to a different environment: "
-            f"{pending_approval.environment_name} -> {environment_name}"
-        )
-    # Dump in JSON mode to match the checkpoint write path: persisted run
-    # config (budget limits) carries Decimal values that python-mode dumps
-    # would leak into the JSON-only checkpoint.
-    copied_checkpoint[PENDING_TOOL_APPROVAL_CHECKPOINT_KEY] = pending_approval.model_copy(
-        update={"task_id": None}
-    ).model_dump(mode="json")
     return copied_checkpoint
 
 
@@ -285,6 +279,10 @@ def recorded_round_tool_outcomes(
         ),
         terminal_event_types=_USER_INPUT_ROUND_TERMINAL_EVENT_TYPES,
     )
+    if ledger.scope_conflicting:
+        raise resume_ledger.ToolCallEvidenceConflict(
+            "User-input recovery evidence contains a call outside the pending tool round."
+        )
     # A tool that started on a prior resume attempt but has no terminal event (a crash mid-tool)
     # cannot be safely re-run — fail loudly instead of silently double-executing a side effect.
     for tool_call_id in ledger.started_without_terminal_ids:
@@ -317,6 +315,10 @@ def recorded_tool_outcomes(
         ),
         terminal_event_types=_APPROVAL_TERMINAL_EVENT_TYPES,
     )
+    if ledger.scope_conflicting:
+        raise resume_ledger.ToolCallEvidenceConflict(
+            "Tool approval evidence contains a call outside the pending tool round."
+        )
 
     for tool_call_id in ledger.started_without_terminal_ids:
         pending_tool_call = pending_by_id[tool_call_id]
@@ -339,10 +341,25 @@ def approval_resolution_history(
     has_executed_or_recovered_result = False
 
     for event in events:
-        if event.payload.get("approval_id") != approval.approval_id or not identity.matches_payload(
-            event.payload
-        ):
+        if event.type not in _APPROVAL_HISTORY_EVENT_TYPES:
             continue
+        approval_matches = event.payload.get("approval_id") == approval.approval_id
+        identity_matches = identity.matches_payload(event.payload)
+        if not approval_matches and not identity_matches:
+            continue
+        if not approval_matches or not identity_matches:
+            raise resume_ledger.ToolCallEvidenceConflict(
+                "Tool approval history contains contradictory execution identity."
+            )
+        try:
+            pending_tool_call_for_approval_event(
+                event=event,
+                approval=approval,
+            )
+        except ValueError:
+            raise resume_ledger.ToolCallEvidenceConflict(
+                "Tool approval history contains a contradictory tool-call descriptor."
+            ) from None
         if event.type == EventType.TOOL_CALL_APPROVAL_DENIED:
             has_denied_result = True
         elif event.type == EventType.TOOL_CALL_APPROVED:
@@ -399,7 +416,8 @@ def validate_recovery_target(
     )
     state = resume_ledger.tool_call_recovery_state(
         events=events,
-        pending_tool_call=pending_tool_call,
+        pending_calls=pending_round_tool_calls(approval),
+        tool_call_id=pending_tool_call.tool_call_id,
         in_scope=lambda event: (
             event.payload.get("approval_id") == approval.approval_id
             and identity.matches_payload(event.payload)
@@ -452,7 +470,8 @@ def validate_round_recovery_target(
     identity = copy_tool_round_identity(tool_round_identity)
     state = resume_ledger.tool_call_recovery_state(
         events=user_input_resume_events(events, input_id),
-        pending_tool_call=pending_tool_call,
+        pending_calls=pending_calls,
+        tool_call_id=pending_tool_call.tool_call_id,
         in_scope=lambda event: identity.matches_payload(event.payload),
         candidate_scope=lambda event: (
             identity.matches_payload(event.payload) or event.payload.get("input_id") == input_id

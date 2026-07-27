@@ -45,7 +45,11 @@ from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, MessageRole
 from cayu.embeddings import TextEmbeddingProvider, TextEmbeddingRequest
 from cayu.runtime.aggregates import EXACT_AGGREGATE, UsageRollupStoreResult
-from cayu.runtime.approvals import ResolutionActor, resolution_actor_payload
+from cayu.runtime.approvals import (
+    _PENDING_TOOL_APPROVAL_EVENT_PROJECTION_KEYS,
+    ResolutionActor,
+    resolution_actor_payload,
+)
 from cayu.runtime.budgets import (
     DEFAULT_RESERVATION_TTL_SECONDS,
     BudgetLedger,
@@ -714,8 +718,57 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
             published BOOLEAN NOT NULL
         )
         """,
+        """
+        INSERT INTO cayu_budget_reservation_identities (
+            reservation_id,
+            publication_session_id,
+            publication_id,
+            published
+        )
+        SELECT
+            payload ->> 'reservation_id',
+            session_id,
+            event_id,
+            TRUE
+        FROM cayu_events
+        WHERE event_type = 'budget.reserved'
+          AND jsonb_typeof(payload -> 'reservation_id') = 'string'
+        ON CONFLICT (reservation_id) DO NOTHING
+        """,
     ),
 }
+
+_REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """
+    GREATEST(
+        CASE
+            WHEN jsonb_typeof(
+                target.state #> '{pending_tool_approval,tool_calls}'
+            ) = 'array'
+            THEN jsonb_array_length(
+                target.state #> '{pending_tool_approval,tool_calls}'
+            )
+            ELSE 0
+        END,
+        CASE
+            WHEN jsonb_typeof(
+                target.state #> '{pending_user_input,tool_calls}'
+            ) = 'array'
+            THEN jsonb_array_length(
+                target.state #> '{pending_user_input,tool_calls}'
+            )
+            ELSE 0
+        END,
+        CASE
+            WHEN jsonb_typeof(
+                target.state #> '{pending_tool_round,tool_calls}'
+            ) = 'array'
+            THEN jsonb_array_length(
+                target.state #> '{pending_tool_round,tool_calls}'
+            )
+            ELSE 0
+        END
+    )
+"""
 
 _REVISION_17_CHECKPOINT_BACKFILL_SQL = f"""
     WITH batch AS MATERIALIZED (
@@ -739,9 +792,8 @@ _REVISION_17_CHECKPOINT_BACKFILL_SQL = f"""
                   AND target.state -> 'pending_tool_round' <> 'null'::jsonb
                 THEN 4 ELSE 0 END,
         pending_action_source_bytes = CASE
-            WHEN jsonb_typeof(target.state #> '{{pending_tool_round,tool_calls}}') = 'array'
-              AND jsonb_array_length(target.state #> '{{pending_tool_round,tool_calls}}')
-                  > {MAX_PENDING_ACTION_TOOL_CALLS}
+            WHEN ({_REVISION_17_PENDING_TOOL_CALL_COUNT_SQL})
+                > {MAX_PENDING_ACTION_TOOL_CALLS}
             THEN 0
             WHEN (target.state -> 'pending_tool_approval' IS NOT NULL
                   AND target.state -> 'pending_tool_approval' <> 'null'::jsonb)
@@ -756,11 +808,7 @@ _REVISION_17_CHECKPOINT_BACKFILL_SQL = f"""
             ))::text)
             ELSE NULL
         END,
-        pending_action_tool_call_count = CASE
-            WHEN jsonb_typeof(target.state #> '{{pending_tool_round,tool_calls}}') = 'array'
-            THEN jsonb_array_length(target.state #> '{{pending_tool_round,tool_calls}}')
-            ELSE 0
-        END,
+        pending_action_tool_call_count = ({_REVISION_17_PENDING_TOOL_CALL_COUNT_SQL}),
         pending_action_metrics_ready = TRUE
     FROM batch
     WHERE target.session_id = batch.session_id
@@ -768,6 +816,19 @@ _REVISION_17_CHECKPOINT_BACKFILL_SQL = f"""
 """
 
 _REVISION_17_EVENT_BACKFILL_SMALL_EVENT_BYTES = 1024 * 1024
+_REVISION_17_APPROVAL_PROJECTION_KEYS_SQL = ", ".join(
+    f"'{key}'" for key in _PENDING_TOOL_APPROVAL_EVENT_PROJECTION_KEYS
+)
+_REVISION_17_APPROVAL_PROJECTION_SQL = f"""
+    (
+        SELECT COALESCE(
+            jsonb_object_agg(approval_field.key, approval_field.value),
+            '{{}}'::jsonb
+        )
+        FROM jsonb_each(payload -> 'approval') AS approval_field
+        WHERE approval_field.key IN ({_REVISION_17_APPROVAL_PROJECTION_KEYS_SQL})
+    )
+"""
 
 
 def _revision_17_event_backfill_sql(*, source_predicate: str, batch_limit: int) -> str:
@@ -842,11 +903,7 @@ def _revision_17_event_backfill_sql(*, source_predicate: str, batch_limit: int) 
                             'tool_round_id', payload -> 'tool_round_id',
                             'approval', CASE
                                 WHEN jsonb_typeof(payload -> 'approval') = 'object'
-                                THEN jsonb_strip_nulls(jsonb_build_object(
-                                    'approval_id', payload #> '{{approval,approval_id}}',
-                                    'reason', payload #> '{{approval,reason}}',
-                                    'tool_name', payload #> '{{approval,tool_name}}'
-                                ))
+                                THEN {_REVISION_17_APPROVAL_PROJECTION_SQL}
                                 ELSE NULL
                             END
                         ))
@@ -872,13 +929,10 @@ def _revision_17_event_backfill_sql(*, source_predicate: str, batch_limit: int) 
                             'error', payload -> 'error',
                             'message', payload -> 'message',
                             'tool_name', payload -> 'tool_name',
+                            'tool_evidence_conflict', payload -> 'tool_evidence_conflict',
                             'approval', CASE
                                 WHEN jsonb_typeof(payload -> 'approval') = 'object'
-                                THEN jsonb_strip_nulls(jsonb_build_object(
-                                    'approval_id', payload #> '{{approval,approval_id}}',
-                                    'reason', payload #> '{{approval,reason}}',
-                                    'tool_name', payload #> '{{approval,tool_name}}'
-                                ))
+                                THEN {_REVISION_17_APPROVAL_PROJECTION_SQL}
                                 ELSE NULL
                             END,
                             'user_input', CASE
@@ -948,6 +1002,10 @@ def _revision_17_event_backfill_sql(*, source_predicate: str, batch_limit: int) 
                             'model_step_id', payload -> 'model_step_id',
                             'model_attempt_id', payload -> 'model_attempt_id',
                             'tool_round_id', payload -> 'tool_round_id'
+                        ))
+                    WHEN event_type = 'session.failed' THEN
+                        jsonb_strip_nulls(jsonb_build_object(
+                            'tool_evidence_conflict', payload -> 'tool_evidence_conflict'
                         ))
                     ELSE '{{}}'::jsonb
                 END,
@@ -1210,6 +1268,112 @@ _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] =
                 "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_events_budget_reservation_identity"
             ),
             unique=True,
+        ),
+        _ConcurrentIndexMigration(
+            index_name="idx_cayu_events_pending_action_round_scope",
+            table_name="cayu_events",
+            key_definitions=(
+                "session_id",
+                "pending_action_projection #>> '{payload,tool_round_id}'",
+                "sequence",
+            ),
+            predicate_definition="""
+                event_type = ANY (ARRAY[
+                    'tool.call.started',
+                    'tool.call.completed',
+                    'tool.call.failed',
+                    'tool.call.blocked',
+                    'tool.call.approval_denied'
+                ])
+                AND jsonb_typeof(
+                    pending_action_projection #> '{payload,tool_round_id}'
+                ) = 'string'
+                AND pending_action_projection #>> '{payload,tool_round_id}'
+                    ~ '^tround_[0-9a-f]{32}$'
+            """,
+            create_statement="""
+                CREATE INDEX CONCURRENTLY IF NOT EXISTS
+                    idx_cayu_events_pending_action_round_scope
+                ON cayu_events(
+                    session_id,
+                    (pending_action_projection #>> '{payload,tool_round_id}'),
+                    sequence
+                )
+                WHERE event_type IN (
+                    'tool.call.started',
+                    'tool.call.completed',
+                    'tool.call.failed',
+                    'tool.call.blocked',
+                    'tool.call.approval_denied'
+                )
+                  AND jsonb_typeof(
+                      pending_action_projection #> '{payload,tool_round_id}'
+                  ) = 'string'
+                  AND pending_action_projection #>> '{payload,tool_round_id}'
+                      ~ '^tround_[0-9a-f]{32}$'
+            """,
+            drop_statement=(
+                "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_events_pending_action_round_scope"
+            ),
+        ),
+        _ConcurrentIndexMigration(
+            index_name="idx_cayu_events_pending_action_attempt_scope",
+            table_name="cayu_events",
+            key_definitions=(
+                "session_id",
+                "pending_action_projection #>> '{payload,model_step_id}'",
+                "pending_action_projection #>> '{payload,model_attempt_id}'",
+                "sequence",
+            ),
+            predicate_definition="""
+                event_type = ANY (ARRAY[
+                    'tool.call.started',
+                    'tool.call.completed',
+                    'tool.call.failed',
+                    'tool.call.blocked',
+                    'tool.call.approval_denied'
+                ])
+                AND jsonb_typeof(
+                    pending_action_projection #> '{payload,model_step_id}'
+                ) = 'string'
+                AND jsonb_typeof(
+                    pending_action_projection #> '{payload,model_attempt_id}'
+                ) = 'string'
+                AND pending_action_projection #>> '{payload,model_step_id}'
+                    ~ '^mstep_[0-9a-f]{32}$'
+                AND pending_action_projection #>> '{payload,model_attempt_id}'
+                    ~ '^matt_[0-9a-f]{32}$'
+            """,
+            create_statement="""
+                CREATE INDEX CONCURRENTLY IF NOT EXISTS
+                    idx_cayu_events_pending_action_attempt_scope
+                ON cayu_events(
+                    session_id,
+                    (pending_action_projection #>> '{payload,model_step_id}'),
+                    (pending_action_projection #>> '{payload,model_attempt_id}'),
+                    sequence
+                )
+                WHERE event_type IN (
+                    'tool.call.started',
+                    'tool.call.completed',
+                    'tool.call.failed',
+                    'tool.call.blocked',
+                    'tool.call.approval_denied'
+                )
+                  AND jsonb_typeof(
+                      pending_action_projection #> '{payload,model_step_id}'
+                  ) = 'string'
+                  AND jsonb_typeof(
+                      pending_action_projection #> '{payload,model_attempt_id}'
+                  ) = 'string'
+                  AND pending_action_projection #>> '{payload,model_step_id}'
+                      ~ '^mstep_[0-9a-f]{32}$'
+                  AND pending_action_projection #>> '{payload,model_attempt_id}'
+                      ~ '^matt_[0-9a-f]{32}$'
+            """,
+            drop_statement=(
+                "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_events_pending_action_attempt_scope"
+            ),
         ),
     ),
 }
@@ -1492,6 +1656,12 @@ class _PostgresStoreBase:
                 await _acquire_schema_transaction_lock(conn, cur)
                 state = await self._read_schema_state(cur)
                 if state.revision < concurrent_revision.revision:
+                    if concurrent_revision.revision == 23:
+                        await self._validate_budget_reservation_identity_registry(
+                            cur,
+                            require=True,
+                            verify_event_ownership=True,
+                        )
                     await self._record_revision(cur, concurrent_revision)
                 await conn.commit()
 
@@ -1596,6 +1766,7 @@ class _PostgresStoreBase:
         cur: Any,
         *,
         require: bool,
+        verify_event_ownership: bool = False,
     ) -> bool:
         table_name = "cayu_budget_reservation_identities"
         await cur.execute("SELECT to_regclass(%s)", (table_name,))
@@ -1645,6 +1816,30 @@ class _PostgresStoreBase:
                 f"Postgres schema object {table_name!r} conflicts with Cayu's "
                 "reservation identity contract. Restore the required ownership "
                 "registry from a known-good backup."
+            )
+        if not verify_event_ownership:
+            return True
+        await cur.execute(
+            """
+            SELECT 1
+            FROM cayu_events AS event
+            LEFT JOIN cayu_budget_reservation_identities AS identity
+              ON identity.reservation_id = event.payload ->> 'reservation_id'
+            WHERE event.event_type = 'budget.reserved'
+              AND jsonb_typeof(event.payload -> 'reservation_id') = 'string'
+              AND (
+                  identity.reservation_id IS NULL
+                  OR identity.publication_session_id <> event.session_id
+                  OR identity.publication_id <> event.event_id
+                  OR NOT identity.published
+              )
+            LIMIT 1
+            """
+        )
+        if await cur.fetchone() is not None:
+            raise RuntimeError(
+                "Postgres budget reservation events disagree with the permanent "
+                "reservation ownership registry."
             )
         return True
 
@@ -7057,6 +7252,41 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         projected_event_sql = "source_event.pending_action_projection"
         pending_action_ctes = f"""
             WITH candidates AS MATERIALIZED ({selected_candidate_sql}),
+            candidate_tool_scopes AS MATERIALIZED (
+                SELECT candidates.id AS session_id,
+                    CASE
+                        WHEN jsonb_typeof(
+                            candidates.pending_state -> 'pending_tool_approval'
+                        ) = 'object'
+                        THEN candidates.pending_state -> 'pending_tool_approval'
+                        WHEN jsonb_typeof(
+                            candidates.pending_state -> 'pending_user_input'
+                        ) = 'object'
+                        THEN candidates.pending_state -> 'pending_user_input'
+                        WHEN jsonb_typeof(
+                            candidates.pending_state -> 'pending_tool_round'
+                        ) = 'object'
+                        THEN candidates.pending_state -> 'pending_tool_round'
+                        ELSE NULL
+                    END AS pending_tool_state
+                FROM candidates
+            ),
+            candidate_tool_calls AS MATERIALIZED (
+                SELECT
+                    tool_scope.session_id,
+                    pending_call ->> 'tool_call_id' AS tool_call_id
+                FROM candidate_tool_scopes AS tool_scope
+                CROSS JOIN LATERAL jsonb_array_elements(
+                    CASE
+                        WHEN jsonb_typeof(
+                            tool_scope.pending_tool_state -> 'tool_calls'
+                        ) = 'array'
+                        THEN tool_scope.pending_tool_state -> 'tool_calls'
+                        ELSE '[]'::jsonb
+                    END
+                ) AS pending_call
+                WHERE jsonb_typeof(pending_call -> 'tool_call_id') = 'string'
+            ),
             candidate_action_keys AS (
                 SELECT id AS session_id,
                     encode(sha256(convert_to(
@@ -7077,32 +7307,20 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     pending_state #> '{{pending_user_input,input_id}}'
                 ) = 'string'
                 UNION
-                SELECT id, encode(sha256(convert_to(
-                    pending_state #>> '{{pending_tool_round,tool_round_id}}',
+                SELECT tool_scope.session_id, encode(sha256(convert_to(
+                    tool_scope.pending_tool_state ->> 'tool_round_id',
                     'UTF8'
                 )), 'hex')
-                FROM candidates
+                FROM candidate_tool_scopes AS tool_scope
                 WHERE jsonb_typeof(
-                    pending_state #> '{{pending_tool_round,tool_round_id}}'
+                    tool_scope.pending_tool_state -> 'tool_round_id'
                 ) = 'string'
                 UNION
-                SELECT candidates.id, encode(sha256(convert_to(
-                    pending_call ->> 'tool_call_id',
+                SELECT pending_call.session_id, encode(sha256(convert_to(
+                    pending_call.tool_call_id,
                     'UTF8'
                 )), 'hex')
-                FROM candidates
-                CROSS JOIN LATERAL jsonb_array_elements(
-                    CASE
-                        WHEN jsonb_typeof(
-                            candidates.pending_state
-                                #> '{{pending_tool_round,tool_calls}}'
-                        ) = 'array'
-                        THEN candidates.pending_state
-                            #> '{{pending_tool_round,tool_calls}}'
-                        ELSE '[]'::jsonb
-                    END
-                ) AS pending_call
-                WHERE jsonb_typeof(pending_call -> 'tool_call_id') = 'string'
+                FROM candidate_tool_calls AS pending_call
             ),
             pending_action_event_types(event_type) AS (
                 VALUES
@@ -7158,6 +7376,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     event.sequence
                 FROM candidate_action_keys AS action_keys
                 JOIN candidates ON candidates.id = action_keys.session_id
+                JOIN candidate_tool_scopes AS tool_scope
+                    ON tool_scope.session_id = action_keys.session_id
                 CROSS JOIN LATERAL (
                     SELECT candidate_event.sequence
                     FROM cayu_events AS candidate_event
@@ -7185,24 +7405,128 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                       AND (
                           candidate_event.pending_action_projection
                               #>> '{{payload,tool_round_id}}'
-                              = candidates.pending_state
-                                  #>> '{{pending_tool_round,tool_round_id}}'
+                              = tool_scope.pending_tool_state ->> 'tool_round_id'
                           OR (
                               candidate_event.pending_action_projection
                                   #>> '{{payload,model_step_id}}'
-                                  = candidates.pending_state
-                                      #>> '{{pending_tool_round,model_step_id}}'
+                                  = tool_scope.pending_tool_state ->> 'model_step_id'
                               AND candidate_event.pending_action_projection
                                   #>> '{{payload,model_attempt_id}}'
-                                  = candidates.pending_state
-                                      #>> '{{pending_tool_round,model_attempt_id}}'
+                                  = tool_scope.pending_tool_state ->> 'model_attempt_id'
                           )
                       )
                     LIMIT {MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL + 1}
                 ) AS event
                 WHERE jsonb_typeof(
-                    candidates.pending_state -> 'pending_tool_round'
+                    tool_scope.pending_tool_state
                 ) = 'object'
+            ),
+            scope_conflict_events AS MATERIALIZED (
+                SELECT
+                    tool_scope.session_id AS candidate_session_id,
+                    conflict.sequence
+                FROM candidate_tool_scopes AS tool_scope
+                CROSS JOIN LATERAL (
+                    (
+                        SELECT scoped_event.sequence
+                        FROM cayu_events AS scoped_event
+                        WHERE scoped_event.session_id = tool_scope.session_id
+                          AND scoped_event.event_type IN (
+                              'tool.call.started',
+                              'tool.call.completed',
+                              'tool.call.failed',
+                              'tool.call.blocked',
+                              'tool.call.approval_denied'
+                          )
+                          AND jsonb_typeof(
+                              scoped_event.pending_action_projection
+                                  #> '{{payload,tool_round_id}}'
+                          ) = 'string'
+                          AND scoped_event.pending_action_projection
+                              #>> '{{payload,tool_round_id}}'
+                              ~ '^tround_[0-9a-f]{{32}}$'
+                          AND scoped_event.pending_action_projection
+                              #>> '{{payload,tool_round_id}}'
+                              = tool_scope.pending_tool_state ->> 'tool_round_id'
+                          AND NOT COALESCE(
+                              scoped_event.pending_action_projection
+                                  #>> '{{payload,tool_round_id}}'
+                                  = tool_scope.pending_tool_state ->> 'tool_round_id'
+                              AND scoped_event.pending_action_projection
+                                  #>> '{{payload,model_step_id}}'
+                                  = tool_scope.pending_tool_state ->> 'model_step_id'
+                              AND scoped_event.pending_action_projection
+                                  #>> '{{payload,model_attempt_id}}'
+                                  = tool_scope.pending_tool_state ->> 'model_attempt_id'
+                              AND EXISTS (
+                                  SELECT 1
+                                  FROM candidate_tool_calls AS pending_call
+                                  WHERE pending_call.session_id = tool_scope.session_id
+                                    AND pending_call.tool_call_id
+                                        = scoped_event.pending_action_projection
+                                            #>> '{{payload,tool_call_id}}'
+                              ),
+                              FALSE
+                          )
+                        LIMIT 1
+                    )
+                    UNION
+                    (
+                        SELECT scoped_event.sequence
+                        FROM cayu_events AS scoped_event
+                        WHERE scoped_event.session_id = tool_scope.session_id
+                          AND scoped_event.event_type IN (
+                              'tool.call.started',
+                              'tool.call.completed',
+                              'tool.call.failed',
+                              'tool.call.blocked',
+                              'tool.call.approval_denied'
+                          )
+                          AND jsonb_typeof(
+                              scoped_event.pending_action_projection
+                                  #> '{{payload,model_step_id}}'
+                          ) = 'string'
+                          AND jsonb_typeof(
+                              scoped_event.pending_action_projection
+                                  #> '{{payload,model_attempt_id}}'
+                          ) = 'string'
+                          AND scoped_event.pending_action_projection
+                              #>> '{{payload,model_step_id}}'
+                              ~ '^mstep_[0-9a-f]{{32}}$'
+                          AND scoped_event.pending_action_projection
+                              #>> '{{payload,model_attempt_id}}'
+                              ~ '^matt_[0-9a-f]{{32}}$'
+                          AND scoped_event.pending_action_projection
+                              #>> '{{payload,model_step_id}}'
+                              = tool_scope.pending_tool_state ->> 'model_step_id'
+                          AND scoped_event.pending_action_projection
+                              #>> '{{payload,model_attempt_id}}'
+                              = tool_scope.pending_tool_state ->> 'model_attempt_id'
+                          AND NOT COALESCE(
+                              scoped_event.pending_action_projection
+                                  #>> '{{payload,tool_round_id}}'
+                                  = tool_scope.pending_tool_state ->> 'tool_round_id'
+                              AND scoped_event.pending_action_projection
+                                  #>> '{{payload,model_step_id}}'
+                                  = tool_scope.pending_tool_state ->> 'model_step_id'
+                              AND scoped_event.pending_action_projection
+                                  #>> '{{payload,model_attempt_id}}'
+                                  = tool_scope.pending_tool_state ->> 'model_attempt_id'
+                              AND EXISTS (
+                                  SELECT 1
+                                  FROM candidate_tool_calls AS pending_call
+                                  WHERE pending_call.session_id = tool_scope.session_id
+                                    AND pending_call.tool_call_id
+                                        = scoped_event.pending_action_projection
+                                            #>> '{{payload,tool_call_id}}'
+                              ),
+                              FALSE
+                          )
+                        LIMIT 1
+                    )
+                    LIMIT 1
+                ) AS conflict
+                WHERE jsonb_typeof(tool_scope.pending_tool_state) = 'object'
             ),
             matched_event_sequences AS (
                 SELECT candidate_session_id, sequence
@@ -7210,6 +7534,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 UNION
                 SELECT candidate_session_id, sequence
                 FROM matched_ledger_events
+                UNION
+                SELECT candidate_session_id, sequence
+                FROM scope_conflict_events
                 UNION
                 SELECT candidates.id, event.sequence
                 FROM candidates

@@ -25,7 +25,10 @@ from cayu.runtime.pending_actions import (
     pending_action_event_storage_values,
     pending_action_lookup_key,
 )
-from cayu.runtime.sessions import MAX_PENDING_ACTION_RESULT_BYTES
+from cayu.runtime.sessions import (
+    MAX_PENDING_ACTION_RESULT_BYTES,
+    BudgetReservationIdentityConflict,
+)
 from cayu.storage import migrations as schema
 from cayu.storage import postgres as postgres_storage
 from cayu.storage.migrations import SchemaMode
@@ -518,6 +521,7 @@ def test_revision_seventeen_requires_pending_action_index_migration(
                         "tool_call_id": "revision_17_projected_approval_call",
                         "message": "reconcile",
                         "tool_name": "deploy",
+                        "tool_evidence_conflict": True,
                         "approval": {
                             "approval_id": "revision_17_projected_approval_id",
                             "reason": "review",
@@ -530,6 +534,12 @@ def test_revision_seventeen_requires_pending_action_index_migration(
                             "options": ["yes", "no"],
                         },
                     },
+                ),
+                Event(
+                    id="revision_17_projected_failure",
+                    type=EventType.SESSION_FAILED,
+                    session_id=long_id_session.id,
+                    payload={"tool_evidence_conflict": True},
                 ),
                 Event(
                     id="revision_17_projected_resume",
@@ -565,6 +575,7 @@ def test_revision_seventeen_requires_pending_action_index_migration(
                     id="revision_17_pending_approval_event",
                     type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
                     session_id=pending_approval_session.id,
+                    agent_name="assistant",
                     tool_name="deploy",
                     payload={
                         **identity_payload,
@@ -573,6 +584,19 @@ def test_revision_seventeen_requires_pending_action_index_migration(
                         "approval": {
                             "approval_id": "revision_17_pending_approval_id",
                             "tool_name": "deploy",
+                            "arguments": {},
+                            "agent_name": "assistant",
+                            "tool_calls": [
+                                {
+                                    "tool_call_id": "revision_17_pending_approval_call",
+                                    "tool_name": "deploy",
+                                    "arguments": {},
+                                    "policy_decision": None,
+                                    "reason": None,
+                                    "metadata": {},
+                                    "active_taint_labels": [],
+                                }
+                            ],
                         },
                     },
                 ),
@@ -585,11 +609,17 @@ def test_revision_seventeen_requires_pending_action_index_migration(
                         "approval_id": "revision_17_pending_approval_id",
                         "tool_call_id": "revision_17_pending_approval_call",
                         "tool_name": "deploy",
+                        "arguments": {},
                         "agent_name": "assistant",
                         "tool_calls": [
                             {
                                 "tool_call_id": "revision_17_pending_approval_call",
                                 "tool_name": "deploy",
+                                "arguments": {},
+                                "policy_decision": None,
+                                "reason": None,
+                                "metadata": {},
+                                "active_taint_labels": [],
                             }
                         ],
                     }
@@ -618,6 +648,8 @@ def test_revision_seventeen_requires_pending_action_index_migration(
                 await cur.execute("DROP INDEX idx_cayu_checkpoints_pending_control_action")
                 await cur.execute("DROP INDEX idx_cayu_events_pending_action_barrier")
                 await cur.execute("DROP INDEX idx_cayu_events_pending_action_lookup")
+                await cur.execute("DROP INDEX idx_cayu_events_pending_action_round_scope")
+                await cur.execute("DROP INDEX idx_cayu_events_pending_action_attempt_scope")
                 await cur.execute(
                     "ALTER TABLE cayu_events DROP COLUMN pending_action_lookup_key, "
                     "DROP COLUMN pending_action_projection, "
@@ -689,6 +721,15 @@ def test_revision_seventeen_requires_pending_action_index_migration(
             assert metric_row is not None
             assert metric_row[0] > 0
             assert metric_row[1:] == (1, 4, True)
+            await cur.execute(
+                "SELECT pending_action_source_bytes, pending_action_tool_call_count, "
+                "pending_action_flags, pending_action_metrics_ready FROM cayu_checkpoints "
+                "WHERE session_id = 'revision_17_pending_approval'"
+            )
+            approval_metric_row = await cur.fetchone()
+            assert approval_metric_row is not None
+            assert approval_metric_row[0] > 0
+            assert approval_metric_row[1:] == (1, 1, True)
             await cur.execute(
                 """
                 SELECT index_definition.indisvalid
@@ -989,6 +1030,90 @@ def test_recorded_revision_twenty_three_requires_the_unique_reservation_index(
                 "'idx_cayu_events_budget_reservation_identity'"
             )
             assert await cur.fetchone() == (True,)
+
+    asyncio.run(runner())
+
+
+def test_revision_twenty_three_preserves_existing_reservation_ownership(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        reservation_id = "bres_revision_23_existing"
+        publication_id = "evt_revision_23_existing"
+        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            session = await creator.create(
+                RunRequest(
+                    session_id="sess_revision_23_existing",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "seed")],
+                ),
+                identity=_identity(),
+            )
+            await creator.append_event(
+                session.id,
+                Event(
+                    id=publication_id,
+                    type=EventType.BUDGET_RESERVED,
+                    session_id=session.id,
+                    payload={"reservation_id": reservation_id},
+                ),
+            )
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 23")
+                await cur.execute("DROP INDEX idx_cayu_events_budget_reservation_identity")
+                await cur.execute("DROP INDEX idx_cayu_events_pending_action_round_scope")
+                await cur.execute("DROP INDEX idx_cayu_events_pending_action_attempt_scope")
+                await cur.execute("DROP TABLE cayu_budget_reservation_identities")
+            await conn.commit()
+
+        store = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            await store.ensure_schema()
+            async with (
+                await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+                conn.cursor() as cur,
+            ):
+                await cur.execute(
+                    "SELECT publication_session_id, publication_id, published "
+                    "FROM cayu_budget_reservation_identities "
+                    "WHERE reservation_id = %s",
+                    (reservation_id,),
+                )
+                assert await cur.fetchone() == (
+                    "sess_revision_23_existing",
+                    publication_id,
+                    True,
+                )
+
+            await store.delete_session("sess_revision_23_existing")
+            replacement = await store.create(
+                RunRequest(
+                    session_id="sess_revision_23_replacement",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "reuse")],
+                ),
+                identity=_identity(),
+            )
+            with pytest.raises(BudgetReservationIdentityConflict):
+                await store.append_event(
+                    replacement.id,
+                    Event(
+                        id="evt_revision_23_reuse",
+                        type=EventType.BUDGET_RESERVED,
+                        session_id=replacement.id,
+                        payload={"reservation_id": reservation_id},
+                    ),
+                )
+        finally:
+            await store.close()
 
     asyncio.run(runner())
 

@@ -321,6 +321,10 @@ def recorded_tool_outcomes(
         ),
         terminal_event_types=_TOOL_ROUND_TERMINAL_EVENT_TYPES,
     )
+    if ledger.scope_conflicting:
+        raise resume_ledger.ToolCallEvidenceConflict(
+            "Tool-round recovery evidence contains a call outside the pending tool round."
+        )
     return ledger.outcomes, ledger.started_ids
 
 
@@ -346,7 +350,8 @@ def validate_tool_round_recovery_target(
         raise ValueError(f"Tool call is not part of the pending tool round: {tool_call_id}")
     state = resume_ledger.tool_call_recovery_state(
         events=events,
-        pending_tool_call=pending_tool_call,
+        pending_calls=pending_round.tool_calls,
+        tool_call_id=pending_tool_call.tool_call_id,
         in_scope=lambda event: identity.matches_payload(event.payload),
         candidate_scope=lambda event: (
             event.payload.get("tool_round_id") == pending_round.tool_round_id

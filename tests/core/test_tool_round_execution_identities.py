@@ -2,11 +2,24 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from typing import cast
+
+import pytest
 
 from cayu.core import AgentSpec, EventType, Message, ToolCallPart, ToolResultPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import CayuApp, InMemorySessionStore, RunRequest
+from cayu.runtime import (
+    CayuApp,
+    InMemorySessionStore,
+    RunRequest,
+    SessionIdentity,
+    SessionStore,
+)
+from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _tool_round_recovery as tool_round_recovery
+from cayu.runtime import _transcript as transcript_helpers
+from cayu.runtime.execution_units import ToolRoundIdentity
 
 
 class _SequencedProvider(ModelProvider):
@@ -44,6 +57,14 @@ class _RecordingTool(Tool):
         return ToolResult(content=str(value))
 
 
+class _TranscriptOnlyStore:
+    def __init__(self, transcript: list[Message]) -> None:
+        self._transcript = transcript
+
+    async def load_transcript(self, _session_id: str) -> list[Message]:
+        return [message.model_copy(deep=True) for message in self._transcript]
+
+
 def _tool_call_response(value: int) -> list[ModelStreamEvent]:
     return [
         ModelStreamEvent.tool_call(
@@ -53,6 +74,51 @@ def _tool_call_response(value: int) -> list[ModelStreamEvent]:
         ),
         ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
     ]
+
+
+def _tool_round_identity(value: str) -> ToolRoundIdentity:
+    return ToolRoundIdentity(
+        model_step_id=f"mstep_{value * 32}",
+        model_attempt_id=f"matt_{value * 32}",
+        tool_round_id=f"tround_{value * 32}",
+    )
+
+
+def _tool_call(
+    *,
+    call_id: str = "call-1",
+    name: str = "side_effect",
+    arguments: dict | None = None,
+) -> runtime_records.ToolCallRequest:
+    return runtime_records.ToolCallRequest(
+        id=call_id,
+        name=name,
+        arguments={} if arguments is None else arguments,
+    )
+
+
+def _mixed_identity_result_message(
+    identity: ToolRoundIdentity,
+    conflicting_identity: ToolRoundIdentity,
+    *,
+    tool_name: str,
+) -> Message:
+    return Message.tool_result(
+        results=[
+            ToolResultPart(
+                tool_call_id="call-1",
+                tool_name=tool_name,
+                content="expected result",
+                **identity.payload(),
+            ),
+            ToolResultPart(
+                tool_call_id="call-1",
+                tool_name=tool_name,
+                content="conflicting result",
+                **conflicting_identity.payload(),
+            ),
+        ]
+    )
 
 
 def test_runtime_links_reused_provider_call_ids_to_distinct_tool_rounds() -> None:
@@ -215,6 +281,372 @@ def test_runtime_rejects_duplicate_call_ids_within_one_tool_round() -> None:
     assert completed.payload["model_attempt_id"].startswith("matt_")
     assert transcript == [Message.text("user", "record twice")]
     assert events[-1].type == EventType.SESSION_FAILED
+
+
+def test_pending_round_rejects_conflicting_transcript_tool_descriptor() -> None:
+    identity = _tool_round_identity("1")
+    transcript = [
+        Message.tool_call(
+            tool_call_id="call-1",
+            tool_name="side_effect",
+            arguments={},
+            **identity.payload(),
+        ),
+        Message.tool_result(
+            tool_call_id="call-1",
+            tool_name="different_tool",
+            content="wrong result",
+            **identity.payload(),
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="result descriptor"):
+        asyncio.run(
+            transcript_helpers.tool_round_has_result_messages(
+                cast("SessionStore", _TranscriptOnlyStore(transcript)),
+                "session-1",
+                [_tool_call()],
+                tool_round_identity=identity,
+            )
+        )
+
+
+def test_pending_round_accepts_one_complete_call_and_result_message() -> None:
+    identity = _tool_round_identity("1")
+    transcript = [
+        Message.tool_call(
+            tool_call_id="call-1",
+            tool_name="side_effect",
+            arguments={},
+            **identity.payload(),
+        ),
+        Message.tool_result(
+            tool_call_id="call-1",
+            tool_name="side_effect",
+            content="recorded",
+            **identity.payload(),
+        ),
+    ]
+
+    closed = asyncio.run(
+        transcript_helpers.tool_round_has_result_messages(
+            cast("SessionStore", _TranscriptOnlyStore(transcript)),
+            "session-1",
+            [_tool_call()],
+            tool_round_identity=identity,
+        )
+    )
+
+    assert closed is True
+
+
+@pytest.mark.parametrize(
+    ("case", "error_pattern"),
+    [
+        pytest.param("result_without_call", "before the pending round call boundary", id="no-call"),
+        pytest.param("result_before_call", "before the pending round call boundary", id="order"),
+        pytest.param("incomplete_calls", "does not match the pending call set", id="membership"),
+        pytest.param("duplicate_calls", "duplicate calls", id="duplicate-calls"),
+        pytest.param("duplicate_results", "duplicate results", id="duplicate-results"),
+    ],
+)
+def test_pending_round_rejects_malformed_transcript_grammar(
+    case: str,
+    error_pattern: str,
+) -> None:
+    identity = _tool_round_identity("1")
+    call_parts = [
+        ToolCallPart(
+            tool_call_id="call-1",
+            tool_name="side_effect",
+            arguments={},
+            **identity.payload(),
+        )
+    ]
+    result_parts = [
+        ToolResultPart(
+            tool_call_id="call-1",
+            tool_name="side_effect",
+            content="recorded",
+            **identity.payload(),
+        )
+    ]
+    pending_calls = [_tool_call()]
+    if case == "result_without_call":
+        transcript = [Message.tool_result(results=result_parts)]
+    elif case == "result_before_call":
+        transcript = [
+            Message.tool_result(results=result_parts),
+            Message.tool_call(calls=call_parts),
+        ]
+    elif case == "incomplete_calls":
+        pending_calls.append(_tool_call(call_id="call-2"))
+        transcript = [
+            Message.tool_call(calls=call_parts),
+            Message.tool_result(
+                results=[
+                    *result_parts,
+                    ToolResultPart(
+                        tool_call_id="call-2",
+                        tool_name="side_effect",
+                        content="recorded",
+                        **identity.payload(),
+                    ),
+                ]
+            ),
+        ]
+    elif case == "duplicate_calls":
+        transcript = [
+            Message.tool_call(calls=[*call_parts, *call_parts]),
+            Message.tool_result(results=result_parts),
+        ]
+    else:
+        transcript = [
+            Message.tool_call(calls=call_parts),
+            Message.tool_result(results=[*result_parts, *result_parts]),
+        ]
+
+    with pytest.raises(ValueError, match=error_pattern):
+        asyncio.run(
+            transcript_helpers.tool_round_has_result_messages(
+                cast("SessionStore", _TranscriptOnlyStore(transcript)),
+                "session-1",
+                pending_calls,
+                tool_round_identity=identity,
+            )
+        )
+
+
+def test_pending_round_rejects_mixed_transcript_tool_round_identities() -> None:
+    identity = _tool_round_identity("1")
+    conflicting_identity = _tool_round_identity("a")
+    transcript = [
+        _mixed_identity_result_message(
+            identity,
+            conflicting_identity,
+            tool_name="side_effect",
+        )
+    ]
+
+    with pytest.raises(ValueError, match="conflicting tool-round identities"):
+        asyncio.run(
+            transcript_helpers.tool_round_has_result_messages(
+                cast("SessionStore", _TranscriptOnlyStore(transcript)),
+                "session-1",
+                [_tool_call()],
+                tool_round_identity=identity,
+            )
+        )
+
+
+def test_pending_round_rejects_newer_conflicting_transcript_message() -> None:
+    identity = _tool_round_identity("1")
+    conflicting_identity = _tool_round_identity("a")
+    transcript = [
+        Message.tool_call(
+            tool_call_id="call-1",
+            tool_name="side_effect",
+            arguments={},
+            **identity.payload(),
+        ),
+        Message.tool_result(
+            tool_call_id="call-1",
+            tool_name="side_effect",
+            content="expected result",
+            **identity.payload(),
+        ),
+        Message.tool_result(
+            tool_call_id="call-1",
+            tool_name="side_effect",
+            content="newer conflicting result",
+            **conflicting_identity.payload(),
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="newer conflicting tool-round evidence"):
+        asyncio.run(
+            transcript_helpers.tool_round_has_result_messages(
+                cast("SessionStore", _TranscriptOnlyStore(transcript)),
+                "session-1",
+                [_tool_call()],
+                tool_round_identity=identity,
+            )
+        )
+
+
+def test_pending_round_rejects_duplicate_result_messages() -> None:
+    identity = _tool_round_identity("1")
+    result = Message.tool_result(
+        tool_call_id="call-1",
+        tool_name="side_effect",
+        content="recorded",
+        **identity.payload(),
+    )
+
+    with pytest.raises(ValueError, match="duplicate tool-round result messages"):
+        asyncio.run(
+            transcript_helpers.tool_round_has_result_messages(
+                cast(
+                    "SessionStore",
+                    _TranscriptOnlyStore(
+                        [
+                            Message.tool_call(
+                                tool_call_id="call-1",
+                                tool_name="side_effect",
+                                arguments={},
+                                **identity.payload(),
+                            ),
+                            result,
+                            result,
+                        ]
+                    ),
+                ),
+                "session-1",
+                [_tool_call()],
+                tool_round_identity=identity,
+            )
+        )
+
+
+def test_pending_round_recovery_retains_checkpoint_without_call_boundary() -> None:
+    async def scenario() -> None:
+        session_id = "sess_result_without_tool_call_boundary"
+        identity = _tool_round_identity("1")
+        tool_call = _tool_call(name="record", arguments={"value": 1})
+        checkpoint, _pending_round = tool_round_recovery.checkpoint_with_pending_tool_round(
+            None,
+            agent_name="assistant",
+            environment_name=None,
+            task_id=None,
+            tool_calls=[tool_call],
+            policy_outcomes=None,
+            structured_output=None,
+            tool_round_identity=identity,
+        )
+        transcript = [
+            Message.tool_result(
+                tool_call_id="call-1",
+                tool_name="record",
+                content="unattributable result",
+                **identity.payload(),
+            )
+        ]
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        tool = _RecordingTool()
+        app.register_provider(_SequencedProvider([]), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="sequenced-model"),
+            tools=[tool],
+        )
+        await store.create(
+            RunRequest(
+                session_id=session_id,
+                agent_name="assistant",
+                messages=[Message.text("user", "record")],
+            ),
+            identity=SessionIdentity(
+                provider_name="sequenced",
+                model="sequenced-model",
+            ),
+        )
+        await store.append_transcript_messages(session_id, transcript)
+        await store.checkpoint(session_id, checkpoint)
+        session = await store.load(session_id)
+        assert session is not None
+
+        with pytest.raises(ValueError, match="before the pending round call boundary"):
+            async for _event in app._recovery_coordinator.recover_pending_tool_round(
+                session=session,
+                registered_agent=app._get_registered_agent("assistant"),
+                registered_environment=None,
+                messages=[message.model_copy(deep=True) for message in transcript],
+            ):
+                pass
+
+        assert await store.load_checkpoint(session_id) == checkpoint
+        assert await store.load_transcript(session_id) == transcript
+        assert await store.load_events(session_id) == []
+        assert tool.values == []
+
+    asyncio.run(scenario())
+
+
+def test_pending_round_recovery_retains_checkpoint_for_mixed_transcript_identity() -> None:
+    async def scenario() -> None:
+        session_id = "sess_mixed_transcript_tool_round_identity"
+        identity = _tool_round_identity("1")
+        conflicting_identity = _tool_round_identity("a")
+        tool_call = _tool_call(name="record", arguments={"value": 1})
+        checkpoint, _pending_round = tool_round_recovery.checkpoint_with_pending_tool_round(
+            None,
+            agent_name="assistant",
+            environment_name=None,
+            task_id=None,
+            tool_calls=[tool_call],
+            policy_outcomes=None,
+            structured_output=None,
+            tool_round_identity=identity,
+        )
+        transcript = [
+            Message.tool_call(
+                tool_call_id="call-1",
+                tool_name="record",
+                arguments={"value": 1},
+                **identity.payload(),
+            ),
+            Message.tool_result(
+                tool_call_id="call-1",
+                tool_name="record",
+                content="expected result",
+                **identity.payload(),
+            ),
+            Message.tool_result(
+                tool_call_id="call-1",
+                tool_name="record",
+                content="newer conflicting result",
+                **conflicting_identity.payload(),
+            ),
+        ]
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        tool = _RecordingTool()
+        app.register_provider(_SequencedProvider([]), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="sequenced-model"),
+            tools=[tool],
+        )
+        await store.create(
+            RunRequest(
+                session_id=session_id,
+                agent_name="assistant",
+                messages=[Message.text("user", "record")],
+            ),
+            identity=SessionIdentity(
+                provider_name="sequenced",
+                model="sequenced-model",
+            ),
+        )
+        await store.append_transcript_messages(session_id, transcript)
+        await store.checkpoint(session_id, checkpoint)
+        session = await store.load(session_id)
+        assert session is not None
+
+        with pytest.raises(ValueError, match="newer conflicting tool-round evidence"):
+            async for _event in app._recovery_coordinator.recover_pending_tool_round(
+                session=session,
+                registered_agent=app._get_registered_agent("assistant"),
+                registered_environment=None,
+                messages=[message.model_copy(deep=True) for message in transcript],
+            ):
+                pass
+
+        assert await store.load_checkpoint(session_id) == checkpoint
+        assert await store.load_transcript(session_id) == transcript
+        assert await store.load_events(session_id) == []
+        assert tool.values == []
+
+    asyncio.run(scenario())
 
 
 def test_runtime_removes_provider_spoofed_execution_identity() -> None:

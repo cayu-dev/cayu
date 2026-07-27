@@ -35,6 +35,7 @@ from cayu.core.thinking import ThinkingConfig
 from cayu.core.tools import _TOOL_POLICY_DENIAL_SOURCE, ToolResult
 from cayu.environments import EnvironmentFactoryOperation
 from cayu.runtime import _approval_support as approval_support
+from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_results as tool_results
@@ -1405,6 +1406,8 @@ class RecoveryCoordinator:
                     payload["manual_recovery_required"] = True
                     payload["tool_call_id"] = exc.tool_call_id
                     payload["tool_name"] = exc.tool_name
+                if isinstance(exc, resume_ledger.ToolCallEvidenceConflict):
+                    payload[resume_ledger.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY] = True
                 session = await self._session_store.update_status(
                     session.id, SessionStatus.INTERRUPTED
                 )
@@ -1968,6 +1971,13 @@ class RecoveryCoordinator:
                                 **tool_round_identity.payload(),
                                 "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
                                 "approval": pending_approval.model_dump(mode="json"),
+                                **(
+                                    {
+                                        resume_ledger.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY: True,
+                                    }
+                                    if isinstance(exc, resume_ledger.ToolCallEvidenceConflict)
+                                    else {}
+                                ),
                             },
                         ),
                         phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,

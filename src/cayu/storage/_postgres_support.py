@@ -255,6 +255,52 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
       AND pending_action_lookup_key IS NOT NULL
     """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_cayu_events_pending_action_round_scope
+    ON cayu_events(
+        session_id,
+        (pending_action_projection #>> '{payload,tool_round_id}'),
+        sequence
+    )
+    WHERE event_type IN (
+        'tool.call.started',
+        'tool.call.completed',
+        'tool.call.failed',
+        'tool.call.blocked',
+        'tool.call.approval_denied'
+    )
+      AND jsonb_typeof(
+          pending_action_projection #> '{payload,tool_round_id}'
+      ) = 'string'
+      AND pending_action_projection #>> '{payload,tool_round_id}'
+          ~ '^tround_[0-9a-f]{32}$'
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_cayu_events_pending_action_attempt_scope
+    ON cayu_events(
+        session_id,
+        (pending_action_projection #>> '{payload,model_step_id}'),
+        (pending_action_projection #>> '{payload,model_attempt_id}'),
+        sequence
+    )
+    WHERE event_type IN (
+        'tool.call.started',
+        'tool.call.completed',
+        'tool.call.failed',
+        'tool.call.blocked',
+        'tool.call.approval_denied'
+    )
+      AND jsonb_typeof(
+          pending_action_projection #> '{payload,model_step_id}'
+      ) = 'string'
+      AND jsonb_typeof(
+          pending_action_projection #> '{payload,model_attempt_id}'
+      ) = 'string'
+      AND pending_action_projection #>> '{payload,model_step_id}'
+          ~ '^mstep_[0-9a-f]{32}$'
+      AND pending_action_projection #>> '{payload,model_attempt_id}'
+          ~ '^matt_[0-9a-f]{32}$'
+    """,
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_insert_xid ON cayu_events(insert_xid)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_persisted_event_side_effects_delivery "
     "ON cayu_persisted_event_side_effects"

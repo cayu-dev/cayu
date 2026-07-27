@@ -4,6 +4,7 @@ import asyncio
 import contextvars
 import hashlib
 import io
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -38,6 +39,7 @@ from cayu.runtime import (
     ContextCompactor,
     EnqueueSessionMessageRequest,
     EventQuery,
+    ForkSessionRequest,
     InMemorySessionStore,
     McpManifestBaseline,
     ModelCompactor,
@@ -257,6 +259,14 @@ class _ConformancePartialOverlapCompactor(ContextCompactor):
             covered_message_count=1,
             represented_existing_summary_sha256=(_represented_existing_summary_sha256(request)),
         )
+
+
+class _UnusedForkProvider(ModelProvider):
+    name = "fake"
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        del request
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
 @pytest.fixture(params=["memory", "sqlite", "postgres"])
@@ -3877,6 +3887,93 @@ def test_session_store_conformance_validates_exact_fork_transcript_atomically(
                 assert await session_store.load(child_id) is None
         finally:
             await _close_store(session_store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("source_status", "copy_checkpoint"),
+    (
+        pytest.param(SessionStatus.INTERRUPTED, True, id="copy-checkpoint"),
+        pytest.param(SessionStatus.FAILED, False, id="discard-checkpoint"),
+    ),
+)
+def test_session_store_conformance_rejects_fork_with_pending_tool_round(
+    session_store_case,
+    source_status: SessionStatus,
+    copy_checkpoint: bool,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        store_kind = session_store_case[0]
+        mode = "copy" if copy_checkpoint else "discard"
+        source_id = f"sess_pending_round_fork_source_{store_kind}_{mode}"
+        child_id = f"sess_pending_round_fork_child_{store_kind}_{mode}"
+        identity = {
+            "model_step_id": f"mstep_{'1' * 32}",
+            "model_attempt_id": f"matt_{'2' * 32}",
+            "tool_round_id": f"tround_{'3' * 32}",
+        }
+        checkpoint = {
+            "pending_tool_round": {
+                **identity,
+                "agent_name": "assistant",
+                "tool_calls": [
+                    {
+                        "tool_call_id": "call_external_effect",
+                        "tool_name": "external_effect",
+                        "arguments": {},
+                    }
+                ],
+            }
+        }
+        try:
+            source = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=source_id,
+                    messages=[Message.text("user", "perform the effect")],
+                ),
+                identity=_identity(),
+            )
+            await store.append_event(
+                source.id,
+                Event(
+                    id=f"evt_pending_round_started_{store_kind}",
+                    type=EventType.TOOL_CALL_STARTED,
+                    session_id=source.id,
+                    tool_name="external_effect",
+                    payload={
+                        **identity,
+                        "tool_call_id": "call_external_effect",
+                    },
+                ),
+            )
+            await store.checkpoint(source.id, checkpoint)
+            await store.update_status(source.id, source_status)
+            source_events = await store.load_events(source.id)
+
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(_UnusedForkProvider(), default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+            with pytest.raises(RuntimeError, match="pending tool round cannot be forked"):
+                [
+                    event
+                    async for event in app.fork_session(
+                        ForkSessionRequest(
+                            source_session_id=source.id,
+                            session_id=child_id,
+                            copy_checkpoint=copy_checkpoint,
+                        )
+                    )
+                ]
+
+            assert await store.load(child_id) is None
+            assert await store.load_checkpoint(source.id) == checkpoint
+            assert await store.load_events(source.id) == source_events
+        finally:
+            await _close_store(store)
 
     asyncio.run(run())
 

@@ -329,6 +329,90 @@ _BASELINE_DDL = """
             'tool.call.approval_denied'
         )
           AND pending_action_lookup_key IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_cayu_events_pending_action_round_scope
+        ON cayu_events(
+            session_id,
+            json_extract(
+                pending_action_projection_json,
+                '$.payload.tool_round_id'
+            ),
+            sequence
+        )
+        WHERE event_type IN (
+            'tool.call.started',
+            'tool.call.completed',
+            'tool.call.failed',
+            'tool.call.blocked',
+            'tool.call.approval_denied'
+        )
+          AND json_type(
+              pending_action_projection_json,
+              '$.payload.tool_round_id'
+          ) = 'text'
+          AND length(json_extract(
+              pending_action_projection_json,
+              '$.payload.tool_round_id'
+          )) = 39
+          AND substr(json_extract(
+              pending_action_projection_json,
+              '$.payload.tool_round_id'
+          ), 1, 7) = 'tround_'
+          AND substr(json_extract(
+              pending_action_projection_json,
+              '$.payload.tool_round_id'
+          ), 8) NOT GLOB '*[^0-9a-f]*';
+    CREATE INDEX IF NOT EXISTS idx_cayu_events_pending_action_attempt_scope
+        ON cayu_events(
+            session_id,
+            json_extract(
+                pending_action_projection_json,
+                '$.payload.model_step_id'
+            ),
+            json_extract(
+                pending_action_projection_json,
+                '$.payload.model_attempt_id'
+            ),
+            sequence
+        )
+        WHERE event_type IN (
+            'tool.call.started',
+            'tool.call.completed',
+            'tool.call.failed',
+            'tool.call.blocked',
+            'tool.call.approval_denied'
+        )
+          AND json_type(
+              pending_action_projection_json,
+              '$.payload.model_step_id'
+          ) = 'text'
+          AND json_type(
+              pending_action_projection_json,
+              '$.payload.model_attempt_id'
+          ) = 'text'
+          AND length(json_extract(
+              pending_action_projection_json,
+              '$.payload.model_step_id'
+          )) = 38
+          AND substr(json_extract(
+              pending_action_projection_json,
+              '$.payload.model_step_id'
+          ), 1, 6) = 'mstep_'
+          AND substr(json_extract(
+              pending_action_projection_json,
+              '$.payload.model_step_id'
+          ), 7) NOT GLOB '*[^0-9a-f]*'
+          AND length(json_extract(
+              pending_action_projection_json,
+              '$.payload.model_attempt_id'
+          )) = 37
+          AND substr(json_extract(
+              pending_action_projection_json,
+              '$.payload.model_attempt_id'
+          ), 1, 5) = 'matt_'
+          AND substr(json_extract(
+              pending_action_projection_json,
+              '$.payload.model_attempt_id'
+          ), 6) NOT GLOB '*[^0-9a-f]*';
     CREATE INDEX IF NOT EXISTS idx_cayu_events_type_timestamp
         ON cayu_events(event_type, timestamp);
     CREATE INDEX IF NOT EXISTS idx_cayu_events_agent_name
@@ -657,6 +741,92 @@ _MIGRATION_STEPS: dict[int, str] = {
             ON cayu_events(json_extract(payload_json, '$.reservation_id'))
             WHERE event_type = 'budget.reserved'
               AND json_type(payload_json, '$.reservation_id') = 'text';
+
+        CREATE INDEX IF NOT EXISTS idx_cayu_events_pending_action_round_scope
+            ON cayu_events(
+                session_id,
+                json_extract(
+                    pending_action_projection_json,
+                    '$.payload.tool_round_id'
+                ),
+                sequence
+            )
+            WHERE event_type IN (
+                'tool.call.started',
+                'tool.call.completed',
+                'tool.call.failed',
+                'tool.call.blocked',
+                'tool.call.approval_denied'
+            )
+              AND json_type(
+                  pending_action_projection_json,
+                  '$.payload.tool_round_id'
+              ) = 'text'
+              AND length(json_extract(
+                  pending_action_projection_json,
+                  '$.payload.tool_round_id'
+              )) = 39
+              AND substr(json_extract(
+                  pending_action_projection_json,
+                  '$.payload.tool_round_id'
+              ), 1, 7) = 'tround_'
+              AND substr(json_extract(
+                  pending_action_projection_json,
+                  '$.payload.tool_round_id'
+              ), 8) NOT GLOB '*[^0-9a-f]*';
+
+        CREATE INDEX IF NOT EXISTS idx_cayu_events_pending_action_attempt_scope
+            ON cayu_events(
+                session_id,
+                json_extract(
+                    pending_action_projection_json,
+                    '$.payload.model_step_id'
+                ),
+                json_extract(
+                    pending_action_projection_json,
+                    '$.payload.model_attempt_id'
+                ),
+                sequence
+            )
+            WHERE event_type IN (
+                'tool.call.started',
+                'tool.call.completed',
+                'tool.call.failed',
+                'tool.call.blocked',
+                'tool.call.approval_denied'
+            )
+              AND json_type(
+                  pending_action_projection_json,
+                  '$.payload.model_step_id'
+              ) = 'text'
+              AND json_type(
+                  pending_action_projection_json,
+                  '$.payload.model_attempt_id'
+              ) = 'text'
+              AND length(json_extract(
+                  pending_action_projection_json,
+                  '$.payload.model_step_id'
+              )) = 38
+              AND substr(json_extract(
+                  pending_action_projection_json,
+                  '$.payload.model_step_id'
+              ), 1, 6) = 'mstep_'
+              AND substr(json_extract(
+                  pending_action_projection_json,
+                  '$.payload.model_step_id'
+              ), 7) NOT GLOB '*[^0-9a-f]*'
+              AND length(json_extract(
+                  pending_action_projection_json,
+                  '$.payload.model_attempt_id'
+              )) = 37
+              AND substr(json_extract(
+                  pending_action_projection_json,
+                  '$.payload.model_attempt_id'
+              ), 1, 5) = 'matt_'
+              AND substr(json_extract(
+                  pending_action_projection_json,
+                  '$.payload.model_attempt_id'
+              ), 6) NOT GLOB '*[^0-9a-f]*';
     """,
 }
 
@@ -899,6 +1069,30 @@ def _add_budget_execution_identity_if_present(connection: sqlite3.Connection) ->
         )
 
 
+def _prepare_revision_twenty_three(connection: sqlite3.Connection) -> None:
+    """Install execution columns and preserve exact historical reservation ownership."""
+
+    _add_budget_execution_identity_if_present(connection)
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO cayu_budget_reservation_identities (
+            reservation_id,
+            publication_session_id,
+            publication_id,
+            published
+        )
+        SELECT
+            json_extract(payload_json, '$.reservation_id'),
+            session_id,
+            event_id,
+            1
+        FROM cayu_events
+        WHERE event_type = 'budget.reserved'
+          AND json_type(payload_json, '$.reservation_id') = 'text'
+        """
+    )
+
+
 # Per-revision Python follow-ups that cannot be expressed as unconditional DDL
 # (e.g. conditionally carrying data out of a legacy ad-hoc table). Each hook runs
 # after its revision's DDL and before the revision is recorded.
@@ -906,7 +1100,7 @@ _MIGRATION_HOOKS: dict[int, Callable[[sqlite3.Connection], None]] = {
     8: _migrate_legacy_budget_reservations,
     14: _backfill_session_activity,
     21: _add_budget_billing_identity_if_present,
-    23: _add_budget_execution_identity_if_present,
+    23: _prepare_revision_twenty_three,
 }
 
 _REVISION_17_INDEX_NAMES = frozenset(
@@ -918,6 +1112,12 @@ _REVISION_17_INDEX_NAMES = frozenset(
 )
 _RESERVATION_EVENT_INDEX_NAME = "idx_cayu_events_budget_reservation_identity"
 _RESERVATION_IDENTITY_TABLE_NAME = "cayu_budget_reservation_identities"
+_PENDING_ACTION_SCOPE_INDEX_NAMES = frozenset(
+    {
+        "idx_cayu_events_pending_action_round_scope",
+        "idx_cayu_events_pending_action_attempt_scope",
+    }
+)
 
 
 def _normalize_sqlite_schema_definition(definition: str) -> str:
@@ -1048,10 +1248,69 @@ def _repair_missing_reservation_event_index(connection: sqlite3.Connection) -> N
         _validate_reservation_event_index(connection, require=True)
 
 
+def _pending_action_scope_index_definitions() -> dict[str, str]:
+    definitions: dict[str, str] = {}
+    for statement in _iter_statements(_MIGRATION_STEPS[23]):
+        for index_name in _PENDING_ACTION_SCOPE_INDEX_NAMES:
+            if index_name in statement:
+                definitions[index_name] = statement
+    if definitions.keys() != _PENDING_ACTION_SCOPE_INDEX_NAMES:
+        raise RuntimeError("Cayu pending-action scope index definitions are incomplete.")
+    return definitions
+
+
+def _validate_pending_action_scope_indexes(
+    connection: sqlite3.Connection,
+    *,
+    require_all: bool,
+) -> None:
+    for index_name, expected in _pending_action_scope_index_definitions().items():
+        row = connection.execute(
+            "SELECT type, tbl_name, sql FROM sqlite_master WHERE name = ?",
+            (index_name,),
+        ).fetchone()
+        if row is None:
+            if require_all:
+                raise RuntimeError(
+                    f"Required Cayu SQLite index is missing: {index_name}. "
+                    "Run with schema_mode='migrate' to repair the schema."
+                )
+            continue
+        actual_type, table_name, actual_definition = row
+        if (
+            actual_type != "index"
+            or table_name != "cayu_events"
+            or actual_definition is None
+            or _normalize_sqlite_schema_definition(actual_definition)
+            != _normalize_sqlite_schema_definition(expected)
+        ):
+            raise RuntimeError(
+                f"SQLite schema object {index_name!r} conflicts with Cayu's "
+                "pending-action scope contract. Rename or remove the conflicting "
+                "object, then run with schema_mode='migrate'."
+            )
+
+
+def _repair_missing_pending_action_scope_indexes(connection: sqlite3.Connection) -> None:
+    with _transaction(connection):
+        _validate_pending_action_scope_indexes(connection, require_all=False)
+        existing_names = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            ).fetchall()
+        }
+        for index_name, definition in _pending_action_scope_index_definitions().items():
+            if index_name not in existing_names:
+                connection.execute(definition)
+        _validate_pending_action_scope_indexes(connection, require_all=True)
+
+
 def _validate_reservation_identity_registry(
     connection: sqlite3.Connection,
     *,
     require: bool,
+    verify_event_ownership: bool = False,
 ) -> None:
     row = connection.execute(
         "SELECT type FROM sqlite_master WHERE name = ?",
@@ -1085,6 +1344,33 @@ def _validate_reservation_identity_registry(
             f"SQLite schema object {_RESERVATION_IDENTITY_TABLE_NAME!r} conflicts "
             "with Cayu's reservation identity contract. Restore the required "
             "ownership registry from a known-good backup."
+        )
+    if not verify_event_ownership:
+        return
+    unmatched_event = connection.execute(
+        """
+        SELECT 1
+        FROM cayu_events AS event
+        LEFT JOIN cayu_budget_reservation_identities AS identity
+          ON identity.reservation_id = json_extract(
+              event.payload_json,
+              '$.reservation_id'
+          )
+        WHERE event.event_type = 'budget.reserved'
+          AND json_type(event.payload_json, '$.reservation_id') = 'text'
+          AND (
+              identity.reservation_id IS NULL
+              OR identity.publication_session_id != event.session_id
+              OR identity.publication_id != event.event_id
+              OR identity.published != 1
+          )
+        LIMIT 1
+        """
+    ).fetchone()
+    if unmatched_event is not None:
+        raise RuntimeError(
+            "SQLite budget reservation events disagree with the permanent "
+            "reservation ownership registry."
         )
 
 
@@ -1131,8 +1417,10 @@ def reconcile_schema(
     if current.revision >= 23:
         if schema_mode is schema.SchemaMode.MIGRATE:
             _repair_missing_reservation_event_index(connection)
+            _repair_missing_pending_action_scope_indexes(connection)
         else:
             _validate_reservation_event_index(connection, require=True)
+            _validate_pending_action_scope_indexes(connection, require_all=True)
         _validate_reservation_identity_registry(connection, require=True)
 
 
@@ -1234,12 +1522,18 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
     if rev.revision == 23:
         with _transaction(connection):
             _validate_reservation_event_index(connection, require=False)
+            _validate_pending_action_scope_indexes(connection, require_all=False)
             for statement in _iter_statements(_MIGRATION_STEPS[23]):
                 connection.execute(statement)
             hook = _MIGRATION_HOOKS[23]
             hook(connection)
             _validate_reservation_event_index(connection, require=True)
-            _validate_reservation_identity_registry(connection, require=True)
+            _validate_pending_action_scope_indexes(connection, require_all=True)
+            _validate_reservation_identity_registry(
+                connection,
+                require=True,
+                verify_event_ownership=True,
+            )
             _record_revision(connection, rev)
             connection.execute(f"PRAGMA user_version = {rev.revision}")
         return

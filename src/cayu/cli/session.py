@@ -30,6 +30,7 @@ from cayu.runtime import (
     SessionQuery,
     SessionStatus,
     SessionStore,
+    ToolPolicyDecision,
     ToolRoundIdentity,
     TranscriptQuery,
     TranscriptRecord,
@@ -50,6 +51,7 @@ _MAX_TRANSCRIPT_CONTENT_BYTES = 1_048_576
 _MAX_TRANSCRIPT_SUMMARY_PARTS = 100
 _EVENT_QUERY_PAGE_SIZE = 200
 _USAGE_INSPECTION_PRICING_STATE_KEY = "_cayu_pricing_state"
+_TOOL_INSPECTION_IDENTITY_CONFLICT_KEY = "_cayu_tool_identity_conflict"
 
 
 def add_session_parser(subparsers: Any) -> None:
@@ -758,8 +760,68 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
     input_calls: dict[_ToolCallKey, dict[str, Any]] = {}
     decision_records: dict[_ToolCallKey, EventRecord] = {}
     approval_states: dict[_ToolCallKey, str] = {}
+    approval_outcomes: dict[_ToolCallKey, str] = {}
+    resolved_approval_keys: set[tuple[str, str, str, str]] = set()
+    approval_request_calls: dict[
+        tuple[str, str, str, str],
+        set[_ToolCallKey],
+    ] = {}
+    approval_request_rounds: set[tuple[str, str, str]] = set()
+    approval_gated_calls: set[_ToolCallKey] = set()
     evidence_conflicts: set[_ToolCallKey] = set()
     approval_decision_conflicts: set[_ToolCallKey] = set()
+    tool_names: dict[_ToolCallKey, set[str]] = {}
+    lifecycle_records: dict[_ToolCallKey, list[EventRecord]] = {}
+    approval_scoped_keys: set[_ToolCallKey] = set()
+
+    def retain_tool_name(call_key: _ToolCallKey, value: object) -> None:
+        if type(value) is not str or not value or value.strip() != value:
+            evidence_conflicts.add(call_key)
+            return
+        tool_names.setdefault(call_key, set()).add(value)
+
+    def retain_lifecycle_record(call_key: _ToolCallKey, record: EventRecord) -> None:
+        lifecycle_records.setdefault(call_key, []).append(record)
+
+    def approval_resolution_key(
+        record: EventRecord,
+    ) -> tuple[str, str, str, str] | None:
+        approval_id = record.event.payload.get("approval_id")
+        identity = _tool_event_identity(record)
+        if (
+            type(approval_id) is not str
+            or not approval_id
+            or approval_id.strip() != approval_id
+            or identity is None
+        ):
+            return None
+        return (
+            identity.model_step_id,
+            identity.model_attempt_id,
+            identity.tool_round_id,
+            approval_id,
+        )
+
+    def retain_approval_decision_state(
+        call_key: _ToolCallKey,
+        record: EventRecord,
+    ) -> None:
+        if record.event.type == EventType.TOOL_CALL_APPROVED:
+            approval_states[call_key] = "approved"
+            return
+        if record.event.type in {
+            EventType.TOOL_CALL_APPROVAL_DENIED,
+            EventType.TOOL_CALL_APPROVAL_EXPIRED,
+        }:
+            outcome = (
+                "expired"
+                if record.event.type == EventType.TOOL_CALL_APPROVAL_EXPIRED
+                or record.event.payload.get("expired") is True
+                else "denied"
+            )
+            approval_states[call_key] = outcome
+            approval_outcomes[call_key] = outcome
+
     for record in records:
         event = record.event
         if event.type == EventType.SESSION_AWAITING_USER_INPUT:
@@ -774,17 +836,23 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
                 if type(call_id) is not str:
                     continue
                 call_key = _tool_call_key(record, call_id)
+                if call_key in input_requests:
+                    evidence_conflicts.add(call_key)
                 input_requests.setdefault(call_key, record)
                 input_calls.setdefault(call_key, call)
+                retain_tool_name(call_key, call.get("tool_name"))
+                if call_id == event.payload.get("tool_call_id"):
+                    retain_tool_name(call_key, event.tool_name)
             continue
         if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED:
             approval = _tool_approval_payload(record)
             if approval is None:
                 continue
             nested_calls = approval.get("tool_calls")
+            has_nested_calls = type(nested_calls) is list and bool(nested_calls)
             calls = (
                 [item for item in nested_calls if type(item) is dict]
-                if type(nested_calls) is list and nested_calls
+                if has_nested_calls
                 else [approval]
             )
             for call in calls:
@@ -792,14 +860,43 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
                 if type(call_id) is not str:
                     continue
                 call_key = _tool_call_key(record, call_id)
+                if call_key in approval_requests:
+                    evidence_conflicts.add(call_key)
+                    approval_decision_conflicts.add(call_key)
                 approval_requests.setdefault(call_key, record)
                 approval_calls.setdefault(call_key, call)
-                approval_states[call_key] = "requested"
+                resolution_key = approval_resolution_key(record)
+                if resolution_key is None:
+                    evidence_conflicts.add(call_key)
+                    approval_decision_conflicts.add(call_key)
+                else:
+                    approval_request_calls.setdefault(resolution_key, set()).add(call_key)
+                    approval_request_rounds.add(resolution_key[:3])
+                policy_decision = call.get("policy_decision")
+                if (
+                    not has_nested_calls
+                    or policy_decision == ToolPolicyDecision.REQUIRE_APPROVAL.value
+                ):
+                    approval_states[call_key] = "requested"
+                    approval_gated_calls.add(call_key)
+                elif policy_decision not in {
+                    ToolPolicyDecision.ALLOW.value,
+                    ToolPolicyDecision.DENY.value,
+                }:
+                    evidence_conflicts.add(call_key)
+                    approval_decision_conflicts.add(call_key)
+                approval_scoped_keys.add(call_key)
+                retain_lifecycle_record(call_key, record)
+                retain_tool_name(call_key, call.get("tool_name"))
+                if call_id == approval.get("tool_call_id"):
+                    retain_tool_name(call_key, event.tool_name)
             continue
         call_id = _tool_event_call_id(record)
         if call_id is None:
             continue
         call_key = _tool_call_key(record, call_id)
+        retain_lifecycle_record(call_key, record)
+        retain_tool_name(call_key, event.tool_name)
         if event.type == EventType.TOOL_CALL_STARTED:
             if call_key in starts or call_key in terminals:
                 evidence_conflicts.add(call_key)
@@ -809,23 +906,98 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
                 evidence_conflicts.add(call_key)
             terminals.setdefault(call_key, record)
         elif event.type == EventType.TOOL_CALL_APPROVED:
-            if call_key in decision_records and decision_records[call_key].event.type != event.type:
+            approval_scoped_keys.add(call_key)
+            if call_key in decision_records:
                 evidence_conflicts.add(call_key)
                 approval_decision_conflicts.add(call_key)
-            approval_states[call_key] = "approved"
             decision_records.setdefault(call_key, record)
         elif event.type == EventType.TOOL_CALL_APPROVAL_DENIED:
-            if call_key in decision_records and decision_records[call_key].event.type != event.type:
+            approval_scoped_keys.add(call_key)
+            prior_decision = decision_records.get(call_key)
+            if prior_decision is not None and not _approval_denial_completes_expiry(
+                prior_decision, record
+            ):
                 evidence_conflicts.add(call_key)
                 approval_decision_conflicts.add(call_key)
-            approval_states[call_key] = "denied"
             decision_records.setdefault(call_key, record)
         elif event.type == EventType.TOOL_CALL_APPROVAL_EXPIRED:
-            if call_key in decision_records and decision_records[call_key].event.type != event.type:
+            approval_scoped_keys.add(call_key)
+            if call_key in decision_records:
                 evidence_conflicts.add(call_key)
                 approval_decision_conflicts.add(call_key)
-            approval_states[call_key] = "expired"
             decision_records.setdefault(call_key, record)
+
+    for call_key, decision_record in decision_records.items():
+        resolution_key = approval_resolution_key(decision_record)
+        if resolution_key is None:
+            evidence_conflicts.add(call_key)
+            approval_decision_conflicts.add(call_key)
+            continue
+        request_calls = approval_request_calls.get(resolution_key)
+        if request_calls is None:
+            if resolution_key[:3] in approval_request_rounds:
+                evidence_conflicts.add(call_key)
+                approval_decision_conflicts.add(call_key)
+                continue
+            # A bounded --after-sequence window may intentionally exclude the
+            # request. Retain the decision's local state without inventing a
+            # call-level join to evidence that is not present.
+            retain_approval_decision_state(call_key, decision_record)
+            resolved_approval_keys.add(resolution_key)
+            continue
+        if call_key not in request_calls:
+            evidence_conflicts.add(call_key)
+            approval_decision_conflicts.add(call_key)
+            continue
+        if call_key in approval_gated_calls:
+            if (
+                decision_record.event.type == EventType.TOOL_CALL_APPROVAL_DENIED
+                and decision_record.event.payload.get("approval_required") is not True
+            ):
+                evidence_conflicts.add(call_key)
+                approval_decision_conflicts.add(call_key)
+                continue
+            retain_approval_decision_state(call_key, decision_record)
+            resolved_approval_keys.add(resolution_key)
+            continue
+
+        approval_call = approval_calls.get(call_key)
+        policy_decision = None if approval_call is None else approval_call.get("policy_decision")
+        if (
+            decision_record.event.type == EventType.TOOL_CALL_APPROVAL_DENIED
+            and policy_decision == ToolPolicyDecision.ALLOW.value
+            and decision_record.event.payload.get("approval_required") is False
+        ):
+            approval_outcomes[call_key] = (
+                "expired" if decision_record.event.payload.get("expired") is True else "denied"
+            )
+            continue
+        evidence_conflicts.add(call_key)
+        approval_decision_conflicts.add(call_key)
+
+    for call_key, names in tool_names.items():
+        if len(names) != 1:
+            evidence_conflicts.add(call_key)
+    for call_key, evidence in lifecycle_records.items():
+        if call_key not in approval_scoped_keys and not any(
+            "approval_id" in record.event.payload for record in evidence
+        ):
+            continue
+        approval_ids: set[str] = set()
+        invalid_approval_identity = False
+        for record in evidence:
+            raw_approval_id = record.event.payload.get("approval_id")
+            if (
+                type(raw_approval_id) is not str
+                or not raw_approval_id
+                or raw_approval_id.strip() != raw_approval_id
+            ):
+                invalid_approval_identity = True
+                continue
+            approval_ids.add(raw_approval_id)
+        if invalid_approval_identity or len(approval_ids) != 1:
+            evidence_conflicts.add(call_key)
+            approval_decision_conflicts.add(call_key)
 
     call_keys = (
         starts.keys()
@@ -875,6 +1047,27 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
             "unavailable"
             if call_key in approval_decision_conflicts
             else approval_states.get(call_key, "none")
+        )
+        approval_outcome = approval_outcomes.get(call_key)
+        approval_id = (
+            None if approval_request is None else approval_request.event.payload.get("approval_id")
+        )
+        approval_key = (
+            (
+                model_step_id,
+                model_attempt_id,
+                round_id,
+                approval_id,
+            )
+            if invalid_event_id is None
+            and type(model_step_id) is str
+            and type(model_attempt_id) is str
+            and type(round_id) is str
+            and type(approval_id) is str
+            else None
+        )
+        awaiting_approval = approval_request is not None and (
+            approval_key is None or approval_key not in resolved_approval_keys
         )
         round_key = (
             None
@@ -944,6 +1137,8 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
                         started,
                         terminal,
                         approval_state,
+                        approval_outcome=approval_outcome,
+                        awaiting_approval=awaiting_approval,
                         awaiting_input=input_request is not None,
                     )
                 ),
@@ -1005,6 +1200,8 @@ _ToolCallKey = tuple[str | None, str | None, str | None, str, str | None]
 def _tool_call_key(record: EventRecord, call_id: str) -> _ToolCallKey:
     """Return an exact round/call join key, isolating malformed evidence."""
 
+    if record.event.payload.get(_TOOL_INSPECTION_IDENTITY_CONFLICT_KEY) is True:
+        return None, None, None, call_id, record.event.id
     identity = _tool_event_identity(record)
     if identity is None:
         return None, None, None, call_id, record.event.id
@@ -1084,20 +1281,65 @@ def _tool_approval_payload(record: EventRecord | None) -> dict[str, Any] | None:
     return approval if type(approval) is dict else None
 
 
+def _tool_approval_identity_matches_event(record: EventRecord) -> bool:
+    """Validate the duplicated approval identity before bounded projection."""
+
+    approval = _tool_approval_payload(record)
+    if approval is None:
+        return False
+    identity_keys = (
+        "approval_id",
+        "tool_call_id",
+        "model_step_id",
+        "model_attempt_id",
+        "tool_round_id",
+    )
+    for key in identity_keys:
+        event_value = record.event.payload.get(key)
+        approval_value = approval.get(key)
+        if (
+            type(event_value) is not str
+            or type(approval_value) is not str
+            or event_value != approval_value
+        ):
+            return False
+    return True
+
+
+def _approval_denial_completes_expiry(
+    prior_decision: EventRecord,
+    denial: EventRecord,
+) -> bool:
+    """Recognize the runtime's expected expiry marker followed by denial."""
+
+    approval_id = prior_decision.event.payload.get("approval_id")
+    return (
+        prior_decision.event.type == EventType.TOOL_CALL_APPROVAL_EXPIRED
+        and denial.event.type == EventType.TOOL_CALL_APPROVAL_DENIED
+        and denial.event.payload.get("expired") is True
+        and type(approval_id) is str
+        and denial.event.payload.get("approval_id") == approval_id
+    )
+
+
 def _tool_status(
     started: EventRecord | None,
     terminal: EventRecord | None,
     approval_state: str,
     *,
+    approval_outcome: str | None,
+    awaiting_approval: bool,
     awaiting_input: bool,
 ) -> str:
     if terminal is None:
         if started is None and awaiting_input:
             return "awaiting_input"
-        if started is None and approval_state == "requested":
-            return "approval_pending"
+        if started is None and approval_outcome in {"denied", "expired"}:
+            return approval_outcome
         if started is None and approval_state in {"denied", "expired"}:
             return approval_state
+        if started is None and (awaiting_approval or approval_state == "requested"):
+            return "approval_pending"
         return "running"
     if terminal.event.type == EventType.TOOL_CALL_COMPLETED:
         return "success"
@@ -1447,6 +1689,7 @@ def _tool_inspection_record(record: EventRecord) -> EventRecord:
         "tool_round_id",
         "approval_id",
         "input_id",
+        "approval_required",
     ):
         if key in event.payload:
             payload[key] = event.payload[key]
@@ -1455,6 +1698,8 @@ def _tool_inspection_record(record: EventRecord) -> EventRecord:
     if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED:
         approval = _tool_approval_payload(record)
         if approval is not None:
+            if not _tool_approval_identity_matches_event(record):
+                payload[_TOOL_INSPECTION_IDENTITY_CONFLICT_KEY] = True
             compact_approval = {
                 key: approval[key]
                 for key in ("approval_id", "tool_call_id", "tool_name")
@@ -1495,6 +1740,11 @@ def _tool_inspection_record(record: EventRecord) -> EventRecord:
                 for item in nested_calls
                 if type(item) is dict
             ]
+    if (
+        event.type == EventType.TOOL_CALL_APPROVAL_DENIED
+        and type(event.payload.get("expired")) is bool
+    ):
+        payload["expired"] = event.payload["expired"]
     if event.type in _TOOL_TERMINAL_TYPES:
         result = event.payload.get("result")
         result = result if type(result) is dict else {}

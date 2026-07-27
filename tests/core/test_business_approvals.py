@@ -454,6 +454,53 @@ def test_audit_does_not_attach_resolution_from_another_execution_unit() -> None:
     assert records[0].resolved_at is None
 
 
+@pytest.mark.parametrize(
+    ("tool_call_id", "tool_name"),
+    [
+        ("unknown-call", "route_package"),
+        ("call_1", "different_tool"),
+    ],
+)
+def test_audit_fails_closed_on_conflicting_resolution_tool_descriptor(
+    tool_call_id: str,
+    tool_name: str,
+) -> None:
+    session_id = "sess_audit_conflicting_tool_descriptor"
+    app, store, _tool, approval_event = _paused_app(_tiered_policy(), session_id)
+    _resolve(app, session_id, approval_event)
+    events = asyncio.run(store.load_events(session_id))
+    resolution = next(event for event in events if event.type == EventType.TOOL_CALL_APPROVED)
+    conflicting_resolution = resolution.model_copy(
+        update={
+            "tool_name": tool_name,
+            "payload": {
+                **resolution.payload,
+                "tool_call_id": tool_call_id,
+            },
+        },
+        deep=True,
+    )
+
+    records = business_approval_audit([approval_event, conflicting_resolution])
+
+    assert records == []
+
+
+def test_audit_fails_closed_on_conflicting_duplicate_request_descriptor() -> None:
+    session_id = "sess_audit_conflicting_request"
+    _app, _store, _tool, approval_event = _paused_app(_tiered_policy(), session_id)
+    conflicting_request = approval_event.model_copy(
+        update={
+            "id": "conflicting-request",
+            "tool_name": "different_tool",
+        },
+        deep=True,
+    )
+
+    assert business_approval_audit([approval_event, conflicting_request]) == []
+    assert business_approval_audit([conflicting_request, approval_event]) == []
+
+
 def test_audit_fails_closed_on_conflicting_resolutions_for_one_execution_unit() -> None:
     session_id = "sess_audit_conflicting_resolution"
     app, store, _tool, approval_event = _paused_app(_tiered_policy(), session_id)
