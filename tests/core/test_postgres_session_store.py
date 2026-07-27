@@ -179,6 +179,7 @@ def test_postgres_session_store_queries_checkpoint_backed_pending_actions(postgr
                         "approval": {
                             "approval_id": f"unrelated_approval_{index}",
                             **_tool_round_identity_payload(),
+                            "tool_call_id": f"unrelated_call_{index}",
                             "tool_name": "unrelated",
                         },
                     },
@@ -370,6 +371,7 @@ def test_postgres_session_store_queries_checkpoint_backed_pending_actions(postgr
                     "approval": {
                         "approval_id": long_approval_id,
                         **_tool_round_identity_payload(),
+                        "tool_call_id": "long_identifier_call",
                         "tool_name": "deploy",
                         "arguments": {},
                         "agent_name": "assistant",

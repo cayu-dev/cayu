@@ -289,6 +289,7 @@ def test_sqlite_pending_action_query_uses_persisted_projection_not_original_payl
                     "approval": {
                         "approval_id": "persisted_pending_projection_approval",
                         **_tool_round_identity_payload(),
+                        "tool_call_id": "persisted_pending_projection_call",
                         "tool_name": "deploy",
                         "arguments": {},
                         "agent_name": "assistant",

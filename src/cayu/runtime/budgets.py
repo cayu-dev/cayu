@@ -25,6 +25,7 @@ from pydantic import (
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     canonical_durable_json_bytes,
+    require_execution_unit_id,
 )
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
@@ -78,6 +79,12 @@ _BUDGET_INSPECTION_EVENT_TYPES = frozenset(
         EventType.BUDGET_RECONCILED,
         EventType.BUDGET_RESERVATION_FAILED,
         EventType.BUDGET_RESERVATION_RELEASED,
+    }
+)
+_MODEL_ATTEMPT_TERMINAL_EVENT_TYPES = frozenset(
+    {
+        EventType.MODEL_COMPLETED,
+        EventType.MODEL_ERROR,
     }
 )
 _BUDGET_RECONCILIATION_PRICING_KEYS = frozenset(
@@ -135,9 +142,39 @@ class SessionBudgetInspection(BaseModel):
     currency: str | None = None
 
 
-def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
-    """Project durable budget events into one honest session cost state."""
+def session_budget_inspection(
+    events: list[Event],
+    *,
+    model_attempt_terminal_events: Iterable[Event] | None = None,
+) -> SessionBudgetInspection:
+    """Project durable budget events into one honest session cost state.
+
+    When bounded model terminal evidence is supplied, every reconciled
+    reservation must join to a completion or error carrying the same exact
+    model-step and model-attempt identity. Standalone callers that only have a
+    budget-event projection may omit that evidence and retain the budget-local
+    validation contract.
+    """
     budget_events = [event for event in events if event.type in _BUDGET_INSPECTION_EVENT_TYPES]
+    terminal_step_ids_by_attempt_id: dict[str, list[str]] = {}
+    invalid_terminal_attempt_ids: set[str] = set()
+    if model_attempt_terminal_events is not None:
+        for event in model_attempt_terminal_events:
+            if event.type not in _MODEL_ATTEMPT_TERMINAL_EVENT_TYPES:
+                continue
+            model_attempt_id = _inspection_execution_unit_id(
+                event.payload.get("model_attempt_id"),
+                "model_attempt_id",
+            )
+            if model_attempt_id is None:
+                continue
+            identity = _inspection_model_attempt_identity(event.payload)
+            if identity is None:
+                invalid_terminal_attempt_ids.add(model_attempt_id)
+                continue
+            terminal_step_ids_by_attempt_id.setdefault(model_attempt_id, []).append(
+                identity.model_step_id
+            )
     checks = [
         event
         for event in budget_events
@@ -344,6 +381,19 @@ def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
     complete_priced_coverage = (
         complete_terminal_coverage and priced_reservation_ids == reconciled_reservation_ids
     )
+    invalid_model_attempt_terminal_join = False
+    if model_attempt_terminal_events is not None:
+        reconciled_attempt_identities = {
+            attempt_identities_by_reservation[reservation_id]
+            for reservation_id in reconciled_reservation_ids
+            if reservation_id in attempt_identities_by_reservation
+        }
+        invalid_model_attempt_terminal_join = any(
+            identity.model_attempt_id in invalid_terminal_attempt_ids
+            or terminal_step_ids_by_attempt_id.get(identity.model_attempt_id)
+            != [identity.model_step_id]
+            for identity in reconciled_attempt_identities
+        )
 
     check_cost_state: Literal["unknown", "unpriced", "partial", "mixed_currency", "priced"]
     check_cost_state, check_amount, check_currency = (
@@ -358,6 +408,7 @@ def session_budget_inspection(events: list[Event]) -> SessionBudgetInspection:
         or invalid_reservation_evidence
         or invalid_failure_identity
         or contradictory_failure_outcome
+        or invalid_model_attempt_terminal_join
         or (
             reservations
             and (not complete_terminal_coverage or contradictory_attempt_terminal_outcome)
@@ -657,6 +708,13 @@ def _inspection_model_attempt_identity(
         return None
 
 
+def _inspection_execution_unit_id(value: Any, field_name: str) -> str | None:
+    try:
+        return require_execution_unit_id(value, field_name)
+    except (TypeError, ValueError):
+        return None
+
+
 def _inspection_budget_limit_descriptor(
     payload: Mapping[str, Any],
 ) -> tuple[str, str | None, str, Decimal, str, str] | None:
@@ -698,6 +756,19 @@ def _inspection_budget_limit_descriptor(
 def is_budget_inspection_event(event: Event) -> bool:
     """Whether an event contributes to the session budget inspection projection."""
     return event.type in _BUDGET_INSPECTION_EVENT_TYPES
+
+
+def project_budget_model_attempt_inspection_event(event: Event) -> Event:
+    """Retain only bounded model-attempt identity used by budget inspection."""
+
+    if event.type not in _MODEL_ATTEMPT_TERMINAL_EVENT_TYPES:
+        raise ValueError("Budget model-attempt inspection requires a model terminal event.")
+    payload: dict[str, str] = {}
+    for field_name in ("model_step_id", "model_attempt_id"):
+        value = _inspection_execution_unit_id(event.payload.get(field_name), field_name)
+        if value is not None:
+            payload[field_name] = value
+    return event.model_copy(update={"payload": payload})
 
 
 def project_budget_inspection_event(event: Event) -> Event:

@@ -7,6 +7,7 @@ from cayu.runtime.budgets import (
     BudgetCheck,
     budget_check_payload,
     project_budget_inspection_event,
+    project_budget_model_attempt_inspection_event,
     session_budget_inspection,
 )
 from cayu.runtime.costs import SessionCostSummary
@@ -607,6 +608,105 @@ def test_budget_inspection_rejects_cross_limit_settlement() -> None:
 
     assert inspection.cost_state == "partial"
     assert inspection.amount is None
+
+
+def test_budget_inspection_requires_exact_model_terminal_join() -> None:
+    identity = _model_attempt_identity(1)
+    budget_limit_id = _budget_limit_id(1)
+    budget_events = [
+        Event(
+            type=EventType.BUDGET_RESERVED,
+            session_id="sess_model_terminal_join",
+            payload={
+                "reservation_id": "reservation-model-terminal-join",
+                "budget_limit_id": budget_limit_id,
+                **identity,
+                "scope": "session",
+                "key": None,
+                "window": "all_time",
+                "currency": "USD",
+                "maximum": "1",
+                "action": "interrupt",
+            },
+        ),
+        Event(
+            type=EventType.BUDGET_RECONCILED,
+            session_id="sess_model_terminal_join",
+            payload={
+                "reservation_id": "reservation-model-terminal-join",
+                "budget_limit_id": budget_limit_id,
+                **identity,
+                "actual_amount": "0.25",
+                "pricing": _pricing_evidence(),
+            },
+        ),
+    ]
+
+    for event_type in (EventType.MODEL_COMPLETED, EventType.MODEL_ERROR):
+        matching_terminal = project_budget_model_attempt_inspection_event(
+            Event(
+                type=event_type,
+                session_id="sess_model_terminal_join",
+                payload=identity,
+            )
+        )
+        inspection = session_budget_inspection(
+            budget_events,
+            model_attempt_terminal_events=[matching_terminal],
+        )
+
+        assert inspection.cost_state == "priced"
+        assert inspection.amount == "0.25"
+        assert inspection.currency == "USD"
+
+    for terminal_payload in (
+        {
+            **identity,
+            "model_step_id": f"mstep_{2:032x}",
+        },
+        {
+            "model_step_id": "malformed",
+            "model_attempt_id": identity["model_attempt_id"],
+        },
+    ):
+        terminal = project_budget_model_attempt_inspection_event(
+            Event(
+                type=EventType.MODEL_COMPLETED,
+                session_id="sess_model_terminal_join",
+                payload=terminal_payload,
+            )
+        )
+        inspection = session_budget_inspection(
+            budget_events,
+            model_attempt_terminal_events=[terminal],
+        )
+
+        assert inspection.cost_state == "partial"
+        assert inspection.amount is None
+        assert inspection.currency is None
+
+    missing = session_budget_inspection(
+        budget_events,
+        model_attempt_terminal_events=[],
+    )
+    assert missing.cost_state == "partial"
+    assert missing.amount is None
+    assert missing.currency is None
+
+    matching_terminal = project_budget_model_attempt_inspection_event(
+        Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id="sess_model_terminal_join",
+            payload=identity,
+        )
+    )
+    duplicate = session_budget_inspection(
+        budget_events,
+        model_attempt_terminal_events=[matching_terminal, matching_terminal],
+    )
+    assert duplicate.cost_state == "partial"
+    assert duplicate.amount is None
+    assert duplicate.currency is None
 
 
 def test_budget_inspection_sums_distinct_attempts_without_amount_heuristics() -> None:

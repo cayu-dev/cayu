@@ -81,6 +81,7 @@ from cayu.runtime.budgets import (
     copy_request_budget_limits,
     is_budget_inspection_event,
     project_budget_inspection_event,
+    project_budget_model_attempt_inspection_event,
     session_budget_inspection,
 )
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
@@ -2888,6 +2889,7 @@ class SessionStore(ABC):
         event_largest_bytes = 0
         usage_accumulator = _SessionInspectionUsageAccumulator()
         budget_events: list[Event] = []
+        budget_model_attempt_terminal_events: list[Event] = []
         retained_event_bytes = 0
         queued_message_count = 0
         delivered_message_count = 0
@@ -2915,6 +2917,13 @@ class SessionStore(ABC):
                 event_total_bytes += payload_bytes
                 event_largest_bytes = max(event_largest_bytes, payload_bytes)
                 event = record.event
+                if event.type in {EventType.MODEL_COMPLETED, EventType.MODEL_ERROR}:
+                    model_attempt_event = project_budget_model_attempt_inspection_event(event)
+                    retained_event_bytes = _retain_session_inspection_event(
+                        retained_event_bytes,
+                        model_attempt_event,
+                    )
+                    budget_model_attempt_terminal_events.append(model_attempt_event)
                 if event.type in {EventType.MODEL_COMPLETED, EventType.TOOL_CALL_STARTED}:
                     usage_event, usage_metrics = project_aggregate_usage_inspection_event(event)
                     retained_event_bytes = _retain_session_inspection_event(
@@ -2966,7 +2975,10 @@ class SessionStore(ABC):
             PendingActionQuery(session_id=session_id, limit=200)
         )
         usage, model_calls_with_usage = usage_accumulator.result(session_id)
-        budget = session_budget_inspection(budget_events)
+        budget = session_budget_inspection(
+            budget_events,
+            model_attempt_terminal_events=budget_model_attempt_terminal_events,
+        )
         return SessionInspectionSummary(
             session=identity,
             transcript=SerializedRecordSummary(

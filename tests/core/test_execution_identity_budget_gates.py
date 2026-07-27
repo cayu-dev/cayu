@@ -13,7 +13,13 @@ import pytest
 import cayu.runtime.budgets as budgets_module
 from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
-from cayu.providers import ModelProvider, ModelProviderError, ModelRequest, ModelStreamEvent
+from cayu.providers import (
+    ModelContextOverflowError,
+    ModelProvider,
+    ModelProviderError,
+    ModelRequest,
+    ModelStreamEvent,
+)
 from cayu.runtime import (
     AlwaysRequireApprovalToolPolicy,
     BudgetLimit,
@@ -24,6 +30,7 @@ from cayu.runtime import (
     InMemorySessionStore,
     ModelPrice,
     PriceBook,
+    RecentTurnsContextPolicy,
     RetryPolicy,
     RunRequest,
     SessionStatus,
@@ -71,6 +78,25 @@ class _NoUsageProvider(ModelProvider):
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         del request
         self.calls += 1
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _OverflowThenNoUsageProvider(ModelProvider):
+    name = "identity-budget"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        del request
+        self.calls += 1
+        if self.calls == 1:
+            raise ModelContextOverflowError(
+                "context too large",
+                provider=self.name,
+                status_code=400,
+                error_code="context_length_exceeded",
+            )
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
@@ -441,6 +467,52 @@ def test_reservation_identity_matching_a_workload_secret_fails_before_dispatch(
         event.payload.get("reservation_id") in {reservation_id, REDACTED_SECRET}
         for event in [*events, *persisted]
     )
+
+
+def test_context_overflow_terminalizes_the_reserved_attempt_for_inspection() -> None:
+    provider = _OverflowThenNoUsageProvider()
+    app = CayuApp(
+        budget_policy=BudgetPolicy(limits=(_reservation_limit(),)),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="identity-model"),
+        context_overflow_policy=RecentTurnsContextPolicy(max_user_turns=1),
+    )
+
+    events = asyncio.run(
+        _collect_app_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_context_overflow_budget_identity",
+                messages=[
+                    Message.text("user", "old request"),
+                    Message.text("user", "new request"),
+                ],
+            ),
+        )
+    )
+    inspection = asyncio.run(
+        app.session_store.inspect_summary("sess_context_overflow_budget_identity")
+    )
+
+    reservations = [event for event in events if event.type == EventType.BUDGET_RESERVED]
+    reconciliations = [event for event in events if event.type == EventType.BUDGET_RECONCILED]
+    model_errors = [event for event in events if event.type == EventType.MODEL_ERROR]
+    completions = [event for event in events if event.type == EventType.MODEL_COMPLETED]
+
+    assert provider.calls == 2
+    assert len(reservations) == len(reconciliations) == 2
+    assert len(model_errors) == len(completions) == 1
+    assert _model_attempt_payload(reservations[0]) == _model_attempt_payload(model_errors[0])
+    assert _model_attempt_payload(reconciliations[0]) == _model_attempt_payload(model_errors[0])
+    assert _model_attempt_payload(reservations[1]) == _model_attempt_payload(completions[0])
+    assert _model_attempt_payload(reconciliations[1]) == _model_attempt_payload(completions[0])
+    assert inspection.budget.cost_state == "unpriced"
+    assert inspection.budget.amount is None
+    assert inspection.budget.currency is None
 
 
 def test_runtime_rejects_reservation_identity_rewritten_by_custom_ledger() -> None:

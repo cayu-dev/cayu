@@ -501,6 +501,27 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
     async def seed() -> None:
         store = SQLiteSessionStore(database)
         try:
+
+            async def append_model_terminal(
+                session_id: str,
+                attempt_identity: dict[str, str],
+            ) -> None:
+                await store.append_event(
+                    session_id,
+                    Event(
+                        type=EventType.MODEL_COMPLETED,
+                        session_id=session_id,
+                        payload={
+                            **attempt_identity,
+                            "usage_metrics": {
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 0,
+                            },
+                        },
+                    ),
+                )
+
             for session_id in (
                 "sess_partial_cost",
                 "sess_mixed_currency",
@@ -530,6 +551,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                     reservation_id = f"{session_id}-reservation-{index}"
                     budget_limit_id = _budget_limit_id(index)
                     attempt_identity = _model_attempt_identity(index)
+                    await append_model_terminal(session_id, attempt_identity)
                     await store.append_event(
                         session_id,
                         Event(
@@ -572,6 +594,8 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                 for index in (1, 2):
                     reservation_id = f"{session_id}-reservation-{index}"
                     attempt_identity = _model_attempt_identity(index)
+                    if index == 1:
+                        await append_model_terminal(session_id, attempt_identity)
                     await store.append_event(
                         session_id,
                         Event(
@@ -621,6 +645,10 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                         )
 
             parallel_attempt_identity = _model_attempt_identity(1)
+            await append_model_terminal(
+                "sess_parallel_limits",
+                parallel_attempt_identity,
+            )
             for index, scope in enumerate(("app", "agent"), start=1):
                 reservation_id = f"sess_parallel_limits-{scope}"
                 budget_limit_id = _budget_limit_id(index)
@@ -658,6 +686,11 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                     ),
                 )
 
+            unpriced_attempt_identity = _model_attempt_identity(1)
+            await append_model_terminal(
+                "sess_unpriced_cost",
+                unpriced_attempt_identity,
+            )
             await store.append_event(
                 "sess_unpriced_cost",
                 Event(
@@ -666,7 +699,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                     payload={
                         "reservation_id": "sess_unpriced_cost-reservation",
                         "budget_limit_id": _budget_limit_id(1),
-                        **_model_attempt_identity(1),
+                        **unpriced_attempt_identity,
                         "scope": "session",
                         "key": None,
                         "window": "all_time",
@@ -704,7 +737,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                     payload={
                         "reservation_id": "sess_unpriced_cost-reservation",
                         "budget_limit_id": _budget_limit_id(1),
-                        **_model_attempt_identity(1),
+                        **unpriced_attempt_identity,
                         "actual_amount": "0.25",
                     },
                 ),

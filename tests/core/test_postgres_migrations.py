@@ -490,6 +490,8 @@ def test_revision_seventeen_requires_pending_action_index_migration(
                         "tool_call_id": "revision_17_projected_approval_call",
                         "approval": {
                             "approval_id": "revision_17_projected_approval_id",
+                            **identity_payload,
+                            "tool_call_id": "revision_17_projected_approval_call",
                             "reason": "review",
                             "tool_name": "deploy",
                         },
@@ -524,6 +526,8 @@ def test_revision_seventeen_requires_pending_action_index_migration(
                         "tool_evidence_conflict": True,
                         "approval": {
                             "approval_id": "revision_17_projected_approval_id",
+                            **identity_payload,
+                            "tool_call_id": "revision_17_projected_approval_call",
                             "reason": "review",
                             "tool_name": "deploy",
                         },
@@ -583,6 +587,8 @@ def test_revision_seventeen_requires_pending_action_index_migration(
                         "tool_call_id": "revision_17_pending_approval_call",
                         "approval": {
                             "approval_id": "revision_17_pending_approval_id",
+                            **identity_payload,
+                            "tool_call_id": "revision_17_pending_approval_call",
                             "tool_name": "deploy",
                             "arguments": {},
                             "agent_name": "assistant",

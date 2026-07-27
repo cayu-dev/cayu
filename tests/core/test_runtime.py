@@ -32937,6 +32937,22 @@ def test_context_overflow_policy_rebuilds_context_and_retries_once():
         EventType.SESSION_COMPLETED,
     ]
     first_started = next(event for event in events if event.type == EventType.MODEL_STARTED)
+    model_error = next(event for event in events if event.type == EventType.MODEL_ERROR)
+    assert model_error.payload == {
+        "error": "context too large",
+        "error_type": "ModelContextOverflowError",
+        "stage": "provider_dispatch",
+        "context_overflow": True,
+        "provider": "overflow",
+        "status_code": 400,
+        "provider_error_code": "context_length_exceeded",
+        "retryable": False,
+        "step": 1,
+        "attempt": 1,
+        "max_attempts": 1,
+        "model_step_id": first_started.payload["model_step_id"],
+        "model_attempt_id": first_started.payload["model_attempt_id"],
+    }
     detected = next(event for event in events if event.type == EventType.CONTEXT_OVERFLOW_DETECTED)
     assert detected.payload == {
         "step": 1,
@@ -32993,9 +33009,10 @@ def test_context_overflow_recovery_from_error_stream_event():
 
     assert len(provider.requests) == 2
     assert len(provider.requests[1].messages) == 1
-    # The typed overflow is rehydrated before the generic MODEL_ERROR/retry
-    # path, so recovery runs exactly like the raised-exception contract.
-    assert EventType.MODEL_ERROR not in [event.type for event in events]
+    # The typed overflow is rehydrated before the generic retry path. It still
+    # receives one terminal model.error so durable budget evidence can join the
+    # dispatched attempt exactly.
+    assert [event.type for event in events].count(EventType.MODEL_ERROR) == 1
     assert [
         event.type
         for event in events
@@ -33012,6 +33029,17 @@ def test_context_overflow_recovery_from_error_stream_event():
         EventType.SESSION_COMPLETED,
     ]
     first_started = next(event for event in events if event.type == EventType.MODEL_STARTED)
+    model_error = next(event for event in events if event.type == EventType.MODEL_ERROR)
+    assert {
+        "model_step_id": model_error.payload["model_step_id"],
+        "model_attempt_id": model_error.payload["model_attempt_id"],
+    } == {
+        "model_step_id": first_started.payload["model_step_id"],
+        "model_attempt_id": first_started.payload["model_attempt_id"],
+    }
+    assert model_error.payload["stage"] == "provider_dispatch"
+    assert model_error.payload["context_overflow"] is True
+    assert model_error.payload["retryable"] is False
     detected = next(event for event in events if event.type == EventType.CONTEXT_OVERFLOW_DETECTED)
     assert detected.payload == {
         "step": 1,
@@ -33045,6 +33073,7 @@ def test_context_overflow_error_stream_event_without_policy_fails_typed():
     )
 
     assert len(provider.requests) == 1
+    assert [event.type for event in events].count(EventType.MODEL_ERROR) == 1
     failed = events[-1]
     assert failed.type == EventType.SESSION_FAILED
     assert failed.payload["error"] == "context too large"
@@ -33521,6 +33550,7 @@ def test_context_overflow_without_policy_fails_without_retry():
 
     assert len(provider.requests) == 1
     assert EventType.CONTEXT_OVERFLOW_DETECTED not in [event.type for event in events]
+    assert [event.type for event in events].count(EventType.MODEL_ERROR) == 1
     failed = events[-1]
     assert failed.type == EventType.SESSION_FAILED
     assert failed.payload["error"] == "context too large"
@@ -33551,6 +33581,12 @@ def test_context_overflow_policy_fails_cleanly_when_recovery_overflows():
     )
 
     assert len(provider.requests) == 2
+    model_errors = [event for event in events if event.type == EventType.MODEL_ERROR]
+    assert len(model_errors) == 2
+    assert model_errors[0].payload["model_step_id"] == model_errors[1].payload["model_step_id"]
+    assert (
+        model_errors[0].payload["model_attempt_id"] != model_errors[1].payload["model_attempt_id"]
+    )
     assert [
         event.type
         for event in events

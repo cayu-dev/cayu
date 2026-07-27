@@ -1461,6 +1461,22 @@ class ModelStepExecutor:
             if provider_events is not None and not provider_exhausted:
                 await _close_async_iterator(provider_events)
 
+        if type(provider_control_failure) is ModelContextOverflowError:
+            yield (
+                await self._event_writer.emit(
+                    _model_context_overflow_error_event(
+                        provider_control_failure,
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        step=step,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        model_attempt_identity=model_attempt_identity,
+                    )
+                ),
+                None,
+            )
         if provider_control_failure is not None:
             raise provider_control_failure from None
         if durable_stream_failure is not None:
@@ -4148,6 +4164,43 @@ def _context_overflow_event_payload(
     if recovery_message_count is not None:
         payload["recovery_message_count"] = recovery_message_count
     return payload
+
+
+def _model_context_overflow_error_event(
+    error: ModelContextOverflowError,
+    *,
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    environment_name: str | None,
+    step: int,
+    attempt: int,
+    max_attempts: int,
+    model_attempt_identity: ModelAttemptIdentity,
+) -> Event:
+    """Terminalize one dispatched context-overflow attempt without retrying it."""
+
+    if type(error) is not ModelContextOverflowError:
+        raise TypeError("Context-overflow terminalization requires a runtime-owned error.")
+    payload = {
+        "error": str(error),
+        "error_type": type(error).__name__,
+        "stage": "provider_dispatch",
+        "context_overflow": True,
+        **ModelProviderError.error_payload_fields(error),
+    }
+    return Event(
+        type=EventType.MODEL_ERROR,
+        session_id=session.id,
+        agent_name=registered_agent.spec.name,
+        environment_name=environment_name,
+        payload=_retry_attempt_payload(
+            payload,
+            step=step,
+            attempt=attempt,
+            max_attempts=max_attempts,
+            model_attempt_identity=model_attempt_identity,
+        ),
+    )
 
 
 class _FileAttachmentUnavailable(RuntimeError):
