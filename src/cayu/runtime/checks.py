@@ -26,13 +26,14 @@ BUILTIN_DIAGNOSTIC_CODES = (
 _WORKSPACE_TOOL_NAMES = frozenset(
     {
         "delete_file",
+        "edit_file",
         "list_files",
         "read_file",
         "search_text",
         "write_file",
     }
 )
-_RUNNER_TOOL_NAMES = frozenset({"exec_command"})
+_RUNNER_TOOL_NAMES = frozenset({"exec_command", "git_changes"})
 
 
 class DiagnosticSeverity(StrEnum):

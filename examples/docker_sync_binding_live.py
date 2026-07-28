@@ -46,6 +46,12 @@ class FakeProvider(ModelProvider):
                     arguments={
                         "path": "notes/input.txt",
                         "content": "updated in docker workspace",
+                        "mode": "overwrite",
+                        "expected_revision": (
+                            "sha256:"
+                            "8c682f8e987416983c7f37d9d8a090a78"
+                            "eb238028aeb3ed9f5ae579f3110391b"
+                        ),
                     },
                 ),
                 ModelStreamEvent.tool_call(
@@ -54,6 +60,7 @@ class FakeProvider(ModelProvider):
                     arguments={
                         "path": "notes/output.txt",
                         "content": "created in docker workspace",
+                        "mode": "create",
                     },
                 ),
                 ModelStreamEvent.tool_call(

@@ -5,6 +5,7 @@ import contextlib
 import os
 import signal
 import subprocess
+from collections.abc import Iterable
 from pathlib import Path
 
 from cayu.runners.base import ExecResult
@@ -26,6 +27,17 @@ _TASKKILL_ENV_KEYS = (
     "TMP",
     "USERPROFILE",
 )
+
+
+def remove_runner_env(environment: dict[str, str], keys: Iterable[str]) -> dict[str, str]:
+    """Return an environment without explicitly forbidden variables."""
+
+    removed: set[str] = set()
+    for key in keys:
+        if type(key) is not str or not key:
+            raise ValueError("Runner env_remove entries must be non-empty strings.")
+        removed.add(key)
+    return {key: value for key, value in environment.items() if key not in removed}
 
 
 class SubprocessCommand:

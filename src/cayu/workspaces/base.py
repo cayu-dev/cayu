@@ -7,6 +7,7 @@ from bisect import insort
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
+from typing import Literal
 
 from cayu._validation import require_clean_nonblank, require_nonblank
 from cayu.runners.base import Runner
@@ -17,6 +18,9 @@ class WorkspaceReadResult:
     content: bytes
     total_bytes: int
     truncated: bool = False
+    offset: int = 0
+    revision: str | None = None
+    sha256: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.content) is not bytes:
@@ -27,11 +31,111 @@ class WorkspaceReadResult:
             raise ValueError("WorkspaceReadResult total_bytes must be non-negative.")
         if type(self.truncated) is not bool:
             raise TypeError("WorkspaceReadResult truncated must be a bool.")
-        if self.total_bytes < len(self.content):
-            raise ValueError("WorkspaceReadResult total_bytes cannot be smaller than content.")
-        expected_truncated = len(self.content) < self.total_bytes
+        if type(self.offset) is not int:
+            raise TypeError("WorkspaceReadResult offset must be an integer.")
+        if self.offset < 0:
+            raise ValueError("WorkspaceReadResult offset must be non-negative.")
+        if self.offset > self.total_bytes:
+            raise ValueError("WorkspaceReadResult offset cannot exceed total_bytes.")
+        if self.total_bytes < self.offset + len(self.content):
+            raise ValueError(
+                "WorkspaceReadResult total_bytes cannot be smaller than content at its offset."
+            )
+        expected_truncated = self.offset + len(self.content) < self.total_bytes
         if self.truncated != expected_truncated:
             raise ValueError("WorkspaceReadResult truncated must match content and total_bytes.")
+        if self.revision is not None and (
+            type(self.revision) is not str or not self.revision.strip()
+        ):
+            raise ValueError("WorkspaceReadResult revision must be a nonblank string or None.")
+        if self.sha256 is not None and (
+            type(self.sha256) is not str
+            or len(self.sha256) != 64
+            or any(character not in "0123456789abcdef" for character in self.sha256)
+        ):
+            raise ValueError(
+                "WorkspaceReadResult sha256 must be a lowercase SHA-256 digest or None."
+            )
+        if (self.revision is not None or self.sha256 is not None) and (
+            self.offset != 0 or self.truncated
+        ):
+            raise ValueError(
+                "WorkspaceReadResult revision metadata requires a complete offset-zero snapshot."
+            )
+
+    @property
+    def next_offset(self) -> int | None:
+        return self.offset + len(self.content) if self.truncated and self.content else None
+
+
+WorkspaceMutationOperation = Literal["create", "replace", "delete"]
+
+
+@dataclass(frozen=True)
+class WorkspaceMutationResult:
+    operation: WorkspaceMutationOperation
+    before_revision: str | None
+    after_revision: str | None
+    before_sha256: str | None
+    after_sha256: str | None
+    before_bytes: int | None
+    after_bytes: int | None
+
+    def __post_init__(self) -> None:
+        if self.operation not in {"create", "replace", "delete"}:
+            raise ValueError("WorkspaceMutationResult operation is invalid.")
+        for field_name in ("before_revision", "after_revision"):
+            value = getattr(self, field_name)
+            if value is not None and (type(value) is not str or not value.strip()):
+                raise ValueError(f"WorkspaceMutationResult {field_name} must be nonblank or None.")
+        for field_name in ("before_sha256", "after_sha256"):
+            value = getattr(self, field_name)
+            if value is not None and (
+                type(value) is not str
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise ValueError(
+                    f"WorkspaceMutationResult {field_name} must be a lowercase SHA-256 digest or None."
+                )
+        for field_name in ("before_bytes", "after_bytes"):
+            value = getattr(self, field_name)
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError(
+                    f"WorkspaceMutationResult {field_name} must be non-negative or None."
+                )
+        if self.operation == "create" and any(
+            value is not None
+            for value in (self.before_revision, self.before_sha256, self.before_bytes)
+        ):
+            raise ValueError("WorkspaceMutationResult create cannot define before metadata.")
+        if self.operation == "delete" and any(
+            value is not None
+            for value in (self.after_revision, self.after_sha256, self.after_bytes)
+        ):
+            raise ValueError("WorkspaceMutationResult delete cannot define after metadata.")
+        before = (self.before_revision, self.before_sha256, self.before_bytes)
+        after = (self.after_revision, self.after_sha256, self.after_bytes)
+        if self.operation in {"replace", "delete"} and any(value is None for value in before):
+            raise ValueError(
+                f"WorkspaceMutationResult {self.operation} requires complete before metadata."
+            )
+        if self.operation in {"create", "replace"} and any(value is None for value in after):
+            raise ValueError(
+                f"WorkspaceMutationResult {self.operation} requires complete after metadata."
+            )
+
+
+class WorkspaceRevisionMismatchError(RuntimeError):
+    """A conditional workspace mutation observed a different current revision."""
+
+    def __init__(self, expected_revision: str, actual_revision: str) -> None:
+        self.expected_revision = expected_revision
+        self.actual_revision = actual_revision
+        super().__init__(
+            "Workspace file revision changed: "
+            f"expected {expected_revision}, found {actual_revision}."
+        )
 
 
 @dataclass(frozen=True)
@@ -202,9 +306,15 @@ class Workspace(ABC):
         self,
         path: str,
         *,
+        offset: int = 0,
         max_bytes: int | None = None,
     ) -> WorkspaceReadResult:
-        """Read a file from the workspace."""
+        """Read a byte page from the workspace.
+
+        Complete offset-zero snapshots expose an opaque revision suitable for a
+        later conditional mutation. Backends must not expose a revision for a
+        partial page.
+        """
 
     @abstractmethod
     def bounded_read_limit(self, max_bytes: int) -> int:
@@ -223,6 +333,29 @@ class Workspace(ABC):
     @abstractmethod
     async def delete(self, path: str) -> None:
         """Delete a file from the workspace if it exists."""
+
+    @abstractmethod
+    async def create_bytes(self, path: str, content: bytes) -> WorkspaceMutationResult:
+        """Create a missing file without overwriting an existing path."""
+
+    @abstractmethod
+    async def replace_bytes(
+        self,
+        path: str,
+        content: bytes,
+        *,
+        expected_revision: str,
+    ) -> WorkspaceMutationResult:
+        """Replace a file only when its current opaque revision matches."""
+
+    @abstractmethod
+    async def delete_if_revision(
+        self,
+        path: str,
+        *,
+        expected_revision: str,
+    ) -> WorkspaceMutationResult:
+        """Delete a file only when its current opaque revision matches."""
 
     @abstractmethod
     async def list(
@@ -266,6 +399,11 @@ class RunnerBoundWorkspace(Workspace):
     @abstractmethod
     def _control_plane_runner(self) -> Runner:
         """Return the private runner used by Cayu-owned workspace bindings."""
+
+    @property
+    @abstractmethod
+    def runner_cwd(self) -> str:
+        """Absolute runner path that this workspace exposes."""
 
     @property
     @abstractmethod
@@ -329,6 +467,20 @@ def _validate_workspace_positive_limit(value: int, field_name: str, *, owner: st
         raise TypeError(f"{owner} {field_name} must be an integer.")
     if value <= 0:
         raise ValueError(f"{owner} {field_name} must be greater than zero.")
+    return value
+
+
+def _validate_workspace_offset(value: int, *, owner: str) -> int:
+    if type(value) is not int:
+        raise TypeError(f"{owner} offset must be an integer.")
+    if value < 0:
+        raise ValueError(f"{owner} offset must be non-negative.")
+    return value
+
+
+def _validate_workspace_revision(value: str, *, owner: str) -> str:
+    if type(value) is not str or not value.strip():
+        raise ValueError(f"{owner} expected_revision must be a nonblank string.")
     return value
 
 

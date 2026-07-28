@@ -754,6 +754,7 @@ class MemoryWorkspace(Workspace):
         self,
         path: str,
         *,
+        offset: int = 0,
         max_bytes: int | None = None,
     ) -> WorkspaceReadResult:
         return WorkspaceReadResult(content=b"", total_bytes=0)
@@ -763,6 +764,15 @@ class MemoryWorkspace(Workspace):
 
     async def delete(self, path: str) -> None:
         return None
+
+    async def create_bytes(self, path: str, content: bytes):
+        raise NotImplementedError
+
+    async def replace_bytes(self, path: str, content: bytes, *, expected_revision: str):
+        raise NotImplementedError
+
+    async def delete_if_revision(self, path: str, *, expected_revision: str):
+        raise NotImplementedError
 
     async def list(
         self,

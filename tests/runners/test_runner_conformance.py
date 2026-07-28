@@ -1179,6 +1179,32 @@ def test_runner_conformance_reports_success_failure_cwd_env_stdin_and_output(
 
 
 @pytest.mark.parametrize("registration", REGISTRATIONS, ids=lambda item: item.name)
+def test_runner_conformance_removes_explicit_environment_authority(
+    registration: RunnerConformanceRegistration,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        harness = await registration.factory(tmp_path, monkeypatch)
+        try:
+            result = await harness.runner.exec(
+                ExecCommand.process(
+                    sys.executable,
+                    "-c",
+                    "import os; print(os.environ.get('REMOVE_ME', 'absent'))",
+                ),
+                env={"REMOVE_ME": "present"},
+                env_remove=("REMOVE_ME",),
+            )
+            assert result.exit_code == 0
+            assert result.stdout == "absent\n"
+        finally:
+            await harness.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("registration", REGISTRATIONS, ids=lambda item: item.name)
 def test_runner_conformance_bounds_output_and_retains_total_byte_counts(
     registration: RunnerConformanceRegistration,
     tmp_path: Path,

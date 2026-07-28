@@ -19,7 +19,14 @@ from cayu.runtime import (
 )
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.tools.commands import ExecCommandTool
-from cayu.tools.files import ListArtifactsTool, ListFilesTool, ReadFileTool, WriteFileTool
+from cayu.tools.files import (
+    DeleteFileTool,
+    EditFileTool,
+    ListArtifactsTool,
+    ListFilesTool,
+    ReadFileTool,
+    WriteFileTool,
+)
 from cayu.tools.knowledge import (
     ListKnowledgeTool,
     ReadKnowledgeTool,
@@ -157,9 +164,13 @@ def test_builtin_mutating_tools_are_not_parallel_safe() -> None:
     # The framework's own side-effecting built-ins must opt out of concurrent execution so the
     # default-on parallel engine never runs concurrent writes/commands/knowledge mutations.
     assert ExecCommandTool.spec.parallel_safe is False
+    assert EditFileTool.spec.parallel_safe is False
+    assert DeleteFileTool.spec.parallel_safe is False
     assert WriteFileTool.spec.parallel_safe is False
     assert RememberKnowledgeTool.spec.parallel_safe is False
     assert ExecCommandTool.spec.effect is ToolEffect.EXTERNAL
+    assert EditFileTool.spec.effect is ToolEffect.EXTERNAL
+    assert DeleteFileTool.spec.effect is ToolEffect.EXTERNAL
     assert WriteFileTool.spec.effect is ToolEffect.EXTERNAL
     assert RememberKnowledgeTool.spec.effect is ToolEffect.EXTERNAL
     assert ReadFileTool.spec.effect is ToolEffect.EXTERNAL

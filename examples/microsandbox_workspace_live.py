@@ -38,7 +38,11 @@ class FakeProvider(ModelProvider):
                 ModelStreamEvent.tool_call(
                     id="call_write",
                     name="write_file",
-                    arguments={"path": "notes/result.txt", "content": "sandbox workspace"},
+                    arguments={
+                        "path": "notes/result.txt",
+                        "content": "sandbox workspace",
+                        "mode": "create",
+                    },
                 ),
                 ModelStreamEvent.tool_call(
                     id="call_read",

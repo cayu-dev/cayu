@@ -10,17 +10,23 @@ from cayu.runners import (
     Runner,
 )
 from cayu.workspaces._guest_guard import (
+    guard_create,
     guard_delete,
+    guard_delete_if_revision,
     guard_read,
+    guard_replace,
     guard_write,
 )
 from cayu.workspaces.base import (
     RunnerBoundWorkspace,
     WorkspaceListResult,
+    WorkspaceMutationResult,
     WorkspaceReadResult,
     _validate_absolute_guest_root,
+    _validate_workspace_offset,
     _validate_workspace_positive_limit,
     _validate_workspace_relative_path,
+    _validate_workspace_revision,
     _WorkspaceListCollector,
     matches_list_pattern,
     validate_list_pattern,
@@ -82,6 +88,10 @@ class MicrosandboxWorkspace(RunnerBoundWorkspace):
         return self._runner
 
     @property
+    def runner_cwd(self) -> str:
+        return self.root
+
+    @property
     def bound_runner_resource_key(self) -> tuple[object, ...]:
         return self._capability.resource_key
 
@@ -95,18 +105,21 @@ class MicrosandboxWorkspace(RunnerBoundWorkspace):
         self,
         path: str,
         *,
+        offset: int = 0,
         max_bytes: int | None = None,
     ) -> WorkspaceReadResult:
         rel_path = self._contained_rel_path(path)
+        offset = _validate_workspace_offset(offset, owner="MicrosandboxWorkspace")
         limit = (
             self.default_read_limit_bytes
             if max_bytes is None
             else _validate_required_limit(max_bytes, "max_bytes")
         )
-        content, total_bytes = await guard_read(
+        content, total_bytes, revision, digest = await guard_read(
             self._runner,
             root=self.root,
             rel_path=rel_path,
+            offset=offset,
             limit=limit,
             original_path=path,
             backend="Microsandbox",
@@ -114,7 +127,10 @@ class MicrosandboxWorkspace(RunnerBoundWorkspace):
         return WorkspaceReadResult(
             content=content,
             total_bytes=max(total_bytes, len(content)),
-            truncated=total_bytes > len(content),
+            truncated=total_bytes > offset + len(content),
+            offset=offset,
+            revision=revision,
+            sha256=digest,
         )
 
     async def write_bytes(self, path: str, content: bytes) -> None:
@@ -136,6 +152,56 @@ class MicrosandboxWorkspace(RunnerBoundWorkspace):
             self._runner,
             root=self.root,
             rel_path=rel_path,
+            original_path=path,
+            backend="Microsandbox",
+        )
+
+    async def create_bytes(self, path: str, content: bytes) -> WorkspaceMutationResult:
+        if type(content) is not bytes:
+            raise TypeError("Workspace create content must be bytes.")
+        return await guard_create(
+            self._runner,
+            root=self.root,
+            rel_path=self._contained_rel_path(path),
+            content=content,
+            original_path=path,
+            backend="Microsandbox",
+        )
+
+    async def replace_bytes(
+        self,
+        path: str,
+        content: bytes,
+        *,
+        expected_revision: str,
+    ) -> WorkspaceMutationResult:
+        if type(content) is not bytes:
+            raise TypeError("Workspace replace content must be bytes.")
+        return await guard_replace(
+            self._runner,
+            root=self.root,
+            rel_path=self._contained_rel_path(path),
+            content=content,
+            expected_revision=_validate_workspace_revision(
+                expected_revision, owner="MicrosandboxWorkspace"
+            ),
+            original_path=path,
+            backend="Microsandbox",
+        )
+
+    async def delete_if_revision(
+        self,
+        path: str,
+        *,
+        expected_revision: str,
+    ) -> WorkspaceMutationResult:
+        return await guard_delete_if_revision(
+            self._runner,
+            root=self.root,
+            rel_path=self._contained_rel_path(path),
+            expected_revision=_validate_workspace_revision(
+                expected_revision, owner="MicrosandboxWorkspace"
+            ),
             original_path=path,
             backend="Microsandbox",
         )

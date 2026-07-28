@@ -24,6 +24,7 @@ from cayu.runners._cleanup import (
 )
 from cayu.runners._subprocess import (
     copy_runner_env,
+    remove_runner_env,
     validate_output_limit,
     validate_stdin,
     validate_timeout,
@@ -581,6 +582,7 @@ class MicrosandboxRunner(Runner):
         *,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
         timeout_s: int | None = None,
         stdin: str | None = None,
         output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
@@ -590,6 +592,7 @@ class MicrosandboxRunner(Runner):
                 command,
                 cwd=cwd,
                 env=env,
+                env_remove=env_remove,
                 timeout_s=timeout_s,
                 stdin=stdin,
                 output_limit_bytes=output_limit_bytes,
@@ -601,6 +604,7 @@ class MicrosandboxRunner(Runner):
         *,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
         timeout_s: int | None = None,
         stdin: str | None = None,
         output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
@@ -612,6 +616,7 @@ class MicrosandboxRunner(Runner):
 
         working_dir = self.resolve_cwd(cwd)
         environment = copy_runner_env(env, inherit_env=False)
+        environment = remove_runner_env(environment, env_remove)
         if self.env_overlay:
             environment.update(self.env_overlay)
         timeout = validate_timeout(timeout_s)

@@ -237,7 +237,11 @@ def _register_providers(app: CayuApp) -> None:
                     ModelStreamEvent.tool_call(
                         id="workspace-write-call",
                         name="write_file",
-                        arguments={"path": WORKSPACE_FILE, "content": WORKSPACE_CONTENT},
+                        arguments={
+                            "path": WORKSPACE_FILE,
+                            "content": WORKSPACE_CONTENT,
+                            "mode": "create",
+                        },
                     ),
                     ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
                 ],

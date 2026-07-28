@@ -2399,7 +2399,18 @@ deny path even when its scheme is missing or unrecognized; it cannot fall
 through to a credentialless destination. Header scheme selection is therefore
 part of the credential grant, not a caller-owned rewrite hint.
 
-A custom `Tool` uses those same services through `ctx`: `await ctx.runner.exec(ExecCommand.process(...))` runs a command in the environment's runner, while `ctx.workspace.write_bytes(path, data)` and `ctx.workspace.read_bytes(path)` (which returns a `WorkspaceReadResult` carrying `content` / `total_bytes`) write and read files. Guard against a missing service (`if ctx.runner is None: ...`), since not every environment configures one. See [`examples/custom_runner_tool.py`](../examples/custom_runner_tool.py) for a worked tool, and `src/cayu/tools/commands.py` (`ExecCommandTool`) for the framework's own reference.
+A custom `Tool` uses those same services through `ctx`: `await ctx.runner.exec(ExecCommand.process(...))` runs a command in the environment's runner, while `ctx.workspace.read_bytes(path, offset=..., max_bytes=...)` returns a `WorkspaceReadResult`. Complete offset-zero snapshots carry an opaque `revision` and diagnostic `sha256`. Use `create_bytes`, `replace_bytes(expected_revision=...)`, or `delete_if_revision(expected_revision=...)` for model-facing mutations; a separate read followed by unconditional `write_bytes` or `delete` is not a safe precondition. Guard against a missing service (`if ctx.runner is None: ...`), since not every environment configures one. See [`examples/custom_runner_tool.py`](../examples/custom_runner_tool.py) for a worked tool, and `src/cayu/tools/commands.py` (`ExecCommandTool`) for the framework's own reference.
+
+Conditional mutations compare the expected revision and mutate as one backend
+operation. Built-in backends serialize conforming Cayu clients by backend
+resource and a separator-, Unicode-, and case-normalized workspace-relative
+path identity, so filesystem aliases cannot bypass the lock. Replacement
+publishes complete content atomically. Revision hashing and byte counting are
+streamed; a stale precondition does not require retaining the complete prior
+file in memory. This cooperative lock is not a sandbox boundary: an
+arbitrary process that writes the same path outside the `Workspace` contract
+does not participate. Descriptor-relative containment, runner isolation, and
+filesystem permissions remain separate controls.
 
 `ExecCommandTool(policy=...)` resolves the model-requested working directory through the active runner **before** it calls `CommandPolicy.evaluate(...)`. `CommandRequest.cwd` remains the original requested value (`None`, relative, normalized-relative, or contained absolute) for audit messages and backward compatibility. `CommandRequest.canonical_cwd` is the runner-resolved directory; it is always populated by `ExecCommandTool` at policy-evaluation time, and policies must use it for workspace-containment decisions. When a policy allows the request, the tool passes that exact canonical string to `runner.exec(...)`, including the canonical default when the request omitted `cwd`. `DENY` and `REQUIRE_COMMAND_APPROVAL` both refuse inline and emit the canonical `tool.call.blocked` event with `denied_by=command_policy`; the latter does not create a durable approval checkpoint. Applications that need pause/resume approval use `ToolPolicyDecision.REQUIRE_APPROVAL`. A command refusal never reaches `runner.exec(...)`, and resolution failures (blank paths, relative traversal that escapes the root, absolute paths outside the runner root, or runner-specific failures such as a missing local directory) happen before policy evaluation or command execution.
 
@@ -2437,10 +2448,13 @@ required safety prefix, and repository-controlled-filter residual risk are in
 
 The first built-in tools are:
 
-- `read_file`: read text from the active workspace by `path`, capture workspace image/PDF files as artifact snapshots when an artifact store is configured, read text artifacts by `artifact_id`, or return provider-neutral image/PDF attachment references for capable providers
-- `write_file`: write UTF-8 text to the active workspace, capped by `max_bytes`
+- `read_file`: page through workspace text by byte `offset` without splitting UTF-8 scalars, returning continuation and complete-snapshot revision metadata; capture workspace image/PDF files as artifact snapshots when an artifact store is configured; read text artifacts by `artifact_id`; or return provider-neutral image/PDF attachment references for capable providers
+- `write_file`: create a missing UTF-8 file or conditionally overwrite an existing revision, capped by `max_bytes`
+- `edit_file`: apply one or more exact, non-overlapping replacements against one complete UTF-8 snapshot as a conditional mutation
+- `delete_file`: delete one existing file through an opaque revision precondition
 - `list_files`: list files in the active workspace, capped by `limit`
 - `search_text`: search file contents through the active runner in bounded `files`, `content`, or `count` mode
+- `git_changes`: inspect pageable status, filename-safe numstat summaries, or bounded unified diffs through the active runner; `diff_offset` continues a truncated single-file diff
 - `list_artifacts`: list session- or environment-scoped artifact metadata, capped by `limit`
 - `exec_command`: execute an explicit process argv or shell script with the active runner, capped by `timeout_s` and `max_output_bytes`
 - `subagent`: delegate a bounded task to a configured child Cayu agent; foreground mode returns the child result, while background mode returns the child session id after startup
@@ -2458,8 +2472,10 @@ Default built-in tool caps are intentionally large enough for normal coding work
 - `read_file` native file attachments: 8 MB by default, 8 MB maximum per call for the built-in tool instance. Applications may raise or lower that tool-facing cap with `ReadFileTool(default_attachment_limit_bytes=..., max_attachment_limit_bytes=...)`.
 - Runtime file attachment resolution: 8 MB maximum per attachment, 32 MB maximum total per provider request, and 20 attachments maximum per provider request by default. Applications may override those runtime caps with `CayuApp(max_file_attachment_bytes=..., max_total_file_attachment_bytes=..., max_file_attachments_per_request=...)`.
 - `write_file`: 256 KB by default, 4 MB maximum per call
+- `edit_file` and `delete_file`: 256 KB complete-file precondition by default, 4 MB maximum per call; edit diff previews are 32 KB by default and 200 KB maximum
 - `list_files`: 500 paths by default, 10,000 maximum per call
 - `search_text`: 100 entries by default, 500 maximum per call; 500 bytes of preview text per content match by default, 4 KB maximum per match; 20 KB of rendered model-facing text by default, 128 KB maximum per call; 1 MB of runner output captured by default, 4 MB maximum; files larger than 2 MB skipped by default, with a 64 MB maximum; 30 seconds by default, 120 seconds maximum
+- `git_changes`: 50 changes by default, 200 maximum per page; 32 KB model-facing output by default, 200 KB maximum; deterministic diff continuation up to a 4 MB byte offset; 1 MB status capture; 30-second command timeout
 - `list_artifacts`: 500 artifacts by default, 10,000 maximum per call
 - `exec_command`: 60 seconds by default, 600 seconds maximum per call; 50,000 bytes stdout and 50,000 bytes stderr by default, 200,000 bytes maximum per stream per call
 - `list_knowledge`: 10 entries or facets per group by default, 25 maximum per call/group; 240 bytes of preview text per entry by default, 4 KB maximum per entry, and 20 KB total preview text by default, 128 KB maximum per call
@@ -2469,21 +2485,23 @@ Default built-in tool caps are intentionally large enough for normal coding work
 
 ### Workspace search progression
 
-`ListFilesTool` and `SearchTextTool` answer different questions. `list_files`
+`ListFilesTool`, `SearchTextTool`, and `GitChangesTool` answer different questions. `list_files`
 applies a filename glob without reading file contents. `search_text` searches
 contents and defaults to filename-only results so an agent can narrow its scope
 before asking for previews. `read_file` then expands one selected file with an
-explicit byte limit. `exec_command` remains the general command capability and
-does not inherit `search_text`'s search-specific argument or output policy.
+explicit byte limit and returns a revision when the snapshot is complete.
+`git_changes` reviews the resulting repository delta without granting a general
+shell. `exec_command` remains the general command capability and does not
+inherit the narrower tools' argument or output policies.
 
 Register search explicitly; Cayu does not add it to every agent:
 
 ```python
-from cayu import ReadFileTool, SearchTextTool
+from cayu import GitChangesTool, ReadFileTool, SearchTextTool
 
 app.register_agent(
     agent_spec,
-    tools=[SearchTextTool(), ReadFileTool()],
+    tools=[SearchTextTool(), ReadFileTool(), GitChangesTool()],
 )
 ```
 
@@ -2493,6 +2511,8 @@ The intended sequence is:
 search_text(pattern="load_config", mode="files", glob="*.py")
 search_text(pattern="load_config", mode="content", path="src", limit=20)
 read_file(path="src/config.py", max_bytes=16000)
+git_changes(mode="summary")
+git_changes(mode="diff", paths=["src/config.py"])
 ```
 
 `SearchTextTool` invokes `rg` as a process argv in the active runner; the runner
@@ -2529,6 +2549,8 @@ so operational failures cannot bypass the same durable-result ceiling.
 
 See [`examples/search_text_tool.py`](../examples/search_text_tool.py) for a
 deterministic local example of this progression.
+See [`examples/coding_workspace_tools.py`](../examples/coding_workspace_tools.py)
+for a complete read-revision, conditional edit, and Git-review loop.
 
 ## Workflow
 
@@ -2547,6 +2569,13 @@ Runner commands use `ExecCommand`:
 
 The framework should not pass a single ambiguous command string to runners. Use process mode unless shell parsing, expansion, and quoting are intentional.
 Runner output capture is bounded by `output_limit_bytes` and returns `stdout_truncated` / `stderr_truncated` flags when output is capped. Direct runner calls default to 1 MiB per stream; the model-facing `exec_command` tool passes its smaller 50,000-byte default into the runner. This limit belongs in the runner, not only in tool post-processing, so commands cannot exhaust runtime memory before the model-facing result is built. Runners continue draining both streams after the capture bound is reached so a child cannot block on a full pipe. `ExecResult.stdout_bytes` and `stderr_bytes` report the total bytes observed before truncation when the adapter can know that value; `None` means the total is unavailable, not zero. The captured strings may therefore be smaller than their total byte counts.
+
+`Runner.exec(..., env_remove=(...))` lets a trusted Cayu caller remove named
+variables after ordinary/injected environment construction. Built-in runners
+apply removals before enforced backend overlays, so a read-only tool can clear
+ambient process-selection authority without weakening mandatory egress or
+sandbox configuration. Custom runners must accept the keyword and apply the
+same ordering.
 
 ### Execution admission
 
@@ -3164,6 +3193,19 @@ truncated result may report the exact total or `None`; callers must use
 retained and returned paths, not traversal work: an adapter may need to inspect
 the complete provider listing to select the deterministic smallest prefix.
 The built-in `read_file(path=...)` treats byte-level binary evidence as stronger than filename/MIME hints, so binary bytes are not decoded into model context just because a path has a text-like extension. Text-looking source files remain readable even when platform MIME tables classify an extension incorrectly.
+Text paging retains byte-offset semantics while returning only complete UTF-8
+scalars. Callers should continue with the returned `next_offset`; an arbitrary
+offset inside a multibyte scalar is rejected deterministically.
+
+`GitChangesTool` resolves the exact directory exposed by the active workspace,
+prevents upward repository discovery, clears inherited Git repository-selection
+variables, and verifies that Git's reported work-tree root equals that
+directory before inspection. It disables repository-configured fsmonitor,
+filter, pager, external-diff, and textconv execution paths. Status and numstat
+use NUL-delimited machine output so tabs, newlines, and renames are unambiguous;
+summary metadata distinguishes text, binary, unknown, and untracked counts.
+Diff pages independently reject binary/control content even when repository
+attributes force Git to label binary bytes as text.
 
 `MicrosandboxWorkspace` exposes a Microsandbox filesystem root through the same
 workspace contract:
@@ -3206,9 +3248,11 @@ conventional `0666` mode filtered by the guest process's umask. Absence/create
 races retry a bounded number of times. Once the guard opens a regular,
 single-link inode without following a symlink, that inode is authoritative for
 the traversal even if it replaced an earlier regular target. Content
-replacement is not atomic: an I/O failure, cancellation, or
-guest-process termination after truncation can leave partial content, matching
-ordinary direct-write behavior. A link or relocation after the descriptor is
+replacement through the compatibility `write_bytes` path is not atomic: an I/O
+failure, cancellation, or guest-process termination after truncation can leave
+partial content, matching ordinary direct-write behavior. Conditional
+`replace_bytes` writes a same-directory temporary file and atomically publishes
+it only after the revision precondition matches. A link or relocation after the descriptor is
 opened does not revoke that descriptor capability. Deletion only unlinks the
 workspace name. Tar imports validate archive members,
 their complete content streams, and existing destination constraints before the
@@ -3231,14 +3275,16 @@ were not omitted.
 
 Workspace result objects enforce consistent metadata:
 
-- `WorkspaceReadResult`: `truncated` must equal `len(content) < total_bytes`
+- `WorkspaceReadResult`: `truncated` must equal `offset + len(content) < total_bytes`; revision and SHA-256 metadata require a complete offset-zero snapshot
+- `WorkspaceMutationResult`: create has only after metadata, delete has only before metadata, and replace has both
 - `WorkspaceListResult` complete list: `truncated=false` and `total_count == len(paths)`
 - `WorkspaceListResult` truncated list: `truncated=true` and `total_count is None or total_count >= len(paths)`
 
 The deterministic conformance registry in
 `tests/workspaces/test_workspace_conformance.py` exercises every exported
 built-in adapter through the public `Workspace` interface. It covers portable
-round trips, raw path and symlink escape rejection, bounded reads, immutable
+round trips, raw path and symlink escape rejection, bounded and pageable reads,
+stale/concurrent conditional mutations, immutable
 result shapes, glob semantics, deterministic listing limits, resource identity, and
 declared adapter extensions. Registrations also declare whether they provide
 descriptor-relative containment against symlink replacement by a hostile

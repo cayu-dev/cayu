@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import sys
 import threading
+import tracemalloc
 from collections.abc import AsyncIterator
 from importlib import import_module
 
@@ -74,6 +76,8 @@ from cayu.tools.files import (
     MAX_READ_LIMIT_BYTES,
     MAX_WRITE_LIMIT_BYTES,
     ArtifactReadRequest,
+    DeleteFileTool,
+    EditFileTool,
     ListArtifactsTool,
     ListFilesTool,
     ReadFileTool,
@@ -446,7 +450,7 @@ def test_workspace_tools_read_write_and_list_files(tmp_path):
     ctx = ToolContext(session_id="sess_1", workspace=workspace)
 
     write_result = asyncio.run(
-        WriteFileTool().run(ctx, {"path": "notes/result.txt", "content": "hello"})
+        WriteFileTool().run(ctx, {"path": "notes/result.txt", "content": "hello", "mode": "create"})
     )
     read_result = asyncio.run(ReadFileTool().run(ctx, {"path": "notes/result.txt"}))
     list_result = asyncio.run(ListFilesTool().run(ctx, {"pattern": "**/*.txt"}))
@@ -456,6 +460,9 @@ def test_workspace_tools_read_write_and_list_files(tmp_path):
         "path": "notes/result.txt",
         "bytes": 5,
         "encoding": "utf-8",
+        "mode": "create",
+        "revision": f"sha256:{hashlib.sha256(b'hello').hexdigest()}",
+        "sha256": hashlib.sha256(b"hello").hexdigest(),
     }
     assert read_result.content == "hello"
     assert read_result.structured == {
@@ -463,6 +470,10 @@ def test_workspace_tools_read_write_and_list_files(tmp_path):
         "path": "notes/result.txt",
         "bytes": 5,
         "total_bytes": 5,
+        "offset": 0,
+        "next_offset": None,
+        "revision": f"sha256:{hashlib.sha256(b'hello').hexdigest()}",
+        "sha256": hashlib.sha256(b"hello").hexdigest(),
         "encoding": "utf-8",
         "truncated": False,
     }
@@ -473,6 +484,351 @@ def test_workspace_tools_read_write_and_list_files(tmp_path):
         "total_files": 1,
         "truncated": False,
     }
+
+
+def test_edit_file_applies_multiple_exact_replacements_atomically(tmp_path):
+    path = tmp_path / "notes.txt"
+    original = b"alpha = 1\nbeta = 2\ngamma = 3\n"
+    path.write_bytes(original)
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=LocalWorkspace(tmp_path, workspace_id="local"),
+    )
+
+    result = asyncio.run(
+        EditFileTool().run(
+            ctx,
+            {
+                "path": "notes.txt",
+                "expected_revision": f"sha256:{hashlib.sha256(original).hexdigest()}",
+                "edits": [
+                    {
+                        "old_text": "alpha = 1",
+                        "new_text": "alpha = 10",
+                    },
+                    {
+                        "old_text": "gamma = 3",
+                        "new_text": "gamma = 30",
+                    },
+                ],
+            },
+        )
+    )
+
+    updated = b"alpha = 10\nbeta = 2\ngamma = 30\n"
+    assert result.is_error is False
+    assert path.read_bytes() == updated
+    assert result.structured["path"] == "notes.txt"
+    assert result.structured["edit_count"] == 2
+    assert result.structured["replacement_count"] == 2
+    assert result.structured["before_sha256"] == hashlib.sha256(original).hexdigest()
+    assert result.structured["after_sha256"] == hashlib.sha256(updated).hexdigest()
+    assert result.structured["before_bytes"] == len(original)
+    assert result.structured["after_bytes"] == len(updated)
+    assert result.structured["diff_truncated"] is False
+    assert "-alpha = 1" in result.structured["diff"]
+    assert "+gamma = 30" in result.structured["diff"]
+
+
+def test_edit_file_rolls_back_all_replacements_when_one_precondition_fails(tmp_path):
+    path = tmp_path / "notes.txt"
+    original = b"alpha = 1\nbeta = 2\n"
+    path.write_bytes(original)
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=LocalWorkspace(tmp_path, workspace_id="local"),
+    )
+
+    result = asyncio.run(
+        EditFileTool().run(
+            ctx,
+            {
+                "path": "notes.txt",
+                "expected_revision": f"sha256:{hashlib.sha256(original).hexdigest()}",
+                "edits": [
+                    {
+                        "old_text": "alpha = 1",
+                        "new_text": "alpha = 10",
+                    },
+                    {
+                        "old_text": "missing = 3",
+                        "new_text": "missing = 30",
+                    },
+                ],
+            },
+        )
+    )
+
+    assert result.is_error is True
+    assert result.structured == {
+        "path": "notes.txt",
+        "edit_index": 1,
+        "expected_replacements": 1,
+        "actual_replacements": 0,
+    }
+    assert path.read_bytes() == original
+
+
+def test_edit_file_rejects_overlapping_original_snapshot_matches(tmp_path):
+    path = tmp_path / "notes.txt"
+    original = b"abcdef\n"
+    path.write_bytes(original)
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=LocalWorkspace(tmp_path, workspace_id="local"),
+    )
+
+    result = asyncio.run(
+        EditFileTool().run(
+            ctx,
+            {
+                "path": "notes.txt",
+                "expected_revision": f"sha256:{hashlib.sha256(original).hexdigest()}",
+                "edits": [
+                    {"old_text": "abc", "new_text": "ABC"},
+                    {"old_text": "bc", "new_text": "BC"},
+                ],
+            },
+        )
+    )
+
+    assert result.is_error is True
+    assert result.structured["reason"] == "overlapping_edits"
+    assert path.read_bytes() == original
+
+
+def test_edit_file_refuses_concurrent_change_at_conditional_mutation(tmp_path):
+    class RacingWorkspace(LocalWorkspace):
+        async def replace_bytes(self, path, content, *, expected_revision):
+            await self.write_bytes(path, b"concurrent\n")
+            return await super().replace_bytes(
+                path,
+                content,
+                expected_revision=expected_revision,
+            )
+
+    path = tmp_path / "notes.txt"
+    original = b"before\n"
+    path.write_bytes(original)
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=RacingWorkspace(tmp_path, workspace_id="local"),
+    )
+
+    result = asyncio.run(
+        EditFileTool().run(
+            ctx,
+            {
+                "path": "notes.txt",
+                "expected_revision": f"sha256:{hashlib.sha256(original).hexdigest()}",
+                "edits": [{"old_text": "before", "new_text": "after"}],
+            },
+        )
+    )
+
+    assert result.is_error is True
+    assert result.structured["reason"] == "stale_content"
+    assert path.read_bytes() == b"concurrent\n"
+
+
+def test_edit_file_rejects_amplified_result_before_constructing_it(tmp_path):
+    path = tmp_path / "notes.txt"
+    original = ("x" * 1000).encode()
+    path.write_bytes(original)
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=LocalWorkspace(tmp_path, workspace_id="local"),
+    )
+
+    tracemalloc.start()
+    result = asyncio.run(
+        EditFileTool().run(
+            ctx,
+            {
+                "path": "notes.txt",
+                "expected_revision": f"sha256:{hashlib.sha256(original).hexdigest()}",
+                "edits": [
+                    {
+                        "old_text": "x",
+                        "new_text": "y" * 50_000,
+                        "expected_replacements": 1000,
+                    }
+                ],
+                "max_bytes": MAX_WRITE_LIMIT_BYTES,
+            },
+        )
+    )
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert result.is_error is True
+    assert result.structured["reason"] == "result_too_large"
+    assert result.structured["after_bytes"] == 50_000_000
+    assert peak < 10 * 1024 * 1024
+    assert path.read_bytes() == original
+
+
+def test_delete_file_requires_the_current_content_digest(tmp_path):
+    path = tmp_path / "obsolete.txt"
+    content = b"remove me\n"
+    path.write_bytes(content)
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=LocalWorkspace(tmp_path, workspace_id="local"),
+    )
+
+    stale = asyncio.run(
+        DeleteFileTool().run(
+            ctx,
+            {
+                "path": "obsolete.txt",
+                "expected_revision": f"sha256:{'0' * 64}",
+            },
+        )
+    )
+    deleted = asyncio.run(
+        DeleteFileTool().run(
+            ctx,
+            {
+                "path": "obsolete.txt",
+                "expected_revision": f"sha256:{hashlib.sha256(content).hexdigest()}",
+            },
+        )
+    )
+
+    assert stale.is_error is True
+    assert stale.structured["actual_revision"] == (f"sha256:{hashlib.sha256(content).hexdigest()}")
+    assert deleted.is_error is False
+    assert deleted.structured == {
+        "path": "obsolete.txt",
+        "deleted_bytes": len(content),
+        "deleted_sha256": hashlib.sha256(content).hexdigest(),
+        "deleted_revision": f"sha256:{hashlib.sha256(content).hexdigest()}",
+    }
+    assert not path.exists()
+
+
+def test_write_file_create_and_overwrite_are_conditional(tmp_path):
+    path = tmp_path / "notes.txt"
+    path.write_text("before")
+    workspace = LocalWorkspace(tmp_path, workspace_id="local")
+    ctx = ToolContext(session_id="sess_1", workspace=workspace)
+
+    duplicate = asyncio.run(
+        WriteFileTool().run(
+            ctx,
+            {"path": "notes.txt", "content": "duplicate", "mode": "create"},
+        )
+    )
+    revision = asyncio.run(workspace.read_bytes("notes.txt")).revision
+    overwritten = asyncio.run(
+        WriteFileTool().run(
+            ctx,
+            {
+                "path": "notes.txt",
+                "content": "after",
+                "mode": "overwrite",
+                "expected_revision": revision,
+            },
+        )
+    )
+
+    assert duplicate.is_error is True
+    assert duplicate.structured["reason"] == "already_exists"
+    assert overwritten.is_error is False
+    assert overwritten.structured["mode"] == "overwrite"
+    assert path.read_text() == "after"
+
+
+def test_write_file_overwrite_refuses_missing_and_invalid_revision(tmp_path):
+    workspace = LocalWorkspace(tmp_path, workspace_id="local")
+    ctx = ToolContext(session_id="sess_1", workspace=workspace)
+
+    missing = asyncio.run(
+        WriteFileTool().run(
+            ctx,
+            {
+                "path": "missing.txt",
+                "content": "after",
+                "mode": "overwrite",
+                "expected_revision": f"sha256:{'0' * 64}",
+            },
+        )
+    )
+    invalid = asyncio.run(
+        WriteFileTool().run(
+            ctx,
+            {
+                "path": "missing.txt",
+                "content": "after",
+                "mode": "overwrite",
+                "expected_revision": "bad\0revision",
+            },
+        )
+    )
+
+    assert missing.is_error is True
+    assert missing.structured["reason"] == "not_found"
+    assert invalid.is_error is True
+    assert invalid.structured == {"error": "invalid_arguments"}
+
+
+def test_read_file_pages_text_and_only_complete_snapshot_has_revision(tmp_path):
+    (tmp_path / "notes.txt").write_text("abcdef")
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=LocalWorkspace(tmp_path, workspace_id="local"),
+    )
+
+    first = asyncio.run(ReadFileTool().run(ctx, {"path": "notes.txt", "max_bytes": 2}))
+    suffix = asyncio.run(
+        ReadFileTool().run(
+            ctx,
+            {"path": "notes.txt", "offset": first.structured["next_offset"], "max_bytes": 10},
+        )
+    )
+
+    assert first.content.startswith("ab")
+    assert first.structured["offset"] == 0
+    assert first.structured["next_offset"] == 2
+    assert first.structured["revision"] is None
+    assert suffix.content == "cdef"
+    assert suffix.structured["offset"] == 2
+    assert suffix.structured["next_offset"] is None
+    assert suffix.structured["revision"] is None
+
+
+def test_read_file_pages_utf8_only_at_complete_scalar_boundaries(tmp_path):
+    (tmp_path / "notes.txt").write_text("A€B")
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=LocalWorkspace(tmp_path, workspace_id="local"),
+    )
+
+    first = asyncio.run(ReadFileTool().run(ctx, {"path": "notes.txt", "max_bytes": 2}))
+    second = asyncio.run(
+        ReadFileTool().run(
+            ctx,
+            {"path": "notes.txt", "offset": first.structured["next_offset"], "max_bytes": 3},
+        )
+    )
+    third = asyncio.run(
+        ReadFileTool().run(
+            ctx,
+            {"path": "notes.txt", "offset": second.structured["next_offset"], "max_bytes": 2},
+        )
+    )
+    split_start = asyncio.run(
+        ReadFileTool().run(ctx, {"path": "notes.txt", "offset": 2, "max_bytes": 3})
+    )
+
+    assert first.content.startswith("A")
+    assert first.structured["next_offset"] == 1
+    assert second.content.startswith("€")
+    assert second.structured["next_offset"] == 4
+    assert third.content == "B"
+    assert split_start.is_error is True
+    assert split_start.structured == {"error": "invalid_arguments"}
 
 
 def test_read_file_snapshots_workspace_pdf_as_artifact_attachment(tmp_path):
@@ -664,10 +1020,16 @@ def test_read_file_returns_tool_error_when_workspace_attachment_changes_during_s
             super().__init__(root, workspace_id="local")
             self.read_count = 0
 
-        async def read_bytes(self, path: str, *, max_bytes: int | None = None):
+        async def read_bytes(
+            self,
+            path: str,
+            *,
+            offset: int = 0,
+            max_bytes: int | None = None,
+        ):
             self.read_count += 1
             if self.read_count == 1:
-                return await super().read_bytes(path, max_bytes=max_bytes)
+                return await super().read_bytes(path, offset=offset, max_bytes=max_bytes)
             return WorkspaceReadResult(
                 content=b"now text",
                 total_bytes=8,
@@ -1454,8 +1816,12 @@ def test_builtin_tools_truncate_model_facing_large_outputs(tmp_path):
     file_ctx = ToolContext(session_id="sess_1", workspace=workspace)
     run_ctx = ToolContext(session_id="sess_1", runner=LocalRunner(tmp_path))
 
-    asyncio.run(WriteFileTool().run(file_ctx, {"path": "large.txt", "content": "abcdef"}))
-    asyncio.run(WriteFileTool().run(file_ctx, {"path": "other.txt", "content": ""}))
+    asyncio.run(
+        WriteFileTool().run(file_ctx, {"path": "large.txt", "content": "abcdef", "mode": "create"})
+    )
+    asyncio.run(
+        WriteFileTool().run(file_ctx, {"path": "other.txt", "content": "", "mode": "create"})
+    )
     read_result = asyncio.run(ReadFileTool().run(file_ctx, {"path": "large.txt", "max_bytes": 3}))
     list_result = asyncio.run(ListFilesTool().run(file_ctx, {"pattern": "*.txt", "limit": 1}))
     command_result = asyncio.run(
@@ -1489,6 +1855,7 @@ def test_write_file_tool_refuses_oversized_content(tmp_path):
             {
                 "path": "large.txt",
                 "content": "abcdef",
+                "mode": "create",
                 "max_bytes": 3,
             },
         )
@@ -1887,7 +2254,7 @@ def test_exec_command_tool_does_not_classify_runner_value_error_as_invalid_argum
 
 
 class _FailingWriteWorkspace(LocalWorkspace):
-    async def write_bytes(self, path: str, content: bytes) -> None:
+    async def create_bytes(self, path: str, content: bytes):
         del path, content
         raise ValueError("workspace backend changed")
 
@@ -1899,7 +2266,7 @@ def test_write_file_tool_does_not_classify_workspace_value_error_as_invalid_argu
         asyncio.run(
             WriteFileTool().run(
                 ToolContext(session_id="sess_1", workspace=workspace),
-                {"path": "notes.txt", "content": "hello"},
+                {"path": "notes.txt", "content": "hello", "mode": "create"},
             )
         )
 

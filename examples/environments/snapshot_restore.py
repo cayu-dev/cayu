@@ -150,7 +150,11 @@ class FakeProvider(ModelProvider):
                 ModelStreamEvent.tool_call(
                     id="a1",
                     name="write_file",
-                    arguments={"path": "data/answer.txt", "content": "42"},
+                    arguments={
+                        "path": "data/answer.txt",
+                        "content": "42",
+                        "mode": "create",
+                    },
                 ),
                 ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
             ],

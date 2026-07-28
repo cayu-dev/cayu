@@ -211,6 +211,7 @@ class Runner(ABC):
         *,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
         timeout_s: int | None = None,
         stdin: str | None = None,
         output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
@@ -223,19 +224,22 @@ class Runner(ABC):
         *,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
         timeout_s: int | None = None,
         stdin: str | None = None,
         output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ) -> ExecResult:
         """Execute a control-plane lifecycle command on the declared system lane."""
-        return await self.exec(
-            command,
-            cwd=cwd,
-            env=env,
-            timeout_s=timeout_s,
-            stdin=stdin,
-            output_limit_bytes=output_limit_bytes,
-        )
+        kwargs: dict[str, Any] = {
+            "cwd": cwd,
+            "env": env,
+            "timeout_s": timeout_s,
+            "stdin": stdin,
+            "output_limit_bytes": output_limit_bytes,
+        }
+        if env_remove:
+            kwargs["env_remove"] = env_remove
+        return await self.exec(command, **kwargs)
 
     async def close(self) -> None:
         """Release the runner. The default implementation only marks it closed."""

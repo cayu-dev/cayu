@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,7 +13,7 @@ from examples._workspace_conformance import (
     verify_portable_workspace_round_trip,
 )
 
-from cayu.workspaces import Workspace
+from cayu.workspaces import Workspace, WorkspaceRevisionMismatchError
 
 CapabilityState = Literal["supported", "not_applicable"]
 ResourceIdentityState = Literal["stable", "indeterminate"]
@@ -141,6 +143,100 @@ async def verify_bounded_reads_and_result_isolation(workspace: Workspace) -> Non
     assert "later.txt" not in listing.paths
     await workspace.delete("bounded.bin")
     await workspace.delete("later.txt")
+
+
+async def verify_paging_and_conditional_mutations(workspace: Workspace) -> None:
+    original = b"abcdef"
+    await workspace.write_bytes("conditional.txt", original)
+
+    first = await workspace.read_bytes("conditional.txt", offset=0, max_bytes=2)
+    assert first.content == b"ab"
+    assert first.offset == 0
+    assert first.total_bytes == len(original)
+    assert first.truncated is True
+    assert first.next_offset == 2
+    assert first.revision is None
+    assert first.sha256 is None
+
+    suffix = await workspace.read_bytes("conditional.txt", offset=2, max_bytes=10)
+    assert suffix.content == b"cdef"
+    assert suffix.offset == 2
+    assert suffix.total_bytes == len(original)
+    assert suffix.truncated is False
+    assert suffix.next_offset is None
+    assert suffix.revision is None
+    assert suffix.sha256 is None
+
+    full = await workspace.read_bytes("conditional.txt", max_bytes=10)
+    digest = hashlib.sha256(original).hexdigest()
+    assert full.sha256 == digest
+    assert full.revision == f"sha256:{digest}"
+
+    await workspace.write_bytes("conditional.txt", b"newer")
+    with pytest.raises(WorkspaceRevisionMismatchError):
+        await workspace.replace_bytes(
+            "conditional.txt",
+            b"stale-write",
+            expected_revision=full.revision,
+        )
+    assert (await workspace.read_bytes("conditional.txt")).content == b"newer"
+
+    current = await workspace.read_bytes("conditional.txt")
+    replaced = await workspace.replace_bytes(
+        "conditional.txt",
+        b"replacement",
+        expected_revision=current.revision,
+    )
+    assert replaced.operation == "replace"
+    assert replaced.before_revision == current.revision
+    assert replaced.after_revision is not None
+    assert replaced.before_bytes == len(b"newer")
+    assert replaced.after_bytes == len(b"replacement")
+
+    with pytest.raises(FileExistsError):
+        await workspace.create_bytes("conditional.txt", b"must-not-overwrite")
+    assert (await workspace.read_bytes("conditional.txt")).content == b"replacement"
+
+    created = await workspace.create_bytes("created.txt", b"created")
+    assert created.operation == "create"
+    assert created.before_revision is None
+    assert created.after_revision is not None
+
+    stale_delete = await workspace.read_bytes("created.txt")
+    await workspace.write_bytes("created.txt", b"changed")
+    with pytest.raises(WorkspaceRevisionMismatchError):
+        await workspace.delete_if_revision(
+            "created.txt",
+            expected_revision=stale_delete.revision,
+        )
+    current_delete = await workspace.read_bytes("created.txt")
+    deleted = await workspace.delete_if_revision(
+        "created.txt",
+        expected_revision=current_delete.revision,
+    )
+    assert deleted.operation == "delete"
+    assert deleted.before_revision == current_delete.revision
+    assert deleted.after_revision is None
+    with pytest.raises(FileNotFoundError):
+        await workspace.read_bytes("created.txt")
+
+    await workspace.write_bytes("race.txt", b"base")
+    race_revision = (await workspace.read_bytes("race.txt")).revision
+
+    async def contender(content: bytes) -> str:
+        try:
+            await workspace.replace_bytes(
+                "race.txt",
+                content,
+                expected_revision=race_revision,
+            )
+        except WorkspaceRevisionMismatchError:
+            return "stale"
+        return "replaced"
+
+    outcomes = await asyncio.gather(contender(b"first"), contender(b"second"))
+    assert sorted(outcomes) == ["replaced", "stale"]
+    assert (await workspace.read_bytes("race.txt")).content in {b"first", b"second"}
 
 
 async def verify_listing_contract(workspace: Workspace) -> None:

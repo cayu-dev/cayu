@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import hashlib
 import io
 import mimetypes
@@ -9,6 +10,7 @@ import posixpath
 from collections.abc import Iterable
 from dataclasses import dataclass
 from importlib import import_module
+from itertools import pairwise
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Protocol
 
@@ -32,7 +34,12 @@ from cayu.tools._errors import (
     structured_invalid_arguments,
     tool_argument_validation,
 )
-from cayu.workspaces import Workspace, WorkspaceReadResult, validate_list_pattern
+from cayu.workspaces import (
+    Workspace,
+    WorkspaceReadResult,
+    WorkspaceRevisionMismatchError,
+    validate_list_pattern,
+)
 
 DEFAULT_READ_LIMIT_BYTES = 256 * 1024
 MAX_READ_LIMIT_BYTES = 4 * 1024 * 1024
@@ -43,6 +50,10 @@ MAX_PDF_SOURCE_BYTES = 32 * 1024 * 1024
 MAX_PDF_PAGES_PER_READ = 10
 DEFAULT_WRITE_LIMIT_BYTES = 256 * 1024
 MAX_WRITE_LIMIT_BYTES = 4 * 1024 * 1024
+DEFAULT_EDIT_DIFF_LIMIT_BYTES = 32 * 1024
+MAX_EDIT_DIFF_LIMIT_BYTES = 200 * 1024
+MAX_EDIT_OPERATIONS = 100
+MAX_FILE_REVISION_CHARS = 4096
 DEFAULT_LIST_LIMIT = 500
 MAX_LIST_LIMIT = 10_000
 
@@ -99,6 +110,13 @@ class ReadFileOptions:
 
 
 @dataclass(frozen=True)
+class _TextEdit:
+    old_text: str
+    new_text: str
+    expected_replacements: int
+
+
+@dataclass(frozen=True)
 class ArtifactReadRequest:
     ctx: ToolContext
     artifact_store: ArtifactStore
@@ -152,6 +170,12 @@ def _read_file_tool_spec(
                     "minimum": 1,
                     "maximum": MAX_READ_LIMIT_BYTES,
                     "default": DEFAULT_READ_LIMIT_BYTES,
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0,
+                    "description": "Byte offset for pageable workspace text reads.",
                 },
                 "max_attachment_bytes": {
                     "type": "integer",
@@ -238,6 +262,7 @@ class ReadFileTool(Tool):
                 default=DEFAULT_READ_LIMIT_BYTES,
                 maximum=MAX_READ_LIMIT_BYTES,
             )
+            offset = _optional_nonnegative_int(args, "offset", default=0)
             max_attachment_bytes = _optional_int(
                 args,
                 "max_attachment_bytes",
@@ -253,10 +278,15 @@ class ReadFileTool(Tool):
                 path=path,
                 artifact_readers=self.artifact_readers,
                 max_bytes=max_bytes,
+                offset=offset,
                 max_attachment_bytes=max_attachment_bytes,
                 pages=pages,
             )
         if artifact_id is not None:
+            if offset != 0:
+                return invalid_tool_arguments_result(
+                    ValueError("Tool argument `offset` is only valid for workspace text files.")
+                )
             return await _read_artifact(
                 ctx,
                 artifact_id=artifact_id,
@@ -274,15 +304,20 @@ async def _read_workspace_file(
     path: str,
     artifact_readers: list[ArtifactReader],
     max_bytes: int,
+    offset: int,
     max_attachment_bytes: int,
     pages: str | None,
 ) -> ToolResult:
     workspace = _require_workspace(ctx)
     if workspace is None:
         return _missing_workspace_result()
-    result = await workspace.read_bytes(path, max_bytes=max_bytes)
     content_type = _guess_workspace_content_type(path)
     if _is_workspace_file_attachment_content_type(content_type):
+        result = await workspace.read_bytes(path, offset=offset, max_bytes=max_bytes)
+        if offset != 0:
+            return invalid_tool_arguments_result(
+                ValueError("Tool argument `offset` is only valid for workspace text files.")
+            )
         return await _read_workspace_file_attachment(
             ctx,
             path=path,
@@ -293,31 +328,108 @@ async def _read_workspace_file(
             pages=pages,
             initial_result=result,
         )
-    if _is_binary_workspace_file(content_type=content_type, content=result.content):
+    fetch_offset = max(0, offset - 3)
+    prefix_bytes = offset - fetch_offset
+    result = await workspace.read_bytes(
+        path,
+        offset=fetch_offset,
+        max_bytes=prefix_bytes + max_bytes + 4,
+    )
+    page_or_error = _utf8_workspace_page(
+        result,
+        path=path,
+        content_type=content_type,
+        requested_offset=offset,
+        max_bytes=max_bytes,
+    )
+    if isinstance(page_or_error, ToolResult):
+        return page_or_error
+    page, next_offset = page_or_error
+    if _is_binary_workspace_file(content_type=content_type, content=page):
+        if offset != 0:
+            return invalid_tool_arguments_result(
+                ValueError("Tool argument `offset` is only valid for workspace text files.")
+            )
         return _binary_workspace_file_result(
             path=path,
             content_type=content_type,
-            bytes_read=len(result.content),
+            bytes_read=len(page),
             total_bytes=result.total_bytes,
-            truncated=result.truncated,
+            truncated=next_offset is not None,
             inspectable=False,
         )
     if pages is not None:
         return invalid_tool_arguments_result(
             ValueError("Tool argument `pages` is only valid for PDF files.")
         )
-    text = result.content.decode("utf-8", errors="replace")
+    text = page.decode("utf-8")
+    truncated = next_offset is not None
+    complete = offset == 0 and not truncated
     return ToolResult(
-        content=f"{text}\n\n[file truncated]" if result.truncated else text,
+        content=f"{text}\n\n[file truncated]" if truncated else text,
         structured={
             "source": "workspace",
             "path": path,
-            "bytes": len(result.content),
+            "bytes": len(page),
             "total_bytes": result.total_bytes,
+            "offset": offset,
+            "next_offset": next_offset,
+            "revision": result.revision if complete else None,
+            "sha256": result.sha256 if complete else None,
             "encoding": "utf-8",
-            "truncated": result.truncated,
+            "truncated": truncated,
         },
     )
+
+
+def _utf8_workspace_page(
+    result: WorkspaceReadResult,
+    *,
+    path: str,
+    content_type: str,
+    requested_offset: int,
+    max_bytes: int,
+) -> tuple[bytes, int | None] | ToolResult:
+    start = requested_offset - result.offset
+    available = result.content[start:]
+    if available and available[0] & 0xC0 == 0x80:
+        return invalid_tool_arguments_result(
+            ValueError(
+                "Tool argument `offset` splits a UTF-8 character; use the previous "
+                "`next_offset` value."
+            )
+        )
+    page = available[:max_bytes]
+    while page:
+        try:
+            page.decode("utf-8")
+            break
+        except UnicodeDecodeError as exc:
+            if exc.reason != "unexpected end of data":
+                return _binary_workspace_file_result(
+                    path=path,
+                    content_type=content_type,
+                    bytes_read=len(page),
+                    total_bytes=result.total_bytes,
+                    truncated=True,
+                    inspectable=False,
+                )
+            page = page[: exc.start]
+    if not page and requested_offset < result.total_bytes:
+        return ToolResult(
+            content=(
+                "Text page is too small to contain the next complete UTF-8 character; "
+                "retry with max_bytes of at least 4."
+            ),
+            structured={
+                "error": "text_page_too_small",
+                "offset": requested_offset,
+                "minimum_max_bytes": 4,
+            },
+            is_error=True,
+        )
+    end = requested_offset + len(page)
+    return page, end if end < result.total_bytes else None
 
 
 def _guess_workspace_content_type(path: str) -> str:
@@ -995,18 +1107,284 @@ def _validate_artifact_readers(
     return copied
 
 
-class WriteFileTool(Tool):
+class EditFileTool(Tool):
+    """Apply exact text replacements to one existing workspace file."""
+
     spec = ToolSpec(
-        name="write_file",
-        # Mutates the workspace; never overlaps other tools in a round.
+        name="edit_file",
         parallel_safe=False,
         effect=ToolEffect.EXTERNAL,
-        description="Write UTF-8 text to a file in the active workspace.",
+        description=(
+            "Atomically edit an existing UTF-8 workspace file using one or more exact "
+            "text replacements. Requires the opaque revision returned by read_file and "
+            "refuses stale content, ambiguous matches, partial edits, and oversized files."
+        ),
         input_schema={
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
-                "content": {"type": "string"},
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative path of the existing UTF-8 file.",
+                },
+                "expected_revision": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_FILE_REVISION_CHARS,
+                    "description": "Opaque revision from a complete read_file result.",
+                },
+                "edits": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_EDIT_OPERATIONS,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_text": {
+                                "type": "string",
+                                "minLength": 1,
+                            },
+                            "new_text": {"type": "string"},
+                            "expected_replacements": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 1000,
+                                "default": 1,
+                            },
+                        },
+                        "required": ["old_text", "new_text"],
+                        "additionalProperties": False,
+                    },
+                },
+                "max_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_WRITE_LIMIT_BYTES,
+                    "default": DEFAULT_WRITE_LIMIT_BYTES,
+                },
+                "max_diff_bytes": {
+                    "type": "integer",
+                    "minimum": 256,
+                    "maximum": MAX_EDIT_DIFF_LIMIT_BYTES,
+                    "default": DEFAULT_EDIT_DIFF_LIMIT_BYTES,
+                },
+            },
+            "required": ["path", "expected_revision", "edits"],
+            "additionalProperties": False,
+        },
+    )
+
+    @structured_invalid_arguments
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        workspace = _require_workspace(ctx)
+        if workspace is None:
+            return _missing_workspace_result()
+        with tool_argument_validation():
+            path = _validate_workspace_path_argument(_require_arg_string(args, "path"))
+            expected_revision = _require_revision(args, "expected_revision")
+            edits = _validate_text_edits(args.get("edits"))
+            max_bytes = _optional_int(
+                args,
+                "max_bytes",
+                default=DEFAULT_WRITE_LIMIT_BYTES,
+                maximum=MAX_WRITE_LIMIT_BYTES,
+            )
+            max_diff_bytes = _optional_int(
+                args,
+                "max_diff_bytes",
+                default=DEFAULT_EDIT_DIFF_LIMIT_BYTES,
+                maximum=MAX_EDIT_DIFF_LIMIT_BYTES,
+            )
+            if max_diff_bytes < 256:
+                raise ValueError("Tool argument `max_diff_bytes` must be at least 256.")
+
+        try:
+            read = await workspace.read_bytes(path, max_bytes=max_bytes)
+        except FileNotFoundError:
+            return ToolResult(
+                content=f"Edit refused: workspace file not found: {path}.",
+                structured={"path": path, "reason": "not_found"},
+                is_error=True,
+            )
+        if read.truncated:
+            return ToolResult(
+                content=(
+                    f"Edit refused: {path} is {read.total_bytes} bytes and exceeds "
+                    f"max_bytes={max_bytes}."
+                ),
+                structured={
+                    "path": path,
+                    "total_bytes": read.total_bytes,
+                    "max_bytes": max_bytes,
+                    "reason": "file_truncated",
+                },
+                is_error=True,
+            )
+        before_sha256 = _content_hash(read.content)
+        if read.revision != expected_revision:
+            return ToolResult(
+                content=(
+                    f"Edit refused: {path} changed since it was read; expected revision "
+                    f"{expected_revision}, found {read.revision}."
+                ),
+                structured={
+                    "path": path,
+                    "expected_revision": expected_revision,
+                    "actual_revision": read.revision,
+                    "reason": "stale_content",
+                },
+                is_error=True,
+            )
+        try:
+            original = read.content.decode("utf-8")
+        except UnicodeDecodeError:
+            return ToolResult(
+                content=f"Edit refused: {path} is not valid UTF-8 text.",
+                structured={"path": path, "encoding": "utf-8", "reason": "invalid_encoding"},
+                is_error=True,
+            )
+
+        replacements: list[tuple[int, int, str, int]] = []
+        replacement_count = 0
+        for index, edit in enumerate(edits):
+            starts = _exact_match_offsets(original, edit.old_text)
+            actual_replacements = len(starts)
+            if actual_replacements != edit.expected_replacements:
+                return ToolResult(
+                    content=(
+                        f"Edit refused: edit {index} expected "
+                        f"{edit.expected_replacements} exact occurrence(s), "
+                        f"found {actual_replacements}. No changes were written."
+                    ),
+                    structured={
+                        "path": path,
+                        "edit_index": index,
+                        "expected_replacements": edit.expected_replacements,
+                        "actual_replacements": actual_replacements,
+                    },
+                    is_error=True,
+                )
+            replacements.extend(
+                (start, start + len(edit.old_text), edit.new_text, index) for start in starts
+            )
+            replacement_count += actual_replacements
+        replacements.sort()
+        for previous, current in pairwise(replacements):
+            if current[0] < previous[1]:
+                return ToolResult(
+                    content=(
+                        f"Edit refused: edits {previous[3]} and {current[3]} overlap in "
+                        f"{path}. No changes were written."
+                    ),
+                    structured={
+                        "path": path,
+                        "first_edit_index": previous[3],
+                        "second_edit_index": current[3],
+                        "reason": "overlapping_edits",
+                    },
+                    is_error=True,
+                )
+        edit_byte_deltas = [
+            _utf8_text_size(edit.new_text) - _utf8_text_size(edit.old_text) for edit in edits
+        ]
+        projected_bytes = len(read.content) + sum(
+            edit_byte_deltas[edit_index] for _start, _end, _replacement, edit_index in replacements
+        )
+        if projected_bytes > max_bytes:
+            return ToolResult(
+                content=(
+                    f"Edit refused: result is {projected_bytes} bytes, "
+                    f"which exceeds max_bytes={max_bytes}."
+                ),
+                structured={
+                    "path": path,
+                    "after_bytes": projected_bytes,
+                    "max_bytes": max_bytes,
+                    "reason": "result_too_large",
+                },
+                is_error=True,
+            )
+        updated_parts: list[str] = []
+        cursor = 0
+        for start, end, replacement, _ in replacements:
+            updated_parts.extend((original[cursor:start], replacement))
+            cursor = end
+        updated_parts.append(original[cursor:])
+        updated = "".join(updated_parts)
+
+        encoded = updated.encode("utf-8")
+        if len(encoded) != projected_bytes:
+            raise AssertionError("Edit result byte-size projection drifted.")
+        diff = "".join(
+            difflib.unified_diff(
+                original.splitlines(keepends=True),
+                updated.splitlines(keepends=True),
+                fromfile=f"a/{path}",
+                tofile=f"b/{path}",
+            )
+        )
+        diff_preview, diff_truncated = _truncate_utf8_text(
+            diff,
+            max_diff_bytes,
+            marker="\n[edit diff truncated]",
+        )
+        try:
+            mutation = await workspace.replace_bytes(
+                path,
+                encoded,
+                expected_revision=expected_revision,
+            )
+        except WorkspaceRevisionMismatchError as exc:
+            return _stale_mutation_result("Edit", path, exc)
+        except FileNotFoundError:
+            return _missing_mutation_target_result("Edit", path)
+        after_sha256 = mutation.after_sha256
+        summary = (
+            f"Edited {path}: {len(edits)} edit(s), {replacement_count} replacement(s), "
+            f"{len(read.content)} -> {len(encoded)} bytes."
+        )
+        return ToolResult(
+            content=f"{summary}\n\n{diff_preview}" if diff_preview else summary,
+            structured={
+                "path": path,
+                "edit_count": len(edits),
+                "replacement_count": replacement_count,
+                "before_sha256": before_sha256,
+                "after_sha256": after_sha256,
+                "before_revision": mutation.before_revision,
+                "after_revision": mutation.after_revision,
+                "before_bytes": len(read.content),
+                "after_bytes": len(encoded),
+                "diff": diff_preview,
+                "diff_truncated": diff_truncated,
+                "max_diff_bytes": max_diff_bytes,
+            },
+        )
+
+
+class DeleteFileTool(Tool):
+    """Delete one workspace file only when its content precondition matches."""
+
+    spec = ToolSpec(
+        name="delete_file",
+        parallel_safe=False,
+        effect=ToolEffect.EXTERNAL,
+        description=(
+            "Delete one workspace-relative file after verifying the opaque revision "
+            "returned by read_file. Refuses missing, stale, directory, and oversized paths."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative path of the file to delete.",
+                },
+                "expected_revision": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_FILE_REVISION_CHARS,
+                    "description": "Opaque revision from a complete read_file result.",
+                },
                 "max_bytes": {
                     "type": "integer",
                     "minimum": 1,
@@ -1014,7 +1392,117 @@ class WriteFileTool(Tool):
                     "default": DEFAULT_WRITE_LIMIT_BYTES,
                 },
             },
-            "required": ["path", "content"],
+            "required": ["path", "expected_revision"],
+            "additionalProperties": False,
+        },
+    )
+
+    @structured_invalid_arguments
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        workspace = _require_workspace(ctx)
+        if workspace is None:
+            return _missing_workspace_result()
+        with tool_argument_validation():
+            path = _validate_workspace_path_argument(_require_arg_string(args, "path"))
+            expected_revision = _require_revision(args, "expected_revision")
+            max_bytes = _optional_int(
+                args,
+                "max_bytes",
+                default=DEFAULT_WRITE_LIMIT_BYTES,
+                maximum=MAX_WRITE_LIMIT_BYTES,
+            )
+        try:
+            read = await workspace.read_bytes(path, max_bytes=max_bytes)
+        except FileNotFoundError:
+            return ToolResult(
+                content=f"Delete refused: workspace file not found: {path}.",
+                structured={"path": path, "reason": "not_found"},
+                is_error=True,
+            )
+        if read.truncated:
+            return ToolResult(
+                content=(
+                    f"Delete refused: {path} is {read.total_bytes} bytes and exceeds "
+                    f"max_bytes={max_bytes}."
+                ),
+                structured={
+                    "path": path,
+                    "total_bytes": read.total_bytes,
+                    "max_bytes": max_bytes,
+                    "reason": "file_truncated",
+                },
+                is_error=True,
+            )
+        actual_sha256 = _content_hash(read.content)
+        if read.revision != expected_revision:
+            return ToolResult(
+                content=(
+                    f"Delete refused: {path} changed since it was read; expected revision "
+                    f"{expected_revision}, found {read.revision}."
+                ),
+                structured={
+                    "path": path,
+                    "expected_revision": expected_revision,
+                    "actual_revision": read.revision,
+                    "reason": "stale_content",
+                },
+                is_error=True,
+            )
+        try:
+            mutation = await workspace.delete_if_revision(
+                path,
+                expected_revision=expected_revision,
+            )
+        except WorkspaceRevisionMismatchError as exc:
+            return _stale_mutation_result("Delete", path, exc)
+        except FileNotFoundError:
+            return _missing_mutation_target_result("Delete", path)
+        return ToolResult(
+            content=f"Deleted {path} ({len(read.content)} bytes).",
+            structured={
+                "path": path,
+                "deleted_bytes": len(read.content),
+                "deleted_sha256": actual_sha256,
+                "deleted_revision": mutation.before_revision,
+            },
+        )
+
+
+class WriteFileTool(Tool):
+    spec = ToolSpec(
+        name="write_file",
+        # Mutates the workspace; never overlaps other tools in a round.
+        parallel_safe=False,
+        effect=ToolEffect.EXTERNAL,
+        description=(
+            "Create a missing UTF-8 file or conditionally overwrite an existing file. "
+            "Overwrite requires the opaque revision returned by a complete read_file."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+                "mode": {
+                    "type": "string",
+                    "enum": ["create", "overwrite"],
+                    "description": "Use create for missing paths or overwrite for existing files.",
+                },
+                "expected_revision": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_FILE_REVISION_CHARS,
+                    "description": "Required when mode is overwrite; omit for create.",
+                },
+                "max_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_WRITE_LIMIT_BYTES,
+                    "default": DEFAULT_WRITE_LIMIT_BYTES,
+                },
+            },
+            "required": ["path", "content", "mode"],
+            "additionalProperties": False,
         },
     )
 
@@ -1026,6 +1514,20 @@ class WriteFileTool(Tool):
         with tool_argument_validation():
             path = _validate_workspace_path_argument(_require_arg_string(args, "path"))
             content = _require_arg_string(args, "content", allow_blank=True)
+            mode = _require_arg_string(args, "mode")
+            if mode not in {"create", "overwrite"}:
+                raise ValueError("Tool argument `mode` must be `create` or `overwrite`.")
+            expected_revision = (
+                _require_revision(args, "expected_revision")
+                if args.get("expected_revision") is not None
+                else None
+            )
+            if mode == "create" and expected_revision is not None:
+                raise ValueError("Tool argument `expected_revision` is invalid for create mode.")
+            if mode == "overwrite" and expected_revision is None:
+                raise ValueError(
+                    "Tool argument `expected_revision` is required for overwrite mode."
+                )
             max_bytes = _optional_int(
                 args,
                 "max_bytes",
@@ -1047,13 +1549,35 @@ class WriteFileTool(Tool):
                 },
                 is_error=True,
             )
-        await workspace.write_bytes(path, encoded)
+        try:
+            if mode == "create":
+                mutation = await workspace.create_bytes(path, encoded)
+            else:
+                assert expected_revision is not None
+                mutation = await workspace.replace_bytes(
+                    path,
+                    encoded,
+                    expected_revision=expected_revision,
+                )
+        except FileExistsError:
+            return ToolResult(
+                content=f"Write refused: workspace file already exists: {path}.",
+                structured={"path": path, "mode": mode, "reason": "already_exists"},
+                is_error=True,
+            )
+        except WorkspaceRevisionMismatchError as exc:
+            return _stale_mutation_result("Write", path, exc)
+        except FileNotFoundError:
+            return _missing_mutation_target_result("Write", path)
         return ToolResult(
             content=f"Wrote {len(encoded)} bytes to {path}.",
             structured={
                 "path": path,
                 "bytes": len(encoded),
                 "encoding": "utf-8",
+                "mode": mode,
+                "revision": mutation.after_revision,
+                "sha256": mutation.after_sha256,
             },
         )
 
@@ -1287,6 +1811,56 @@ def _require_arg_string(
     return require_nonblank(value, key)
 
 
+def _exact_match_offsets(text: str, needle: str) -> list[int]:
+    offsets: list[int] = []
+    cursor = 0
+    while True:
+        offset = text.find(needle, cursor)
+        if offset < 0:
+            return offsets
+        offsets.append(offset)
+        cursor = offset + len(needle)
+
+
+def _require_revision(args: dict, key: str) -> str:
+    value = require_unicode_scalar_text(_require_arg_string(args, key), key)
+    if "\0" in value:
+        raise ValueError(f"Tool argument `{key}` must not contain NUL characters.")
+    if len(value) > MAX_FILE_REVISION_CHARS:
+        raise ValueError(
+            f"Tool argument `{key}` must be at most {MAX_FILE_REVISION_CHARS} characters."
+        )
+    return value
+
+
+def _stale_mutation_result(
+    operation: str,
+    path: str,
+    error: WorkspaceRevisionMismatchError,
+) -> ToolResult:
+    return ToolResult(
+        content=(
+            f"{operation} refused: {path} changed during the operation; expected revision "
+            f"{error.expected_revision}, found {error.actual_revision}."
+        ),
+        structured={
+            "path": path,
+            "expected_revision": error.expected_revision,
+            "actual_revision": error.actual_revision,
+            "reason": "stale_content",
+        },
+        is_error=True,
+    )
+
+
+def _missing_mutation_target_result(operation: str, path: str) -> ToolResult:
+    return ToolResult(
+        content=f"{operation} refused: workspace file not found: {path}.",
+        structured={"path": path, "reason": "not_found"},
+        is_error=True,
+    )
+
+
 def _validate_workspace_path_argument(path: str) -> str:
     # This is intentionally a tool-level, backend-independent validation boundary:
     # private backend validators run too late to classify model input, while rejecting
@@ -1326,6 +1900,50 @@ def _optional_arg_string(args: dict, key: str) -> str | None:
     return require_unicode_scalar_text(require_nonblank(value, key), key)
 
 
+def _require_sha256(args: dict, key: str) -> str:
+    value = _require_arg_string(args, key)
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        raise ValueError(f"Tool argument `{key}` must be a lowercase SHA-256 digest.")
+    return value
+
+
+def _validate_text_edits(value: object) -> tuple[_TextEdit, ...]:
+    if not isinstance(value, list):
+        raise ValueError("Tool argument `edits` must be an array.")
+    if not value:
+        raise ValueError("Tool argument `edits` cannot be empty.")
+    if len(value) > MAX_EDIT_OPERATIONS:
+        raise ValueError(f"Tool argument `edits` must contain at most {MAX_EDIT_OPERATIONS} items.")
+    edits: list[_TextEdit] = []
+    for index, item in enumerate(value):
+        if type(item) is not dict:
+            raise ValueError(f"Tool argument `edits[{index}]` must be an object.")
+        unknown = set(item) - {"old_text", "new_text", "expected_replacements"}
+        if unknown:
+            names = ", ".join(sorted(unknown))
+            raise ValueError(f"Tool argument `edits[{index}]` has unknown fields: {names}.")
+        old_text = _require_arg_string(item, "old_text")
+        new_text = _require_arg_string(item, "new_text", allow_blank=True)
+        old_text = require_unicode_scalar_text(old_text, f"edits[{index}].old_text")
+        new_text = require_unicode_scalar_text(new_text, f"edits[{index}].new_text")
+        if old_text == new_text:
+            raise ValueError(f"Tool argument `edits[{index}]` must change the matched text.")
+        expected_replacements = _optional_int(
+            item,
+            "expected_replacements",
+            default=1,
+            maximum=1000,
+        )
+        edits.append(
+            _TextEdit(
+                old_text=old_text,
+                new_text=new_text,
+                expected_replacements=expected_replacements,
+            )
+        )
+    return tuple(edits)
+
+
 def _optional_int(
     args: dict,
     key: str,
@@ -1341,6 +1959,24 @@ def _optional_int(
     if value > maximum:
         raise ValueError(f"Tool argument `{key}` must be at most {maximum}.")
     return value
+
+
+def _optional_nonnegative_int(args: dict, key: str, *, default: int) -> int:
+    value = args.get(key, default)
+    if type(value) is not int:
+        raise ValueError(f"Tool argument `{key}` must be an integer.")
+    if value < 0:
+        raise ValueError(f"Tool argument `{key}` must be non-negative.")
+    return value
+
+
+def _truncate_utf8_text(value: str, maximum: int, *, marker: str) -> tuple[str, bool]:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= maximum:
+        return value, False
+    marker_bytes = marker.encode("utf-8")
+    prefix = encoded[: maximum - len(marker_bytes)]
+    return prefix.decode("utf-8", errors="ignore").rstrip() + marker, True
 
 
 def _optional_scope(
@@ -1479,6 +2115,16 @@ def _count_pdf_pages(content: bytes) -> int | None:
 
 def _content_hash(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
+
+
+def _utf8_text_size(value: str) -> int:
+    size = 0
+    for char in value:
+        codepoint = ord(char)
+        size += (
+            1 if codepoint < 0x80 else 2 if codepoint < 0x800 else 3 if codepoint < 0x10000 else 4
+        )
+    return size
 
 
 def _derivation_key(*, source_hash: str, operation: str, params: str) -> str:

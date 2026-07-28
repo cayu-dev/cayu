@@ -59,13 +59,39 @@ def test_concrete_implementations_satisfy_tool_context_protocols(tmp_path) -> No
 
 def test_tool_context_accepts_structural_handles(tmp_path) -> None:
     class DuckWorkspace:
-        async def read_bytes(self, path: str, *, max_bytes: int | None = None) -> Any:
+        async def read_bytes(
+            self,
+            path: str,
+            *,
+            offset: int = 0,
+            max_bytes: int | None = None,
+        ) -> Any:
             return b""
 
         async def write_bytes(self, path: str, content: bytes) -> None:
             return None
 
         async def delete(self, path: str) -> None:
+            return None
+
+        async def create_bytes(self, path: str, content: bytes) -> Any:
+            return None
+
+        async def replace_bytes(
+            self,
+            path: str,
+            content: bytes,
+            *,
+            expected_revision: str,
+        ) -> Any:
+            return None
+
+        async def delete_if_revision(
+            self,
+            path: str,
+            *,
+            expected_revision: str,
+        ) -> Any:
             return None
 
         async def list(self, pattern: str = "**/*", *, limit: int | None = None) -> Any:

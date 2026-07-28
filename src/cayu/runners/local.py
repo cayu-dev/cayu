@@ -17,6 +17,7 @@ from cayu.runners._secrets import (
 from cayu.runners._subprocess import (
     SubprocessCommand,
     copy_runner_env,
+    remove_runner_env,
     run_subprocess,
 )
 from cayu.runners.base import (
@@ -154,6 +155,7 @@ class LocalRunner(Runner):
         *,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
         timeout_s: int | None = None,
         stdin: str | None = None,
         output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
@@ -172,6 +174,7 @@ class LocalRunner(Runner):
             else {}
         )
         environment = merge_secret_env_values(environment, resolved_secrets)
+        environment = remove_runner_env(environment, env_remove)
         invocation_redactor = resolved_secret_redactor(resolved_secrets)
         subprocess_command = _subprocess_command(command)
         subprocess_run = run_subprocess(

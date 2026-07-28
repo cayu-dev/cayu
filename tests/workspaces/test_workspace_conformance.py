@@ -7,6 +7,7 @@ import os
 import stat
 import sys
 import tarfile
+import tracemalloc
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,6 +22,7 @@ from tests.workspaces.conformance import (
     WorkspaceHarness,
     verify_bounded_reads_and_result_isolation,
     verify_listing_contract,
+    verify_paging_and_conditional_mutations,
     verify_relative_path_safety,
     verify_resource_identity,
     verify_resource_identity_relationships,
@@ -344,6 +346,116 @@ def test_workspace_bounds_and_listing_conformance(
 
 
 @pytest.mark.parametrize("registration", REGISTRATIONS, ids=lambda item: item.name)
+def test_workspace_paging_and_conditional_mutation_conformance(
+    registration: WorkspaceConformanceRegistration,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario(harness: WorkspaceHarness) -> None:
+        await verify_paging_and_conditional_mutations(harness.workspace)
+
+    _run_scenario(registration, tmp_path, monkeypatch, scenario)
+
+
+def test_local_and_local_runner_workspace_share_conditional_mutation_lock(
+    tmp_path: Path,
+) -> None:
+    local = LocalWorkspace(tmp_path, workspace_id="local")
+    runner = LocalRunner(tmp_path, inherit_env=False)
+    runner_workspace = RunnerWorkspace(
+        runner,
+        workspace_id="runner",
+        python_executable=sys.executable,
+    )
+
+    async def scenario() -> None:
+        await local.write_bytes("shared.txt", b"base")
+        revision = (await local.read_bytes("shared.txt")).revision
+        assert revision is not None
+
+        async def replace(workspace: Workspace, content: bytes) -> str:
+            try:
+                await workspace.replace_bytes(
+                    "shared.txt",
+                    content,
+                    expected_revision=revision,
+                )
+            except workspaces_module.WorkspaceRevisionMismatchError:
+                return "stale"
+            return "replaced"
+
+        outcomes = await asyncio.gather(
+            replace(local, b"local"),
+            replace(runner_workspace, b"runner"),
+        )
+        assert sorted(outcomes) == ["replaced", "stale"]
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(runner.close())
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX file modes")
+def test_local_workspace_create_uses_conventional_umask_permissions(tmp_path: Path) -> None:
+    workspace = LocalWorkspace(tmp_path)
+    previous_umask = os.umask(0o022)
+    try:
+        asyncio.run(workspace.create_bytes("created.txt", b"content"))
+    finally:
+        os.umask(previous_umask)
+
+    assert stat.S_IMODE((tmp_path / "created.txt").stat().st_mode) == 0o644
+
+
+def test_conditional_mutations_serialize_filesystem_case_aliases(tmp_path: Path) -> None:
+    workspace = LocalWorkspace(tmp_path)
+    asyncio.run(workspace.write_bytes("Case.txt", b"base"))
+    lower_alias = tmp_path / "case.txt"
+    if not lower_alias.exists() or not os.path.samefile(tmp_path / "Case.txt", lower_alias):
+        pytest.skip("filesystem is case-sensitive")
+    revision = asyncio.run(workspace.read_bytes("Case.txt")).revision
+    assert revision is not None
+
+    async def replace(path: str, content: bytes) -> str:
+        try:
+            await workspace.replace_bytes(path, content, expected_revision=revision)
+        except workspaces_module.WorkspaceRevisionMismatchError:
+            return "stale"
+        return "replaced"
+
+    async def scenario() -> list[str]:
+        return await asyncio.gather(
+            replace("Case.txt", b"first"),
+            replace("case.txt", b"second"),
+        )
+
+    outcomes = asyncio.run(scenario())
+    assert sorted(outcomes) == ["replaced", "stale"]
+
+
+def test_stale_local_conditional_mutation_streams_current_identity(tmp_path: Path) -> None:
+    path = tmp_path / "large.bin"
+    with path.open("wb") as file:
+        file.truncate(32 * 1024 * 1024)
+    workspace = LocalWorkspace(tmp_path)
+
+    tracemalloc.start()
+    with pytest.raises(workspaces_module.WorkspaceRevisionMismatchError):
+        asyncio.run(
+            workspace.replace_bytes(
+                "large.bin",
+                b"replacement",
+                expected_revision="sha256:stale",
+            )
+        )
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert peak < 5 * 1024 * 1024
+
+
+@pytest.mark.parametrize("registration", REGISTRATIONS, ids=lambda item: item.name)
 def test_workspace_resource_identity_and_capabilities(
     registration: WorkspaceConformanceRegistration,
     tmp_path: Path,
@@ -445,6 +557,7 @@ class _SeededBrokenWorkspace(Workspace):
         self,
         path: str,
         *,
+        offset: int = 0,
         max_bytes: int | None = None,
     ) -> WorkspaceReadResult:
         if self.defect == "traversal" and path == "nested/../accepted.txt":
@@ -457,7 +570,7 @@ class _SeededBrokenWorkspace(Workspace):
             return WorkspaceReadResult(content, len(content))
         if self.defect == "overread":
             return await self.delegate.read_bytes(path)
-        return await self.delegate.read_bytes(path, max_bytes=max_bytes)
+        return await self.delegate.read_bytes(path, offset=offset, max_bytes=max_bytes)
 
     async def write_bytes(self, path: str, content: bytes) -> None:
         if self.defect == "traversal" and path == "nested/../accepted.txt":
@@ -468,6 +581,22 @@ class _SeededBrokenWorkspace(Workspace):
         if self.defect == "traversal" and path == "nested/../accepted.txt":
             return
         await self.delegate.delete(path)
+
+    async def create_bytes(self, path: str, content: bytes):
+        return await self.delegate.create_bytes(path, content)
+
+    async def replace_bytes(self, path: str, content: bytes, *, expected_revision: str):
+        return await self.delegate.replace_bytes(
+            path,
+            content,
+            expected_revision=expected_revision,
+        )
+
+    async def delete_if_revision(self, path: str, *, expected_revision: str):
+        return await self.delegate.delete_if_revision(
+            path,
+            expected_revision=expected_revision,
+        )
 
     async def list(
         self,

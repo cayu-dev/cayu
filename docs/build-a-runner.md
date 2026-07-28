@@ -27,6 +27,7 @@ class Runner(ABC):
         *,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
         timeout_s: int | None = None,
         stdin: str | None = None,
         output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
@@ -36,6 +37,10 @@ class Runner(ABC):
 - `command` is positional; everything else is keyword-only. Match the signature
   and defaults exactly — `ExecCommandTool` calls `exec(...)` with these keywords.
 - Set `isolation` to a short label for your backend (`"modal"`, `"docker"`, …).
+- Apply `env_remove` after ordinary/injected environment construction and before
+  enforced backend overlays. This lets trusted built-ins remove ambient variables
+  that would redirect a supposedly read-only process while preserving mandatory
+  sandbox networking configuration.
 - Implement `resolve_cwd()` as an idempotent containment boundary. Relative
   requests resolve beneath `default_cwd`; an absolute input is accepted only
   when it is the runner's own canonical root/child path. In particular,

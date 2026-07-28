@@ -104,6 +104,7 @@ class ModalRunner(Runner):
         *,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
         timeout_s: int | None = None,
         stdin: str | None = None,
         output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
@@ -113,6 +114,8 @@ class ModalRunner(Runner):
 
         working_dir = self.resolve_cwd(cwd)
         environment = _copy_env(env)
+        for key in env_remove:
+            environment.pop(key, None)
         argv = _command_argv(command)
         limit = _validate_output_limit(output_limit_bytes)
 

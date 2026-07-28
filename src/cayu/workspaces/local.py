@@ -6,10 +6,21 @@ from os import PathLike
 from pathlib import Path
 
 from cayu._validation import require_clean_nonblank
+from cayu.workspaces._mutations import (
+    atomic_create,
+    atomic_replace,
+    content_identity,
+    file_content_identity,
+    mutation_result,
+    mutation_result_from_identities,
+    workspace_path_lock,
+)
 from cayu.workspaces.base import (
     Workspace,
     WorkspaceListResult,
+    WorkspaceMutationResult,
     WorkspaceReadResult,
+    WorkspaceRevisionMismatchError,
     _local_resource_key,
     _validate_workspace_relative_path,
     _WorkspaceListCollector,
@@ -50,23 +61,80 @@ class LocalWorkspace(Workspace):
         self,
         path: str,
         *,
+        offset: int = 0,
         max_bytes: int | None = None,
     ) -> WorkspaceReadResult:
+        relative_path = _validate_workspace_relative_path(path)
         target = self.resolve(path)
         if not target.is_file():
             raise FileNotFoundError(f"Workspace file not found: {path}")
+        validated_offset = _validate_offset(offset)
         limit = _validate_limit(max_bytes, "max_bytes")
-        return await asyncio.to_thread(_read_file, target, limit)
+        return await asyncio.to_thread(
+            _read_file_locked,
+            self.root,
+            relative_path,
+            target,
+            validated_offset,
+            limit,
+        )
 
     async def write_bytes(self, path: str, content: bytes) -> None:
         if type(content) is not bytes:
             raise TypeError("Workspace write content must be bytes.")
+        relative_path = _validate_workspace_relative_path(path)
         target = self.resolve_no_symlinks(path)
-        await asyncio.to_thread(_write_file, target, content)
+        await asyncio.to_thread(_write_file, self.root, relative_path, target, content)
 
     async def delete(self, path: str) -> None:
+        relative_path = _validate_workspace_relative_path(path)
         target = self.resolve_no_symlinks(path)
-        await asyncio.to_thread(_delete_file, target)
+        await asyncio.to_thread(_delete_file, self.root, relative_path, target)
+
+    async def create_bytes(self, path: str, content: bytes) -> WorkspaceMutationResult:
+        if type(content) is not bytes:
+            raise TypeError("Workspace create content must be bytes.")
+        relative_path = _validate_workspace_relative_path(path)
+        target = self.resolve_no_symlinks(path)
+        return await asyncio.to_thread(_create_file, self.root, relative_path, target, content)
+
+    async def replace_bytes(
+        self,
+        path: str,
+        content: bytes,
+        *,
+        expected_revision: str,
+    ) -> WorkspaceMutationResult:
+        if type(content) is not bytes:
+            raise TypeError("Workspace replace content must be bytes.")
+        expected_revision = _validate_revision(expected_revision)
+        relative_path = _validate_workspace_relative_path(path)
+        target = self.resolve_no_symlinks(path)
+        return await asyncio.to_thread(
+            _replace_file,
+            self.root,
+            relative_path,
+            target,
+            content,
+            expected_revision,
+        )
+
+    async def delete_if_revision(
+        self,
+        path: str,
+        *,
+        expected_revision: str,
+    ) -> WorkspaceMutationResult:
+        expected_revision = _validate_revision(expected_revision)
+        relative_path = _validate_workspace_relative_path(path)
+        target = self.resolve_no_symlinks(path)
+        return await asyncio.to_thread(
+            _delete_file_if_revision,
+            self.root,
+            relative_path,
+            target,
+            expected_revision,
+        )
 
     async def list(
         self,
@@ -122,37 +190,92 @@ class LocalWorkspace(Workspace):
         return current
 
 
-def _write_file(path: Path, content: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(content)
+def _write_file(root: Path, relative_path: str, path: Path, content: bytes) -> None:
+    with workspace_path_lock(root, relative_path):
+        if path.exists():
+            if not path.is_file():
+                raise IsADirectoryError(f"Workspace path is not a file: {path}")
+            atomic_replace(path, content)
+        else:
+            atomic_create(path, content)
 
 
-def _delete_file(path: Path) -> None:
-    if not path.exists():
-        return
-    if not path.is_file():
-        raise IsADirectoryError(f"Workspace path is not a file: {path}")
-    path.unlink()
+def _delete_file(root: Path, relative_path: str, path: Path) -> None:
+    with workspace_path_lock(root, relative_path):
+        if not path.exists():
+            return
+        if not path.is_file():
+            raise IsADirectoryError(f"Workspace path is not a file: {path}")
+        path.unlink()
 
 
-def _read_file(path: Path, max_bytes: int | None) -> WorkspaceReadResult:
-    if max_bytes is None:
-        content = path.read_bytes()
-        return WorkspaceReadResult(
-            content=content,
-            total_bytes=len(content),
-            truncated=False,
-        )
+def _read_file_locked(
+    root: Path,
+    relative_path: str,
+    path: Path,
+    offset: int,
+    max_bytes: int | None,
+) -> WorkspaceReadResult:
+    with workspace_path_lock(root, relative_path):
+        return _read_file(path, offset, max_bytes)
+
+
+def _read_file(path: Path, offset: int, max_bytes: int | None) -> WorkspaceReadResult:
     with path.open("rb") as file:
-        chunk = file.read(max_bytes + 1)
         total_bytes = os.fstat(file.fileno()).st_size
-    content = chunk[:max_bytes]
-    total_bytes = max(total_bytes, len(chunk))
+        if offset > total_bytes:
+            raise ValueError("Workspace read offset cannot exceed file size.")
+        file.seek(offset)
+        content = file.read() if max_bytes is None else file.read(max_bytes)
+    complete = offset == 0 and len(content) == total_bytes
+    revision, digest = content_identity(content) if complete else (None, None)
     return WorkspaceReadResult(
         content=content,
         total_bytes=total_bytes,
-        truncated=total_bytes > len(content),
+        truncated=offset + len(content) < total_bytes,
+        offset=offset,
+        revision=revision,
+        sha256=digest,
     )
+
+
+def _create_file(
+    root: Path, relative_path: str, path: Path, content: bytes
+) -> WorkspaceMutationResult:
+    with workspace_path_lock(root, relative_path):
+        atomic_create(path, content)
+        return mutation_result("create", before=None, after=content)
+
+
+def _replace_file(
+    root: Path,
+    relative_path: str,
+    path: Path,
+    content: bytes,
+    expected_revision: str,
+) -> WorkspaceMutationResult:
+    with workspace_path_lock(root, relative_path):
+        before = file_content_identity(path)
+        actual_revision = before[0]
+        if actual_revision != expected_revision:
+            raise WorkspaceRevisionMismatchError(expected_revision, actual_revision)
+        atomic_replace(path, content)
+        return mutation_result_from_identities("replace", before=before, after=content)
+
+
+def _delete_file_if_revision(
+    root: Path,
+    relative_path: str,
+    path: Path,
+    expected_revision: str,
+) -> WorkspaceMutationResult:
+    with workspace_path_lock(root, relative_path):
+        before = file_content_identity(path)
+        actual_revision = before[0]
+        if actual_revision != expected_revision:
+            raise WorkspaceRevisionMismatchError(expected_revision, actual_revision)
+        path.unlink()
+        return mutation_result_from_identities("delete", before=before, after=None)
 
 
 def _list_files(
@@ -201,4 +324,18 @@ def _validate_limit(value: int | None, field_name: str) -> int | None:
         raise TypeError(f"Workspace {field_name} must be an integer.")
     if value <= 0:
         raise ValueError(f"Workspace {field_name} must be greater than zero.")
+    return value
+
+
+def _validate_offset(value: int) -> int:
+    if type(value) is not int:
+        raise TypeError("Workspace offset must be an integer.")
+    if value < 0:
+        raise ValueError("Workspace offset must be non-negative.")
+    return value
+
+
+def _validate_revision(value: str) -> str:
+    if type(value) is not str or not value.strip():
+        raise ValueError("Workspace expected_revision must be a nonblank string.")
     return value

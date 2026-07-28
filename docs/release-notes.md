@@ -15,6 +15,19 @@ regenerated from the current OpenAPI document. Independently deployed dashboards
 and servers must be upgraded together; the dashboard rejects a version 3
 response before resolving navigation or starting route-specific API requests.
 
+### Coding workspace mutations are conditional and reviewable
+
+Complete workspace reads now expose opaque file revisions, pageable byte
+offsets, continuation metadata, and diagnostic SHA-256 digests. Every built-in
+workspace implements atomic create-if-missing, conditional replacement, and
+conditional deletion through the same cooperative resource/path lock.
+
+The first-party coding surface adds exact multi-edit, conditional delete,
+explicit create-versus-overwrite, and bounded Git status/summary/diff
+inspection. Applications can require model-visible tests and repository-change
+review without granting an unrestricted shell or relying on a racy
+read/check/write sequence.
+
 ### Chat Completions usage dialects are explicit and subclass-safe
 
 `ChatCompletionsProvider` now accepts an explicit `usage_dialect`, preserves

@@ -39,6 +39,7 @@ from cayu.workspaces import (
     TarWriter,
     Workspace,
     WorkspaceListResult,
+    WorkspaceMutationResult,
     WorkspaceReadResult,
 )
 from cayu.workspaces._tar import tar_archive_size_bound
@@ -54,6 +55,7 @@ class StubWorkspace(Workspace):
         self,
         path: str,
         *,
+        offset: int = 0,
         max_bytes: int | None = None,
     ) -> WorkspaceReadResult:
         return WorkspaceReadResult(content=b"", total_bytes=0)
@@ -63,6 +65,22 @@ class StubWorkspace(Workspace):
 
     async def delete(self, path: str) -> None:
         pass
+
+    async def create_bytes(self, path: str, content: bytes) -> WorkspaceMutationResult:
+        del path, content
+        raise NotImplementedError
+
+    async def replace_bytes(
+        self, path: str, content: bytes, *, expected_revision: str
+    ) -> WorkspaceMutationResult:
+        del path, content, expected_revision
+        raise NotImplementedError
+
+    async def delete_if_revision(
+        self, path: str, *, expected_revision: str
+    ) -> WorkspaceMutationResult:
+        del path, expected_revision
+        raise NotImplementedError
 
     async def list(
         self,

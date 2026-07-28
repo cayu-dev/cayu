@@ -18,6 +18,7 @@ from guard_harness import (
     require_bounded_tar_member_reads,
 )
 
+import cayu.workspaces._guest_guard as guest_guard_module
 import cayu.workspaces.runner as runner_workspace_module
 from cayu.core.tools import ToolContext
 from cayu.runners import LocalRunner
@@ -55,6 +56,12 @@ def _install_directory_open_barrier(
         runner_workspace_module,
         "_RUNNER_WORKSPACE_PROGRAM",
         instrument_directory_open_barrier(program, ready=ready, release=release),
+    )
+    guest_program = guest_guard_module.GUEST_GUARD_PROGRAM
+    monkeypatch.setattr(
+        guest_guard_module,
+        "GUEST_GUARD_PROGRAM",
+        instrument_directory_open_barrier(guest_program, ready=ready, release=release),
     )
 
 
@@ -912,7 +919,7 @@ def test_runner_workspace_reports_runner_failure_when_python_cannot_start(tmp_pa
         python_executable="missing-python-executable",
     )
 
-    with pytest.raises(RuntimeError, match="Runner workspace operation failed"):
+    with pytest.raises(RuntimeError, match="Failed to read Runner workspace file"):
         asyncio.run(workspace.read_bytes("notes/result.txt"))
 
 
@@ -1248,7 +1255,11 @@ def test_builtin_file_tools_use_runner_workspace(tmp_path) -> None:
     write_result = asyncio.run(
         WriteFileTool().run(
             ctx,
-            {"path": "notes/result.txt", "content": "runner workspace"},
+            {
+                "path": "notes/result.txt",
+                "content": "runner workspace",
+                "mode": "create",
+            },
         )
     )
     read_result = asyncio.run(

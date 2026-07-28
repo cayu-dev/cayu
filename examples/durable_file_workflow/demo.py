@@ -7,6 +7,7 @@ Run with:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import sys
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -98,6 +99,7 @@ class RecoveryProvider(ModelProvider):
                     arguments={
                         "path": "transform.py",
                         "content": "raise RuntimeError('repair me')\n",
+                        "mode": "create",
                     },
                 ),
                 ModelStreamEvent.tool_call(
@@ -122,6 +124,11 @@ class RecoveryProvider(ModelProvider):
                             "source = Path('source.txt').read_text(encoding='utf-8')\n"
                             "Path('result.txt').write_text("
                             "source.strip().upper() + '\\n', encoding='utf-8')\n"
+                        ),
+                        "mode": "overwrite",
+                        "expected_revision": (
+                            "sha256:"
+                            + hashlib.sha256(b"raise RuntimeError('repair me')\n").hexdigest()
                         ),
                     },
                 ),

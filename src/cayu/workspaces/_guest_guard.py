@@ -41,9 +41,14 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 from typing import TYPE_CHECKING
 
 from cayu.runners import ExecCommand
+from cayu.workspaces.base import (
+    WorkspaceMutationResult,
+    WorkspaceRevisionMismatchError,
+)
 
 if TYPE_CHECKING:
     from cayu.runners import ExecResult, Runner
@@ -58,6 +63,8 @@ _STATUS_NOTDIR = "notdir"
 _STATUS_ISDIR = "isdir"
 _STATUS_HARDLINK = "hardlink"
 _STATUS_UNSUPPORTED = "unsupported"
+_STATUS_EXISTS = "exists"
+_STATUS_STALE = "stale"
 
 _READ_OUTPUT_HEADROOM_BYTES = 4096
 
@@ -69,10 +76,15 @@ _READ_OUTPUT_HEADROOM_BYTES = 4096
 # payloads are base64 on stdout after the status line; write payloads are
 # base64 on stdin.
 GUEST_DESCRIPTOR_GUARD_SOURCE = r"""
+import contextlib
 import errno
+import fcntl
+import hashlib
 import os
 import stat
 import sys
+import tempfile
+import unicodedata
 
 
 class GuardPathError(Exception):
@@ -106,7 +118,7 @@ def require_descriptor_guard_support():
         raise GuardPathError("unsupported")
     supports_dir_fd = getattr(os, "supports_dir_fd", ())
     supports_follow_symlinks = getattr(os, "supports_follow_symlinks", ())
-    required_dir_fd = (os.open, os.mkdir, os.stat, os.unlink)
+    required_dir_fd = (os.open, os.mkdir, os.stat, os.unlink, os.link, os.rename)
     if any(operation not in supports_dir_fd for operation in required_dir_fd):
         raise GuardPathError("unsupported")
     if os.stat not in supports_follow_symlinks or not hasattr(os, "ftruncate"):
@@ -340,6 +352,144 @@ def write_all(fd, payload):
         view = view[written:]
 
 
+def content_identity(content):
+    digest = hashlib.sha256(content).hexdigest()
+    return "sha256:" + digest, digest
+
+
+def read_all(fd):
+    os.lseek(fd, 0, os.SEEK_SET)
+    chunks = []
+    while True:
+        chunk = os.read(fd, 1 << 16)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+@contextlib.contextmanager
+def workspace_path_lock(root_fd, rel_path):
+    root_info = os.fstat(root_fd)
+    normalized_path = unicodedata.normalize("NFC", rel_path.replace("\\", "/")).casefold()
+    identity = f"{root_info.st_dev}:{root_info.st_ino}\0{normalized_path}".encode()
+    lock_name = hashlib.sha256(identity).hexdigest()
+    lock_root = os.path.join(tempfile.gettempdir(), "cayu-workspace-locks")
+    os.makedirs(lock_root, mode=0o700, exist_ok=True)
+    lock_fd = os.open(
+        os.path.join(lock_root, lock_name),
+        os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
+        0o600,
+    )
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+def _temporary_name(name):
+    return "." + name + ".cayu-" + os.urandom(12).hex()
+
+
+def create_guarded_regular_atomic(name, dir_fd, content):
+    try:
+        guarded_lstat(name, dir_fd)
+    except GuardPathError as exc:
+        if exc.status != "enoent":
+            raise
+    else:
+        raise GuardPathError("exists")
+    temp_name = _temporary_name(name)
+    temp_fd = None
+    try:
+        temp_fd = os.open(
+            temp_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+            GUARDED_FILE_CREATE_MODE,
+            dir_fd=dir_fd,
+        )
+        write_all(temp_fd, content)
+        os.close(temp_fd)
+        temp_fd = None
+        try:
+            os.link(
+                temp_name,
+                name,
+                src_dir_fd=dir_fd,
+                dst_dir_fd=dir_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError as exc:
+            raise GuardPathError("exists") from exc
+    finally:
+        if temp_fd is not None:
+            os.close(temp_fd)
+        try:
+            os.unlink(temp_name, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
+
+
+def _conditional_snapshot(name, dir_fd):
+    fd, info = open_guarded_regular(name, dir_fd)
+    try:
+        if info.st_nlink != 1:
+            raise GuardPathError("hardlink")
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            chunk = os.read(fd, 1 << 16)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+    finally:
+        os.close(fd)
+    hexdigest = digest.hexdigest()
+    return (
+        "sha256:" + hexdigest,
+        hexdigest,
+        size,
+        stat.S_IMODE(info.st_mode) & 0o777,
+    )
+
+
+def replace_guarded_regular_if_revision(name, dir_fd, content, expected_revision):
+    revision, digest, size, mode = _conditional_snapshot(name, dir_fd)
+    if revision != expected_revision:
+        return None, revision
+    temp_name = _temporary_name(name)
+    temp_fd = None
+    try:
+        temp_fd = os.open(
+            temp_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+            mode,
+            dir_fd=dir_fd,
+        )
+        write_all(temp_fd, content)
+        os.close(temp_fd)
+        temp_fd = None
+        os.rename(temp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    finally:
+        if temp_fd is not None:
+            os.close(temp_fd)
+        try:
+            os.unlink(temp_name, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
+    return (revision, digest, size), None
+
+
+def delete_guarded_regular_if_revision(name, dir_fd, expected_revision):
+    revision, digest, size, _ = _conditional_snapshot(name, dir_fd)
+    if revision != expected_revision:
+        return None, revision
+    os.unlink(name, dir_fd=dir_fd)
+    return (revision, digest, size), None
+
+
 def delete_guarded_regular(name, dir_fd):
     try:
         before = guarded_lstat(name, dir_fd)
@@ -365,6 +515,7 @@ GUEST_GUARD_PROGRAM = (
     GUEST_DESCRIPTOR_GUARD_SOURCE
     + r"""
 import base64
+import json
 import sys
 
 
@@ -374,39 +525,112 @@ def finish(status):
     sys.exit(0)
 
 
+def mutation_payload(operation, before, after):
+    before_revision, before_sha256 = (
+        content_identity(before) if before is not None else (None, None)
+    )
+    after_revision, after_sha256 = (
+        content_identity(after) if after is not None else (None, None)
+    )
+    return {
+        "operation": operation,
+        "before_revision": before_revision,
+        "after_revision": after_revision,
+        "before_sha256": before_sha256,
+        "after_sha256": after_sha256,
+        "before_bytes": len(before) if before is not None else None,
+        "after_bytes": len(after) if after is not None else None,
+    }
+
+
+def mutation_payload_from_identity(operation, before, after):
+    after_revision, after_sha256 = (
+        content_identity(after) if after is not None else (None, None)
+    )
+    return {
+        "operation": operation,
+        "before_revision": before[0] if before is not None else None,
+        "after_revision": after_revision,
+        "before_sha256": before[1] if before is not None else None,
+        "after_sha256": after_sha256,
+        "before_bytes": before[2] if before is not None else None,
+        "after_bytes": len(after) if after is not None else None,
+    }
+
+
 def main():
     mode = sys.argv[1]
     root = sys.argv[2]
     rel_path = sys.argv[3]
-    limit = int(sys.argv[4]) if len(sys.argv) > 4 else 0
     root_fd = None
     parent_fd = None
     leaf_fd = None
     try:
         parts = guarded_parts(rel_path)
         root_fd = open_guard_root(root)
-        parent_fd, leaf_name = open_guarded_parent(root_fd, parts, mode == "write")
-        if mode == "read":
-            leaf_fd, info = open_guarded_regular(leaf_name, parent_fd)
-            chunks = []
-            remaining = limit
-            while remaining > 0:
-                chunk = os.read(leaf_fd, min(remaining, 1 << 16))
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                remaining -= len(chunk)
-            print("ok " + str(info.st_size))
-            sys.stdout.write(base64.b64encode(b"".join(chunks)).decode("ascii"))
-            sys.stdout.flush()
-            return
-        if mode == "write":
-            payload = base64.b64decode(sys.stdin.read(), validate=True)
-            write_guarded_regular(leaf_name, parent_fd, (payload,))
-            finish("ok")
-        if mode == "delete":
-            finish("ok" if delete_guarded_regular(leaf_name, parent_fd) else "enoent")
-        raise SystemExit("unknown guard mode: " + mode)
+        with workspace_path_lock(root_fd, rel_path):
+            parent_fd, leaf_name = open_guarded_parent(
+                root_fd, parts, mode in ("write", "create")
+            )
+            if mode == "read":
+                offset = int(sys.argv[4])
+                limit = int(sys.argv[5])
+                leaf_fd, info = open_guarded_regular(leaf_name, parent_fd)
+                if offset > info.st_size:
+                    raise ValueError("Workspace read offset cannot exceed file size.")
+                os.lseek(leaf_fd, offset, os.SEEK_SET)
+                chunks = []
+                remaining = limit
+                while remaining > 0:
+                    chunk = os.read(leaf_fd, min(remaining, 1 << 16))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                content = b"".join(chunks)
+                revision, digest = (
+                    content_identity(content)
+                    if offset == 0 and len(content) == info.st_size
+                    else ("-", "-")
+                )
+                print(f"ok {info.st_size} {revision} {digest}")
+                sys.stdout.write(base64.b64encode(content).decode("ascii"))
+                sys.stdout.flush()
+                return
+            if mode == "write":
+                payload = base64.b64decode(sys.stdin.read(), validate=True)
+                write_guarded_regular(leaf_name, parent_fd, (payload,))
+                finish("ok")
+            if mode == "delete":
+                finish("ok" if delete_guarded_regular(leaf_name, parent_fd) else "enoent")
+            if mode == "create":
+                payload = base64.b64decode(sys.stdin.read(), validate=True)
+                create_guarded_regular_atomic(leaf_name, parent_fd, payload)
+                print("ok")
+                print(json.dumps(mutation_payload("create", None, payload)))
+                return
+            if mode == "replace":
+                expected_revision = sys.argv[4]
+                payload = base64.b64decode(sys.stdin.read(), validate=True)
+                before_data, stale_revision = replace_guarded_regular_if_revision(
+                    leaf_name, parent_fd, payload, expected_revision
+                )
+                if stale_revision is not None:
+                    finish("stale " + stale_revision)
+                print("ok")
+                print(json.dumps(mutation_payload_from_identity("replace", before_data, payload)))
+                return
+            if mode == "delete-if-revision":
+                expected_revision = sys.argv[4]
+                before_data, stale_revision = delete_guarded_regular_if_revision(
+                    leaf_name, parent_fd, expected_revision
+                )
+                if stale_revision is not None:
+                    finish("stale " + stale_revision)
+                print("ok")
+                print(json.dumps(mutation_payload_from_identity("delete", before_data, None)))
+                return
+            raise SystemExit("unknown guard mode: " + mode)
     except GuardPathError as exc:
         finish(exc.status)
     finally:
@@ -428,12 +652,14 @@ async def guard_read(
     *,
     root: str,
     rel_path: str,
+    offset: int,
     limit: int,
     original_path: str,
     backend: str,
     timeout_s: int | None = None,
-) -> tuple[bytes, int]:
-    """Atomically resolve-and-read a contained file; return (content, total size)."""
+    python_executable: str = GUEST_PYTHON,
+) -> tuple[bytes, int, str | None, str | None]:
+    """Atomically resolve-and-read a contained file and complete-snapshot identity."""
 
     output_limit = 4 * ((limit + 2) // 3) + _READ_OUTPUT_HEADROOM_BYTES
     result = await _exec_guard(
@@ -441,9 +667,11 @@ async def guard_read(
         "read",
         root,
         rel_path,
+        str(offset),
         str(limit),
         timeout_s=timeout_s,
         output_limit_bytes=output_limit,
+        python_executable=python_executable,
     )
     status, payload = _guard_status(
         result, mode="read", backend=backend, original_path=original_path
@@ -451,14 +679,16 @@ async def guard_read(
     if status in {_STATUS_ENOENT, _STATUS_NOTFILE, _STATUS_NOTDIR}:
         raise FileNotFoundError(f"Workspace file not found: {original_path}")
     _raise_common_status(status, mode="read", backend=backend, original_path=original_path)
-    total_bytes = _parse_ok_size(status, backend=backend, original_path=original_path)
+    total_bytes, revision, digest = _parse_ok_read(
+        status, backend=backend, original_path=original_path
+    )
     try:
         content = base64.b64decode(payload.strip(), validate=True)
     except (binascii.Error, ValueError) as exc:
         raise RuntimeError(
             f"{backend} workspace guard returned an invalid read payload: {original_path}"
         ) from exc
-    return content, total_bytes
+    return content, total_bytes, revision, digest
 
 
 async def guard_write(
@@ -513,6 +743,126 @@ async def guard_delete(
     raise AssertionError("unreachable")
 
 
+async def guard_create(
+    runner: Runner,
+    *,
+    root: str,
+    rel_path: str,
+    content: bytes,
+    original_path: str,
+    backend: str,
+    timeout_s: int | None = None,
+    python_executable: str = GUEST_PYTHON,
+) -> WorkspaceMutationResult:
+    return await _guard_conditional_mutation(
+        runner,
+        "create",
+        root=root,
+        rel_path=rel_path,
+        content=content,
+        expected_revision=None,
+        original_path=original_path,
+        backend=backend,
+        timeout_s=timeout_s,
+        python_executable=python_executable,
+    )
+
+
+async def guard_replace(
+    runner: Runner,
+    *,
+    root: str,
+    rel_path: str,
+    content: bytes,
+    expected_revision: str,
+    original_path: str,
+    backend: str,
+    timeout_s: int | None = None,
+    python_executable: str = GUEST_PYTHON,
+) -> WorkspaceMutationResult:
+    return await _guard_conditional_mutation(
+        runner,
+        "replace",
+        root=root,
+        rel_path=rel_path,
+        content=content,
+        expected_revision=expected_revision,
+        original_path=original_path,
+        backend=backend,
+        timeout_s=timeout_s,
+        python_executable=python_executable,
+    )
+
+
+async def guard_delete_if_revision(
+    runner: Runner,
+    *,
+    root: str,
+    rel_path: str,
+    expected_revision: str,
+    original_path: str,
+    backend: str,
+    timeout_s: int | None = None,
+    python_executable: str = GUEST_PYTHON,
+) -> WorkspaceMutationResult:
+    return await _guard_conditional_mutation(
+        runner,
+        "delete-if-revision",
+        root=root,
+        rel_path=rel_path,
+        content=None,
+        expected_revision=expected_revision,
+        original_path=original_path,
+        backend=backend,
+        timeout_s=timeout_s,
+        python_executable=python_executable,
+    )
+
+
+async def _guard_conditional_mutation(
+    runner: Runner,
+    mode: str,
+    *,
+    root: str,
+    rel_path: str,
+    content: bytes | None,
+    expected_revision: str | None,
+    original_path: str,
+    backend: str,
+    timeout_s: int | None,
+    python_executable: str,
+) -> WorkspaceMutationResult:
+    extra_args = (expected_revision,) if expected_revision is not None else ()
+    stdin = base64.b64encode(content).decode("ascii") if content is not None else None
+    result = await _exec_guard(
+        runner,
+        mode,
+        root,
+        rel_path,
+        *extra_args,
+        stdin=stdin,
+        timeout_s=timeout_s,
+        python_executable=python_executable,
+    )
+    status, payload = _guard_status(result, mode=mode, backend=backend, original_path=original_path)
+    if status == _STATUS_EXISTS:
+        raise FileExistsError(f"Workspace file already exists: {original_path}")
+    if status.startswith(f"{_STATUS_STALE} "):
+        actual_revision = status.partition(" ")[2]
+        assert expected_revision is not None
+        raise WorkspaceRevisionMismatchError(expected_revision, actual_revision)
+    if status in {_STATUS_ENOENT, _STATUS_NOTFILE, _STATUS_NOTDIR}:
+        raise FileNotFoundError(f"Workspace file not found: {original_path}")
+    _raise_common_status(status, mode=mode, backend=backend, original_path=original_path)
+    try:
+        decoded = json.loads(payload)
+        return WorkspaceMutationResult(**decoded)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"{backend} workspace guard returned invalid mutation metadata: {original_path}"
+        ) from exc
+
+
 async def _exec_guard(
     runner: Runner,
     mode: str,
@@ -522,9 +872,10 @@ async def _exec_guard(
     stdin: str | None = None,
     timeout_s: int | None = None,
     output_limit_bytes: int | None = None,
+    python_executable: str = GUEST_PYTHON,
 ) -> ExecResult:
     command = ExecCommand.process(
-        GUEST_PYTHON, "-c", GUEST_GUARD_PROGRAM, mode, root, rel_path, *extra_args
+        python_executable, "-c", GUEST_GUARD_PROGRAM, mode, root, rel_path, *extra_args
     )
     kwargs: dict[str, object] = {"stdin": stdin, "timeout_s": timeout_s}
     if output_limit_bytes is not None:
@@ -572,10 +923,14 @@ def _raise_common_status(status: str, *, mode: str, backend: str, original_path:
     )
 
 
-def _parse_ok_size(status: str, *, backend: str, original_path: str) -> int:
+def _parse_ok_read(
+    status: str, *, backend: str, original_path: str
+) -> tuple[int, str | None, str | None]:
     parts = status.split()
-    if len(parts) == 2 and parts[0] == _STATUS_OK and parts[1].isdigit():
-        return int(parts[1])
+    if len(parts) == 4 and parts[0] == _STATUS_OK and parts[1].isdigit():
+        revision = None if parts[2] == "-" else parts[2]
+        digest = None if parts[3] == "-" else parts[3]
+        return int(parts[1]), revision, digest
     raise RuntimeError(
         f"Failed to read {backend} workspace file: "
         f"{original_path}: unexpected guard status {status!r}"

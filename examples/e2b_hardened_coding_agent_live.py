@@ -62,6 +62,7 @@ class CodingProvider(ModelProvider):
                     name="write_file",
                     arguments={
                         "path": "solution.py",
+                        "mode": "create",
                         "content": (
                             "from math import factorial\n"
                             "from pathlib import Path\n"

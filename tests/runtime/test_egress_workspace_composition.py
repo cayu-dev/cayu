@@ -179,8 +179,10 @@ class _PlainSpoofWorkspace(Workspace):
     def __init__(self, runner: Runner) -> None:
         self.runner = runner
 
-    async def read_bytes(self, path: str, *, max_bytes: int | None = None) -> WorkspaceReadResult:
-        del path, max_bytes
+    async def read_bytes(
+        self, path: str, *, offset: int = 0, max_bytes: int | None = None
+    ) -> WorkspaceReadResult:
+        del path, offset, max_bytes
         raise NotImplementedError
 
     def bounded_read_limit(self, max_bytes: int) -> int:
@@ -192,6 +194,18 @@ class _PlainSpoofWorkspace(Workspace):
 
     async def delete(self, path: str) -> None:
         del path
+        raise NotImplementedError
+
+    async def create_bytes(self, path: str, content: bytes):
+        del path, content
+        raise NotImplementedError
+
+    async def replace_bytes(self, path: str, content: bytes, *, expected_revision: str):
+        del path, content, expected_revision
+        raise NotImplementedError
+
+    async def delete_if_revision(self, path: str, *, expected_revision: str):
+        del path, expected_revision
         raise NotImplementedError
 
     async def list(

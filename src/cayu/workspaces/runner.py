@@ -8,18 +8,27 @@ from typing import Any
 
 from cayu._validation import require_clean_nonblank, require_nonblank
 from cayu.runners import DEFAULT_EXEC_OUTPUT_LIMIT_BYTES, ExecCommand, LocalRunner, Runner
-from cayu.workspaces._guest_guard import GUEST_DESCRIPTOR_GUARD_SOURCE
+from cayu.workspaces._guest_guard import (
+    GUEST_DESCRIPTOR_GUARD_SOURCE,
+    guard_create,
+    guard_delete_if_revision,
+    guard_read,
+    guard_replace,
+)
 from cayu.workspaces._tar import tar_archive_size_bound
 from cayu.workspaces.base import (
     BoundedTarReader,
     RunnerBoundWorkspace,
     TarWriter,
     WorkspaceListResult,
+    WorkspaceMutationResult,
     WorkspaceReadResult,
     _local_resource_key,
     _runner_resource_key,
+    _validate_workspace_offset,
     _validate_workspace_positive_limit,
     _validate_workspace_relative_path,
+    _validate_workspace_revision,
     translate_list_pattern,
     validate_list_pattern,
 )
@@ -121,9 +130,10 @@ def write_operation(root_fd):
     content = base64.b64decode(payload["content_base64"], validate=True)
     parent_fd = None
     try:
-        parent_fd, leaf_name = open_path(root_fd, rel_path, create=True)
-        write_guarded_regular(leaf_name, parent_fd, (content,))
-        print(json.dumps({"ok": True, "bytes": len(content)}))
+        with workspace_path_lock(root_fd, rel_path):
+            parent_fd, leaf_name = open_path(root_fd, rel_path, create=True)
+            write_guarded_regular(leaf_name, parent_fd, (content,))
+            print(json.dumps({"ok": True, "bytes": len(content)}))
     except GuardPathError as exc:
         fail_guard(exc, rel_path)
     finally:
@@ -134,9 +144,10 @@ def delete_operation(root_fd):
     rel_path = sys.argv[2]
     parent_fd = None
     try:
-        parent_fd, leaf_name = open_path(root_fd, rel_path)
-        deleted = delete_guarded_regular(leaf_name, parent_fd)
-        print(json.dumps({"ok": True, "deleted": deleted}))
+        with workspace_path_lock(root_fd, rel_path):
+            parent_fd, leaf_name = open_path(root_fd, rel_path)
+            deleted = delete_guarded_regular(leaf_name, parent_fd)
+            print(json.dumps({"ok": True, "deleted": deleted}))
     except GuardPathError as exc:
         if exc.status in ("enoent", "notdir"):
             print(json.dumps({"ok": True, "deleted": False}))
@@ -492,6 +503,10 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
         return self._runner
 
     @property
+    def runner_cwd(self) -> str:
+        return self._runner.resolve_cwd(self.cwd)
+
+    @property
     def bound_runner_resource_key(self) -> tuple[object, ...] | None:
         return _runner_resource_key(self._runner)
 
@@ -505,28 +520,33 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
         self,
         path: str,
         *,
+        offset: int = 0,
         max_bytes: int | None = None,
     ) -> WorkspaceReadResult:
         path = _validate_relative_path(path)
+        offset = _validate_workspace_offset(offset, owner="RunnerWorkspace")
         limit = (
             self.default_read_limit_bytes
             if max_bytes is None
             else _validate_required_limit(max_bytes, "max_bytes")
         )
-        result = await self._run_json_operation(
-            "read",
-            path,
-            str(limit),
-            output_limit_bytes=_json_read_output_limit(limit),
+        content, total_bytes, revision, digest = await guard_read(
+            self._runner,
+            root=self._runner.resolve_cwd(self.cwd),
+            rel_path=path,
+            offset=offset,
+            limit=limit,
+            original_path=path,
+            backend="Runner",
+            python_executable=self.python_executable,
         )
-        content = _decode_base64(result["content_base64"], "content_base64")
-        total_bytes = result["total_bytes"]
-        if type(total_bytes) is not int:
-            raise TypeError("Runner workspace read returned invalid total_bytes.")
         return WorkspaceReadResult(
             content=content,
-            total_bytes=max(total_bytes, len(content)),
-            truncated=total_bytes > len(content),
+            total_bytes=max(total_bytes, offset + len(content)),
+            truncated=total_bytes > offset + len(content),
+            offset=offset,
+            revision=revision,
+            sha256=digest,
         )
 
     async def write_bytes(self, path: str, content: bytes) -> None:
@@ -549,6 +569,62 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
             "delete",
             path,
             output_limit_bytes=RUNNER_WORKSPACE_SCRIPT_OUTPUT_OVERHEAD_BYTES,
+        )
+
+    async def create_bytes(self, path: str, content: bytes) -> WorkspaceMutationResult:
+        path = _validate_relative_path(path)
+        if type(content) is not bytes:
+            raise TypeError("Workspace create content must be bytes.")
+        return await guard_create(
+            self._runner,
+            root=self._runner.resolve_cwd(self.cwd),
+            rel_path=path,
+            content=content,
+            original_path=path,
+            backend="Runner",
+            python_executable=self.python_executable,
+        )
+
+    async def replace_bytes(
+        self,
+        path: str,
+        content: bytes,
+        *,
+        expected_revision: str,
+    ) -> WorkspaceMutationResult:
+        path = _validate_relative_path(path)
+        if type(content) is not bytes:
+            raise TypeError("Workspace replace content must be bytes.")
+        return await guard_replace(
+            self._runner,
+            root=self._runner.resolve_cwd(self.cwd),
+            rel_path=path,
+            content=content,
+            expected_revision=_validate_workspace_revision(
+                expected_revision, owner="RunnerWorkspace"
+            ),
+            original_path=path,
+            backend="Runner",
+            python_executable=self.python_executable,
+        )
+
+    async def delete_if_revision(
+        self,
+        path: str,
+        *,
+        expected_revision: str,
+    ) -> WorkspaceMutationResult:
+        path = _validate_relative_path(path)
+        return await guard_delete_if_revision(
+            self._runner,
+            root=self._runner.resolve_cwd(self.cwd),
+            rel_path=path,
+            expected_revision=_validate_workspace_revision(
+                expected_revision, owner="RunnerWorkspace"
+            ),
+            original_path=path,
+            backend="Runner",
+            python_executable=self.python_executable,
         )
 
     async def list(

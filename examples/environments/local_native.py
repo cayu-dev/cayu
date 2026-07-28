@@ -49,7 +49,11 @@ class FakeProvider(ModelProvider):
                 ModelStreamEvent.tool_call(
                     id="call_1",
                     name="write_file",
-                    arguments={"path": "notes/result.txt", "content": "native ok"},
+                    arguments={
+                        "path": "notes/result.txt",
+                        "content": "native ok",
+                        "mode": "create",
+                    },
                 ),
                 ModelStreamEvent.tool_call(
                     id="call_2", name="list_files", arguments={"pattern": "**/*.txt"}

@@ -46,10 +46,10 @@ class _UnusedRuntime:
 
 
 class _OperationalValueErrorWorkspace(LocalWorkspace):
-    async def read_bytes(self, path, *, max_bytes=None):
+    async def read_bytes(self, path, *, offset=0, max_bytes=None):
         raise ValueError("workspace read failed")
 
-    async def write_bytes(self, path, content):
+    async def create_bytes(self, path, content):
         raise ValueError("workspace write failed")
 
     async def list(self, pattern="**/*", *, limit=None):
@@ -188,7 +188,9 @@ def test_write_file_invalid_arguments_return_structured_error(tmp_path):
     _assert_invalid_arguments(result, match="must be a string")
 
     result = asyncio.run(
-        WriteFileTool().run(ctx, {"path": "a.txt", "content": "x", "max_bytes": 0})
+        WriteFileTool().run(
+            ctx, {"path": "a.txt", "content": "x", "mode": "create", "max_bytes": 0}
+        )
     )
     _assert_invalid_arguments(result, match="greater than zero")
 
@@ -324,7 +326,9 @@ def test_workspace_operational_value_errors_propagate(tmp_path):
         asyncio.run(ReadFileTool().run(ctx, {"path": "notes.txt"}))
 
     with pytest.raises(ValueError, match="workspace write failed"):
-        asyncio.run(WriteFileTool().run(ctx, {"path": "notes.txt", "content": "hello"}))
+        asyncio.run(
+            WriteFileTool().run(ctx, {"path": "notes.txt", "content": "hello", "mode": "create"})
+        )
 
     with pytest.raises(ValueError, match="workspace list failed"):
         asyncio.run(ListFilesTool().run(ctx, {}))

@@ -305,11 +305,34 @@ class WorkspaceHandle(Protocol):
     workspaces only need to implement the file operations tools rely on.
     """
 
-    async def read_bytes(self, path: str, *, max_bytes: int | None = None) -> Any: ...
+    async def read_bytes(
+        self,
+        path: str,
+        *,
+        offset: int = 0,
+        max_bytes: int | None = None,
+    ) -> Any: ...
 
     async def write_bytes(self, path: str, content: bytes) -> None: ...
 
     async def delete(self, path: str) -> None: ...
+
+    async def create_bytes(self, path: str, content: bytes) -> Any: ...
+
+    async def replace_bytes(
+        self,
+        path: str,
+        content: bytes,
+        *,
+        expected_revision: str,
+    ) -> Any: ...
+
+    async def delete_if_revision(
+        self,
+        path: str,
+        *,
+        expected_revision: str,
+    ) -> Any: ...
 
     async def list(self, pattern: str = "**/*", *, limit: int | None = None) -> Any: ...
 
