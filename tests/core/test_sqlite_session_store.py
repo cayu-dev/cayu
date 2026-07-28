@@ -34,6 +34,7 @@ from cayu.runtime.aggregates import AggregateUsageMetrics
 from cayu.runtime.pending_actions import pending_action_lookup_key
 from cayu.runtime.sessions import (
     BudgetReservationIdentityConflict,
+    ModelCompletionStageRequest,
     PendingActionQuery,
 )
 from cayu.storage import _sqlite_support as sqlite_support
@@ -3134,6 +3135,139 @@ def test_sqlite_prune_events_bounds_growth(tmp_path):
         await store.mark_persisted_event_side_effect_delivered(new_claim)
         assert await store.prune_events(before=datetime(2026, 4, 1, tzinfo=UTC)) == 1
         assert await store.load_events(session.id) == []
+        await _close(store)
+
+    asyncio.run(run())
+
+
+def test_sqlite_maintenance_preserves_active_model_completion_stage(tmp_path):
+    db_path = tmp_path / "sessions.sqlite"
+    store = SQLiteSessionStore(db_path)
+
+    async def run() -> None:
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_active_stage_retention",
+                messages=[],
+            ),
+            identity=_identity(),
+        )
+        messages = [Message.text("user", f"m{index}") for index in range(3)]
+        await store.append_transcript_messages(session.id, messages)
+        event = Event(
+            type=EventType.MODEL_STARTED,
+            session_id=session.id,
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+            payload={"step": 1},
+        )
+        await store.append_event(session.id, event)
+        claim = await store.claim_persisted_event_side_effect(
+            session_id=session.id,
+            event_id=event.id,
+        )
+        assert claim is not None
+        await store.mark_persisted_event_side_effect_delivered(claim)
+        running = await store.transition_status(
+            session.id,
+            from_statuses={SessionStatus.PENDING},
+            to_status=SessionStatus.RUNNING,
+        )
+        await store.prepare_model_completion_stage(
+            session.id,
+            request=ModelCompletionStageRequest(
+                stage_id="retention-stage",
+                logical_step_id="retention-step",
+                dispatch_ordinal=0,
+                intent={"request_fingerprint": "retention"},
+            ),
+            expected_statuses={SessionStatus.RUNNING},
+            expected_run_epoch=running.run_epoch,
+            expected_transcript_cursor=len(messages),
+        )
+
+        assert (
+            await store.prune_events(
+                before=datetime(2026, 2, 1, tzinfo=UTC),
+                session_id=session.id,
+            )
+            == 0
+        )
+        assert await store.compact_transcript(session.id, keep_last=0) == 0
+        assert await store.load_events(session.id) == [event]
+        assert await store.load_transcript(session.id) == messages
+        await _close(store)
+
+    asyncio.run(run())
+
+
+def test_sqlite_maintenance_preserves_pending_tool_round(tmp_path):
+    db_path = tmp_path / "sessions.sqlite"
+    store = SQLiteSessionStore(db_path)
+
+    async def run() -> None:
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_pending_round_retention",
+                messages=[],
+            ),
+            identity=_identity(),
+        )
+        messages = [Message.text("user", f"m{index}") for index in range(3)]
+        await store.append_transcript_messages(session.id, messages)
+        round_id = "retention-round"
+        tool_call_id = "retention-call"
+        await store.checkpoint(
+            session.id,
+            {
+                "pending_tool_round": {
+                    "round_id": round_id,
+                    "agent_name": "assistant",
+                    "tool_calls": [
+                        {
+                            "tool_call_id": tool_call_id,
+                            "tool_name": "read_file",
+                            "arguments": {},
+                        }
+                    ],
+                }
+            },
+        )
+        event = Event(
+            type=EventType.TOOL_CALL_COMPLETED,
+            session_id=session.id,
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+            tool_name="read_file",
+            payload={
+                "tool_call_id": tool_call_id,
+                "tool_round_id": round_id,
+                "result": {
+                    "content": "done",
+                    "structured": None,
+                    "artifacts": [],
+                    "is_error": False,
+                },
+            },
+        )
+        await store.append_event(session.id, event)
+        claim = await store.claim_persisted_event_side_effect(
+            session_id=session.id,
+            event_id=event.id,
+        )
+        assert claim is not None
+        await store.mark_persisted_event_side_effect_delivered(claim)
+
+        assert (
+            await store.prune_events(
+                before=datetime(2026, 2, 1, tzinfo=UTC),
+                session_id=session.id,
+            )
+            == 0
+        )
+        assert await store.compact_transcript(session.id, keep_last=0) == 0
+        assert await store.load_events(session.id) == [event]
+        assert await store.load_transcript(session.id) == messages
         await _close(store)
 
     asyncio.run(run())
