@@ -733,6 +733,7 @@ def test_sse_serialization_matches_contract_envelope() -> None:
         id="event_1",
         type=EventType.TOOL_CALL_COMPLETED,
         session_id="session_1",
+        interaction_id="interaction_1",
         agent_name="assistant",
         environment_name="production",
         workflow_name="review",
@@ -745,6 +746,7 @@ def test_sse_serialization_matches_contract_envelope() -> None:
     assert data["id"] == "event_1"
     assert data["type"] == "tool.call.completed"
     assert data["session_id"] == "session_1"
+    assert data["interaction_id"] == "interaction_1"
     assert data["agent_name"] == "assistant"
     assert data["environment_name"] == "production"
     assert data["workflow_name"] == "review"

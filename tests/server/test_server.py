@@ -75,6 +75,7 @@ from cayu.runtime import (
     PendingActionIssueCode,
     PendingActionListResult,
     PersistedEventSideEffectStatus,
+    ResumeRequest,
     RunRequest,
     SessionIdentity,
     SessionListResult,
@@ -674,10 +675,12 @@ def test_server_run_environment_factory_failure_terminalizes_linked_task() -> No
         events = [frame["data"] for frame in _sse_frames(response) if "data" in frame]
 
     assert [event["type"] for event in events] == [
+        EventType.INTERACTION_STARTED,
         EventType.ENVIRONMENT_FACTORY_STARTED,
         EventType.TASK_STARTED,
         EventType.ENVIRONMENT_FACTORY_FAILED,
         EventType.TASK_FAILED,
+        EventType.INTERACTION_FAILED,
         EventType.SESSION_FAILED,
     ]
     tasks = asyncio.run(task_store.list_tasks())
@@ -737,10 +740,12 @@ def test_server_run_binding_failure_terminalizes_prestarted_task() -> None:
         events = [frame["data"] for frame in _sse_frames(response) if "data" in frame]
 
     assert [event["type"] for event in events] == [
+        EventType.INTERACTION_STARTED,
         EventType.ENVIRONMENT_BINDING_STARTED,
         EventType.TASK_STARTED,
         EventType.ENVIRONMENT_BINDING_FAILED,
         EventType.TASK_FAILED,
+        EventType.INTERACTION_FAILED,
         EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
@@ -4684,8 +4689,10 @@ def test_server_exposes_session_summary() -> None:
     assert body["session"]["model"] == "fake-model"
     assert body["session"]["environment_name"] is None
     assert "interruption_cascade" not in body
-    assert body["events"]["total_events"] == 6
+    assert body["events"]["total_events"] == 8
     assert body["events"]["counts_by_type"] == {
+        "interaction.completed": 1,
+        "interaction.started": 1,
         "model.completed": 1,
         "model.started": 1,
         "model.text.delta": 1,
@@ -4953,6 +4960,7 @@ def test_server_exposes_paginated_session_events() -> None:
         "id": "event_2",
         "type": "tool.call.completed",
         "session_id": "events_1",
+        "interaction_id": None,
         "agent_name": "assistant",
         "environment_name": None,
         "workflow_name": None,
@@ -5317,6 +5325,12 @@ def test_server_exposes_paginated_session_transcript() -> None:
                     tool_name="read_file",
                     arguments={"path": "notes/result.txt"},
                 ),
+            ],
+            interaction_id="interaction_1",
+        )
+        await app.session_store.append_transcript_messages(
+            "transcript_1",
+            [
                 Message.tool_result(
                     tool_call_id="call_1",
                     tool_name="read_file",
@@ -5327,6 +5341,7 @@ def test_server_exposes_paginated_session_transcript() -> None:
                 ),
                 Message.text("assistant", "done"),
             ],
+            interaction_id="interaction_2",
         )
 
     asyncio.run(seed_transcript())
@@ -5348,6 +5363,10 @@ def test_server_exposes_paginated_session_transcript() -> None:
     assert first_body["total_messages"] == 4
     assert [message["index"] for message in first_body["messages"]] == [0, 1]
     assert [message["role"] for message in first_body["messages"]] == ["user", "assistant"]
+    assert [message["interaction_id"] for message in first_body["messages"]] == [
+        "interaction_1",
+        "interaction_1",
+    ]
     assert first_body["messages"][1]["content"] == [
         {
             "type": "tool_call",
@@ -5363,10 +5382,124 @@ def test_server_exposes_paginated_session_transcript() -> None:
     assert second_body["next_offset"] == 4
     assert second_body["has_more"] is False
     assert [message["role"] for message in second_body["messages"]] == ["tool", "assistant"]
+    assert [message["interaction_id"] for message in second_body["messages"]] == [
+        "interaction_2",
+        "interaction_2",
+    ]
     result_content = second_body["messages"][0]["content"][0]
     assert result_content["model_step_id"] == f"mstep_{'1' * 32}"
     assert result_content["model_attempt_id"] == f"matt_{'2' * 32}"
     assert result_content["tool_round_id"] == f"tround_{'3' * 32}"
+
+    interaction_page = client.get(
+        "/api/sessions/transcript_1/transcript?interaction_id=interaction_2"
+    )
+    assert interaction_page.status_code == 200
+    assert [message["index"] for message in interaction_page.json()["messages"]] == [2, 3]
+
+
+def test_server_exposes_response_scoped_interaction_summaries() -> None:
+    app = CayuApp()
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def seed_interactions() -> None:
+        await _collect_run(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="interaction_summary_1",
+                messages=[Message.text("user", "first")],
+            ),
+        )
+        _ = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id="interaction_summary_1",
+                    messages=[Message.text("user", "second")],
+                )
+            )
+        ]
+        await _collect_run(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="interaction_summary_other",
+                messages=[Message.text("user", "other")],
+            ),
+        )
+
+    asyncio.run(seed_interactions())
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    response = client.get("/api/sessions/interaction_summary_1/interactions?limit=10")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["session_id"] == "interaction_summary_1"
+    assert body["has_more"] is False
+    assert len(body["interactions"]) == 2
+    assert [item["status"] for item in body["interactions"]] == [
+        "completed",
+        "completed",
+    ]
+    first = body["interactions"][1]
+    second = body["interactions"][0]
+    assert first["interaction_id"] != second["interaction_id"]
+    assert first["source_transcript_start"] == 0
+    assert first["result_transcript_end"] == 1
+    assert second["source_transcript_start"] == 2
+    assert second["result_transcript_end"] == 3
+    assert first["model_step_count"] == 1
+    assert first["tool_call_count"] == 0
+    assert first["active_duration_ms"] >= 0
+
+    newest_page = client.get("/api/sessions/interaction_summary_1/interactions?limit=1").json()
+    assert newest_page["has_more"] is True
+    older_page = client.get(
+        "/api/sessions/interaction_summary_1/interactions",
+        params={"limit": 1, "before_sequence": newest_page["next_sequence"]},
+    ).json()
+    assert older_page["has_more"] is False
+    assert [
+        newest_page["interactions"][0]["interaction_id"],
+        older_page["interactions"][0]["interaction_id"],
+    ] == [second["interaction_id"], first["interaction_id"]]
+
+    detail = client.get(
+        f"/api/sessions/interaction_summary_1/interactions/{first['interaction_id']}"
+    )
+    assert detail.status_code == 200
+    assert detail.json() == first
+    events = client.get(
+        f"/api/sessions/interaction_summary_1/events?interaction_id={first['interaction_id']}"
+    ).json()["events"]
+    assert events
+    assert {event["interaction_id"] for event in events} == {first["interaction_id"]}
+    transcript = client.get(
+        f"/api/sessions/interaction_summary_1/transcript?interaction_id={first['interaction_id']}"
+    ).json()["messages"]
+    assert [message["index"] for message in transcript] == [0, 1]
+    assert (
+        client.get(
+            f"/api/sessions/interaction_summary_other/interactions/{first['interaction_id']}"
+        ).status_code
+        == 404
+    )
+    assert (
+        client.get(
+            "/api/sessions/interaction_summary_1/events",
+            params={"interaction_id": " "},
+        ).status_code
+        == 422
+    )
+    assert (
+        client.get(
+            "/api/sessions/interaction_summary_1/transcript",
+            params={"interaction_id": " "},
+        ).status_code
+        == 422
+    )
 
 
 def test_server_filters_session_transcript_by_role() -> None:
@@ -7076,7 +7209,10 @@ def test_interrupt_after_acceptance_before_observer_start_reaches_runtime() -> N
 
     assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
     observed_types = [json.loads(message["data"])["type"] for message in observed]
-    assert observed_types[0] == EventType.SESSION_STARTED
+    assert observed_types[:2] == [
+        EventType.INTERACTION_STARTED,
+        EventType.SESSION_STARTED,
+    ]
     assert observed_types[-1] == EventType.SESSION_INTERRUPTED
     assert status is SessionStatus.INTERRUPTED
 
@@ -7143,7 +7279,10 @@ def test_interrupt_before_observer_start_cancels_environment_factory() -> None:
 
     assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
     observed_types = [json.loads(message["data"])["type"] for message in observed]
-    assert observed_types[0] == EventType.ENVIRONMENT_FACTORY_STARTED
+    assert observed_types[:2] == [
+        EventType.INTERACTION_STARTED,
+        EventType.ENVIRONMENT_FACTORY_STARTED,
+    ]
     assert observed_types[-1] == EventType.SESSION_INTERRUPTED
     assert status is SessionStatus.INTERRUPTED
 
@@ -7215,7 +7354,10 @@ def test_interrupt_during_run_acceptance_finishes_task_bookkeeping() -> None:
 
     assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
     observed_types = [json.loads(message["data"])["type"] for message in observed]
-    assert observed_types[0] == EventType.SESSION_STARTED
+    assert observed_types[:2] == [
+        EventType.INTERACTION_STARTED,
+        EventType.SESSION_STARTED,
+    ]
     assert observed_types[-1] == EventType.SESSION_INTERRUPTED
     assert status is SessionStatus.INTERRUPTED
 
@@ -7717,6 +7859,9 @@ def test_run_stream_carries_resumable_event_ids_and_replays_on_last_event_id() -
     assert [frame["data"]["id"] for frame in replayed] == [
         frame["data"]["id"] for frame in frames[1:]
     ]
+    assert [frame["data"]["interaction_id"] for frame in replayed] == [
+        frame["data"]["interaction_id"] for frame in frames[1:]
+    ]
     assert replayed[-1]["data"]["type"] == "session.completed"
     assert queries[0].event_id == frames[0]["data"]["id"]
     assert queries[1].limit == SSE_REPLAY_PAGE_EVENTS
@@ -7743,6 +7888,9 @@ def test_run_stream_carries_resumable_event_ids_and_replays_on_last_event_id() -
         replayed_from_start = [frame for frame in _sse_frames(response) if "data" in frame]
     assert [frame["data"]["id"] for frame in replayed_from_start] == [
         frame["data"]["id"] for frame in frames
+    ]
+    assert [frame["data"]["interaction_id"] for frame in replayed_from_start] == [
+        frame["data"]["interaction_id"] for frame in frames
     ]
 
     with client.stream(
@@ -7788,6 +7936,8 @@ def test_streaming_mutation_id_creates_an_exact_durable_acceptance_event() -> No
     assert len(markers) == 1
     marker = markers[0]
     assert marker["session_id"] == session_id
+    assert marker["interaction_id"] == frames[0]["data"]["interaction_id"]
+    assert marker["interaction_id"] is not None
     assert marker["payload"] == {
         "mutation_id": mutation_id,
         "mutation_kind": "run",
@@ -7801,6 +7951,7 @@ def test_streaming_mutation_id_creates_an_exact_durable_acceptance_event() -> No
         params={"event_type": EventType.SERVER_MUTATION_ACCEPTED},
     ).json()["events"]
     assert [event["id"] for event in events] == [marker["id"]]
+    assert events[0]["interaction_id"] == marker["interaction_id"]
 
 
 def test_streaming_mutation_id_header_rejects_unsafe_values_before_execution() -> None:
@@ -8251,13 +8402,13 @@ def test_concurrent_client_run_identity_creates_one_session_and_one_task() -> No
             self.claims = 0
             self.both_claiming = asyncio.Event()
 
-        async def create(self, request, *, identity):
+        async def create(self, request, *, identity, **kwargs):
             if request.session_id == "session_concurrent_claim":
                 self.claims += 1
                 if self.claims == 2:
                     self.both_claiming.set()
                 await self.both_claiming.wait()
-            return await super().create(request, identity=identity)
+            return await super().create(request, identity=identity, **kwargs)
 
     store = CoordinatedRunStore()
     task_store = InMemoryTaskStore()

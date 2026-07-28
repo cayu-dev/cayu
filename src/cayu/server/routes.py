@@ -79,6 +79,11 @@ from cayu.runtime.costs import (
 from cayu.runtime.costs import (
     estimate_session_cost as build_session_cost_summary,
 )
+from cayu.runtime.interactions import (
+    INTERACTION_LIFECYCLE_EVENT_TYPES,
+    INTERACTION_TERMINAL_EVENT_TYPES,
+    InteractionSummaryEvidence,
+)
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.sessions import (
     SESSION_MESSAGE_CONTENT_MAX_BYTES,
@@ -146,6 +151,7 @@ from cayu.server.contracts import (
     SESSION_TOPOLOGY_ENDPOINT_RESPONSES,
     STREAMING_ENDPOINT_RESPONSES,
     AgentsResponse,
+    ApiInteractionSummary,
     ApiReviewedKnowledgeEntry,
     ApiSession,
     ApiTaskDetail,
@@ -157,6 +163,7 @@ from cayu.server.contracts import (
     EnvironmentsResponse,
     HealthResponse,
     ListSessionEventsResponse,
+    ListSessionInteractionsResponse,
     ListSessionsResponse,
     OperationalSnapshotRequest,
     OperationalSnapshotResponse,
@@ -1269,6 +1276,7 @@ def _serialize_event_record(cayu_app: Any, record: EventRecord) -> dict[str, Any
             "id": event.id,
             "type": str(event.type),
             "session_id": event.session_id,
+            "interaction_id": event.interaction_id,
             "agent_name": event.agent_name,
             "environment_name": event.environment_name,
             "workflow_name": event.workflow_name,
@@ -1284,6 +1292,30 @@ def _serialize_event_record(cayu_app: Any, record: EventRecord) -> dict[str, Any
     if type(event_id) is str and len(event_id) > EVENT_ID_MAX_CHARS:
         serialized["id"] = event_id[:EVENT_ID_MAX_CHARS]
     return serialized
+
+
+def _serialize_interaction_record(cayu_app: Any, record: EventRecord) -> dict[str, Any]:
+    event = record.event
+    interaction_id = event.interaction_id
+    if interaction_id is None:
+        raise RuntimeError("Interaction lifecycle event has no interaction identity.")
+    evidence = InteractionSummaryEvidence.model_validate(event.payload)
+    terminal = event.type in INTERACTION_TERMINAL_EVENT_TYPES
+    return _redact_control_plane_values(
+        cayu_app,
+        {
+            "interaction_id": interaction_id,
+            "session_id": event.session_id,
+            **evidence.model_dump(mode="json"),
+            "start_event_sequence": evidence.start_event_sequence or record.sequence,
+            "terminal_event_id": event.id if terminal else None,
+            "terminal_event_sequence": record.sequence if terminal else None,
+            "updated_at": event.timestamp.isoformat(),
+        },
+        "interaction",
+        preserve_string_fields={"completed_at", "started_at", "status", "updated_at"},
+        untrusted_container_fields={"models", "provider_names", "token_usage"},
+    )
 
 
 def _serialize_session_outcome(cayu_app: Any, outcome: SessionOutcome) -> dict[str, Any]:
@@ -2053,9 +2085,11 @@ def _serialize_transcript_message(
     cayu_app: Any,
     index: int,
     message: Message,
+    interaction_id: str | None,
 ) -> dict[str, Any]:
     return {
         "index": index,
+        "interaction_id": interaction_id,
         "role": str(message.role),
         "content": [_serialize_message_part(cayu_app, part) for part in message.content],
     }
@@ -4361,6 +4395,57 @@ def create_router(
             after_sequence = page[-1].sequence
 
     @router.get(
+        "/sessions/{session_id}/interactions",
+        response_model=ListSessionInteractionsResponse,
+        dependencies=protected,
+    )
+    async def list_session_interactions(
+        session_id: NonBlankString,
+        before_sequence: int | None = Query(default=None, ge=1),
+        limit: int = Query(default=50, ge=1, le=100),
+    ):
+        state = await session_store.load_state(session_id)
+        if state is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        records = await session_store.query_latest_interaction_events(
+            session_id,
+            before_sequence=before_sequence,
+            limit=limit + 1,
+        )
+        page = records[:limit]
+        return {
+            "session_id": session_id,
+            "interactions": [_serialize_interaction_record(cayu_app, record) for record in page],
+            "next_sequence": page[-1].sequence if page else before_sequence,
+            "has_more": len(records) > limit,
+        }
+
+    @router.get(
+        "/sessions/{session_id}/interactions/{interaction_id}",
+        response_model=ApiInteractionSummary,
+        dependencies=protected,
+    )
+    async def get_session_interaction(
+        session_id: NonBlankString,
+        interaction_id: NonBlankString,
+    ):
+        state = await session_store.load_state(session_id)
+        if state is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        records = await session_store.query_events(
+            EventQuery(
+                session_id=session_id,
+                interaction_id=interaction_id,
+                event_types=INTERACTION_LIFECYCLE_EVENT_TYPES,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=1,
+            )
+        )
+        if not records:
+            raise HTTPException(status_code=404, detail="Interaction not found")
+        return _serialize_interaction_record(cayu_app, records[0])
+
+    @router.get(
         "/sessions/{session_id}/events",
         response_model=ListSessionEventsResponse,
         dependencies=protected,
@@ -4372,6 +4457,10 @@ def create_router(
             description="Return the event with this exact session-scoped event ID, if it exists.",
         ),
         event_type: str | None = None,
+        interaction_id: str | None = Query(
+            default=None,
+            description="Return only events attributed to this interaction.",
+        ),
         exclude_event_type: str | None = Query(
             default=None,
             description="Exclude one event type before applying pagination.",
@@ -4405,6 +4494,7 @@ def create_router(
             for value in (
                 event_id,
                 event_type,
+                interaction_id,
                 exclude_event_type,
                 tool_name,
                 agent_name,
@@ -4417,6 +4507,7 @@ def create_router(
                 session_id=session_id,
                 event_id=event_id,
                 event_type=event_type,
+                interaction_id=interaction_id,
                 exclude_event_types=(exclude_event_type,) if exclude_event_type is not None else (),
                 tool_name=tool_name,
                 agent_name=agent_name,
@@ -4487,6 +4578,10 @@ def create_router(
     async def get_session_transcript(
         session_id: NonBlankString,
         role: MessageRole | None = None,
+        interaction_id: Annotated[
+            NonBlankString | None,
+            Query(description="Return only transcript records attributed to this interaction."),
+        ] = None,
         offset: int = Query(default=0, ge=0),
         limit: int = Query(default=100, ge=1, le=_TRANSCRIPT_PAGE_LIMIT_MAX),
         include_thinking: bool = Query(default=True),
@@ -4499,6 +4594,7 @@ def create_router(
             TranscriptQuery(
                 session_id=session_id,
                 role=role,
+                interaction_id=interaction_id,
                 offset=offset,
                 limit=limit,
                 include_thinking=include_thinking,
@@ -4513,7 +4609,12 @@ def create_router(
         return {
             "session_id": session_id,
             "messages": [
-                _serialize_transcript_message(cayu_app, record.index, record.message)
+                _serialize_transcript_message(
+                    cayu_app,
+                    record.index,
+                    record.message,
+                    record.interaction_id,
+                )
                 for record in transcript_page.records
             ],
             "offset": offset,

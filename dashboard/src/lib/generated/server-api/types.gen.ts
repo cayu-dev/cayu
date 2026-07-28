@@ -369,6 +369,10 @@ export type ApiEventRecord = {
      */
     id: string;
     /**
+     * Interaction Id
+     */
+    interaction_id: string | null;
+    /**
      * Payload
      */
     payload: {
@@ -415,6 +419,94 @@ export type ApiEventSummary = {
      * Total Events
      */
     total_events: number;
+};
+
+/**
+ * ApiInteractionSummary
+ */
+export type ApiInteractionSummary = {
+    /**
+     * Active Duration Ms
+     */
+    active_duration_ms?: number;
+    /**
+     * Completed At
+     */
+    completed_at?: string | null;
+    /**
+     * Interaction Id
+     */
+    interaction_id: string;
+    /**
+     * Model Step Count
+     */
+    model_step_count?: number;
+    /**
+     * Models
+     */
+    models?: Array<string>;
+    /**
+     * Pending Action Kind
+     */
+    pending_action_kind?: string | null;
+    /**
+     * Provider Names
+     */
+    provider_names?: Array<string>;
+    /**
+     * Result Transcript End
+     */
+    result_transcript_end?: number | null;
+    /**
+     * Result Transcript Start
+     */
+    result_transcript_start?: number | null;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Source Transcript End
+     */
+    source_transcript_end?: number | null;
+    /**
+     * Source Transcript Start
+     */
+    source_transcript_start?: number | null;
+    /**
+     * Start Event Id
+     */
+    start_event_id: string;
+    /**
+     * Start Event Sequence
+     */
+    start_event_sequence?: number | null;
+    /**
+     * Started At
+     */
+    started_at: string;
+    status: InteractionStatus;
+    /**
+     * Terminal Event Id
+     */
+    terminal_event_id: string | null;
+    /**
+     * Terminal Event Sequence
+     */
+    terminal_event_sequence?: number | null;
+    token_usage?: AggregateUsageMetrics;
+    /**
+     * Tool Call Count
+     */
+    tool_call_count?: number;
+    /**
+     * Updated At
+     */
+    updated_at: string;
+    /**
+     * Wall Duration Ms
+     */
+    wall_duration_ms?: number | null;
 };
 
 /**
@@ -1175,6 +1267,10 @@ export type ApiTranscriptMessage = {
      */
     index: number;
     /**
+     * Interaction Id
+     */
+    interaction_id: string | null;
+    /**
      * Role
      */
     role: string;
@@ -1805,6 +1901,11 @@ export type HealthResponse = {
 };
 
 /**
+ * InteractionStatus
+ */
+export type InteractionStatus = 'active' | 'paused' | 'completed' | 'failed' | 'interrupted';
+
+/**
  * InterruptSessionBody
  */
 export type InterruptSessionBody = {
@@ -1876,6 +1977,28 @@ export type ListSessionEventsResponse = {
      * Highest durable sequence that a forward tail reader can safely pass as after_sequence. This can be newer than next_sequence when filters exclude events.
      */
     scan_through_sequence: number | null;
+    /**
+     * Session Id
+     */
+    session_id: string;
+};
+
+/**
+ * ListSessionInteractionsResponse
+ */
+export type ListSessionInteractionsResponse = {
+    /**
+     * Has More
+     */
+    has_more: boolean;
+    /**
+     * Interactions
+     */
+    interactions: Array<ApiInteractionSummary>;
+    /**
+     * Next Sequence
+     */
+    next_sequence: number | null;
     /**
      * Session Id
      */
@@ -3040,6 +3163,10 @@ export type SseEventEnvelope = {
      * Id
      */
     id: string;
+    /**
+     * Interaction Id
+     */
+    interaction_id: string | null;
     /**
      * Payload
      */
@@ -5175,6 +5302,12 @@ export type ListSessionEventsApiSessionsSessionIdEventsGetData = {
          */
         event_type?: string | null;
         /**
+         * Interaction Id
+         *
+         * Return only events attributed to this interaction.
+         */
+        interaction_id?: string | null;
+        /**
          * Exclude Event Type
          *
          * Exclude one event type before applying pagination.
@@ -5237,6 +5370,79 @@ export type ListSessionEventsApiSessionsSessionIdEventsGetResponses = {
 };
 
 export type ListSessionEventsApiSessionsSessionIdEventsGetResponse = ListSessionEventsApiSessionsSessionIdEventsGetResponses[keyof ListSessionEventsApiSessionsSessionIdEventsGetResponses];
+
+export type ListSessionInteractionsApiSessionsSessionIdInteractionsGetData = {
+    body?: never;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: {
+        /**
+         * Before Sequence
+         */
+        before_sequence?: number | null;
+        /**
+         * Limit
+         */
+        limit?: number;
+    };
+    url: '/api/sessions/{session_id}/interactions';
+};
+
+export type ListSessionInteractionsApiSessionsSessionIdInteractionsGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ListSessionInteractionsApiSessionsSessionIdInteractionsGetError = ListSessionInteractionsApiSessionsSessionIdInteractionsGetErrors[keyof ListSessionInteractionsApiSessionsSessionIdInteractionsGetErrors];
+
+export type ListSessionInteractionsApiSessionsSessionIdInteractionsGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: ListSessionInteractionsResponse;
+};
+
+export type ListSessionInteractionsApiSessionsSessionIdInteractionsGetResponse = ListSessionInteractionsApiSessionsSessionIdInteractionsGetResponses[keyof ListSessionInteractionsApiSessionsSessionIdInteractionsGetResponses];
+
+export type GetSessionInteractionApiSessionsSessionIdInteractionsInteractionIdGetData = {
+    body?: never;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+        /**
+         * Interaction Id
+         */
+        interaction_id: string;
+    };
+    query?: never;
+    url: '/api/sessions/{session_id}/interactions/{interaction_id}';
+};
+
+export type GetSessionInteractionApiSessionsSessionIdInteractionsInteractionIdGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type GetSessionInteractionApiSessionsSessionIdInteractionsInteractionIdGetError = GetSessionInteractionApiSessionsSessionIdInteractionsInteractionIdGetErrors[keyof GetSessionInteractionApiSessionsSessionIdInteractionsInteractionIdGetErrors];
+
+export type GetSessionInteractionApiSessionsSessionIdInteractionsInteractionIdGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: ApiInteractionSummary;
+};
+
+export type GetSessionInteractionApiSessionsSessionIdInteractionsInteractionIdGetResponse = GetSessionInteractionApiSessionsSessionIdInteractionsInteractionIdGetResponses[keyof GetSessionInteractionApiSessionsSessionIdInteractionsInteractionIdGetResponses];
 
 export type InterruptSessionApiSessionsSessionIdInterruptPostData = {
     /**
@@ -5520,6 +5726,12 @@ export type GetSessionTranscriptApiSessionsSessionIdTranscriptGetData = {
          * Role
          */
         role?: MessageRole | null;
+        /**
+         * Interaction Id
+         *
+         * Return only transcript records attributed to this interaction.
+         */
+        interaction_id?: string | null;
         /**
          * Offset
          */

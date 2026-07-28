@@ -636,6 +636,17 @@
           "title": "Id",
           "type": "string"
         },
+        "interaction_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Interaction Id"
+        },
         "payload": {
           "additionalProperties": true,
           "title": "Payload",
@@ -686,6 +697,7 @@
         "id",
         "type",
         "session_id",
+        "interaction_id",
         "agent_name",
         "environment_name",
         "workflow_name",
@@ -728,6 +740,200 @@
         "latest_event"
       ],
       "title": "ApiEventSummary",
+      "type": "object"
+    },
+    "ApiInteractionSummary": {
+      "additionalProperties": false,
+      "properties": {
+        "active_duration_ms": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Active Duration Ms",
+          "type": "integer"
+        },
+        "completed_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Completed At"
+        },
+        "interaction_id": {
+          "title": "Interaction Id",
+          "type": "string"
+        },
+        "model_step_count": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Model Step Count",
+          "type": "integer"
+        },
+        "models": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Models",
+          "type": "array"
+        },
+        "pending_action_kind": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Pending Action Kind"
+        },
+        "provider_names": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Provider Names",
+          "type": "array"
+        },
+        "result_transcript_end": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Result Transcript End"
+        },
+        "result_transcript_start": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Result Transcript Start"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        },
+        "source_transcript_end": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source Transcript End"
+        },
+        "source_transcript_start": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source Transcript Start"
+        },
+        "start_event_id": {
+          "title": "Start Event Id",
+          "type": "string"
+        },
+        "start_event_sequence": {
+          "anyOf": [
+            {
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Start Event Sequence"
+        },
+        "started_at": {
+          "format": "date-time",
+          "title": "Started At",
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/components/schemas/InteractionStatus"
+        },
+        "terminal_event_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Terminal Event Id"
+        },
+        "terminal_event_sequence": {
+          "anyOf": [
+            {
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Terminal Event Sequence"
+        },
+        "token_usage": {
+          "$ref": "#/components/schemas/AggregateUsageMetrics"
+        },
+        "tool_call_count": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Tool Call Count",
+          "type": "integer"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "title": "Updated At",
+          "type": "string"
+        },
+        "wall_duration_ms": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Wall Duration Ms"
+        }
+      },
+      "required": [
+        "status",
+        "start_event_id",
+        "started_at",
+        "interaction_id",
+        "session_id",
+        "terminal_event_id",
+        "updated_at"
+      ],
+      "title": "ApiInteractionSummary",
       "type": "object"
     },
     "ApiKnowledgeChunk": {
@@ -2224,6 +2430,17 @@
           "title": "Index",
           "type": "integer"
         },
+        "interaction_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Interaction Id"
+        },
         "role": {
           "title": "Role",
           "type": "string"
@@ -2231,6 +2448,7 @@
       },
       "required": [
         "index",
+        "interaction_id",
         "role",
         "content"
       ],
@@ -3440,6 +3658,17 @@
       "title": "HealthResponse",
       "type": "object"
     },
+    "InteractionStatus": {
+      "enum": [
+        "active",
+        "paused",
+        "completed",
+        "failed",
+        "interrupted"
+      ],
+      "title": "InteractionStatus",
+      "type": "string"
+    },
     "InterruptSessionBody": {
       "properties": {
         "metadata": {
@@ -3583,6 +3812,46 @@
         "has_more"
       ],
       "title": "ListSessionEventsResponse",
+      "type": "object"
+    },
+    "ListSessionInteractionsResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "has_more": {
+          "title": "Has More",
+          "type": "boolean"
+        },
+        "interactions": {
+          "items": {
+            "$ref": "#/components/schemas/ApiInteractionSummary"
+          },
+          "title": "Interactions",
+          "type": "array"
+        },
+        "next_sequence": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Next Sequence"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "interactions",
+        "next_sequence",
+        "has_more"
+      ],
+      "title": "ListSessionInteractionsResponse",
       "type": "object"
     },
     "ListSessionsResponse": {
@@ -5716,6 +5985,17 @@
           "title": "Id",
           "type": "string"
         },
+        "interaction_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Interaction Id"
+        },
         "payload": {
           "additionalProperties": true,
           "title": "Payload",
@@ -5760,6 +6040,7 @@
         "id",
         "type",
         "session_id",
+        "interaction_id",
         "agent_name",
         "tool_name",
         "payload",
@@ -9870,6 +10151,23 @@
           },
           {
             "in": "query",
+            "name": "interaction_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Return only events attributed to this interaction.",
+              "title": "Interaction Id"
+            }
+          },
+          {
+            "in": "query",
             "name": "limit",
             "required": false,
             "schema": {
@@ -9931,6 +10229,117 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/ListSessionEventsResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/sessions/{session_id}/interactions": {
+      "get": {
+        "operation_id": "list_session_interactions_api_sessions__session_id__interactions_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "before_sequence",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Before Sequence"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ListSessionInteractionsResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/sessions/{session_id}/interactions/{interaction_id}": {
+      "get": {
+        "operation_id": "get_session_interaction_api_sessions__session_id__interactions__interaction_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "interaction_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Interaction Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiInteractionSummary"
               }
             }
           },
@@ -10362,6 +10771,24 @@
               "default": true,
               "title": "Include Thinking",
               "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "interaction_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Return only transcript records attributed to this interaction.",
+              "title": "Interaction Id"
             }
           },
           {

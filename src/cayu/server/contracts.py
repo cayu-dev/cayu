@@ -33,6 +33,7 @@ from cayu.runtime.costs import (
     PriceBook,
     SessionCostSummary,
 )
+from cayu.runtime.interactions import InteractionSummaryEvidence
 from cayu.runtime.sessions import (
     MAX_USAGE_ROLLUP_WINDOW,
     SESSION_TOPOLOGY_DEFAULT_CHILD_LIMIT,
@@ -483,6 +484,7 @@ class SseEventEnvelope(ApiBaseModel):
     id: str = Field(max_length=EVENT_ID_MAX_CHARS)
     type: str
     session_id: str
+    interaction_id: str | None
     agent_name: str | None
     environment_name: str | None = None
     workflow_name: str | None = None
@@ -508,6 +510,7 @@ def _sse_event_example() -> SseEventEnvelope:
         id="event_123",
         type="session.started",
         session_id="session-123",
+        interaction_id="interaction-123",
         agent_name="assistant",
         environment_name="production",
         workflow_name=None,
@@ -685,6 +688,7 @@ class ApiEventRecord(ApiBaseModel):
     id: str = Field(max_length=EVENT_ID_MAX_CHARS)
     type: str
     session_id: str
+    interaction_id: str | None
     agent_name: str | None
     environment_name: str | None
     workflow_name: str | None
@@ -1097,8 +1101,24 @@ class ListSessionEventsResponse(ApiBaseModel):
     has_more: StrictBool
 
 
+class ApiInteractionSummary(InteractionSummaryEvidence):
+    interaction_id: str
+    session_id: str
+    terminal_event_id: str | None
+    terminal_event_sequence: StrictInt | None = Field(default=None, ge=1)
+    updated_at: datetime
+
+
+class ListSessionInteractionsResponse(ApiBaseModel):
+    session_id: str
+    interactions: list[ApiInteractionSummary]
+    next_sequence: StrictInt | None = Field(ge=0)
+    has_more: StrictBool
+
+
 class ApiTranscriptMessage(ApiBaseModel):
     index: StrictInt = Field(ge=0)
+    interaction_id: str | None
     role: str
     content: list[dict[str, Any]]
 

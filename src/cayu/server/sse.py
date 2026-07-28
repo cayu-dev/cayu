@@ -67,6 +67,7 @@ def _event_to_sse_payload(event: Event) -> dict[str, Any]:
         "id": event.id,
         "type": str(event.type),
         "session_id": event.session_id,
+        "interaction_id": event.interaction_id,
         "agent_name": event.agent_name,
         "tool_name": event.tool_name,
         "payload": event.payload,
