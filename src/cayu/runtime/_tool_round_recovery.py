@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
     copy_durable_json_value,
     require_clean_nonblank,
     require_durable_text,
@@ -24,6 +25,7 @@ from cayu.runtime.approvals import (
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.runtime.sessions import Session, SessionStatus
 from cayu.runtime.structured_output import (
+    STRUCTURED_OUTPUT_TOOL_NAME,
     StructuredOutputSpec,
     copy_structured_output_spec,
 )
@@ -54,6 +56,22 @@ class PendingToolRound(BaseModel):
     task_id: str | None = None
     tool_calls: list[PendingToolCallApproval]
     structured_output: StructuredOutputSpec | None = None
+    source_model_step_id: str | None = None
+    source_transcript_cursor: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=MAX_DURABLE_JSON_INTEGER,
+    )
+    model_step: StrictInt | None = Field(
+        default=None,
+        ge=1,
+        le=MAX_DURABLE_JSON_INTEGER,
+    )
+    structured_output_attempt: StrictInt | None = Field(
+        default=None,
+        ge=1,
+        le=MAX_DURABLE_JSON_INTEGER,
+    )
 
     @field_validator("agent_name")
     @classmethod
@@ -72,7 +90,7 @@ class PendingToolRound(BaseModel):
         )
         return self
 
-    @field_validator("environment_name", "task_id")
+    @field_validator("environment_name", "task_id", "source_model_step_id")
     @classmethod
     def validate_optional_nonblank_fields(
         cls,
@@ -104,6 +122,28 @@ class PendingToolRound(BaseModel):
         value: StructuredOutputSpec | None,
     ) -> StructuredOutputSpec | None:
         return copy_structured_output_spec(value)
+
+    @model_validator(mode="after")
+    def validate_model_step_link(self) -> PendingToolRound:
+        source_fields = (
+            self.source_model_step_id,
+            self.source_transcript_cursor,
+            self.model_step,
+        )
+        if any(value is not None for value in source_fields) and any(
+            value is None for value in source_fields
+        ):
+            raise ValueError(
+                "Pending tool-round model-step identity fields must be supplied together."
+            )
+        if self.structured_output_attempt is not None and (
+            self.structured_output is None
+            or not any(call.tool_name == STRUCTURED_OUTPUT_TOOL_NAME for call in self.tool_calls)
+        ):
+            raise ValueError(
+                "structured_output_attempt requires a structured-output finalizer call."
+            )
+        return self
 
 
 def pending_tool_round_identity(pending_round: PendingToolRound) -> ToolRoundIdentity:
@@ -182,6 +222,10 @@ def checkpoint_with_pending_tool_round(
     structured_output: StructuredOutputSpec | None,
     tool_round_identity: ToolRoundIdentity,
     redactor: SecretRedactor | None = None,
+    source_model_step_id: str | None = None,
+    source_transcript_cursor: int | None = None,
+    model_step: int | None = None,
+    structured_output_attempt: int | None = None,
 ) -> tuple[dict[str, Any], PendingToolRound]:
     copied_checkpoint = (
         {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
@@ -209,6 +253,10 @@ def checkpoint_with_pending_tool_round(
             redactor=redactor,
         ),
         structured_output=copy_structured_output_spec(structured_output),
+        source_model_step_id=source_model_step_id,
+        source_transcript_cursor=source_transcript_cursor,
+        model_step=model_step,
+        structured_output_attempt=structured_output_attempt,
     )
     _require_executable_pending_tool_round(pending_round)
     pending_payload = pending_round.model_dump(mode="json")
@@ -240,7 +288,13 @@ def checkpoint_with_pending_tool_round(
 
 
 def _require_executable_pending_tool_round(pending_round: PendingToolRound) -> None:
-    if any(contains_redacted_secret(call.arguments) for call in pending_round.tool_calls):
+    has_redacted_arguments = any(
+        contains_redacted_secret(call.arguments) for call in pending_round.tool_calls
+    )
+    is_internal_structured_output_round = pending_round.structured_output is not None and any(
+        call.tool_name == STRUCTURED_OUTPUT_TOOL_NAME for call in pending_round.tool_calls
+    )
+    if has_redacted_arguments and not is_internal_structured_output_round:
         raise ValueError(
             "Pending tool-round arguments contain a redaction marker and cannot be executed."
         )
