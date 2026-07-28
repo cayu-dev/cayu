@@ -4575,6 +4575,38 @@ def test_local_runner_injects_and_redacts_declared_secret_env(tmp_path):
     assert result.stderr.strip() == REDACTED_SECRET
 
 
+def test_local_runner_redacts_secret_before_output_truncation(tmp_path):
+    secret = "runner-output-split-boundary-canary"
+    output_limit_bytes = 48
+    visible_secret_prefix = secret[:20]
+    prefix = "x" * (output_limit_bytes - len(visible_secret_prefix))
+    runner = LocalRunner(
+        tmp_path,
+        secret_env={"API_TOKEN": SecretRef(name="api_token")},
+        secret_resolver=StaticVault({"api_token": secret}),
+    )
+
+    result = asyncio.run(
+        runner.exec(
+            ExecCommand.process(
+                sys.executable,
+                "-c",
+                (
+                    "import os,sys; "
+                    f"sys.stdout.write({prefix!r} + os.environ['API_TOKEN'] + '-suffix')"
+                ),
+            ),
+            output_limit_bytes=output_limit_bytes,
+        )
+    )
+
+    assert secret not in result.stdout
+    assert visible_secret_prefix not in result.stdout
+    assert REDACTED_SECRET in result.stdout
+    assert len(result.stdout.encode()) <= output_limit_bytes
+    assert result.stdout_truncated is True
+
+
 def test_local_runner_rejects_env_key_colliding_with_secret_env(tmp_path):
     runner = LocalRunner(
         tmp_path,

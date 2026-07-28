@@ -39,6 +39,7 @@ from cayu.runtime.structured_output import (
     validate_structured_output_text,
     validate_structured_output_tool_arguments,
 )
+from cayu.vaults import contains_redacted_secret
 from cayu.workflows.journal import (
     WORKFLOW_ATTEMPT_EVENT_TYPE,
     WORKFLOW_JOURNAL_PROVIDER,
@@ -725,11 +726,16 @@ async def _run_step(
         )
 
     state = _StepRunEventState()
+    capture_structured_output = spec is not None
+    if capture_structured_output:
+        ctx.app._session_engine.prepare_workflow_structured_output(child_session_id)
     run_stream = ctx.app.run(request)
     try:
         async for event in run_stream:
             state.record(event)
     except asyncio.CancelledError:
+        if capture_structured_output:
+            ctx.app._session_engine.discard_workflow_structured_output(child_session_id)
         aclose = getattr(run_stream, "aclose", None)
         if aclose is not None:
             with contextlib.suppress(Exception, asyncio.CancelledError):
@@ -746,14 +752,29 @@ async def _run_step(
             )
         raise
     except StepError:
+        if capture_structured_output:
+            ctx.app._session_engine.discard_workflow_structured_output(child_session_id)
         raise
     except Exception as exc:
+        if capture_structured_output:
+            ctx.app._session_engine.discard_workflow_structured_output(child_session_id)
         raise StepError(
             str(exc),
             step_id=step_id,
             session_id=child_session_id,
         ) from exc
+    except BaseException:
+        if capture_structured_output:
+            ctx.app._session_engine.discard_workflow_structured_output(child_session_id)
+        raise
 
+    raw_output_available = False
+    raw_output = None
+    if capture_structured_output:
+        (
+            raw_output_available,
+            raw_output,
+        ) = ctx.app._session_engine.take_workflow_structured_output(child_session_id)
     if state.failure is not None:
         raise StepError(state.failure, step_id=step_id, session_id=child_session_id)
     if state.interrupted is not None:
@@ -766,11 +787,17 @@ async def _run_step(
             session_id=child_session_id,
         )
 
-    output = (
-        await _resolve_structured_step_output(ctx, child_session_id, spec, state.output)
-        if state.output_validated
-        else state.output
-    )
+    if raw_output_available:
+        output = raw_output
+    elif state.output_validated:
+        output = await _resolve_structured_step_output(
+            ctx,
+            child_session_id,
+            spec,
+            state.output,
+        )
+    else:
+        output = state.output
     result = StepResult(
         step_id=step_id,
         session_id=child_session_id,
@@ -827,6 +854,13 @@ async def _step_result_from_completed_child(
         if state.output_validated
         else state.output
     )
+    if structured_output is not None and contains_redacted_secret(output):
+        raise StepError(
+            "completed child structured output contains redacted workload-secret data and "
+            "cannot be reconstructed safely after process recovery",
+            step_id=step_id,
+            session_id=child_session_id,
+        )
     return StepResult(
         step_id=step_id,
         session_id=child_session_id,

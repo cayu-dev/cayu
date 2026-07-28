@@ -10,6 +10,7 @@ from cayu.core.events import Event, EventType
 from cayu.core.tools import ToolResult
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
 from cayu.runtime.approvals import (
     PendingToolApproval,
     PendingToolCallApproval,
@@ -22,7 +23,7 @@ from cayu.runtime.approvals import (
 )
 from cayu.runtime.sessions import Session, SessionStore
 from cayu.runtime.tool_policy import ToolPolicyResult
-from cayu.vaults import SecretRedactor
+from cayu.vaults import SecretRedactor, contains_redacted_secret
 
 PENDING_TOOL_APPROVAL_CHECKPOINT_KEY = "pending_tool_approval"
 _APPROVAL_TERMINAL_EVENT_TYPES = frozenset(
@@ -441,16 +442,62 @@ def recovered_tool_result(
 
 def pending_approval_from_checkpoint(
     checkpoint: dict[str, Any] | None,
+    *,
+    redactor: SecretRedactor | None = None,
+    consume_on_rejection: bool = False,
 ) -> PendingToolApproval | None:
+    if type(consume_on_rejection) is not bool:
+        raise TypeError("consume_on_rejection must be a bool.")
     if checkpoint is None:
         return None
     copied_checkpoint = copy_durable_json_value(checkpoint, "checkpoint")
     value = copied_checkpoint.get(PENDING_TOOL_APPROVAL_CHECKPOINT_KEY)
     if value is None:
         return None
+    if redactor is not None and durable_value_contains_secret(
+        value,
+        redactor=redactor,
+        path=(PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,),
+    ):
+        # Public callers retain their input by default. Runtime callers opt in
+        # to consuming their private checkpoint copy so no outer traceback
+        # frame keeps executable secret-bearing state.
+        if type(value) is dict:
+            value.clear()
+        value = None
+        copied_checkpoint.clear()
+        if consume_on_rejection:
+            checkpoint.clear()
+        checkpoint = None
+        raise ValueError(
+            "Pending tool approval checkpoint contains a workload secret and cannot be executed."
+        ) from None
     if type(value) is not dict:
         raise ValueError("Pending tool approval checkpoint must be an object.")
-    return PendingToolApproval(**value)
+    validation_rejected = False
+    try:
+        approval = PendingToolApproval(**value)
+    except Exception:
+        if redactor is None:
+            raise
+        validation_rejected = True
+    if validation_rejected:
+        value.clear()
+        value = None
+        copied_checkpoint.clear()
+        if consume_on_rejection:
+            checkpoint.clear()
+        checkpoint = None
+        raise ValueError(
+            "Pending tool approval checkpoint is invalid and cannot be executed."
+        ) from None
+    if contains_redacted_secret(approval.arguments) or any(
+        contains_redacted_secret(call.arguments) for call in approval.tool_calls
+    ):
+        raise ValueError(
+            "Pending approval arguments contain a redaction marker and cannot be executed."
+        )
+    return approval
 
 
 def pending_tool_call_approvals(

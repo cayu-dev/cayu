@@ -56,6 +56,7 @@ from cayu.providers import (
 )
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _session_request_boundary as session_request_boundary
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
@@ -84,6 +85,7 @@ from cayu.runtime._interruption_coordinator import (
     interruption_cascade_suppressed,
     suppress_interruption_cascade,
 )
+from cayu.runtime._message_redaction import redact_message_for_boundary
 from cayu.runtime._model_errors import (
     detach_billing_identity_cancellation,
     detach_billing_identity_cancellation_group,
@@ -130,6 +132,9 @@ from cayu.runtime._tool_round_executor import (
     UserInputRequired,
     ordered_tool_result_messages,
 )
+from cayu.runtime._workflow_structured_output_handoff import (
+    WorkflowStructuredOutputHandoff,
+)
 from cayu.runtime.approvals import (
     PendingToolApproval,
     resolution_actor_payload,
@@ -159,9 +164,12 @@ from cayu.runtime.context import (
     _compaction_completion_publisher_scope,
     _compaction_model_completed_payload,
     _CompactionAccountingUsageError,
+    _context_secret_redactor_scope,
     _defer_billing_identity_cancellation_scope,
     _durable_compaction_completion_evidence,
     context_build_termination_compaction_telemetry,
+    sanitize_context_build_error_checkpoint,
+    sanitize_context_build_result_checkpoint,
     sanitize_context_compaction_telemetry,
 )
 from cayu.runtime.costs import (
@@ -218,7 +226,6 @@ from cayu.runtime.sessions import (
     SessionStore,
     _incomplete_recovery_claim_from_checkpoint,
     copy_compact_session_request,
-    copy_enqueue_session_message_request,
     copy_resume_request,
     copy_run_request,
 )
@@ -236,6 +243,7 @@ from cayu.runtime.structured_output import (
     StructuredOutputStrategy,
     StructuredOutputValidation,
     copy_structured_output_spec,
+    require_secret_free_structured_output_spec,
     structured_output_repair_lead,
     structured_output_repair_prompt,
     structured_output_tool_required_validation,
@@ -688,13 +696,35 @@ def _reject_unresumable_session_checkpoint(
     session: Session,
     checkpoint: dict[str, Any] | None,
     *,
+    redactor: SecretRedactor,
     allow_active_operation: bool = False,
 ) -> None:
-    if approval_support.pending_approval_from_checkpoint(checkpoint) is not None:
+    if (
+        approval_support.pending_approval_from_checkpoint(
+            checkpoint,
+            redactor=redactor,
+            consume_on_rejection=True,
+        )
+        is not None
+    ):
         raise RuntimeError("Session has a pending tool approval.")
-    if pending_user_input_from_checkpoint(checkpoint) is not None:
+    if (
+        pending_user_input_from_checkpoint(
+            checkpoint,
+            redactor=redactor,
+            consume_on_rejection=True,
+        )
+        is not None
+    ):
         raise RuntimeError("Session is awaiting user input.")
-    if tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint) is not None:
+    if (
+        tool_round_recovery.pending_tool_round_from_checkpoint(
+            checkpoint,
+            redactor=redactor,
+            consume_on_rejection=True,
+        )
+        is not None
+    ):
         raise RuntimeError("Session has a pending tool round.")
     if checkpoint is not None and _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY in checkpoint:
         raise RuntimeError("Session has an incomplete background interruption cascade.")
@@ -1747,6 +1777,7 @@ class SessionEngine:
         self._recovery_coordinator = recovery_coordinator
         self._background_interruption_coordinator = background_interruption_coordinator
         self._secret_redactor = secret_redactor
+        self._workflow_structured_output_handoff = WorkflowStructuredOutputHandoff()
         self._clock = clock
         self._runtime_hooks = runtime_hooks
         self._loop_policies = loop_policies
@@ -1768,6 +1799,22 @@ class SessionEngine:
         self._get_registered_environment_for_session = get_registered_environment_for_session
         self._effective_retry_policy = effective_retry_policy
         self._detached_session_operation_tasks: set[asyncio.Task[Any]] = set()
+
+    def prepare_workflow_structured_output(self, session_id: str) -> None:
+        """Opt one live workflow child into a process-local raw output handoff."""
+
+        self._workflow_structured_output_handoff.prepare(session_id)
+
+    def take_workflow_structured_output(self, session_id: str) -> tuple[bool, Any]:
+        """Consume a live raw output without making it part of durable session state."""
+
+        return self._workflow_structured_output_handoff.take(session_id)
+
+    def discard_workflow_structured_output(self, session_id: str) -> None:
+        self._workflow_structured_output_handoff.discard(session_id)
+
+    def _record_workflow_structured_output(self, session_id: str, output: Any) -> None:
+        self._workflow_structured_output_handoff.record(session_id, output)
 
     def _track_detached_session_operation_task(self, task: asyncio.Task[Any]) -> None:
         """Retain and observe best-effort work that cannot block its caller."""
@@ -2024,6 +2071,10 @@ class SessionEngine:
         )
 
     async def run(self, request: RunRequest) -> AsyncGenerator[Event, None]:
+        request = session_request_boundary.prepare_run_request(
+            request,
+            redactor=self._secret_redactor,
+        )
         registered_agent = self._get_registered_agent(request.agent_name)
         # Provider resolution for new sessions: per-run override, then the
         # agent's pinned provider, then model-pattern routing, then the app
@@ -2039,11 +2090,27 @@ class SessionEngine:
                 self._route_registered_provider_for_model(model=model)
                 or self._get_registered_provider()
             )
+        for field_name, value in (
+            ("agent_name", registered_agent.spec.name),
+            ("provider_name", registered_provider.name),
+            ("model", model),
+        ):
+            session_request_boundary.require_secret_free_session_authority(
+                value,
+                field_name=field_name,
+                redactor=self._secret_redactor,
+            )
         # Checked before the session is created so it surfaces to the caller.
         _require_native_structured_output_support(
             request.structured_output, registered_provider=registered_provider
         )
         registered_environment = self._get_registered_environment(request.environment_name)
+        if registered_environment is not None:
+            session_request_boundary.require_secret_free_session_authority(
+                registered_environment.spec.name,
+                field_name="environment_name",
+                redactor=self._secret_redactor,
+            )
         if request.environment_name is None and registered_environment is not None:
             request = _with_environment_name(request, registered_environment.spec.name)
         workspace_instructions = None
@@ -2145,7 +2212,10 @@ class SessionEngine:
             async for queued_event in self._session_control.drain_out_of_band_events(session.id):
                 yield queued_event
             if resolution.error is not None:
-                failure_diagnostic = exception_diagnostic(resolution.error)
+                failure_diagnostic = exception_diagnostic(
+                    resolution.error,
+                    redactor=self._secret_redactor,
+                )
                 task_failure_event, task_failure_error = await self._fail_task_for_run_setup_error(
                     task_id=request.task_id,
                     task_worker_id=request.task_worker_id,
@@ -2160,9 +2230,15 @@ class SessionEngine:
                 failure_payload = exception_failure_payload(
                     resolution.error,
                     diagnostic=failure_diagnostic,
+                    redactor=self._secret_redactor,
                 )
                 if task_failure_error is not None:
-                    failure_payload.update(task_update_error_payload(task_failure_error))
+                    failure_payload.update(
+                        task_update_error_payload(
+                            task_failure_error,
+                            redactor=self._secret_redactor,
+                        )
+                    )
                 async for event in self._emit_terminal_event_with_hooks(
                     event=Event(
                         type=EventType.SESSION_FAILED,
@@ -2218,7 +2294,10 @@ class SessionEngine:
                 raise exc
             raise
         except Exception as exc:
-            failure_diagnostic = exception_diagnostic(exc)
+            failure_diagnostic = exception_diagnostic(
+                exc,
+                redactor=self._secret_redactor,
+            )
             task_failure_event, task_failure_error = await self._fail_task_for_run_setup_error(
                 task_id=request.task_id,
                 task_worker_id=request.task_worker_id,
@@ -2233,9 +2312,15 @@ class SessionEngine:
             failure_payload = exception_failure_payload(
                 exc,
                 diagnostic=failure_diagnostic,
+                redactor=self._secret_redactor,
             )
             if task_failure_error is not None:
-                failure_payload.update(task_update_error_payload(task_failure_error))
+                failure_payload.update(
+                    task_update_error_payload(
+                        task_failure_error,
+                        redactor=self._secret_redactor,
+                    )
+                )
             async for event in self._emit_terminal_event_with_hooks(
                 event=Event(
                     type=EventType.SESSION_FAILED,
@@ -2440,6 +2525,10 @@ class SessionEngine:
             raise propagated_cancellation_group
 
     async def resume(self, request: ResumeRequest) -> AsyncGenerator[Event, None]:
+        request = session_request_boundary.prepare_resume_request(
+            request,
+            redactor=self._secret_redactor,
+        )
         task_id = await self._linked_running_task_id(request.session_id)
         session_stream = self._resume_session(
             request=request,
@@ -2476,6 +2565,10 @@ class SessionEngine:
         self,
         request: CompactSessionRequest,
     ) -> AsyncGenerator[Event, None]:
+        request = session_request_boundary.prepare_compact_session_request(
+            request,
+            redactor=self._secret_redactor,
+        )
         operation_stream = self._compact_session(request)
         forwarded_stream = self._session_control.stream_with_out_of_band_events(
             request.session_id,
@@ -2508,9 +2601,11 @@ class SessionEngine:
     ) -> EnqueueSessionMessageResult:
         """Durably queue user steering for delivery by the active controller."""
 
-        result = await self.session_store.enqueue_session_message(
-            copy_enqueue_session_message_request(request)
+        redacted_request = session_request_boundary.prepare_enqueue_message_request(
+            request,
+            redactor=self._secret_redactor,
         )
+        result = await self.session_store.enqueue_session_message(redacted_request)
         if not result.replayed:
             await self._event_writer.fan_out_persisted([result.event])
         return result
@@ -2564,6 +2659,17 @@ class SessionEngine:
         loaded_session = await self.session_store.load(request.session_id)
         if loaded_session is None:
             raise KeyError(f"Session not found: {request.session_id}")
+        for field_name in (
+            "agent_name",
+            "provider_name",
+            "model",
+            "environment_name",
+        ):
+            session_request_boundary.require_secret_free_session_authority(
+                getattr(loaded_session, field_name),
+                field_name=field_name,
+                redactor=self._secret_redactor,
+            )
         request_digest = _compact_session_request_digest(request)
         checkpoint_before_claim = await self.session_store.load_checkpoint(loaded_session.id)
         persisted_before_claim = await self.session_store.load_session_operation(
@@ -2604,6 +2710,12 @@ class SessionEngine:
                     ):
                         yield event
                     return
+        _reject_unresumable_session_checkpoint(
+            loaded_session,
+            checkpoint_before_claim,
+            redactor=self._secret_redactor,
+            allow_active_operation=True,
+        )
         if loaded_session.status not in _RESUMABLE_SESSION_STATUSES:
             raise ValueError(
                 f"Session compaction requires a resumable session boundary: {loaded_session.status}"
@@ -2766,17 +2878,19 @@ class SessionEngine:
                     existing_before_claim.get("operation_id"),
                     "operation_id",
                 )
-        started_event = Event(
-            type=EventType.CONTEXT_COMPACTION_STARTED,
-            session_id=loaded_session.id,
-            agent_name=registered_agent.spec.name,
-            environment_name=environment_name,
-            payload=_application_compaction_causal_payload(
-                request=request,
-                operation_id=operation_id,
-                attempt_id=attempt_id,
-                source_cursor=len(transcript),
-                compactor=compactor_name,
+        started_event = self._event_writer.prepare(
+            Event(
+                type=EventType.CONTEXT_COMPACTION_STARTED,
+                session_id=loaded_session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                payload=_application_compaction_causal_payload(
+                    request=request,
+                    operation_id=operation_id,
+                    attempt_id=attempt_id,
+                    source_cursor=len(transcript),
+                    compactor=compactor_name,
+                ),
             ),
         )
         claimed_checkpoint: dict[str, Any] | None = None
@@ -2805,6 +2919,7 @@ class SessionEngine:
             _reject_unresumable_session_checkpoint(
                 current_session,
                 checkpoint,
+                redactor=self._secret_redactor,
                 allow_active_operation=True,
             )
             updated = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
@@ -3654,30 +3769,51 @@ class SessionEngine:
                 return dispatch_result
 
             async def execute_compaction() -> ContextBuildResult:
-                with (
-                    _compaction_completion_publisher_scope(publish_compaction_completions),
-                    _defer_billing_identity_cancellation_scope(),
-                ):
-                    return await context_policy.build_with_checkpoint(
-                        ContextRequest(
-                            session=loaded_session,
-                            agent=_session_agent_spec(
-                                registered_agent=registered_agent,
+                try:
+                    with (
+                        _compaction_completion_publisher_scope(publish_compaction_completions),
+                        _context_secret_redactor_scope(self._secret_redactor),
+                        _defer_billing_identity_cancellation_scope(),
+                    ):
+                        result = await context_policy.build_with_checkpoint(
+                            ContextRequest(
                                 session=loaded_session,
+                                agent=_session_agent_spec(
+                                    registered_agent=registered_agent,
+                                    session=loaded_session,
+                                ),
+                                messages=transcript,
+                                step=1,
+                                environment_name=environment_name,
+                                metadata={
+                                    "operation_id": operation_id,
+                                    "reason": request.reason,
+                                },
+                                force_compaction=True,
+                                force_bounded_compaction=True,
+                                compaction_instructions=request.instructions,
                             ),
-                            messages=transcript,
-                            step=1,
-                            environment_name=environment_name,
-                            metadata={
-                                "operation_id": operation_id,
-                                "reason": request.reason,
-                            },
-                            force_compaction=True,
-                            force_bounded_compaction=True,
-                            compaction_instructions=request.instructions,
-                        ),
-                        checkpoint=claimed_checkpoint,
+                            checkpoint=claimed_checkpoint,
+                        )
+                except ContextBuildError as error:
+                    sanitize_context_build_error_checkpoint(
+                        error,
+                        redactor=self._secret_redactor,
                     )
+                    raise
+                safe_checkpoint, safe_checkpoint_event_payload = (
+                    sanitize_context_build_result_checkpoint(
+                        result,
+                        redactor=self._secret_redactor,
+                    )
+                )
+                return result.model_copy(
+                    update={
+                        "checkpoint": safe_checkpoint,
+                        "checkpoint_event_payload": safe_checkpoint_event_payload,
+                    },
+                    deep=True,
+                )
 
             async def execute_compaction_with_limits() -> tuple[
                 ContextBuildResult,
@@ -3817,11 +3953,17 @@ class SessionEngine:
                     ),
                 },
             )
-            published_events = [
-                *attempt_events,
-                *[event for event in telemetry_events if event.type != EventType.MODEL_COMPLETED],
-                checkpoint_event,
-            ]
+            published_events = self._event_writer.prepare_many(
+                [
+                    *attempt_events,
+                    *[
+                        event
+                        for event in telemetry_events
+                        if event.type != EventType.MODEL_COMPLETED
+                    ],
+                    checkpoint_event,
+                ]
+            )
             event_ids = [started_event.id, *[event.id for event in published_events]]
             try:
                 heartbeat_blocker = await stop_claim_heartbeat()
@@ -4204,6 +4346,9 @@ class SessionEngine:
                 unpublished_attempt_events = [
                     event for event in attempt_events if event.id not in persisted_attempt_event_ids
                 ]
+                failed_events = self._event_writer.prepare_many(
+                    [*unpublished_attempt_events, failed_event]
+                )
                 failed_terminal_claim_expires_at: datetime | None = None
 
                 def capture_failed_terminal_claim_expiry(expires_at: datetime) -> None:
@@ -4233,12 +4378,10 @@ class SessionEngine:
                         on_terminalize=capture_failed_terminal_claim_expiry,
                     ),
                     commit_guard=require_unexpired_failed_terminal_commit,
-                    events=[*unpublished_attempt_events, failed_event],
+                    events=failed_events,
                 )
                 operation_published = True
-                await self._event_writer.fan_out_persisted(
-                    [*unpublished_attempt_events, failed_event]
-                )
+                await self._event_writer.fan_out_persisted(failed_events)
             except BaseException as cleanup_error:
                 cleanup_error.add_note(
                     "Compaction was abandoned by GeneratorExit, but its usage and "
@@ -4423,7 +4566,9 @@ class SessionEngine:
                 unpublished_attempt_events = [
                     event for event in attempt_events if event.id not in persisted_attempt_event_ids
                 ]
-                failed_events = [*unpublished_attempt_events, failed_event]
+                failed_events = self._event_writer.prepare_many(
+                    [*unpublished_attempt_events, failed_event]
+                )
                 failed_terminal_claim_expires_at: datetime | None = None
 
                 def capture_failed_terminal_claim_expiry(expires_at: datetime) -> None:
@@ -5116,6 +5261,7 @@ class SessionEngine:
     ) -> None:
         if not events:
             return
+        events[:] = self._event_writer.prepare_many(events)
         event_inventory.update((event.id, event.model_copy(deep=True)) for event in events)
         publication_claim_expires_at: datetime | None = None
         renewed_claim_expires_at: datetime | None = None
@@ -5506,9 +5652,24 @@ class SessionEngine:
     async def interrupt_session(
         self, request: InterruptSessionRequest
     ) -> AsyncGenerator[Event, None]:
+        request = session_request_boundary.prepare_interrupt_session_request(
+            request,
+            redactor=self._secret_redactor,
+        )
         loaded_session = await self.session_store.load(request.session_id)
         if loaded_session is None:
             raise KeyError(f"Session not found: {request.session_id}")
+        for field_name in (
+            "agent_name",
+            "provider_name",
+            "model",
+            "environment_name",
+        ):
+            session_request_boundary.require_secret_free_session_authority(
+                getattr(loaded_session, field_name),
+                field_name=field_name,
+                redactor=self._secret_redactor,
+            )
         if loaded_session.status == SessionStatus.INTERRUPTED:
             existing_interrupt_event = (
                 await self._session_control.wait_for_active_interrupted_event(loaded_session.id)
@@ -5765,9 +5926,25 @@ class SessionEngine:
         start_event_payload_extra: dict[str, Any],
         start_task_on_enter: bool,
     ) -> AsyncGenerator[Event, None]:
+        require_secret_free_structured_output_spec(
+            request.structured_output,
+            redactor=self._secret_redactor,
+            field_name="ResumeRequest.structured_output",
+        )
         loaded_session = await self.session_store.load(request.session_id)
         if loaded_session is None:
             raise KeyError(f"Session not found: {request.session_id}")
+        for field_name in (
+            "agent_name",
+            "provider_name",
+            "model",
+            "environment_name",
+        ):
+            session_request_boundary.require_secret_free_session_authority(
+                getattr(loaded_session, field_name),
+                field_name=field_name,
+                redactor=self._secret_redactor,
+            )
 
         registered_agent = self._get_registered_agent(loaded_session.agent_name)
         registered_provider = self._get_registered_provider(loaded_session.provider_name)
@@ -5778,6 +5955,19 @@ class SessionEngine:
         registered_environment = self._get_registered_environment_for_session(
             loaded_session.environment_name
         )
+        if self._secret_redactor.has_values:
+            preflight_transcript = await self.session_store.load_transcript(loaded_session.id)
+            redacted_preflight, transcript_is_valid = session_request_boundary.redact_transcript(
+                preflight_transcript,
+                redactor=self._secret_redactor,
+                field_name="session.transcript",
+            )
+            redacted_preflight.clear()
+            if not transcript_is_valid:
+                raise ValueError(
+                    "Session transcript contains a workload secret in execution authority "
+                    "and cannot be resumed."
+                ) from None
 
         def reject_unresumable_checkpoint(
             current_session: Session,
@@ -5804,19 +5994,37 @@ class SessionEngine:
                 raise RuntimeError(
                     f"Session has an active durable operation: {active_operation_id}"
                 )
-            if approval_support.pending_approval_from_checkpoint(updated_checkpoint) is not None:
+            if (
+                approval_support.pending_approval_from_checkpoint(
+                    updated_checkpoint,
+                    redactor=self._secret_redactor,
+                    consume_on_rejection=True,
+                )
+                is not None
+            ):
                 raise RuntimeError(
                     "Session has a pending tool approval. Resolve it with "
                     "resolve_tool_approval(...) before resuming with new messages."
                 )
-            if pending_user_input_from_checkpoint(updated_checkpoint) is not None:
+            if (
+                pending_user_input_from_checkpoint(
+                    updated_checkpoint,
+                    redactor=self._secret_redactor,
+                    consume_on_rejection=True,
+                )
+                is not None
+            ):
                 raise RuntimeError(
                     "Session is awaiting user input. Answer it with "
                     "resolve_user_input(...) before resuming with new messages."
                 )
             if (
                 current_session.status == SessionStatus.COMPLETED
-                and tool_round_recovery.pending_tool_round_from_checkpoint(updated_checkpoint)
+                and tool_round_recovery.pending_tool_round_from_checkpoint(
+                    updated_checkpoint,
+                    redactor=self._secret_redactor,
+                    consume_on_rejection=True,
+                )
                 is not None
             ):
                 raise RuntimeError(
@@ -5849,6 +6057,16 @@ class SessionEngine:
             if request.model is not None:
                 session = await self.session_store.update_model(session.id, request.model)
             transcript = await self.session_store.load_transcript(session.id)
+            transcript, transcript_is_valid = session_request_boundary.redact_transcript(
+                transcript,
+                redactor=self._secret_redactor,
+                field_name="session.transcript",
+            )
+            if not transcript_is_valid:
+                raise ValueError(
+                    "Session transcript contains a workload secret in execution authority "
+                    "and cannot be resumed."
+                ) from None
         except Exception as exc:
             try:
                 await self.session_store.update_status(session.id, SessionStatus.FAILED)
@@ -5858,7 +6076,10 @@ class SessionEngine:
                         session_id=session.id,
                         agent_name=registered_agent.spec.name,
                         environment_name=_environment_name(registered_environment),
-                        payload=exception_failure_payload(exc),
+                        payload=exception_failure_payload(
+                            exc,
+                            redactor=self._secret_redactor,
+                        ),
                     )
                 )
             finally:
@@ -5902,9 +6123,46 @@ class SessionEngine:
             raise
 
     async def fork_session(self, request: ForkSessionRequest) -> AsyncGenerator[Event, None]:
+        request = session_request_boundary.prepare_fork_session_request(
+            request,
+            redactor=self._secret_redactor,
+        )
         source_session = await self.session_store.load(request.source_session_id)
         if source_session is None:
             raise KeyError(f"Session not found: {request.source_session_id}")
+        source_authority_error: str | None = None
+        for field_name in (
+            "id",
+            "agent_name",
+            "provider_name",
+            "model",
+            "parent_session_id",
+            "causal_budget_id",
+            "runtime_name",
+            "runtime_version",
+            "environment_name",
+        ):
+            value = getattr(source_session, field_name)
+            if type(value) is str and self._secret_redactor.redact_text(value) != value:
+                source_authority_error = (
+                    f"source_session.{field_name} contains a workload secret and "
+                    "cannot be used as durable session authority."
+                )
+                break
+        for key, value in source_session.labels.items():
+            if (
+                self._secret_redactor.redact_text(key) != key
+                or self._secret_redactor.redact_text(value) != value
+            ):
+                source_authority_error = (
+                    "source_session.labels contain a workload secret and cannot be "
+                    "copied as durable session authority."
+                )
+                break
+        if source_authority_error is not None:
+            del source_session
+            field_name = key = value = ""
+            raise ValueError(source_authority_error) from None
         if source_session.status not in _FORKABLE_SESSION_STATUSES:
             raise ValueError(
                 "Only completed, failed, or interrupted sessions can be forked: "
@@ -5916,16 +6174,6 @@ class SessionEngine:
             )
         if source_session.status == SessionStatus.INTERRUPTED and not request.copy_checkpoint:
             raise ValueError("Interrupted sessions cannot be forked without checkpoint state.")
-
-        source_checkpoint = await self.session_store.load_checkpoint(source_session.id)
-        if (
-            source_checkpoint is not None
-            and _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY in source_checkpoint
-        ):
-            raise RuntimeError(
-                "Session has an incomplete background interruption cascade. "
-                "Retry the interruption before forking it."
-            )
 
         registered_provider = self._get_registered_provider(source_session.provider_name)
         try:
@@ -5992,7 +6240,14 @@ class SessionEngine:
                     raise RuntimeError(
                         "Interrupted session cannot be forked because checkpoint state is missing."
                     )
-                if pending_user_input_from_checkpoint(source_checkpoint) is not None:
+                if (
+                    pending_user_input_from_checkpoint(
+                        source_checkpoint,
+                        redactor=self._secret_redactor,
+                        consume_on_rejection=True,
+                    )
+                    is not None
+                ):
                     raise RuntimeError(
                         "Session awaiting user input cannot be forked; answer it with "
                         "resolve_user_input(...) first."
@@ -6012,6 +6267,19 @@ class SessionEngine:
                 )
                 if fork_checkpoint is not None:
                     fork_checkpoint.pop(_SESSION_OPERATIONS_CHECKPOINT_KEY, None)
+                if not session_request_boundary.fork_checkpoint_is_secret_free(
+                    fork_checkpoint,
+                    redactor=self._secret_redactor,
+                ):
+                    if source_checkpoint is not None:
+                        source_checkpoint.clear()
+                    if fork_checkpoint is not None:
+                        fork_checkpoint.clear()
+                    source_checkpoint = fork_checkpoint = None
+                    raise ValueError(
+                        "source_session.checkpoint contains a workload secret and cannot "
+                        "be copied without changing resumable execution state."
+                    ) from None
                 return fork_checkpoint
         else:
 
@@ -6032,7 +6300,21 @@ class SessionEngine:
                     raise RuntimeError(
                         f"Session has an active durable operation: {active_operation_id}"
                     )
+                if (
+                    source_checkpoint is not None
+                    and _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY in source_checkpoint
+                ):
+                    raise RuntimeError(
+                        "Session has an incomplete background interruption cascade. "
+                        "Retry the interruption before forking it."
+                    )
                 return None
+
+        def transcript_validator(messages: tuple[Message, ...]) -> bool:
+            return session_request_boundary.fork_transcript_is_secret_free(
+                messages,
+                redactor=self._secret_redactor,
+            )
 
         inherited_taint_labels = await self._tool_round_executor.prior_taint_labels_for_policy(
             session_id=source_session.id,
@@ -6061,14 +6343,25 @@ class SessionEngine:
             metadata=copy_json_value(fork_metadata, "metadata"),
         )
         try:
-            created = await self.session_store.create_fork(
-                source_session_id=source_session.id,
-                fork=fork_session,
-                source_statuses=_FORKABLE_SESSION_STATUSES,
-                transcript_cursor=request.transcript_cursor,
-                checkpoint_transform=checkpoint_transform,
-                expected_source_run_epoch=source_session.run_epoch,
-            )
+            if self._secret_redactor.has_values:
+                created = await self.session_store.create_fork_with_transcript_validation(
+                    source_session_id=source_session.id,
+                    fork=fork_session,
+                    source_statuses=_FORKABLE_SESSION_STATUSES,
+                    transcript_cursor=request.transcript_cursor,
+                    checkpoint_transform=checkpoint_transform,
+                    expected_source_run_epoch=source_session.run_epoch,
+                    transcript_validator=transcript_validator,
+                )
+            else:
+                created = await self.session_store.create_fork(
+                    source_session_id=source_session.id,
+                    fork=fork_session,
+                    source_statuses=_FORKABLE_SESSION_STATUSES,
+                    transcript_cursor=request.transcript_cursor,
+                    checkpoint_transform=checkpoint_transform,
+                    expected_source_run_epoch=source_session.run_epoch,
+                )
         except _ExpiredIncompleteRecoveryClaim as expired_claim:
             current = await self._require_session(source_session.id)
             fenced = await self._recovery_coordinator.fence_expired_incomplete_recovery_claim(
@@ -6130,7 +6423,30 @@ class SessionEngine:
         start_task_on_enter: bool = True,
         release_run_fence_on_exit: bool = True,
     ) -> AsyncGenerator[Event, None]:
+        # Deep defense for internal recovery callers. Public entry points
+        # validate before claiming mutable session ownership.
+        require_secret_free_structured_output_spec(
+            structured_output,
+            redactor=self._secret_redactor,
+            field_name="structured_output",
+        )
         provider = registered_provider.provider
+        messages = [
+            redact_message_for_boundary(
+                message,
+                redactor=self._secret_redactor,
+                field_name="message",
+            )
+            for message in messages
+        ]
+        messages_to_append = [
+            redact_message_for_boundary(
+                message,
+                redactor=self._secret_redactor,
+                field_name="message",
+            )
+            for message in messages_to_append
+        ]
         # Per-run thinking override (RunRequest/ResumeRequest) wins over the agent's
         # default (AgentSpec.thinking); the agent default applies on every path,
         # including continuations that pass no override.
@@ -6423,7 +6739,16 @@ class SessionEngine:
                 assistant_step_result = model_step_flow_outcome.assistant_step_result
                 if assistant_step_result is None:
                     raise RuntimeError("Successful model step finished without a result.")
-                assistant_message = assistant_step_result.assistant_message
+                raw_assistant_message = assistant_step_result.assistant_message
+                assistant_message = (
+                    redact_message_for_boundary(
+                        raw_assistant_message,
+                        redactor=self._secret_redactor,
+                        field_name="assistant_message",
+                    )
+                    if raw_assistant_message is not None
+                    else None
+                )
                 tool_calls = assistant_step_result.tool_calls
 
                 pending_tool_round: tool_round_recovery.PendingToolRound | None = None
@@ -6542,6 +6867,10 @@ class SessionEngine:
                         tool_result_messages,
                     )
                     if validation.valid:
+                        self._record_workflow_structured_output(
+                            session.id,
+                            validation.output,
+                        )
                         yield await self._event_writer.emit(
                             _structured_output_event(
                                 event_type=EventType.STRUCTURED_OUTPUT_VALIDATED,
@@ -6642,6 +6971,10 @@ class SessionEngine:
                                 structured_output,
                             )
                             if validation.valid:
+                                self._record_workflow_structured_output(
+                                    session.id,
+                                    validation.output,
+                                )
                                 yield await self._event_writer.emit(
                                     _structured_output_event(
                                         event_type=EventType.STRUCTURED_OUTPUT_VALIDATED,
@@ -6993,7 +7326,10 @@ class SessionEngine:
             )
             raise
         except Exception as exc:
-            failure_diagnostic = exception_diagnostic(exc)
+            failure_diagnostic = exception_diagnostic(
+                exc,
+                redactor=self._secret_redactor,
+            )
             task_failure_error: Exception | None = None
             if (
                 not task_started
@@ -7039,9 +7375,15 @@ class SessionEngine:
             payload = exception_failure_payload(
                 exc,
                 diagnostic=failure_diagnostic,
+                redactor=self._secret_redactor,
             )
             if task_failure_error is not None:
-                payload.update(task_update_error_payload(task_failure_error))
+                payload.update(
+                    task_update_error_payload(
+                        task_failure_error,
+                        redactor=self._secret_redactor,
+                    )
+                )
             yield await self._emit_turn_completed_once(
                 session=session,
                 registered_agent=registered_agent,
@@ -7782,7 +8124,11 @@ class SessionEngine:
         if checkpoint is None:
             return
         copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
-        current = tool_round_recovery.pending_tool_round_from_checkpoint(copied_checkpoint)
+        current = tool_round_recovery.pending_tool_round_from_checkpoint(
+            copied_checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+        )
         if current is None or current.round_id != pending_round.round_id:
             return
         copied_checkpoint.pop(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY, None)
@@ -8293,6 +8639,7 @@ class SessionEngine:
                     exc,
                     empty_message="runtime hook failed",
                     nonportable_message="Runtime hook failed with a non-portable diagnostic.",
+                    redactor=self._secret_redactor,
                 )
                 yield await self._event_writer.emit(
                     _runtime_hook_event(
@@ -8385,6 +8732,7 @@ class SessionEngine:
                         exc,
                         empty_message="loop policy failed",
                         nonportable_message=("Loop policy failed with a non-portable diagnostic."),
+                        redactor=self._secret_redactor,
                     )
                     yield (
                         await self._event_writer.emit(

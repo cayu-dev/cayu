@@ -43,7 +43,6 @@ from cayu._validation import (
     require_durable_nonblank,
 )
 from cayu.core.events import Event, EventType
-from cayu.runtime._approval_support import pending_approval_from_checkpoint
 from cayu.runtime.approvals import (
     PendingToolApproval,
     ResolutionActor,
@@ -324,7 +323,10 @@ async def resolve_business_approval(
     # tier gate is adapter-only (the primitive does not know tiers), so its
     # input must come from trusted checkpoint state, never from the caller.
     checkpoint = await app.session_store.load_checkpoint(session_id)
-    pending = pending_approval_from_checkpoint(checkpoint)
+    pending = app._pending_tool_approval_from_checkpoint(
+        checkpoint,
+        consume_on_rejection=True,
+    )
     if pending is None:
         raise RuntimeError("Session has no pending tool approval.")
     if pending.approval_id != approval_id:

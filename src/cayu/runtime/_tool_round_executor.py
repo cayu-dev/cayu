@@ -28,7 +28,6 @@ from cayu._task_wait import (
 from cayu._validation import (
     copy_durable_json_object,
     copy_durable_json_value,
-    copy_json_object,
     copy_json_value,
     require_clean_nonblank,
     require_durable_text,
@@ -48,19 +47,17 @@ from cayu.core.tools import (
     _bound_policy_denial_text,
 )
 from cayu.mcp import McpToolAdapter, McpToolset
-from cayu.proxies import (
-    CredentialProxy,
-    ProxyAuthorizationResult,
-    copy_proxy_authorization_result,
-)
-from cayu.runners import RunnerCancelledError
 from cayu.runtime import _approval_support as approval_support
+from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
-from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._checkpoint_redaction import (
+    require_secret_free_durable_object as _require_secret_free_durable_object,
+)
+from cayu.runtime._event_writer import RuntimeEventWriter, prepare_runtime_event
 from cayu.runtime._run_limits import (
     LimitEvaluation,
     RunLimitGate,
@@ -130,13 +127,7 @@ from cayu.runtime.user_input import (
     copy_pending_user_input,
     pending_user_input_from_checkpoint,
 )
-from cayu.vaults import (
-    ResolvedSecret,
-    SecretRedactor,
-    SecretRef,
-    copy_resolved_secret,
-    copy_secret_ref,
-)
+from cayu.vaults import SecretRedactor
 
 CheckpointTransform = Callable[
     [Session, dict[str, Any] | None],
@@ -172,6 +163,7 @@ class InterruptedToolRoundRequest:
     tool_round_id: str | None
     cancellation_artifacts: list[dict[str, Any]] | None
     cancellation_artifacts_by_id: dict[str, list[dict[str, Any]]] | None
+    cancellation_redactors_by_id: dict[str, SecretRedactor] | None = None
 
 
 LimitEventStream = Callable[[ToolRoundLimitRequest], AsyncIterator[Event]]
@@ -417,9 +409,21 @@ class ToolRoundExecutor:
         budget_limits: tuple[BudgetLimit, ...] | None,
         retry_policy: RetryPolicy | None,
     ) -> tuple[PendingToolApproval, Event]:
+        redactor = _redactor_for_tool_calls(
+            self._secret_redactor,
+            registered_agent=registered_agent,
+            tool_calls=tool_calls,
+        )
         checkpoint = await self._session_store.load_checkpoint(session.id)
         checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
-        if approval_support.pending_approval_from_checkpoint(checkpoint) is not None:
+        if (
+            approval_support.pending_approval_from_checkpoint(
+                checkpoint,
+                redactor=self._secret_redactor,
+                consume_on_rejection=True,
+            )
+            is not None
+        ):
             raise RuntimeError("Session already has a pending tool approval.")
         checkpoint.pop(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY, None)
 
@@ -450,7 +454,7 @@ class ToolRoundExecutor:
                 tool_calls=tool_calls,
                 policy_outcomes=policy_outcomes,
                 active_taint_by_id=active_taint_by_id,
-                redactor=self._secret_redactor,
+                redactor=redactor,
             ),
             structured_output=copy_structured_output_spec(structured_output),
             thinking=thinking,
@@ -462,8 +466,17 @@ class ToolRoundExecutor:
             retry_policy=copy_retry_policy(retry_policy) if retry_policy is not None else None,
             expires_at=expires_at,
         )
-        checkpoint[approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY] = approval.model_dump(
-            mode="json"
+        approval_payload = _require_secret_free_durable_object(
+            approval.model_dump(mode="json"),
+            redactor=redactor,
+            field_name="pending_tool_approval",
+            schema_root=approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,
+        )
+        checkpoint[approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY] = approval_payload
+        checkpoint = _require_secret_free_durable_object(
+            checkpoint,
+            redactor=redactor,
+            field_name="checkpoint",
         )
         await self._session_store.transform_checkpoint(
             session.id,
@@ -504,11 +517,30 @@ class ToolRoundExecutor:
         question: str,
         options: list[str],
     ) -> tuple[PendingUserInput, Event]:
+        redactor = _redactor_for_tool_calls(
+            self._secret_redactor,
+            registered_agent=registered_agent,
+            tool_calls=tool_calls,
+        )
         checkpoint = await self._session_store.load_checkpoint(session.id)
         checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
-        if approval_support.pending_approval_from_checkpoint(checkpoint) is not None:
+        if (
+            approval_support.pending_approval_from_checkpoint(
+                checkpoint,
+                redactor=self._secret_redactor,
+                consume_on_rejection=True,
+            )
+            is not None
+        ):
             raise RuntimeError("Session already has a pending tool approval.")
-        if pending_user_input_from_checkpoint(checkpoint) is not None:
+        if (
+            pending_user_input_from_checkpoint(
+                checkpoint,
+                redactor=self._secret_redactor,
+                consume_on_rejection=True,
+            )
+            is not None
+        ):
             raise RuntimeError("Session already has a pending user input.")
         checkpoint.pop(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY, None)
 
@@ -527,7 +559,7 @@ class ToolRoundExecutor:
                 tool_calls=tool_calls,
                 policy_outcomes=policy_outcomes,
                 active_taint_by_id=active_taint_by_id,
-                redactor=self._secret_redactor,
+                redactor=redactor,
             ),
             structured_output=copy_structured_output_spec(structured_output),
             thinking=thinking,
@@ -538,7 +570,18 @@ class ToolRoundExecutor:
             ),
             retry_policy=copy_retry_policy(retry_policy) if retry_policy is not None else None,
         )
-        checkpoint[PENDING_USER_INPUT_CHECKPOINT_KEY] = pending.model_dump(mode="json")
+        pending_payload = _require_secret_free_durable_object(
+            pending.model_dump(mode="json"),
+            redactor=redactor,
+            field_name="pending_user_input",
+            schema_root=PENDING_USER_INPUT_CHECKPOINT_KEY,
+        )
+        checkpoint[PENDING_USER_INPUT_CHECKPOINT_KEY] = pending_payload
+        checkpoint = _require_secret_free_durable_object(
+            checkpoint,
+            redactor=redactor,
+            field_name="checkpoint",
+        )
         await self._session_store.transform_checkpoint(
             session.id,
             self._checkpoint_transform(checkpoint),
@@ -570,6 +613,11 @@ class ToolRoundExecutor:
         structured_output: StructuredOutputSpec | None,
     ) -> tuple[dict[str, Any], tool_round_recovery.PendingToolRound]:
         checkpoint = await self._session_store.load_checkpoint(session.id)
+        redactor = _redactor_for_tool_calls(
+            self._secret_redactor,
+            registered_agent=registered_agent,
+            tool_calls=tool_calls,
+        )
         return tool_round_recovery.checkpoint_with_pending_tool_round(
             checkpoint,
             agent_name=registered_agent.spec.name,
@@ -578,7 +626,7 @@ class ToolRoundExecutor:
             tool_calls=tool_calls,
             policy_outcomes=policy_outcomes,
             structured_output=structured_output,
-            redactor=self._secret_redactor,
+            redactor=redactor,
         )
 
     async def checkpoint_without_pending_tool_round(
@@ -600,7 +648,11 @@ class ToolRoundExecutor:
         if checkpoint is None:
             return
         copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
-        pending_approval = approval_support.pending_approval_from_checkpoint(copied_checkpoint)
+        pending_approval = approval_support.pending_approval_from_checkpoint(
+            copied_checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+        )
         if pending_approval is None or pending_approval.tool_call_id not in expected_ids:
             return
         copied_checkpoint.pop(approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY, None)
@@ -627,6 +679,11 @@ class ToolRoundExecutor:
         taint_labels: frozenset[str] | None = None,
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
         environment_name = _environment_name(registered_environment)
+        invocation_redactor = _redactor_for_tool_calls(
+            self._secret_redactor,
+            registered_agent=registered_agent,
+            tool_calls=[tool_call],
+        )
         started_event: Event | None = None
         registered_tool = registered_agent.tools.get(tool_call.name)
         if taint_labels is None:
@@ -658,14 +715,18 @@ class ToolRoundExecutor:
                 payload["approval_id"] = approval_id
             if input_id is not None:
                 payload["input_id"] = input_id
+            started = Event(
+                type=EventType.TOOL_CALL_STARTED,
+                session_id=session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                tool_name=tool_call.name,
+                payload=payload,
+            )
             started_event = await self._event_writer.emit(
-                Event(
-                    type=EventType.TOOL_CALL_STARTED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    tool_name=tool_call.name,
-                    payload=payload,
+                prepare_runtime_event(
+                    started,
+                    redactor=invocation_redactor,
                 )
             )
             yield started_event, None
@@ -701,6 +762,7 @@ class ToolRoundExecutor:
                 tool_call=tool_call,
                 result=result,
                 task_id=task_id,
+                redactor=invocation_redactor,
             ):
                 yield event
             return
@@ -753,6 +815,7 @@ class ToolRoundExecutor:
                     tool_call=tool_call,
                     result=result,
                     task_id=task_id,
+                    redactor=invocation_redactor,
                 ):
                     yield event
                 return
@@ -774,16 +837,27 @@ class ToolRoundExecutor:
                     budget_limits=None,
                     retry_policy=None,
                 )
-                yield (await self._event_writer.emit(checkpoint_event), None)
                 yield (
                     await self._event_writer.emit(
-                        Event(
-                            type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
-                            session_id=session.id,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            tool_name=tool_call.name,
-                            payload={"approval": approval.model_dump(mode="json")},
+                        _redact_event_for_invocation(
+                            checkpoint_event,
+                            redactor=invocation_redactor,
+                        )
+                    ),
+                    None,
+                )
+                yield (
+                    await self._event_writer.emit(
+                        _redact_event_for_invocation(
+                            Event(
+                                type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                                session_id=session.id,
+                                agent_name=registered_agent.spec.name,
+                                environment_name=environment_name,
+                                tool_name=tool_call.name,
+                                payload={"approval": approval.model_dump(mode="json")},
+                            ),
+                            redactor=invocation_redactor,
                         )
                     ),
                     None,
@@ -811,6 +885,7 @@ class ToolRoundExecutor:
             anchor_event=anchor_event,
             task_id=task_id,
             resolution=before_resolution,
+            redactor=invocation_redactor,
         ):
             yield hook_event, None
         effective_tool_call = (
@@ -842,6 +917,7 @@ class ToolRoundExecutor:
                 approval_id=approval_id,
                 input_id=input_id,
                 allow_modification=False,
+                redactor=invocation_redactor,
             ):
                 yield event
             return
@@ -868,6 +944,7 @@ class ToolRoundExecutor:
                 approval_id=approval_id,
                 input_id=input_id,
                 allow_modification=True,
+                redactor=invocation_redactor,
             ):
                 yield event
             return
@@ -916,12 +993,13 @@ class ToolRoundExecutor:
                     approval_id=approval_id,
                     input_id=input_id,
                     allow_modification=False,
+                    redactor=invocation_redactor,
                 ):
                     yield event
                 return
 
-        resolved_proxy_secrets: list[ResolvedSecret] = []
-        proxy_authorizations: list[_ProxyAuthorizationRecord] = []
+        invocation_secret_scope = invocation_secrets.InvocationSecretTracker(invocation_redactor)
+        proxy_authorizations: list[invocation_secrets.ProxyAuthorizationRecord] = []
         ctx_metadata = tool_execution.context_metadata(
             request_metadata=request_metadata,
             tool_call_id=tool_call.id,
@@ -943,10 +1021,13 @@ class ToolRoundExecutor:
             workspace=_workspace(registered_environment),
             artifact_store=_artifact_store(registered_environment),
             runner=_runner(registered_environment),
-            vault=_vault(registered_environment),
-            proxy=_proxy(
+            vault=invocation_secrets.vault_for_environment(
                 registered_environment,
-                on_resolve=resolved_proxy_secrets.append,
+                on_resolve=invocation_secret_scope.record,
+            ),
+            proxy=invocation_secrets.proxy_for_environment(
+                registered_environment,
+                on_resolve=invocation_secret_scope.record,
                 on_authorize=proxy_authorizations.append,
             ),
             knowledge_store=_knowledge_store(registered_environment),
@@ -959,15 +1040,18 @@ class ToolRoundExecutor:
                 effect=registered_tool.effect,
                 ctx=tool_context,
                 arguments=effective_tool_call.arguments,
+                redactor=lambda: invocation_secret_scope.redactor,
                 timeout_seconds=self._tool_timeout_seconds,
             )
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
+            invocation_secrets.initialize_cancellation_evidence(exc)
+            invocation_secrets.set_cancellation_redactor(
+                exc,
+                invocation_secret_scope.redactor,
+            )
+            invocation_secrets.set_cancellation_tool_call_id(exc, tool_call.id)
             if proxy_authorizations and await self._session_control.interrupt_requested(session.id):
                 clear_current_task_cancellation()
-                redactor = _redactor_with_resolved_secrets(
-                    self._secret_redactor,
-                    resolved_proxy_secrets,
-                )
                 async for event in self._emit_proxy_authorization_events(
                     session=session,
                     registered_agent=registered_agent,
@@ -978,15 +1062,12 @@ class ToolRoundExecutor:
                     approval_id=approval_id,
                     input_id=input_id,
                     idempotency_key=idempotency_key,
-                    redactor=redactor,
+                    redactor=invocation_secret_scope.redactor,
                 ):
                     yield event, None
             raise
         result = execution_outcome.result
-        redactor = _redactor_with_resolved_secrets(
-            self._secret_redactor,
-            resolved_proxy_secrets,
-        )
+        redactor = invocation_secret_scope.redactor
         policy_denial = tool_context._policy_denial_for(registered_tool.tool)
         result_event: Event | None = None
         published_terminal_event: Event | None = None
@@ -1360,6 +1441,7 @@ class ToolRoundExecutor:
                     )
                     for evaluation in evaluations
                 ]
+            publication_events = self._event_writer.prepare_many(publication_events)
             baseline_updates: dict[str, McpManifestBaseline] = {}
             if not blocked:
                 for evaluation in evaluations:
@@ -1455,7 +1537,7 @@ class ToolRoundExecutor:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         tool_call: runtime_records.ToolCallRequest,
-        records: list[_ProxyAuthorizationRecord],
+        records: list[invocation_secrets.ProxyAuthorizationRecord],
         tool_round_id: str | None,
         approval_id: str | None,
         input_id: str | None,
@@ -1481,21 +1563,17 @@ class ToolRoundExecutor:
                 payload["approval_id"] = approval_id
             if input_id is not None:
                 payload["input_id"] = input_id
-            if redactor.has_values:
-                redacted_payload = redactor.redact_json(payload)
-                if type(redacted_payload) is not dict:
-                    raise AssertionError(
-                        "Proxy authorization redaction returned non-object payload."
-                    )
-                payload = redacted_payload
             yield await self._event_writer.emit(
-                Event(
-                    type=EventType.CREDENTIAL_PROXY_CHECKED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=_environment_name(registered_environment),
-                    tool_name=tool_call.name,
-                    payload=payload,
+                prepare_runtime_event(
+                    Event(
+                        type=EventType.CREDENTIAL_PROXY_CHECKED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=_environment_name(registered_environment),
+                        tool_name=tool_call.name,
+                        payload=payload,
+                    ),
+                    redactor=redactor,
                 )
             )
 
@@ -1557,6 +1635,7 @@ class ToolRoundExecutor:
         anchor_event: Event,
         task_id: str | None,
         resolution: _BeforeToolCallResolution,
+        redactor: SecretRedactor,
     ) -> AsyncIterator[Event]:
         for hooks, scope in (
             (self._runtime_hooks, "app"),
@@ -1571,19 +1650,22 @@ class ToolRoundExecutor:
                     continue
                 hook_name = registered_hook.name
                 yield await self._event_writer.emit(
-                    _runtime_hook_event(
-                        event_type=EventType.HOOK_STARTED,
-                        hook_name=hook_name,
-                        scope=scope,
-                        phase=RuntimeHookPhase.BEFORE_TOOL_CALL,
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        terminal_event=anchor_event,
-                        payload={
-                            "tool_name": tool_call.name,
-                            "tool_call_id": tool_call.id,
-                        },
+                    _redact_event_for_invocation(
+                        _runtime_hook_event(
+                            event_type=EventType.HOOK_STARTED,
+                            hook_name=hook_name,
+                            scope=scope,
+                            phase=RuntimeHookPhase.BEFORE_TOOL_CALL,
+                            session=session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            terminal_event=anchor_event,
+                            payload={
+                                "tool_name": tool_call.name,
+                                "tool_call_id": tool_call.id,
+                            },
+                        ),
+                        redactor=redactor,
                     )
                 )
                 context = BeforeToolCallHookContext(
@@ -1601,8 +1683,31 @@ class ToolRoundExecutor:
                     stop = _resolve_before_tool_call_decision(decision, resolution)
                 except Exception as exc:
                     yield await self._event_writer.emit(
+                        _redact_event_for_invocation(
+                            _runtime_hook_event(
+                                event_type=EventType.HOOK_FAILED,
+                                hook_name=hook_name,
+                                scope=scope,
+                                phase=RuntimeHookPhase.BEFORE_TOOL_CALL,
+                                session=session,
+                                registered_agent=registered_agent,
+                                registered_environment=registered_environment,
+                                terminal_event=anchor_event,
+                                payload={
+                                    "tool_name": tool_call.name,
+                                    "tool_call_id": tool_call.id,
+                                    **_hook_failure_payload(exc, redactor=redactor),
+                                    **_hook_actions_payload(context, redactor=redactor),
+                                },
+                            ),
+                            redactor=redactor,
+                        )
+                    )
+                    continue
+                yield await self._event_writer.emit(
+                    _redact_event_for_invocation(
                         _runtime_hook_event(
-                            event_type=EventType.HOOK_FAILED,
+                            event_type=EventType.HOOK_COMPLETED,
                             hook_name=hook_name,
                             scope=scope,
                             phase=RuntimeHookPhase.BEFORE_TOOL_CALL,
@@ -1613,36 +1718,13 @@ class ToolRoundExecutor:
                             payload={
                                 "tool_name": tool_call.name,
                                 "tool_call_id": tool_call.id,
-                                **_hook_failure_payload(
-                                    exc,
-                                    redactor=self._secret_redactor,
-                                ),
                                 **_hook_actions_payload(
                                     context,
-                                    redactor=self._secret_redactor,
+                                    redactor=redactor,
                                 ),
                             },
-                        )
-                    )
-                    continue
-                yield await self._event_writer.emit(
-                    _runtime_hook_event(
-                        event_type=EventType.HOOK_COMPLETED,
-                        hook_name=hook_name,
-                        scope=scope,
-                        phase=RuntimeHookPhase.BEFORE_TOOL_CALL,
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        terminal_event=anchor_event,
-                        payload={
-                            "tool_name": tool_call.name,
-                            "tool_call_id": tool_call.id,
-                            **_hook_actions_payload(
-                                context,
-                                redactor=self._secret_redactor,
-                            ),
-                        },
+                        ),
+                        redactor=redactor,
                     )
                 )
                 if stop:
@@ -1780,19 +1862,22 @@ class ToolRoundExecutor:
             hook_name = registered_hook.name
             yield (
                 await self._event_writer.emit(
-                    _runtime_hook_event(
-                        event_type=EventType.HOOK_STARTED,
-                        hook_name=hook_name,
-                        scope=scope,
-                        phase=RuntimeHookPhase.AFTER_TOOL_CALL,
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        terminal_event=tool_event,
-                        payload={
-                            "tool_name": tool_call.name,
-                            "tool_call_id": tool_call.id,
-                        },
+                    _redact_event_for_invocation(
+                        _runtime_hook_event(
+                            event_type=EventType.HOOK_STARTED,
+                            hook_name=hook_name,
+                            scope=scope,
+                            phase=RuntimeHookPhase.AFTER_TOOL_CALL,
+                            session=session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            terminal_event=tool_event,
+                            payload={
+                                "tool_name": tool_call.name,
+                                "tool_call_id": tool_call.id,
+                            },
+                        ),
+                        redactor=redactor,
                     )
                 ),
                 None,
@@ -1824,8 +1909,36 @@ class ToolRoundExecutor:
             except Exception as exc:
                 yield (
                     await self._event_writer.emit(
+                        _redact_event_for_invocation(
+                            _runtime_hook_event(
+                                event_type=EventType.HOOK_FAILED,
+                                hook_name=hook_name,
+                                scope=scope,
+                                phase=RuntimeHookPhase.AFTER_TOOL_CALL,
+                                session=session,
+                                registered_agent=registered_agent,
+                                registered_environment=registered_environment,
+                                terminal_event=tool_event,
+                                payload={
+                                    "tool_name": tool_call.name,
+                                    "tool_call_id": tool_call.id,
+                                    **_hook_failure_payload(exc, redactor=redactor),
+                                    **_hook_actions_payload(context, redactor=redactor),
+                                },
+                            ),
+                            redactor=redactor,
+                        )
+                    ),
+                    None,
+                )
+                continue
+            if modified is not None:
+                current_result = modified
+            yield (
+                await self._event_writer.emit(
+                    _redact_event_for_invocation(
                         _runtime_hook_event(
-                            event_type=EventType.HOOK_FAILED,
+                            event_type=EventType.HOOK_COMPLETED,
                             hook_name=hook_name,
                             scope=scope,
                             phase=RuntimeHookPhase.AFTER_TOOL_CALL,
@@ -1836,32 +1949,10 @@ class ToolRoundExecutor:
                             payload={
                                 "tool_name": tool_call.name,
                                 "tool_call_id": tool_call.id,
-                                **_hook_failure_payload(exc, redactor=redactor),
                                 **_hook_actions_payload(context, redactor=redactor),
                             },
-                        )
-                    ),
-                    None,
-                )
-                continue
-            if modified is not None:
-                current_result = modified
-            yield (
-                await self._event_writer.emit(
-                    _runtime_hook_event(
-                        event_type=EventType.HOOK_COMPLETED,
-                        hook_name=hook_name,
-                        scope=scope,
-                        phase=RuntimeHookPhase.AFTER_TOOL_CALL,
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        terminal_event=tool_event,
-                        payload={
-                            "tool_name": tool_call.name,
-                            "tool_call_id": tool_call.id,
-                            **_hook_actions_payload(context, redactor=redactor),
-                        },
+                        ),
+                        redactor=redactor,
                     )
                 ),
                 modified,
@@ -2152,17 +2243,34 @@ class ToolRoundRun:
     ) -> AsyncIterator[Event]:
         cancellation_artifacts: list[dict[str, Any]] | None = None
         cancellation_artifacts_by_id: dict[str, list[dict[str, Any]]] | None = None
+        cancellation_redactors_by_id: dict[str, SecretRedactor] | None = None
         if isinstance(exc, SessionInterruptedByRequest):
             pass
         elif isinstance(exc, asyncio.CancelledError):
             if not await self._executor._session_control.interrupt_requested(self._session.id):
+                invocation_secrets.sanitize_external_cancellation(exc)
                 return
             clear_current_task_cancellation()
-            cancellation_artifacts = _cancellation_artifacts(exc)
-            producer_id = _cancellation_tool_call_id(exc)
-            if producer_id is not None and cancellation_artifacts:
+            cancellation_artifacts = invocation_secrets.cancellation_artifacts(exc)
+            cancellation_artifacts_by_id = invocation_secrets.cancellation_artifacts_by_id(exc)
+            cancellation_redactors_by_id = invocation_secrets.cancellation_redactors_by_id(exc)
+            if cancellation_artifacts_by_id is not None:
+                cancellation_artifacts = None
+            producer_id = invocation_secrets.cancellation_tool_call_id(exc)
+            cancellation_redactor = invocation_secrets.cancellation_redactor(exc)
+            if (
+                producer_id is not None
+                and cancellation_artifacts
+                and cancellation_artifacts_by_id is None
+            ):
                 cancellation_artifacts_by_id = {producer_id: cancellation_artifacts}
                 cancellation_artifacts = None
+            if (
+                producer_id is not None
+                and cancellation_redactor is not None
+                and cancellation_redactors_by_id is None
+            ):
+                cancellation_redactors_by_id = {producer_id: cancellation_redactor}
         else:
             raise TypeError(f"Unsupported interrupt exception: {type(exc).__name__}")
         if clear_pending_approval:
@@ -2180,6 +2288,7 @@ class ToolRoundRun:
             tool_round_id=tool_round_id,
             cancellation_artifacts=cancellation_artifacts,
             cancellation_artifacts_by_id=cancellation_artifacts_by_id,
+            cancellation_redactors_by_id=cancellation_redactors_by_id,
         )
         async for event in self._executor._close_interrupted_round(request):
             yield event
@@ -2293,12 +2402,32 @@ class ToolRoundRun:
         except BaseExceptionGroup as exc_group:
             flush_completed_outcomes()
             raise _parallel_tool_round_exception(exc_group) from exc_group
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
             flush_completed_outcomes()
+            artifacts_by_id: dict[str, list[dict[str, Any]]] = {}
+            redactors_by_id: dict[str, SecretRedactor] = {}
             for index, child_exc in enumerate(child_cancellations):
-                if child_exc is not None and _cancellation_artifacts(child_exc):
-                    _set_cancellation_tool_call_id(child_exc, tool_calls[index].id)
-                    raise child_exc from None
+                if child_exc is None:
+                    continue
+                tool_call_id = tool_calls[index].id
+                child_artifacts = invocation_secrets.cancellation_artifacts(child_exc)
+                child_redactor = invocation_secrets.cancellation_redactor(child_exc)
+                if child_artifacts:
+                    artifacts_by_id[tool_call_id] = child_artifacts
+                if child_redactor is not None:
+                    redactors_by_id[tool_call_id] = child_redactor
+            if artifacts_by_id or redactors_by_id:
+                invocation_secrets.initialize_cancellation_evidence(cancellation)
+            if artifacts_by_id:
+                invocation_secrets.set_cancellation_artifacts_by_id(
+                    cancellation,
+                    artifacts_by_id,
+                )
+            if redactors_by_id:
+                invocation_secrets.set_cancellation_redactors_by_id(
+                    cancellation,
+                    redactors_by_id,
+                )
             raise
         for index, tool_call in enumerate(tool_calls):
             if all(outcome is None for _, outcome in buffers[index]):
@@ -2420,27 +2549,6 @@ def _parallel_tool_round_exception(group: BaseExceptionGroup) -> BaseException:
     return flattened[0]
 
 
-def _cancellation_artifacts(exc: asyncio.CancelledError) -> list[dict[str, Any]]:
-    if isinstance(exc, RunnerCancelledError):
-        return copy_json_value(exc.artifacts, "artifacts")
-    artifacts = getattr(exc, "artifacts", None)
-    if artifacts is not None:
-        return copy_json_value(artifacts, "artifacts")
-    return []
-
-
-_CANCELLATION_TOOL_CALL_ID_ATTR = "_cayu_cancellation_tool_call_id"
-
-
-def _set_cancellation_tool_call_id(exc: asyncio.CancelledError, tool_call_id: str) -> None:
-    setattr(exc, _CANCELLATION_TOOL_CALL_ID_ATTR, tool_call_id)
-
-
-def _cancellation_tool_call_id(exc: asyncio.CancelledError) -> str | None:
-    value = getattr(exc, _CANCELLATION_TOOL_CALL_ID_ATTR, None)
-    return value if isinstance(value, str) else None
-
-
 def _copy_agent_spec(spec: AgentSpec) -> AgentSpec:
     if type(spec) is not AgentSpec:
         raise TypeError("Agent registration requires an AgentSpec.")
@@ -2504,12 +2612,6 @@ def _runner(registered_environment: runtime_records.RegisteredEnvironment | None
     return registered_environment.environment.runner
 
 
-def _vault(registered_environment: runtime_records.RegisteredEnvironment | None) -> Any:
-    if registered_environment is None:
-        return None
-    return registered_environment.environment.vault
-
-
 def _knowledge_store(
     registered_environment: runtime_records.RegisteredEnvironment | None,
 ) -> Any:
@@ -2524,156 +2626,6 @@ def _mcp_servers(
     if registered_environment is None:
         return ()
     return registered_environment.environment.mcp_servers
-
-
-@dataclass(frozen=True)
-class _ProxyAuthorizationRecord:
-    destination: str
-    credential: SecretRef | None
-    action: str | None
-    metadata: dict[str, Any]
-    result: ProxyAuthorizationResult
-
-
-def _copy_durable_proxy_secret_ref(ref: SecretRef) -> SecretRef:
-    """Detach the credential identity retained for durable proxy telemetry."""
-
-    copied = copy_secret_ref(ref)
-    return SecretRef(
-        name=require_clean_nonblank(
-            require_durable_text(copied.name, "credential.name"),
-            "credential.name",
-        ),
-        handle=(
-            None
-            if copied.handle is None
-            else require_clean_nonblank(
-                require_durable_text(copied.handle, "credential.handle"),
-                "credential.handle",
-            )
-        ),
-        metadata=copy_durable_json_object(copied.metadata, "credential.metadata"),
-    )
-
-
-def _copy_durable_proxy_authorization_result(
-    result: ProxyAuthorizationResult,
-) -> ProxyAuthorizationResult:
-    """Detach the proxy result fields published after the tool call."""
-
-    copied = copy_proxy_authorization_result(result)
-    return ProxyAuthorizationResult(
-        allowed=copied.allowed,
-        reason=(
-            None
-            if copied.reason is None
-            else require_clean_nonblank(
-                require_durable_text(copied.reason, "proxy_authorization.reason"),
-                "proxy_authorization.reason",
-            )
-        ),
-        metadata=copy_durable_json_object(
-            copied.metadata,
-            "proxy_authorization.metadata",
-        ),
-    )
-
-
-class _RedactingCredentialProxy(CredentialProxy):
-    def __init__(
-        self,
-        proxy: CredentialProxy,
-        on_resolve: Callable[[ResolvedSecret], None],
-        on_authorize: Callable[[_ProxyAuthorizationRecord], None],
-    ) -> None:
-        if not isinstance(proxy, CredentialProxy):
-            raise TypeError("proxy must be a CredentialProxy.")
-        if not callable(on_resolve):
-            raise TypeError("on_resolve must be callable.")
-        if not callable(on_authorize):
-            raise TypeError("on_authorize must be callable.")
-        self._proxy = proxy
-        self._on_resolve = on_resolve
-        self._on_authorize = on_authorize
-
-    async def resolve(
-        self,
-        ref: SecretRef,
-        *,
-        scope: dict[str, Any] | None = None,
-    ) -> ResolvedSecret:
-        copied_ref = copy_secret_ref(ref)
-        copied_scope = None if scope is None else copy_json_object(scope, "scope")
-        secret = await self._proxy.resolve(
-            copied_ref,
-            scope=None if copied_scope is None else copy_json_object(copied_scope, "scope"),
-        )
-        if type(secret) is not ResolvedSecret:
-            raise TypeError("Proxy secret resolution must return ResolvedSecret.")
-        self._on_resolve(copy_resolved_secret(secret))
-        return copy_resolved_secret(secret)
-
-    async def authorize_request(
-        self,
-        *,
-        destination: str,
-        credential: SecretRef | None = None,
-        action: str | None = None,
-        metadata: dict[str, Any] | None = None,
-    ) -> ProxyAuthorizationResult:
-        copied_destination = require_clean_nonblank(
-            require_durable_text(destination, "destination"),
-            "destination",
-        )
-        copied_credential = (
-            None if credential is None else _copy_durable_proxy_secret_ref(credential)
-        )
-        copied_action = (
-            None
-            if action is None
-            else require_clean_nonblank(
-                require_durable_text(action, "action"),
-                "action",
-            )
-        )
-        copied_metadata = {} if metadata is None else copy_durable_json_object(metadata, "metadata")
-        result = await self._proxy.authorize_request(
-            destination=copied_destination,
-            credential=(
-                None
-                if copied_credential is None
-                else _copy_durable_proxy_secret_ref(copied_credential)
-            ),
-            action=copied_action,
-            metadata=copy_durable_json_object(copied_metadata, "metadata"),
-        )
-        if type(result) is not ProxyAuthorizationResult:
-            raise TypeError("Proxy authorization must return ProxyAuthorizationResult.")
-        copied_result = _copy_durable_proxy_authorization_result(result)
-        self._on_authorize(
-            _ProxyAuthorizationRecord(
-                destination=copied_destination,
-                credential=copied_credential,
-                action=copied_action,
-                metadata=copied_metadata,
-                result=copied_result,
-            )
-        )
-        return _copy_durable_proxy_authorization_result(copied_result)
-
-
-def _proxy(
-    registered_environment: runtime_records.RegisteredEnvironment | None,
-    *,
-    on_resolve: Callable[[ResolvedSecret], None],
-    on_authorize: Callable[[_ProxyAuthorizationRecord], None],
-) -> Any:
-    if registered_environment is None:
-        return None
-    proxy = registered_environment.environment.proxy
-    if proxy is None:
-        return None
-    return _RedactingCredentialProxy(proxy, on_resolve, on_authorize)
 
 
 def _mcp_manifest_candidates_for_agent(
@@ -2794,8 +2746,8 @@ def _mcp_manifest_exposed_tool_evidence(
     matching_source_entries = [
         entry
         for entry in source.tools
-        if entry.mcp_name == binding.mcp_name
-        and entry.contract_hash == binding.source_contract_hash
+        if entry.mcp_name == binding.manifest_mcp_name
+        and entry.contract_hash == binding.manifest_contract_hash
     ]
     if len(matching_source_entries) != 1:
         raise McpManifestHistoryConflict(
@@ -2803,19 +2755,19 @@ def _mcp_manifest_exposed_tool_evidence(
         )
     tool_id = _mcp_manifest_tool_identity(
         cayu_name=registered_tool.name,
-        mcp_name=binding.mcp_name,
+        mcp_name=binding.manifest_mcp_name,
     )
     contract = json.dumps(
         {
             "schema": "cayu.mcp.exposed_tool_contract.v1",
             "tool_id": tool_id,
-            "source_contract_hash": binding.source_contract_hash,
+            "source_contract_hash": binding.manifest_contract_hash,
             "name": registered_tool.name,
             "description": registered_tool.description,
             "input_schema": registered_tool.schema,
             "parallel_safe": registered_tool.parallel_safe,
             "effect": registered_tool.effect.value,
-            "mcp_name": binding.mcp_name,
+            "mcp_name": binding.manifest_mcp_name,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -3308,6 +3260,16 @@ def _runtime_hook_event(
     )
 
 
+def _redact_event_for_invocation(
+    event: Event,
+    *,
+    redactor: SecretRedactor,
+) -> Event:
+    """Scrub adapter/invocation secrets before the app-level writer sees them."""
+
+    return prepare_runtime_event(event, redactor=redactor)
+
+
 _POLICY_DENIAL_CONTROL_PAYLOAD_FIELDS = frozenset(
     {
         "approval_id",
@@ -3374,8 +3336,8 @@ def _hook_failure_payload(
         exc,
         empty_message="runtime hook failed",
         nonportable_message="Runtime hook failed with a non-portable diagnostic.",
+        redactor=redactor,
     )
-    diagnostic = tool_results.redact_exception_diagnostic(diagnostic, redactor)
     return copy_durable_json_object(diagnostic.payload_fields(), "hook_failure")
 
 
@@ -3498,13 +3460,18 @@ def policy_denial_payload_fields(
     }
 
 
-def _redactor_with_resolved_secrets(
-    redactor: SecretRedactor,
-    secrets: list[ResolvedSecret],
+def _redactor_for_tool_calls(
+    base: SecretRedactor,
+    *,
+    registered_agent: runtime_records.RegisteredAgentState,
+    tool_calls: list[runtime_records.ToolCallRequest],
 ) -> SecretRedactor:
-    resolved_redactor = redactor
-    for secret in secrets:
-        if type(secret) is not ResolvedSecret:
-            raise TypeError("Resolved proxy secrets must be ResolvedSecret instances.")
-        resolved_redactor = resolved_redactor.with_secret(secret)
-    return resolved_redactor
+    redactor = base
+    for tool_call in tool_calls:
+        registered_tool = registered_agent.tools.get(tool_call.name)
+        if registered_tool is None:
+            continue
+        tool = registered_tool.tool
+        if isinstance(tool, McpToolAdapter):
+            redactor = redactor.merged_with(tool.toolset.secret_redactor)
+    return redactor

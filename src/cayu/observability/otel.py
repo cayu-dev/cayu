@@ -6,7 +6,9 @@ from types import ModuleType
 from typing import Any
 
 from cayu.core.events import Event, EventType
+from cayu.runtime._event_writer import prepare_runtime_event
 from cayu.runtime.event_sinks import EventSink
+from cayu.vaults.redaction import SecretRedactor
 
 # GenAI attribute names, mirrored as plain strings from the OpenTelemetry GenAI
 # semantic conventions so the sink does not import (or couple to the version of)
@@ -149,16 +151,23 @@ class OpenTelemetryEventSink(EventSink):
     """
 
     def __init__(
-        self, *, tracer_name: str = DEFAULT_TRACER_NAME, tracer: Any | None = None
+        self,
+        *,
+        tracer_name: str = DEFAULT_TRACER_NAME,
+        tracer: Any | None = None,
+        redactor: SecretRedactor | None = None,
     ) -> None:
         if type(tracer_name) is not str or not tracer_name.strip():
             raise ValueError("OpenTelemetryEventSink tracer_name must be a non-empty string.")
+        if redactor is not None and not isinstance(redactor, SecretRedactor):
+            raise TypeError("OpenTelemetryEventSink redactor must be a SecretRedactor.")
         self._trace = _import_otel("opentelemetry.trace")
         status_module = _import_otel("opentelemetry.trace.status")
         self._status = status_module.Status
         self._status_error = status_module.StatusCode.ERROR
         self._empty_context = _import_otel("opentelemetry.context").Context()
         self._tracer = tracer if tracer is not None else self._trace.get_tracer(tracer_name)
+        self._redactor = redactor or SecretRedactor()
         self._propagator_instance: Any | None = None
         self._sessions: dict[str, _SessionSpans] = {}
         self._recent_event_identities: OrderedDict[tuple[str, str], None] = OrderedDict()
@@ -177,6 +186,7 @@ class OpenTelemetryEventSink(EventSink):
     async def emit(self, event: Event) -> None:
         if type(event) is not Event:
             raise TypeError("OpenTelemetryEventSink requires Event instances.")
+        event = _redact_event_for_export(event, redactor=self._redactor)
         event_type = event.type
         if event_type not in _TRACED_EVENT_TYPES:
             return
@@ -247,7 +257,7 @@ class OpenTelemetryEventSink(EventSink):
         span = self._tracer.start_span(
             name, context=self._resolve_parent_context(event), start_time=event_ns
         )
-        span.set_attribute(CAYU_SESSION_ID, session_id)
+        span.set_attribute(CAYU_SESSION_ID, self._redactor.redact_text(session_id))
         _set_str(span, CAYU_AGENT_NAME, event.agent_name)
         _set_str(span, CAYU_ENVIRONMENT_NAME, event.environment_name)
         self._sessions[session_id] = _SessionSpans(span, event_ns)
@@ -375,7 +385,11 @@ class OpenTelemetryEventSink(EventSink):
         )
         span.set_attribute(GEN_AI_OPERATION_NAME, _OPERATION_EXECUTE_TOOL)
         _set_str(span, GEN_AI_TOOL_NAME, tool_name)
-        _set_str(span, GEN_AI_TOOL_CALL_ID, _tool_call_id(event))
+        _set_str(
+            span,
+            GEN_AI_TOOL_CALL_ID,
+            self._redactor.redact_text(_tool_call_id(event)),
+        )
         return span
 
     def _end_tool_span(self, event: Event, *, error: str | None) -> bool:
@@ -457,6 +471,33 @@ def _event_time_ns(event: Event) -> int:
     the event bus buffers or a downstream sink is slow.
     """
     return int(event.timestamp.timestamp() * 1_000_000_000)
+
+
+def _redact_event_for_export(event: Event, *, redactor: SecretRedactor) -> Event:
+    """Redact exported data while retaining raw in-process correlation keys."""
+
+    redacted = prepare_runtime_event(
+        event,
+        redactor=redactor,
+        reject_authority_secrets=False,
+    )
+    payload = dict(redacted.payload)
+    parent_session_id = event.payload.get("parent_session_id")
+    if type(parent_session_id) is str:
+        payload["parent_session_id"] = parent_session_id
+    return redacted.model_copy(
+        update={
+            "session_id": event.session_id,
+            "payload": payload,
+        },
+        deep=True,
+    )
+
+
+def _redact_optional_text(value: str | None, *, redactor: SecretRedactor) -> str | None:
+    if value is None:
+        return None
+    return redactor.redact_text(value)
 
 
 def _span_name(base: str, suffix: Any) -> str:

@@ -73,6 +73,7 @@ from cayu.providers.base import (
     UsageDialect,
     copy_usage_dialect,
 )
+from cayu.runtime._checkpoint_redaction import require_secret_free_durable_object
 from cayu.runtime._completion_projection import portable_model_completion_projection
 from cayu.runtime._diagnostics import exception_diagnostic
 from cayu.runtime._model_errors import (
@@ -104,12 +105,34 @@ from cayu.storage.memory import (
     KnowledgeSearchMode,
     KnowledgeVisibility,
 )
+from cayu.vaults import SecretRedactor
 
 _COMPACTION_CHECKPOINT_KEY = "context_compaction"
 _COMPACTION_CHECKPOINT_VERSION = 2
 _COMPACTION_PROGRESS_STATE_KEY = "progress"
 _COMPACTION_PROGRESS_EXHAUSTED_KEY = "exhausted"
 _COMPACTION_PROGRESS_KEY = "key"
+_CONTEXT_CHECKPOINT_EVENT_STRUCTURE_KEYS = frozenset(
+    {
+        "checkpoint",
+        "compacted_transcript_cursor",
+        "estimated_context_input_tokens",
+        "estimated_context_window_tokens",
+        "estimated_delta_input_tokens",
+        "last_input_tokens",
+        "last_total_tokens",
+        "last_transcript_cursor",
+        "min_input_tokens",
+        "min_total_tokens",
+        "newly_compacted_message_count",
+        "previous_compacted_transcript_cursor",
+        "provider_count_context_window_tokens",
+        "provider_count_input_tokens",
+        "recent_message_count",
+        "reserved_output_tokens",
+        "trigger_estimated_context_tokens",
+    }
+)
 _USAGE_TRIGGERED_CHECKPOINT_KEY = "usage_triggered_context"
 _USAGE_TRIGGERED_CHECKPOINT_VERSION = 1
 _DEFAULT_KNOWLEDGE_INJECTION_MAX_HITS = 3
@@ -1226,6 +1249,83 @@ class ContextBuildResult(BaseModel):
         return copy_json_value(value, info.field_name)
 
 
+def clear_context_build_result_payload(result: ContextBuildResult) -> None:
+    """Discard extension-provided data before a validation error crosses the boundary."""
+
+    if not isinstance(result, ContextBuildResult):
+        raise TypeError("result must be a ContextBuildResult.")
+    result.messages.clear()
+    if result.checkpoint is not None:
+        result.checkpoint.clear()
+    if result.checkpoint_event_payload is not None:
+        result.checkpoint_event_payload.clear()
+    result.compaction_telemetry.clear()
+    result.knowledge_telemetry.clear()
+
+
+def _copy_secret_free_context_checkpoint_evidence(
+    checkpoint: dict[str, Any] | None,
+    checkpoint_event_payload: dict[str, Any] | None,
+    *,
+    redactor: SecretRedactor,
+    checkpoint_field_name: str,
+    checkpoint_event_payload_field_name: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Copy the two checkpoint representations through one validation seam."""
+
+    safe_checkpoint = (
+        None
+        if checkpoint is None
+        else require_secret_free_durable_object(
+            checkpoint,
+            redactor=redactor,
+            field_name=checkpoint_field_name,
+        )
+    )
+    safe_checkpoint_event_payload = (
+        None
+        if checkpoint_event_payload is None
+        else _require_secret_free_checkpoint_event_payload(
+            checkpoint_event_payload,
+            redactor=redactor,
+            field_name=checkpoint_event_payload_field_name,
+        )
+    )
+    return safe_checkpoint, safe_checkpoint_event_payload
+
+
+def sanitize_context_build_result_checkpoint(
+    result: ContextBuildResult,
+    *,
+    redactor: SecretRedactor,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Copy safe checkpoint evidence or consume the rejected extension result."""
+
+    if not isinstance(result, ContextBuildResult):
+        raise TypeError("result must be a ContextBuildResult.")
+    if not isinstance(redactor, SecretRedactor):
+        raise TypeError("redactor must be a SecretRedactor.")
+    checkpoint = result.checkpoint
+    checkpoint_event_payload = result.checkpoint_event_payload
+    try:
+        safe_checkpoint, safe_checkpoint_event_payload = (
+            _copy_secret_free_context_checkpoint_evidence(
+                checkpoint,
+                checkpoint_event_payload,
+                redactor=redactor,
+                checkpoint_field_name="ContextBuildResult.checkpoint",
+                checkpoint_event_payload_field_name=("ContextBuildResult.checkpoint_event_payload"),
+            )
+        )
+    except BaseException:
+        clear_context_build_result_payload(result)
+        checkpoint = None
+        checkpoint_event_payload = None
+        del result
+        raise
+    return safe_checkpoint, safe_checkpoint_event_payload
+
+
 class ContextBuildError(RuntimeError):
     """Context build failure with compaction telemetry to emit first."""
 
@@ -1254,6 +1354,110 @@ class ContextBuildError(RuntimeError):
             else copy_json_value(checkpoint_event_payload, "checkpoint_event_payload")
         )
         self.cause = cause
+
+
+def sanitize_context_build_error_checkpoint(
+    error: ContextBuildError,
+    *,
+    redactor: SecretRedactor,
+    field_name: str = "ContextBuildError.checkpoint",
+) -> None:
+    """Retain safe failure progress while discarding an unsafe checkpoint update."""
+
+    if not isinstance(error, ContextBuildError):
+        raise TypeError("error must be a ContextBuildError.")
+    if not isinstance(redactor, SecretRedactor):
+        raise TypeError("redactor must be a SecretRedactor.")
+    checkpoint = error.checkpoint
+    checkpoint_event_payload = error.checkpoint_event_payload
+    try:
+        safe_checkpoint, safe_checkpoint_event_payload = (
+            _copy_secret_free_context_checkpoint_evidence(
+                checkpoint,
+                checkpoint_event_payload,
+                redactor=redactor,
+                checkpoint_field_name=field_name,
+                checkpoint_event_payload_field_name=("ContextBuildError.checkpoint_event_payload"),
+            )
+        )
+    except Exception:
+        if checkpoint is not None:
+            checkpoint.clear()
+        if checkpoint_event_payload is not None:
+            checkpoint_event_payload.clear()
+        error.checkpoint = None
+        error.checkpoint_event_payload = None
+        error.add_note(
+            "The context policy's failure checkpoint update was discarded because "
+            "it contained a workload secret."
+        )
+        return
+    error.checkpoint = safe_checkpoint
+    error.checkpoint_event_payload = safe_checkpoint_event_payload
+
+
+def _require_secret_free_checkpoint_event_payload(
+    value: dict[str, Any],
+    *,
+    redactor: SecretRedactor,
+    field_name: str,
+) -> dict[str, Any]:
+    """Copy and validate checkpoint event evidence without retaining rejected keys."""
+
+    copied = copy_json_value(value, field_name)
+    if type(copied) is not dict:
+        raise AssertionError("Checkpoint event payload copied as a non-object.")
+    contains_secret = redactor.redact_json_values(
+        copied
+    ) != copied or _json_object_keys_contain_secret(
+        copied,
+        redactor=redactor,
+        preserve_keys=_CONTEXT_CHECKPOINT_EVENT_STRUCTURE_KEYS,
+    )
+    if not contains_secret:
+        return copied
+    copied.clear()
+    value.clear()
+    value = {}
+    raise ValueError(f"{field_name} contains a workload secret; refusing to publish it.")
+
+
+def _json_object_keys_contain_secret(
+    value: Any,
+    *,
+    redactor: SecretRedactor,
+    preserve_keys: frozenset[str],
+    structural_boundary: bool = True,
+) -> bool:
+    """Return whether a JSON tree has a secret-bearing non-structural key."""
+
+    if value is None or type(value) in {str, bool, int, float}:
+        return False
+    if type(value) is list:
+        return any(
+            _json_object_keys_contain_secret(
+                item,
+                redactor=redactor,
+                preserve_keys=preserve_keys,
+                structural_boundary=False,
+            )
+            for item in value
+        )
+    if type(value) is dict:
+        return any(
+            (
+                (not structural_boundary or key not in preserve_keys)
+                and redactor.redact_text(key) != key
+            )
+            or _json_object_keys_contain_secret(
+                item,
+                redactor=redactor,
+                preserve_keys=preserve_keys,
+                structural_boundary=False,
+            )
+            for key, item in value.items()
+        )
+    raise AssertionError("Checkpoint event payload contains non-JSON-compatible data.")
 
 
 class _ContextBuildTerminationDiagnostics:
@@ -1449,6 +1653,7 @@ class KnowledgeInjectionPolicy(RuntimeManagedContextPolicy):
                 exc,
                 empty_message="knowledge search failed",
                 nonportable_message="Knowledge search failed with a non-portable diagnostic.",
+                redactor=_active_context_secret_redactor(),
             )
             telemetry.append(
                 _knowledge_search_telemetry(
@@ -2304,6 +2509,10 @@ _AUTOMATIC_COMPACTION_RUNNER: ContextVar[_AutomaticCompactionRunner | None] = Co
     "automatic_compaction_runner",
     default=None,
 )
+_CONTEXT_SECRET_REDACTOR: ContextVar[SecretRedactor | None] = ContextVar(
+    "cayu_context_secret_redactor",
+    default=None,
+)
 
 _AutomaticCompactionDispatchRunner = Callable[
     [
@@ -2336,6 +2545,21 @@ def _automatic_compaction_runner_scope(
         yield
     finally:
         _AUTOMATIC_COMPACTION_RUNNER.reset(token)
+
+
+@contextmanager
+def _context_secret_redactor_scope(redactor: SecretRedactor) -> Iterator[None]:
+    if not isinstance(redactor, SecretRedactor):
+        raise TypeError("redactor must be a SecretRedactor.")
+    token = _CONTEXT_SECRET_REDACTOR.set(redactor)
+    try:
+        yield
+    finally:
+        _CONTEXT_SECRET_REDACTOR.reset(token)
+
+
+def _active_context_secret_redactor() -> SecretRedactor:
+    return _CONTEXT_SECRET_REDACTOR.get() or SecretRedactor()
 
 
 @contextmanager

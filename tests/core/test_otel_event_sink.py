@@ -35,6 +35,7 @@ from cayu.runtime import InMemorySessionStore, SessionIdentity
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime.budgets import InMemoryBudgetStore
 from cayu.runtime.event_sinks import EventSink
+from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 REMOTE_TRACE_ID = "11111111111111111111111111111111"
 REMOTE_TRACEPARENT = f"00-{REMOTE_TRACE_ID}-2222222222222222-01"
@@ -373,6 +374,47 @@ def test_traceparent_for_returns_open_session_context() -> None:
     assert sink.traceparent_for("unknown") is None
 
 
+def test_sink_redacts_exported_session_ids_without_changing_internal_correlation() -> None:
+    session_ids = ("otel-session-secret-a", "otel-session-secret-b")
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    sink = OpenTelemetryEventSink(
+        tracer=provider.get_tracer("session-redaction-test"),
+        redactor=SecretRedactor(session_ids),
+    )
+
+    for session_id in session_ids:
+        asyncio.run(
+            sink.emit(
+                Event(
+                    type=EventType.SESSION_STARTED,
+                    session_id=session_id,
+                    payload={},
+                )
+            )
+        )
+
+    traceparents = [sink.traceparent_for(session_id) for session_id in session_ids]
+    assert all(traceparent is not None for traceparent in traceparents)
+    assert traceparents[0] != traceparents[1]
+
+    for session_id in session_ids:
+        asyncio.run(
+            sink.emit(
+                Event(
+                    type=EventType.SESSION_COMPLETED,
+                    session_id=session_id,
+                    payload={},
+                )
+            )
+        )
+
+    session_spans = [span for span in exporter.get_finished_spans() if span.name == "cayu.session"]
+    assert len(session_spans) == 2
+    assert {span.attributes[otel.CAYU_SESSION_ID] for span in session_spans} == {REDACTED_SECRET}
+
+
 def test_failures_set_error_status() -> None:
     # MODEL_ERROR carries no "step" on the default path; the span must still close.
     exporter, sink = _make_sink()
@@ -397,6 +439,69 @@ def test_failures_set_error_status() -> None:
     assert spans["chat"].status.status_code == StatusCode.ERROR
     assert spans["chat"].status.description == "RuntimeError: boom"
     assert spans["cayu.session"].status.status_code == StatusCode.ERROR
+
+
+def test_sink_redacts_workload_secrets_before_exporting_span_data() -> None:
+    secret = "otel-export-boundary-canary"
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    sink = OpenTelemetryEventSink(
+        tracer=provider.get_tracer("redaction-test"),
+        redactor=SecretRedactor(secret),
+    )
+
+    _drive(
+        sink,
+        [
+            Event(
+                type=EventType.SESSION_STARTED,
+                session_id="redaction-session",
+                agent_name=f"agent-{secret}",
+                environment_name=f"environment-{secret}",
+                payload={"agent_name": f"agent-{secret}"},
+            ),
+            Event(
+                type=EventType.MODEL_STARTED,
+                session_id="redaction-session",
+                payload={
+                    "provider": f"provider-{secret}",
+                    "model": f"model-{secret}",
+                },
+            ),
+            Event(
+                type=EventType.MODEL_ERROR,
+                session_id="redaction-session",
+                payload={
+                    "provider": f"provider-{secret}",
+                    "model": f"model-{secret}",
+                    "error_type": "RuntimeError",
+                    "error": f"provider rejected {secret}",
+                },
+            ),
+            Event(
+                type=EventType.SESSION_FAILED,
+                session_id="redaction-session",
+                payload={
+                    "error_type": "RuntimeError",
+                    "error": f"session failed with {secret}",
+                },
+            ),
+        ],
+    )
+
+    serialized = repr(
+        [
+            {
+                "name": span.name,
+                "attributes": dict(span.attributes),
+                "status": span.status.description,
+            }
+            for span in exporter.get_finished_spans()
+        ]
+    )
+    assert secret not in serialized
+    assert REDACTED_SECRET in serialized
 
 
 def test_session_failure_ends_orphaned_children_and_marks_only_the_root() -> None:

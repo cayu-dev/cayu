@@ -40,6 +40,7 @@ from cayu.runtime import (
 )
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.tools.user_input import UserInputTool
+from cayu.vaults import SecretRedactor
 
 
 class _ScriptedProvider(ModelProvider):
@@ -254,9 +255,20 @@ def _tool_result_parts(transcript) -> list[ToolResultPart]:
     return [part for part in tool_message.content if isinstance(part, ToolResultPart)]
 
 
-def _build(first_round, *, tools=None, final_text="done", store=None):
+def _build(
+    first_round,
+    *,
+    tools=None,
+    final_text="done",
+    store=None,
+    secret_redactor: SecretRedactor | None = None,
+):
     store = InMemorySessionStore() if store is None else store
-    app = CayuApp(session_store=store, enable_logging=False)
+    app = CayuApp(
+        session_store=store,
+        enable_logging=False,
+        secret_redactor=secret_redactor,
+    )
     app.register_provider(_ScriptedProvider(first_round, final_text=final_text), default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
@@ -1159,6 +1171,49 @@ def test_resolve_user_input_rejects_structured_output_swap() -> None:
         )
 
 
+def test_resolve_user_input_rejects_secret_structured_output_before_transition() -> None:
+    secret = "user-input-schema-secret-canary"
+    app, store = _build(
+        [("call_1", "ask_user", {"question": "q"})],
+        secret_redactor=SecretRedactor(secret),
+    )
+    pause = asyncio.run(
+        _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="s_secret_structured_output",
+                messages=[Message.text("user", "go")],
+            ),
+        )
+    )
+    input_id = next(
+        event for event in pause if event.type == EventType.SESSION_AWAITING_USER_INPUT
+    ).payload["input_id"]
+
+    with pytest.raises(ValueError, match="workload secret"):
+        asyncio.run(
+            _drain(
+                app.resolve_user_input(
+                    UserInputResponse(
+                        session_id="s_secret_structured_output",
+                        input_id=input_id,
+                        answer="a",
+                        structured_output=StructuredOutputSpec(
+                            json_schema={"type": "string", "const": secret},
+                        ),
+                    )
+                )
+            )
+        )
+
+    session = asyncio.run(store.load("s_secret_structured_output"))
+    assert session is not None and session.status == SessionStatus.INTERRUPTED
+    provider = app._get_registered_provider("fake").provider
+    assert isinstance(provider, _ScriptedProvider)
+    assert len(provider.requests) == 1
+
+
 def test_resolve_user_input_rejects_native_structured_output_for_unsupported_provider() -> None:
     # The paused run had no spec, so the resolver's NATIVE spec would be adopted —
     # and must be rejected before the status transition (the fake provider does
@@ -1441,6 +1496,83 @@ def test_recover_user_input_rejects_native_structured_output_for_unsupported_pro
     session = asyncio.run(store.load("s_rec_native"))
     assert session is not None
     assert session.status == SessionStatus.INTERRUPTED
+
+
+def test_recover_user_input_rejects_secret_structured_output_before_transition() -> None:
+    secret = "user-input-recovery-schema-secret-canary"
+    store = InMemorySessionStore()
+    counting = _CountingTool()
+    provider = _ScriptedProvider(
+        [("call_1", "count", {}), ("call_2", "ask_user", {"question": "q"})],
+        final_text="all done",
+    )
+    app = CayuApp(
+        session_store=store,
+        enable_logging=False,
+        secret_redactor=SecretRedactor(secret),
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[UserInputTool(), counting],
+    )
+    session_id = "s_recover_secret_structured_output"
+    pause = asyncio.run(
+        _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+    )
+    input_id = next(
+        event for event in pause if event.type == EventType.SESSION_AWAITING_USER_INPUT
+    ).payload["input_id"]
+    asyncio.run(
+        store.append_event(
+            session_id,
+            Event(
+                type=EventType.TOOL_CALL_STARTED,
+                session_id=session_id,
+                agent_name="assistant",
+                tool_name="count",
+                payload={"tool_call_id": "call_1"},
+            ),
+        )
+    )
+    stuck = asyncio.run(
+        _drain(
+            app.resolve_user_input(
+                UserInputResponse(session_id=session_id, input_id=input_id, answer="a")
+            )
+        )
+    )
+    assert stuck[-1].payload.get("manual_recovery_required") is True
+
+    with pytest.raises(ValueError, match="workload secret"):
+        asyncio.run(
+            _drain(
+                app.recover_user_input(
+                    UserInputRecoveryRequest(
+                        session_id=session_id,
+                        input_id=input_id,
+                        answer="a",
+                        tool_call_id="call_1",
+                        outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                        message="recovered externally",
+                        structured_output=StructuredOutputSpec(
+                            json_schema={"type": "string", "const": secret},
+                        ),
+                    )
+                )
+            )
+        )
+
+    session = asyncio.run(store.load(session_id))
+    assert session is not None and session.status == SessionStatus.INTERRUPTED
+    assert len(provider.requests) == 1
 
 
 def test_recover_user_input_supplies_outcome_and_completes() -> None:

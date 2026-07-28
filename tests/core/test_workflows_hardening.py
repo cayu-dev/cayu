@@ -68,6 +68,9 @@ from cayu.runtime import (
     ToolPolicyRequest,
     ToolPolicyResult,
 )
+from cayu.runtime._workflow_structured_output_handoff import (
+    WorkflowStructuredOutputHandoff,
+)
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
@@ -2167,6 +2170,71 @@ def test_step_structured_output_returns_unredacted_typed_edge():
     events = asyncio.run(app.session_store.load_events(result.session_id))
     validated = [event for event in events if event.type == EventType.STRUCTURED_OUTPUT_VALIDATED]
     assert validated[-1].payload["output"] == {"token": REDACTED_SECRET}
+    transcript = asyncio.run(app.session_store.load_transcript(result.session_id))
+    assert secret not in str([message.model_dump(mode="json") for message in transcript])
+
+
+def test_workflow_structured_output_handoff_preserves_json_null_and_lifecycle():
+    handoff = WorkflowStructuredOutputHandoff()
+
+    handoff.prepare("child")
+    with pytest.raises(RuntimeError, match="capture is already active"):
+        handoff.prepare("child")
+    handoff.record("child", None)
+    assert handoff.take("child") == (True, None)
+    assert handoff.take("child") == (False, None)
+
+    handoff.prepare("child")
+    handoff.record("child", {"attempt": 1})
+    handoff.record("child", {"attempt": 2})
+    assert handoff.take("child") == (True, {"attempt": 2})
+
+    handoff.prepare("child")
+    handoff.discard("child")
+    assert handoff.take("child") == (False, None)
+
+
+def test_step_structured_output_replay_fails_closed_on_redaction_marker():
+    app = CayuApp(enable_logging=False)
+    store = app.session_store
+    child_session_id = "wf-structured-output-replay-child"
+    schema = {
+        "type": "object",
+        "properties": {"token": {"type": "string"}},
+        "required": ["token"],
+        "additionalProperties": False,
+    }
+    ctx = TinyWorkflow(app).context("wf-structured-output-replay")
+
+    async def run():
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=child_session_id,
+                messages=[Message.text("user", "already completed")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.append_event(
+            child_session_id,
+            Event(
+                type=EventType.STRUCTURED_OUTPUT_VALIDATED,
+                session_id=child_session_id,
+                payload={"output": {"token": REDACTED_SECRET}},
+            ),
+        )
+        await store.update_status(child_session_id, SessionStatus.COMPLETED)
+        return await step(
+            ctx,
+            agent="assistant",
+            step_id="structured",
+            prompt="go",
+            schema=schema,
+            session_id=child_session_id,
+        )
+
+    with pytest.raises(StepError, match="cannot be reconstructed safely"):
+        asyncio.run(run())
 
 
 def test_emit_events_rejects_runtime_namespace_events():

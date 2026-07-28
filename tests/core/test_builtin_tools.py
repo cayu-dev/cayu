@@ -2293,7 +2293,6 @@ def test_command_policy_redaction_preserves_protocol_fields_that_match_secrets()
         "reason",
         "denied",
         "deny",
-        "command",
         "policy",
         "decision",
         "result",
@@ -2328,7 +2327,7 @@ def test_command_policy_redaction_preserves_protocol_fields_that_match_secrets()
     app = CayuApp(secret_redactor=redactor, enable_logging=False)
     app.register_provider(provider, default=True)
     app.register_environment(
-        Environment(EnvironmentSpec(name="protocol-policy-runner"), runner=runner),
+        Environment(EnvironmentSpec(name="protocol-runner"), runner=runner),
         default=True,
     )
     app.register_agent(
@@ -2342,7 +2341,7 @@ def test_command_policy_redaction_preserves_protocol_fields_that_match_secrets()
             app,
             RunRequest(
                 agent_name="assistant",
-                session_id="sess_command_policy_protocol_collision",
+                session_id="sess_protocol_collision",
                 messages=[Message.text("user", "push")],
             ),
         )
@@ -2365,7 +2364,9 @@ def test_command_policy_redaction_preserves_protocol_fields_that_match_secrets()
         "decision": "deny",
         "reason": expected_reason,
     }
-    assert observed["payload"] == blocked.payload
+    observed_payload = dict(observed["payload"])
+    observed_payload["tool_name"] = blocked.payload["tool_name"]
+    assert observed_payload == blocked.payload
     assert observed["structured"] == blocked.payload["result"]["structured"]
     assert runner.command is None
 

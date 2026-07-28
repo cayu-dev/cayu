@@ -4,7 +4,7 @@ import asyncio
 import os
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import pytest
 
@@ -19,12 +19,16 @@ from cayu.runtime import (
     RunRequest,
     SessionStatus,
     SessionStatusConflict,
+    StructuredOutputSpec,
     TaskCreate,
     TaskQuery,
     TaskStatus,
     TaskStore,
     TaskStoreDispatcher,
 )
+from cayu.runtime._diagnostics import ExceptionDiagnostic, exception_diagnostic
+from cayu.runtime.dispatch import copy_dispatch_request
+from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 _DISPATCH_TASK_TYPE = "cayu.dispatch"
 
@@ -53,6 +57,31 @@ class Harness(NamedTuple):
     dispatcher: TaskStoreDispatcher
 
 
+class _SecretFreeDispatchRuntime:
+    """Test runtime implementing the mandatory durable-dispatch boundary."""
+
+    @staticmethod
+    def redact_dispatch_request(request: DispatchRequest) -> DispatchRequest:
+        return copy_dispatch_request(request)
+
+    @staticmethod
+    def redact_json(value: Any) -> Any:
+        return SecretRedactor().redact_json(value)
+
+    @staticmethod
+    def redact_exception_diagnostic(
+        error: BaseException,
+        *,
+        empty_message: str,
+        nonportable_message: str,
+    ) -> ExceptionDiagnostic:
+        return exception_diagnostic(
+            error,
+            empty_message=empty_message,
+            nonportable_message=nonportable_message,
+        )
+
+
 def _batch(text: str) -> list[ModelStreamEvent]:
     return [
         ModelStreamEvent.text_delta(text),
@@ -66,6 +95,7 @@ def _build(
     task_store: TaskStore | None = None,
     task_type: str = _DISPATCH_TASK_TYPE,
     recover_stalled_sessions_after_seconds: int | None = None,
+    secret_redactor: SecretRedactor | None = None,
 ) -> Harness:
     store = InMemorySessionStore()
     tasks = task_store if task_store is not None else InMemoryTaskStore()
@@ -80,6 +110,7 @@ def _build(
         task_store=tasks,
         dispatcher=dispatcher,
         enable_logging=False,
+        secret_redactor=secret_redactor,
     )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -130,6 +161,213 @@ def test_submit_enqueues_pending_task_without_running() -> None:
     assert task.session_id is None
     assert task.input["request"]["session_id"] == "sess_submit"
     assert task.input["request"]["dispatch_id"] == "d_submit"
+
+
+def test_submit_redacts_workload_secrets_before_durable_dispatch_write() -> None:
+    secret = "dispatch-boundary-canary"
+    h = _build(
+        [_batch("first answer")],
+        secret_redactor=SecretRedactor(secret),
+    )
+    _create_resumable_session(h.app, "sess_dispatch_redaction")
+    request = DispatchRequest(
+        session_id="sess_dispatch_redaction",
+        dispatch_id="d_redacted",
+        messages=[Message.text("user", f"queued {secret}")],
+        metadata={"note": f"metadata {secret}"},
+    )
+
+    handle = asyncio.run(h.app.dispatch(request))
+    task = asyncio.run(h.tasks.load_task(handle.metadata["queue_task_id"]))
+
+    assert task is not None
+    serialized = str(task.input)
+    assert secret not in serialized
+    assert REDACTED_SECRET in serialized
+
+
+def test_submit_rejects_protocol_minimal_runtime_before_persisting_secret_input() -> None:
+    secret = "protocol-minimal-dispatch-input-secret"
+    tasks = InMemoryTaskStore()
+    dispatcher = TaskStoreDispatcher(tasks)
+
+    class ProtocolMinimalRuntime:
+        async def dispatch_inline(self, request: DispatchRequest) -> AsyncIterator[Event]:
+            del request
+            if False:
+                yield
+
+    request = DispatchRequest(
+        session_id="sess_protocol_minimal",
+        dispatch_id="d_protocol_minimal",
+        messages=[Message.text("user", secret)],
+    )
+
+    with pytest.raises(TypeError, match="redact_dispatch_request"):
+        asyncio.run(dispatcher.submit(ProtocolMinimalRuntime(), request))
+
+    assert asyncio.run(tasks.list_tasks(TaskQuery(type=_DISPATCH_TASK_TYPE))) == []
+
+
+def test_worker_rejects_protocol_minimal_runtime_before_persisting_secret_failure() -> None:
+    secret = "protocol-minimal-dispatch-failure-secret"
+    tasks = InMemoryTaskStore()
+    dispatcher = TaskStoreDispatcher(tasks)
+
+    class ProtocolMinimalRuntime:
+        @staticmethod
+        def redact_dispatch_request(request: DispatchRequest) -> DispatchRequest:
+            return copy_dispatch_request(request)
+
+        @staticmethod
+        def redact_json(value: Any) -> Any:
+            return value
+
+        async def dispatch_inline(self, request: DispatchRequest) -> AsyncIterator[Event]:
+            del request
+            if False:
+                yield
+            raise RuntimeError(secret)
+
+    task = asyncio.run(
+        tasks.create_task(
+            TaskCreate(
+                type=_DISPATCH_TASK_TYPE,
+                input={
+                    "request": _dispatch_request(
+                        "sess_protocol_minimal_failure",
+                        "d_protocol_minimal_failure",
+                    ).model_dump(mode="json")
+                },
+            )
+        )
+    )
+
+    with pytest.raises(TypeError, match="redact_exception_diagnostic"):
+        asyncio.run(dispatcher.process_next(ProtocolMinimalRuntime(), worker_id="worker_a"))
+
+    persisted = asyncio.run(tasks.load_task(task.id))
+    assert persisted is not None
+    assert persisted.status is TaskStatus.PENDING
+    assert secret not in str(persisted)
+
+
+def test_submit_rejects_secret_bearing_structured_output_without_changing_schema() -> None:
+    secret = "dispatch-schema-canary"
+    h = _build(
+        [_batch("first answer")],
+        secret_redactor=SecretRedactor(secret),
+    )
+    _create_resumable_session(h.app, "sess_dispatch_schema")
+    request = DispatchRequest(
+        session_id="sess_dispatch_schema",
+        dispatch_id="d_schema",
+        messages=[Message.text("user", "queued work")],
+        structured_output=StructuredOutputSpec(
+            json_schema={
+                "type": "object",
+                "properties": {"answer": {"const": secret}},
+                "required": ["answer"],
+            }
+        ),
+    )
+
+    with pytest.raises(ValueError, match="changing execution semantics"):
+        asyncio.run(h.app.dispatch(request))
+
+    assert len(h.provider.requests) == 1
+
+
+def test_inline_dispatch_rejects_secret_bearing_structured_output_before_session_claim() -> None:
+    secret = "inline-dispatch-schema-canary"
+    h = _build(
+        [_batch("first answer")],
+        secret_redactor=SecretRedactor(secret),
+    )
+    session_id = "sess_inline_dispatch_schema"
+    _create_resumable_session(h.app, session_id)
+
+    async def scenario() -> None:
+        with pytest.raises(ValueError, match="workload secret"):
+            async for _ in h.app.dispatch_inline(
+                DispatchRequest(
+                    session_id=session_id,
+                    dispatch_id="d_inline_schema",
+                    messages=[Message.text("user", "queued work")],
+                    structured_output=StructuredOutputSpec(
+                        json_schema={"type": "string", "const": secret},
+                    ),
+                )
+            ):
+                pass
+
+    asyncio.run(scenario())
+    session = asyncio.run(h.store.load(session_id))
+
+    assert session is not None
+    assert session.status is SessionStatus.COMPLETED
+    assert len(h.provider.requests) == 1
+
+
+def test_process_next_redacts_runtime_failure_before_task_persistence(monkeypatch) -> None:
+    secret = "dispatch-failure-canary"
+    h = _build(
+        [_batch("first answer")],
+        secret_redactor=SecretRedactor(secret),
+    )
+    _create_resumable_session(h.app, "sess_dispatch_failure")
+    handle = asyncio.run(h.app.dispatch(_dispatch_request("sess_dispatch_failure", "d_failure")))
+
+    async def fail_dispatch(request):
+        del request
+        if False:
+            yield
+        raise RuntimeError(f"dispatch failed with {secret}")
+
+    monkeypatch.setattr(h.app, "dispatch_inline", fail_dispatch)
+    result = asyncio.run(h.dispatcher.process_next(h.app, worker_id="worker_a"))
+    task = asyncio.run(h.tasks.load_task(handle.metadata["queue_task_id"]))
+
+    assert result is not None
+    assert result.status == DispatchStatus.FAILED
+    assert task is not None
+    assert task.status == TaskStatus.FAILED
+    assert secret not in str(task.error)
+    assert REDACTED_SECRET in str(task.error)
+
+
+def test_stalled_recovery_log_redacts_workload_secret(
+    monkeypatch,
+    caplog,
+) -> None:
+    secret = "dispatch-recovery-log-canary"
+    h = _build(
+        [_batch("first answer")],
+        recover_stalled_sessions_after_seconds=0,
+        secret_redactor=SecretRedactor(secret),
+    )
+    _create_resumable_session(h.app, "sess_dispatch_recovery_log")
+    asyncio.run(h.app.dispatch(_dispatch_request("sess_dispatch_recovery_log", "d_recovery_log")))
+    asyncio.run(
+        h.store.transition_status(
+            "sess_dispatch_recovery_log",
+            from_statuses={SessionStatus.COMPLETED},
+            to_status=SessionStatus.RUNNING,
+        )
+    )
+
+    async def fail_recovery(request):
+        del request
+        raise RuntimeError(f"recovery failed with {secret}")
+
+    monkeypatch.setattr(h.app, "recover_incomplete_session", fail_recovery)
+    with caplog.at_level("WARNING", logger="cayu.runtime.dispatch"):
+        result = asyncio.run(h.dispatcher.process_next(h.app, worker_id="worker_recovery"))
+
+    assert result is not None
+    assert result.metadata.get("requeued") is True
+    assert secret not in caplog.text
+    assert REDACTED_SECRET in caplog.text
 
 
 def test_process_next_claims_runs_and_completes() -> None:
@@ -373,6 +611,24 @@ def test_submit_rejects_loop_policies() -> None:
         asyncio.run(h.app.dispatch(request))
 
 
+def test_durable_request_redaction_rejects_loop_policies_for_custom_dispatchers() -> None:
+    from cayu.runtime import LoopPolicy
+
+    class _NoopPolicy(LoopPolicy):
+        pass
+
+    h = _build([_batch("first answer")])
+    request = DispatchRequest(
+        session_id="sess_custom_dispatch_policy",
+        dispatch_id="d_custom_policy",
+        messages=[Message.text("user", "queued work")],
+        loop_policies=(_NoopPolicy(),),
+    )
+
+    with pytest.raises(ValueError, match="loop_policies"):
+        h.app.redact_dispatch_request(request)
+
+
 def test_reclaimed_dispatch_is_reprocessable() -> None:
     h = _build([_batch("first answer"), _batch("dispatch answer")])
     _create_resumable_session(h.app, "sess_reclaim")
@@ -492,7 +748,7 @@ def test_malformed_dispatch_claim_loss_returns_without_clobbering_new_owner() ->
     tasks = ReclaimBeforeMalformedFailureStore()
     dispatcher = TaskStoreDispatcher(tasks)
 
-    class UnusedRuntime:
+    class UnusedRuntime(_SecretFreeDispatchRuntime):
         async def dispatch_inline(self, request: DispatchRequest) -> AsyncIterator[Event]:
             del request
             if False:
@@ -522,7 +778,7 @@ def test_conflict_requeue_returns_reclaimed_handle_when_control_plane_wins() -> 
     request = _dispatch_request("sess_conflict_claim_lost", "d_conflict_claim_lost")
 
     async def scenario():
-        class SubmitRuntime:
+        class SubmitRuntime(_SecretFreeDispatchRuntime):
             async def dispatch_inline(
                 self,
                 request: DispatchRequest,
@@ -534,7 +790,7 @@ def test_conflict_requeue_returns_reclaimed_handle_when_control_plane_wins() -> 
         submitted = await dispatcher.submit(SubmitRuntime(), request)
         task_id = submitted.metadata["queue_task_id"]
 
-        class TerminalizingConflictRuntime:
+        class TerminalizingConflictRuntime(_SecretFreeDispatchRuntime):
             async def dispatch_inline(
                 self,
                 request: DispatchRequest,
@@ -576,7 +832,7 @@ def test_dispatch_failure_with_nonportable_text_is_terminal_and_not_reclaimed(
     tasks = InMemoryTaskStore()
     dispatcher = TaskStoreDispatcher(tasks)
 
-    class FailingRuntime:
+    class FailingRuntime(_SecretFreeDispatchRuntime):
         async def dispatch_inline(self, request: DispatchRequest) -> AsyncIterator[Event]:
             del request
             if False:

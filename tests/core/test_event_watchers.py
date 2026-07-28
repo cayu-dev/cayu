@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
+from tests.provider_traceback_assertions import is_cayu_source_filename
 
 from cayu import (
     CayuApp,
@@ -28,6 +29,7 @@ from cayu.runtime.event_watchers import (
 )
 from cayu.runtime.sessions import EventRecord, SessionIdentity, SessionStore
 from cayu.storage.migrations import SchemaMode
+from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 _POSTGRES_TABLES = (
     "cayu_event_watcher_dead_letters",
@@ -478,6 +480,175 @@ def test_sqlite_watcher_recovers_nonportable_failure_and_unblocks_later_events(
     assert recovered_state.dead_lettered_count == 1
     assert len(dead_letters) == 1
     assert dead_letters[0].error == safe_error
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_event_watcher_redacts_failure_before_all_durable_representations(
+    store_kind: str,
+    tmp_path: Path,
+) -> None:
+    secret = "event-watcher-diagnostic-secret-canary"
+
+    async def run():
+        session_store = InMemorySessionStore()
+        await _create_session(session_store)
+        await _append_event(session_store, payload={"number": 1})
+        watcher_store = (
+            InMemoryEventWatcherStore()
+            if store_kind == "memory"
+            else SQLiteEventWatcherStore(tmp_path / "watcher-redaction.sqlite")
+        )
+        app = CayuApp(
+            session_store=session_store,
+            event_watcher_store=watcher_store,
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+
+        async def handler(_context: EventWatcherContext) -> None:
+            raise RuntimeError(f"delivery failed with {secret}")
+
+        watcher = EventWatcher(
+            name="redacted-watcher",
+            query=EventQuery(event_type=EventType.BUDGET_LIMIT_REACHED),
+            handler=handler,
+            max_attempts=1,
+        )
+        results = await app.run_event_watchers([watcher])
+        state = await watcher_store.load_state(watcher.name)
+        dead_letters = await watcher_store.list_dead_letters(watcher.name)
+        if isinstance(watcher_store, SQLiteEventWatcherStore):
+            await watcher_store.close()
+        return results, state, dead_letters
+
+    results, state, dead_letters = asyncio.run(run())
+    rendered = repr((results, state, dead_letters))
+
+    assert secret not in rendered
+    assert REDACTED_SECRET in rendered
+
+
+def test_event_watcher_records_handler_error_with_broken_stringification() -> None:
+    class BrokenStringError(Exception):
+        def __str__(self) -> str:
+            raise RuntimeError("stringification failed")
+
+    async def run():
+        session_store = InMemorySessionStore()
+        await _create_session(session_store)
+        await _append_event(session_store)
+        watcher_store = InMemoryEventWatcherStore()
+        app = CayuApp(
+            session_store=session_store,
+            event_watcher_store=watcher_store,
+            enable_logging=False,
+        )
+
+        async def fail(_context: EventWatcherContext) -> None:
+            raise BrokenStringError
+
+        watcher = EventWatcher(
+            name="broken-string-watcher",
+            query=EventQuery(event_type=EventType.BUDGET_LIMIT_REACHED),
+            handler=fail,
+        )
+        results = await app.run_event_watchers([watcher], limit=1)
+        state = await watcher_store.load_state(watcher.name)
+        return results, state
+
+    results, state = asyncio.run(run())
+
+    assert results[0].deliveries[0].status is EventWatcherDeliveryStatus.FAILED
+    assert results[0].deliveries[0].error == "BrokenStringError: event watcher failed"
+    assert state.last_error == "BrokenStringError: event watcher failed"
+
+
+def test_event_watcher_cancellation_during_failure_storage_drops_handler_error() -> None:
+    secret = "event-watcher-cancelled-publication-secret-canary"
+
+    class BlockingFailureStore(InMemoryEventWatcherStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failure_started = asyncio.Event()
+
+        async def mark_failure(
+            self,
+            claim: EventWatcherClaim,
+            *,
+            error: str,
+            max_attempts: int,
+        ) -> EventWatcherDelivery:
+            assert secret not in error
+            self.failure_started.set()
+            await asyncio.Event().wait()
+            return await super().mark_failure(
+                claim,
+                error=error,
+                max_attempts=max_attempts,
+            )
+
+    async def run() -> tuple[asyncio.CancelledError, int, bool]:
+        session_store = InMemorySessionStore()
+        await _create_session(session_store)
+        await _append_event(session_store)
+        watcher_store = BlockingFailureStore()
+        app = CayuApp(
+            session_store=session_store,
+            event_watcher_store=watcher_store,
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+
+        async def fail(_context: EventWatcherContext) -> None:
+            raise RuntimeError(f"delivery failed with {secret}")
+
+        task = asyncio.create_task(
+            app.run_event_watchers(
+                [
+                    EventWatcher(
+                        name="cancelled-publication-watcher",
+                        query=EventQuery(event_type=EventType.BUDGET_LIMIT_REACHED),
+                        handler=fail,
+                    )
+                ],
+                limit=1,
+            )
+        )
+        await watcher_store.failure_started.wait()
+        task.cancel("operator cancelled")
+        cancelling = task.cancelling()
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+        return exc_info.value, cancelling, task.cancelled()
+
+    cancellation, cancelling, cancelled = asyncio.run(run())
+
+    assert cancelling == 1
+    assert cancelled is True
+    assert cancellation.args == ("operator cancelled",)
+    assert cancellation.__context__ is None
+    traceback = cancellation.__traceback__
+    while traceback is not None:
+        if is_cayu_source_filename(traceback.tb_frame.f_code.co_filename):
+            assert all(secret not in repr(value) for value in traceback.tb_frame.f_locals.values())
+        traceback = traceback.tb_next
+
+
+def test_event_watcher_rejects_secret_bearing_watcher_authority() -> None:
+    secret = "event-watcher-authority-secret-canary"
+    app = CayuApp(secret_redactor=SecretRedactor(secret), enable_logging=False)
+    watcher = EventWatcher(
+        name=f"watcher-{secret}",
+        query=EventQuery(),
+        handler=lambda _context: None,
+    )
+
+    with pytest.raises(ValueError, match="durable watcher authority"):
+        asyncio.run(app.run_event_watchers([watcher]))
+
+    with pytest.raises(ValueError, match="Duplicate event watcher name") as exc_info:
+        asyncio.run(app.run_event_watchers([watcher, watcher]))
+    assert secret not in str(exc_info.value)
 
 
 def test_event_watcher_active_lease_blocks_duplicate_processing() -> None:

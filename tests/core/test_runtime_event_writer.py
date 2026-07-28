@@ -24,6 +24,7 @@ from cayu.runtime.sessions import (
     EventQuery,
     EventRecord,
 )
+from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 
 class _RecordingSink(EventSink):
@@ -229,6 +230,277 @@ def test_emit_persists_forwards_cost_event_and_fans_out() -> None:
     assert [event.id for event in persisted] == [emitted.id]
     assert [event.id for event in budget_events] == [emitted.id]
     assert [event.id for event in sink_events] == [emitted.id]
+
+
+def test_emit_redacts_workload_secrets_before_durable_and_external_boundaries() -> None:
+    secret = "writer-boundary-canary"
+
+    async def scenario() -> tuple[Event, Event, Event, Event, Event]:
+        store = await _session_store("writer_redaction")
+        budget_store = InMemoryBudgetStore()
+        sink = _RecordingSink()
+        writer = RuntimeEventWriter(
+            session_store=store,
+            budget_store=budget_store,
+            event_sinks=[sink],
+            secret_redactor=SecretRedactor(secret),
+        )
+        event = Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id="writer_redaction",
+            agent_name=f"assistant-{secret}",
+            environment_name=f"sandbox-{secret}",
+            workflow_name=f"review-{secret}",
+            tool_name=f"search-{secret}",
+            payload={
+                "details": {
+                    "arguments": f"Bearer {secret}",
+                    "errors": [f"provider rejected {secret}"],
+                    "tool_name": secret,
+                }
+            },
+        )
+
+        emitted = await writer.emit(event)
+        persisted = (await store.load_events("writer_redaction"))[0]
+        budget_event = (
+            await budget_store.load_events_for_budget(
+                scope="app",
+                key=None,
+                window=BudgetWindow.all_time(),
+            )
+        )[0]
+        return event, emitted, persisted, budget_event, sink.events[0]
+
+    original, emitted, persisted, budget_event, sink_event = asyncio.run(scenario())
+
+    assert secret in str(original.model_dump(mode="json"))
+    for event in (emitted, persisted, budget_event, sink_event):
+        serialized = str(event.model_dump(mode="json"))
+        assert secret not in serialized
+        assert REDACTED_SECRET in serialized
+
+
+def test_emit_rejects_workload_secret_in_untyped_payload_key() -> None:
+    secret = "writer-secret-object-key-canary"
+
+    async def scenario() -> list[Event]:
+        store = await _session_store("writer_secret_key")
+        writer = RuntimeEventWriter(
+            session_store=store,
+            budget_store=InMemoryBudgetStore(),
+            event_sinks=[],
+            secret_redactor=SecretRedactor(secret),
+        )
+        with pytest.raises(ValueError, match="object key"):
+            await writer.emit(
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id="writer_secret_key",
+                    payload={"metadata": {secret: "value"}},
+                )
+            )
+        return await store.load_events("writer_secret_key")
+
+    assert asyncio.run(scenario()) == []
+
+
+def test_emit_rejects_short_workload_secret_in_untyped_payload_key() -> None:
+    secret = "short7"
+
+    async def scenario() -> list[Event]:
+        store = await _session_store("writer_short_secret_key")
+        writer = RuntimeEventWriter(
+            session_store=store,
+            budget_store=InMemoryBudgetStore(),
+            event_sinks=[],
+            secret_redactor=SecretRedactor(secret),
+        )
+        with pytest.raises(ValueError, match="object key"):
+            await writer.emit(
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id="writer_short_secret_key",
+                    payload={"metadata": {secret: "value"}},
+                )
+            )
+        return await store.load_events("writer_short_secret_key")
+
+    assert asyncio.run(scenario()) == []
+
+
+def test_emit_rejects_short_workload_secret_embedded_in_untyped_payload_key() -> None:
+    secret = "short7"
+
+    async def scenario() -> list[Event]:
+        store = await _session_store("writer_embedded_short_secret_key")
+        writer = RuntimeEventWriter(
+            session_store=store,
+            budget_store=InMemoryBudgetStore(),
+            event_sinks=[],
+            secret_redactor=SecretRedactor(secret),
+        )
+        with pytest.raises(ValueError, match="object key"):
+            await writer.emit(
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id="writer_embedded_short_secret_key",
+                    payload={"metadata": {f"prefix-{secret}-suffix": "value"}},
+                )
+            )
+        return await store.load_events("writer_embedded_short_secret_key")
+
+    assert asyncio.run(scenario()) == []
+
+
+def test_emit_redacts_secret_identity_in_envelope_and_payload() -> None:
+    secret = "event-identity-secret"
+
+    async def scenario() -> Event:
+        store = await _session_store("writer_identity_secret")
+        writer = RuntimeEventWriter(
+            session_store=store,
+            budget_store=InMemoryBudgetStore(),
+            event_sinks=[],
+            secret_redactor=SecretRedactor(secret),
+        )
+        return await writer.emit(
+            Event(
+                type=EventType.TOOL_CALL_STARTED,
+                session_id="writer_identity_secret",
+                tool_name=secret,
+                payload={"tool_name": secret},
+            )
+        )
+
+    emitted = asyncio.run(scenario())
+
+    assert emitted.tool_name == REDACTED_SECRET
+    assert emitted.payload["tool_name"] == REDACTED_SECRET
+
+
+def test_emit_rejects_workload_secret_in_durable_authority_value() -> None:
+    secret = "writer-task-authority-canary"
+
+    async def scenario() -> list[Event]:
+        store = await _session_store("writer_secret_authority")
+        writer = RuntimeEventWriter(
+            session_store=store,
+            budget_store=InMemoryBudgetStore(),
+            event_sinks=[],
+            secret_redactor=SecretRedactor(secret),
+        )
+        with pytest.raises(ValueError, match="durable event authority"):
+            await writer.emit(
+                Event(
+                    type=EventType.TOOL_CALL_STARTED,
+                    session_id="writer_secret_authority",
+                    payload={"task_id": secret},
+                )
+            )
+        return await store.load_events("writer_secret_authority")
+
+    assert asyncio.run(scenario()) == []
+
+
+def test_emit_defensively_redacts_canonical_policy_denial_payload() -> None:
+    secret = "writer-policy-denial-canary"
+
+    async def scenario() -> tuple[Event, list[Event]]:
+        store = await _session_store("writer_policy_denial")
+        writer = RuntimeEventWriter(
+            session_store=store,
+            budget_store=InMemoryBudgetStore(),
+            event_sinks=[],
+            secret_redactor=SecretRedactor([secret, "REDA"]),
+        )
+        emitted = await writer.emit(
+            Event(
+                type=EventType.TOOL_CALL_BLOCKED,
+                session_id="writer_policy_denial",
+                payload={
+                    "denied_by": "command_policy",
+                    "reason": f"blocked {secret}",
+                    "result": {
+                        "content": f"blocked {secret}",
+                        "structured": None,
+                        "artifacts": [],
+                        "is_error": True,
+                    },
+                },
+            )
+        )
+        return emitted, await store.load_events("writer_policy_denial")
+
+    emitted, stored = asyncio.run(scenario())
+
+    assert emitted.payload["reason"] == f"blocked {REDACTED_SECRET}"
+    assert emitted.payload["result"]["content"] == f"blocked {REDACTED_SECRET}"
+    assert stored == [emitted]
+
+
+def test_recovery_redacts_legacy_persisted_event_before_side_effect_fan_out() -> None:
+    secret = "writer-recovery-canary"
+
+    async def scenario() -> tuple[list[Event], list[Event]]:
+        store = await _session_store("writer_recovery_redaction")
+        event = Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id="writer_recovery_redaction",
+            payload={"error": f"provider rejected {secret}"},
+        )
+        await store.append_event(event.session_id, event)
+        sink = _RecordingSink()
+        writer = RuntimeEventWriter(
+            session_store=store,
+            budget_store=InMemoryBudgetStore(),
+            event_sinks=[sink],
+            secret_redactor=SecretRedactor(secret),
+        )
+
+        recovered = await writer.recover_persisted_side_effects()
+        return recovered, sink.events
+
+    recovered, sink_events = asyncio.run(scenario())
+
+    for event in (*recovered, *sink_events):
+        serialized = str(event.model_dump(mode="json"))
+        assert secret not in serialized
+        assert REDACTED_SECRET in serialized
+
+
+def test_recovery_marks_unpreparable_legacy_event_failed() -> None:
+    secret = "writer-legacy-key-canary"
+
+    async def scenario():
+        store = await _session_store("writer_unpreparable_legacy")
+        event = Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id="writer_unpreparable_legacy",
+            payload={secret: "value"},
+        )
+        await store.append_event(event.session_id, event)
+        writer = RuntimeEventWriter(
+            session_store=store,
+            budget_store=InMemoryBudgetStore(),
+            event_sinks=[],
+            secret_redactor=SecretRedactor(secret),
+        )
+
+        recovered = await writer.recover_persisted_side_effects()
+        delivery = await store.get_persisted_event_side_effect_delivery(
+            session_id=event.session_id,
+            event_id=event.id,
+        )
+        return recovered, delivery
+
+    recovered, delivery = asyncio.run(scenario())
+
+    assert recovered == []
+    assert delivery is not None
+    assert delivery.status is PersistedEventSideEffectStatus.FAILED
+    assert delivery.last_error is not None
+    assert "ValueError" in delivery.last_error
 
 
 def test_persist_leaves_side_effect_delivery_for_recovery() -> None:
@@ -1039,6 +1311,23 @@ def test_sink_failure_and_exception_note_aggregation_have_fixed_work_bounds() ->
     assert "note 15" in summary
     assert "note 16" not in summary
     assert summary.endswith("4 additional notes omitted")
+
+
+def test_sink_failure_summary_redacts_before_durable_bounding() -> None:
+    secret = "writer-failure-boundary-canary"
+    visible_suffix = secret[len(secret) // 2 :]
+    prefix = "x" * (
+        PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES - len(visible_suffix.encode("utf-8"))
+    )
+
+    summary = event_writer_module._exception_summary(
+        RuntimeError(prefix + secret),
+        redactor=SecretRedactor(secret),
+    )
+
+    assert secret not in summary
+    assert visible_suffix not in summary
+    assert len(summary.encode("utf-8")) <= PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES
 
 
 def test_failed_sink_delivery_is_recovered_and_closed(monkeypatch) -> None:

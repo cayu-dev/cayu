@@ -27,6 +27,7 @@ from cayu.runtime import (
 from cayu.runtime.sessions import SESSION_MESSAGE_DELIVERY_BATCH_LIMIT
 from cayu.storage import SQLiteSessionStore
 from cayu.tools.user_input import UserInputTool
+from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 
 class BlockingTwoTurnProvider(ModelProvider):
@@ -252,6 +253,47 @@ def test_enqueue_session_message_request_validates_public_contract() -> None:
         }
         with pytest.raises(ValidationError, match="NUL"):
             EnqueueSessionMessageRequest(**values)  # type: ignore[arg-type]
+
+
+def test_enqueue_session_message_redacts_before_durable_queue_write() -> None:
+    secret = "queued-steering-boundary-canary"
+    store = InMemorySessionStore()
+    app = CayuApp(
+        session_store=store,
+        secret_redactor=SecretRedactor(secret),
+        enable_logging=False,
+    )
+
+    async def run():
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_redacted_steering",
+                messages=[Message.text("user", "start")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        result = await app.enqueue_session_message(
+            EnqueueSessionMessageRequest(
+                session_id="sess_redacted_steering",
+                idempotency_key="steer-redacted",
+                content=f"continue with {secret}",
+                delivery_mode=SessionMessageDeliveryMode.NEXT_TURN,
+            )
+        )
+        await store.update_status("sess_redacted_steering", SessionStatus.RUNNING)
+        batch = await store.deliver_queued_session_messages(
+            "sess_redacted_steering",
+            include_on_idle=True,
+        )
+        return result, batch
+
+    result, batch = asyncio.run(run())
+
+    assert result.message.content == f"continue with {REDACTED_SECRET}"
+    assert batch.messages[0].content == result.message.content
+    assert secret not in str(result.model_dump(mode="json"))
+    assert secret not in str(batch.model_dump(mode="json"))
 
 
 def test_cross_process_enqueue_drains_next_turn_before_on_idle_without_event_content() -> None:

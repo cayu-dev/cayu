@@ -36,14 +36,19 @@ from cayu.mcp._jsonrpc import (
     DEFAULT_MCP_CLIENT_VERSION,
     DEFAULT_MCP_MAX_LIST_ITEMS,
     DEFAULT_MCP_MAX_LIST_PAGES,
+    JsonrpcAuthorityMappingResult,
+    McpPaginatedPage,
     McpProtocolError,
     collect_paginated,
     initialize_params,
     initialize_result_from_payload,
+    jsonrpc_authority_mapping,
     jsonrpc_notification_payload,
     jsonrpc_request_payload,
+    merge_jsonrpc_authority_mapping,
     resource_definition_from_payload,
     result_from_jsonrpc_response,
+    safely_redact_jsonrpc_response,
     tool_definition_from_payload,
     tool_result_from_payload,
     validate_negotiated_protocol_version,
@@ -150,6 +155,7 @@ class HttpMcpClient(McpClient):
                 headers[name] = secret.value.get_secret_value()
             # A hostile server can echo these values back through tool output; scrub them.
             secret_redactor = SecretRedactor(tuple(resolved.values()))
+            resolved.clear()
         client_kwargs: dict[str, Any] = {
             "headers": headers,
             "timeout": httpx.Timeout(timeout_s, connect=connect_timeout_s),
@@ -162,16 +168,23 @@ class HttpMcpClient(McpClient):
             client_kwargs["verify"] = certifi.where() if self.verify is None else self.verify
             if proxy is not None:
                 client_kwargs["proxy"] = proxy
-        session = HttpMcpSession(
-            server=server,
-            http_client=httpx.AsyncClient(**client_kwargs),
-            url=server.url,
-            client_name=self.client_name,
-            client_version=self.client_version,
-            max_list_pages=self.max_list_pages,
-            max_list_items=self.max_list_items,
-            secret_redactor=secret_redactor,
-        )
+        try:
+            session = HttpMcpSession(
+                server=server,
+                http_client=httpx.AsyncClient(**client_kwargs),
+                url=server.url,
+                client_name=self.client_name,
+                client_version=self.client_version,
+                max_list_pages=self.max_list_pages,
+                max_list_items=self.max_list_items,
+                secret_redactor=secret_redactor,
+            )
+        finally:
+            # httpx owns copied headers/config after successful construction. Do
+            # not retain injected values if construction or initialize fails and
+            # diagnostics capture traceback locals.
+            headers.clear()
+            client_kwargs.clear()
         try:
             await session.initialize()
         except BaseException:
@@ -216,6 +229,9 @@ class HttpMcpSession(McpSession):
         self._next_id = 1
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
+        self._tool_transport_names: dict[str, str] = {}
+        self._resource_transport_uris: dict[str, str] = {}
+        self._authority_mapping_lock = asyncio.Lock()
 
     @property
     def initialize_result(self) -> McpInitializeResult:
@@ -231,18 +247,63 @@ class HttpMcpSession(McpSession):
         if type(result) is not dict:
             raise McpProtocolError("MCP initialize result must be an object.")
         self._initialize_result = initialize_result_from_payload(result)
-        validate_negotiated_protocol_version(self._initialize_result.protocol_version)
+        validation_error: McpProtocolError | None = None
+        try:
+            validate_negotiated_protocol_version(self._initialize_result.protocol_version)
+        except McpProtocolError as exc:
+            validation_error = McpProtocolError(self._secret_redactor.redact_text(str(exc)))
+        if validation_error is not None:
+            raise validation_error
         await self._notify("notifications/initialized", {})
 
     async def list_tools(self) -> tuple[McpToolDefinition, ...]:
+        transport_names: dict[str, str] = {}
+
+        async def request_page(method: str, params: dict[str, Any]) -> Any:
+            return await self._request(
+                method,
+                params,
+                authority_mapping=transport_names,
+                paginated=True,
+            )
+
         tools = await collect_paginated(
-            self._request,
+            request_page,
             "tools/list",
             "tools",
             max_pages=self.max_list_pages,
             max_items=self.max_list_items,
+            redactor=self._secret_redactor,
         )
-        return tuple(tool_definition_from_payload(tool, self.server.name) for tool in tools)
+        definitions: tuple[McpToolDefinition, ...] = ()
+        definition_error = False
+        try:
+            definitions = tuple(
+                tool_definition_from_payload(tool, self.server.name) for tool in tools
+            )
+        except (McpProtocolError, TypeError, ValueError):
+            definition_error = True
+        if definition_error:
+            transport_names.clear()
+            tools.clear()
+            raise McpProtocolError("MCP tools/list returned an invalid tool definition.") from None
+        async with self._authority_mapping_lock:
+            merge_result = merge_jsonrpc_authority_mapping(
+                self._tool_transport_names,
+                transport_names,
+                max_items=self.max_list_items,
+            )
+            if merge_result.error is not None:
+                transport_names.clear()
+                raise McpProtocolError(
+                    self._secret_redactor.redact_text(merge_result.error)
+                ) from None
+            self._tool_transport_names = {
+                public: raw for public, raw in merge_result.mapping.items() if public != raw
+            }
+            merge_result.mapping.clear()
+            transport_names.clear()
+        return definitions
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> McpToolResult:
         tool_name = require_clean_nonblank(name, "tool name")
@@ -251,27 +312,73 @@ class HttpMcpSession(McpSession):
             raise TypeError("MCP tool arguments must be an object.")
         result = await self._request(
             "tools/call",
-            {"name": tool_name, "arguments": copied_arguments},
+            {
+                "name": self._tool_transport_names.get(tool_name, tool_name),
+                "arguments": copied_arguments,
+            },
         )
         if type(result) is not dict:
             raise McpProtocolError("MCP tools/call result must be an object.")
         return tool_result_from_payload(result)
 
     async def list_resources(self) -> tuple[McpResourceDefinition, ...]:
+        transport_uris: dict[str, str] = {}
+
+        async def request_page(method: str, params: dict[str, Any]) -> Any:
+            return await self._request(
+                method,
+                params,
+                authority_mapping=transport_uris,
+                paginated=True,
+            )
+
         resources = await collect_paginated(
-            self._request,
+            request_page,
             "resources/list",
             "resources",
             max_pages=self.max_list_pages,
             max_items=self.max_list_items,
+            redactor=self._secret_redactor,
         )
-        return tuple(
-            resource_definition_from_payload(resource, self.server.name) for resource in resources
-        )
+        definitions: tuple[McpResourceDefinition, ...] = ()
+        definition_error = False
+        try:
+            definitions = tuple(
+                resource_definition_from_payload(resource, self.server.name)
+                for resource in resources
+            )
+        except (McpProtocolError, TypeError, ValueError):
+            definition_error = True
+        if definition_error:
+            transport_uris.clear()
+            resources.clear()
+            raise McpProtocolError(
+                "MCP resources/list returned an invalid resource definition."
+            ) from None
+        async with self._authority_mapping_lock:
+            merge_result = merge_jsonrpc_authority_mapping(
+                self._resource_transport_uris,
+                transport_uris,
+                max_items=self.max_list_items,
+            )
+            if merge_result.error is not None:
+                transport_uris.clear()
+                raise McpProtocolError(
+                    self._secret_redactor.redact_text(merge_result.error)
+                ) from None
+            self._resource_transport_uris = {
+                public: raw for public, raw in merge_result.mapping.items() if public != raw
+            }
+            merge_result.mapping.clear()
+            transport_uris.clear()
+        return definitions
 
     async def read_resource(self, uri: str) -> McpResourceResult:
         resource_uri = require_clean_nonblank(uri, "resource uri")
-        result = await self._request("resources/read", {"uri": resource_uri})
+        result = await self._request(
+            "resources/read",
+            {"uri": self._resource_transport_uris.get(resource_uri, resource_uri)},
+        )
         if type(result) is not dict:
             raise McpProtocolError("MCP resources/read result must be an object.")
         contents = result.get("contents", [])
@@ -306,14 +413,97 @@ class HttpMcpSession(McpSession):
                 await response.aread()
         await self._http.aclose()
 
-    async def _request(self, method: str, params: dict[str, Any]) -> Any:
+    async def _request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        authority_mapping: dict[str, str] | None = None,
+        paginated: bool = False,
+    ) -> Any:
         method_name = require_clean_nonblank(method, "method")
         request_id = self._next_id
         self._next_id += 1
-        message = await self._send(
-            jsonrpc_request_payload(request_id, method_name, params), request_id
+        sanitized_error: McpProtocolError | None = None
+        try:
+            message = await self._send(
+                jsonrpc_request_payload(request_id, method_name, params), request_id
+            )
+        except McpProtocolError as exc:
+            redacted_error = self._secret_redactor.redact_text(str(exc))
+            if redacted_error == str(exc):
+                raise
+            sanitized_error = McpProtocolError(redacted_error)
+        if sanitized_error is not None:
+            raise sanitized_error
+        redaction_result = safely_redact_jsonrpc_response(
+            message,
+            method=method_name,
+            redactor=self._secret_redactor,
         )
-        return result_from_jsonrpc_response(message, method_name)
+        redacted_message = redaction_result.response
+        mapping_result = JsonrpcAuthorityMappingResult({})
+        mapping_error = redaction_result.error
+        private_cursor: Any = None
+        raw_result: Any = None
+        if paginated and mapping_error is None:
+            raw_result = message.get("result")
+            if type(raw_result) is dict and "nextCursor" in raw_result:
+                try:
+                    private_cursor = copy_json_value(
+                        raw_result["nextCursor"],
+                        "nextCursor",
+                    )
+                except (TypeError, ValueError):
+                    mapping_error = f"MCP {method_name} response has an invalid nextCursor."
+        if mapping_error is None:
+            mapping_result = jsonrpc_authority_mapping(
+                message,
+                redacted_message,
+                method=method_name,
+            )
+            mapping_error = mapping_result.error
+        if mapping_error is None and authority_mapping is not None:
+            merge_result = merge_jsonrpc_authority_mapping(
+                authority_mapping,
+                mapping_result.mapping,
+                max_items=self.max_list_items,
+            )
+            mapping_error = merge_result.error
+            if mapping_error is None:
+                authority_mapping.clear()
+                authority_mapping.update(merge_result.mapping)
+            merge_result.mapping.clear()
+        if mapping_error is not None and authority_mapping is not None:
+            authority_mapping.clear()
+        mapping_result.mapping.clear()
+        raw_result = None
+        # The redacted response is the only representation needed after
+        # authority extraction. Do not retain the private server payload in a
+        # traceback if validation or result parsing fails.
+        message.clear()
+        message = {}
+        if mapping_error is not None:
+            private_cursor = None
+            raise McpProtocolError(
+                self._secret_redactor.redact_text_bounded(
+                    mapping_error,
+                    max_bytes=4096,
+                )
+            ) from None
+        try:
+            result = result_from_jsonrpc_response(redacted_message, method_name)
+        except BaseException:
+            private_cursor = None
+            raise
+        if not paginated:
+            return result
+        if type(result) is dict:
+            result.pop("nextCursor", None)
+        return McpPaginatedPage(
+            result=result,
+            next_cursor=private_cursor,
+        )
 
     async def _notify(self, method: str, params: dict[str, Any]) -> None:
         method_name = require_clean_nonblank(method, "method")
@@ -324,6 +514,7 @@ class HttpMcpSession(McpSession):
         # JSON-RPC event arrives, without waiting for the server to close the stream.
         if self._closed:
             raise McpProtocolError("MCP HTTP session is closed.")
+        transport_error: TimeoutError | McpProtocolError | None = None
         try:
             async with self._http.stream(
                 "POST",
@@ -342,16 +533,38 @@ class HttpMcpSession(McpSession):
                 content_type = response.headers.get("content-type", "")
                 # Media types are case-insensitive (RFC 9110); httpx returns it as sent.
                 if content_type.split(";", 1)[0].strip().lower() == _SSE_CONTENT_TYPE:
-                    return await _read_sse_response(response, request_id)
+                    return await _read_sse_response(
+                        response,
+                        request_id,
+                        redactor=self._secret_redactor,
+                    )
                 await response.aread()
-                message = _decode_jsonrpc(response.text)
+                response_text = response.text
+                # Do not retain the raw body through a protocol-error traceback.
+                # The stream context owns its response independently of this local.
+                response = None
+                try:
+                    message = _decode_jsonrpc(response_text)
+                finally:
+                    response_text = ""
                 if message.get("id") != request_id:
+                    message.clear()
+                    message = {}
                     raise McpProtocolError("MCP HTTP response id did not match the request.")
                 return message
-        except httpx.TimeoutException as exc:
-            raise TimeoutError(f"MCP HTTP request to {self._url} timed out.") from exc
+        except httpx.TimeoutException:
+            message = self._secret_redactor.redact_text(
+                f"MCP HTTP request to {self._url} timed out."
+            )
+            transport_error = TimeoutError(message)
         except httpx.RequestError as exc:
-            raise McpProtocolError(f"MCP HTTP request failed for {self._url}: {exc}") from exc
+            message = self._secret_redactor.redact_text(
+                f"MCP HTTP request failed for {self._url}: {exc}"
+            )
+            transport_error = McpProtocolError(message)
+        if transport_error is not None:
+            raise transport_error
+        raise AssertionError("MCP HTTP request returned without a response or transport error.")
 
     async def _handle_status(self, response: httpx.Response) -> None:
         if response.status_code == 404:
@@ -364,7 +577,8 @@ class HttpMcpSession(McpSession):
         if response.status_code >= 400:
             await response.aread()
             raise McpProtocolError(
-                f"MCP HTTP request failed with HTTP {response.status_code}: {_safe_body(response)}"
+                f"MCP HTTP request failed with HTTP {response.status_code}: "
+                f"{_safe_body(response, redactor=self._secret_redactor)}"
             )
 
     def _protocol_headers(self) -> dict[str, str]:
@@ -388,18 +602,33 @@ def _validate_optional_proxy(value: object, field_name: str) -> str | None:
 
 
 def _decode_jsonrpc(text: str) -> dict[str, Any]:
+    payload: Any = None
+    protocol_error: str | None = None
     try:
         payload = json.loads(text)
-    except ValueError as exc:
-        raise McpProtocolError("MCP HTTP response was not valid JSON.") from exc
-    if type(payload) is not dict:
-        raise McpProtocolError("MCP JSON-RPC message must be an object.")
-    if payload.get("jsonrpc") != "2.0":
-        raise McpProtocolError("MCP JSON-RPC message must use jsonrpc='2.0'.")
+    except ValueError:
+        protocol_error = "MCP HTTP response was not valid JSON."
+    # Drop the raw document before any public parser error is raised. A
+    # syntactically valid but structurally invalid response can carry the same
+    # injected secrets as an undecodable response.
+    text = ""
+    if protocol_error is None:
+        if type(payload) is not dict:
+            protocol_error = "MCP JSON-RPC message must be an object."
+        elif payload.get("jsonrpc") != "2.0":
+            protocol_error = "MCP JSON-RPC message must use jsonrpc='2.0'."
+    if protocol_error is not None:
+        payload = None
+        raise McpProtocolError(protocol_error)
     return payload
 
 
-async def _read_sse_response(response: httpx.Response, request_id: int) -> dict[str, Any]:
+async def _read_sse_response(
+    response: httpx.Response,
+    request_id: int,
+    *,
+    redactor: SecretRedactor,
+) -> dict[str, Any]:
     """Read the SSE stream incrementally and return the response matching the request.
 
     Events are dispatched on blank lines (per the SSE spec). The matching JSON-RPC
@@ -418,35 +647,49 @@ async def _read_sse_response(response: httpx.Response, request_id: int) -> dict[
                 continue
             if message.get("id") == request_id:
                 return message
-            _reject_server_message(message)
+            _reject_server_message(message, redactor=redactor)
         # Other SSE fields (event:, id:, retry:, comments) carry no JSON-RPC payload.
+    # The final loop value can itself be a raw data line. Clear it before a
+    # parser failure can expose this frame through traceback-local capture.
+    line = ""
     message = _sse_event_message(data_lines)
     if message is not None:
         if message.get("id") == request_id:
             return message
-        _reject_server_message(message)
+        _reject_server_message(message, redactor=redactor)
     raise McpProtocolError("MCP HTTP SSE stream did not contain the response.")
 
 
 def _sse_event_message(data_lines: list[str]) -> dict[str, Any] | None:
     if not data_lines:
         return None
-    return _decode_jsonrpc("\n".join(data_lines))
+    text = "\n".join(data_lines)
+    data_lines.clear()
+    try:
+        return _decode_jsonrpc(text)
+    finally:
+        text = ""
 
 
-def _reject_server_message(message: dict[str, Any]) -> None:
+def _reject_server_message(
+    message: dict[str, Any],
+    *,
+    redactor: SecretRedactor,
+) -> None:
     # A server-initiated request (method + id) cannot be answered by this
     # request/response client, so fail loudly rather than leave the server waiting
     # (stdio likewise refuses server requests). Server notifications (method, no id)
     # and stray responses carry no obligation and are ignored.
     if "method" in message and "id" in message:
+        safe_method = redactor.redact_text(repr(message["method"]))
+        message.clear()
         raise McpProtocolError(
-            f"Cayu does not service MCP server requests over HTTP: {message['method']!r}."
+            f"Cayu does not service MCP server requests over HTTP: {safe_method}."
         )
 
 
-def _safe_body(response: httpx.Response) -> str:
+def _safe_body(response: httpx.Response, *, redactor: SecretRedactor) -> str:
     try:
-        return response.text[:_MAX_ERROR_BODY_CHARS]
+        return redactor.redact_text(response.text)[:_MAX_ERROR_BODY_CHARS]
     except Exception:
         return "<unreadable response body>"

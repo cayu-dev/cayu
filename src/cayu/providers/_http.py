@@ -521,7 +521,7 @@ def credential_safe_error_event(
         safe_message,
         cause=exc,
     )
-    redacted = SecretRedactor(credential_values).redact_json(event.payload)
+    redacted = SecretRedactor(credential_values).redact_json_values(event.payload)
     if type(redacted) is not dict:  # pragma: no cover - SecretRedactor contract guard
         raise AssertionError("provider error payload redaction returned a non-object")
     return ModelStreamEvent(type=event.type, payload=redacted)

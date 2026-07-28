@@ -8,7 +8,7 @@ import contextlib
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from math import isfinite
-from typing import TYPE_CHECKING, Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 from unicodedata import category as unicode_category
 from urllib.parse import quote
 from uuid import uuid4
@@ -46,7 +46,7 @@ from cayu.artifacts import (
     InvalidArtifactIdError,
     copy_artifact_read_result,
 )
-from cayu.core.events import Event, EventType
+from cayu.core.events import EVENT_ID_MAX_CHARS, Event, EventType
 from cayu.core.messages import Message, MessageRole
 from cayu.core.thinking import ThinkingConfig
 from cayu.runtime._binding_cleanup import is_containable_cleanup_error
@@ -1167,64 +1167,150 @@ def _request_interruption_actor(
     return _request_actor(auth_context, body_requested_by, field_name="requested_by")
 
 
-def _serialize_event_record(record: EventRecord) -> dict[str, Any]:
+def _serialize_event_record(cayu_app: Any, record: EventRecord) -> dict[str, Any]:
     event = record.event
-    return {
-        "sequence": record.sequence,
-        "id": event.id,
-        "type": str(event.type),
-        "session_id": event.session_id,
-        "agent_name": event.agent_name,
-        "environment_name": event.environment_name,
-        "workflow_name": event.workflow_name,
-        "tool_name": event.tool_name,
-        "payload": event.payload,
-        "timestamp": event.timestamp.isoformat(),
-    }
+    serialized = _redact_control_plane_values(
+        cayu_app,
+        {
+            "sequence": record.sequence,
+            "id": event.id,
+            "type": str(event.type),
+            "session_id": event.session_id,
+            "agent_name": event.agent_name,
+            "environment_name": event.environment_name,
+            "workflow_name": event.workflow_name,
+            "tool_name": event.tool_name,
+            "payload": event.payload,
+            "timestamp": event.timestamp.isoformat(),
+        },
+        "event",
+        preserve_string_fields={"timestamp", "type"},
+        untrusted_container_fields={"payload"},
+    )
+    event_id = serialized.get("id")
+    if type(event_id) is str and len(event_id) > EVENT_ID_MAX_CHARS:
+        serialized["id"] = event_id[:EVENT_ID_MAX_CHARS]
+    return serialized
 
 
-def _serialize_session_outcome(outcome: SessionOutcome) -> dict[str, Any]:
+def _serialize_session_outcome(cayu_app: Any, outcome: SessionOutcome) -> dict[str, Any]:
     return {
-        "session_id": outcome.session_id,
+        "session_id": _redact_control_plane_json(
+            cayu_app,
+            outcome.session_id,
+            "session_outcome.session_id",
+        ),
         "status": outcome.status.value,
-        "reason": outcome.reason,
-        "details": outcome.details,
-        "retry": outcome.retry,
+        "reason": _redact_control_plane_json(
+            cayu_app,
+            outcome.reason,
+            "session_outcome.reason",
+        ),
+        "details": _redact_control_plane_json(
+            cayu_app,
+            outcome.details,
+            "session_outcome.details",
+        ),
+        "retry": _redact_control_plane_json(
+            cayu_app,
+            outcome.retry,
+            "session_outcome.retry",
+        ),
         "terminal_event": (
             None
             if outcome.terminal_event is None
-            else _serialize_event_record(outcome.terminal_event)
+            else _serialize_event_record(cayu_app, outcome.terminal_event)
         ),
         "latest_retry_event": (
             None
             if outcome.latest_retry_event is None
-            else _serialize_event_record(outcome.latest_retry_event)
+            else _serialize_event_record(cayu_app, outcome.latest_retry_event)
         ),
     }
 
 
-def _serialize_session_base(session: Session | PendingActionSession) -> dict[str, Any]:
+def _serialize_session_base(
+    cayu_app: Any,
+    session: Session | PendingActionSession,
+) -> dict[str, Any]:
     # Shared list-view fields. The list endpoint omits the (potentially large,
     # unbounded) per-session metadata; callers fetch a single session to get it.
+    return _redact_control_plane_values(
+        cayu_app,
+        {
+            "id": session.id,
+            "status": session.status.value,
+            "agent_name": session.agent_name,
+            "provider_name": session.provider_name,
+            "model": session.model,
+            "parent_session_id": session.parent_session_id,
+            "causal_budget_id": session.causal_budget_id,
+            "runtime_name": session.runtime_name,
+            "runtime_version": session.runtime_version,
+            "environment_name": session.environment_name,
+            "created_at": session.created_at.isoformat(),
+            "updated_at": session.updated_at.isoformat(),
+            "labels": session.labels,
+        },
+        "session",
+        preserve_string_fields={"created_at", "status", "updated_at"},
+        untrusted_container_fields={"labels"},
+    )
+
+
+def _serialize_session(cayu_app: Any, session: Session) -> dict[str, Any]:
     return {
-        "id": session.id,
-        "status": session.status.value,
-        "agent_name": session.agent_name,
-        "provider_name": session.provider_name,
-        "model": session.model,
-        "parent_session_id": session.parent_session_id,
-        "causal_budget_id": session.causal_budget_id,
-        "runtime_name": session.runtime_name,
-        "runtime_version": session.runtime_version,
-        "environment_name": session.environment_name,
-        "created_at": session.created_at.isoformat(),
-        "updated_at": session.updated_at.isoformat(),
-        "labels": session.labels,
+        **_serialize_session_base(cayu_app, session),
+        "metadata": _redact_control_plane_json(
+            cayu_app,
+            session.metadata,
+            "session.metadata",
+        ),
     }
 
 
-def _serialize_session(session: Session) -> dict[str, Any]:
-    return {**_serialize_session_base(session), "metadata": session.metadata}
+def _serialize_session_cursor(cayu_app: Any, cursor: str | None) -> str | None:
+    """Return a pagination cursor only when its keyset authority is secret-free."""
+
+    if cursor is None:
+        return None
+    redacted_cursor = _redact_control_plane_json(
+        cayu_app,
+        cursor,
+        "session_cursor",
+    )
+    if type(redacted_cursor) is not str or redacted_cursor != cursor:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Session pagination cannot continue because its cursor authority "
+                "contains a configured workload secret."
+            ),
+        )
+    try:
+        _, session_id = decode_session_cursor(cursor)
+    except ValueError:
+        # SessionStore cursors are intentionally opaque. Built-in stores use
+        # encode_session_cursor(), which lets us inspect embedded authority,
+        # while custom stores may return any secret-free portable token.
+        return cursor
+    redacted_session_id = _redact_control_plane_json(
+        cayu_app,
+        session_id,
+        "session_cursor.session_id",
+    )
+    if type(redacted_session_id) is not str or redacted_session_id != session_id:
+        # Redacting the ID inside the cursor would change its keyset position and
+        # silently skip or duplicate sessions. Reject the legacy authority until
+        # the server has a configured opaque cursor codec.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Session pagination cannot continue because its cursor authority "
+                "contains a configured workload secret."
+            ),
+        )
+    return cursor
 
 
 def _redact_control_plane_json(cayu_app: Any, value: Any, field_name: str) -> Any:
@@ -1233,6 +1319,43 @@ def _redact_control_plane_json(cayu_app: Any, value: Any, field_name: str) -> An
     if callable(redactor):
         return redactor(copied)
     return copied
+
+
+def _redact_control_plane_values(
+    cayu_app: Any,
+    value: Any,
+    field_name: str,
+    *,
+    preserve_string_fields: set[str] | frozenset[str] = frozenset(),
+    untrusted_container_fields: set[str] | frozenset[str] = frozenset(),
+) -> Any:
+    """Redact values recursively without rewriting typed response keys."""
+
+    copied = copy_json_value(value, field_name)
+    redactor = getattr(cayu_app, "redact_json", None)
+    if not callable(redactor):
+        return copied
+    redact_json = cast("Callable[[Any], Any]", redactor)
+
+    def redact(item: Any, *, item_field: str | None = None) -> Any:
+        if type(item) is str:
+            if item_field in preserve_string_fields:
+                return item
+            return redact_json(item)
+        if type(item) is list:
+            return [redact(child, item_field=item_field) for child in item]
+        if type(item) is dict:
+            return {
+                key: (
+                    redact_json(child)
+                    if key in untrusted_container_fields
+                    else redact(child, item_field=key)
+                )
+                for key, child in item.items()
+            }
+        return item
+
+    return redact(copied)
 
 
 def _serialize_tool(cayu_app: Any, tool: Any) -> dict[str, Any]:
@@ -1684,49 +1807,90 @@ def _trace_context_metadata(http_request: Request) -> dict[str, Any]:
 TraceContextMetadata = Annotated[dict[str, Any], Depends(_trace_context_metadata)]
 
 
-def _serialize_message_part(part: Any) -> dict[str, Any]:
+def _serialize_message_part(cayu_app: Any, part: Any) -> dict[str, Any]:
     if part.type == "thinking":
         # The opaque round-trip state (Anthropic signatures / redacted blobs) is
         # provider-internal and must not be exposed to transcript API consumers.
-        return part.model_dump(mode="json", exclude={"provider_state"})
-    return part.model_dump(mode="json")
+        payload = part.model_dump(mode="json", exclude={"provider_state"})
+    else:
+        payload = part.model_dump(mode="json")
+    return _redact_control_plane_values(
+        cayu_app,
+        payload,
+        "transcript_message.part",
+        # These values belong to validated file-attachment protocol structure,
+        # not caller data. Preserve them so redaction cannot turn a valid
+        # attachment into an uninterpretable shape when a short secret happens
+        # to overlap "image", "document", or a supported MIME type.
+        preserve_string_fields={"content_type", "kind", "type"},
+        untrusted_container_fields={
+            "arguments",
+            "artifacts",
+            "metadata",
+            "provider_state",
+            "state",
+            "structured",
+        },
+    )
 
 
-def _serialize_transcript_message(index: int, message: Message) -> dict[str, Any]:
+def _serialize_transcript_message(
+    cayu_app: Any,
+    index: int,
+    message: Message,
+) -> dict[str, Any]:
     return {
         "index": index,
         "role": str(message.role),
-        "content": [_serialize_message_part(part) for part in message.content],
+        "content": [_serialize_message_part(cayu_app, part) for part in message.content],
     }
 
 
-def _serialize_task_list_item(task: Task) -> dict[str, Any]:
-    return {
-        "id": task.id,
-        "type": task.type,
-        "title": task.title,
-        "description": task.description,
-        "status": task.status.value,
-        "status_reason": task.status_reason,
-        "status_payload": task.status_payload,
-        "session_id": task.session_id,
-        "parent_task_id": task.parent_task_id,
-        "assigned_agent_name": task.assigned_agent_name,
-        "worker_id": task.worker_id,
-        "lease_expires_at": (task.lease_expires_at.isoformat() if task.lease_expires_at else None),
-        "created_at": task.created_at.isoformat(),
-        "updated_at": task.updated_at.isoformat(),
-        "completed_at": task.completed_at.isoformat() if task.completed_at else None,
-    }
+def _serialize_task_list_item(cayu_app: Any, task: Task) -> dict[str, Any]:
+    return _redact_control_plane_values(
+        cayu_app,
+        {
+            "id": task.id,
+            "type": task.type,
+            "title": task.title,
+            "description": task.description,
+            "status": task.status.value,
+            "status_reason": task.status_reason,
+            "status_payload": task.status_payload,
+            "session_id": task.session_id,
+            "parent_task_id": task.parent_task_id,
+            "assigned_agent_name": task.assigned_agent_name,
+            "worker_id": task.worker_id,
+            "lease_expires_at": (
+                task.lease_expires_at.isoformat() if task.lease_expires_at else None
+            ),
+            "created_at": task.created_at.isoformat(),
+            "updated_at": task.updated_at.isoformat(),
+            "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+        },
+        "task",
+        preserve_string_fields={
+            "completed_at",
+            "created_at",
+            "lease_expires_at",
+            "status",
+            "updated_at",
+        },
+        untrusted_container_fields={"status_payload"},
+    )
 
 
-def _serialize_task_detail(task: Task) -> dict[str, Any]:
+def _serialize_task_detail(cayu_app: Any, task: Task) -> dict[str, Any]:
     return {
-        **_serialize_task_list_item(task),
-        "input": task.input,
-        "result": task.result,
-        "error": task.error,
-        "metadata": task.metadata,
+        **_serialize_task_list_item(cayu_app, task),
+        "input": _redact_control_plane_json(cayu_app, task.input, "task.input"),
+        "result": _redact_control_plane_json(cayu_app, task.result, "task.result"),
+        "error": _redact_control_plane_json(cayu_app, task.error, "task.error"),
+        "metadata": _redact_control_plane_json(
+            cayu_app,
+            task.metadata,
+            "task.metadata",
+        ),
         "started_at": task.started_at.isoformat() if task.started_at else None,
     }
 
@@ -3259,17 +3423,31 @@ def create_router(
         return {
             "actions": [
                 {
-                    **action.model_dump(
-                        mode="json",
-                        exclude={"session", "event"},
+                    **_redact_control_plane_values(
+                        cayu_app,
+                        action.model_dump(
+                            mode="json",
+                            exclude={"session", "event"},
+                        ),
+                        "pending_action",
+                        preserve_string_fields={"kind"},
+                        untrusted_container_fields={"arguments"},
                     ),
-                    "session": _serialize_session_base(action.session),
-                    "event": _serialize_event_record(action.event),
+                    "session": _serialize_session_base(cayu_app, action.session),
+                    "event": _serialize_event_record(cayu_app, action.event),
                 }
                 for action in result.actions
             ],
-            "issues": [issue.model_dump(mode="json") for issue in result.issues],
-            "next_cursor": result.next_cursor,
+            "issues": [
+                _redact_control_plane_values(
+                    cayu_app,
+                    issue.model_dump(mode="json"),
+                    "pending_action_issue",
+                    preserve_string_fields={"code", "status", "updated_at"},
+                )
+                for issue in result.issues
+            ],
+            "next_cursor": _serialize_session_cursor(cayu_app, result.next_cursor),
             "has_more": result.has_more,
             "total_count": result.total_count,
             "inspected_candidate_count": result.inspected_candidate_count,
@@ -3328,8 +3506,8 @@ def create_router(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {
-            "sessions": [_serialize_session_base(session) for session in result.sessions],
-            "next_cursor": result.next_cursor,
+            "sessions": [_serialize_session_base(cayu_app, session) for session in result.sessions],
+            "next_cursor": _serialize_session_cursor(cayu_app, result.next_cursor),
             "total_count": result.total_count,
         }
 
@@ -3462,15 +3640,15 @@ def create_router(
             event_summary = event_summary_from_records(session.id, records)
             session_items.append(
                 {
-                    "session": _serialize_session(session),
-                    "outcome": _serialize_session_outcome(outcome),
+                    "session": _serialize_session(cayu_app, session),
+                    "outcome": _serialize_session_outcome(cayu_app, outcome),
                     "events": {
                         "total_events": event_summary.total_events,
                         "counts_by_type": event_summary.counts_by_type,
                         "latest_event": (
                             None
                             if event_summary.latest_event is None
-                            else _serialize_event_record(event_summary.latest_event)
+                            else _serialize_event_record(cayu_app, event_summary.latest_event)
                         ),
                     },
                 }
@@ -3479,7 +3657,7 @@ def create_router(
         return {
             "session_count": len(sessions),
             "sessions": session_items,
-            "next_cursor": result.next_cursor,
+            "next_cursor": _serialize_session_cursor(cayu_app, result.next_cursor),
             "total_count": result.total_count,
             "usage": usage_summary,
             "provider_breakdown": provider_breakdown,
@@ -3605,15 +3783,15 @@ def create_router(
             )
             session_items.append(
                 {
-                    "session": _serialize_session(session),
-                    "outcome": _serialize_session_outcome(outcome),
+                    "session": _serialize_session(cayu_app, session),
+                    "outcome": _serialize_session_outcome(cayu_app, outcome),
                     "events": {
                         "total_events": event_summary.total_events,
                         "counts_by_type": event_summary.counts_by_type,
                         "latest_event": (
                             None
                             if event_summary.latest_event is None
-                            else _serialize_event_record(event_summary.latest_event)
+                            else _serialize_event_record(cayu_app, event_summary.latest_event)
                         ),
                     },
                 }
@@ -3663,20 +3841,20 @@ def create_router(
         usage_summary = await cayu_app.get_session_usage(session_id)
 
         return {
-            "session": _serialize_session(session),
+            "session": _serialize_session(cayu_app, session),
             "events": {
                 "total_events": event_summary.total_events,
                 "counts_by_type": event_summary.counts_by_type,
                 "latest_event": (
                     None
                     if event_summary.latest_event is None
-                    else _serialize_event_record(event_summary.latest_event)
+                    else _serialize_event_record(cayu_app, event_summary.latest_event)
                 ),
             },
             "transcript": {
                 "total_messages": transcript_page.total_records,
             },
-            "outcome": _serialize_session_outcome(outcome),
+            "outcome": _serialize_session_outcome(cayu_app, outcome),
             "usage": usage_summary.model_dump(),
         }
 
@@ -3851,7 +4029,7 @@ def create_router(
 
         return {
             "session_id": session_id,
-            "events": [_serialize_event_record(record) for record in page],
+            "events": [_serialize_event_record(cayu_app, record) for record in page],
             "order_by": order_by,
             "next_sequence": next_sequence,
             "scan_through_sequence": scan_through_sequence,
@@ -3892,7 +4070,7 @@ def create_router(
         return {
             "session_id": session_id,
             "messages": [
-                _serialize_transcript_message(record.index, record.message)
+                _serialize_transcript_message(cayu_app, record.index, record.message)
                 for record in transcript_page.records
             ],
             "offset": offset,
@@ -3910,7 +4088,7 @@ def create_router(
         session = await session_store.load(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Session not found")
-        return _serialize_session(session)
+        return _serialize_session(cayu_app, session)
 
     @router.delete("/sessions/{session_id}", status_code=204, dependencies=protected)
     async def delete_session(session_id: NonBlankString):
@@ -3936,7 +4114,7 @@ def create_router(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _serialize_session(session)
+        return _serialize_session(cayu_app, session)
 
     @router.patch(
         "/sessions/{session_id}/metadata",
@@ -3954,7 +4132,7 @@ def create_router(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (ValueError, TypeError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _serialize_session(session)
+        return _serialize_session(cayu_app, session)
 
     @router.get("/tasks", response_model=list[ApiTaskListItem], dependencies=protected)
     async def list_tasks(
@@ -3985,7 +4163,7 @@ def create_router(
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=exc.errors()) from exc
         tasks = await task_store.list_tasks(query)
-        return [_serialize_task_list_item(t) for t in tasks]
+        return [_serialize_task_list_item(cayu_app, t) for t in tasks]
 
     async def _require_task_store():
         if task_store is None:
@@ -4002,7 +4180,7 @@ def create_router(
         task = await store.load_task(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
-        return _serialize_task_detail(task)
+        return _serialize_task_detail(cayu_app, task)
 
     async def _apply_task_action(action, task_id: str):
         try:
@@ -4011,7 +4189,7 @@ def create_router(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return _serialize_task_detail(task)
+        return _serialize_task_detail(cayu_app, task)
 
     @router.post(
         "/tasks/{task_id}/pause",

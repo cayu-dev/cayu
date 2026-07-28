@@ -28,6 +28,7 @@ from cayu.runtime.sessions import (
     SessionStore,
     _deactivate_session_run_fence,
 )
+from cayu.vaults import SecretRedactor
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ _BACKGROUND_INTERRUPTION_FAILURE_DETAIL_LIMIT = 100
 _BACKGROUND_INTERRUPTION_LEASE_SECONDS = 30.0
 _BACKGROUND_INTERRUPTION_HEARTBEAT_SECONDS = 10.0
 _BACKGROUND_INTERRUPTION_HEARTBEAT_RETRY_SECONDS = 1.0
+_BACKGROUND_INTERRUPTION_ERROR_MAX_BYTES = 4096
 _INTERRUPTION_TYPE_OPERATOR_REQUESTED = "operator_requested"
 _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY = "pending_session_interrupt"
 _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY = "pending_interruption_cascade"
@@ -222,6 +224,7 @@ class BackgroundInterruptionCoordinator:
         ],
         renew_pending_interruption_cascade_claim: Callable[[str, str, int, str], Awaitable[bool]],
         release_pending_interruption_cascade_claim: Callable[[str, str, int, str], Awaitable[None]],
+        secret_redactor: SecretRedactor | None = None,
     ) -> None:
         self._session_store = session_store
         self._event_writer = event_writer
@@ -237,6 +240,7 @@ class BackgroundInterruptionCoordinator:
         self._release_pending_interruption_cascade_claim = (
             release_pending_interruption_cascade_claim
         )
+        self._secret_redactor = secret_redactor or SecretRedactor()
         self._tasks: set[asyncio.Task[None]] = set()
         self._tasks_by_parent: dict[str, asyncio.Task[None]] = {}
         self._stop = asyncio.Event()
@@ -250,6 +254,12 @@ class BackgroundInterruptionCoordinator:
         self._draining = False
         self._shutdown_active = False
         self._workers_stopped = asyncio.Event()
+
+    def _safe_exception_message(self, error: BaseException) -> str:
+        return self._secret_redactor.redact_text_bounded(
+            str(error),
+            max_bytes=_BACKGROUND_INTERRUPTION_ERROR_MAX_BYTES,
+        )
 
     def is_admitted(self, parent_session_id: str) -> bool:
         task = self._tasks_by_parent.get(parent_session_id)
@@ -453,9 +463,11 @@ class BackgroundInterruptionCoordinator:
             exception = completed.exception()
             if exception is not None:
                 logger.error(
-                    "Background interruption cascade for parent %s failed unexpectedly.",
+                    "Background interruption cascade for parent %s failed unexpectedly: "
+                    "error_type=%s error=%s",
                     parent_session_id,
-                    exc_info=(type(exception), exception, exception.__traceback__),
+                    type(exception).__name__,
+                    self._safe_exception_message(exception),
                 )
 
         task.add_done_callback(discard)
@@ -616,7 +628,7 @@ class BackgroundInterruptionCoordinator:
             logger.warning(
                 "Background interruption cascade for parent %s has an invalid durable payload: %s",
                 parent_session_id,
-                exc,
+                self._safe_exception_message(exc),
             )
             return
 
@@ -736,7 +748,7 @@ class BackgroundInterruptionCoordinator:
                 logger.warning(
                     "Could not persist background interruption cascade failure for parent %s: %s",
                     parent_session_id,
-                    exc,
+                    self._safe_exception_message(exc),
                 )
             return
 
@@ -786,7 +798,7 @@ class BackgroundInterruptionCoordinator:
             logger.warning(
                 "Could not persist background interruption cascade completion for parent %s: %s",
                 parent_session_id,
-                exc,
+                self._safe_exception_message(exc),
             )
 
     async def _record_background_interruption_completion_failure(
@@ -832,7 +844,7 @@ class BackgroundInterruptionCoordinator:
             logger.warning(
                 "Could not persist background interruption completion failure for parent %s: %s",
                 state.parent_session_id,
-                record_exc,
+                self._safe_exception_message(record_exc),
             )
 
     async def _heartbeat_background_interruption_claim(
@@ -856,7 +868,7 @@ class BackgroundInterruptionCoordinator:
                 logger.warning(
                     "Could not renew background interruption claim for parent %s: %s",
                     state.parent_session_id,
-                    exc,
+                    self._safe_exception_message(exc),
                 )
                 if self._clock() >= claim_expires_at:
                     state.claim_lost.set()
@@ -908,9 +920,12 @@ class BackgroundInterruptionCoordinator:
                         "error_type": type(exc).__name__,
                     },
                 )
-                logger.exception(
-                    "Unexpected background interruption worker failure for %s.",
+                logger.error(
+                    "Unexpected background interruption worker failure for %s: "
+                    "error_type=%s error=%s",
                     node.session_id,
+                    type(exc).__name__,
+                    self._safe_exception_message(exc),
                 )
             finally:
                 node.state.outstanding -= 1

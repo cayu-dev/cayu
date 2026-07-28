@@ -24,7 +24,7 @@ from collections.abc import Awaitable, Callable
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
-from cayu.runtime._diagnostics import exception_diagnostic
+from cayu._validation import require_clean_nonblank
 from cayu.runtime.sessions import SessionStatus
 from cayu.runtime.tasks import Task, TaskClaimLost, TaskQuery, TaskStatus, TaskStore
 
@@ -39,6 +39,7 @@ class TaskHandlerOutcome(StrEnum):
 
 
 TaskHandler = Callable[["CayuApp", Task, str], Awaitable[TaskHandlerOutcome | None]]
+_MAX_TASK_FAILURE_MESSAGE_BYTES = 500
 
 
 async def run_task_worker(
@@ -76,6 +77,11 @@ async def run_task_worker(
         raise ValueError("poll_interval_s must be positive.")
     if max_tasks is not None and max_tasks < 0:
         raise ValueError("max_tasks must be non-negative.")
+    worker_id = require_clean_nonblank(worker_id, "worker_id")
+    if app.redact_json(worker_id) != worker_id:
+        raise ValueError(
+            "worker_id contains a workload secret and cannot be used as durable task authority."
+        )
 
     handled = 0
     while (max_tasks is None or handled < max_tasks) and not _is_stopped(stop):
@@ -113,18 +119,21 @@ async def _handle_with_heartbeat(
         stop_heartbeat.set()
         await heartbeat_task
     if handler_error is not None:
-        await _safe_fail(task_store, task.id, worker_id, handler_error)
+        failure_payload = _task_failure_payload(app, handler_error)
+        handler_error = None
+        await _safe_fail_payload(task_store, task.id, worker_id, failure_payload)
     elif handler_outcome is TaskHandlerOutcome.SESSION_INTERRUPTED:
         await _handoff_interrupted_session(app, task_store, task.id, worker_id)
     elif handler_outcome is not None:
         await _safe_fail(
+            app,
             task_store,
             task.id,
             worker_id,
             TypeError(f"Unsupported task handler outcome: {handler_outcome!r}."),
         )
     else:
-        await _safe_fail_unfinished(task_store, task.id, worker_id)
+        await _safe_fail_unfinished(app, task_store, task.id, worker_id)
 
 
 async def _handoff_interrupted_session(
@@ -142,6 +151,7 @@ async def _handoff_interrupted_session(
         return
     if task.status is not TaskStatus.RUNNING or task.session_id is None:
         await _safe_fail(
+            app,
             task_store,
             task_id,
             worker_id,
@@ -155,6 +165,7 @@ async def _handoff_interrupted_session(
     session = await app.session_store.load_state(task.session_id)
     if session is None:
         await _safe_fail(
+            app,
             task_store,
             task_id,
             worker_id,
@@ -163,6 +174,7 @@ async def _handoff_interrupted_session(
         return
     if session.status is not SessionStatus.INTERRUPTED:
         await _safe_fail(
+            app,
             task_store,
             task_id,
             worker_id,
@@ -173,10 +185,18 @@ async def _handoff_interrupted_session(
         )
         return
 
+    release_failure_payload: dict[str, str] | None = None
     try:
         await task_store.release_attached_task_worker(task_id, worker_id)
     except Exception as exc:
-        await _safe_fail(task_store, task_id, worker_id, exc)
+        release_failure_payload = _task_failure_payload(app, exc)
+    if release_failure_payload is not None:
+        await _safe_fail_payload(
+            task_store,
+            task_id,
+            worker_id,
+            release_failure_payload,
+        )
 
 
 async def _heartbeat_until(
@@ -197,8 +217,22 @@ async def _heartbeat_until(
             return
 
 
-async def _safe_fail(task_store: TaskStore, task_id: str, worker_id: str, exc: Exception) -> None:
-    diagnostic = exception_diagnostic(
+async def _safe_fail(
+    app: CayuApp,
+    task_store: TaskStore,
+    task_id: str,
+    worker_id: str,
+    exc: Exception,
+) -> None:
+    payload = _task_failure_payload(app, exc)
+    del exc
+    await _safe_fail_payload(task_store, task_id, worker_id, payload)
+
+
+def _task_failure_payload(app: CayuApp, exc: Exception) -> dict[str, Any]:
+    """Snapshot, redact, and bound one task failure before a store await."""
+
+    diagnostic = app.redact_exception_diagnostic(
         exc,
         empty_message="task handler failed",
         nonportable_message="Task handler failed with a non-portable diagnostic.",
@@ -210,6 +244,33 @@ async def _safe_fail(task_store: TaskStore, task_id: str, worker_id: str, exc: E
     if diagnostic.durable_value_error_code is not None:
         payload["durable_value_error_code"] = diagnostic.durable_value_error_code
         payload["durable_value_error_path"] = diagnostic.durable_value_error_path
+    diagnostic = None
+    redacted_payload = app.redact_json(payload)
+    payload.clear()
+    if type(redacted_payload) is not dict:
+        raise AssertionError("Task failure payload redaction returned a non-object.")
+    return {
+        key: _redact_and_bound_task_failure_text(app, value) if type(value) is str else value
+        for key, value in redacted_payload.items()
+    }
+
+
+def _redact_and_bound_task_failure_text(app: CayuApp, value: str) -> str:
+    redacted_value = app.redact_json(value)
+    if type(redacted_value) is not str:
+        raise AssertionError("Task failure text redaction returned a non-string.")
+    encoded_value = redacted_value.encode("utf-8", "replace")
+    if len(encoded_value) <= _MAX_TASK_FAILURE_MESSAGE_BYTES:
+        return redacted_value
+    return encoded_value[:_MAX_TASK_FAILURE_MESSAGE_BYTES].decode("utf-8", "ignore")
+
+
+async def _safe_fail_payload(
+    task_store: TaskStore,
+    task_id: str,
+    worker_id: str,
+    payload: dict[str, Any],
+) -> None:
     try:
         await task_store.fail_task(
             task_id,
@@ -232,11 +293,17 @@ async def _safe_fail(task_store: TaskStore, task_id: str, worker_id: str, exc: E
         raise
 
 
-async def _safe_fail_unfinished(task_store: TaskStore, task_id: str, worker_id: str) -> None:
+async def _safe_fail_unfinished(
+    app: CayuApp,
+    task_store: TaskStore,
+    task_id: str,
+    worker_id: str,
+) -> None:
     task = await task_store.load_task(task_id)
     if task is None or task.status not in {TaskStatus.CLAIMED, TaskStatus.RUNNING}:
         return
     await _safe_fail(
+        app,
         task_store,
         task_id,
         worker_id,

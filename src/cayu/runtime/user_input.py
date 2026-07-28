@@ -11,6 +11,7 @@ from cayu._validation import (
     require_durable_nonblank,
 )
 from cayu.core.thinking import ThinkingConfig
+from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
 from cayu.runtime.approvals import (
     PendingToolCallApproval,
     ResolutionActor,
@@ -23,6 +24,7 @@ from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.runtime.structured_output import StructuredOutputSpec, copy_structured_output_spec
+from cayu.vaults import SecretRedactor, contains_redacted_secret
 
 PENDING_USER_INPUT_CHECKPOINT_KEY = "pending_user_input"
 
@@ -265,16 +267,66 @@ def copy_pending_user_input(pending: PendingUserInput) -> PendingUserInput:
 
 def pending_user_input_from_checkpoint(
     checkpoint: dict[str, Any] | None,
+    *,
+    redactor: SecretRedactor | None = None,
+    consume_on_rejection: bool = False,
 ) -> PendingUserInput | None:
+    if type(consume_on_rejection) is not bool:
+        raise TypeError("consume_on_rejection must be a bool.")
     if checkpoint is None:
         return None
     copied_checkpoint = copy_durable_json_value(checkpoint, "checkpoint")
     value = copied_checkpoint.get(PENDING_USER_INPUT_CHECKPOINT_KEY)
     if value is None:
         return None
+    if redactor is not None and durable_value_contains_secret(
+        value,
+        redactor=redactor,
+        path=(PENDING_USER_INPUT_CHECKPOINT_KEY,),
+    ):
+        # Public callers retain their input by default. Runtime callers opt in
+        # to consuming their private checkpoint copy so no outer traceback
+        # frame keeps executable secret-bearing state.
+        if type(value) is dict:
+            value.clear()
+        value = None
+        copied_checkpoint.clear()
+        if consume_on_rejection:
+            checkpoint.clear()
+        checkpoint = None
+        raise ValueError(
+            "Pending user-input checkpoint contains a workload secret and cannot be executed."
+        ) from None
     if type(value) is not dict:
         raise ValueError("Pending user input checkpoint must be an object.")
-    return PendingUserInput(**value)
+    validation_rejected = False
+    try:
+        pending = PendingUserInput(**value)
+    except Exception:
+        if redactor is None:
+            raise
+        validation_rejected = True
+    if validation_rejected:
+        # A malformed legacy object can place a secret-looking schema field at
+        # an invalid position. Clear every private copy after validation, and
+        # optionally the runtime-owned source, before raising a fresh error so
+        # neither the Pydantic failure nor this traceback retains the payload.
+        value.clear()
+        value = None
+        copied_checkpoint.clear()
+        if consume_on_rejection:
+            checkpoint.clear()
+        checkpoint = None
+        raise ValueError(
+            "Pending user-input checkpoint is invalid and cannot be executed."
+        ) from None
+    if contains_redacted_secret(pending.arguments) or any(
+        contains_redacted_secret(call.arguments) for call in pending.tool_calls
+    ):
+        raise ValueError(
+            "Pending user-input arguments contain a redaction marker and cannot be executed."
+        )
+    return pending
 
 
 class UserInputRecoveryRequest(BaseModel):

@@ -14,7 +14,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any
 
-from cayu._exception_groups import exception_tree_contains, iter_exception_tree
+from cayu._exception_groups import (
+    exception_tree_contains,
+    iter_exception_tree,
+)
 from cayu._task_wait import await_shielded_task_outcome
 from cayu._validation import copy_durable_json_object, copy_json_value, copy_label_map
 from cayu.core.events import Event, EventType
@@ -36,6 +39,7 @@ from cayu.environments import (
     load_workspace_instructions,
 )
 from cayu.runners import Runner
+from cayu.runtime import _environment_operation_boundary as environment_operation_boundary
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._binding_cleanup import (
     append_binding_finalize_cancellation,
@@ -63,6 +67,7 @@ from cayu.vaults import SecretRedactor
 
 ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY = "environment_factory_reconnect"
 ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY = "environment_factory_allocation_owner"
+FAILURE_DIAGNOSTIC_TEXT_MAX_BYTES = 4096
 _ENVIRONMENT_FACTORY_CHECKPOINT_MAY_BE_COMMITTED_ATTRIBUTE = (
     "_cayu_environment_factory_checkpoint_may_be_committed"
 )
@@ -228,7 +233,11 @@ class EnvironmentLifecycle:
                 evidence=None if admission_candidate is None else admission_candidate.evidence,
                 stage="pre_create",
             ).require_admitted()
-            result = await factory.create(request)
+            result = await environment_operation_boundary.await_environment_operation(
+                lambda: factory.create(request),
+                operation_name="Environment factory creation",
+                redactor=self._secret_redactor,
+            )
             if type(result) is not EnvironmentFactoryResult:
                 raise TypeError("EnvironmentFactory.create must return EnvironmentFactoryResult.")
             environment = copy_environment(result.environment)
@@ -250,6 +259,16 @@ class EnvironmentLifecycle:
                 result.reconnect_metadata,
                 "reconnect_metadata",
             )
+            self._secret_redactor.require_no_secret_keys(
+                reconnect_metadata,
+                field_name="EnvironmentFactoryResult.reconnect_metadata",
+                match_short_substrings=True,
+            )
+            if self._secret_redactor.redact_json_values(reconnect_metadata) != (reconnect_metadata):
+                raise ValueError(
+                    "EnvironmentFactoryResult.reconnect_metadata contains a workload "
+                    "secret and cannot be checkpointed without changing reconnect semantics."
+                )
             try:
                 await self._checkpoint_factory_reconnect_metadata(
                     session_id=session.id,
@@ -316,6 +335,7 @@ class EnvironmentLifecycle:
                         else EnvironmentFactoryReleaseAction.DISCARD
                     ),
                     original_error=exc,
+                    redactor=self._secret_redactor,
                 )
                 _attach_environment_factory_release_payload(exc, release_payload)
             ordinary_failure = isinstance(exc, Exception) or exception_tree_contains(exc, Exception)
@@ -333,7 +353,10 @@ class EnvironmentLifecycle:
                                 environment_name=environment_name,
                                 payload={
                                     **base_payload,
-                                    **exception_failure_payload(exc),
+                                    **exception_failure_payload(
+                                        exc,
+                                        redactor=self._secret_redactor,
+                                    ),
                                 },
                             )
                         )
@@ -496,6 +519,7 @@ class EnvironmentLifecycle:
             result,
             action=EnvironmentFactoryReleaseAction.PRESERVE,
             original_error=error,
+            redactor=self._secret_redactor,
         )
         _attach_environment_factory_release_payload(error, release_payload)
         return (
@@ -582,26 +606,43 @@ class EnvironmentLifecycle:
         events: list[Event] = []
         base_payload = _binding_base_payload(registered_environment)
         try:
-            bound = await binding.bind(
-                registered_environment.environment.workspace,
-                registered_environment.environment.runner,
-                session_id=session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=environment_name,
+            bound = await environment_operation_boundary.await_environment_operation(
+                lambda: binding.bind(
+                    registered_environment.environment.workspace,
+                    registered_environment.environment.runner,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                ),
+                operation_name="Environment workspace binding",
+                redactor=self._secret_redactor,
             )
         except BaseException as exc:
             cleanup_status = binding_cleanup_status(exc)
             retry_error: BaseException | None = None
             if cleanup_status is not None:
                 cleanup_status.retry_attempted = True
+                retry_operation = cleanup_status.retry
                 try:
-                    await cleanup_status.retry()
+                    await environment_operation_boundary.await_environment_operation(
+                        retry_operation,
+                        operation_name="Environment binding cleanup retry",
+                        redactor=self._secret_redactor,
+                    )
                 except asyncio.CancelledError as cleanup_exc:
                     cleanup_status.retry_error = cleanup_exc
                     retry_error = cleanup_exc
                 except BaseException as cleanup_exc:
                     cleanup_status.retry_error = cleanup_exc
                     retry_error = cleanup_exc
+                finally:
+                    # The callback is binding-owned authority needed only for this
+                    # retry. Do not leave it reachable from an exception that may
+                    # cross the lifecycle boundary.
+                    cleanup_status.retry = (
+                        environment_operation_boundary.completed_environment_operation
+                    )
+                    del retry_operation
             ordinary_failure = isinstance(exc, Exception) or exception_tree_contains(exc, Exception)
             fatal_signal = binding_finalize_fatal_signal(exc)
             if fatal_signal is not None and not ordinary_failure:
@@ -623,7 +664,13 @@ class EnvironmentLifecycle:
             )
             self._active_environment_setups.pop(session.id, None)
             if ordinary_failure:
-                failure_payload = {**base_payload, **exception_failure_payload(exc)}
+                failure_payload = {
+                    **base_payload,
+                    **exception_failure_payload(
+                        exc,
+                        redactor=self._secret_redactor,
+                    ),
+                }
                 try:
                     events.append(
                         await self._event_writer.emit(
@@ -777,6 +824,7 @@ class EnvironmentLifecycle:
         binding = registered_environment.environment.binding
         if binding is None:
             return EnvironmentBindingFinalizeResult(event=event, events=[])
+        bound_workspace = registered_environment.bound_workspace
 
         terminal_outcome = _binding_outcome_for_terminal_event(event.type)
         preserve_factory_allocation = registered_environment.preserve_factory_allocation
@@ -784,7 +832,7 @@ class EnvironmentLifecycle:
         environment_name = _environment_name(registered_environment)
         base_payload = {
             **_binding_base_payload(registered_environment),
-            **_bound_workspace_payload(registered_environment.bound_workspace),
+            **_bound_workspace_payload(bound_workspace),
             "outcome": outcome,
         }
         if preserve_factory_allocation:
@@ -808,13 +856,17 @@ class EnvironmentLifecycle:
             start_publication_error = exc
 
         try:
-            final_snapshot = await binding.finalize(
-                registered_environment.bound_workspace,
-                outcome=outcome,
-                metadata={
-                    "event_type": str(event.type),
-                    "session_id": session.id,
-                },
+            final_snapshot = await environment_operation_boundary.await_environment_operation(
+                lambda: binding.finalize(
+                    bound_workspace,
+                    outcome=outcome,
+                    metadata={
+                        "event_type": str(event.type),
+                        "session_id": session.id,
+                    },
+                ),
+                operation_name="Environment binding finalization",
+                redactor=self._secret_redactor,
             )
             final_snapshot = copy_workspace_snapshot(final_snapshot)
         except (BaseExceptionGroup, Exception, asyncio.CancelledError) as exc:
@@ -852,6 +904,7 @@ class EnvironmentLifecycle:
                         "Binding finalization failure publication failed with a "
                         "non-portable diagnostic."
                     ),
+                    redactor=self._secret_redactor,
                 )
                 _add_exception_note_safely(
                     exc,
@@ -894,6 +947,7 @@ class EnvironmentLifecycle:
                         "Binding finalization diagnostic fan-out failed with a "
                         "non-portable diagnostic."
                     ),
+                    redactor=self._secret_redactor,
                 )
                 _add_exception_note_safely(
                     exc,
@@ -1001,14 +1055,19 @@ class EnvironmentLifecycle:
         binding = registered_environment.environment.binding
         if binding is None or registered_environment.bound_workspace is None:
             return
+        bound_workspace = registered_environment.bound_workspace
         try:
-            await binding.finalize(
-                registered_environment.bound_workspace,
-                outcome="interrupted",
-                metadata={
-                    "event_type": "environment_setup_aborted",
-                    "session_id": session_id,
-                },
+            await environment_operation_boundary.await_environment_operation(
+                lambda: binding.finalize(
+                    bound_workspace,
+                    outcome="interrupted",
+                    metadata={
+                        "event_type": "environment_setup_aborted",
+                        "session_id": session_id,
+                    },
+                ),
+                operation_name="Environment binding cleanup finalization",
+                redactor=self._secret_redactor,
             )
         except BaseException as cleanup_error:
             diagnostic = exception_diagnostic(
@@ -1017,6 +1076,7 @@ class EnvironmentLifecycle:
                 nonportable_message=(
                     "Environment binding cleanup failed with a non-portable diagnostic."
                 ),
+                redactor=self._secret_redactor,
             )
             _add_exception_note_safely(
                 original_error,
@@ -1187,14 +1247,19 @@ def exception_failure_payload(
     error: BaseException,
     *,
     diagnostic: ExceptionDiagnostic | None = None,
+    redactor: SecretRedactor | None = None,
 ) -> dict[str, Any]:
-    """Return portable terminal evidence without trusting exception behavior."""
+    """Return portable, workload-secret-safe terminal evidence."""
 
+    resolved_redactor = redactor or SecretRedactor()
     if diagnostic is None:
-        diagnostic = exception_diagnostic(error)
+        diagnostic = exception_diagnostic(error, redactor=resolved_redactor)
     elif type(diagnostic) is not ExceptionDiagnostic:
         raise TypeError("diagnostic must be an ExceptionDiagnostic.")
-    fallback = diagnostic.payload_fields()
+    fallback = _redact_and_bound_failure_payload(
+        diagnostic.payload_fields(),
+        redactor=resolved_redactor,
+    )
 
     safe_payload = binding_finalize_safe_payload(error)
     if safe_payload is None and isinstance(error, BaseExceptionGroup):
@@ -1208,7 +1273,10 @@ def exception_failure_payload(
             None,
         )
     if safe_payload is not None:
-        return safe_payload
+        return _redact_and_bound_failure_payload(
+            safe_payload,
+            redactor=resolved_redactor,
+        )
 
     payload = dict(fallback)
     try:
@@ -1217,7 +1285,10 @@ def exception_failure_payload(
     except BaseException:
         return fallback
     try:
-        cleanup_payload = binding_cleanup_payload(error)
+        cleanup_payload = binding_cleanup_payload(
+            error,
+            redactor=resolved_redactor,
+        )
     except BaseException:
         cleanup_payload = None
     if cleanup_payload is not None:
@@ -1226,9 +1297,13 @@ def exception_failure_payload(
     if factory_release is not None:
         payload["environment_factory_release"] = factory_release
     try:
-        return copy_durable_json_object(payload, "failure_payload")
+        portable = copy_durable_json_object(payload, "failure_payload")
     except BaseException:
         return fallback
+    return _redact_and_bound_failure_payload(
+        portable,
+        redactor=resolved_redactor,
+    )
 
 
 def _mark_environment_factory_checkpoint_may_be_committed(
@@ -1268,6 +1343,38 @@ def _environment_factory_release_payload(
         error,
         attribute_name=_ENVIRONMENT_FACTORY_RELEASE_ERROR_ATTRIBUTE,
     )
+
+
+def _redact_and_bound_failure_payload(
+    value: dict[str, Any],
+    *,
+    redactor: SecretRedactor,
+) -> dict[str, Any]:
+    redacted = redactor.redact_json_values(
+        value,
+        preserve_string_fields={"outcome", "phase"},
+    )
+    if type(redacted) is not dict:
+        raise AssertionError("Failure payload redaction returned a non-object.")
+
+    def bound(item: Any) -> Any:
+        if type(item) is str:
+            return redactor.redact_text_bounded(
+                item,
+                max_bytes=FAILURE_DIAGNOSTIC_TEXT_MAX_BYTES,
+            )
+        if item is None or type(item) in {bool, int, float}:
+            return item
+        if type(item) is list:
+            return [bound(child) for child in item]
+        if type(item) is dict:
+            return {key: bound(child) for key, child in item.items()}
+        raise AssertionError("Failure payload contains non-JSON-compatible data.")
+
+    bounded = bound(redacted)
+    if type(bounded) is not dict:
+        raise AssertionError("Failure payload bounding returned a non-object.")
+    return bounded
 
 
 def _copy_event_with_payload(event: Event, payload: dict[str, Any]) -> Event:
@@ -1473,7 +1580,11 @@ async def _release_unclaimed_factory_result(
     *,
     action: EnvironmentFactoryReleaseAction,
     original_error: BaseException,
+    redactor: SecretRedactor | None = None,
 ) -> dict[str, Any]:
+    if redactor is not None and not isinstance(redactor, SecretRedactor):
+        raise TypeError("redactor must be a SecretRedactor.")
+    resolved_redactor = redactor or SecretRedactor()
     payload: dict[str, Any] = {
         "action": action.value,
         "callback_provided": result.release is not None,
@@ -1482,7 +1593,11 @@ async def _release_unclaimed_factory_result(
         release = result.release
 
         async def run_release() -> None:
-            await release(action)
+            await environment_operation_boundary.await_environment_operation(
+                lambda: release(action),
+                operation_name="Environment factory release",
+                redactor=resolved_redactor,
+            )
 
         release_task = asyncio.create_task(run_release())
         try:
@@ -1497,6 +1612,7 @@ async def _release_unclaimed_factory_result(
                 nonportable_message=(
                     "Environment factory release failed with a non-portable diagnostic."
                 ),
+                redactor=resolved_redactor,
             )
             payload.update(
                 {
@@ -1554,7 +1670,11 @@ async def _release_unclaimed_factory_result(
         runner = result.environment.runner
         if runner is not None:
             try:
-                await runner.close()
+                await environment_operation_boundary.await_environment_operation(
+                    runner.close,
+                    operation_name="Environment runner fallback release",
+                    redactor=resolved_redactor,
+                )
             except Exception as cleanup_error:
                 cleanup_errors.append(("runner", cleanup_error))
 
@@ -1562,9 +1682,17 @@ async def _release_unclaimed_factory_result(
         close = getattr(binding, "close", None)
         if callable(close):
             try:
-                close_result = close()
-                if inspect.isawaitable(close_result):
-                    await close_result
+
+                async def close_binding() -> None:
+                    close_result = close()
+                    if inspect.isawaitable(close_result):
+                        await close_result
+
+                await environment_operation_boundary.await_environment_operation(
+                    close_binding,
+                    operation_name="Environment binding fallback release",
+                    redactor=resolved_redactor,
+                )
             except Exception as cleanup_error:
                 cleanup_errors.append(("binding", cleanup_error))
 
@@ -1581,6 +1709,7 @@ async def _release_unclaimed_factory_result(
             nonportable_message=(
                 "Environment factory fallback release failed with a non-portable diagnostic."
             ),
+            redactor=resolved_redactor,
         )
         payload.update(
             {
@@ -1602,7 +1731,10 @@ async def _release_unclaimed_factory_result(
         raise asyncio.CancelledError()
     payload["completed"] = not cleanup_errors
     if cleanup_errors:
-        diagnostics = [(phase, exception_diagnostic(error)) for phase, error in cleanup_errors]
+        diagnostics = [
+            (phase, exception_diagnostic(error, redactor=resolved_redactor))
+            for phase, error in cleanup_errors
+        ]
         details = bound_diagnostic_text(
             "; ".join(
                 f"{phase}: {diagnostic.error_type}: {diagnostic.message}"

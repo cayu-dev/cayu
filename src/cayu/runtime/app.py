@@ -58,7 +58,9 @@ from cayu.providers import (
     ModelProvider,
     copy_usage_dialect,
 )
+from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime._diagnostics import ExceptionDiagnostic, exception_diagnostic
 from cayu.runtime._environment_lifecycle import (
     EnvironmentLifecycle,
 )
@@ -142,6 +144,7 @@ from cayu.runtime.dispatch import (
     InlineDispatcher,
     copy_dispatch_handle,
     copy_dispatch_request,
+    redact_dispatch_request,
 )
 from cayu.runtime.event_sinks import EventSink
 from cayu.runtime.event_watchers import (
@@ -511,6 +514,7 @@ class CayuApp:
             session_store=self.session_store,
             budget_store=self.budget_store,
             event_sinks=self._event_sinks,
+            secret_redactor=self._secret_redactor,
         )
         self._environment_lifecycle = EnvironmentLifecycle(
             session_store=self.session_store,
@@ -543,6 +547,7 @@ class CayuApp:
             max_file_attachment_bytes=self._max_file_attachment_bytes,
             max_total_file_attachment_bytes=self._max_total_file_attachment_bytes,
             max_file_attachments_per_request=self._max_file_attachments_per_request,
+            secret_redactor=self._secret_redactor,
             checkpoint_transform=(
                 self._environment_lifecycle.checkpoint_transform_preserving_runtime_state
             ),
@@ -611,6 +616,7 @@ class CayuApp:
             release_pending_interruption_cascade_claim=(
                 self._release_pending_interruption_cascade_claim
             ),
+            secret_redactor=self._secret_redactor,
         )
 
         self._session_engine = SessionEngine(
@@ -643,6 +649,41 @@ class CayuApp:
     def redact_json(self, value: Any) -> Any:
         """Return a JSON-compatible value with configured secret values redacted."""
         return self._secret_redactor.redact_json(value)
+
+    def redact_exception_diagnostic(
+        self,
+        error: BaseException,
+        *,
+        empty_message: str,
+        nonportable_message: str,
+    ) -> ExceptionDiagnostic:
+        """Snapshot a dispatch diagnostic with workload secrets removed before bounding."""
+
+        return exception_diagnostic(
+            error,
+            empty_message=empty_message,
+            nonportable_message=nonportable_message,
+            redactor=self._secret_redactor,
+        )
+
+    def redact_dispatch_request(self, request: DispatchRequest) -> DispatchRequest:
+        """Return a durable dispatch request scrubbed with this app's redactor."""
+
+        return redact_dispatch_request(request, redactor=self._secret_redactor)
+
+    def _pending_tool_approval_from_checkpoint(
+        self,
+        checkpoint: dict[str, Any] | None,
+        *,
+        consume_on_rejection: bool = False,
+    ) -> PendingToolApproval | None:
+        """Parse trusted approval state through this app's secret boundary."""
+
+        return approval_support.pending_approval_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=consume_on_rejection,
+        )
 
     def describe(self, *, project_root: str | Path | None = None) -> AppManifest:
         """Return this application's deterministic public manifest.
@@ -1385,6 +1426,12 @@ class CayuApp:
         event reaches the watcher's dead-letter threshold.
         """
         watcher_list = _validate_event_watchers(watchers)
+        for watcher in watcher_list:
+            if self._secret_redactor.redact_text(watcher.name) != watcher.name:
+                raise ValueError(
+                    "Event watcher name contains a workload secret and cannot be "
+                    "used as durable watcher authority."
+                )
         if type(limit) is not int or limit < 1:
             raise ValueError("limit must be an integer greater than or equal to 1.")
 
@@ -1426,6 +1473,7 @@ class CayuApp:
                         should_fetch_next_page = False
                         break
 
+                    watcher_error: str | None = None
                     try:
                         await run_event_watcher_handler(
                             watcher,
@@ -1436,9 +1484,17 @@ class CayuApp:
                             ),
                         )
                     except Exception as exc:
+                        watcher_error = self._secret_redactor.redact_text_bounded(
+                            event_watcher_error_payload(
+                                exc,
+                                redactor=self._secret_redactor,
+                            ),
+                            max_bytes=4096,
+                        )
+                    if watcher_error is not None:
                         delivery = await self.event_watcher_store.mark_failure(
                             claim,
-                            error=event_watcher_error_payload(exc),
+                            error=watcher_error,
                             max_attempts=watcher.max_attempts,
                         )
                         deliveries.append(delivery)
@@ -2294,6 +2350,6 @@ def _validate_event_watchers(watchers: Iterable[EventWatcher]) -> tuple[EventWat
         if type(watcher) is not EventWatcher:
             raise TypeError("watchers must contain EventWatcher instances.")
         if watcher.name in names:
-            raise ValueError(f"Duplicate event watcher name: {watcher.name}")
+            raise ValueError("Duplicate event watcher name.")
         names.add(watcher.name)
     return tuple(watcher_list)

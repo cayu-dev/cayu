@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Any
 
 import pytest
+from tests.provider_traceback_assertions import is_cayu_source_filename
 
 from cayu import (
     AgentSpec,
     AlwaysRequireApprovalToolPolicy,
     CayuApp,
     EventType,
+    InMemoryTaskStore,
     Message,
     ModelStreamEvent,
     PendingActionQuery,
@@ -35,11 +38,16 @@ from cayu import (
 )
 from cayu.runtime import SessionStatus
 from cayu.runtime.sessions import SessionIdentity
+from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 
-def _build(tmp_path: Path) -> tuple[CayuApp, SQLiteTaskStore]:
+def _build(
+    tmp_path: Path,
+    *,
+    secret_redactor: SecretRedactor | None = None,
+) -> tuple[CayuApp, SQLiteTaskStore]:
     store = SQLiteTaskStore(tmp_path / "tasks.sqlite")
-    app = CayuApp(task_store=store)
+    app = CayuApp(task_store=store, secret_redactor=secret_redactor)
     app.register_provider(
         ScriptedModelProvider(
             [
@@ -238,6 +246,189 @@ def test_run_task_worker_terminalizes_nonportable_handler_failures(
     }
     assert reclaimed == []
     assert second_claim is None
+
+
+def test_run_task_worker_redacts_handler_failure_before_durable_write(tmp_path: Path) -> None:
+    secret = "task-worker-diagnostic-secret-canary"
+    app, store = _build(tmp_path, secret_redactor=SecretRedactor(secret))
+
+    async def fail(_app: CayuApp, _task: Task, _worker_id: str) -> None:
+        raise RuntimeError(f"upstream rejected credential {secret}")
+
+    async def scenario() -> Task | None:
+        created = await store.create_task(TaskCreate(type="job"))
+        await run_task_worker(
+            app,
+            store,
+            fail,
+            worker_id="worker-1",
+            max_tasks=1,
+            poll_interval_s=0.01,
+            reclaim=False,
+        )
+        return await store.load_task(created.id)
+
+    task = asyncio.run(scenario())
+
+    assert task is not None
+    assert task.status == "failed"
+    assert task.error is not None
+    assert secret not in str(task.error)
+    assert REDACTED_SECRET in task.error["message"]
+
+
+def test_run_task_worker_redacts_secret_bearing_exception_type_before_durable_write(
+    tmp_path: Path,
+) -> None:
+    secret = "TaskWorkerSecretTypeCanary"
+    app, store = _build(tmp_path, secret_redactor=SecretRedactor(secret))
+    secret_error_type = type(f"Failure{secret}", (Exception,), {})
+
+    async def fail(_app: CayuApp, _task: Task, _worker_id: str) -> None:
+        raise secret_error_type
+
+    async def scenario() -> Task | None:
+        created = await store.create_task(TaskCreate(type="job"))
+        await run_task_worker(
+            app,
+            store,
+            fail,
+            worker_id="worker-1",
+            max_tasks=1,
+            poll_interval_s=0.01,
+            reclaim=False,
+        )
+        return await store.load_task(created.id)
+
+    task = asyncio.run(scenario())
+
+    assert task is not None
+    assert task.error == {
+        "error": f"Failure{REDACTED_SECRET}",
+        "message": f"Failure{REDACTED_SECRET}: task handler failed",
+    }
+
+
+def test_run_task_worker_continues_after_handler_error_with_broken_stringification(
+    tmp_path: Path,
+) -> None:
+    app, store = _build(tmp_path)
+
+    class BrokenStringError(Exception):
+        def __str__(self) -> str:
+            raise RuntimeError("stringification failed")
+
+    async def fail(_app: CayuApp, _task: Task, _worker_id: str) -> None:
+        raise BrokenStringError
+
+    async def scenario() -> tuple[int, list[Task | None]]:
+        created = [
+            await store.create_task(TaskCreate(type="job")),
+            await store.create_task(TaskCreate(type="job")),
+        ]
+        handled = await run_task_worker(
+            app,
+            store,
+            fail,
+            worker_id="worker-1",
+            query=TaskQuery(type="job"),
+            max_tasks=2,
+            poll_interval_s=0.01,
+            reclaim=False,
+        )
+        return handled, [await store.load_task(task.id) for task in created]
+
+    handled, tasks = asyncio.run(scenario())
+
+    assert handled == 2
+    assert all(task is not None and task.status == "failed" for task in tasks)
+    assert [task.error for task in tasks if task is not None] == [
+        {
+            "error": "BrokenStringError",
+            "message": "BrokenStringError: task handler failed",
+        },
+        {
+            "error": "BrokenStringError",
+            "message": "BrokenStringError: task handler failed",
+        },
+    ]
+
+
+def test_task_worker_cancellation_during_failure_write_does_not_retain_raw_error() -> None:
+    secret = "task-worker-cancelled-publication-secret-canary"
+
+    class BlockingFailureStore(InMemoryTaskStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failure_started = asyncio.Event()
+
+        async def fail_task(
+            self,
+            task_id: str,
+            error: dict[str, Any],
+            *,
+            worker_id: str | None = None,
+        ) -> Task:
+            self.failure_started.set()
+            await asyncio.Event().wait()
+            return await super().fail_task(task_id, error, worker_id=worker_id)
+
+    store = BlockingFailureStore()
+    app = CayuApp(
+        task_store=store,
+        secret_redactor=SecretRedactor(secret),
+        enable_logging=False,
+    )
+
+    async def fail(_app: CayuApp, _task: Task, _worker_id: str) -> None:
+        raise RuntimeError(f"upstream rejected credential {secret}")
+
+    async def scenario() -> tuple[asyncio.CancelledError, int, bool]:
+        await store.create_task(TaskCreate(type="job"))
+        worker_task = asyncio.create_task(
+            run_task_worker(
+                app,
+                store,
+                fail,
+                worker_id="worker-1",
+                max_tasks=1,
+                poll_interval_s=0.01,
+                reclaim=False,
+            )
+        )
+        await store.failure_started.wait()
+        worker_task.cancel("stop worker")
+        cancelling = worker_task.cancelling()
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await worker_task
+        return exc_info.value, cancelling, worker_task.cancelled()
+
+    cancellation, cancelling, cancelled = asyncio.run(scenario())
+
+    assert cancelling == 1
+    assert cancelled is True
+    assert cancellation.args == ("stop worker",)
+    traceback = cancellation.__traceback__
+    while traceback is not None:
+        if is_cayu_source_filename(traceback.tb_frame.f_code.co_filename):
+            assert all(secret not in repr(value) for value in traceback.tb_frame.f_locals.values())
+        traceback = traceback.tb_next
+
+
+def test_run_task_worker_rejects_secret_bearing_worker_authority(tmp_path: Path) -> None:
+    secret = "task-worker-authority-secret-canary"
+    app, store = _build(tmp_path, secret_redactor=SecretRedactor(secret))
+
+    with pytest.raises(ValueError, match="durable task authority"):
+        asyncio.run(
+            run_task_worker(
+                app,
+                store,
+                _run_handler,
+                worker_id=f"worker-{secret}",
+                max_tasks=0,
+            )
+        )
 
 
 def test_run_task_worker_hands_interrupted_session_to_reconstructed_control_plane(

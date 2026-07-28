@@ -12,6 +12,7 @@ from cayu.runners._secrets import (
     merge_secret_env_values,
     normalize_runner_secret_env,
     redact_exec_result,
+    resolved_secret_redactor,
 )
 from cayu.runners._subprocess import (
     SubprocessCommand,
@@ -162,6 +163,7 @@ class LocalRunner(Runner):
         self._ensure_exec_open()
         working_dir = self.resolve_cwd(cwd)
         environment = copy_runner_env(env, inherit_env=self.inherit_env)
+        env = None
         if not self.inherit_env:
             environment = {**_safe_host_env(), **environment}
         resolved_secrets = (
@@ -170,15 +172,21 @@ class LocalRunner(Runner):
             else {}
         )
         environment = merge_secret_env_values(environment, resolved_secrets)
+        invocation_redactor = resolved_secret_redactor(resolved_secrets)
         subprocess_command = _subprocess_command(command)
-        result = await run_subprocess(
+        subprocess_run = run_subprocess(
             subprocess_command,
             cwd=working_dir,
             env=environment,
             timeout_s=timeout_s,
             stdin=stdin,
             output_limit_bytes=output_limit_bytes,
+            output_redactor=invocation_redactor,
         )
+        # Transfer the raw environment into the subprocess coroutine before
+        # crossing an await; this frame must not retain it on cancellation.
+        environment = {}
+        result = await subprocess_run
         return redact_exec_result(result, resolved_secrets)
 
     def resolve_cwd(self, cwd: str | None = None) -> str:

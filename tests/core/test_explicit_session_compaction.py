@@ -7,6 +7,7 @@ import threading
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -57,6 +58,7 @@ from cayu.runtime import (
 from cayu.runtime._run_limits import BudgetReservationLeaseLost
 from cayu.runtime.context import ContextBuildError
 from cayu.storage import SQLiteSessionStore
+from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 
 class RecordingCompactor(ContextCompactor):
@@ -2160,6 +2162,354 @@ def test_compact_session_preserves_transcript_and_replays_original_outcome() -> 
     asyncio.run(run())
 
 
+def test_compact_session_redacts_instructions_before_provider_and_durable_boundaries() -> None:
+    secret = "explicit-compaction-instruction-canary"
+
+    async def run() -> tuple[RecordingCompactor, list[Event], dict[str, object] | None]:
+        store = InMemorySessionStore()
+        compactor = RecordingCompactor()
+        app = CayuApp(
+            session_store=store,
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=compactor,
+                max_user_turns=1,
+                compact_after_messages=100,
+            ),
+        )
+        created = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_compaction_boundary",
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        transcript = [
+            Message.text("user", "old request"),
+            Message.text("assistant", "old answer"),
+            Message.text("user", "current request"),
+        ]
+        await store.append_transcript_messages(created.id, transcript)
+        completed = await store.update_status(created.id, SessionStatus.COMPLETED)
+
+        events = [
+            event
+            async for event in app.compact_session(
+                CompactSessionRequest(
+                    session_id=created.id,
+                    idempotency_key="compact-boundary-1",
+                    expected_run_epoch=completed.run_epoch,
+                    expected_transcript_cursor=len(transcript),
+                    instructions=f"Preserve decisions but never expose {secret}.",
+                )
+            )
+        ]
+        return compactor, events, await store.load_checkpoint(created.id)
+
+    compactor, events, checkpoint = asyncio.run(run())
+
+    assert compactor.requests[0].instructions == (
+        f"Preserve decisions but never expose {REDACTED_SECRET}."
+    )
+    assert secret not in str([event.model_dump(mode="json") for event in events])
+    assert secret not in str(checkpoint)
+
+
+def test_compact_session_rejects_secret_policy_checkpoint_before_publication() -> None:
+    from cayu.runtime.context import ContextBuildResult
+
+    secret = "explicit-policy-checkpoint-secret-canary"
+
+    class SecretCheckpointPolicy(CheckpointCompactionContextPolicy):
+        async def build_with_checkpoint(
+            self,
+            request: ContextRequest,
+            *,
+            checkpoint: dict[str, Any] | None,
+        ) -> ContextBuildResult:
+            del checkpoint
+            return ContextBuildResult(
+                messages=[Message.text("assistant", f"unsafe result {secret}")],
+                checkpoint={"context_compaction": {"summary": secret}},
+                checkpoint_event_payload={
+                    "compacted_transcript_cursor": len(request.messages),
+                    "custom_detail": secret,
+                },
+            )
+
+    async def run() -> tuple[
+        ValueError,
+        list[Event],
+        dict[str, object] | None,
+        list[Event],
+    ]:
+        store = InMemorySessionStore()
+        app = CayuApp(
+            session_store=store,
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=SecretCheckpointPolicy(
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+        created = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_explicit_secret_checkpoint",
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        transcript = [
+            Message.text("user", "old request"),
+            Message.text("assistant", "old answer"),
+            Message.text("user", "current request"),
+        ]
+        await store.append_transcript_messages(created.id, transcript)
+        completed = await store.update_status(created.id, SessionStatus.COMPLETED)
+        observed: list[Event] = []
+        with pytest.raises(ValueError, match="contains a workload secret") as exc_info:
+            async for event in app.compact_session(
+                CompactSessionRequest(
+                    session_id=created.id,
+                    idempotency_key="secret-checkpoint",
+                    expected_run_epoch=completed.run_epoch,
+                    expected_transcript_cursor=len(transcript),
+                )
+            ):
+                observed.append(event)
+        return (
+            exc_info.value,
+            observed,
+            await store.load_checkpoint(created.id),
+            await store.load_events(created.id),
+        )
+
+    error, observed, checkpoint, durable_events = asyncio.run(run())
+
+    assert all(event.type is not EventType.SESSION_CHECKPOINTED for event in observed)
+    assert secret not in repr(observed)
+    assert secret not in repr(checkpoint)
+    assert secret not in repr(durable_events)
+    traceback = error.__traceback__
+    while traceback is not None:
+        filename = traceback.tb_frame.f_code.co_filename.replace("\\", "/")
+        if "/src/cayu/" in filename:
+            assert all(secret not in repr(value) for value in traceback.tb_frame.f_locals.values())
+        traceback = traceback.tb_next
+
+
+@pytest.mark.parametrize("secret_location", ["key", "value", "nested_typed_key"])
+def test_compact_session_rejects_secret_checkpoint_event_payload_before_publication(
+    secret_location: str,
+) -> None:
+    from cayu.runtime.context import ContextBuildResult
+
+    secret = (
+        "checkpoint"
+        if secret_location == "nested_typed_key"
+        else "explicit-policy-event-payload-secret-canary"
+    )
+
+    class SecretEventPayloadPolicy(CheckpointCompactionContextPolicy):
+        def __init__(self) -> None:
+            super().__init__(
+                max_user_turns=1,
+                compact_after_messages=1,
+            )
+            self.result: ContextBuildResult | None = None
+
+        async def build_with_checkpoint(
+            self,
+            request: ContextRequest,
+            *,
+            checkpoint: dict[str, Any] | None,
+        ) -> ContextBuildResult:
+            del checkpoint
+            if secret_location == "nested_typed_key":
+                unsafe_payload = {"custom": {"checkpoint": "safe"}}
+            else:
+                unsafe_field = secret if secret_location == "key" else "custom_detail"
+                unsafe_value = "safe" if secret_location == "key" else secret
+                unsafe_payload = {unsafe_field: unsafe_value}
+            self.result = ContextBuildResult(
+                messages=[Message.text("assistant", f"unsafe result {secret}")],
+                checkpoint={"context_compaction": {"summary": "safe summary"}},
+                checkpoint_event_payload={
+                    "compacted_transcript_cursor": len(request.messages),
+                    **unsafe_payload,
+                },
+            )
+            return self.result
+
+    async def run() -> tuple[
+        ValueError,
+        SecretEventPayloadPolicy,
+        dict[str, object] | None,
+        list[Event],
+    ]:
+        store = InMemorySessionStore()
+        app = CayuApp(
+            session_store=store,
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+        policy = SecretEventPayloadPolicy()
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=policy,
+        )
+        created = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=f"sess_explicit_secret_event_{secret_location}",
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        transcript = [
+            Message.text("user", "old request"),
+            Message.text("assistant", "old answer"),
+            Message.text("user", "current request"),
+        ]
+        await store.append_transcript_messages(created.id, transcript)
+        completed = await store.update_status(created.id, SessionStatus.COMPLETED)
+        with pytest.raises(ValueError, match="contains a workload secret") as exc_info:
+            async for _ in app.compact_session(
+                CompactSessionRequest(
+                    session_id=created.id,
+                    idempotency_key=f"secret-event-{secret_location}",
+                    expected_run_epoch=completed.run_epoch,
+                    expected_transcript_cursor=len(transcript),
+                )
+            ):
+                pass
+        return (
+            exc_info.value,
+            policy,
+            await store.load_checkpoint(created.id),
+            await store.load_events(created.id),
+        )
+
+    error, policy, checkpoint, durable_events = asyncio.run(run())
+
+    assert checkpoint == {}
+    assert secret not in repr(durable_events)
+    assert policy.result is not None
+    assert policy.result.messages == []
+    assert policy.result.checkpoint == {}
+    assert policy.result.checkpoint_event_payload == {}
+    if secret_location == "nested_typed_key":
+        return
+    traceback = error.__traceback__
+    while traceback is not None:
+        filename = traceback.tb_frame.f_code.co_filename.replace("\\", "/")
+        if "/src/cayu/" in filename:
+            assert all(secret not in repr(value) for value in traceback.tb_frame.f_locals.values())
+        traceback = traceback.tb_next
+
+
+@pytest.mark.parametrize(
+    "failure_checkpoint",
+    [
+        None,
+        {"context_compaction": {"summary": "safe summary"}},
+    ],
+)
+def test_compact_session_discards_secret_checkpoint_event_payload_from_failure(
+    failure_checkpoint: dict[str, Any] | None,
+) -> None:
+    secret = "explicit-failure-event-payload-secret-canary"
+
+    class FailingCheckpointPolicy(CheckpointCompactionContextPolicy):
+        async def build_with_checkpoint(
+            self,
+            request: ContextRequest,
+            *,
+            checkpoint: dict[str, Any] | None,
+        ):
+            del request, checkpoint
+            raise ContextBuildError(
+                "context build failed",
+                compaction_telemetry=[],
+                checkpoint=failure_checkpoint,
+                checkpoint_event_payload={
+                    "checkpoint": "context_compaction",
+                    "custom_detail": secret,
+                },
+                cause=RuntimeError("safe policy failure"),
+            )
+
+    async def run() -> tuple[ContextBuildError, dict[str, object] | None, list[Event]]:
+        store = InMemorySessionStore()
+        app = CayuApp(
+            session_store=store,
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=FailingCheckpointPolicy(
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+        created = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_explicit_secret_failure_event_payload",
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        transcript = [
+            Message.text("user", "old request"),
+            Message.text("assistant", "old answer"),
+            Message.text("user", "current request"),
+        ]
+        await store.append_transcript_messages(created.id, transcript)
+        completed = await store.update_status(created.id, SessionStatus.COMPLETED)
+
+        with pytest.raises(ContextBuildError) as exc_info:
+            async for _event in app.compact_session(
+                CompactSessionRequest(
+                    session_id=created.id,
+                    idempotency_key="secret-failure-event-payload",
+                    expected_run_epoch=completed.run_epoch,
+                    expected_transcript_cursor=len(transcript),
+                )
+            ):
+                pass
+        return (
+            exc_info.value,
+            await store.load_checkpoint(created.id),
+            await store.load_events(created.id),
+        )
+
+    error, checkpoint, durable_events = asyncio.run(run())
+
+    assert error.checkpoint is None
+    assert error.checkpoint_event_payload is None
+    assert secret not in repr(error.__dict__)
+    traceback = error.__traceback__
+    while traceback is not None:
+        filename = traceback.tb_frame.f_code.co_filename.replace("\\", "/")
+        if "/src/cayu/" in filename:
+            assert all(secret not in repr(value) for value in traceback.tb_frame.f_locals.values())
+        traceback = traceback.tb_next
+    assert secret not in repr(checkpoint)
+    assert secret not in repr(durable_events)
+
+
 def test_compact_session_fences_expired_recovery_owner_before_retry() -> None:
     async def run() -> None:
         now = datetime(2026, 7, 18, tzinfo=UTC)
@@ -2352,6 +2702,83 @@ def test_compact_session_replays_original_outcome_after_session_advances() -> No
         assert [event.id for event in replay] == [event.id for event in first]
         assert [event.id for event in durable_operation_events] == [event.id for event in first]
         assert len(compactor.requests) == 1
+
+    asyncio.run(run())
+
+
+def test_compact_session_replays_legacy_terminal_record_before_later_pending_state() -> None:
+    from cayu.runtime import _approval_support as approval_support
+    from cayu.runtime.approvals import PendingToolApproval, PendingToolCallApproval
+
+    async def run() -> None:
+        store = InMemorySessionStore()
+        created = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_compact_legacy_replay_pending",
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        completed = await store.update_status(created.id, SessionStatus.COMPLETED)
+        request = CompactSessionRequest(
+            session_id=created.id,
+            idempotency_key="compact-legacy-replay-pending",
+            expected_run_epoch=completed.run_epoch,
+            expected_transcript_cursor=0,
+        )
+        replay_events = [
+            Event(
+                id="legacy-compaction-completed",
+                type=EventType.CONTEXT_COMPACTION_COMPLETED,
+                session_id=created.id,
+            ),
+            Event(
+                id="legacy-session-checkpointed",
+                type=EventType.SESSION_CHECKPOINTED,
+                session_id=created.id,
+            ),
+        ]
+        await store.append_events(created.id, replay_events)
+        pending = PendingToolApproval(
+            approval_id="approval-safe",
+            tool_call_id="call-safe",
+            tool_name="safe-tool",
+            agent_name="assistant",
+            tool_calls=[
+                PendingToolCallApproval(
+                    tool_call_id="call-safe",
+                    tool_name="safe-tool",
+                )
+            ],
+        )
+        await store.transform_checkpoint(
+            created.id,
+            lambda _session, _checkpoint: {
+                "session_operations": {
+                    "version": 1,
+                    "active_operation_id": None,
+                    "records": {
+                        request.idempotency_key: {
+                            "status": "completed",
+                            "request_digest": session_engine_module._compact_session_request_digest(
+                                request
+                            ),
+                            "event_ids": [event.id for event in replay_events],
+                        }
+                    },
+                },
+                approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY: pending.model_dump(
+                    mode="json"
+                ),
+            },
+        )
+        assert await store.load_session_operation(created.id, request.idempotency_key) is None
+        app = CayuApp(session_store=store, enable_logging=False)
+
+        replay = [event async for event in app.compact_session(request)]
+
+        assert [event.id for event in replay] == [event.id for event in replay_events]
 
     asyncio.run(run())
 

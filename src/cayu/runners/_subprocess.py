@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 
 from cayu.runners.base import ExecResult
+from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 # Wall-clock bound for draining captured stdout/stderr after the child has been
 # killed. A daemonizing grandchild can inherit the pipe write ends and keep them
@@ -69,6 +70,7 @@ async def run_subprocess(
     timeout_s: int | None = None,
     stdin: str | None = None,
     output_limit_bytes: int | None = None,
+    output_redactor: SecretRedactor | None = None,
     start_new_session: bool | None = None,
 ) -> ExecResult:
     """Run a subprocess with bounded output, timeout, and cancellation cleanup."""
@@ -78,14 +80,23 @@ async def run_subprocess(
     timeout = validate_timeout(timeout_s)
     standard_input = validate_stdin(stdin)
     output_limit = validate_output_limit(output_limit_bytes)
+    if output_redactor is not None and not isinstance(output_redactor, SecretRedactor):
+        raise TypeError("run_subprocess output_redactor must be a SecretRedactor.")
+    redactor = output_redactor or SecretRedactor()
+    capture_limit = (
+        output_limit + redactor.max_secret_utf8_bytes
+        if output_limit is not None and redactor.has_values
+        else output_limit
+    )
     working_dir = _copy_cwd(cwd)
     environment = copy_runner_env(env, inherit_env=False)
+    env = None
     use_new_session = os.name == "posix" if start_new_session is None else start_new_session
 
     try:
         if command.argv is not None:
             if os.name == "posix":
-                process = await asyncio.create_subprocess_exec(
+                spawn = asyncio.create_subprocess_exec(
                     *command.argv,
                     cwd=working_dir,
                     env=environment,
@@ -95,7 +106,7 @@ async def run_subprocess(
                     start_new_session=use_new_session,
                 )
             else:
-                process = await asyncio.create_subprocess_exec(
+                spawn = asyncio.create_subprocess_exec(
                     *command.argv,
                     cwd=working_dir,
                     env=environment,
@@ -107,7 +118,7 @@ async def run_subprocess(
             if command.shell is None:
                 raise ValueError("Subprocess shell command cannot be None.")
             if os.name == "posix":
-                process = await asyncio.create_subprocess_shell(
+                spawn = asyncio.create_subprocess_shell(
                     command.shell,
                     cwd=working_dir,
                     env=environment,
@@ -117,7 +128,7 @@ async def run_subprocess(
                     start_new_session=use_new_session,
                 )
             else:
-                process = await asyncio.create_subprocess_shell(
+                spawn = asyncio.create_subprocess_shell(
                     command.shell,
                     cwd=working_dir,
                     env=environment,
@@ -125,29 +136,41 @@ async def run_subprocess(
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
+        # The spawn coroutine owns the detached environment now. Drop this
+        # frame's direct reference before cancellation can cross the await.
+        environment = {}
+        process = await spawn
     except FileNotFoundError:
         message = f"Command not found: {command.command_name}"
-        return ExecResult(
-            stderr=message,
-            exit_code=127,
-            stdout_bytes=0,
-            stderr_bytes=len(message.encode("utf-8")),
+        return _redact_and_bound_exec_result(
+            ExecResult(
+                stderr=message,
+                exit_code=127,
+                stdout_bytes=0,
+                stderr_bytes=len(message.encode("utf-8")),
+            ),
+            redactor=redactor,
+            output_limit=output_limit,
         )
     except PermissionError:
         message = f"Command not executable: {command.command_name}"
-        return ExecResult(
-            stderr=message,
-            exit_code=126,
-            stdout_bytes=0,
-            stderr_bytes=len(message.encode("utf-8")),
+        return _redact_and_bound_exec_result(
+            ExecResult(
+                stderr=message,
+                exit_code=126,
+                stdout_bytes=0,
+                stderr_bytes=len(message.encode("utf-8")),
+            ),
+            redactor=redactor,
+            output_limit=output_limit,
         )
 
     input_bytes = standard_input.encode("utf-8") if standard_input is not None else None
     stdout = _CapturedOutput()
     stderr = _CapturedOutput()
     stdin_task = asyncio.create_task(_write_stdin(process, input_bytes))
-    stdout_task = asyncio.create_task(_read_limited(process.stdout, output_limit, stdout))
-    stderr_task = asyncio.create_task(_read_limited(process.stderr, output_limit, stderr))
+    stdout_task = asyncio.create_task(_read_limited(process.stdout, capture_limit, stdout))
+    stderr_task = asyncio.create_task(_read_limited(process.stderr, capture_limit, stderr))
     wait_task = asyncio.create_task(process.wait())
     try:
         await asyncio.wait_for(asyncio.shield(wait_task), timeout=timeout)
@@ -184,17 +207,21 @@ async def run_subprocess(
         )
     else:
         await asyncio.gather(stdout_task, stderr_task)
-    return ExecResult(
-        stdout=stdout.content.decode("utf-8", errors="replace"),
-        stderr=stderr.content.decode("utf-8", errors="replace"),
-        exit_code=process.returncode
-        if process.returncode is not None
-        else (-1 if timed_out else 0),
-        timed_out=timed_out,
-        stdout_truncated=stdout.truncated,
-        stderr_truncated=stderr.truncated,
-        stdout_bytes=stdout.total_bytes,
-        stderr_bytes=stderr.total_bytes,
+    return _redact_and_bound_exec_result(
+        ExecResult(
+            stdout=stdout.content.decode("utf-8", errors="replace"),
+            stderr=stderr.content.decode("utf-8", errors="replace"),
+            exit_code=process.returncode
+            if process.returncode is not None
+            else (-1 if timed_out else 0),
+            timed_out=timed_out,
+            stdout_truncated=stdout.truncated,
+            stderr_truncated=stderr.truncated,
+            stdout_bytes=stdout.total_bytes,
+            stderr_bytes=stderr.total_bytes,
+        ),
+        redactor=redactor,
+        output_limit=output_limit,
     )
 
 
@@ -240,6 +267,70 @@ def validate_output_limit(output_limit_bytes: int | None) -> int | None:
     if output_limit_bytes <= 0:
         raise ValueError("Runner output_limit_bytes must be greater than zero.")
     return output_limit_bytes
+
+
+def _redact_and_bound_exec_result(
+    result: ExecResult,
+    *,
+    redactor: SecretRedactor,
+    output_limit: int | None,
+) -> ExecResult:
+    stdout, stdout_redaction_truncated = _redact_and_bound_output(
+        result.stdout,
+        redactor=redactor,
+        output_limit=output_limit,
+    )
+    stderr, stderr_redaction_truncated = _redact_and_bound_output(
+        result.stderr,
+        redactor=redactor,
+        output_limit=output_limit,
+    )
+    return result.model_copy(
+        update={
+            "stdout": stdout,
+            "stderr": stderr,
+            "stdout_truncated": result.stdout_truncated
+            or stdout_redaction_truncated
+            or (
+                output_limit is not None
+                and result.stdout_bytes is not None
+                and result.stdout_bytes > output_limit
+            ),
+            "stderr_truncated": result.stderr_truncated
+            or stderr_redaction_truncated
+            or (
+                output_limit is not None
+                and result.stderr_bytes is not None
+                and result.stderr_bytes > output_limit
+            ),
+        }
+    )
+
+
+def _redact_and_bound_output(
+    value: str,
+    *,
+    redactor: SecretRedactor,
+    output_limit: int | None,
+) -> tuple[str, bool]:
+    redacted = redactor.redact_text(value)
+    if output_limit is None:
+        return redacted, False
+    encoded = redacted.encode("utf-8", "replace")
+    if len(encoded) <= output_limit:
+        return redacted, False
+
+    marker = REDACTED_SECRET.encode()
+    marker_start = encoded.rfind(marker, 0, output_limit + len(marker))
+    if marker_start >= 0 and marker_start < output_limit < marker_start + len(marker):
+        if len(marker) <= output_limit:
+            retained_prefix = encoded[: output_limit - len(marker)]
+            encoded = retained_prefix + marker
+        else:
+            encoded = marker[:output_limit]
+    else:
+        encoded = encoded[:output_limit]
+    return encoded.decode("utf-8", "ignore"), True
 
 
 def _copy_cwd(cwd: Path | str | None) -> str | None:

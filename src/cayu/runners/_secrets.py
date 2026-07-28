@@ -92,9 +92,7 @@ def redact_exec_result(
 ) -> ExecResult:
     """Scrub resolved secret values from an ExecResult's captured output."""
 
-    if not resolved:
-        return result
-    redactor = SecretRedactor(tuple(resolved.values()))
+    redactor = resolved_secret_redactor(resolved)
     if not redactor.has_values:
         return result
     return result.model_copy(
@@ -103,6 +101,14 @@ def redact_exec_result(
             "stderr": redactor.redact_text(result.stderr),
         }
     )
+
+
+def resolved_secret_redactor(
+    resolved: Mapping[str, ResolvedSecret],
+) -> SecretRedactor:
+    """Build the invocation-scoped redactor without exposing its secret registry."""
+
+    return SecretRedactor(tuple(resolved.values()))
 
 
 @contextmanager
@@ -132,6 +138,9 @@ def runner_env_file(environment: Mapping[str, str]) -> Iterator[str | None]:
                         "cannot contain '=' and neither names nor values may contain newlines."
                     )
                 handle.write(f"{key}={value}\n")
+        # The file now owns the transport representation. Do not keep the raw
+        # mapping alive in this generator while the subprocess is awaited.
+        environment = {}
         yield path
     finally:
         with contextlib.suppress(FileNotFoundError):

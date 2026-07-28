@@ -12,6 +12,33 @@ Core message parts, tool results, events, model requests, session/task stores, c
 
 Runtime APIs copy framework objects at boundaries. User code should not mutate registered specs, request objects, message parts, event payloads, tool results, or provider events and expect those mutations to change already-registered or already-emitted runtime state. Session stores return isolated transcript copies: messages loaded from a store share no mutable payload state with the stored transcript, and messages passed to append cannot rewrite stored history after the fact.
 
+## Workload-secret boundaries
+
+`SecretRedactor` defines the runtime's exact-value workload-secret contract. The
+application redactor applies before event persistence and side-effect fan-out,
+transcript writes, provider requests, task failure storage, runtime logging, and
+OpenTelemetry export. MCP transports additionally build a session redactor from
+resolved secret headers or environment values; MCP tool calls compose that
+adapter redactor with the application redactor before tool-round publication.
+The secret registry itself remains process-local and is never serialized.
+
+MCP results, errors, initialize metadata, instructions, tool schemas,
+annotations, resources, and manifest history are redacted before they become
+model-visible or durable. Raw tool names and resource URIs needed by the
+transport remain in private in-memory mappings; public MCP definitions expose
+only their redacted identities. Runner and MCP output capture retains enough
+overlap to redact a secret that crosses the configured truncation boundary, then
+reapplies the original output bound.
+
+Executable checkpoint data is not rewritten into redaction markers. If known
+workload-secret data appears in pending tool-round, approval, or user-input
+arguments, the runtime rejects the checkpoint before any tool executes.
+Recovery likewise rejects historical checkpoint arguments containing
+`[REDACTED_SECRET]`; a marker is diagnostic data, never an executable argument.
+Workflow structured output may use a process-local raw handoff during one live
+run, but replay fails closed when only a redacted durable value remains instead
+of silently changing the downstream typed value.
+
 ## Application Construction
 
 A Cayu project declares a synchronous, zero-argument application factory. Each

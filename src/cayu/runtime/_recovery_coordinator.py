@@ -106,6 +106,7 @@ from cayu.runtime.stop_policy import RunLimits, StopDecision, copy_run_limits, h
 from cayu.runtime.structured_output import (
     StructuredOutputSpec,
     copy_structured_output_spec,
+    require_secret_free_structured_output_spec,
 )
 from cayu.runtime.structured_output import (
     _require_native_structured_output_support as _require_provider_native_output_support,
@@ -146,12 +147,20 @@ _TOOL_ROUND_RECOVERABLE_SESSION_STATUSES = {
 }
 
 
-def _optional_exception_type_name(error: BaseException | None) -> str:
-    return "Exception" if error is None else exception_diagnostic(error).error_type
+def _optional_exception_type_name(
+    error: BaseException | None,
+    *,
+    redactor: SecretRedactor,
+) -> str:
+    return (
+        "Exception" if error is None else exception_diagnostic(error, redactor=redactor).error_type
+    )
 
 
 def _environment_factory_resolution_error_payload(
     error: BaseException,
+    *,
+    redactor: SecretRedactor,
 ) -> dict[str, Any]:
     """Project one factory reconnect failure for durable recovery records."""
 
@@ -161,6 +170,7 @@ def _environment_factory_resolution_error_payload(
         nonportable_message=(
             "Environment factory resolution failed with a non-portable diagnostic."
         ),
+        redactor=redactor,
     ).payload_fields()
 
 
@@ -670,7 +680,11 @@ class RecoveryCoordinator:
             raise KeyError(f"Session not found: {response.session_id}")
 
         checkpoint = await self._session_store.load_checkpoint(loaded_session.id)
-        pending = pending_user_input_from_checkpoint(checkpoint)
+        pending = pending_user_input_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+        )
         if pending is None:
             raise RuntimeError("Session has no pending user input.")
         if pending.input_id != response.input_id:
@@ -682,6 +696,11 @@ class RecoveryCoordinator:
         effective_structured_output = _effective_user_input_structured_output(
             structured_output=response.structured_output,
             pending=pending,
+        )
+        require_secret_free_structured_output_spec(
+            effective_structured_output,
+            redactor=self._secret_redactor,
+            field_name="UserInputResponse.structured_output",
         )
 
         registered_agent = self._resolve_registered_agent(loaded_session.agent_name)
@@ -737,7 +756,11 @@ class RecoveryCoordinator:
             raise KeyError(f"Session not found: {request.session_id}")
 
         checkpoint = await self._session_store.load_checkpoint(loaded_session.id)
-        pending = pending_user_input_from_checkpoint(checkpoint)
+        pending = pending_user_input_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+        )
         if pending is None:
             raise RuntimeError("Session has no pending user input.")
         if pending.input_id != request.input_id:
@@ -745,6 +768,11 @@ class RecoveryCoordinator:
         effective_structured_output = _effective_user_input_structured_output(
             structured_output=request.structured_output,
             pending=pending,
+        )
+        require_secret_free_structured_output_spec(
+            effective_structured_output,
+            redactor=self._secret_redactor,
+            field_name="UserInputRecoveryRequest.structured_output",
         )
 
         pending_tool_call = approval_support.round_tool_call_for_recovery(
@@ -795,7 +823,11 @@ class RecoveryCoordinator:
             raise KeyError(f"Session not found: {request.session_id}")
 
         checkpoint = await self._session_store.load_checkpoint(loaded_session.id)
-        pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
+        pending_approval = approval_support.pending_approval_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+        )
         if pending_approval is None:
             raise RuntimeError("Session has no pending tool approval.")
         if pending_approval.approval_id != request.approval_id:
@@ -805,6 +837,11 @@ class RecoveryCoordinator:
         effective_structured_output = _effective_approval_structured_output(
             structured_output=request.structured_output,
             pending_approval=pending_approval,
+        )
+        require_secret_free_structured_output_spec(
+            effective_structured_output,
+            redactor=self._secret_redactor,
+            field_name="ToolApprovalRequest.structured_output",
         )
 
         registered_agent = self._resolve_registered_agent(loaded_session.agent_name)
@@ -852,7 +889,11 @@ class RecoveryCoordinator:
             raise KeyError(f"Session not found: {request.session_id}")
 
         checkpoint = await self._session_store.load_checkpoint(loaded_session.id)
-        pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
+        pending_approval = approval_support.pending_approval_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+        )
         if pending_approval is None:
             raise RuntimeError("Session has no pending tool approval.")
         if pending_approval.approval_id != request.approval_id:
@@ -862,6 +903,11 @@ class RecoveryCoordinator:
         effective_structured_output = _effective_approval_structured_output(
             structured_output=request.structured_output,
             pending_approval=pending_approval,
+        )
+        require_secret_free_structured_output_spec(
+            effective_structured_output,
+            redactor=self._secret_redactor,
+            field_name="ToolApprovalRecoveryRequest.structured_output",
         )
 
         pending_tool_call = approval_support.pending_tool_call_for_recovery(
@@ -933,7 +979,11 @@ class RecoveryCoordinator:
             raise KeyError(f"Session not found: {request.session_id}")
 
         checkpoint = await self._session_store.load_checkpoint(loaded_session.id)
-        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+        )
         if pending_round is None:
             raise RuntimeError("Session has no pending tool round.")
         if pending_round.round_id != request.round_id:
@@ -941,6 +991,11 @@ class RecoveryCoordinator:
         effective_structured_output = _effective_tool_round_structured_output(
             structured_output=request.structured_output,
             pending_round=pending_round,
+        )
+        require_secret_free_structured_output_spec(
+            effective_structured_output,
+            redactor=self._secret_redactor,
+            field_name="ToolRoundRecoveryRequest.structured_output",
         )
 
         pending_tool_call = approval_support.round_tool_call_for_recovery(
@@ -1321,7 +1376,10 @@ class RecoveryCoordinator:
                 # Carry the failure so a caller can distinguish "your answer failed, retry" from a
                 # fresh pause (whose interrupted event has no error fields).
                 payload: dict[str, Any] = {
-                    **exception_failure_payload(exc),
+                    **exception_failure_payload(
+                        exc,
+                        redactor=self._secret_redactor,
+                    ),
                     "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
                     "user_input": pending.model_dump(mode="json"),
                 }
@@ -1814,7 +1872,10 @@ class RecoveryCoordinator:
             await self.finalize_abandoned_session_by_id(session.id)
             raise
         except Exception as exc:
-            failure_diagnostic = exception_diagnostic(exc)
+            failure_diagnostic = exception_diagnostic(
+                exc,
+                redactor=self._secret_redactor,
+            )
             if isinstance(exc, approval_support.ToolApprovalManualRecoveryRequired):
                 session = await self._session_store.update_status(
                     session.id,
@@ -1828,7 +1889,10 @@ class RecoveryCoordinator:
                             agent_name=registered_agent.spec.name,
                             environment_name=environment_name,
                             payload={
-                                **exception_failure_payload(exc),
+                                **exception_failure_payload(
+                                    exc,
+                                    redactor=self._secret_redactor,
+                                ),
                                 "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
                                 "approval": pending_approval.model_dump(mode="json"),
                                 "approval_id": pending_approval.approval_id,
@@ -1859,7 +1923,10 @@ class RecoveryCoordinator:
                             agent_name=registered_agent.spec.name,
                             environment_name=environment_name,
                             payload={
-                                **exception_failure_payload(exc),
+                                **exception_failure_payload(
+                                    exc,
+                                    redactor=self._secret_redactor,
+                                ),
                                 "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
                                 "approval": pending_approval.model_dump(mode="json"),
                             },
@@ -1904,12 +1971,18 @@ class RecoveryCoordinator:
                 **exception_failure_payload(
                     exc,
                     diagnostic=failure_diagnostic,
+                    redactor=self._secret_redactor,
                 ),
                 "approval_id": pending_approval.approval_id,
                 "tool_call_id": pending_approval.tool_call_id,
             }
             if task_failure_error is not None:
-                payload.update(task_update_error_payload(task_failure_error))
+                payload.update(
+                    task_update_error_payload(
+                        task_failure_error,
+                        redactor=self._secret_redactor,
+                    )
+                )
             async for event in self._emit_terminal_event_with_hooks(
                 RecoveryTerminalEventRequest(
                     event=Event(
@@ -2104,7 +2177,8 @@ class RecoveryCoordinator:
                                 "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
                                 "user_input": pending.model_dump(mode="json"),
                                 **_environment_factory_resolution_error_payload(
-                                    factory_resolution.error
+                                    factory_resolution.error,
+                                    redactor=self._secret_redactor,
                                 ),
                             },
                         ),
@@ -2224,11 +2298,17 @@ class RecoveryCoordinator:
                     else {
                         "manual_recovery_persistence_unknown": True,
                         "persistence_reconciliation_error_type": (
-                            _optional_exception_type_name(reconciliation_error)
+                            _optional_exception_type_name(
+                                reconciliation_error,
+                                redactor=self._secret_redactor,
+                            )
                         ),
                     }
                 )
-                diagnostic = exception_diagnostic(exc)
+                diagnostic = exception_diagnostic(
+                    exc,
+                    redactor=self._secret_redactor,
+                )
                 try:
                     async for event in self._interrupt_for_resumable_manual_recovery(
                         session=session,
@@ -2414,7 +2494,8 @@ class RecoveryCoordinator:
                                 "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
                                 "approval": pending_approval.model_dump(mode="json"),
                                 **_environment_factory_resolution_error_payload(
-                                    factory_resolution.error
+                                    factory_resolution.error,
+                                    redactor=self._secret_redactor,
                                 ),
                                 "approval_id": pending_approval.approval_id,
                             },
@@ -2533,11 +2614,17 @@ class RecoveryCoordinator:
                     else {
                         "manual_recovery_persistence_unknown": True,
                         "persistence_reconciliation_error_type": (
-                            _optional_exception_type_name(reconciliation_error)
+                            _optional_exception_type_name(
+                                reconciliation_error,
+                                redactor=self._secret_redactor,
+                            )
                         ),
                     }
                 )
-                diagnostic = exception_diagnostic(exc)
+                diagnostic = exception_diagnostic(
+                    exc,
+                    redactor=self._secret_redactor,
+                )
                 try:
                     async for event in self._interrupt_for_resumable_manual_recovery(
                         session=session,
@@ -2663,7 +2750,11 @@ class RecoveryCoordinator:
         session_before_fence: Session | None = None
 
         def require_matching_pending_call(checkpoint: dict[str, Any] | None) -> None:
-            current_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+            current_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+                checkpoint,
+                redactor=self._secret_redactor,
+                consume_on_rejection=True,
+            )
             if current_round is None:
                 raise RuntimeError("Session has no pending tool round.")
             if current_round.round_id != pending_round.round_id:
@@ -3339,7 +3430,10 @@ class RecoveryCoordinator:
                     payload={
                         "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
                         "tool_round_id": pending_round.round_id,
-                        **_environment_factory_resolution_error_payload(factory_resolution.error),
+                        **_environment_factory_resolution_error_payload(
+                            factory_resolution.error,
+                            redactor=self._secret_redactor,
+                        ),
                     },
                 ):
                     yield event
@@ -3503,7 +3597,10 @@ class RecoveryCoordinator:
                             from_statuses={SessionStatus.RUNNING},
                             to_status=SessionStatus.INTERRUPTING,
                         )
-                    diagnostic = exception_diagnostic(exc)
+                    diagnostic = exception_diagnostic(
+                        exc,
+                        redactor=self._secret_redactor,
+                    )
                     async for event in self._interrupt_for_resumable_manual_recovery(
                         session=session,
                         registered_agent=registered_agent,
@@ -3549,11 +3646,17 @@ class RecoveryCoordinator:
                 else {
                     "manual_recovery_persistence_unknown": True,
                     "persistence_reconciliation_error_type": (
-                        _optional_exception_type_name(reconciliation_error)
+                        _optional_exception_type_name(
+                            reconciliation_error,
+                            redactor=self._secret_redactor,
+                        )
                     ),
                 }
             )
-            diagnostic = exception_diagnostic(exc)
+            diagnostic = exception_diagnostic(
+                exc,
+                redactor=self._secret_redactor,
+            )
             async for event in self._interrupt_for_resumable_manual_recovery(
                 session=session,
                 registered_agent=registered_agent,
@@ -3675,10 +3778,14 @@ class RecoveryCoordinator:
             request.tool_outcomes,
             self._secret_redactor,
         )
-        interrupted_results = tool_results.redact_tool_call_outcomes(
-            interrupted_results,
-            self._secret_redactor,
-        )
+        cancellation_redactors = request.cancellation_redactors_by_id or {}
+        interrupted_results = [
+            tool_results.redact_tool_call_outcomes(
+                [outcome],
+                cancellation_redactors.get(outcome.call.id, self._secret_redactor),
+            )[0]
+            for outcome in interrupted_results
+        ]
         if not interrupted_results and not tool_outcomes:
             return
         if not terminal_event_exists:
@@ -3752,7 +3859,11 @@ class RecoveryCoordinator:
     ) -> AsyncGenerator[Event, None]:
         """Repair one durable pending round strictly from recorded evidence."""
         checkpoint = await self._session_store.load_checkpoint(session.id)
-        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+        )
         if pending_round is None:
             return
         environment_name = _environment_name(registered_environment)
@@ -4079,12 +4190,14 @@ class RecoveryCoordinator:
                     exc,
                     empty_message="recovery failed",
                     nonportable_message="Recovery failed with a non-portable diagnostic.",
+                    redactor=self._secret_redactor,
                 )
                 logger.warning(
-                    "Recovery failed for session %s (agent %s): %s",
+                    "Recovery failed for session %s (agent %s): error_type=%s error=%s",
                     session.id,
                     session.agent_name,
-                    exc,
+                    diagnostic.error_type,
+                    diagnostic.message,
                 )
                 try:
                     reloaded = await self._session_store.load(session.id)
@@ -4143,9 +4256,21 @@ class RecoveryCoordinator:
     ) -> IncompleteSessionRecoveryResult:
 
         checkpoint = await self._session_store.load_checkpoint(session.id)
-        pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
-        pending_user_input = pending_user_input_from_checkpoint(checkpoint)
-        pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        pending_approval = approval_support.pending_approval_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+        )
+        pending_user_input = pending_user_input_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+        )
+        pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+        )
         if (
             session.status in _RECOVERY_RESUMABLE_SESSION_STATUSES
             and pending_approval is None
@@ -4791,9 +4916,21 @@ class RecoveryCoordinator:
         actions: list[IncompleteSessionRecoveryAction] = []
         events: list[Event] = []
         checkpoint = await self._session_store.load_checkpoint(session.id)
-        pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
-        pending_user_input = pending_user_input_from_checkpoint(checkpoint)
-        pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        pending_approval = approval_support.pending_approval_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+        )
+        pending_user_input = pending_user_input_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+        )
+        pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+        )
         environment_name = _environment_name(registered_environment)
 
         if inactive_before is not None:
@@ -4864,7 +5001,11 @@ class RecoveryCoordinator:
                 raise
             session = await self._require_session(session.id)
             checkpoint = await self._session_store.load_checkpoint(session.id)
-            pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+            pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+                checkpoint,
+                redactor=self._secret_redactor,
+                consume_on_rejection=True,
+            )
 
         if pending_tool_round is not None:
             transcript = await self._session_store.load_transcript(session.id)
@@ -4879,7 +5020,11 @@ class RecoveryCoordinator:
             session = await self._require_session(session.id)
             checkpoint = await self._session_store.load_checkpoint(session.id)
 
-        pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
+        pending_approval = approval_support.pending_approval_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+        )
         if pending_approval is not None:
             session = await self._finalize_interrupting_for_recovery(
                 session=session,
@@ -4899,7 +5044,11 @@ class RecoveryCoordinator:
                 message="Session has a pending tool approval; resolve it with ToolApprovalRequest.",
             )
 
-        pending_user_input = pending_user_input_from_checkpoint(checkpoint)
+        pending_user_input = pending_user_input_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+        )
         if pending_user_input is not None:
             session = await self._finalize_interrupting_for_recovery(
                 session=session,
@@ -4984,7 +5133,11 @@ class RecoveryCoordinator:
         if checkpoint is None:
             return
         copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
-        current = tool_round_recovery.pending_tool_round_from_checkpoint(copied_checkpoint)
+        current = tool_round_recovery.pending_tool_round_from_checkpoint(
+            copied_checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+        )
         if current is None or current.round_id != pending_round.round_id:
             return
         copied_checkpoint.pop(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY, None)

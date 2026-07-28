@@ -990,6 +990,47 @@ CheckpointTransform = Callable[
     [Session, dict[str, Any] | None],
     dict[str, Any] | None,
 ]
+ForkTranscriptValidator = Callable[[tuple[Message, ...]], bool]
+FORK_TRANSCRIPT_VALIDATION_ERROR = (
+    "Fork transcript contains a workload secret and cannot be copied without "
+    "changing durable conversation history."
+)
+
+
+def fork_transcript_is_accepted(
+    messages: list[Message],
+    validator: ForkTranscriptValidator | None,
+) -> bool:
+    """Require explicit positive validation for the exact transcript being copied."""
+
+    if validator is None:
+        return True
+    # A validator is an external callback. Give it an isolated projection so
+    # mutation cannot alter either the source transcript or the messages that
+    # will be committed to the fork.
+    validation_messages = tuple(detach_message(message) for message in messages)
+    try:
+        accepted = validator(validation_messages)
+    except Exception:
+        return False
+    finally:
+        validation_messages = ()
+    return type(accepted) is bool and accepted
+
+
+def transform_fork_checkpoint(
+    source_session: Session,
+    source_checkpoint: dict[str, Any] | None,
+    transform: CheckpointTransform,
+) -> dict[str, Any] | None:
+    """Apply a fork transform without retaining its raw input on failure."""
+
+    try:
+        return transform(source_session, source_checkpoint)
+    except BaseException:
+        if source_checkpoint is not None:
+            source_checkpoint.clear()
+        raise
 
 
 class SessionOperationPublication(BaseModel):
@@ -2500,6 +2541,28 @@ class SessionStore(ABC):
     ) -> Session:
         """Create a forked session with copied transcript/checkpoint state."""
 
+    async def create_fork_with_transcript_validation(
+        self,
+        *,
+        source_session_id: str,
+        fork: Session,
+        source_statuses: set[SessionStatus],
+        transcript_cursor: int | None,
+        checkpoint_transform: CheckpointTransform | None,
+        expected_source_run_epoch: int,
+        transcript_validator: ForkTranscriptValidator,
+    ) -> Session:
+        """Create a fork after validating the exact transcript inside the copy boundary.
+
+        Custom stores must opt into this safety capability explicitly. The
+        conservative default prevents the runtime from silently falling back to
+        a time-of-check/time-of-use transcript validation.
+        """
+
+        raise NotImplementedError(
+            "This SessionStore does not support atomic fork transcript validation."
+        )
+
     @abstractmethod
     async def load(self, session_id: str) -> Session | None:
         """Load a session by id."""
@@ -3211,6 +3274,48 @@ class InMemorySessionStore(SessionStore):
         checkpoint_transform: CheckpointTransform | None,
         expected_source_run_epoch: int,
     ) -> Session:
+        return await self._create_fork(
+            source_session_id=source_session_id,
+            fork=fork,
+            source_statuses=source_statuses,
+            transcript_cursor=transcript_cursor,
+            checkpoint_transform=checkpoint_transform,
+            expected_source_run_epoch=expected_source_run_epoch,
+            transcript_validator=None,
+        )
+
+    async def create_fork_with_transcript_validation(
+        self,
+        *,
+        source_session_id: str,
+        fork: Session,
+        source_statuses: set[SessionStatus],
+        transcript_cursor: int | None,
+        checkpoint_transform: CheckpointTransform | None,
+        expected_source_run_epoch: int,
+        transcript_validator: ForkTranscriptValidator,
+    ) -> Session:
+        return await self._create_fork(
+            source_session_id=source_session_id,
+            fork=fork,
+            source_statuses=source_statuses,
+            transcript_cursor=transcript_cursor,
+            checkpoint_transform=checkpoint_transform,
+            expected_source_run_epoch=expected_source_run_epoch,
+            transcript_validator=transcript_validator,
+        )
+
+    async def _create_fork(
+        self,
+        *,
+        source_session_id: str,
+        fork: Session,
+        source_statuses: set[SessionStatus],
+        transcript_cursor: int | None,
+        checkpoint_transform: CheckpointTransform | None,
+        expected_source_run_epoch: int,
+        transcript_validator: ForkTranscriptValidator | None,
+    ) -> Session:
         source_session_id, fork, allowed_statuses, transcript_cursor = (
             _prepare_session_fork_request(
                 source_session_id=source_session_id,
@@ -3231,24 +3336,39 @@ class InMemorySessionStore(SessionStore):
                 raise ValueError(f"Session already exists: {fork.id}")
 
             source_transcript = self._transcripts.get(source_session_id, [])
+            source_transcript_length = len(source_transcript)
             # Fork and source transcripts may share message objects: internal
             # transcript lists never escape except through the detaching
             # load/append/query boundaries, so the cheap share stays invisible.
             if transcript_cursor is None:
                 copied_transcript = [copy_message(message) for message in source_transcript]
             else:
-                if transcript_cursor > len(source_transcript):
+                if transcript_cursor > source_transcript_length:
+                    source_transcript = []
                     raise ValueError("transcript_cursor is greater than source transcript length.")
                 copied_transcript = [
                     copy_message(message) for message in source_transcript[:transcript_cursor]
                 ]
+            # A cursor may intentionally exclude legacy secret-bearing suffix
+            # entries. The source store owns those records; this frame does not.
+            source_transcript = []
+            if not fork_transcript_is_accepted(copied_transcript, transcript_validator):
+                copied_transcript.clear()
+                copied_transcript = []
+                raise ValueError(FORK_TRANSCRIPT_VALIDATION_ERROR) from None
             copied_checkpoint = None
             if checkpoint_transform is not None:
-                source_checkpoint = self._checkpoints.get(source_session_id)
-                copied_checkpoint = checkpoint_transform(
-                    source_session.model_copy(deep=True),
-                    None if source_checkpoint is None else deepcopy(source_checkpoint),
+                stored_checkpoint = self._checkpoints.get(source_session_id)
+                checkpoint_input = (
+                    None if stored_checkpoint is None else deepcopy(stored_checkpoint)
                 )
+                stored_checkpoint = None
+                copied_checkpoint = transform_fork_checkpoint(
+                    source_session.model_copy(deep=True),
+                    checkpoint_input,
+                    checkpoint_transform,
+                )
+                checkpoint_input = None
                 if copied_checkpoint is not None:
                     copied_checkpoint = copy_durable_json_object(
                         copied_checkpoint,

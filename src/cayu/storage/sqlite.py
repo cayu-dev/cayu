@@ -26,6 +26,7 @@ from cayu.runtime.aggregates import EXACT_AGGREGATE, UsageRollupStoreResult
 from cayu.runtime.approvals import ResolutionActor, resolution_actor_payload
 from cayu.runtime.sessions import (
     DELETE_BLOCKED_SESSION_STATUSES,
+    FORK_TRANSCRIPT_VALIDATION_ERROR,
     MAX_PENDING_ACTION_RESULT_BYTES,
     MAX_PENDING_ACTION_TOOL_CALLS,
     SESSION_INSPECTION_LABEL_LIMIT,
@@ -36,6 +37,7 @@ from cayu.runtime.sessions import (
     EventQuery,
     EventRecord,
     EventSummary,
+    ForkTranscriptValidator,
     McpManifestBaseline,
     McpManifestBaselineLoadResult,
     McpManifestPublicationResult,
@@ -106,10 +108,12 @@ from cayu.runtime.sessions import (
     encode_session_cursor,
     enforce_pending_action_result_size,
     filter_transcript_records,
+    fork_transcript_is_accepted,
     replace_session_user_metadata,
     session_next_cursor,
     session_outcome,
     session_query_from_aggregate_filter,
+    transform_fork_checkpoint,
     validate_persisted_event_side_effect_error,
 )
 from cayu.runtime.tasks import (
@@ -735,6 +739,48 @@ class SQLiteSessionStore(SessionStore):
         checkpoint_transform: CheckpointTransform | None,
         expected_source_run_epoch: int,
     ) -> Session:
+        return await self._create_fork(
+            source_session_id=source_session_id,
+            fork=fork,
+            source_statuses=source_statuses,
+            transcript_cursor=transcript_cursor,
+            checkpoint_transform=checkpoint_transform,
+            expected_source_run_epoch=expected_source_run_epoch,
+            transcript_validator=None,
+        )
+
+    async def create_fork_with_transcript_validation(
+        self,
+        *,
+        source_session_id: str,
+        fork: Session,
+        source_statuses: set[SessionStatus],
+        transcript_cursor: int | None,
+        checkpoint_transform: CheckpointTransform | None,
+        expected_source_run_epoch: int,
+        transcript_validator: ForkTranscriptValidator,
+    ) -> Session:
+        return await self._create_fork(
+            source_session_id=source_session_id,
+            fork=fork,
+            source_statuses=source_statuses,
+            transcript_cursor=transcript_cursor,
+            checkpoint_transform=checkpoint_transform,
+            expected_source_run_epoch=expected_source_run_epoch,
+            transcript_validator=transcript_validator,
+        )
+
+    async def _create_fork(
+        self,
+        *,
+        source_session_id: str,
+        fork: Session,
+        source_statuses: set[SessionStatus],
+        transcript_cursor: int | None,
+        checkpoint_transform: CheckpointTransform | None,
+        expected_source_run_epoch: int,
+        transcript_validator: ForkTranscriptValidator | None,
+    ) -> Session:
         source_session_id, fork, allowed_statuses, transcript_cursor = (
             _prepare_session_fork_request(
                 source_session_id=source_session_id,
@@ -763,25 +809,40 @@ class SQLiteSessionStore(SessionStore):
                     """,
                     (source_session_id,),
                 ).fetchall()
+                transcript_row_count = len(transcript_rows)
                 if transcript_cursor is None:
+                    selected_transcript_rows = transcript_rows
+                    transcript_rows = []
                     copied_messages = [
-                        Message(**json.loads(row["message_json"])) for row in transcript_rows
+                        Message(**json.loads(row["message_json"]))
+                        for row in selected_transcript_rows
                     ]
                 else:
-                    if transcript_cursor > len(transcript_rows):
+                    if transcript_cursor > transcript_row_count:
+                        transcript_rows.clear()
                         raise ValueError(
                             "transcript_cursor is greater than source transcript length."
                         )
+                    selected_transcript_rows = transcript_rows[:transcript_cursor]
+                    transcript_rows.clear()
                     copied_messages = [
                         Message(**json.loads(row["message_json"]))
-                        for row in transcript_rows[:transcript_cursor]
+                        for row in selected_transcript_rows
                     ]
+                selected_transcript_rows.clear()
+                if not fork_transcript_is_accepted(copied_messages, transcript_validator):
+                    copied_messages.clear()
+                    copied_messages = []
+                    raise ValueError(FORK_TRANSCRIPT_VALIDATION_ERROR) from None
                 copied_checkpoint = None
                 if checkpoint_transform is not None:
-                    copied_checkpoint = checkpoint_transform(
+                    checkpoint_input = self._load_checkpoint_unlocked(source_session_id)
+                    copied_checkpoint = transform_fork_checkpoint(
                         source_session,
-                        self._load_checkpoint_unlocked(source_session_id),
+                        checkpoint_input,
+                        checkpoint_transform,
                     )
+                    checkpoint_input = None
                     if copied_checkpoint is not None:
                         copied_checkpoint = copy_durable_json_object(
                             copied_checkpoint,

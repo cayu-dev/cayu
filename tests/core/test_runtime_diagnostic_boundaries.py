@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 import pytest
+from tests.core._workload_secret_support import FakeProvider
 
 from cayu import (
     AgentSpec,
@@ -42,6 +45,7 @@ from cayu._exception_groups import (
     exception_tree_contains,
     set_exception_cause,
 )
+from cayu.environments import EnvironmentFactory, EnvironmentFactoryRequest
 from cayu.runtime._binding_cleanup import (
     BindingCleanupStatus,
     BindingFinalizeFailure,
@@ -57,16 +61,41 @@ from cayu.runtime._binding_cleanup import (
     is_containable_cleanup_error,
     record_binding_cleanup_failure,
 )
+from cayu.runtime._diagnostics import MAX_DIAGNOSTIC_UTF8_BYTES
 from cayu.runtime._environment_lifecycle import (
+    FAILURE_DIAGNOSTIC_TEXT_MAX_BYTES,
     _release_unclaimed_factory_result,
     exception_failure_payload,
 )
 from cayu.runtime._tool_round_executor import _parallel_tool_round_exception
 from cayu.runtime.egress import _contains_timeout, _split_cleanup_cancellation
+from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 
 async def _collect(app: CayuApp, request: RunRequest) -> list[Event]:
     return [event async for event in app.run(request)]
+
+
+class _RecordingEnvironmentFactory(EnvironmentFactory):
+    def __init__(
+        self,
+        environment: Environment,
+        *,
+        reconnect_metadata: dict[str, Any] | None = None,
+        release: (Callable[[EnvironmentFactoryReleaseAction], Awaitable[None]] | None) = None,
+    ) -> None:
+        self.environment = environment
+        self.reconnect_metadata = reconnect_metadata or {}
+        self.release = release
+        self.requests: list[EnvironmentFactoryRequest] = []
+
+    async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
+        self.requests.append(request)
+        return EnvironmentFactoryResult(
+            environment=self.environment,
+            reconnect_metadata=self.reconnect_metadata,
+            release=self.release,
+        )
 
 
 def _deep_group(leaf: BaseException, *, depth: int = 1_500) -> BaseExceptionGroup:
@@ -463,6 +492,207 @@ def test_binding_cleanup_status_corruption_fails_closed_without_erasing_state() 
         "retry_error": "Binding cleanup retry metadata was invalid.",
         "retry_error_type": "RuntimeError",
     }
+
+
+def test_knowledge_failure_redacts_secret_crossing_diagnostic_boundary() -> None:
+    secret = "knowledge-boundary-secret-canary"
+    prefix = "d" * (MAX_DIAGNOSTIC_UTF8_BYTES - len(secret.encode("utf-8")) // 2)
+
+    class FailingKnowledgeStore(InMemoryKnowledgeStore):
+        async def search(self, query):
+            del query
+            raise RuntimeError(prefix + secret)
+
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.text_delta("answered without injected knowledge"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(
+        secret_redactor=SecretRedactor(secret),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            knowledge_store=FailingKnowledgeStore(),
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=KnowledgeInjectionPolicy(fail_open=True),
+    )
+
+    events = asyncio.run(
+        _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_knowledge_boundary_redaction",
+                messages=[Message.text("user", "search")],
+            ),
+        )
+    )
+
+    failed_event = next(
+        event for event in events if event.type == EventType.KNOWLEDGE_SEARCH_FAILED
+    )
+    rendered = str(failed_event.payload)
+    assert secret not in rendered
+    assert secret[: len(secret) // 2] not in rendered
+    assert len(failed_event.payload["error"].encode("utf-8")) <= MAX_DIAGNOSTIC_UTF8_BYTES
+    assert len(provider.requests) == 1
+
+
+@pytest.mark.parametrize("failure_kind", ["factory", "binding"])
+def test_cayu_app_redacts_environment_setup_failure_payloads(failure_kind: str) -> None:
+    secret = f"environment-{failure_kind}-boundary-canary"
+
+    class SecretFailingFactory(_RecordingEnvironmentFactory):
+        async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
+            self.requests.append(request)
+            raise RuntimeError(f"factory failed with {secret}")
+
+    class SecretFailingBinding(WorkspaceBinding):
+        async def bind(self, workspace, runner, **kwargs):  # type: ignore[no-untyped-def]
+            raise RuntimeError(f"binding failed with {secret}")
+
+        async def finalize(self, bound, *, outcome=None, metadata=None):  # type: ignore[no-untyped-def]
+            raise AssertionError("finalize should not run")
+
+    async def run() -> tuple[list[Event], list[Event]]:
+        store = InMemorySessionStore()
+        app = CayuApp(
+            session_store=store,
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+        app.register_provider(FakeProvider([]), default=True)
+        if failure_kind == "factory":
+            app.register_environment_factory(
+                EnvironmentSpec(name="dynamic"),
+                SecretFailingFactory(Environment(EnvironmentSpec(name="dynamic"))),
+                default=True,
+            )
+        else:
+            app.register_environment(
+                Environment(
+                    EnvironmentSpec(name="local"),
+                    binding=SecretFailingBinding(),
+                ),
+                default=True,
+            )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        session_id = f"sess_environment_{failure_kind}_redaction"
+        emitted = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        return emitted, await store.load_events(session_id)
+
+    emitted, persisted = asyncio.run(run())
+    serialized = str([event.model_dump(mode="json") for event in [*emitted, *persisted]])
+    assert secret not in serialized
+    assert REDACTED_SECRET in serialized
+
+
+def test_cayu_app_rejects_secret_bearing_factory_reconnect_metadata_before_checkpoint() -> None:
+    secret = "factory-reconnect-boundary-canary"
+
+    async def run():
+        release_actions: list[EnvironmentFactoryReleaseAction] = []
+
+        async def release(action: EnvironmentFactoryReleaseAction) -> None:
+            release_actions.append(action)
+
+        store = InMemorySessionStore()
+        factory = _RecordingEnvironmentFactory(
+            Environment(EnvironmentSpec(name="dynamic")),
+            reconnect_metadata={"allocation_id": f"sandbox-{secret}"},
+            release=release,
+        )
+        provider = FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})])
+        app = CayuApp(
+            session_store=store,
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_factory_reconnect_redaction",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        return (
+            events,
+            await store.load_checkpoint("sess_factory_reconnect_redaction"),
+            release_actions,
+            provider.requests,
+        )
+
+    events, checkpoint, release_actions, provider_requests = asyncio.run(run())
+
+    assert events[-1].type is EventType.SESSION_FAILED
+    assert secret not in str([event.model_dump(mode="json") for event in events])
+    assert secret not in str(checkpoint)
+    assert release_actions == [EnvironmentFactoryReleaseAction.DISCARD]
+    assert provider_requests == []
+
+
+def test_cayu_app_redacts_and_bounds_task_store_failure_details() -> None:
+    secret = "task-store-failure-canary"
+    error_message = f"provider rejected {secret} " + ("x" * 5000)
+    session_store = InMemorySessionStore()
+    task_store = InMemoryTaskStore()
+    provider = FakeProvider([ModelStreamEvent.error(error_message)])
+
+    async def run():
+        await task_store.create_task(TaskCreate(task_id="task_redacted_failure", type="respond"))
+        app = CayuApp(
+            session_store=session_store,
+            task_store=task_store,
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        events = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_task_redacted_failure",
+                task_id="task_redacted_failure",
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+        return events, await task_store.load_task("task_redacted_failure")
+
+    events, task = asyncio.run(run())
+
+    assert task is not None
+    assert task.status is TaskStatus.FAILED
+    assert task.error is not None
+    assert secret not in str(task.error)
+    assert REDACTED_SECRET in task.error["message"]
+    assert len(task.error["message"].encode()) <= FAILURE_DIAGNOSTIC_TEXT_MAX_BYTES
+    assert secret not in str([event.model_dump(mode="json") for event in events])
 
 
 @pytest.mark.parametrize(

@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
@@ -21,7 +21,8 @@ from cayu._validation import (
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, detach_message
 from cayu.core.thinking import ThinkingConfig
-from cayu.runtime._diagnostics import exception_diagnostic
+from cayu.runtime._diagnostics import ExceptionDiagnostic
+from cayu.runtime._message_redaction import redact_message_for_boundary
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
@@ -31,10 +32,16 @@ from cayu.runtime.sessions import (
     SessionStatusConflict,
 )
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
-from cayu.runtime.structured_output import StructuredOutputSpec, copy_structured_output_spec
+from cayu.runtime.structured_output import (
+    StructuredOutputSpec,
+    copy_structured_output_spec,
+    require_secret_free_structured_output_spec,
+)
 from cayu.runtime.tasks import TaskClaimLost, TaskCreate, TaskOrder, TaskQuery, TaskStore
+from cayu.vaults import SecretRedactor
 
 logger = logging.getLogger(__name__)
+_DISPATCH_DIAGNOSTIC_MAX_BYTES = 4096
 
 
 class DispatchStatus(StrEnum):
@@ -145,6 +152,25 @@ class DispatchRuntime(Protocol):
         """Run dispatched work inline and stream runtime events."""
 
 
+class _DurableDispatchRuntime(DispatchRuntime, Protocol):
+    """Runtime capabilities required before dispatch data becomes durable."""
+
+    def redact_dispatch_request(self, request: DispatchRequest) -> DispatchRequest:
+        """Return a request safe to cross a durable dispatch boundary."""
+
+    def redact_json(self, value: Any) -> Any:
+        """Return a JSON-compatible value safe for durable publication."""
+
+    def redact_exception_diagnostic(
+        self,
+        error: BaseException,
+        *,
+        empty_message: str,
+        nonportable_message: str,
+    ) -> ExceptionDiagnostic:
+        """Snapshot an exception without exposing workload secrets."""
+
+
 class Dispatcher(ABC):
     """Execution backend for dispatched session work."""
 
@@ -245,6 +271,7 @@ class TaskStoreDispatcher(Dispatcher):
         runtime: DispatchRuntime,
         request: DispatchRequest,
     ) -> DispatchHandle:
+        durable_runtime = _require_dispatch_redaction_boundary(runtime)
         if request.loop_policies:
             # loop_policies are process-local callables excluded from JSON serialization, so
             # they cannot cross a durable queue. Reject rather than silently drop them (which
@@ -253,6 +280,7 @@ class TaskStoreDispatcher(Dispatcher):
                 "TaskStoreDispatcher cannot queue a DispatchRequest with loop_policies; "
                 "they are process-local and do not survive serialization."
             )
+        request = _runtime_redact_dispatch_request(durable_runtime, request)
         # No defensive copy here: app.dispatch already copied the request, model_dump produces
         # an isolated snapshot, and the handle reads only immutable string fields.
         # The queue task must be session-unbound (``session_id is None``) to be claimable by
@@ -277,6 +305,7 @@ class TaskStoreDispatcher(Dispatcher):
         Returns ``None`` if the queue is empty, or if the claimed task's payload was
         malformed (in which case the task is failed before returning).
         """
+        durable_runtime = _require_dispatch_redaction_boundary(runtime)
         worker_id = require_clean_nonblank(worker_id, "worker_id")
         task = await self._tasks.claim_task(
             worker_id,
@@ -295,17 +324,23 @@ class TaskStoreDispatcher(Dispatcher):
                 raise ValueError("dispatch task request payload is not an object")
             request = DispatchRequest.model_validate(payload)
         except Exception as exc:
-            diagnostic = exception_diagnostic(
+            diagnostic = _runtime_exception_diagnostic(
+                durable_runtime,
                 exc,
                 empty_message="invalid dispatch request",
                 nonportable_message=(
                     "Invalid dispatch request contained a non-portable diagnostic."
                 ),
             )
+            failure_payload = _safe_runtime_diagnostic_payload(
+                durable_runtime,
+                diagnostic.payload_fields(),
+            )
+            diagnostic = None
             try:
                 await self._tasks.fail_task(
                     task.id,
-                    diagnostic.payload_fields(),
+                    failure_payload,
                     worker_id=worker_id,
                 )
             except TaskClaimLost:
@@ -322,7 +357,7 @@ class TaskStoreDispatcher(Dispatcher):
         # run a second time — and always stops it, including on CancelledError (graceful
         # worker shutdown), which neither except below catches.
         status = DispatchStatus.SUBMITTED
-        heartbeat = asyncio.create_task(self._heartbeat(task.id, worker_id))
+        heartbeat = asyncio.create_task(self._heartbeat(task.id, worker_id, durable_runtime))
         try:
             try:
                 async for event in runtime.dispatch_inline(request):
@@ -333,7 +368,7 @@ class TaskStoreDispatcher(Dispatcher):
                 # After a worker crash, though, the session is stranded in a live status
                 # forever and every re-claim of the reclaimed task would conflict in a
                 # loop; recover a stalled session so the requeued dispatch can proceed.
-                recovered = await self._recover_stalled_session(runtime, request)
+                recovered = await self._recover_stalled_session(durable_runtime, request)
                 try:
                     await self._tasks.release_task(task.id, worker_id)
                 except TaskClaimLost:
@@ -356,7 +391,8 @@ class TaskStoreDispatcher(Dispatcher):
                     recovered_session=recovered,
                 )
             except Exception as exc:
-                diagnostic = exception_diagnostic(
+                diagnostic = _runtime_exception_diagnostic(
+                    durable_runtime,
                     exc,
                     empty_message="dispatch failed",
                     nonportable_message="Dispatch failed with a non-portable diagnostic.",
@@ -366,7 +402,10 @@ class TaskStoreDispatcher(Dispatcher):
                     worker_id,
                     request,
                     DispatchStatus.FAILED,
-                    diagnostic.payload_fields(),
+                    _safe_runtime_diagnostic_payload(
+                        durable_runtime,
+                        diagnostic.payload_fields(),
+                    ),
                 )
             # A run can fail in-band (a SESSION_FAILED event, not an exception); record that as
             # a failed task so failure queries and retries see it, not a COMPLETED one.
@@ -405,13 +444,13 @@ class TaskStoreDispatcher(Dispatcher):
 
     async def _recover_stalled_session(
         self,
-        runtime: DispatchRuntime,
+        runtime: _DurableDispatchRuntime,
         request: DispatchRequest,
     ) -> bool:
         """Best-effort finalization of a session stranded in a live status by a crashed worker.
 
-        Uses the runtime's incomplete-session recovery when available (duck-typed so the
-        ``DispatchRuntime`` protocol stays minimal). The store atomically checks the
+        Uses the runtime's incomplete-session recovery when available while the
+        durable redaction capabilities remain mandatory. The store atomically checks the
         durable activity horizon and increments the run epoch before recovery, so a
         genuinely live run is left alone and an evicted worker cannot write after the
         decision. Returns True when the session was recovered out of its stranded status.
@@ -431,25 +470,36 @@ class TaskStoreDispatcher(Dispatcher):
                     metadata={"dispatch_id": request.dispatch_id},
                 )
             )
-        except Exception:
+        except Exception as exc:
             logger.warning(
-                "dispatch %s could not recover stalled session %s",
+                "dispatch %s could not recover stalled session %s: error_type=%s error=%s",
                 request.dispatch_id,
                 request.session_id,
-                exc_info=True,
+                type(exc).__name__,
+                _safe_runtime_text(runtime, str(exc)),
             )
             return False
         return bool(_STALLED_RECOVERED_ACTIONS & set(result.actions))
 
-    async def _heartbeat(self, task_id: str, worker_id: str) -> None:
+    async def _heartbeat(
+        self,
+        task_id: str,
+        worker_id: str,
+        runtime: _DurableDispatchRuntime,
+    ) -> None:
         """Extend the lease every ``lease_seconds / 3`` until cancelled (best effort)."""
         interval = self._lease_seconds / 3
         while True:
             await asyncio.sleep(interval)
             try:
                 await self._tasks.heartbeat(task_id, worker_id, extend_seconds=self._lease_seconds)
-            except Exception:
-                logger.warning("dispatch heartbeat failed for task %s", task_id, exc_info=True)
+            except Exception as exc:
+                logger.warning(
+                    "dispatch heartbeat failed for task %s: error_type=%s error=%s",
+                    task_id,
+                    type(exc).__name__,
+                    _safe_runtime_text(runtime, str(exc)),
+                )
 
     @staticmethod
     async def _stop_heartbeat(heartbeat: asyncio.Task[None]) -> None:
@@ -467,20 +517,29 @@ class TaskStoreDispatcher(Dispatcher):
         reclaim_every_s: float = 60.0,
     ) -> None:
         """Claim-and-run loop until ``stop`` is set, periodically reclaiming dead leases."""
+        durable_runtime = _require_dispatch_redaction_boundary(runtime)
         loop = asyncio.get_running_loop()
         next_reclaim = loop.time()
         while not stop.is_set():
             if loop.time() >= next_reclaim:
                 try:
                     await self._tasks.reclaim_expired(query=TaskQuery(type=self._task_type))
-                except Exception:
-                    logger.warning("dispatch reclaim_expired failed", exc_info=True)
+                except Exception as exc:
+                    logger.warning(
+                        "dispatch reclaim_expired failed: error_type=%s error=%s",
+                        type(exc).__name__,
+                        _safe_runtime_text(durable_runtime, str(exc)),
+                    )
                 next_reclaim = loop.time() + reclaim_every_s
             try:
                 handle = await self.process_next(runtime, worker_id=worker_id)
-            except Exception:
+            except Exception as exc:
                 # A transient store error on one task must not kill the durable worker loop.
-                logger.exception("dispatch worker failed while processing a task")
+                logger.error(
+                    "dispatch worker failed while processing a task: error_type=%s error=%s",
+                    type(exc).__name__,
+                    _safe_runtime_text(durable_runtime, str(exc)),
+                )
                 handle = None
             # Back off when idle, after a busy-session requeue, or after a lost-lease reclaim —
             # otherwise the just-released/reclaimed task (FIFO-oldest) is re-claimed immediately
@@ -538,6 +597,194 @@ def copy_dispatch_request(request: DispatchRequest) -> DispatchRequest:
         thinking=request.thinking,
         loop_policies=validate_loop_policies(request.loop_policies, field_name="loop_policies"),
     )
+
+
+def redact_dispatch_request(
+    request: DispatchRequest,
+    *,
+    redactor: SecretRedactor,
+) -> DispatchRequest:
+    """Return the executable request shape that is safe to persist in a task queue."""
+
+    request = copy_dispatch_request(request)
+    if not isinstance(redactor, SecretRedactor):
+        raise TypeError("redactor must be a SecretRedactor.")
+    if request.loop_policies:
+        raise ValueError(
+            "A durable DispatchRequest cannot contain loop_policies; they are "
+            "process-local and cannot be persisted without weakening execution policy."
+        )
+    for field_name, value in (
+        ("session_id", request.session_id),
+        ("dispatch_id", request.dispatch_id),
+        ("task_id", request.task_id),
+        ("model", request.model),
+    ):
+        if value is not None and redactor.redact_text(value) != value:
+            raise ValueError(
+                f"DispatchRequest.{field_name} contains a workload secret and cannot "
+                "be used as durable dispatch authority."
+            )
+
+    redactor.require_no_secret_keys(
+        request.metadata,
+        field_name="DispatchRequest.metadata",
+        match_short_substrings=True,
+    )
+    metadata = redactor.redact_json_values(request.metadata)
+    if type(metadata) is not dict:
+        raise AssertionError("Dispatch metadata redaction returned a non-object.")
+
+    require_secret_free_structured_output_spec(
+        request.structured_output,
+        redactor=redactor,
+        field_name="DispatchRequest.structured_output",
+    )
+
+    for field_name, value in (
+        ("limits", request.limits.model_dump(mode="json")),
+        (
+            "budget_limits",
+            [limit.model_dump(mode="json") for limit in request.budget_limits],
+        ),
+        (
+            "retry_policy",
+            (
+                None
+                if request.retry_policy is None
+                else request.retry_policy.model_dump(mode="json")
+            ),
+        ),
+        (
+            "thinking",
+            None if request.thinking is None else request.thinking.model_dump(mode="json"),
+        ),
+    ):
+        if redactor.redact_json_values(value) != value:
+            raise ValueError(
+                f"DispatchRequest.{field_name} contains a workload secret and cannot be "
+                "persisted without changing execution semantics."
+            )
+    for limit_index, limit in enumerate(request.budget_limits):
+        for price_index, price in enumerate(limit.pricing.prices):
+            pricing_context = price.pricing_context
+            if pricing_context is None:
+                continue
+            redactor.require_no_secret_keys(
+                {dimension: None for dimension in pricing_context.dimensions},
+                field_name=(
+                    f"DispatchRequest.budget_limits[{limit_index}].pricing."
+                    f"prices[{price_index}].pricing_context.dimensions"
+                ),
+                match_short_substrings=True,
+            )
+
+    return DispatchRequest(
+        session_id=request.session_id,
+        messages=[
+            redact_message_for_boundary(
+                message,
+                redactor=redactor,
+                field_name="DispatchRequest.messages",
+            )
+            for message in request.messages
+        ],
+        dispatch_id=request.dispatch_id,
+        task_id=request.task_id,
+        model=request.model,
+        metadata=metadata,
+        max_steps=request.max_steps,
+        limits=copy_run_limits(request.limits),
+        budget_limits=copy_request_budget_limits(request.budget_limits),
+        retry_policy=(
+            copy_retry_policy(request.retry_policy) if request.retry_policy is not None else None
+        ),
+        structured_output=request.structured_output,
+        thinking=request.thinking,
+        loop_policies=(),
+    )
+
+
+def _safe_runtime_text(runtime: _DurableDispatchRuntime, value: str) -> str:
+    redacted = _runtime_redact_json(runtime, value)
+    if type(redacted) is not str:
+        raise TypeError("Dispatch runtime string redaction returned a non-string.")
+    encoded = redacted.encode("utf-8", "replace")
+    if len(encoded) <= _DISPATCH_DIAGNOSTIC_MAX_BYTES:
+        return redacted
+    marker = b"...[truncated]"
+    return (encoded[: _DISPATCH_DIAGNOSTIC_MAX_BYTES - len(marker)] + marker).decode(
+        "utf-8",
+        "ignore",
+    )
+
+
+def _runtime_exception_diagnostic(
+    runtime: _DurableDispatchRuntime,
+    error: BaseException,
+    *,
+    empty_message: str,
+    nonportable_message: str,
+) -> ExceptionDiagnostic:
+    """Snapshot a dispatch failure through the runtime's redactor before bounding."""
+
+    diagnostic = runtime.redact_exception_diagnostic(
+        error,
+        empty_message=empty_message,
+        nonportable_message=nonportable_message,
+    )
+    if type(diagnostic) is not ExceptionDiagnostic:
+        raise TypeError(
+            "Dispatch runtime redact_exception_diagnostic must return ExceptionDiagnostic."
+        )
+    return diagnostic
+
+
+def _safe_runtime_diagnostic_payload(
+    runtime: _DurableDispatchRuntime,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    redacted = _runtime_redact_json(runtime, payload)
+    payload.clear()
+    if type(redacted) is not dict:
+        raise TypeError("Dispatch runtime diagnostic redaction returned a non-object.")
+    return {
+        key: _safe_runtime_text(runtime, value) if type(value) is str else value
+        for key, value in redacted.items()
+    }
+
+
+def _runtime_redact_json(runtime: _DurableDispatchRuntime, value: Any) -> Any:
+    return runtime.redact_json(value)
+
+
+def _runtime_redact_dispatch_request(
+    runtime: _DurableDispatchRuntime,
+    request: DispatchRequest,
+) -> DispatchRequest:
+    redacted = runtime.redact_dispatch_request(request)
+    if type(redacted) is not DispatchRequest:
+        raise TypeError("Dispatch runtime request redaction returned an invalid request.")
+    return copy_dispatch_request(redacted)
+
+
+def _require_dispatch_redaction_boundary(
+    runtime: DispatchRuntime,
+) -> _DurableDispatchRuntime:
+    """Reject runtimes that cannot make durable dispatch publication secret-safe."""
+
+    for method_name in (
+        "redact_dispatch_request",
+        "redact_json",
+        "redact_exception_diagnostic",
+    ):
+        try:
+            method = getattr(runtime, method_name)
+        except (AttributeError, TypeError):
+            raise TypeError(f"Dispatch runtime {method_name} must be callable.") from None
+        if not callable(method):
+            raise TypeError(f"Dispatch runtime {method_name} must be callable.")
+    return cast("_DurableDispatchRuntime", runtime)
 
 
 def copy_dispatch_handle(handle: DispatchHandle) -> DispatchHandle:

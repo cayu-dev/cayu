@@ -53,7 +53,9 @@ from cayu import (
 )
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.artifacts import ArtifactListResult, ArtifactMetadata, ArtifactReadResult, ArtifactStore
-from cayu.core.events import Event, EventType
+from cayu.artifacts.attachments import FileAttachment, FileAttachmentKind
+from cayu.core.events import EVENT_ID_MAX_CHARS, Event, EventType
+from cayu.core.messages import FilePart, ProviderStatePart
 from cayu.providers import (
     ModelProvider,
     ModelRequest,
@@ -69,10 +71,13 @@ from cayu.runtime import (
     InMemoryEventSink,
     InMemorySessionStore,
     InterruptSessionRequest,
+    PendingActionIssue,
+    PendingActionIssueCode,
     PendingActionListResult,
     PersistedEventSideEffectStatus,
     RunRequest,
     SessionIdentity,
+    SessionListResult,
     SessionStatus,
     TranscriptDigestCompactor,
 )
@@ -3548,6 +3553,468 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
     stale_body = stale_exact.json()
     assert stale_body["inspected_candidate_count"] == 0
     assert stale_body["total_count"] == 0
+
+
+def test_control_plane_redacts_legacy_session_event_transcript_pending_and_task_data() -> None:
+    secret = "legacy-control-plane-secret-canary"
+    task_store = InMemoryTaskStore()
+    app = CayuApp(
+        task_store=task_store,
+        secret_redactor=SecretRedactor(secret),
+        enable_logging=False,
+    )
+    session_id = "legacy_control_plane_secret"
+
+    async def seed() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[],
+                metadata={secret: f"session value {secret}"},
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.update_status(session_id, SessionStatus.INTERRUPTED)
+        await app.session_store.append_events(
+            session_id,
+            [
+                Event(
+                    id="legacy_secret_approval",
+                    type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                    session_id=session_id,
+                    agent_name="assistant",
+                    tool_name="deploy",
+                    payload={
+                        "approval": {
+                            "approval_id": "legacy_approval",
+                            "tool_name": "deploy",
+                            "arguments": {secret: f"event value {secret}"},
+                        }
+                    },
+                )
+            ],
+        )
+        await app.session_store.append_transcript_messages(
+            session_id,
+            [
+                Message.text("user", f"legacy transcript {secret}"),
+                Message(
+                    role=MessageRole.ASSISTANT,
+                    content=(
+                        ProviderStatePart(
+                            provider="fake",
+                            state={secret: f"provider state {secret}"},
+                        ),
+                    ),
+                ),
+            ],
+        )
+        await app.session_store.checkpoint(
+            session_id,
+            {
+                "pending_tool_approval": {
+                    "approval_id": "legacy_approval",
+                    "tool_call_id": "legacy_call",
+                    "tool_name": "deploy",
+                    "arguments": {secret: f"checkpoint value {secret}"},
+                    "agent_name": "assistant",
+                    "tool_calls": [
+                        {
+                            "tool_call_id": "legacy_call",
+                            "tool_name": "deploy",
+                            "arguments": {secret: f"checkpoint value {secret}"},
+                            "policy_decision": None,
+                            "reason": None,
+                            "metadata": {},
+                            "active_taint_labels": [],
+                        }
+                    ],
+                }
+            },
+        )
+        await task_store.create_task(
+            TaskCreate(
+                task_id="legacy_secret_task",
+                type="review",
+                title=f"legacy task {secret}",
+                description=f"legacy task description {secret}",
+                input={secret: f"task value {secret}"},
+                metadata={secret: f"task metadata {secret}"},
+            )
+        )
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    responses = [
+        client.get(f"/api/sessions/{session_id}"),
+        client.get(f"/api/sessions/{session_id}/events"),
+        client.get(f"/api/sessions/{session_id}/transcript"),
+        client.get(f"/api/pending-actions?session_id={session_id}"),
+        client.get("/api/tasks"),
+        client.get("/api/tasks/legacy_secret_task"),
+    ]
+
+    for response in responses:
+        assert response.status_code == 200
+        rendered = json.dumps(response.json(), sort_keys=True)
+        assert secret not in rendered
+        assert REDACTED_SECRET in rendered
+
+    pending_body = responses[3].json()
+    assert pending_body["actions"][0]["arguments"] == {
+        REDACTED_SECRET: f"checkpoint value {REDACTED_SECRET}"
+    }
+    assert pending_body["next_cursor"] is None
+
+
+def test_control_plane_rejects_secret_bearing_session_cursor_authority() -> None:
+    secret = "cursor-secret-canary"
+    secret_session_id = f"session-{secret}"
+    safe_session_id = "session-safe-cursor-boundary"
+    store = InMemorySessionStore()
+    app = CayuApp(
+        session_store=store,
+        secret_redactor=SecretRedactor(secret),
+        enable_logging=False,
+    )
+
+    async def seed_pending_approval(session_id: str, suffix: str) -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+        await store.append_event(
+            session_id,
+            Event(
+                id=f"approval-event-{suffix}",
+                type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                session_id=session_id,
+                tool_name="deploy",
+                payload={
+                    "approval": {
+                        "approval_id": f"approval-{suffix}",
+                        "tool_name": "deploy",
+                        "arguments": {},
+                    }
+                },
+            ),
+        )
+        await store.checkpoint(
+            session_id,
+            {
+                "pending_tool_approval": {
+                    "approval_id": f"approval-{suffix}",
+                    "tool_call_id": f"call-{suffix}",
+                    "tool_name": "deploy",
+                    "arguments": {},
+                    "agent_name": "assistant",
+                    "tool_calls": [
+                        {
+                            "tool_call_id": f"call-{suffix}",
+                            "tool_name": "deploy",
+                            "arguments": {},
+                            "policy_decision": None,
+                            "reason": None,
+                            "metadata": {},
+                            "active_taint_labels": [],
+                        }
+                    ],
+                }
+            },
+        )
+
+    async def seed() -> None:
+        # Pending-action and session listings sort newest first by default, so
+        # the second record becomes the keyset boundary for a one-item page.
+        await seed_pending_approval(safe_session_id, "safe")
+        await seed_pending_approval(secret_session_id, "legacy")
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    responses = [
+        client.get("/api/sessions", params={"limit": 1}),
+        client.post("/api/sessions/summary", params={"limit": 1}),
+        client.get("/api/pending-actions", params={"limit": 1}),
+    ]
+
+    for response in responses:
+        assert response.status_code == 409
+        rendered = json.dumps(response.json(), sort_keys=True)
+        assert secret not in rendered
+        assert response.json()["detail"] == (
+            "Session pagination cannot continue because its cursor authority "
+            "contains a configured workload secret."
+        )
+
+
+def test_control_plane_preserves_secret_free_opaque_custom_store_cursor() -> None:
+    class OpaqueCursorStore(InMemorySessionStore):
+        async def list_sessions(self, query=None):
+            del query
+            return SessionListResult(
+                sessions=[],
+                next_cursor="custom-store:opaque-page-2",
+                total_count=0,
+            )
+
+    app = CayuApp(
+        session_store=OpaqueCursorStore(),
+        enable_logging=False,
+    )
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    response = client.get("/api/sessions")
+
+    assert response.status_code == 200
+    assert response.json()["next_cursor"] == "custom-store:opaque-page-2"
+
+
+def test_control_plane_short_secret_preserves_typed_response_envelopes() -> None:
+    secret = "a"
+    task_store = InMemoryTaskStore()
+    app = CayuApp(
+        task_store=task_store,
+        secret_redactor=SecretRedactor(secret),
+        enable_logging=False,
+    )
+    session_id = "sess_001"
+
+    async def seed() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="bot",
+                session_id=session_id,
+                messages=[],
+                metadata={"data": "safe"},
+            ),
+            identity=SessionIdentity(provider_name="prov", model="mdl"),
+        )
+        await app.session_store.append_events(
+            session_id,
+            [
+                Event(
+                    id=secret * 100,
+                    type=EventType.SESSION_STARTED,
+                    session_id=session_id,
+                    agent_name="bot",
+                    payload={"data": "safe"},
+                )
+            ],
+        )
+        await app.session_store.append_transcript_messages(
+            session_id,
+            [Message.text("user", "safe")],
+        )
+        await task_store.create_task(
+            TaskCreate(
+                task_id="tsk_001",
+                type="review",
+                title="safe",
+                input={"data": "safe"},
+            )
+        )
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    session_response = client.get(f"/api/sessions/{session_id}")
+    events_response = client.get(f"/api/sessions/{session_id}/events")
+    transcript_response = client.get(f"/api/sessions/{session_id}/transcript")
+    task_list_response = client.get("/api/tasks")
+    task_detail_response = client.get("/api/tasks/tsk_001")
+
+    assert session_response.status_code == 200
+    assert events_response.status_code == 200
+    assert transcript_response.status_code == 200
+    assert task_list_response.status_code == 200
+    assert task_detail_response.status_code == 200
+
+    session_body = session_response.json()
+    assert "agent_name" in session_body
+    assert session_body["status"] == "pending"
+    redacted_untrusted = app.redact_json({"data": "safe"})
+    assert session_body["metadata"] == redacted_untrusted
+
+    event_body = events_response.json()["events"][0]
+    assert event_body["type"] == "session.started"
+    assert len(event_body["id"]) <= EVENT_ID_MAX_CHARS
+    assert "payload" in event_body
+
+    transcript_body = transcript_response.json()["messages"][0]
+    assert transcript_body["role"] == "user"
+    assert transcript_body["content"][0]["type"] == "text"
+
+    assert task_list_response.json()[0]["status"] == "pending"
+    assert task_detail_response.json()["input"] == redacted_untrusted
+
+
+def test_control_plane_short_secret_preserves_file_attachment_protocol() -> None:
+    secret = "image"
+    session_id = "legacy_file_attachment_protocol"
+    store = InMemorySessionStore()
+    app = CayuApp(
+        session_store=store,
+        secret_redactor=SecretRedactor(secret),
+        enable_logging=False,
+    )
+    attachment = FileAttachment(
+        artifact_id="safe-artifact",
+        kind=FileAttachmentKind.IMAGE,
+        filename=f"private-{secret}-file.png",
+        content_type="image/png",
+        size_bytes=12,
+        metadata={f"private-{secret}-key": f"private {secret} value"},
+    )
+
+    async def seed() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.append_transcript_messages(
+            session_id,
+            [
+                Message(
+                    role=MessageRole.USER,
+                    content=(
+                        FilePart(
+                            attachment=attachment.model_dump(mode="json"),
+                        ),
+                    ),
+                )
+            ],
+        )
+
+    asyncio.run(seed())
+    response = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG)).get(
+        f"/api/sessions/{session_id}/transcript"
+    )
+
+    assert response.status_code == 200
+    payload = response.json()["messages"][0]["content"][0]["attachment"]
+    serialized = FileAttachment.model_validate(payload)
+    assert serialized.kind is FileAttachmentKind.IMAGE
+    assert serialized.content_type == "image/png"
+    assert serialized.type == attachment.type
+    assert secret not in serialized.filename
+    assert REDACTED_SECRET in serialized.filename
+    assert secret not in repr(serialized.metadata)
+    assert REDACTED_SECRET in repr(serialized.metadata)
+
+
+def test_pending_action_issue_preserves_typed_timestamp_for_short_secret() -> None:
+    observed_at = datetime(2026, 7, 27, tzinfo=UTC)
+
+    class IssueStore(InMemorySessionStore):
+        async def query_pending_actions(self, query=None):
+            del query
+            return PendingActionListResult(
+                issues=[
+                    PendingActionIssue(
+                        code=PendingActionIssueCode.SOURCE_INVALID,
+                        session_id="safe-session",
+                        agent_name="safe-agent",
+                        status=SessionStatus.INTERRUPTED,
+                        updated_at=observed_at,
+                        detail="safe detail",
+                    )
+                ],
+                total_count=1,
+                inspected_candidate_count=1,
+            )
+
+    app = CayuApp(
+        session_store=IssueStore(),
+        secret_redactor=SecretRedactor("2"),
+        enable_logging=False,
+    )
+    response = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG)).get(
+        "/api/pending-actions"
+    )
+
+    assert response.status_code == 200
+    assert (
+        datetime.fromisoformat(response.json()["issues"][0]["updated_at"].replace("Z", "+00:00"))
+        == observed_at
+    )
+
+
+def test_control_plane_preserves_runtime_timestamps_for_short_secret() -> None:
+    task_store = InMemoryTaskStore()
+    app = CayuApp(
+        task_store=task_store,
+        secret_redactor=SecretRedactor("2"),
+        enable_logging=False,
+    )
+    session_id = "safe-session"
+
+    async def seed() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="bot",
+                session_id=session_id,
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.append_events(
+            session_id,
+            [
+                Event(
+                    id="safe-event",
+                    type=EventType.SESSION_STARTED,
+                    session_id=session_id,
+                )
+            ],
+        )
+        task = await task_store.create_task(
+            TaskCreate(
+                task_id="safe-task",
+                type="review",
+            )
+        )
+        await task_store.claim_task("safe-worker")
+        await task_store.complete_task(
+            task.id,
+            {"status": "done"},
+            worker_id="safe-worker",
+        )
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    session = client.get(f"/api/sessions/{session_id}")
+    event = client.get(f"/api/sessions/{session_id}/events")
+    tasks = client.get("/api/tasks")
+    task = client.get("/api/tasks/safe-task")
+
+    assert session.status_code == 200
+    assert event.status_code == 200
+    assert tasks.status_code == 200
+    assert task.status_code == 200
+    for value in (
+        session.json()["created_at"],
+        session.json()["updated_at"],
+        event.json()["events"][0]["timestamp"],
+        tasks.json()[0]["created_at"],
+        tasks.json()[0]["updated_at"],
+        tasks.json()[0]["completed_at"],
+        task.json()["started_at"],
+    ):
+        assert value is not None
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
 def test_server_pending_actions_uses_one_store_native_query() -> None:

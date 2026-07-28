@@ -140,7 +140,7 @@ def redact_tool_result_event(
 
     if not isinstance(redactor, SecretRedactor):
         raise TypeError("redactor must be a SecretRedactor.")
-    terminal_controls = _runtime_terminal_controls(event.payload)
+    terminal_controls = runtime_terminal_controls(event.payload)
     if not redactor.has_values:
         return event, redact_tool_result(result, redactor)
     result_to_redact = _tool_result_without_terminal_controls(
@@ -192,7 +192,7 @@ def _runtime_tool_event_linkage_fields(payload: dict[str, Any]) -> dict[str, str
     return linkage
 
 
-def _runtime_terminal_controls(payload: dict[str, Any]) -> dict[str, Any]:
+def runtime_terminal_controls(payload: dict[str, Any]) -> dict[str, Any]:
     """Validate runtime controls before exempting them from secret redaction."""
 
     if "terminal_outcome" not in payload:
@@ -242,6 +242,23 @@ def _runtime_terminal_controls(payload: dict[str, Any]) -> dict[str, Any]:
     return controls
 
 
+def runtime_tool_event_controls(
+    payload: dict[str, Any],
+    *,
+    include_terminal_controls: bool = True,
+) -> dict[str, Any]:
+    """Return validated runtime-owned linkage and terminal control fields."""
+
+    if type(payload) is not dict:
+        raise TypeError("Runtime tool event payload must be a dict.")
+    if type(include_terminal_controls) is not bool:
+        raise TypeError("include_terminal_controls must be a bool.")
+    controls: dict[str, Any] = _runtime_tool_event_linkage_fields(payload)
+    if include_terminal_controls:
+        controls.update(runtime_terminal_controls(payload))
+    return copy_durable_json_value(controls, "runtime_tool_event_controls")
+
+
 def _tool_result_without_terminal_controls(
     result: ToolResult,
     *,
@@ -282,20 +299,6 @@ def tool_result_from_payload(payload: dict[str, Any]) -> ToolResult:
     return normalize_tool_result(validate_tool_result(ToolResult(**deepcopy(payload))))
 
 
-def redact_exception_diagnostic(
-    diagnostic: ExceptionDiagnostic,
-    redactor: SecretRedactor,
-) -> ExceptionDiagnostic:
-    if not isinstance(redactor, SecretRedactor):
-        raise TypeError("redactor must be a SecretRedactor.")
-    return ExceptionDiagnostic(
-        message=_bound_diagnostic_text(redactor.redact_text(diagnostic.message)),
-        error_type=diagnostic.error_type,
-        durable_value_error_code=diagnostic.durable_value_error_code,
-        durable_value_error_path=diagnostic.durable_value_error_path,
-    )
-
-
 def exception_message(exc: Exception) -> str:
     """Backward-compatible safe message used by ordinary tool failures."""
 
@@ -307,6 +310,7 @@ def terminal_failure_result(
     terminal_outcome: str,
     effect: ToolEffect,
     message: str,
+    redactor: SecretRedactor,
     raw_evidence: Any = _NO_EVIDENCE,
     diagnostic: ExceptionDiagnostic | None = None,
 ) -> tuple[ToolResult, dict[str, Any]]:
@@ -317,8 +321,13 @@ def terminal_failure_result(
     invalid leaves and custom container implementations are never invoked.
     """
 
+    if not isinstance(redactor, SecretRedactor):
+        raise TypeError("redactor must be a SecretRedactor.")
     terminal_outcome = require_durable_text(terminal_outcome, "terminal_outcome")
-    message = _bound_diagnostic_text(require_durable_text(message, "message"))
+    message = redactor.redact_text_bounded(
+        require_durable_text(message, "message"),
+        max_bytes=_MAX_DIAGNOSTIC_UTF8_BYTES,
+    )
     outcome_unknown = effect is not ToolEffect.NONE
     manual_reconciliation_required = effect is ToolEffect.EXTERNAL
     controls: dict[str, Any] = {
@@ -334,7 +343,7 @@ def terminal_failure_result(
         structured["durable_value_error_code"] = diagnostic.durable_value_error_code
         structured["durable_value_error_path"] = diagnostic.durable_value_error_path
     if raw_evidence is not _NO_EVIDENCE:
-        evidence = portable_result_evidence(raw_evidence)
+        evidence = portable_result_evidence(raw_evidence, redactor=redactor)
         if evidence.included:
             structured["portable_result_evidence"] = evidence.value
         structured["portable_result_evidence_incomplete"] = evidence.incomplete
@@ -363,9 +372,14 @@ def raw_tool_result_evidence(value: Any) -> Any:
     return evidence
 
 
-def portable_result_evidence(value: Any) -> _PortableEvidence:
+def portable_result_evidence(
+    value: Any,
+    *,
+    redactor: SecretRedactor | None = None,
+) -> _PortableEvidence:
     """Project portable siblings from an untrusted result under fixed limits."""
 
+    resolved_redactor = redactor or SecretRedactor()
     state = _SalvageState()
     try:
         salvaged = _salvage_portable_value(
@@ -374,6 +388,7 @@ def portable_result_evidence(value: Any) -> _PortableEvidence:
             depth=0,
             active_container_ids=set(),
             state=state,
+            redactor=resolved_redactor,
         )
     except BaseException:
         return _PortableEvidence(value=None, included=False, incomplete=True)
@@ -397,6 +412,7 @@ def _salvage_portable_value(
     depth: int,
     active_container_ids: set[int],
     state: _SalvageState,
+    redactor: SecretRedactor,
 ) -> Any:
     if state.remaining_nodes <= 0 or max_bytes <= 0:
         state.incomplete = True
@@ -420,6 +436,7 @@ def _salvage_portable_value(
         except Exception:
             state.incomplete = True
             return _OMITTED
+        value = redactor.redact_text(value)
         if json_utf8_size_within_limit(value, max_bytes, ensure_ascii=False):
             return value
         state.incomplete = True
@@ -445,6 +462,7 @@ def _salvage_portable_value(
                 depth=depth,
                 active_container_ids=active_container_ids,
                 state=state,
+                redactor=redactor,
             )
         return _salvage_portable_array(
             value,
@@ -452,6 +470,7 @@ def _salvage_portable_value(
             depth=depth,
             active_container_ids=active_container_ids,
             state=state,
+            redactor=redactor,
         )
     finally:
         active_container_ids.remove(container_id)
@@ -464,6 +483,7 @@ def _salvage_portable_object(
     depth: int,
     active_container_ids: set[int],
     state: _SalvageState,
+    redactor: SecretRedactor,
 ) -> Any:
     if max_bytes < 2:
         state.incomplete = True
@@ -480,6 +500,10 @@ def _salvage_portable_object(
         try:
             require_durable_text(key, "tool_result_evidence key")
         except Exception:
+            state.incomplete = True
+            continue
+        key = redactor.redact_text(key)
+        if key in result:
             state.incomplete = True
             continue
         remaining_for_key = max_bytes - used_bytes - 1 - (1 if result else 0)
@@ -501,6 +525,7 @@ def _salvage_portable_object(
             depth=depth + 1,
             active_container_ids=active_container_ids,
             state=state,
+            redactor=redactor,
         )
         if child is _OMITTED:
             continue
@@ -544,6 +569,7 @@ def _salvage_portable_array(
     depth: int,
     active_container_ids: set[int],
     state: _SalvageState,
+    redactor: SecretRedactor,
 ) -> Any:
     if max_bytes < 2:
         state.incomplete = True
@@ -565,6 +591,7 @@ def _salvage_portable_array(
             depth=depth + 1,
             active_container_ids=active_container_ids,
             state=state,
+            redactor=redactor,
         )
         if child is _OMITTED:
             continue
@@ -609,7 +636,7 @@ def _redact_terminal_result(result: ToolResult, redactor: SecretRedactor) -> Too
     if type(redacted_structured) is not dict:
         raise AssertionError("Terminal tool result redaction returned non-object structured data.")
     if raw_evidence is not _NO_EVIDENCE:
-        evidence = portable_result_evidence(redactor.redact_json(raw_evidence))
+        evidence = portable_result_evidence(raw_evidence, redactor=redactor)
         if evidence.included:
             redacted_structured["portable_result_evidence"] = evidence.value
         redacted_structured["portable_result_evidence_incomplete"] = (

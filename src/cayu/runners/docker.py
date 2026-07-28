@@ -26,6 +26,7 @@ from cayu.runners._secrets import (
     merge_secret_env_values,
     normalize_runner_secret_env,
     redact_exec_result,
+    resolved_secret_redactor,
     runner_env_file,
 )
 from cayu.runners._subprocess import SubprocessCommand, copy_runner_env, run_subprocess
@@ -484,12 +485,14 @@ class DockerRunner(Runner):
             raise TypeError("DockerRunner command must be an ExecCommand.")
         self._ensure_exec_open()
         environment = copy_runner_env(env, inherit_env=False)
+        env = None
         resolved_secrets = (
             await resolve_secret_env(self.secret_env, self.secret_resolver)
             if self.secret_env and self.secret_resolver is not None
             else {}
         )
         environment = merge_secret_env_values(environment, resolved_secrets)
+        invocation_redactor = resolved_secret_redactor(resolved_secrets)
         if self.env_overlay:
             # Applied last: the enforced egress overlay must win over model env.
             environment.update(self.env_overlay)
@@ -502,6 +505,7 @@ class DockerRunner(Runner):
             docker_cli_env_allowlist=self.docker_cli_env_allowlist,
         )
         with runner_env_file(environment) as env_file:
+            environment = {}
             argv = _build_docker_exec_argv(
                 self.docker_path,
                 self.name,
@@ -523,6 +527,7 @@ class DockerRunner(Runner):
                     timeout_s=timeout_s,
                     stdin=stdin,
                     output_limit_bytes=output_limit_bytes,
+                    output_redactor=invocation_redactor,
                 )
             except asyncio.CancelledError as exc:
                 cleanup = await cleanup_runner_command_with_diagnostic(

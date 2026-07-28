@@ -14,6 +14,10 @@ from cayu.core.events import Event, EventType
 from cayu.core.tools import ToolResult
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime._checkpoint_redaction import (
+    durable_value_contains_secret,
+    require_secret_free_durable_object,
+)
 from cayu.runtime.approvals import (
     PendingToolCallApproval,
     copy_pending_tool_call_approval,
@@ -24,7 +28,7 @@ from cayu.runtime.structured_output import (
     copy_structured_output_spec,
 )
 from cayu.runtime.tool_policy import ToolPolicyResult
-from cayu.vaults import SecretRedactor
+from cayu.vaults import SecretRedactor, contains_redacted_secret
 
 PENDING_TOOL_ROUND_CHECKPOINT_KEY = "pending_tool_round"
 _TOOL_ROUND_TERMINAL_EVENT_TYPES = frozenset(
@@ -93,16 +97,57 @@ class PendingToolRound(BaseModel):
 
 def pending_tool_round_from_checkpoint(
     checkpoint: dict[str, Any] | None,
+    *,
+    redactor: SecretRedactor | None = None,
+    consume_on_rejection: bool = False,
 ) -> PendingToolRound | None:
+    if type(consume_on_rejection) is not bool:
+        raise TypeError("consume_on_rejection must be a bool.")
     if checkpoint is None:
         return None
     copied_checkpoint = copy_durable_json_value(checkpoint, "checkpoint")
     value = copied_checkpoint.get(PENDING_TOOL_ROUND_CHECKPOINT_KEY)
     if value is None:
         return None
+    if redactor is not None and durable_value_contains_secret(
+        value,
+        redactor=redactor,
+        path=(PENDING_TOOL_ROUND_CHECKPOINT_KEY,),
+    ):
+        # Public callers retain their input by default. Runtime callers opt in
+        # to consuming their private checkpoint copy so no outer traceback
+        # frame keeps executable secret-bearing state.
+        if type(value) is dict:
+            value.clear()
+        value = None
+        copied_checkpoint.clear()
+        if consume_on_rejection:
+            checkpoint.clear()
+        checkpoint = None
+        raise ValueError(
+            "Pending tool-round checkpoint contains a workload secret and cannot be executed."
+        ) from None
     if type(value) is not dict:
         raise ValueError("Pending tool round checkpoint must be an object.")
-    return PendingToolRound(**value)
+    validation_rejected = False
+    try:
+        pending_round = PendingToolRound(**value)
+    except Exception:
+        if redactor is None:
+            raise
+        validation_rejected = True
+    if validation_rejected:
+        value.clear()
+        value = None
+        copied_checkpoint.clear()
+        if consume_on_rejection:
+            checkpoint.clear()
+        checkpoint = None
+        raise ValueError(
+            "Pending tool-round checkpoint is invalid and cannot be executed."
+        ) from None
+    _require_executable_pending_tool_round(pending_round)
+    return pending_round
 
 
 def checkpoint_with_pending_tool_round(
@@ -119,7 +164,15 @@ def checkpoint_with_pending_tool_round(
     copied_checkpoint = (
         {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
     )
-    if pending_tool_round_from_checkpoint(copied_checkpoint) is not None:
+    resolved_redactor = redactor or SecretRedactor()
+    if (
+        pending_tool_round_from_checkpoint(
+            copied_checkpoint,
+            redactor=resolved_redactor,
+            consume_on_rejection=True,
+        )
+        is not None
+    ):
         raise RuntimeError("Session already has a pending tool round.")
 
     pending_round = PendingToolRound(
@@ -133,8 +186,40 @@ def checkpoint_with_pending_tool_round(
         ),
         structured_output=copy_structured_output_spec(structured_output),
     )
-    copied_checkpoint[PENDING_TOOL_ROUND_CHECKPOINT_KEY] = pending_round.model_dump(mode="json")
+    _require_executable_pending_tool_round(pending_round)
+    pending_payload = pending_round.model_dump(mode="json")
+    serialized_calls = pending_payload.get("tool_calls")
+    if not isinstance(serialized_calls, list):
+        raise AssertionError("Pending tool round serialized tool_calls as a non-list.")
+    for serialized_call in serialized_calls:
+        if type(serialized_call) is not dict:
+            raise AssertionError("Pending tool round serialized a non-object tool call.")
+        reason = serialized_call.get("reason")
+        if type(reason) is str:
+            serialized_call["reason"] = resolved_redactor.redact_text(reason)
+        metadata = serialized_call.get("metadata")
+        if type(metadata) is dict:
+            serialized_call["metadata"] = resolved_redactor.redact_json(metadata)
+    pending_payload = require_secret_free_durable_object(
+        pending_payload,
+        redactor=resolved_redactor,
+        field_name="pending_tool_round",
+        schema_root=PENDING_TOOL_ROUND_CHECKPOINT_KEY,
+    )
+    copied_checkpoint[PENDING_TOOL_ROUND_CHECKPOINT_KEY] = pending_payload
+    copied_checkpoint = require_secret_free_durable_object(
+        copied_checkpoint,
+        redactor=resolved_redactor,
+        field_name="checkpoint",
+    )
     return copied_checkpoint, pending_round
+
+
+def _require_executable_pending_tool_round(pending_round: PendingToolRound) -> None:
+    if any(contains_redacted_secret(call.arguments) for call in pending_round.tool_calls):
+        raise ValueError(
+            "Pending tool-round arguments contain a redaction marker and cannot be executed."
+        )
 
 
 def checkpoint_without_pending_tool_round(

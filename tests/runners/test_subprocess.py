@@ -6,8 +6,10 @@ import sys
 import time
 
 import pytest
+from tests.provider_traceback_assertions import is_cayu_source_filename
 
 import cayu.runners._subprocess as subprocess_module
+from cayu.runners import ExecCommand, LocalRunner
 from cayu.runners._subprocess import (
     SubprocessCommand,
     copy_runner_env,
@@ -88,6 +90,43 @@ def test_run_subprocess_does_not_inherit_parent_env_by_default(tmp_path, monkeyp
 def test_runner_env_copy_rejects_invalid_env() -> None:
     with pytest.raises(TypeError, match="dictionary"):
         copy_runner_env([], inherit_env=False)  # type: ignore[arg-type]
+
+
+def test_local_runner_cancellation_does_not_retain_raw_environment(
+    tmp_path,
+) -> None:
+    secret = "local-runner-traceback-environment-secret-canary"
+
+    async def run() -> asyncio.CancelledError:
+        task = asyncio.create_task(
+            LocalRunner(tmp_path).exec(
+                ExecCommand.process(
+                    sys.executable,
+                    "-c",
+                    "import time; time.sleep(30)",
+                ),
+                env={"WORKLOAD_TOKEN": secret},
+            )
+        )
+        await asyncio.sleep(0.1)
+        task.cancel("operator cancelled")
+        assert task.cancelling() == 1
+        with pytest.raises(asyncio.CancelledError) as excinfo:
+            await task
+        assert task.cancelled()
+        return excinfo.value
+
+    error = asyncio.run(run())
+    traceback = error.__traceback__
+    while traceback is not None:
+        if is_cayu_source_filename(traceback.tb_frame.f_code.co_filename):
+            for name, value in traceback.tb_frame.f_locals.items():
+                assert secret not in repr(value), (
+                    traceback.tb_frame.f_code.co_filename,
+                    traceback.tb_frame.f_code.co_name,
+                    name,
+                )
+        traceback = traceback.tb_next
 
     with pytest.raises(ValueError, match="keys"):
         copy_runner_env({" ": "bad"}, inherit_env=False)

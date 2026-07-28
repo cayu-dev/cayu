@@ -11,6 +11,7 @@ from cayu._validation import (
     require_durable_text,
     safe_durable_value_error_details,
 )
+from cayu.vaults import SecretRedactor
 
 MAX_DIAGNOSTIC_UTF8_BYTES = 4 * 1024
 MAX_DIAGNOSTIC_TYPE_UTF8_BYTES = 128
@@ -135,6 +136,7 @@ def exception_diagnostic(
     empty_message: str = "operation failed",
     nonportable_message: str = "Operation failed with a non-portable diagnostic.",
     preserve_empty_message: bool = False,
+    redactor: SecretRedactor | None = None,
 ) -> ExceptionDiagnostic:
     """Snapshot an exception without carrying rejected text into durability.
 
@@ -143,12 +145,19 @@ def exception_diagnostic(
     retain only their runtime-owned code and path.
     """
 
-    error_type = _safe_exception_type_name(exc)
+    resolved_redactor = redactor or SecretRedactor()
+    error_type = _safe_exception_type_name(
+        exc,
+        redactor=resolved_redactor,
+    )
     durable_error = extract_durable_value_error(exc)
     if durable_error is not None:
         code, path = safe_durable_value_error_details(durable_error)
         return ExceptionDiagnostic(
-            message=bound_diagnostic_text(nonportable_message),
+            message=resolved_redactor.redact_text_bounded(
+                nonportable_message,
+                max_bytes=MAX_DIAGNOSTIC_UTF8_BYTES,
+            ),
             error_type=error_type,
             durable_value_error_code=code,
             durable_value_error_path=path,
@@ -168,7 +177,10 @@ def exception_diagnostic(
             if durable_error is not None:
                 code, path = safe_durable_value_error_details(durable_error)
             return ExceptionDiagnostic(
-                message=bound_diagnostic_text(nonportable_message),
+                message=resolved_redactor.redact_text_bounded(
+                    nonportable_message,
+                    max_bytes=MAX_DIAGNOSTIC_UTF8_BYTES,
+                ),
                 error_type=error_type,
                 durable_value_error_code=code,
                 durable_value_error_path=path,
@@ -179,7 +191,10 @@ def exception_diagnostic(
     else:
         message = f"{error_type}: {empty_message}"
     return ExceptionDiagnostic(
-        message=bound_diagnostic_text(message),
+        message=resolved_redactor.redact_text_bounded(
+            message,
+            max_bytes=MAX_DIAGNOSTIC_UTF8_BYTES,
+        ),
         error_type=error_type,
     )
 
@@ -206,13 +221,18 @@ def task_failure_payload_from_diagnostic(
     return payload
 
 
-def task_update_error_payload(error: BaseException) -> dict[str, Any]:
+def task_update_error_payload(
+    error: BaseException,
+    *,
+    redactor: SecretRedactor | None = None,
+) -> dict[str, Any]:
     """Return prefixed portable evidence for a secondary task-store failure."""
 
     return exception_diagnostic(
         error,
         empty_message="task update failed",
         nonportable_message="Task update failed with a non-portable diagnostic.",
+        redactor=redactor,
     ).payload_fields(
         message_key="task_update_error",
         error_type_key="task_update_error_type",
@@ -238,7 +258,11 @@ def bound_diagnostic_text(value: str) -> str:
     return value
 
 
-def _safe_exception_type_name(exc: BaseException) -> str:
+def _safe_exception_type_name(
+    exc: BaseException,
+    *,
+    redactor: SecretRedactor,
+) -> str:
     try:
         name = type.__getattribute__(type(exc), "__name__")
     except BaseException:
@@ -249,7 +273,10 @@ def _safe_exception_type_name(exc: BaseException) -> str:
         require_durable_text(name, "error_type")
     except BaseException:
         name = "Exception"
-    return _bound_utf8_text(name, MAX_DIAGNOSTIC_TYPE_UTF8_BYTES)
+    return _bound_utf8_text(
+        redactor.redact_text(name),
+        MAX_DIAGNOSTIC_TYPE_UTF8_BYTES,
+    )
 
 
 def _bound_utf8_text(value: str, max_bytes: int) -> str:

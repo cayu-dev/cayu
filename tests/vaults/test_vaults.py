@@ -262,6 +262,66 @@ def test_secret_redactor_exposes_whether_it_has_values() -> None:
     assert SecretRedactor("token").has_values is True
 
 
+def test_secret_redactor_redacts_json_values_without_rewriting_protocol_fields() -> None:
+    redactor = SecretRedactor(["tool", "deny", "secret"])
+
+    redacted = redactor.redact_json_values(
+        {
+            "tool_name": "tool",
+            "decision": "deny",
+            "arguments": {"secret-key": "secret"},
+        },
+        preserve_string_fields={"tool_name", "decision"},
+    )
+
+    assert redacted == {
+        "tool_name": "tool",
+        "decision": "deny",
+        "arguments": {"secret-key": REDACTED_SECRET},
+    }
+
+
+@pytest.mark.parametrize("preserved_key", ["error", "result", "metadata", "tool_name"])
+def test_secret_redactor_rejects_preserved_key_spellings_inside_untrusted_data(
+    preserved_key: str,
+) -> None:
+    redactor = SecretRedactor(preserved_key)
+
+    with pytest.raises(ValueError, match="workload secret in an object key"):
+        redactor.require_no_secret_keys(
+            {
+                "metadata": {
+                    preserved_key: "caller-controlled",
+                }
+            },
+            preserve_keys={"metadata", "error", "result", "tool_name"},
+            untrusted_container_keys={"metadata"},
+        )
+
+    # The same spellings remain valid at their documented structural boundary.
+    redactor.require_no_secret_keys(
+        {preserved_key: "typed structure"},
+        preserve_keys={"metadata", "error", "result", "tool_name"},
+        untrusted_container_keys={"metadata"},
+    )
+
+
+def test_secret_redactor_is_idempotent_when_a_secret_overlaps_the_marker() -> None:
+    marker_prefixed_secret = f"{REDACTED_SECRET}-credential"
+    redactor = SecretRedactor(["REDA", "secret", marker_prefixed_secret])
+    once = redactor.redact_text(f"prefix secret {marker_prefixed_secret} suffix")
+
+    assert once == f"prefix {REDACTED_SECRET} {REDACTED_SECRET} suffix"
+    assert redactor.redact_text(once) == once
+
+
+def test_secret_redactor_reports_longest_utf8_secret_for_bounded_overlap() -> None:
+    redactor = SecretRedactor(["ascii", "密钥值"])
+
+    assert redactor.max_secret_utf8_bytes == len("密钥值".encode())
+    assert SecretRedactor().max_secret_utf8_bytes == 0
+
+
 def test_secret_redactor_rejects_non_json_values() -> None:
     redactor = SecretRedactor(["secret"])
 

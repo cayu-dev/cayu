@@ -81,6 +81,7 @@ from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime._completion_projection import portable_model_completion_projection
 from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._message_redaction import redact_message_for_boundary
 from cayu.runtime._model_errors import (
     copy_provider_exception_control,
     model_provider_error_from_payload,
@@ -134,12 +135,15 @@ from cayu.runtime.context import (
     _automatic_compaction_runner_scope,
     _AutomaticCompactionRunner,
     _compaction_completion_publisher_scope,
+    _context_secret_redactor_scope,
     _defer_billing_identity_cancellation_scope,
     context_build_termination_compaction_telemetry,
     copy_context_messages,
     estimate_context_pressure,
     estimate_model_request_context_pressure,
     noteify_unresolvable_prompt_files,
+    sanitize_context_build_error_checkpoint,
+    sanitize_context_build_result_checkpoint,
     sanitize_context_compaction_telemetry,
 )
 from cayu.runtime.context_counting import ContextCountingConfig, ContextCountingMode
@@ -167,6 +171,8 @@ from cayu.runtime.sessions import (
 from cayu.runtime.structured_output import (
     StructuredOutputSpec,
     StructuredOutputStrategy,
+    require_secret_free_json_schema_keys,
+    require_secret_free_structured_output_spec,
     structured_output_spec_payload,
     structured_output_tool_instruction,
     structured_output_tool_spec,
@@ -178,6 +184,7 @@ from cayu.runtime.usage import (
     usage_metrics_from_event_payload,
     usage_metrics_payload,
 )
+from cayu.vaults import SecretRedactor
 
 logger = logging.getLogger(__name__)
 
@@ -339,6 +346,7 @@ class ModelStepExecutor:
         max_file_attachment_bytes: int,
         max_total_file_attachment_bytes: int,
         max_file_attachments_per_request: int,
+        secret_redactor: SecretRedactor,
         checkpoint_transform: CheckpointTransformFactory,
         apply_budget_evaluation: BudgetEvaluationEventStream,
         apply_limit_evaluation: LimitEvaluationEventStream,
@@ -352,6 +360,7 @@ class ModelStepExecutor:
         self._max_file_attachment_bytes = max_file_attachment_bytes
         self._max_total_file_attachment_bytes = max_total_file_attachment_bytes
         self._max_file_attachments_per_request = max_file_attachments_per_request
+        self._secret_redactor = secret_redactor
         self._checkpoint_transform = checkpoint_transform
         self._apply_budget_evaluation = apply_budget_evaluation
         self._apply_limit_evaluation = apply_limit_evaluation
@@ -449,32 +458,135 @@ class ModelStepExecutor:
                 ", ".join(sorted(unresolvable_prompt_ids)),
             )
 
+        provider_options = copy_json_value(
+            registered_agent.spec.provider_options,
+            "provider_options",
+        )
+        if type(provider_options) is not dict:
+            raise AssertionError("Agent provider options copied as a non-object.")
+        agent_metadata = deepcopy(registered_agent.spec.metadata)
+        environment_metadata = (
+            deepcopy(registered_environment.spec.metadata)
+            if registered_environment is not None
+            else {}
+        )
+        structured_output_payload = (
+            structured_output_spec_payload(structured_output)
+            if structured_output is not None
+            else None
+        )
+        thinking_payload = thinking_config_payload(thinking) if thinking is not None else None
         request_options: dict[str, Any] = {
-            **copy_json_value(
-                registered_agent.spec.provider_options,
-                "provider_options",
-            ),
-            "agent_metadata": deepcopy(registered_agent.spec.metadata),
-            "environment_metadata": (
-                deepcopy(registered_environment.spec.metadata)
-                if registered_environment is not None
-                else {}
-            ),
+            **provider_options,
+            "agent_metadata": agent_metadata,
+            "environment_metadata": environment_metadata,
             "step": step,
-            "structured_output": (
-                structured_output_spec_payload(structured_output)
-                if structured_output is not None
-                else None
-            ),
+            "structured_output": structured_output_payload,
             RESOLVED_FILE_ATTACHMENTS_OPTION: resolved_attachments,
         }
-        if thinking is not None:
-            request_options["thinking"] = thinking_config_payload(thinking)
+        if thinking_payload is not None:
+            request_options["thinking"] = thinking_payload
+        redacted_messages = [
+            redact_message_for_boundary(
+                message,
+                redactor=self._secret_redactor,
+                field_name="model_message",
+            )
+            for message in model_messages
+        ]
+        if self._secret_redactor.redact_text(session.model) != session.model:
+            raise ValueError(
+                "Model identity contains a workload secret and cannot be sent to a provider."
+            )
+        for index, tool in enumerate(model_tools):
+            tool_name = tool.get("name")
+            if type(tool_name) is str and self._secret_redactor.redact_text(tool_name) != tool_name:
+                raise ValueError(
+                    f"model_tools[{index}].name contains a workload secret and cannot "
+                    "be sent as provider execution authority."
+                )
+            self._secret_redactor.require_no_secret_keys(
+                {
+                    "name": tool.get("name"),
+                    "description": tool.get("description"),
+                    "input_schema": None,
+                },
+                field_name=f"model_tools[{index}]",
+                preserve_keys={"name", "description", "input_schema"},
+                match_short_substrings=True,
+            )
+            input_schema = tool.get("input_schema")
+            if type(input_schema) is not dict:
+                raise AssertionError("A model tool input_schema must be an object.")
+            require_secret_free_json_schema_keys(
+                input_schema,
+                redactor=self._secret_redactor,
+                field_name=f"model_tools[{index}].input_schema",
+            )
+        redacted_tools = [
+            self._secret_redactor.redact_json_values(
+                tool,
+                preserve_string_fields={"name"},
+            )
+            for tool in model_tools
+        ]
+        for field_name, untyped_value in (
+            ("provider_options", provider_options),
+            ("agent_metadata", agent_metadata),
+            ("environment_metadata", environment_metadata),
+        ):
+            self._secret_redactor.require_no_secret_keys(
+                untyped_value,
+                field_name=f"model_request_options.{field_name}",
+                match_short_substrings=True,
+            )
+        require_secret_free_structured_output_spec(
+            structured_output,
+            redactor=self._secret_redactor,
+            field_name="model_request_options.structured_output",
+        )
+        if (
+            thinking_payload is not None
+            and self._secret_redactor.redact_json_values(thinking_payload) != thinking_payload
+        ):
+            raise ValueError(
+                "model_request_options.thinking contains a workload secret and cannot "
+                "be sent without changing execution semantics."
+            )
+        self._secret_redactor.require_no_secret_keys(
+            resolved_attachments,
+            field_name=f"model_request_options.{RESOLVED_FILE_ATTACHMENTS_OPTION}",
+            preserve_keys={
+                "artifact_id",
+                "kind",
+                "filename",
+                "content_type",
+                "data_base64",
+                "metadata",
+            },
+            untrusted_container_keys={"metadata"},
+            match_short_substrings=True,
+        )
+        for artifact_id, attachment in resolved_attachments.items():
+            stored_artifact_id = attachment.get("artifact_id")
+            if self._secret_redactor.redact_text(artifact_id) != artifact_id or (
+                type(stored_artifact_id) is str
+                and self._secret_redactor.redact_text(stored_artifact_id) != stored_artifact_id
+            ):
+                raise ValueError(
+                    "Resolved file attachment authority contains a workload secret "
+                    "and cannot be sent to a provider."
+                )
+        redacted_options = self._secret_redactor.redact_json_values(
+            request_options,
+        )
+        if type(redacted_options) is not dict:
+            raise AssertionError("Model request-option redaction returned a non-object.")
         return ModelRequest(
             model=session.model,
-            messages=model_messages,
-            tools=model_tools,
-            options=request_options,
+            messages=redacted_messages,
+            tools=redacted_tools,
+            options=redacted_options,
         )
 
     async def run_with_retries(
@@ -1354,6 +1466,7 @@ class ModelStepRun:
                 ),
                 count_input_tokens=self._context_input_token_counter(step=step),
                 build_cache_prefix_request=self._cache_prefix_request_builder(step=step),
+                secret_redactor=self._executor._secret_redactor,
                 run_compaction=run_automatic_compaction,
             )
         except ContextBuildError as exc:
@@ -1952,6 +2065,7 @@ class ModelStepRun:
                 ),
                 count_input_tokens=self._context_input_token_counter(step=step),
                 build_cache_prefix_request=self._cache_prefix_request_builder(step=step),
+                secret_redactor=self._executor._secret_redactor,
                 run_compaction=run_automatic_compaction,
                 force_bounded_compaction=True,
             )
@@ -2706,7 +2820,9 @@ class ModelStepRun:
                 environment_name=self._environment_name,
                 payload=checkpoint_event_payload,
             )
-            atomic_events = [*prepared_events, checkpoint_event]
+            atomic_events = self._executor._event_writer.prepare_many(
+                [*prepared_events, checkpoint_event]
+            )
             checkpoint_transform = self._executor._checkpoint_transform(checkpoint_update)
             try:
                 await self._executor._session_store.publish_checkpoint_and_events(
@@ -3418,6 +3534,7 @@ async def _build_context(
     pressure_overhead: ContextPressureOverhead,
     count_input_tokens: Callable[[list[Message]], Awaitable[int | None]] | None,
     build_cache_prefix_request: Callable[[list[Message]], Awaitable[ModelRequest]] | None,
+    secret_redactor: SecretRedactor,
     run_compaction: _AutomaticCompactionRunner | None = None,
     force_bounded_compaction: bool = False,
 ) -> tuple[
@@ -3454,23 +3571,36 @@ async def _build_context(
     )
     if isinstance(context_policy, RuntimeManagedContextPolicy):
         checkpoint = await session_store.load_checkpoint(session.id)
-        with (
-            _defer_billing_identity_cancellation_scope(),
-            _automatic_compaction_runner_scope(run_compaction),
-        ):
-            result = await context_policy.build_with_checkpoint(
-                request,
-                checkpoint=checkpoint,
+        try:
+            with (
+                _context_secret_redactor_scope(secret_redactor),
+                _defer_billing_identity_cancellation_scope(),
+                _automatic_compaction_runner_scope(run_compaction),
+            ):
+                result = await context_policy.build_with_checkpoint(
+                    request,
+                    checkpoint=checkpoint,
+                )
+        except ContextBuildError as error:
+            sanitize_context_build_error_checkpoint(
+                error,
+                redactor=secret_redactor,
             )
+            raise
+        safe_checkpoint, safe_checkpoint_event_payload = sanitize_context_build_result_checkpoint(
+            result,
+            redactor=secret_redactor,
+        )
         return (
             copy_context_messages(result.messages),
-            copy_json_value(result.checkpoint, "checkpoint"),
-            result.checkpoint_event_payload,
+            safe_checkpoint,
+            safe_checkpoint_event_payload,
             [telemetry.model_copy(deep=True) for telemetry in result.compaction_telemetry],
             [telemetry.model_copy(deep=True) for telemetry in result.knowledge_telemetry],
         )
 
-    result = await context_policy.build(request)
+    with _context_secret_redactor_scope(secret_redactor):
+        result = await context_policy.build(request)
     return copy_context_messages(result), None, None, [], []
 
 

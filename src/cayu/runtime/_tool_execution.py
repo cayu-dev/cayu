@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,6 +17,7 @@ from cayu._validation import (
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime.tool_policy import ToolPolicyResult
+from cayu.vaults import SecretRedactor
 
 _OUTCOME_CONSTRUCTION_TOKEN = object()
 
@@ -113,11 +115,14 @@ async def run_tool(
     effect: ToolEffect,
     ctx: ToolContext,
     arguments: dict[str, Any],
+    redactor: Callable[[], SecretRedactor],
     timeout_seconds: float | None = None,
 ) -> ToolExecutionOutcome:
     timer: asyncio.Timeout | None = None
     if type(effect) is not ToolEffect:
         raise TypeError("effect must be a ToolEffect.")
+    if not callable(redactor):
+        raise TypeError("redactor must be a callable returning SecretRedactor.")
     try:
         if timeout_seconds is None:
             raw_result = await tool.run(ctx, arguments)
@@ -127,41 +132,50 @@ async def run_tool(
     except TimeoutError as exc:
         ctx._discard_policy_denials_for(tool)
         if timer is not None and timer.expired():
+            active_redactor = _active_redactor(redactor)
             result, controls = tool_results.terminal_failure_result(
                 terminal_outcome="tool_execution_timeout",
                 effect=effect,
                 message=f"Tool call timed out after {timeout_seconds} seconds.",
+                redactor=active_redactor,
             )
             return _execution_outcome(result, controls)
+        active_redactor = _active_redactor(redactor)
         diagnostic = tool_results.exception_diagnostic(
             exc,
             empty_message="tool execution failed",
             nonportable_message="Tool execution failed with a non-portable diagnostic.",
+            redactor=active_redactor,
         )
         result, controls = tool_results.terminal_failure_result(
             terminal_outcome="tool_execution_error",
             effect=effect,
             message=diagnostic.message,
             diagnostic=diagnostic,
+            redactor=active_redactor,
         )
         return _execution_outcome(result, controls)
     except Exception as exc:
         ctx._discard_policy_denials_for(tool)
+        active_redactor = _active_redactor(redactor)
         diagnostic = tool_results.exception_diagnostic(
             exc,
             empty_message="tool execution failed",
             nonportable_message="Tool execution failed with a non-portable diagnostic.",
+            redactor=active_redactor,
         )
         result, controls = tool_results.terminal_failure_result(
             terminal_outcome="tool_execution_error",
             effect=effect,
             message=diagnostic.message,
             diagnostic=diagnostic,
+            redactor=active_redactor,
         )
         return _execution_outcome(result, controls)
 
     if type(raw_result) is not ToolResult:
         ctx._discard_policy_denials_for(tool)
+        active_redactor = _active_redactor(redactor)
         result, controls = tool_results.terminal_failure_result(
             terminal_outcome="invalid_tool_output",
             effect=effect,
@@ -170,6 +184,7 @@ async def run_tool(
                 f"{_safe_type_name(raw_result)}. Expected ToolResult."
             ),
             raw_evidence=tool_results.raw_tool_result_evidence(raw_result),
+            redactor=active_redactor,
         )
         return _execution_outcome(result, controls)
     try:
@@ -178,10 +193,12 @@ async def run_tool(
         )
     except Exception as exc:
         ctx._discard_policy_denials_for(tool)
+        active_redactor = _active_redactor(redactor)
         diagnostic = tool_results.exception_diagnostic(
             exc,
             empty_message="tool result validation failed",
             nonportable_message="Tool returned a non-portable result after execution.",
+            redactor=active_redactor,
         )
         result, controls = tool_results.terminal_failure_result(
             terminal_outcome="invalid_tool_output",
@@ -189,9 +206,17 @@ async def run_tool(
             message=diagnostic.message,
             raw_evidence=tool_results.raw_tool_result_evidence(raw_result),
             diagnostic=diagnostic,
+            redactor=active_redactor,
         )
         return _execution_outcome(result, controls)
     return _execution_outcome(validated_result)
+
+
+def _active_redactor(redactor: Callable[[], SecretRedactor]) -> SecretRedactor:
+    active = redactor()
+    if not isinstance(active, SecretRedactor):
+        raise TypeError("redactor must return a SecretRedactor.")
+    return active
 
 
 def _safe_type_name(value: Any) -> str:

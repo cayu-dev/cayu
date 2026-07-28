@@ -77,6 +77,7 @@ from cayu.runtime.event_watchers import (
 )
 from cayu.runtime.sessions import (
     DELETE_BLOCKED_SESSION_STATUSES,
+    FORK_TRANSCRIPT_VALIDATION_ERROR,
     MAX_PENDING_ACTION_RESULT_BYTES,
     MAX_PENDING_ACTION_TOOL_CALLS,
     SESSION_INSPECTION_LABEL_LIMIT,
@@ -87,6 +88,7 @@ from cayu.runtime.sessions import (
     EventQuery,
     EventRecord,
     EventSummary,
+    ForkTranscriptValidator,
     McpManifestBaseline,
     McpManifestBaselineLoadResult,
     McpManifestPublicationResult,
@@ -157,10 +159,12 @@ from cayu.runtime.sessions import (
     encode_session_cursor,
     enforce_pending_action_result_size,
     filter_transcript_records,
+    fork_transcript_is_accepted,
     replace_session_user_metadata,
     session_next_cursor,
     session_outcome,
     session_query_from_aggregate_filter,
+    transform_fork_checkpoint,
     validate_persisted_event_side_effect_error,
 )
 from cayu.runtime.tasks import (
@@ -4198,6 +4202,48 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         checkpoint_transform: CheckpointTransform | None,
         expected_source_run_epoch: int,
     ) -> Session:
+        return await self._create_fork(
+            source_session_id=source_session_id,
+            fork=fork,
+            source_statuses=source_statuses,
+            transcript_cursor=transcript_cursor,
+            checkpoint_transform=checkpoint_transform,
+            expected_source_run_epoch=expected_source_run_epoch,
+            transcript_validator=None,
+        )
+
+    async def create_fork_with_transcript_validation(
+        self,
+        *,
+        source_session_id: str,
+        fork: Session,
+        source_statuses: set[SessionStatus],
+        transcript_cursor: int | None,
+        checkpoint_transform: CheckpointTransform | None,
+        expected_source_run_epoch: int,
+        transcript_validator: ForkTranscriptValidator,
+    ) -> Session:
+        return await self._create_fork(
+            source_session_id=source_session_id,
+            fork=fork,
+            source_statuses=source_statuses,
+            transcript_cursor=transcript_cursor,
+            checkpoint_transform=checkpoint_transform,
+            expected_source_run_epoch=expected_source_run_epoch,
+            transcript_validator=transcript_validator,
+        )
+
+    async def _create_fork(
+        self,
+        *,
+        source_session_id: str,
+        fork: Session,
+        source_statuses: set[SessionStatus],
+        transcript_cursor: int | None,
+        checkpoint_transform: CheckpointTransform | None,
+        expected_source_run_epoch: int,
+        transcript_validator: ForkTranscriptValidator | None,
+    ) -> Session:
         source_session_id, fork, allowed_statuses, transcript_cursor = (
             _prepare_session_fork_request(
                 source_session_id=source_session_id,
@@ -4229,24 +4275,42 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         (source_session_id,),
                     )
                     transcript_rows = await cur.fetchall()
+                    transcript_row_count = len(transcript_rows)
                     if transcript_cursor is None:
-                        copied_messages = [Message(**_json_obj(row[0])) for row in transcript_rows]
+                        selected_transcript_rows = transcript_rows
+                        transcript_rows = []
+                        copied_messages = [
+                            Message(**_json_obj(row[0])) for row in selected_transcript_rows
+                        ]
                     else:
-                        if transcript_cursor > len(transcript_rows):
+                        if transcript_cursor > transcript_row_count:
+                            transcript_rows.clear()
                             raise ValueError(
                                 "transcript_cursor is greater than source transcript length."
                             )
+                        selected_transcript_rows = transcript_rows[:transcript_cursor]
+                        transcript_rows.clear()
                         copied_messages = [
-                            Message(**_json_obj(row[0]))
-                            for row in transcript_rows[:transcript_cursor]
+                            Message(**_json_obj(row[0])) for row in selected_transcript_rows
                         ]
+                    selected_transcript_rows.clear()
+                    if not fork_transcript_is_accepted(copied_messages, transcript_validator):
+                        copied_messages.clear()
+                        copied_messages = []
+                        raise ValueError(FORK_TRANSCRIPT_VALIDATION_ERROR) from None
 
                     copied_checkpoint = None
                     if checkpoint_transform is not None:
-                        copied_checkpoint = checkpoint_transform(
-                            source_session,
-                            await self._load_checkpoint(cur, source_session_id),
+                        checkpoint_input = await self._load_checkpoint(
+                            cur,
+                            source_session_id,
                         )
+                        copied_checkpoint = transform_fork_checkpoint(
+                            source_session,
+                            checkpoint_input,
+                            checkpoint_transform,
+                        )
+                        checkpoint_input = None
                         if copied_checkpoint is not None:
                             copied_checkpoint = copy_durable_json_object(
                                 copied_checkpoint,

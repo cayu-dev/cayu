@@ -20,6 +20,7 @@ from cayu._validation import (
 )
 from cayu.runtime._diagnostics import exception_diagnostic
 from cayu.runtime.sessions import EventQuery, EventRecord, copy_event_query
+from cayu.vaults import SecretRedactor
 
 EVENT_WATCHER_QUERY_PAGE_LIMIT = 5000
 
@@ -552,11 +553,16 @@ def copy_event_watcher_dead_letter(
     return EventWatcherDeadLetter.model_validate(dead_letter.model_dump(mode="python"))
 
 
-def event_watcher_error_payload(error: BaseException) -> str:
+def event_watcher_error_payload(
+    error: BaseException,
+    *,
+    redactor: SecretRedactor | None = None,
+) -> str:
     return exception_diagnostic(
         error,
         empty_message="event watcher failed",
         nonportable_message="Event watcher failed with a non-portable diagnostic.",
+        redactor=redactor,
     ).message
 
 

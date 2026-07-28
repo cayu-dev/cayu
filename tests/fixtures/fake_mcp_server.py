@@ -13,6 +13,121 @@ def main() -> None:
         if "id" not in message:
             continue
         request_id = message["id"]
+        structural_response = os.environ.get("CAYU_FAKE_MCP_STRUCTURAL_RESPONSE")
+        structural_method = os.environ.get(
+            "CAYU_FAKE_MCP_STRUCTURAL_METHOD",
+            "tools/list",
+        )
+        if structural_response is not None and method == structural_method:
+            canary = os.environ.get("CAYU_FAKE_MCP_STRUCTURAL_CANARY", "")
+            if structural_response == "non_object":
+                _write([canary])
+            elif structural_response == "wrong_version":
+                _write(
+                    {
+                        "jsonrpc": "1.0",
+                        "id": request_id,
+                        "result": {"secret": canary},
+                    }
+                )
+            elif structural_response == "non_finite":
+                _write(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {
+                            "tools": [
+                                {
+                                    "name": "echo",
+                                    "description": canary,
+                                    "inputSchema": {"type": "object"},
+                                }
+                            ],
+                            "invalid": float("nan"),
+                        },
+                    }
+                )
+            elif structural_response == "non_finite_cursor":
+                _write(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {
+                            "tools": [
+                                {
+                                    "name": "echo",
+                                    "description": canary,
+                                    "inputSchema": {"type": "object"},
+                                }
+                            ],
+                            "nextCursor": float("nan"),
+                        },
+                    }
+                )
+            elif structural_response == "unclean_identity":
+                _write(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {
+                            "tools": [
+                                {
+                                    "name": f" {canary}",
+                                    "description": "Unclean private transport identity.",
+                                    "inputSchema": {"type": "object"},
+                                }
+                            ]
+                        },
+                    }
+                )
+            elif structural_response in {
+                "ambiguous_identity_first",
+                "ambiguous_identity_last",
+                "ambiguous_identity_only",
+            }:
+                if structural_method == "resources/list":
+                    valid_item = {
+                        "uri": canary,
+                        "name": "Valid private transport identity.",
+                    }
+                    ambiguous_item = {
+                        "uri": True,
+                        "name": "Wrong-type transport identity.",
+                    }
+                    result_key = "resources"
+                else:
+                    valid_item = {
+                        "name": canary,
+                        "description": "Valid private transport identity.",
+                        "inputSchema": {"type": "object"},
+                    }
+                    ambiguous_item = {
+                        "name": True,
+                        "description": "Wrong-type transport identity.",
+                        "inputSchema": {"type": "object"},
+                    }
+                    result_key = "tools"
+                items = (
+                    [ambiguous_item]
+                    if structural_response == "ambiguous_identity_only"
+                    else (
+                        [ambiguous_item, valid_item]
+                        if structural_response == "ambiguous_identity_first"
+                        else [valid_item, ambiguous_item]
+                    )
+                )
+                _write(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {result_key: items},
+                    }
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported CAYU_FAKE_MCP_STRUCTURAL_RESPONSE: {structural_response}"
+                )
+            continue
         if method == "initialize":
             _write(
                 {
@@ -134,7 +249,7 @@ def main() -> None:
             )
 
 
-def _write(message: dict) -> None:
+def _write(message: object) -> None:
     sys.stdout.write(json.dumps(message, separators=(",", ":")) + "\n")
     sys.stdout.flush()
 

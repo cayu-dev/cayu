@@ -172,9 +172,15 @@ def binding_cleanup_status(error: BaseException) -> BindingCleanupStatus | None:
     return status if type(status) is BindingCleanupStatus else None
 
 
-def binding_cleanup_payload(error: BaseException) -> dict[str, Any] | None:
+def binding_cleanup_payload(
+    error: BaseException,
+    *,
+    redactor: SecretRedactor,
+) -> dict[str, Any] | None:
     """Serialize cleanup state without exposing exception objects."""
 
+    if not isinstance(redactor, SecretRedactor):
+        raise TypeError("redactor must be a SecretRedactor.")
     status = binding_cleanup_status(error)
     if status is None:
         return None
@@ -197,6 +203,7 @@ def binding_cleanup_payload(error: BaseException) -> dict[str, Any] | None:
             initial_error,
             empty_message="binding cleanup failed",
             nonportable_message=("Binding cleanup failed with a non-portable diagnostic."),
+            redactor=redactor,
         ).payload_fields(
             message_key="initial_error",
             error_type_key="initial_error_type",
@@ -214,6 +221,7 @@ def binding_cleanup_payload(error: BaseException) -> dict[str, Any] | None:
                 nonportable_message=(
                     "Binding cleanup retry failed with a non-portable diagnostic."
                 ),
+                redactor=redactor,
             ).payload_fields(
                 message_key="retry_error",
                 error_type_key="retry_error_type",
@@ -418,11 +426,15 @@ def _binding_finalize_error_details(
     *,
     redactors: tuple[SecretRedactor, ...],
 ) -> dict[str, str]:
+    combined_redactor = redactors[0]
+    for redactor in redactors[1:]:
+        combined_redactor = combined_redactor.merged_with(redactor)
     diagnostic = exception_diagnostic(
         error,
         empty_message=_BINDING_FINALIZE_EMPTY_MESSAGE,
         nonportable_message=_BINDING_FINALIZE_NONPORTABLE_MESSAGE,
         preserve_empty_message=True,
+        redactor=combined_redactor,
     )
     return {
         "error": _bounded_redacted_text(

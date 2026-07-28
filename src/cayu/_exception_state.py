@@ -54,6 +54,21 @@ def set_exception_state(
     return True
 
 
+def pop_exception_state(
+    error: BaseException,
+    attribute_name: str,
+) -> object | None:
+    """Remove instance state without invoking exception-subclass descriptors."""
+
+    namespace = _exception_namespace(error)
+    if namespace is None:
+        return None
+    try:
+        return dict.pop(namespace, attribute_name, None)
+    except BaseException:
+        return None
+
+
 def _exception_namespace(error: BaseException) -> dict[str, Any] | None:
     if not isinstance(error, BaseException):
         return None
@@ -64,4 +79,9 @@ def _exception_namespace(error: BaseException) -> dict[str, Any] | None:
     return namespace if type(namespace) is dict else None
 
 
-__all__ = ["exception_state", "exception_state_contains", "set_exception_state"]
+__all__ = [
+    "exception_state",
+    "exception_state_contains",
+    "pop_exception_state",
+    "set_exception_state",
+]

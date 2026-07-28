@@ -1910,18 +1910,19 @@ def test_invalid_tool_output_evidence_is_redacted_before_hooks_and_publication()
 
 
 def test_terminal_tool_diagnostics_and_evidence_remain_bounded_after_expanding_redaction():
-    from cayu.vaults import SecretRedactor
+    from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
     secret = "z"
     redactor = SecretRedactor(secret)
-    diagnostic = tool_results_module.exception_diagnostic(RuntimeError(secret * 4096))
-    redacted_diagnostic = tool_results_module.redact_exception_diagnostic(
-        diagnostic,
-        redactor,
+    redacted_diagnostic = tool_results_module.exception_diagnostic(
+        RuntimeError(secret * 4096),
+        redactor=redactor,
     )
     assert len(redacted_diagnostic.message.encode("utf-8")) <= (
         tool_results_module._MAX_DIAGNOSTIC_UTF8_BYTES
     )
+    assert secret not in redacted_diagnostic.message
+    assert REDACTED_SECRET in redacted_diagnostic.message
 
     class ExpandingEvidenceTool(Tool):
         spec = ToolSpec(
@@ -1978,6 +1979,70 @@ def test_terminal_tool_diagnostics_and_evidence_remain_bounded_after_expanding_r
     )
     assert evidence_bytes <= tool_results_module._MAX_PORTABLE_EVIDENCE_UTF8_BYTES
     assert secret not in json.dumps(terminal.model_dump(mode="json"), ensure_ascii=False)
+
+
+def test_terminal_diagnostic_and_evidence_redact_secret_crossing_byte_boundaries() -> None:
+    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+
+    secret = "boundary-secret-canary"
+    redactor = SecretRedactor(secret)
+    diagnostic_prefix = "d" * (
+        tool_results_module._MAX_DIAGNOSTIC_UTF8_BYTES - len(secret.encode("utf-8")) // 2
+    )
+    diagnostic = tool_results_module.exception_diagnostic(
+        RuntimeError(diagnostic_prefix + secret),
+        redactor=redactor,
+    )
+
+    assert secret not in diagnostic.message
+    assert secret[: len(secret) // 2] not in diagnostic.message
+    assert len(diagnostic.message.encode("utf-8")) <= (
+        tool_results_module._MAX_DIAGNOSTIC_UTF8_BYTES
+    )
+
+    evidence_prefix = "e" * (
+        tool_results_module._MAX_PORTABLE_EVIDENCE_UTF8_BYTES
+        - len(secret.encode("utf-8")) // 2
+        - 32
+    )
+    evidence = tool_results_module.portable_result_evidence(
+        {"receipt_id": evidence_prefix + secret},
+        redactor=redactor,
+    )
+    rendered = json.dumps(
+        evidence.value,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+
+    assert evidence.included is True
+    assert secret not in rendered
+    assert secret[: len(secret) // 2] not in rendered
+    assert REDACTED_SECRET in rendered
+    assert len(rendered.encode("utf-8")) <= (tool_results_module._MAX_PORTABLE_EVIDENCE_UTF8_BYTES)
+
+
+def test_exception_type_name_is_redacted_before_its_byte_bound() -> None:
+    from cayu.runtime._diagnostics import MAX_DIAGNOSTIC_TYPE_UTF8_BYTES
+    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+
+    secret = "exception-type-boundary-secret"
+    exception_type = type(
+        ("x" * 105) + secret + ("y" * 100),
+        (RuntimeError,),
+        {},
+    )
+
+    diagnostic = tool_results_module.exception_diagnostic(
+        exception_type("safe message"),
+        redactor=SecretRedactor(secret),
+    )
+
+    assert secret not in diagnostic.error_type
+    assert secret[:8] not in diagnostic.error_type
+    assert REDACTED_SECRET[:8] in diagnostic.error_type
+    assert len(diagnostic.error_type.encode("utf-8")) <= (MAX_DIAGNOSTIC_TYPE_UTF8_BYTES)
 
 
 def test_external_invalid_tool_output_is_durable_before_blocking_after_hook() -> None:
@@ -2328,7 +2393,7 @@ def test_terminal_tool_controls_survive_matching_secret_redaction():
     assert events[-1].type == EventType.SESSION_COMPLETED
 
 
-def test_terminal_tool_linkage_survives_call_id_secret_redaction_and_replay() -> None:
+def test_secret_bearing_provider_call_id_fails_closed_before_tool_execution() -> None:
     from cayu.vaults import SecretRedactor
 
     call_id = "call_secret_identity"
@@ -2377,14 +2442,10 @@ def test_terminal_tool_linkage_survives_call_id_secret_redaction_and_replay() ->
     )
 
     assert initial_events[-1].type == EventType.SESSION_FAILED
-    started = next(event for event in initial_events if event.type == EventType.TOOL_CALL_STARTED)
-    terminal = next(event for event in initial_events if event.type == EventType.TOOL_CALL_FAILED)
-    assert started.payload["tool_call_id"] == call_id
-    assert terminal.payload["tool_call_id"] == call_id
-    assert terminal.payload["terminal_outcome"] == "invalid_tool_output"
-    evidence = terminal.payload["result"]["structured"]["portable_result_evidence"]
-    assert evidence["structured"]["receipt_id"] == "receipt"
-    assert tool.effects == 1
+    assert all(event.type != EventType.TOOL_CALL_STARTED for event in initial_events)
+    assert all(event.type != EventType.TOOL_CALL_FAILED for event in initial_events)
+    assert call_id not in repr([event.model_dump(mode="json") for event in initial_events])
+    assert tool.effects == 0
 
     resumed_events = asyncio.run(
         collect_resume_events(
@@ -2397,15 +2458,12 @@ def test_terminal_tool_linkage_survives_call_id_secret_redaction_and_replay() ->
     )
 
     assert resumed_events[-1].type == EventType.SESSION_COMPLETED
-    assert tool.effects == 1
+    assert tool.effects == 0
     stored_events = asyncio.run(store.load_events(session_id))
     stored_started = [event for event in stored_events if event.type == EventType.TOOL_CALL_STARTED]
     stored_terminal = [event for event in stored_events if event.type == EventType.TOOL_CALL_FAILED]
-    assert len(stored_started) == len(stored_terminal) == 1
-    assert stored_started[0].payload["tool_call_id"] == call_id
-    assert stored_terminal[0].payload["tool_call_id"] == call_id
+    assert stored_started == []
+    assert stored_terminal == []
     transcript = asyncio.run(store.load_transcript(session_id))
-    tool_part = next(message for message in transcript if message.role == "tool").content[0]
-    assert tool_part.structured["portable_result_evidence"]["structured"]["receipt_id"] == (
-        "receipt"
-    )
+    assert all(message.role != "tool" for message in transcript)
+    assert call_id not in repr([message.model_dump(mode="json") for message in transcript])

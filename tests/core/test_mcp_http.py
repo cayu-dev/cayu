@@ -6,6 +6,7 @@ from typing import Any
 
 import httpx
 import pytest
+from tests.provider_traceback_assertions import is_cayu_source_filename
 
 from cayu import (
     DEFAULT_HTTP_MCP_CONNECT_TIMEOUT_S,
@@ -17,13 +18,20 @@ from cayu import (
     connect_mcp_toolset,
 )
 from cayu.mcp._jsonrpc import MCP_PROTOCOL_VERSION
-from cayu.mcp.http import MCP_PROTOCOL_VERSION_HEADER, MCP_SESSION_ID_HEADER, HttpMcpSession
+from cayu.mcp.http import (
+    _MAX_ERROR_BODY_CHARS,
+    MCP_PROTOCOL_VERSION_HEADER,
+    MCP_SESSION_ID_HEADER,
+    HttpMcpSession,
+    _decode_jsonrpc,
+)
 from cayu.mcp.tools import _default_client_for
-from cayu.vaults import SecretRef, StaticVault
+from cayu.vaults import REDACTED_SECRET, SecretRedactor, SecretRef, StaticVault
 
 _DEFAULT_TOOLS = [
     {"name": "search", "description": "Search the web.", "inputSchema": {"type": "object"}},
 ]
+_DEFAULT_RESOURCES = [{"uri": "file://x", "name": "x"}]
 
 
 class FakeMcpHttpServer:
@@ -35,15 +43,20 @@ class FakeMcpHttpServer:
         sse: bool = False,
         session_id: str | None = "sess-1",
         tools: list[dict[str, Any]] | None = None,
+        resources: list[dict[str, Any]] | None = None,
         protocol_version: str = MCP_PROTOCOL_VERSION,
         expire_after_init: bool = False,
         error_on: str | None = None,
+        error_message: str = "boom",
+        instructions: str | None = None,
         timeout_on: str | None = None,
         sse_content_type: str = "text/event-stream",
         sse_extra_events: list[dict[str, Any]] | None = None,
         sse_trailing_events: list[dict[str, Any]] | None = None,
         empty_sse_on: str | None = None,
         bad_jsonrpc_on: str | None = None,
+        raw_json_on: str | None = None,
+        raw_json_document: str | None = None,
         fold_sse: bool = False,
         paginate: bool = False,
     ) -> None:
@@ -53,14 +66,19 @@ class FakeMcpHttpServer:
         self.fold_sse = fold_sse
         self.session_id = session_id
         self.tools = _DEFAULT_TOOLS if tools is None else tools
+        self.resources = _DEFAULT_RESOURCES if resources is None else resources
         self.protocol_version = protocol_version
         self.expire_after_init = expire_after_init
         self.error_on = error_on
+        self.error_message = error_message
+        self.instructions = instructions
         self.timeout_on = timeout_on
         self.sse_extra_events = sse_extra_events
         self.sse_trailing_events = sse_trailing_events
         self.empty_sse_on = empty_sse_on
         self.bad_jsonrpc_on = bad_jsonrpc_on
+        self.raw_json_on = raw_json_on
+        self.raw_json_document = raw_json_document
         self.calls: list[tuple[str, dict[str, str]]] = []  # (method, lowercased headers)
         self.initialized = False
         self.deleted = False
@@ -86,9 +104,21 @@ class FakeMcpHttpServer:
         if self.expire_after_init and method != "initialize":
             return httpx.Response(404)
         if self.error_on is not None and method == self.error_on:
-            return self._respond(request_id, method, error={"code": -32000, "message": "boom"})
+            return self._respond(
+                request_id,
+                method,
+                error={"code": -32000, "message": self.error_message},
+            )
         if self.empty_sse_on is not None and method == self.empty_sse_on:
             return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=b"")
+        if self.raw_json_on is not None and method == self.raw_json_on:
+            if self.raw_json_document is None:
+                raise AssertionError("raw_json_document is required with raw_json_on")
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                content=self.raw_json_document.encode(),
+            )
         if self.bad_jsonrpc_on is not None and method == self.bad_jsonrpc_on:
             return self._respond(request_id, method, result=self._result_for(method), jsonrpc="1.0")
         params = body.get("params", {})
@@ -97,11 +127,14 @@ class FakeMcpHttpServer:
     def _result_for(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         params = params or {}
         if method == "initialize":
-            return {
+            result = {
                 "protocolVersion": self.protocol_version,
                 "capabilities": {},
                 "serverInfo": {"name": "fake", "version": "1.0"},
             }
+            if self.instructions is not None:
+                result["instructions"] = self.instructions
+            return result
         if method == "tools/list":
             if self.paginate and params.get("cursor") is None:
                 return {"tools": self.tools, "nextCursor": "tools-page-2"}
@@ -111,7 +144,7 @@ class FakeMcpHttpServer:
         if method == "tools/call":
             return {"content": [{"type": "text", "text": "ok"}], "isError": False}
         if method == "resources/list":
-            return {"resources": [{"uri": "file://x", "name": "x"}]}
+            return {"resources": self.resources}
         if method == "resources/read":
             return {"contents": [{"uri": "file://x", "text": "hi"}]}
         return {}
@@ -266,18 +299,81 @@ def test_http_empty_sse_raises() -> None:
         asyncio.run(run())
 
 
-def test_http_rejects_non_2_0_jsonrpc() -> None:
-    server = FakeMcpHttpServer(bad_jsonrpc_on="tools/list")
+def test_http_rejects_non_2_0_jsonrpc_without_retaining_secret_payload() -> None:
+    secret = "mcp-http-structural-json-canary"
+    server = FakeMcpHttpServer(
+        bad_jsonrpc_on="tools/list",
+        tools=[
+            {
+                "name": "search",
+                "description": secret,
+                "inputSchema": {"type": "object"},
+            }
+        ],
+    )
+    vault = StaticVault({"token": secret})
 
     async def run():
-        session = await HttpMcpClient(transport=server.transport).connect(_server_spec())
+        session = await HttpMcpClient(
+            transport=server.transport,
+            secret_resolver=vault,
+        ).connect(_server_spec(secret_headers={"authorization": SecretRef(name="token")}))
         try:
-            await session.list_tools()
+            with pytest.raises(McpProtocolError, match="2.0") as excinfo:
+                await session.list_tools()
+            return excinfo.value
         finally:
             await session.close()
 
-    with pytest.raises(McpProtocolError, match="2.0"):
-        asyncio.run(run())
+    error = asyncio.run(run())
+
+    _assert_cayu_traceback_does_not_retain_secret(error, secret)
+
+
+def test_http_rejects_non_object_jsonrpc_without_retaining_secret_payload() -> None:
+    secret = "mcp-http-non-object-json-canary"
+    server = FakeMcpHttpServer(
+        raw_json_on="tools/list",
+        raw_json_document=json.dumps([secret]),
+    )
+    vault = StaticVault({"token": secret})
+
+    async def run():
+        session = await HttpMcpClient(
+            transport=server.transport,
+            secret_resolver=vault,
+        ).connect(_server_spec(secret_headers={"authorization": SecretRef(name="token")}))
+        try:
+            with pytest.raises(McpProtocolError, match="must be an object") as excinfo:
+                await session.list_tools()
+            return excinfo.value
+        finally:
+            await session.close()
+
+    error = asyncio.run(run())
+
+    _assert_cayu_traceback_does_not_retain_secret(error, secret)
+
+
+def test_http_invalid_initialize_envelope_does_not_retain_secret_config() -> None:
+    secret = "mcp-http-initialize-json-canary"
+    server = FakeMcpHttpServer(
+        bad_jsonrpc_on="initialize",
+        instructions=secret,
+    )
+    vault = StaticVault({"token": secret})
+
+    async def run():
+        with pytest.raises(McpProtocolError, match="2.0") as excinfo:
+            await HttpMcpClient(
+                transport=server.transport,
+                secret_resolver=vault,
+            ).connect(_server_spec(secret_headers={"authorization": SecretRef(name="token")}))
+        return excinfo.value
+
+    error = asyncio.run(run())
+
+    _assert_cayu_traceback_does_not_retain_secret(error, secret)
 
 
 def test_http_sends_session_id_protocol_and_accept_headers() -> None:
@@ -330,6 +426,520 @@ def test_http_resolves_secret_headers_through_secret_resolver() -> None:
 
     asyncio.run(run())
     assert server.headers_for("initialize")["authorization"] == "Bearer sk-mcp-secret"
+
+
+def test_http_redacts_session_secrets_from_mcp_metadata_and_protocol_errors() -> None:
+    secret = "mcp-response-boundary-canary"
+    server = FakeMcpHttpServer(
+        tools=[
+            {
+                "name": "search",
+                "description": f"Send {secret} when searching.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"query": {"description": f"Authenticated by {secret}"}},
+                },
+                "annotations": {"title": f"Search with {secret}"},
+            }
+        ],
+        instructions=f"Always use {secret}.",
+        error_on="tools/call",
+        error_message=f"upstream rejected {secret}",
+    )
+    vault = StaticVault({"mcp_token": secret})
+
+    async def run():
+        session = await HttpMcpClient(
+            transport=server.transport,
+            secret_resolver=vault,
+        ).connect(_server_spec(secret_headers={"authorization": SecretRef(name="mcp_token")}))
+        try:
+            tools = await session.list_tools()
+            with pytest.raises(McpProtocolError) as excinfo:
+                await session.call_tool("search", {})
+            return session.initialize_result, tools, excinfo.value
+        finally:
+            await session.close()
+
+    initialize_result, tools, error = asyncio.run(run())
+    serialized = json.dumps(
+        {
+            "initialize": initialize_result.model_dump(mode="json"),
+            "tools": [tool.model_dump(mode="json") for tool in tools],
+            "error": str(error),
+        }
+    )
+
+    assert secret not in serialized
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert REDACTED_SECRET in serialized
+
+
+def test_http_keeps_raw_mcp_identities_private_while_calls_use_transport_mapping() -> None:
+    tool_secret = "mcp-tool-identity-canary"
+    resource_secret = "file://x"
+    server = FakeMcpHttpServer(
+        tools=[
+            {
+                "name": tool_secret,
+                "description": "Private transport identity.",
+                "inputSchema": {"type": "object"},
+            }
+        ]
+    )
+    vault = StaticVault(
+        {
+            "tool_token": tool_secret,
+            "resource_token": resource_secret,
+        }
+    )
+
+    async def run():
+        session = await HttpMcpClient(
+            transport=server.transport,
+            secret_resolver=vault,
+        ).connect(
+            _server_spec(
+                secret_headers={
+                    "x-tool-token": SecretRef(name="tool_token"),
+                    "x-resource-token": SecretRef(name="resource_token"),
+                }
+            )
+        )
+        try:
+            tools = await session.list_tools()
+            resources = await session.list_resources()
+            tool_result = await session.call_tool(tools[0].name, {})
+            resource_result = await session.read_resource(resources[0].uri)
+            return tools, resources, tool_result, resource_result
+        finally:
+            await session.close()
+
+    tools, resources, tool_result, resource_result = asyncio.run(run())
+    serialized = json.dumps(
+        {
+            "tools": [tool.model_dump(mode="json") for tool in tools],
+            "resources": [resource.model_dump(mode="json") for resource in resources],
+            "tool_result": tool_result.model_dump(mode="json"),
+            "resource_result": resource_result.model_dump(mode="json"),
+        }
+    )
+
+    assert tool_secret not in serialized
+    assert resource_secret not in serialized
+    assert tools[0].name == REDACTED_SECRET
+    assert resources[0].uri == REDACTED_SECRET
+
+
+def test_http_rejects_cross_page_authority_collisions_without_partial_mapping() -> None:
+    first_secret = "mcp-page-one-authority-canary"
+    second_secret = "search_page_2"
+    server = FakeMcpHttpServer(
+        paginate=True,
+        tools=[
+            {
+                "name": first_secret,
+                "description": "First page private identity.",
+                "inputSchema": {"type": "object"},
+            }
+        ],
+    )
+    vault = StaticVault({"first": first_secret, "second": second_secret})
+
+    async def run():
+        session = await HttpMcpClient(
+            transport=server.transport,
+            secret_resolver=vault,
+        ).connect(
+            _server_spec(
+                secret_headers={
+                    "x-first": SecretRef(name="first"),
+                    "x-second": SecretRef(name="second"),
+                }
+            )
+        )
+        assert isinstance(session, HttpMcpSession)
+        try:
+            with pytest.raises(McpProtocolError, match="collide") as excinfo:
+                await session.list_tools()
+            return dict(session._tool_transport_names), excinfo.value
+        finally:
+            await session.close()
+
+    mapping, error = asyncio.run(run())
+
+    assert mapping == {}
+    _assert_cayu_traceback_does_not_retain_secret(error, first_secret)
+    _assert_cayu_traceback_does_not_retain_secret(error, second_secret)
+
+
+def test_http_paginated_mapping_failure_does_not_retain_private_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_secret = "mcp-http-private-first-authority-canary"
+    second_secret = "mcp-http-private-second-authority-canary"
+    cursor = "mcp-http-private-cursor-canary"
+    redactor = SecretRedactor([first_secret, second_secret, cursor])
+
+    async def run() -> McpProtocolError:
+        session = HttpMcpSession(
+            server=_server_spec(),
+            http_client=httpx.AsyncClient(
+                transport=httpx.MockTransport(lambda _: httpx.Response(200))
+            ),
+            url="https://mcp.example/rpc",
+            client_name="cayu",
+            client_version="0.1.0",
+            secret_redactor=redactor,
+        )
+
+        async def send(_payload: dict[str, Any], request_id: int) -> dict[str, Any]:
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "tools": [
+                        {"name": first_secret},
+                        {"name": second_secret},
+                    ],
+                    "nextCursor": cursor,
+                },
+            }
+
+        monkeypatch.setattr(session, "_send", send)
+        try:
+            with pytest.raises(McpProtocolError, match="collide") as exc_info:
+                await session._request(
+                    "tools/list",
+                    {},
+                    authority_mapping={},
+                    paginated=True,
+                )
+            return exc_info.value
+        finally:
+            await session.close()
+
+    error = asyncio.run(run())
+
+    _assert_cayu_traceback_does_not_retain_secret(error, first_secret)
+    _assert_cayu_traceback_does_not_retain_secret(error, second_secret)
+    _assert_cayu_traceback_does_not_retain_secret(error, cursor)
+
+
+def test_http_invalid_paginated_cursor_does_not_retain_secret_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "mcp-http-invalid-cursor-secret-canary"
+    redactor = SecretRedactor(secret)
+
+    async def run() -> McpProtocolError:
+        session = HttpMcpSession(
+            server=_server_spec(),
+            http_client=httpx.AsyncClient(
+                transport=httpx.MockTransport(lambda _: httpx.Response(200))
+            ),
+            url="https://mcp.example/rpc",
+            client_name="cayu",
+            client_version="0.1.0",
+            secret_redactor=redactor,
+        )
+
+        async def send(_payload: dict[str, Any], request_id: int) -> dict[str, Any]:
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "tools": [
+                        {
+                            "name": "echo",
+                            "description": secret,
+                            "inputSchema": {"type": "object"},
+                        }
+                    ],
+                    "nextCursor": float("nan"),
+                },
+            }
+
+        monkeypatch.setattr(session, "_send", send)
+        try:
+            with pytest.raises(McpProtocolError, match="invalid portable JSON") as exc_info:
+                await session._request(
+                    "tools/list",
+                    {},
+                    authority_mapping={},
+                    paginated=True,
+                )
+            return exc_info.value
+        finally:
+            await session.close()
+
+    error = asyncio.run(run())
+
+    _assert_cayu_traceback_does_not_retain_secret(error, secret)
+
+
+def test_http_rejects_invalid_portable_response_without_retaining_secret_payload() -> None:
+    secret = "mcp-http-invalid-portable-json-canary"
+    server = FakeMcpHttpServer(
+        raw_json_on="tools/list",
+        raw_json_document=json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "tools": [
+                        {
+                            "name": "search",
+                            "description": secret,
+                            "inputSchema": {"type": "object"},
+                        }
+                    ],
+                    "invalid": float("nan"),
+                },
+            }
+        ),
+    )
+    vault = StaticVault({"token": secret})
+
+    async def run():
+        session = await HttpMcpClient(
+            transport=server.transport,
+            secret_resolver=vault,
+        ).connect(_server_spec(secret_headers={"authorization": SecretRef(name="token")}))
+        try:
+            with pytest.raises(McpProtocolError, match="invalid portable JSON") as excinfo:
+                await session.list_tools()
+            return excinfo.value
+        finally:
+            await session.close()
+
+    error = asyncio.run(run())
+
+    _assert_cayu_traceback_does_not_retain_secret(error, secret)
+
+
+def test_http_rejects_unclean_private_authority_without_partial_mapping() -> None:
+    secret = "mcp-http-unclean-authority-canary"
+    server = FakeMcpHttpServer(
+        tools=[
+            {
+                "name": f" {secret}",
+                "description": "Unclean private transport identity.",
+                "inputSchema": {"type": "object"},
+            }
+        ]
+    )
+    vault = StaticVault({"token": secret})
+
+    async def run():
+        session = await HttpMcpClient(
+            transport=server.transport,
+            secret_resolver=vault,
+        ).connect(_server_spec(secret_headers={"authorization": SecretRef(name="token")}))
+        assert isinstance(session, HttpMcpSession)
+        try:
+            with pytest.raises(McpProtocolError, match="clean nonblank") as excinfo:
+                await session.list_tools()
+            return dict(session._tool_transport_names), excinfo.value
+        finally:
+            await session.close()
+
+    mapping, error = asyncio.run(run())
+
+    assert mapping == {}
+    _assert_cayu_traceback_does_not_retain_secret(error, secret)
+
+
+@pytest.mark.parametrize(
+    "tool_order",
+    [
+        "ambiguous_first",
+        "ambiguous_last",
+        "ambiguous_only",
+    ],
+)
+def test_http_ambiguous_authority_never_commits_private_mapping(
+    tool_order: str,
+) -> None:
+    secret = f"mcp-http-{tool_order}-authority-canary"
+    valid_tool = {
+        "name": secret,
+        "description": "Valid private transport identity.",
+        "inputSchema": {"type": "object"},
+    }
+    ambiguous_tool = {
+        "name": True,
+        "description": "Wrong-type transport identity.",
+        "inputSchema": {"type": "object"},
+    }
+    tools = (
+        [ambiguous_tool]
+        if tool_order == "ambiguous_only"
+        else (
+            [ambiguous_tool, valid_tool]
+            if tool_order == "ambiguous_first"
+            else [valid_tool, ambiguous_tool]
+        )
+    )
+    server = FakeMcpHttpServer(tools=tools)
+    vault = StaticVault({"token": secret})
+
+    async def run():
+        session = await HttpMcpClient(
+            transport=server.transport,
+            secret_resolver=vault,
+        ).connect(_server_spec(secret_headers={"authorization": SecretRef(name="token")}))
+        assert isinstance(session, HttpMcpSession)
+        try:
+            with pytest.raises(McpProtocolError, match="invalid tool definition") as excinfo:
+                await session.list_tools()
+            return dict(session._tool_transport_names), excinfo.value
+        finally:
+            await session.close()
+
+    mapping, error = asyncio.run(run())
+
+    assert mapping == {}
+    _assert_cayu_traceback_does_not_retain_secret(error, secret)
+
+
+@pytest.mark.parametrize(
+    "resource_order",
+    [
+        "ambiguous_first",
+        "ambiguous_last",
+        "ambiguous_only",
+    ],
+)
+def test_http_ambiguous_resource_authority_never_commits_private_mapping(
+    resource_order: str,
+) -> None:
+    secret = f"mcp-http-{resource_order}-resource-authority-canary"
+    valid_resource = {
+        "uri": secret,
+        "name": "Valid private transport identity.",
+    }
+    ambiguous_resource = {
+        "uri": True,
+        "name": "Wrong-type transport identity.",
+    }
+    resources = (
+        [ambiguous_resource]
+        if resource_order == "ambiguous_only"
+        else (
+            [ambiguous_resource, valid_resource]
+            if resource_order == "ambiguous_first"
+            else [valid_resource, ambiguous_resource]
+        )
+    )
+    server = FakeMcpHttpServer(resources=resources)
+    vault = StaticVault({"token": secret})
+
+    async def run():
+        session = await HttpMcpClient(
+            transport=server.transport,
+            secret_resolver=vault,
+        ).connect(_server_spec(secret_headers={"authorization": SecretRef(name="token")}))
+        assert isinstance(session, HttpMcpSession)
+        try:
+            with pytest.raises(
+                McpProtocolError,
+                match="invalid resource definition",
+            ) as excinfo:
+                await session.list_resources()
+            return dict(session._resource_transport_uris), excinfo.value
+        finally:
+            await session.close()
+
+    mapping, error = asyncio.run(run())
+
+    assert mapping == {}
+    _assert_cayu_traceback_does_not_retain_secret(error, secret)
+
+
+def test_http_invalid_json_error_does_not_retain_raw_decoder_document() -> None:
+    secret = "mcp-invalid-json-canary"
+
+    with pytest.raises(McpProtocolError) as excinfo:
+        _decode_jsonrpc(f"not-json-{secret}")
+
+    _assert_cayu_traceback_does_not_retain_secret(excinfo.value, secret)
+
+
+def _assert_cayu_traceback_does_not_retain_secret(
+    error: BaseException,
+    secret: str,
+) -> None:
+    assert secret not in str(error)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    traceback = error.__traceback__
+    while traceback is not None:
+        if is_cayu_source_filename(traceback.tb_frame.f_code.co_filename):
+            for value in traceback.tb_frame.f_locals.values():
+                assert secret not in repr(value)
+        traceback = traceback.tb_next
+
+
+def test_http_redacts_secret_before_bounding_error_body() -> None:
+    secret = "mcp-http-split-boundary-canary"
+    visible_prefix_length = len(REDACTED_SECRET)
+    body = "x" * (_MAX_ERROR_BODY_CHARS - visible_prefix_length) + secret + "-unbounded-suffix"
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text=body, request=request)
+
+    async def run() -> str:
+        session = HttpMcpSession(
+            server=_server_spec(),
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond)),
+            url="https://mcp.example/rpc",
+            client_name="cayu",
+            client_version="0.1.0",
+            secret_redactor=SecretRedactor(secret),
+        )
+        try:
+            with pytest.raises(McpProtocolError) as excinfo:
+                await session.initialize()
+            return str(excinfo.value)
+        finally:
+            await session.close()
+
+    error = asyncio.run(run())
+
+    assert secret not in error
+    assert secret[:visible_prefix_length] not in error
+    assert REDACTED_SECRET in error
+
+
+def test_http_redacts_transport_error_without_retaining_raw_exception_cause() -> None:
+    secret = "mcp-http-transport-canary"
+
+    def fail(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(f"upstream rejected {secret}", request=request)
+
+    async def run() -> McpProtocolError:
+        session = HttpMcpSession(
+            server=_server_spec(),
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(fail)),
+            url="https://mcp.example/rpc",
+            client_name="cayu",
+            client_version="0.1.0",
+            secret_redactor=SecretRedactor(secret),
+        )
+        try:
+            with pytest.raises(McpProtocolError) as excinfo:
+                await session.initialize()
+            return excinfo.value
+        finally:
+            await session.close()
+
+    error = asyncio.run(run())
+
+    assert secret not in str(error)
+    assert REDACTED_SECRET in str(error)
+    assert error.__cause__ is None
 
 
 def test_http_rejects_secret_env() -> None:

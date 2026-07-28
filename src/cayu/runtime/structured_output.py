@@ -19,10 +19,114 @@ from cayu._validation import (
     require_durable_text,
 )
 from cayu.providers import ModelProvider
+from cayu.vaults.redaction import SecretRedactor
 
 STRUCTURED_OUTPUT_TOOL_NAME = "__cayu_submit_structured_output"
 _STRUCTURED_OUTPUT_TEXT_FIELD = "structured output"
 _INVALID_PORTABLE_JSON_MESSAGE = "Final assistant output is not valid portable JSON."
+
+# JSON Schema object members are typed protocol structure, including when they
+# recur below another schema-valued member. Names below map-valued members such
+# as ``properties`` and ``$defs`` remain caller-controlled and must never gain
+# this exemption.
+_JSON_SCHEMA_KEYWORDS = frozenset(
+    {
+        "$anchor",
+        "$comment",
+        "$defs",
+        "$dynamicAnchor",
+        "$dynamicRef",
+        "$id",
+        "$recursiveAnchor",
+        "$recursiveRef",
+        "$ref",
+        "$schema",
+        "$vocabulary",
+        "additionalItems",
+        "additionalProperties",
+        "allOf",
+        "anyOf",
+        "const",
+        "contains",
+        "contentEncoding",
+        "contentMediaType",
+        "contentSchema",
+        "default",
+        "definitions",
+        "dependencies",
+        "dependentRequired",
+        "dependentSchemas",
+        "deprecated",
+        "description",
+        "disallow",
+        "divisibleBy",
+        "else",
+        "enum",
+        "examples",
+        "exclusiveMaximum",
+        "exclusiveMinimum",
+        "extends",
+        "format",
+        "id",
+        "if",
+        "items",
+        "maxContains",
+        "maxItems",
+        "maxLength",
+        "maxProperties",
+        "maximum",
+        "minContains",
+        "minItems",
+        "minLength",
+        "minProperties",
+        "minimum",
+        "multipleOf",
+        "not",
+        "nullable",
+        "oneOf",
+        "pattern",
+        "patternProperties",
+        "prefixItems",
+        "properties",
+        "propertyNames",
+        "readOnly",
+        "required",
+        "then",
+        "title",
+        "type",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+        "uniqueItems",
+        "writeOnly",
+    }
+)
+_JSON_SCHEMA_MAP_OF_SCHEMAS = frozenset(
+    {
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+        "patternProperties",
+        "properties",
+    }
+)
+_JSON_SCHEMA_SINGLE_SCHEMAS = frozenset(
+    {
+        "additionalItems",
+        "additionalProperties",
+        "contains",
+        "contentSchema",
+        "else",
+        "if",
+        "items",
+        "not",
+        "propertyNames",
+        "then",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    }
+)
+_JSON_SCHEMA_ARRAYS_OF_SCHEMAS = frozenset({"allOf", "anyOf", "oneOf", "prefixItems"})
+_JSON_SCHEMA_LEGACY_SCHEMA_OR_ARRAY_MEMBERS = frozenset({"disallow", "extends", "type"})
 
 
 class StructuredOutputStrategy(StrEnum):
@@ -148,6 +252,178 @@ def copy_structured_output_spec(
         repair_prompt=spec.repair_prompt,
         strategy=spec.strategy,
     )
+
+
+def require_secret_free_json_schema_keys(
+    schema: dict[str, Any],
+    *,
+    redactor: SecretRedactor,
+    field_name: str,
+) -> None:
+    """Reject secrets in data-owned JSON Schema keys without rejecting keywords."""
+
+    copied = copy_durable_json_value(schema, field_name)
+    if type(copied) is not dict:
+        raise TypeError("schema must be a JSON object.")
+    if not isinstance(redactor, SecretRedactor):
+        raise TypeError("redactor must be a SecretRedactor.")
+
+    def require_untrusted_key(key: str, *, path: str) -> None:
+        redactor.require_no_secret_keys(
+            {key: None},
+            field_name=path,
+            match_short_substrings=True,
+        )
+
+    def inspect_untyped(value: Any, *, path: str) -> None:
+        redactor.require_no_secret_keys(
+            value,
+            field_name=path,
+            match_short_substrings=True,
+        )
+
+    def inspect_schema(value: Any, *, path: str) -> None:
+        if type(value) is bool:
+            return
+        if type(value) is not dict:
+            inspect_untyped(value, path=path)
+            return
+        for key, item in value.items():
+            member_path = f"{path}.{key}"
+            if key not in _JSON_SCHEMA_KEYWORDS:
+                require_untrusted_key(key, path=path)
+                inspect_untyped(item, path=member_path)
+                continue
+            if key in _JSON_SCHEMA_MAP_OF_SCHEMAS:
+                if type(item) is not dict:
+                    inspect_untyped(item, path=member_path)
+                    continue
+                for dynamic_key, child_schema in item.items():
+                    require_untrusted_key(dynamic_key, path=member_path)
+                    inspect_schema(
+                        child_schema,
+                        path=f"{member_path}.{dynamic_key}",
+                    )
+                continue
+            if key == "items" and type(item) is list:
+                for index, child_schema in enumerate(item):
+                    inspect_schema(child_schema, path=f"{member_path}[{index}]")
+                continue
+            if key in _JSON_SCHEMA_SINGLE_SCHEMAS:
+                inspect_schema(item, path=member_path)
+                continue
+            if key in _JSON_SCHEMA_ARRAYS_OF_SCHEMAS:
+                if type(item) is list:
+                    for index, child_schema in enumerate(item):
+                        inspect_schema(child_schema, path=f"{member_path}[{index}]")
+                else:
+                    inspect_untyped(item, path=member_path)
+                continue
+            if key in _JSON_SCHEMA_LEGACY_SCHEMA_OR_ARRAY_MEMBERS:
+                if type(item) is dict:
+                    inspect_schema(item, path=member_path)
+                elif type(item) is list:
+                    for index, member in enumerate(item):
+                        if type(member) is dict:
+                            inspect_schema(member, path=f"{member_path}[{index}]")
+                        else:
+                            inspect_untyped(member, path=f"{member_path}[{index}]")
+                else:
+                    inspect_untyped(item, path=member_path)
+                continue
+            if key == "dependencies" and type(item) is dict:
+                for dynamic_key, dependency in item.items():
+                    require_untrusted_key(dynamic_key, path=member_path)
+                    if type(dependency) in {dict, bool}:
+                        inspect_schema(
+                            dependency,
+                            path=f"{member_path}.{dynamic_key}",
+                        )
+                    else:
+                        inspect_untyped(
+                            dependency,
+                            path=f"{member_path}.{dynamic_key}",
+                        )
+                continue
+            inspect_untyped(item, path=member_path)
+
+    inspect_schema(copied, path=field_name)
+
+
+def json_schema_contains_secret(
+    schema: dict[str, Any],
+    *,
+    redactor: SecretRedactor,
+    field_name: str,
+) -> bool:
+    """Return whether schema-owned keys or any schema value contain a secret."""
+
+    try:
+        require_secret_free_json_schema_keys(
+            schema,
+            redactor=redactor,
+            field_name=field_name,
+        )
+    except ValueError:
+        return True
+    return redactor.redact_json_values(schema) != schema
+
+
+def require_secret_free_structured_output_spec(
+    spec: StructuredOutputSpec | None,
+    *,
+    redactor: SecretRedactor,
+    field_name: str,
+) -> None:
+    """Reject a spec that redaction would change at an execution boundary."""
+
+    if spec is None:
+        return
+    if type(spec) is not StructuredOutputSpec:
+        raise TypeError("Structured output spec must be a StructuredOutputSpec instance.")
+    if not isinstance(redactor, SecretRedactor):
+        raise TypeError("redactor must be a SecretRedactor.")
+    payload = spec.model_dump(mode="json")
+    public_structure = {
+        "json_schema",
+        "max_retries",
+        "name",
+        "repair_prompt",
+        "strategy",
+    }
+    redactor.require_no_secret_keys(
+        {
+            "json_schema": None,
+            "max_retries": payload["max_retries"],
+            "name": payload["name"],
+            "repair_prompt": payload["repair_prompt"],
+            "strategy": payload["strategy"],
+        },
+        field_name=field_name,
+        preserve_keys=public_structure,
+        match_short_substrings=True,
+    )
+    require_secret_free_json_schema_keys(
+        spec.json_schema,
+        redactor=redactor,
+        field_name=f"{field_name}.json_schema",
+    )
+    for authority_field in ("name", "strategy"):
+        value = payload.get(authority_field)
+        if type(value) is str and redactor.redact_text(value) != value:
+            raise ValueError(
+                f"{field_name}.{authority_field} contains a workload secret and cannot "
+                "be used as structured-output execution authority."
+            )
+    redacted_payload = redactor.redact_json_values(
+        payload,
+        preserve_string_fields={"name", "strategy"},
+    )
+    if redacted_payload != payload:
+        raise ValueError(
+            f"{field_name} contains a workload secret and cannot cross the boundary "
+            "without changing execution semantics."
+        )
 
 
 def validate_structured_output_text(

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from tests.provider_traceback_assertions import is_cayu_source_filename
 
 import cayu.mcp as mcp_module
 from cayu import (
@@ -56,7 +57,13 @@ from cayu import (
 )
 from cayu.mcp._jsonrpc import MCP_PROTOCOL_VERSION
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import InMemorySessionStore
+from cayu.runtime import (
+    InMemorySessionStore,
+    ToolPolicy,
+    ToolPolicyDecision,
+    ToolPolicyRequest,
+    ToolPolicyResult,
+)
 from cayu.runtime.sessions import (
     _mcp_authoritative_manifest_hash,
     _mcp_manifest_session_ref,
@@ -284,6 +291,316 @@ def test_mcp_tool_adapter_redacts_injected_secrets_echoed_by_server() -> None:
     assert result.structured["mcp_content"][0]["text"] == f"here is your token: {REDACTED_SECRET}"
     assert result.structured["mcp_structured_content"]["token"] == REDACTED_SECRET
     assert result.structured["mcp_structured_content"]["nested"]["also"] == REDACTED_SECRET
+
+
+@pytest.mark.parametrize("secret", ["text", "type"])
+def test_mcp_tool_adapter_preserves_text_framing_for_short_schema_secret(
+    secret: str,
+) -> None:
+    class RedactingSession(FakeMcpSession):
+        def __init__(self) -> None:
+            super().__init__(
+                definitions=(McpToolDefinition(name="echo", input_schema={"type": "object"}),)
+            )
+            self._secret_redactor = SecretRedactor(secret)
+
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> McpToolResult:
+            del name, arguments
+            return McpToolResult(
+                content=[{"type": "text", "text": "hello world"}],
+            )
+
+    session = RedactingSession()
+    toolset = McpToolset(
+        server=_fake_server_spec(),
+        session=session,
+        definitions=session.definitions,
+    )
+
+    result = asyncio.run(
+        toolset.tools[0].run(ToolContext(session_id="sess_1", agent_name="assistant"), {})
+    )
+
+    assert result.content == "hello world"
+    assert result.structured["mcp_content"] == [{"type": "text", "text": "hello world"}]
+
+
+@pytest.mark.parametrize(
+    "secret_offset_from_boundary",
+    [-128, -8, 64],
+    ids=["before-boundary", "crosses-boundary", "after-boundary"],
+)
+def test_mcp_tool_adapter_redacts_structured_secret_before_byte_truncation(
+    secret_offset_from_boundary: int,
+) -> None:
+    secret = "密钥🔐boundary-canary"
+    rendered_prefix = 'Structured MCP content:\n{\n  "token": "'
+    secret_start = 20_000 + secret_offset_from_boundary
+    padding = "a" * (secret_start - len(rendered_prefix.encode("utf-8")))
+
+    class RedactingSession(FakeMcpSession):
+        def __init__(self) -> None:
+            super().__init__(
+                definitions=(McpToolDefinition(name="echo", input_schema={"type": "object"}),)
+            )
+            self._secret_redactor = SecretRedactor(secret)
+
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> McpToolResult:
+            del name, arguments
+            return McpToolResult(
+                content=[],
+                structured_content={"token": padding + secret + "-suffix"},
+            )
+
+    session = RedactingSession()
+    toolset = McpToolset(
+        server=_fake_server_spec(),
+        session=session,
+        definitions=session.definitions,
+    )
+    result = asyncio.run(
+        toolset.tools[0].run(ToolContext(session_id="sess_1", agent_name="assistant"), {})
+    )
+
+    assert secret not in result.content
+    assert secret not in json.dumps(result.structured, ensure_ascii=False)
+    assert result.structured["mcp_structured_content"]["token"].endswith(
+        f"{REDACTED_SECRET}-suffix"
+    )
+    if secret_offset_from_boundary == -8:
+        assert "密钥" not in result.content
+
+
+def test_mcp_toolset_redacts_session_secret_from_provider_definitions_and_manifest() -> None:
+    secret = "mcp-definition-boundary-canary"
+
+    class RedactingSession(FakeMcpSession):
+        def __init__(self) -> None:
+            super().__init__(
+                initialize_result=McpInitializeResult(
+                    protocol_version=MCP_PROTOCOL_VERSION,
+                    server_name=f"server-{secret}",
+                    server_version=f"version-{secret}",
+                    instructions=f"Always authenticate with {secret}.",
+                    capabilities={"authentication": secret},
+                ),
+                definitions=(
+                    McpToolDefinition(
+                        name="echo",
+                        description=f"Echo using {secret}.",
+                        input_schema={
+                            "type": "object",
+                            "properties": {"text": {"description": f"Authenticated by {secret}"}},
+                        },
+                        annotations={"title": f"Echo with {secret}"},
+                    ),
+                ),
+            )
+            self._secret_redactor = SecretRedactor(secret)
+
+    session = RedactingSession()
+    toolset = McpToolset(
+        server=_fake_server_spec(),
+        session=session,
+        definitions=session.definitions,
+    )
+
+    serialized = json.dumps(
+        {
+            "initialize": toolset.initialize_result.model_dump(mode="json"),
+            "definitions": [
+                definition.model_dump(mode="json") for definition in toolset.definitions
+            ],
+            "tools": [
+                {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "schema": tool.schema,
+                }
+                for tool in toolset.tools
+            ],
+            "manifest_tools": toolset.manifest_tools,
+            "manifest_hash": toolset.manifest_hash,
+        }
+    )
+
+    assert secret not in serialized
+    assert REDACTED_SECRET in serialized
+    binding = toolset.tools[0]._manifest_binding
+    assert binding.source_contract_hash != binding.manifest_contract_hash
+    assert any(
+        entry.mcp_name == binding.manifest_mcp_name
+        and entry.contract_hash == binding.manifest_contract_hash
+        for entry in toolset._manifest_snapshot.tools
+    )
+
+
+def test_runtime_composes_mcp_session_secrets_before_durable_tool_checkpoint() -> None:
+    secret = "mcp-invocation-checkpoint-canary"
+
+    class SecretSession(FakeMcpSession):
+        def __init__(self) -> None:
+            super().__init__(
+                definitions=(
+                    McpToolDefinition(
+                        name="echo",
+                        description="Echo text.",
+                        input_schema={"type": "object"},
+                    ),
+                )
+            )
+            self._secret_redactor = SecretRedactor(secret)
+            self.calls = 0
+
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> McpToolResult:
+            del name, arguments
+            self.calls += 1
+            return McpToolResult(content=[{"type": "text", "text": "unexpected"}])
+
+    async def run():
+        session = SecretSession()
+        toolset = McpToolset(
+            server=McpServerSpec(
+                name="private-mcp",
+                connection_id="private-mcp-checkpoint",
+                command=["unused"],
+            ),
+            session=session,
+            definitions=session.definitions,
+        )
+        provider = FakeProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="call_secret",
+                        name=toolset.tools[0].name,
+                        arguments={"token": secret},
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ]
+            ]
+        )
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=toolset.tools,
+        )
+        events = await _collect_events(
+            app.run(
+                RunRequest(
+                    session_id="mcp_invocation_checkpoint",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "use the tool")],
+                )
+            )
+        )
+        checkpoint = await store.load_checkpoint("mcp_invocation_checkpoint")
+        transcript = await store.load_transcript("mcp_invocation_checkpoint")
+        return events, checkpoint, transcript, session.calls
+
+    events, checkpoint, transcript, calls = asyncio.run(run())
+    serialized = json.dumps(
+        {
+            "events": [event.model_dump(mode="json") for event in events],
+            "checkpoint": checkpoint,
+            "transcript": [message.model_dump(mode="json") for message in transcript],
+        }
+    )
+
+    assert events[-1].type == EventType.SESSION_FAILED
+    assert calls == 0
+    assert checkpoint is None
+    assert secret not in serialized
+
+
+def test_runtime_uses_mcp_session_redactor_for_policy_denial_branches() -> None:
+    secret = "mcp-policy-branch-canary"
+
+    class SecretSession(FakeMcpSession):
+        def __init__(self) -> None:
+            super().__init__(
+                definitions=(
+                    McpToolDefinition(
+                        name="echo",
+                        description="Echo text.",
+                        input_schema={"type": "object"},
+                    ),
+                )
+            )
+            self._secret_redactor = SecretRedactor(secret)
+            self.calls = 0
+
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> McpToolResult:
+            del name, arguments
+            self.calls += 1
+            return McpToolResult(content=[{"type": "text", "text": "unexpected"}])
+
+    class SecretDenyPolicy(ToolPolicy):
+        async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+            del request
+            return ToolPolicyResult(
+                decision=ToolPolicyDecision.DENY,
+                reason=f"server policy denied {secret}",
+                metadata={"diagnostic": secret},
+            )
+
+    async def run():
+        session = SecretSession()
+        toolset = McpToolset(
+            server=McpServerSpec(
+                name="private-mcp",
+                connection_id="private-mcp-policy",
+                command=["unused"],
+            ),
+            session=session,
+            definitions=session.definitions,
+        )
+        provider = FakeProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="call_policy",
+                        name=toolset.tools[0].name,
+                        arguments={"text": "safe"},
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ],
+                [ModelStreamEvent.completed({"finish_reason": "stop"})],
+            ]
+        )
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=toolset.tools,
+            tool_policy=SecretDenyPolicy(),
+        )
+        emitted = await _collect_events(
+            app.run(
+                RunRequest(
+                    session_id="mcp_policy_branch_redaction",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "use the tool")],
+                )
+            )
+        )
+        persisted = await store.load_events("mcp_policy_branch_redaction")
+        return emitted, persisted, session.calls
+
+    emitted, persisted, calls = asyncio.run(run())
+
+    assert calls == 0
+    assert any(event.type == EventType.TOOL_CALL_BLOCKED for event in emitted)
+    assert emitted[-1].type == EventType.SESSION_COMPLETED
+    serialized = json.dumps(
+        [event.model_dump(mode="json") for event in [*emitted, *persisted]],
+        default=str,
+    )
+    assert secret not in serialized
+    assert REDACTED_SECRET in serialized
 
 
 def test_mcp_tool_adapter_derives_parallel_safe_from_read_only_hint() -> None:
@@ -959,6 +1276,45 @@ def test_runtime_emits_first_seen_mcp_manifest_event() -> None:
     assert "tools" not in payload
     assert "server" not in payload
     assert len(records) == 1
+
+
+def test_runtime_admits_sanitized_manifest_with_private_binding_hash() -> None:
+    secret = "mcp-private-binding-canary"
+    definitions = (
+        McpToolDefinition(
+            name="echo",
+            description=f"Echo using {secret}.",
+            input_schema={"type": "object"},
+        ),
+    )
+    session = FakeMcpSession(definitions=definitions)
+    session._secret_redactor = SecretRedactor(secret)
+    toolset = McpToolset(
+        server=McpServerSpec(
+            name="private-mcp",
+            connection_id="private-mcp-binding",
+            command=["unused"],
+        ),
+        session=session,
+        definitions=definitions,
+    )
+
+    async def run():
+        store = InMemorySessionStore()
+        await _run_mcp_manifest_session(
+            store=store,
+            session_id="mcp_private_binding",
+            toolset=toolset,
+        )
+        return await store.query_events(
+            EventQuery(event_type=EventType.MCP_MANIFEST_CHECKED, limit=10)
+        )
+
+    records = asyncio.run(run())
+
+    assert len(records) == 1
+    assert records[0].event.payload["outcome"] == "accepted"
+    assert secret not in json.dumps(records[0].event.model_dump(mode="json"))
 
 
 def test_runtime_marks_mcp_manifest_unchanged_across_sessions() -> None:
@@ -3483,11 +3839,14 @@ def test_stdio_mcp_client_list_tools_follows_next_cursor() -> None:
 
 
 def test_collect_paginated_rejects_repeated_cursor() -> None:
-    from cayu.mcp._jsonrpc import collect_paginated
+    from cayu.mcp._jsonrpc import McpPaginatedPage, collect_paginated
 
     async def request(method, params):
         # Always hand back the same cursor -> would loop forever without a guard.
-        return {"tools": [{"name": params.get("cursor", "first")}], "nextCursor": "stuck"}
+        return McpPaginatedPage(
+            {"tools": [{"name": params.get("cursor", "first")}]},
+            "stuck",
+        )
 
     with pytest.raises(McpProtocolError, match="repeated pagination cursor"):
         asyncio.run(collect_paginated(request, "tools/list", "tools"))
@@ -3499,15 +3858,15 @@ def test_mcp_pagination_defaults_are_public_and_bounded() -> None:
 
 
 def test_collect_paginated_accepts_exact_page_and_item_limits() -> None:
-    from cayu.mcp._jsonrpc import collect_paginated
+    from cayu.mcp._jsonrpc import McpPaginatedPage, collect_paginated
 
     calls: list[dict[str, Any]] = []
 
     async def request(method, params):
-        calls.append(params)
+        calls.append(dict(params))
         if not params:
-            return {"tools": [{"name": "first"}], "nextCursor": "next"}
-        return {"tools": [{"name": "second"}]}
+            return McpPaginatedPage({"tools": [{"name": "first"}]}, "next")
+        return McpPaginatedPage({"tools": [{"name": "second"}]})
 
     result = asyncio.run(
         collect_paginated(
@@ -3524,17 +3883,17 @@ def test_collect_paginated_accepts_exact_page_and_item_limits() -> None:
 
 
 def test_collect_paginated_stops_before_requesting_page_over_limit() -> None:
-    from cayu.mcp._jsonrpc import collect_paginated
+    from cayu.mcp._jsonrpc import McpPaginatedPage, collect_paginated
 
     calls: list[dict[str, Any]] = []
 
     async def request(method, params):
-        calls.append(params)
+        calls.append(dict(params))
         cursor_number = len(calls)
-        return {
-            "tools": [{"name": f"tool-{cursor_number}"}],
-            "nextCursor": f"cursor-{cursor_number}",
-        }
+        return McpPaginatedPage(
+            {"tools": [{"name": f"tool-{cursor_number}"}]},
+            f"cursor-{cursor_number}",
+        )
 
     with pytest.raises(
         McpProtocolError,
@@ -3554,12 +3913,12 @@ def test_collect_paginated_stops_before_requesting_page_over_limit() -> None:
 
 
 def test_collect_paginated_rejects_oversized_cumulative_items() -> None:
-    from cayu.mcp._jsonrpc import collect_paginated
+    from cayu.mcp._jsonrpc import McpPaginatedPage, collect_paginated
 
     async def request(method, params):
         if not params:
-            return {"resources": [{"uri": "one"}], "nextCursor": "next"}
-        return {"resources": [{"uri": "two"}, {"uri": "three"}]}
+            return McpPaginatedPage({"resources": [{"uri": "one"}]}, "next")
+        return McpPaginatedPage({"resources": [{"uri": "two"}, {"uri": "three"}]})
 
     with pytest.raises(
         McpProtocolError,
@@ -3615,23 +3974,263 @@ def test_stdio_mcp_client_applies_configured_page_limit() -> None:
 
 
 def test_collect_paginated_treats_blank_cursor_as_end_of_list() -> None:
-    from cayu.mcp._jsonrpc import collect_paginated
+    from cayu.mcp._jsonrpc import McpPaginatedPage, collect_paginated
 
     async def request(method, params):
         assert params == {}
-        return {"tools": [{"name": "only"}], "nextCursor": ""}
+        return McpPaginatedPage({"tools": [{"name": "only"}]}, "")
 
     assert asyncio.run(collect_paginated(request, "tools/list", "tools")) == [{"name": "only"}]
 
 
 def test_collect_paginated_rejects_non_string_cursor() -> None:
-    from cayu.mcp._jsonrpc import collect_paginated
+    from cayu.mcp._jsonrpc import McpPaginatedPage, collect_paginated
 
     async def request(method, params):
-        return {"tools": [], "nextCursor": 42}
+        return McpPaginatedPage({"tools": []}, 42)
 
     with pytest.raises(McpProtocolError, match="nextCursor must be a string"):
         asyncio.run(collect_paginated(request, "tools/list", "tools"))
+
+
+def _assert_traceback_does_not_retain_text(error: BaseException, text: str) -> None:
+    traceback = error.__traceback__
+    while traceback is not None:
+        if is_cayu_source_filename(traceback.tb_frame.f_code.co_filename):
+            retained = {
+                name: type(value).__name__
+                for name, value in traceback.tb_frame.f_locals.items()
+                if text in repr(value)
+            }
+            assert retained == {}, (
+                traceback.tb_frame.f_code.co_filename,
+                traceback.tb_frame.f_code.co_name,
+                retained,
+            )
+        traceback = traceback.tb_next
+
+
+def test_collect_paginated_does_not_retain_private_cursor_in_request_failure() -> None:
+    from cayu.mcp._jsonrpc import McpPaginatedPage, collect_paginated
+
+    cursor = "private-cursor-request-failure-canary"
+    redactor = SecretRedactor("different-configured-workload-secret")
+    calls = 0
+
+    async def request(method, params):
+        nonlocal calls
+        del method
+        calls += 1
+        if calls == 1:
+            return McpPaginatedPage({"tools": []}, cursor)
+        raise RuntimeError(f"server rejected {params['cursor']}")
+
+    with pytest.raises(McpProtocolError) as exc_info:
+        asyncio.run(
+            collect_paginated(
+                request,
+                "tools/list",
+                "tools",
+                redactor=redactor,
+            )
+        )
+
+    assert cursor not in str(exc_info.value)
+    assert REDACTED_SECRET in str(exc_info.value)
+    _assert_traceback_does_not_retain_text(exc_info.value, cursor)
+
+
+def test_collect_paginated_does_not_retain_private_cursor_on_later_page_validation() -> None:
+    from cayu.mcp._jsonrpc import McpPaginatedPage, collect_paginated
+
+    cursor = "private-cursor-later-validation-canary"
+    calls = 0
+
+    async def request(method, params):
+        nonlocal calls
+        del method
+        calls += 1
+        if calls == 1:
+            return McpPaginatedPage({"tools": []}, cursor)
+        assert params["cursor"] == cursor
+        return McpPaginatedPage("invalid-result")
+
+    with pytest.raises(McpProtocolError, match="result must be an object") as exc_info:
+        asyncio.run(
+            collect_paginated(
+                request,
+                "tools/list",
+                "tools",
+                redactor=SecretRedactor(cursor),
+            )
+        )
+
+    _assert_traceback_does_not_retain_text(exc_info.value, cursor)
+
+
+def test_collect_paginated_contains_hostile_exception_rendering() -> None:
+    from cayu.mcp._jsonrpc import McpPaginatedPage, collect_paginated
+
+    cursor = "private-cursor-hostile-rendering-canary"
+    calls = 0
+
+    class HostileRenderingError(RuntimeError):
+        def __str__(self) -> str:
+            raise KeyboardInterrupt(f"hostile renderer retained {cursor}")
+
+    async def request(method, params):
+        nonlocal calls
+        del method
+        calls += 1
+        if calls == 1:
+            return McpPaginatedPage({"tools": []}, cursor)
+        assert params["cursor"] == cursor
+        raise HostileRenderingError("private request failure")
+
+    with pytest.raises(McpProtocolError, match="paginated request failed") as exc_info:
+        asyncio.run(
+            collect_paginated(
+                request,
+                "tools/list",
+                "tools",
+                redactor=SecretRedactor(cursor),
+            )
+        )
+
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    _assert_traceback_does_not_retain_text(exc_info.value, cursor)
+
+
+def test_collect_paginated_detaches_nested_group_with_private_cursor() -> None:
+    from cayu.mcp._jsonrpc import McpPaginatedPage, collect_paginated
+
+    cursor = "private-cursor-group-canary"
+    calls = 0
+
+    async def request(method, params):
+        nonlocal calls
+        del method
+        calls += 1
+        if calls == 1:
+            return McpPaginatedPage({"tools": []}, cursor)
+        assert params["cursor"] == cursor
+        raise BaseExceptionGroup(
+            f"outer group retained {cursor}",
+            [
+                BaseExceptionGroup(
+                    f"inner group retained {cursor}",
+                    [
+                        asyncio.CancelledError(f"cancelled with {cursor}"),
+                        RuntimeError(f"failed with {cursor}"),
+                    ],
+                )
+            ],
+        )
+
+    with pytest.raises(BaseExceptionGroup) as exc_info:
+        asyncio.run(
+            collect_paginated(
+                request,
+                "tools/list",
+                "tools",
+                redactor=SecretRedactor("different-configured-workload-secret"),
+            )
+        )
+
+    error = exc_info.value
+    assert cursor not in repr(error)
+    assert REDACTED_SECRET in repr(error)
+    assert isinstance(error.exceptions[0], BaseExceptionGroup)
+    nested = error.exceptions[0]
+    assert isinstance(nested.exceptions[0], asyncio.CancelledError)
+    assert isinstance(nested.exceptions[1], McpProtocolError)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    _assert_traceback_does_not_retain_text(error, cursor)
+
+
+@pytest.mark.parametrize("fatal_type", [KeyboardInterrupt, SystemExit, GeneratorExit])
+def test_collect_paginated_detaches_scalar_fatal_signal_with_private_cursor(
+    fatal_type: type[BaseException],
+) -> None:
+    from cayu.mcp._jsonrpc import McpPaginatedPage, collect_paginated
+
+    cursor = f"private-cursor-{fatal_type.__name__}-canary"
+    calls = 0
+
+    async def request(method, params):
+        nonlocal calls
+        del method
+        calls += 1
+        if calls == 1:
+            return McpPaginatedPage({"tools": []}, cursor)
+        assert params["cursor"] == cursor
+        raise fatal_type(f"fatal signal retained {params['cursor']}")
+
+    async def scenario() -> BaseException:
+        with pytest.raises(fatal_type) as exc_info:
+            await collect_paginated(
+                request,
+                "tools/list",
+                "tools",
+                redactor=SecretRedactor("different-configured-workload-secret"),
+            )
+        return exc_info.value
+
+    error = asyncio.run(scenario())
+    assert cursor not in repr(error)
+    assert REDACTED_SECRET in repr(error)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    _assert_traceback_does_not_retain_text(error, cursor)
+
+
+def test_collect_paginated_does_not_retain_private_cursor_on_real_cancellation() -> None:
+    from cayu.mcp._jsonrpc import McpPaginatedPage, collect_paginated
+
+    cursor = "private-cursor-cancellation-canary"
+
+    async def scenario() -> tuple[asyncio.CancelledError, int, bool]:
+        second_request_started = asyncio.Event()
+        calls = 0
+
+        async def request(method, params):
+            nonlocal calls
+            del method
+            calls += 1
+            if calls == 1:
+                return McpPaginatedPage({"resources": []}, cursor)
+            assert params["cursor"] == cursor
+            second_request_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise asyncio.CancelledError(
+                    f"transport cancelled while sending {params['cursor']}"
+                ) from None
+
+        task = asyncio.create_task(
+            collect_paginated(
+                request,
+                "resources/list",
+                "resources",
+                redactor=SecretRedactor("different-configured-workload-secret"),
+            )
+        )
+        await second_request_started.wait()
+        task.cancel("caller cancelled")
+        cancelling = task.cancelling()
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+        return exc_info.value, cancelling, task.cancelled()
+
+    cancellation, cancelling, cancelled = asyncio.run(scenario())
+
+    assert cancelling == 1
+    assert cancelled is True
+    assert cancellation.args == (f"transport cancelled while sending {REDACTED_SECRET}",)
+    _assert_traceback_does_not_retain_text(cancellation, cursor)
 
 
 def test_stdio_mcp_client_times_out_blocked_initialized_notification_write() -> None:
@@ -3792,17 +4391,63 @@ def test_mcp_toolset_connect_preserves_original_error_when_cleanup_is_cancelled(
     assert asyncio.run(run()) is True
 
 
+def test_mcp_toolset_connect_redacts_discovery_failure_before_propagation() -> None:
+    secret = "mcp-discovery-failure-canary"
+
+    async def run():
+        session = FakeMcpSession(list_tools_error=RuntimeError(f"discovery failed {secret}"))
+        session._secret_redactor = SecretRedactor(secret)
+        with pytest.raises(McpProtocolError) as excinfo:
+            await connect_mcp_toolset(_fake_server_spec(), client=FakeMcpClient(session))
+        return session.closed, excinfo.value
+
+    closed, error = asyncio.run(run())
+
+    assert closed is True
+    assert secret not in str(error)
+    assert REDACTED_SECRET in str(error)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+def test_mcp_toolset_connect_detaches_safe_discovery_error_from_secret_definitions() -> None:
+    secret = "mcp-discovery-definition-secret-canary"
+    definition = McpToolDefinition(
+        name="duplicate",
+        description=f"private description {secret}",
+        input_schema={"type": "object"},
+    )
+
+    async def run():
+        session = FakeMcpSession(definitions=(definition, definition))
+        session._secret_redactor = SecretRedactor(secret)
+        with pytest.raises(McpProtocolError, match="duplicate") as excinfo:
+            await connect_mcp_toolset(_fake_server_spec(), client=FakeMcpClient(session))
+        return session.closed, excinfo.value
+
+    closed, error = asyncio.run(run())
+
+    assert closed is True
+    _assert_mcp_traceback_does_not_retain_secret(error, secret)
+
+
 def test_mcp_toolset_connect_preserves_original_cancellation_when_cleanup_fails() -> None:
+    secret = "mcp-cancel-cleanup-canary"
+
     async def run():
         session = FakeMcpSession(
             list_tools_error=asyncio.CancelledError(),
-            close_error=RuntimeError("cleanup failed"),
+            close_error=RuntimeError(f"cleanup failed {secret}"),
         )
-        with pytest.raises(asyncio.CancelledError):
+        session._secret_redactor = SecretRedactor(secret)
+        with pytest.raises(asyncio.CancelledError) as excinfo:
             await connect_mcp_toolset(_fake_server_spec(), client=FakeMcpClient(session))
-        return session.closed
+        return session.closed, excinfo.value
 
-    assert asyncio.run(run()) is True
+    closed, error = asyncio.run(run())
+
+    assert closed is True
+    assert secret not in repr(error)
 
 
 def test_mcp_tool_adapter_runs_through_cayu_runtime() -> None:
@@ -3891,8 +4536,12 @@ def test_stdio_mcp_client_injects_secret_env_into_child_process() -> None:
     )
     vault = StaticVault({"protocol": "1999-01-01"})
 
-    with pytest.raises(McpProtocolError, match="1999-01-01"):
+    with pytest.raises(McpProtocolError) as excinfo:
         asyncio.run(StdioMcpClient(secret_resolver=vault).connect(spec))
+    assert "1999-01-01" not in str(excinfo.value)
+    assert REDACTED_SECRET in str(excinfo.value)
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
     assert not any("1999-01-01" in item for item in spec.command)
 
 
@@ -4139,6 +4788,215 @@ def test_stdio_mcp_client_redacts_secret_stderr_tail_on_startup_crash() -> None:
     assert "closed stdout" in message
     assert "mcp-secret-token" not in message
     assert REDACTED_SECRET in message
+
+
+def test_stdio_mcp_client_redacts_secret_before_bounding_stderr_tail() -> None:
+    secret = "mcp-stderr-split-boundary-canary"
+    retained_secret_suffix = secret[len(secret) // 2 :]
+    trailing_bytes = 8192 - len(retained_secret_suffix.encode())
+
+    async def run():
+        script = (
+            "import os, sys; "
+            "secret = os.environ['TOKEN']; "
+            f"sys.stderr.write('p' * 100 + secret + 'z' * {trailing_bytes}); "
+            "sys.stderr.flush()"
+        )
+        spec = McpServerSpec(
+            name="crash-secret-mcp",
+            command=[sys.executable, "-c", script],
+            secret_env={"TOKEN": SecretRef(name="token")},
+        )
+        vault = StaticVault({"token": secret})
+        with pytest.raises(McpProtocolError) as excinfo:
+            await StdioMcpClient(secret_resolver=vault).connect(spec)
+        return str(excinfo.value)
+
+    message = asyncio.run(run())
+
+    assert secret not in message
+    assert retained_secret_suffix not in message
+    assert REDACTED_SECRET in message
+
+
+def test_stdio_invalid_json_error_does_not_retain_raw_decoder_document() -> None:
+    secret = "mcp-stdio-invalid-json-canary"
+    spec = McpServerSpec(
+        name="invalid-json",
+        command=[
+            sys.executable,
+            "-c",
+            "import os; print('not-json-' + os.environ['TOKEN'], flush=True)",
+        ],
+        secret_env={"TOKEN": SecretRef(name="token")},
+    )
+
+    async def run():
+        with pytest.raises(McpProtocolError) as excinfo:
+            await StdioMcpClient(secret_resolver=StaticVault({"token": secret})).connect(spec)
+        return excinfo.value
+
+    error = asyncio.run(run())
+
+    _assert_mcp_traceback_does_not_retain_secret(error, secret)
+
+
+@pytest.mark.parametrize(
+    ("response_mode", "error_match"),
+    [
+        ("non_object", "must be an object"),
+        ("wrong_version", "jsonrpc='2.0'"),
+    ],
+)
+def test_stdio_structurally_invalid_json_does_not_retain_secret_payload(
+    response_mode: str,
+    error_match: str,
+) -> None:
+    secret = f"mcp-stdio-{response_mode}-json-canary"
+    spec = McpServerSpec(
+        name="structurally-invalid-json",
+        command=[sys.executable, str(_FAKE_SERVER)],
+        env={"CAYU_FAKE_MCP_STRUCTURAL_RESPONSE": response_mode},
+        secret_env={
+            "CAYU_FAKE_MCP_STRUCTURAL_CANARY": SecretRef(name="token"),
+        },
+    )
+
+    async def run():
+        session = await StdioMcpClient(secret_resolver=StaticVault({"token": secret})).connect(spec)
+        try:
+            with pytest.raises(McpProtocolError, match=error_match) as excinfo:
+                await session.list_tools()
+            return excinfo.value
+        finally:
+            await session.close()
+
+    error = asyncio.run(run())
+
+    _assert_mcp_traceback_does_not_retain_secret(error, secret)
+
+
+@pytest.mark.parametrize(
+    ("response_mode", "error_match"),
+    [
+        ("non_finite", "invalid portable JSON"),
+        ("non_finite_cursor", "invalid portable JSON"),
+        ("unclean_identity", "clean nonblank"),
+        ("ambiguous_identity_first", "invalid tool definition"),
+        ("ambiguous_identity_last", "invalid tool definition"),
+        ("ambiguous_identity_only", "invalid tool definition"),
+    ],
+)
+def test_stdio_post_parse_failure_does_not_retain_secret_payload(
+    response_mode: str,
+    error_match: str,
+) -> None:
+    secret = f"mcp-stdio-{response_mode}-json-canary"
+    spec = McpServerSpec(
+        name="post-parse-invalid-json",
+        command=[sys.executable, str(_FAKE_SERVER)],
+        env={"CAYU_FAKE_MCP_STRUCTURAL_RESPONSE": response_mode},
+        secret_env={
+            "CAYU_FAKE_MCP_STRUCTURAL_CANARY": SecretRef(name="token"),
+        },
+    )
+
+    async def run():
+        session = await StdioMcpClient(secret_resolver=StaticVault({"token": secret})).connect(spec)
+        assert isinstance(session, StdioMcpSession)
+        try:
+            with pytest.raises(McpProtocolError, match=error_match) as excinfo:
+                await session.list_tools()
+            return dict(session._tool_transport_names), excinfo.value
+        finally:
+            await session.close()
+
+    mapping, error = asyncio.run(run())
+
+    assert mapping == {}
+    _assert_mcp_traceback_does_not_retain_secret(error, secret)
+
+
+@pytest.mark.parametrize(
+    "response_mode",
+    [
+        "ambiguous_identity_first",
+        "ambiguous_identity_last",
+        "ambiguous_identity_only",
+    ],
+)
+def test_stdio_ambiguous_resource_authority_never_commits_private_mapping(
+    response_mode: str,
+) -> None:
+    secret = f"mcp-stdio-{response_mode}-resource-authority-canary"
+    spec = McpServerSpec(
+        name="post-parse-invalid-resource",
+        command=[sys.executable, str(_FAKE_SERVER)],
+        env={
+            "CAYU_FAKE_MCP_STRUCTURAL_RESPONSE": response_mode,
+            "CAYU_FAKE_MCP_STRUCTURAL_METHOD": "resources/list",
+        },
+        secret_env={
+            "CAYU_FAKE_MCP_STRUCTURAL_CANARY": SecretRef(name="token"),
+        },
+    )
+
+    async def run():
+        session = await StdioMcpClient(secret_resolver=StaticVault({"token": secret})).connect(spec)
+        assert isinstance(session, StdioMcpSession)
+        try:
+            with pytest.raises(
+                McpProtocolError,
+                match="invalid resource definition",
+            ) as excinfo:
+                await session.list_resources()
+            return dict(session._resource_transport_uris), excinfo.value
+        finally:
+            await session.close()
+
+    mapping, error = asyncio.run(run())
+
+    assert mapping == {}
+    _assert_mcp_traceback_does_not_retain_secret(error, secret)
+
+
+def test_stdio_invalid_initialize_envelope_does_not_retain_secret_config() -> None:
+    secret = "mcp-stdio-initialize-json-canary"
+    spec = McpServerSpec(
+        name="structurally-invalid-initialize",
+        command=[sys.executable, str(_FAKE_SERVER)],
+        env={
+            "CAYU_FAKE_MCP_STRUCTURAL_RESPONSE": "wrong_version",
+            "CAYU_FAKE_MCP_STRUCTURAL_METHOD": "initialize",
+        },
+        secret_env={
+            "CAYU_FAKE_MCP_STRUCTURAL_CANARY": SecretRef(name="token"),
+        },
+    )
+
+    async def run():
+        with pytest.raises(McpProtocolError, match="jsonrpc='2.0'") as excinfo:
+            await StdioMcpClient(secret_resolver=StaticVault({"token": secret})).connect(spec)
+        return excinfo.value
+
+    error = asyncio.run(run())
+
+    _assert_mcp_traceback_does_not_retain_secret(error, secret)
+
+
+def _assert_mcp_traceback_does_not_retain_secret(
+    error: BaseException,
+    secret: str,
+) -> None:
+    assert secret not in str(error)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    traceback = error.__traceback__
+    while traceback is not None:
+        if is_cayu_source_filename(traceback.tb_frame.f_code.co_filename):
+            for value in traceback.tb_frame.f_locals.values():
+                assert secret not in repr(value)
+        traceback = traceback.tb_next
 
 
 def test_stdio_mcp_session_fast_fails_after_reader_stops() -> None:

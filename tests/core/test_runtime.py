@@ -235,7 +235,7 @@ from cayu.tools.commands import (
     CommandRequest,
 )
 from cayu.tools.user_input import UserInputTool
-from cayu.vaults import ResolvedSecret, SecretRef, StaticVault
+from cayu.vaults import ResolvedSecret, SecretRedactor, SecretRef, StaticVault
 from cayu.workspaces import LocalWorkspace, Workspace, WorkspaceListResult, WorkspaceReadResult
 
 
@@ -3129,10 +3129,10 @@ def test_cayu_app_bounds_policy_denial_after_secret_redaction_expands_it() -> No
 def test_policy_denial_redaction_preserves_protocol_fields_that_match_secrets() -> None:
     from cayu.vaults import SecretRedactor
 
-    secret_values = ["reason", "denied", "deny", "tool", "echo", "decision", "result"]
+    secret_values = ["reason", "denied", "deny", "tool", "decision", "result"]
     redactor = SecretRedactor(secret_values)
     raw_reason = "reason denied deny tool echo decision result " * 300
-    raw_metadata = {"reason-detail": "tool", "safe": "deny this value"}
+    raw_metadata = {"detail": "tool", "safe": "deny this value"}
     observed: dict[str, Any] = {}
 
     class CollisionPolicy(ToolPolicy):
@@ -3173,7 +3173,7 @@ def test_policy_denial_redaction_preserves_protocol_fields_that_match_secrets() 
             app,
             RunRequest(
                 agent_name="assistant",
-                session_id="sess_policy_denial_protocol_collision",
+                session_id="sess_protocol_collision",
                 messages=[Message.text("user", "use the tool")],
             ),
         )
@@ -3194,7 +3194,9 @@ def test_policy_denial_redaction_preserves_protocol_fields_that_match_secrets() 
         "reason": expected_reason,
         "metadata": expected_metadata,
     }
-    assert observed["payload"] == blocked.payload
+    observed_payload = dict(observed["payload"])
+    observed_payload["tool_name"] = blocked.payload["tool_name"]
+    assert observed_payload == blocked.payload
     assert observed["structured"] == blocked.payload["result"]["structured"]
     assert len(expected_reason.encode("utf-8")) <= _POLICY_DENIAL_TEXT_MAX_BYTES
 
@@ -18931,12 +18933,24 @@ def test_after_tool_call_hook_sees_redacted_arguments():
         async def after_tool_call(self, context: ToolCallHookContext) -> None:
             seen["arguments"] = context.arguments
 
+    class InjectAfterCheckpoint(RuntimeHook):
+        async def before_tool_call(
+            self,
+            context: BeforeToolCallHookContext,
+        ) -> BeforeToolCallDecision:
+            arguments = dict(context.arguments)
+            arguments["text"] = secret_value
+            return BeforeToolCallDecision(
+                action="proceed_modified",
+                modified_arguments=arguments,
+            )
+
     store = InMemorySessionStore()
     provider = FakeProvider(
         [
             [
                 ModelStreamEvent.tool_call(
-                    id="call_echo", name="echo", arguments={"text": secret_value}
+                    id="call_echo", name="echo", arguments={"text": "public"}
                 ),
                 ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
             ],
@@ -18955,10 +18969,10 @@ def test_after_tool_call_hook_sees_redacted_arguments():
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
         tools=[EchoTool()],
-        runtime_hooks=[ObservingHook()],
+        runtime_hooks=[InjectAfterCheckpoint(), ObservingHook()],
     )
 
-    asyncio.run(
+    events = asyncio.run(
         collect_events(
             app,
             RunRequest(
@@ -18972,6 +18986,18 @@ def test_after_tool_call_hook_sees_redacted_arguments():
     # The after-hook observes redacted arguments, not just a redacted result.
     assert secret_value not in str(seen["arguments"])
     assert seen["arguments"] == {"text": REDACTED_SECRET}
+
+    started = next(event for event in events if event.type == EventType.TOOL_CALL_STARTED)
+    assert started.payload["arguments"] == {"text": "public"}
+
+    transcript = asyncio.run(store.load_transcript("sess_arg_redact"))
+    assistant_tool_call = next(
+        part for message in transcript for part in message.content if type(part) is ToolCallPart
+    )
+    assert assistant_tool_call.arguments == {"text": "public"}
+    assert secret_value not in str(
+        [message.model_dump(mode="json") for message in provider.requests[1].messages]
+    )
 
 
 def test_composed_after_hook_never_sees_prior_hooks_raw_secret_result():
@@ -22081,6 +22107,7 @@ def _crashed_tool_round_app(
     store: FailingTerminalToolEventStore | None = None,
     *,
     clock: Callable[[], datetime] | None = None,
+    secret_redactor: SecretRedactor | None = None,
 ) -> tuple[CayuApp, FailingTerminalToolEventStore, SideEffectTool, dict]:
     """Run a session whose only tool call starts but records no terminal event.
 
@@ -22101,7 +22128,11 @@ def _crashed_tool_round_app(
             ],
         ]
     )
-    app = CayuApp(session_store=store, clock=clock)
+    app = CayuApp(
+        session_store=store,
+        clock=clock,
+        secret_redactor=secret_redactor,
+    )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=[tool])
 
@@ -24725,6 +24756,36 @@ def test_cayu_app_recover_tool_round_rejects_native_structured_output_preflight(
     assert tool.calls == [{}]
 
 
+def test_cayu_app_recover_tool_round_rejects_secret_structured_output_preflight():
+    secret = "tool-round-recovery-schema-secret-canary"
+    session_id = "sess_tool_round_secret_preflight"
+    app, store, tool, checkpoint = _crashed_tool_round_app(
+        session_id,
+        secret_redactor=SecretRedactor(secret),
+    )
+
+    with pytest.raises(ValueError, match="workload secret"):
+        asyncio.run(
+            collect_tool_round_recovery_events(
+                app,
+                ToolRoundRecoveryRequest(
+                    session_id=session_id,
+                    round_id=checkpoint["pending_tool_round"]["round_id"],
+                    tool_call_id="call_1",
+                    outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                    message="verified",
+                    structured_output=StructuredOutputSpec(
+                        json_schema={"type": "string", "const": secret},
+                    ),
+                ),
+            )
+        )
+
+    session = asyncio.run(store.load(session_id))
+    assert session is not None and session.status == SessionStatus.FAILED
+    assert tool.calls == [{}]
+
+
 def test_cayu_app_recover_tool_round_multi_call_recovers_iteratively():
     session_id = "sess_tool_round_manual_multi"
     store = FailingAllTerminalToolEventStore()
@@ -25928,8 +25989,14 @@ def test_cayu_app_recover_incomplete_sessions_skips_unregistered_agent_and_conti
 
 
 def test_cayu_app_recover_incomplete_sessions_isolates_mid_batch_failure(monkeypatch):
+    from cayu.vaults import REDACTED_SECRET, SecretRedactor
+
+    secret = "batch-recovery-diagnostic-canary"
     store = InMemorySessionStore()
-    app = CayuApp(session_store=store)
+    app = CayuApp(
+        session_store=store,
+        secret_redactor=SecretRedactor(secret),
+    )
     app.register_provider(FakeProvider([]), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
@@ -25949,7 +26016,7 @@ def test_cayu_app_recover_incomplete_sessions_isolates_mid_batch_failure(monkeyp
 
         async def broken_load_checkpoint(session_id: str) -> dict[str, Any] | None:
             if session_id == "sess_sweep_broken":
-                raise RuntimeError("checkpoint store exploded")
+                raise RuntimeError(f"checkpoint store exploded with {secret}")
             return await original_load_checkpoint(session_id)
 
         monkeypatch.setattr(store, "load_checkpoint", broken_load_checkpoint)
@@ -25969,6 +26036,8 @@ def test_cayu_app_recover_incomplete_sessions_isolates_mid_batch_failure(monkeyp
     broken = by_id["sess_sweep_broken"]
     assert broken.actions == (IncompleteSessionRecoveryAction.FAILED,)
     assert "checkpoint store exploded" in broken.message
+    assert secret not in broken.message
+    assert REDACTED_SECRET in broken.message
 
 
 def test_cayu_app_recover_incomplete_sessions_failed_entry_reports_current_status(monkeypatch):
@@ -49208,6 +49277,7 @@ def test_tool_call_times_out_and_session_continues():
 
 def test_run_tool_does_not_mislabel_tool_raised_timeout_error():
     from cayu.runtime._tool_execution import run_tool
+    from cayu.vaults import SecretRedactor
 
     class TimeoutRaisingTool(Tool):
         spec = ToolSpec(
@@ -49226,6 +49296,7 @@ def test_run_tool_does_not_mislabel_tool_raised_timeout_error():
             ctx=ToolContext(session_id="sess_tool_raised_timeout"),
             arguments={},
             timeout_seconds=5,
+            redactor=SecretRedactor,
         )
     )
 

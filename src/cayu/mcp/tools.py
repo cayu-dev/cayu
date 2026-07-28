@@ -10,6 +10,7 @@ from typing import Any
 
 from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.mcp._jsonrpc import McpProtocolError
 from cayu.mcp.base import (
     McpClient,
     McpInitializeResult,
@@ -26,6 +27,7 @@ _TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _UNSAFE_TOOL_NAME_CHARS_RE = re.compile(r"[^A-Za-z0-9_-]+")
 _MAX_STRUCTURED_CONTENT_TEXT_BYTES = 20_000
 _MAX_SERVER_INSTRUCTIONS_DESCRIPTION_CHARS = 1_000
+_MAX_MCP_DISCOVERY_ERROR_BYTES = 4096
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +54,8 @@ class _McpAdapterBinding:
     toolset: McpToolset
     mcp_name: str
     source_contract_hash: str
+    manifest_mcp_name: str
+    manifest_contract_hash: str
 
 
 class McpToolAdapter(Tool):
@@ -69,7 +73,14 @@ class McpToolAdapter(Tool):
         if type(definition) is not McpToolDefinition:
             raise TypeError("definition must be an McpToolDefinition.")
         binding = toolset._bind_adapter_definition(definition)
-        tool_name = name or mcp_cayu_tool_name(toolset.server.name, definition.name)
+        public_definition = _redact_tool_definition(
+            definition,
+            redactor=toolset.secret_redactor,
+        )
+        tool_name = name or mcp_cayu_tool_name(
+            toolset.server.name,
+            public_definition.name,
+        )
         if not _TOOL_NAME_RE.fullmatch(tool_name):
             raise ValueError(
                 "MCP Cayu tool names must contain 1-64 letters, numbers, underscores, or hyphens."
@@ -77,14 +88,14 @@ class McpToolAdapter(Tool):
         self.__binding = binding
         self.__mcp_manifest_hash = toolset.manifest_hash
         self.__server = toolset.server
-        self.__definition = definition.model_copy(deep=True)
+        self.__definition = public_definition
         super().__init__(
             spec=ToolSpec(
                 name=tool_name,
-                description=_tool_description(toolset, definition),
-                input_schema=definition.input_schema,
-                parallel_safe=_mcp_tool_parallel_safe(definition),
-                effect=_mcp_tool_effect(definition),
+                description=_tool_description(toolset, self.__definition),
+                input_schema=self.__definition.input_schema,
+                parallel_safe=_mcp_tool_parallel_safe(self.__definition),
+                effect=_mcp_tool_effect(self.__definition),
             )
         )
 
@@ -117,25 +128,27 @@ class McpToolAdapter(Tool):
         if type(arguments) is not dict:
             raise TypeError("MCP tool arguments must be an object.")
         result = await self.__binding.toolset.call_tool(self.__binding.mcp_name, arguments)
-        content = _mcp_tool_result_text(
-            result.content,
-            structured_content=result.structured_content,
-        )
+        redactor = self.__binding.toolset.secret_redactor
         mcp_content = result.content
         mcp_structured_content = result.structured_content
-        redactor = self.__binding.toolset.secret_redactor
+        if redactor.has_values:
+            # Redact the complete server values before rendering can truncate a
+            # secret across the model-visible structured-content byte boundary.
+            mcp_content = _redact_mcp_content(result.content, redactor=redactor)
+            mcp_structured_content = redactor.redact_json(result.structured_content)
+        content = _mcp_tool_result_text(
+            mcp_content,
+            structured_content=mcp_structured_content,
+        )
         if redactor.has_values:
             # A hostile MCP server can echo injected secrets (secret_env/secret_headers)
-            # back through its result; scrub the rendered text AND the raw content/
-            # structured echoes before they reach model-visible context.
+            # back through its result. Keep a final text pass as defense in depth.
             content = redactor.redact_text(content)
-            mcp_content = redactor.redact_json(result.content)
-            mcp_structured_content = redactor.redact_json(result.structured_content)
         return ToolResult(
             content=content,
             structured={
                 "mcp_server": self.__server.name,
-                "mcp_tool": self.__binding.mcp_name,
+                "mcp_tool": self.__definition.name,
                 "mcp_manifest_hash": self.__mcp_manifest_hash,
                 "mcp_content": mcp_content,
                 "mcp_structured_content": mcp_structured_content,
@@ -158,27 +171,72 @@ class McpToolset:
             raise TypeError("server must be an McpServerSpec.")
         if not isinstance(session, McpSession):
             raise TypeError("session must be an McpSession.")
-        self.__server = server.model_copy(deep=True)
         self.__session = session
-        self.__definitions = tuple(definition.model_copy(deep=True) for definition in definitions)
-        manifest_hash = mcp_tool_manifest_hash(
-            server=self.__server,
-            initialize_result=self.initialize_result,
-            definitions=self.__definitions,
+        redactor = session.secret_redactor
+        raw_definitions = tuple(definition.model_copy(deep=True) for definition in definitions)
+        raw_server = server.model_copy(deep=True)
+        raw_initialize_result = session.initialize_result
+        self.__binding_server = raw_server
+        self.__server = _redact_server_spec(raw_server, redactor=redactor)
+        self.__initialize_result = _redact_initialize_result(
+            session.initialize_result,
+            redactor=redactor,
+        )
+        self.__definitions = tuple(
+            _redact_tool_definition(definition, redactor=redactor) for definition in raw_definitions
+        )
+        binding_manifest_hash = mcp_tool_manifest_hash(
+            server=raw_server,
+            initialize_result=raw_initialize_result,
+            definitions=raw_definitions,
         )
         manifest_identity = mcp_tool_manifest_identity(
+            server=raw_server,
+        )
+        binding_server_hash = mcp_tool_manifest_server_hash(
+            server=raw_server,
+            initialize_result=raw_initialize_result,
+        )
+        binding_manifest_tools = mcp_tool_manifest_tools(
+            server=raw_server,
+            definitions=raw_definitions,
+        )
+        self.__binding_snapshot = _McpManifestSnapshot(
+            identity_is_explicit=raw_server.connection_id is not None,
+            identity=manifest_identity,
+            manifest_hash=binding_manifest_hash,
+            server_hash=binding_server_hash,
+            tools=tuple(
+                _McpManifestToolEvidence(
+                    cayu_name=entry["cayu_name"],
+                    mcp_name=entry["mcp_name"],
+                    contract_hash=entry["hash"],
+                )
+                for entry in binding_manifest_tools
+            ),
+            tool_count=len(raw_definitions),
+        )
+        source_tool_keys = [
+            (entry.cayu_name, entry.mcp_name) for entry in self.__binding_snapshot.tools
+        ]
+        if len(source_tool_keys) != len(set(source_tool_keys)):
+            raise ValueError("MCP tool definitions must not contain duplicate tools.")
+
+        manifest_hash = mcp_tool_manifest_hash(
             server=self.__server,
+            initialize_result=self.__initialize_result,
+            definitions=self.__definitions,
         )
         manifest_server_hash = mcp_tool_manifest_server_hash(
             server=self.__server,
-            initialize_result=self.initialize_result,
+            initialize_result=self.__initialize_result,
         )
         manifest_tools = mcp_tool_manifest_tools(
             server=self.__server,
             definitions=self.__definitions,
         )
         self.__manifest_snapshot = _McpManifestSnapshot(
-            identity_is_explicit=self.__server.connection_id is not None,
+            identity_is_explicit=raw_server.connection_id is not None,
             identity=manifest_identity,
             manifest_hash=manifest_hash,
             server_hash=manifest_server_hash,
@@ -192,13 +250,8 @@ class McpToolset:
             ),
             tool_count=len(self.__definitions),
         )
-        source_tool_keys = [
-            (entry.cayu_name, entry.mcp_name) for entry in self.__manifest_snapshot.tools
-        ]
-        if len(source_tool_keys) != len(set(source_tool_keys)):
-            raise ValueError("MCP tool definitions must not contain duplicate tools.")
         self.__tools = tuple(
-            McpToolAdapter(toolset=self, definition=definition) for definition in self.__definitions
+            McpToolAdapter(toolset=self, definition=definition) for definition in raw_definitions
         )
         _validate_unique_tool_names(list(self.__tools))
 
@@ -222,22 +275,40 @@ class McpToolset:
         """Bind an adapter only to a definition advertised by this toolset."""
 
         entry = mcp_tool_manifest_tools(
-            server=self.__server,
+            server=self.__binding_server,
             definitions=(definition.model_copy(deep=True),),
         )[0]
         matches = [
             candidate
-            for candidate in self.__manifest_snapshot.tools
+            for candidate in self.__binding_snapshot.tools
             if candidate.mcp_name == entry["mcp_name"] and candidate.contract_hash == entry["hash"]
         ]
         if len(matches) != 1:
             raise ValueError(
                 "MCP adapters must bind exactly one definition advertised by their toolset."
             )
+        public_definition = _redact_tool_definition(
+            definition,
+            redactor=self.secret_redactor,
+        )
+        public_entry = mcp_tool_manifest_tools(
+            server=self.__server,
+            definitions=(public_definition,),
+        )[0]
+        public_matches = [
+            candidate
+            for candidate in self.__manifest_snapshot.tools
+            if candidate.mcp_name == public_entry["mcp_name"]
+            and candidate.contract_hash == public_entry["hash"]
+        ]
+        if len(public_matches) != 1:
+            raise ValueError("MCP adapters must map to exactly one sanitized manifest definition.")
         return _McpAdapterBinding(
             toolset=self,
             mcp_name=matches[0].mcp_name,
             source_contract_hash=matches[0].contract_hash,
+            manifest_mcp_name=public_matches[0].mcp_name,
+            manifest_contract_hash=public_matches[0].contract_hash,
         )
 
     @property
@@ -286,19 +357,30 @@ class McpToolset:
             raise TypeError("server must be an McpServerSpec.")
         mcp_client = client if client is not None else _default_client_for(server)
         session = await mcp_client.connect(server)
+        sanitized_error: McpProtocolError | None = None
         try:
             definitions = await session.list_tools()
             return cls(server=server, session=session, definitions=definitions)
         except asyncio.CancelledError:
             await _close_session_after_failed_toolset_connect(session)
             raise
-        except Exception:
+        except Exception as exc:
             await _close_session_after_failed_toolset_connect(session)
-            raise
+            if not session.secret_redactor.has_values:
+                raise
+            safe_error = session.secret_redactor.redact_text_bounded(
+                str(exc),
+                max_bytes=_MAX_MCP_DISCOVERY_ERROR_BYTES,
+            )
+            sanitized_error = McpProtocolError(f"MCP tool discovery failed: {safe_error}")
+            definitions = ()
+        if sanitized_error is not None:
+            raise sanitized_error from None
+        raise AssertionError("MCP tool discovery returned without a toolset or error.")
 
     @property
     def initialize_result(self) -> McpInitializeResult:
-        return self.__session.initialize_result
+        return self.__initialize_result.model_copy(deep=True)
 
     @property
     def secret_redactor(self) -> SecretRedactor:
@@ -320,6 +402,42 @@ async def connect_mcp_toolset(
     """Connect to one MCP server and return its initialized toolset."""
 
     return await McpToolset.connect(server, client=client)
+
+
+def _redact_server_spec(
+    server: McpServerSpec,
+    *,
+    redactor: SecretRedactor,
+) -> McpServerSpec:
+    payload = redactor.redact_json_values(server.model_dump(mode="json"))
+    if type(payload) is not dict:
+        raise AssertionError("MCP server redaction returned a non-object.")
+    return McpServerSpec(**payload)
+
+
+def _redact_initialize_result(
+    result: McpInitializeResult,
+    *,
+    redactor: SecretRedactor,
+) -> McpInitializeResult:
+    payload = redactor.redact_json_values(
+        result.model_dump(mode="json"),
+        preserve_string_fields={"protocol_version"},
+    )
+    if type(payload) is not dict:
+        raise AssertionError("MCP initialize-result redaction returned a non-object.")
+    return McpInitializeResult(**payload)
+
+
+def _redact_tool_definition(
+    definition: McpToolDefinition,
+    *,
+    redactor: SecretRedactor,
+) -> McpToolDefinition:
+    payload = redactor.redact_json_values(definition.model_dump(mode="json"))
+    if type(payload) is not dict:
+        raise AssertionError("MCP tool-definition redaction returned a non-object.")
+    return McpToolDefinition(**payload)
 
 
 def _default_client_for(server: McpServerSpec) -> McpClient:
@@ -589,6 +707,39 @@ def _mcp_tool_result_text(
         note = f"[MCP returned {non_text_count} non-text content block(s).]"
         result = f"{result}\n\n{note}".strip() if result else note
     return result
+
+
+def _redact_mcp_content(
+    content: list[dict[str, Any]],
+    *,
+    redactor: SecretRedactor,
+) -> list[dict[str, Any]]:
+    """Redact MCP blocks while preserving the typed text envelope used for rendering."""
+
+    redacted: list[dict[str, Any]] = []
+    for block in content:
+        if type(block) is not dict:
+            raise AssertionError("MCP tool content must contain objects.")
+        block_type = block.get("type")
+        text = block.get("text")
+        if block_type == "text" and type(text) is str:
+            untrusted = {key: value for key, value in block.items() if key not in {"type", "text"}}
+            redacted_untrusted = redactor.redact_json(untrusted)
+            if type(redacted_untrusted) is not dict:
+                raise AssertionError("MCP text block redaction returned a non-object.")
+            redacted.append(
+                {
+                    "type": "text",
+                    "text": redactor.redact_text(text),
+                    **redacted_untrusted,
+                }
+            )
+            continue
+        redacted_block = redactor.redact_json(block)
+        if type(redacted_block) is not dict:
+            raise AssertionError("MCP content block redaction returned a non-object.")
+        redacted.append(redacted_block)
+    return redacted
 
 
 def _structured_content_text(structured_content: dict[str, Any] | None) -> str:

@@ -3208,6 +3208,138 @@ def test_session_store_conformance_validates_fork_request_preamble(
     asyncio.run(run())
 
 
+def test_session_store_conformance_validates_exact_fork_transcript_atomically(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        session_store = await _open_store(session_store_case)
+        try:
+            source = await session_store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_validated_fork_source",
+                    messages=[Message.text("user", "fork")],
+                ),
+                identity=_identity(),
+            )
+            await session_store.append_transcript_messages(
+                source.id,
+                [
+                    Message.text("user", "copied-prefix"),
+                    Message.text("user", "excluded-suffix"),
+                ],
+            )
+            source = await session_store.update_status(
+                source.id,
+                SessionStatus.COMPLETED,
+            )
+            observed: list[tuple[Message, ...]] = []
+
+            fork = await session_store.create_fork_with_transcript_validation(
+                source_session_id=source.id,
+                fork=Session(
+                    id="sess_validated_fork_child",
+                    agent_name="assistant",
+                    provider_name="fake",
+                    model="fake-model",
+                    parent_session_id=source.id,
+                    status=SessionStatus.COMPLETED,
+                ),
+                source_statuses={SessionStatus.COMPLETED},
+                expected_source_run_epoch=source.run_epoch,
+                transcript_cursor=1,
+                checkpoint_transform=None,
+                transcript_validator=lambda messages: not observed.append(messages),
+            )
+            assert fork.id == "sess_validated_fork_child"
+            assert len(observed) == 1
+            assert [message.content[0].text for message in observed[0]] == ["copied-prefix"]
+            assert [
+                message.content[0].text for message in await session_store.load_transcript(fork.id)
+            ] == ["copied-prefix"]
+
+            mutation_source = await session_store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_validated_fork_mutation_source",
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            await session_store.append_transcript_messages(
+                mutation_source.id,
+                [
+                    Message.tool_call(
+                        tool_call_id="call_validator_mutation",
+                        tool_name="validator_mutation",
+                        arguments={"nested": {"value": "original"}},
+                    )
+                ],
+            )
+            mutation_source = await session_store.update_status(
+                mutation_source.id,
+                SessionStatus.COMPLETED,
+            )
+
+            def mutate_validation_projection(messages: tuple[Message, ...]) -> bool:
+                part = messages[0].content[0]
+                assert isinstance(part, ToolCallPart)
+                part.arguments["nested"]["value"] = "mutated"
+                return True
+
+            await session_store.create_fork_with_transcript_validation(
+                source_session_id=mutation_source.id,
+                fork=Session(
+                    id="sess_validated_fork_mutation_child",
+                    agent_name="assistant",
+                    provider_name="fake",
+                    model="fake-model",
+                    parent_session_id=mutation_source.id,
+                    status=SessionStatus.COMPLETED,
+                ),
+                source_statuses={SessionStatus.COMPLETED},
+                expected_source_run_epoch=mutation_source.run_epoch,
+                transcript_cursor=None,
+                checkpoint_transform=None,
+                transcript_validator=mutate_validation_projection,
+            )
+            for session_id in (
+                mutation_source.id,
+                "sess_validated_fork_mutation_child",
+            ):
+                transcript = await session_store.load_transcript(session_id)
+                part = transcript[0].content[0]
+                assert isinstance(part, ToolCallPart)
+                assert part.arguments == {"nested": {"value": "original"}}
+
+            for child_id, invalid_result in (
+                ("sess_rejected_fork_false", False),
+                ("sess_rejected_fork_ambiguous", 1),
+            ):
+                with pytest.raises(ValueError, match="workload secret"):
+                    await session_store.create_fork_with_transcript_validation(
+                        source_session_id=source.id,
+                        fork=Session(
+                            id=child_id,
+                            agent_name="assistant",
+                            provider_name="fake",
+                            model="fake-model",
+                            parent_session_id=source.id,
+                            status=SessionStatus.COMPLETED,
+                        ),
+                        source_statuses={SessionStatus.COMPLETED},
+                        expected_source_run_epoch=source.run_epoch,
+                        transcript_cursor=None,
+                        checkpoint_transform=None,
+                        transcript_validator=lambda _messages, result=invalid_result: result,
+                    )
+                assert await session_store.load(child_id) is None
+        finally:
+            await _close_store(session_store)
+
+    asyncio.run(run())
+
+
 def test_session_store_conformance_atomically_fences_mcp_manifest_baselines(
     session_store_case,
 ) -> None:
