@@ -10,10 +10,13 @@ error messages, and the shared URL validation.
 from __future__ import annotations
 
 import asyncio
+import ssl
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
+import certifi
 import httpx
 import pytest
 
@@ -31,6 +34,7 @@ from cayu.providers import (
 )
 from cayu.providers._http import (
     SharedAsyncClient,
+    new_async_client,
     retry_after_seconds,
     validate_base_url,
     validate_url,
@@ -52,6 +56,87 @@ class _StreamingResponse:
             if self._heartbeat_sleep_s:
                 await asyncio.sleep(self._heartbeat_sleep_s)
             yield line
+
+
+def test_new_async_client_uses_certifi_without_extra_ca(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    created_with: list[str] = []
+    context = object()
+
+    def make_client(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        return object()
+
+    def create_default_context(*, cafile: str) -> object:
+        created_with.append(cafile)
+        return context
+
+    monkeypatch.delenv("CAYU_PROVIDER_CA_BUNDLE", raising=False)
+    monkeypatch.setattr(
+        "cayu.providers._http.ssl.create_default_context",
+        create_default_context,
+    )
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", make_client)
+
+    assert new_async_client() is not None
+    assert created_with == [certifi.where()]
+    assert captured == {"verify": context}
+
+
+def test_new_async_client_augments_certifi_with_explicit_extra_ca(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    extra_ca = tmp_path / "session-ca.pem"
+    extra_ca.write_text("test certificate", encoding="utf-8")
+    loaded: list[str] = []
+    created_with: list[str] = []
+    captured: dict[str, Any] = {}
+
+    class Context:
+        def load_verify_locations(self, *, cafile: str) -> None:
+            loaded.append(cafile)
+
+    context = Context()
+
+    def create_default_context(*, cafile: str) -> Context:
+        created_with.append(cafile)
+        return context
+
+    def make_client(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setenv("CAYU_PROVIDER_CA_BUNDLE", str(extra_ca))
+    monkeypatch.setattr(
+        "cayu.providers._http.ssl.create_default_context",
+        create_default_context,
+    )
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", make_client)
+
+    assert new_async_client() is not None
+    assert created_with == [certifi.where()]
+    assert loaded == [str(extra_ca)]
+    assert captured == {"verify": context}
+
+
+def test_new_async_client_fails_closed_when_extra_ca_is_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Context:
+        def load_verify_locations(self, *, cafile: str) -> None:
+            raise ssl.SSLError("invalid CA bundle")
+
+    monkeypatch.setenv("CAYU_PROVIDER_CA_BUNDLE", "/missing/session-ca.pem")
+    monkeypatch.setattr(
+        "cayu.providers._http.ssl.create_default_context",
+        lambda *, cafile: Context(),
+    )
+
+    with pytest.raises(ssl.SSLError, match="invalid CA bundle"):
+        new_async_client()
 
 
 class _StreamContext:

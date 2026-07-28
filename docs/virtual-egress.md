@@ -122,6 +122,21 @@ Install the TLS/Docker pieces with the optional extra:
 pip install 'cayu[egress]'   # adds cryptography
 ```
 
+### Trusting a broker CA for Cayu provider calls
+
+When the Cayu model-provider client itself runs behind a TLS-intercepting
+virtual-egress broker, the trusted runtime can set
+`CAYU_PROVIDER_CA_BUNDLE=/path/to/session-ca.pem`. Cayu's built-in HTTP
+provider transports then augment their normal certifi roots with that PEM
+bundle. The setting is read when the shared provider client is created, and an
+unreadable or invalid bundle fails closed instead of disabling verification.
+
+This is a trusted deployment input, not an agent-controlled provider option.
+Give an isolated workload a read-only per-run CA file, set the variable from
+the orchestrator, and continue enforcing destination and credential policy in
+the broker. Cayu deliberately does not infer this provider-specific trust from
+generic `SSL_CERT_FILE` or `REQUESTS_CA_BUNDLE` variables.
+
 ## Runtime integration (CayuApp)
 
 `virtual_egress` is a first-class, session-lifecycle-managed mode via

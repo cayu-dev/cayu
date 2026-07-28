@@ -2528,6 +2528,16 @@ host auth source
   -> provider Authorization boundary
 ```
 
+Built-in HTTP provider transports verify public TLS roots from certifi. A
+trusted deployment that routes those provider calls through a private endpoint
+or TLS-intercepting virtual-egress broker may set
+`CAYU_PROVIDER_CA_BUNDLE=/path/to/ca.pem`; Cayu augments certifi with that PEM
+bundle when it lazily creates the shared provider client. Invalid bundles fail
+closed. This setting changes certificate trust only: it does not grant network
+reachability, provider authority, or permission to bypass egress policy, and
+must be supplied by trusted deployment configuration rather than
+model-controlled input.
+
 Provider authority must not enter tool arguments or `ToolContext`, runner
 `env`/`secret_env`, workspace files or mounts, environment-factory or reconnect
 metadata, virtual credentials, manifests, task/session/event payloads, captured

@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
+import ssl
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -33,17 +35,27 @@ from cayu.providers.base import (
 from cayu.vaults.redaction import SecretRedactor
 
 MAX_PROVIDER_ERROR_BODY_CHARS = 2_000
+_PROVIDER_CA_BUNDLE_ENV = "CAYU_PROVIDER_CA_BUNDLE"
 _ApiErrorFromResponse = Callable[[httpx.Response, str, float | None], Exception]
 
 
 def new_async_client() -> httpx.AsyncClient:
-    """Build an httpx.AsyncClient with explicit certifi-backed TLS verification.
+    """Build an httpx.AsyncClient with explicit, optionally augmented CA trust.
 
     Per-request timeouts are passed at call time (see :func:`post_json` and
     :func:`stream_sse_json_events`), so the client itself carries no fixed
     timeout and can be reused across both blocking and streaming requests.
+
+    Public roots always come from certifi. A trusted runtime may additionally
+    set ``CAYU_PROVIDER_CA_BUNDLE`` to a PEM bundle for a private provider or
+    virtual-egress broker. That bundle augments certifi rather than replacing
+    it, and invalid configuration fails while the lazy client is created.
     """
-    return httpx.AsyncClient(verify=certifi.where())
+    context = ssl.create_default_context(cafile=certifi.where())
+    extra_ca_bundle = os.environ.get(_PROVIDER_CA_BUNDLE_ENV)
+    if extra_ca_bundle is not None and extra_ca_bundle.strip():
+        context.load_verify_locations(cafile=extra_ca_bundle)
+    return httpx.AsyncClient(verify=context)
 
 
 class SharedAsyncClient:
