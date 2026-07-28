@@ -259,6 +259,66 @@ def _tool_round_identity_payload(events: list[Event]) -> dict[str, str]:
     }
 
 
+def _crashed_user_input_resume_events(
+    events: list[Event],
+    *,
+    session_id: str,
+    tool_call_id: str,
+) -> list[Event]:
+    """Build the durable prefix emitted before a resumed tool crashes."""
+
+    pause = next(event for event in events if event.type == EventType.SESSION_AWAITING_USER_INPUT)
+    input_id = pause.payload["input_id"]
+    tool_calls = pause.payload["tool_calls"]
+    assert isinstance(input_id, str)
+    assert isinstance(tool_calls, list)
+    tool_call = next(
+        call
+        for call in tool_calls
+        if isinstance(call, dict) and call.get("tool_call_id") == tool_call_id
+    )
+    tool_name = tool_call["tool_name"]
+    arguments = tool_call["arguments"]
+    assert isinstance(tool_name, str)
+    assert isinstance(arguments, dict)
+    identity = ToolRoundIdentity.model_validate(_tool_round_identity_payload(events))
+    idempotency_key = tool_execution.tool_idempotency_key(
+        session_id=session_id,
+        tool_round_id=identity.tool_round_id,
+        tool_call_id=tool_call_id,
+        pause_id=input_id,
+    )
+    return [
+        Event(
+            type=EventType.SESSION_RESUMED,
+            session_id=session_id,
+            agent_name=pause.agent_name,
+            environment_name=pause.environment_name,
+            payload={
+                **identity.payload(),
+                "interruption_type": "user_input_required",
+                "input_id": input_id,
+                "tool_call_id": pause.payload["tool_call_id"],
+                "resolved_by": None,
+            },
+        ),
+        Event(
+            type=EventType.TOOL_CALL_STARTED,
+            session_id=session_id,
+            agent_name=pause.agent_name,
+            environment_name=pause.environment_name,
+            tool_name=tool_name,
+            payload={
+                **identity.payload(),
+                "input_id": input_id,
+                "tool_call_id": tool_call_id,
+                "idempotency_key": idempotency_key,
+                "arguments": arguments,
+            },
+        ),
+    ]
+
+
 def _tool_result_parts(transcript) -> list[ToolResultPart]:
     tool_message = next(message for message in transcript if message.role == "tool")
     return [part for part in tool_message.content if isinstance(part, ToolResultPart)]
@@ -1423,17 +1483,12 @@ def test_retry_after_crashed_sibling_flags_manual_recovery_not_re_execute() -> N
     ]
     # Simulate a prior resume attempt that started `count` but crashed before a terminal event.
     asyncio.run(
-        store.append_event(
+        store.append_events(
             "s_crash",
-            Event(
-                type=EventType.TOOL_CALL_STARTED,
+            _crashed_user_input_resume_events(
+                pause,
                 session_id="s_crash",
-                agent_name="assistant",
-                tool_name="count",
-                payload={
-                    **_tool_round_identity_payload(pause),
-                    "tool_call_id": "call_1",
-                },
+                tool_call_id="call_1",
             ),
         )
     )
@@ -1485,17 +1540,12 @@ def test_recover_user_input_rejects_native_structured_output_for_unsupported_pro
         "input_id"
     ]
     asyncio.run(
-        store.append_event(
+        store.append_events(
             "s_rec_native",
-            Event(
-                type=EventType.TOOL_CALL_STARTED,
+            _crashed_user_input_resume_events(
+                pause,
                 session_id="s_rec_native",
-                agent_name="assistant",
-                tool_name="count",
-                payload={
-                    **_tool_round_identity_payload(pause),
-                    "tool_call_id": "call_1",
-                },
+                tool_call_id="call_1",
             ),
         )
     )
@@ -1567,19 +1617,12 @@ def test_recover_user_input_rejects_secret_structured_output_before_transition()
     )
     input_id = awaiting_input.payload["input_id"]
     asyncio.run(
-        store.append_event(
+        store.append_events(
             session_id,
-            Event(
-                type=EventType.TOOL_CALL_STARTED,
+            _crashed_user_input_resume_events(
+                pause,
                 session_id=session_id,
-                agent_name="assistant",
-                tool_name="count",
-                payload={
-                    "tool_call_id": "call_1",
-                    "model_step_id": awaiting_input.payload["model_step_id"],
-                    "model_attempt_id": awaiting_input.payload["model_attempt_id"],
-                    "tool_round_id": awaiting_input.payload["tool_round_id"],
-                },
+                tool_call_id="call_1",
             ),
         )
     )
@@ -1647,17 +1690,12 @@ def test_recover_user_input_supplies_outcome_and_completes() -> None:
     ]
     # Simulate a prior resume that started `count` but crashed before a terminal event.
     asyncio.run(
-        store.append_event(
+        store.append_events(
             "s_rec",
-            Event(
-                type=EventType.TOOL_CALL_STARTED,
+            _crashed_user_input_resume_events(
+                pause,
                 session_id="s_rec",
-                agent_name="assistant",
-                tool_name="count",
-                payload={
-                    **_tool_round_identity_payload(pause),
-                    "tool_call_id": "call_1",
-                },
+                tool_call_id="call_1",
             ),
         )
     )
@@ -1747,17 +1785,12 @@ def test_recover_user_input_reconciles_ambiguous_append_acknowledgement() -> Non
         input_id = next(
             event for event in paused if event.type == EventType.SESSION_AWAITING_USER_INPUT
         ).payload["input_id"]
-        await store.append_event(
+        await store.append_events(
             session_id,
-            Event(
-                type=EventType.TOOL_CALL_STARTED,
+            _crashed_user_input_resume_events(
+                paused,
                 session_id=session_id,
-                agent_name="assistant",
-                tool_name="count",
-                payload={
-                    **_tool_round_identity_payload(paused),
-                    "tool_call_id": "call_1",
-                },
+                tool_call_id="call_1",
             ),
         )
         stuck = await _drain(
@@ -1839,17 +1872,12 @@ def test_recover_user_input_post_persist_fanout_failure_stays_resumable(
         input_id = next(
             event for event in paused if event.type == EventType.SESSION_AWAITING_USER_INPUT
         ).payload["input_id"]
-        await store.append_event(
+        await store.append_events(
             session_id,
-            Event(
-                type=EventType.TOOL_CALL_STARTED,
+            _crashed_user_input_resume_events(
+                paused,
                 session_id=session_id,
-                agent_name="assistant",
-                tool_name="count",
-                payload={
-                    **_tool_round_identity_payload(paused),
-                    "tool_call_id": "call_1",
-                },
+                tool_call_id="call_1",
             ),
         )
         stuck = await _drain(
@@ -1953,17 +1981,12 @@ def test_recover_user_input_post_persist_cleanup_failure_is_not_suppressed() -> 
         input_id = next(
             event for event in paused if event.type == EventType.SESSION_AWAITING_USER_INPUT
         ).payload["input_id"]
-        await store.append_event(
+        await store.append_events(
             session_id,
-            Event(
-                type=EventType.TOOL_CALL_STARTED,
+            _crashed_user_input_resume_events(
+                paused,
                 session_id=session_id,
-                agent_name="assistant",
-                tool_name="count",
-                payload={
-                    **_tool_round_identity_payload(paused),
-                    "tool_call_id": "call_1",
-                },
+                tool_call_id="call_1",
             ),
         )
         stuck = await _drain(
@@ -2039,17 +2062,12 @@ def test_recover_user_input_closes_continuation_before_aclose_returns() -> None:
         input_id = next(
             event for event in pause if event.type == EventType.SESSION_AWAITING_USER_INPUT
         ).payload["input_id"]
-        await store.append_event(
+        await store.append_events(
             session_id,
-            Event(
-                type=EventType.TOOL_CALL_STARTED,
+            _crashed_user_input_resume_events(
+                pause,
                 session_id=session_id,
-                agent_name="assistant",
-                tool_name="count",
-                payload={
-                    **_tool_round_identity_payload(pause),
-                    "tool_call_id": "call_1",
-                },
+                tool_call_id="call_1",
             ),
         )
         stuck = await _drain(
@@ -2116,17 +2134,12 @@ def test_recover_user_input_task_cancellation_finalizes_continuation() -> None:
         input_id = next(
             event for event in pause if event.type == EventType.SESSION_AWAITING_USER_INPUT
         ).payload["input_id"]
-        await store.append_event(
+        await store.append_events(
             session_id,
-            Event(
-                type=EventType.TOOL_CALL_STARTED,
+            _crashed_user_input_resume_events(
+                pause,
                 session_id=session_id,
-                agent_name="assistant",
-                tool_name="count",
-                payload={
-                    **_tool_round_identity_payload(pause),
-                    "tool_call_id": "call_count",
-                },
+                tool_call_id="call_count",
             ),
         )
         stuck = await _drain(
@@ -2400,17 +2413,12 @@ def test_recover_after_reused_id_prior_round_is_not_wrongly_rejected() -> None:
     ]
     # Simulate round 2's resolve starting count(call_1) then crashing (started, no terminal in-window).
     asyncio.run(
-        store.append_event(
+        store.append_events(
             "s_reuse_rec",
-            Event(
-                type=EventType.TOOL_CALL_STARTED,
+            _crashed_user_input_resume_events(
+                pause,
                 session_id="s_reuse_rec",
-                agent_name="assistant",
-                tool_name="count",
-                payload={
-                    **_tool_round_identity_payload(pause),
-                    "tool_call_id": "call_1",
-                },
+                tool_call_id="call_1",
             ),
         )
     )

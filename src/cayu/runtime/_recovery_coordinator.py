@@ -31,7 +31,11 @@ from cayu._task_wait import (
     await_shielded_task_outcome,
     unexpected_child_cancellation_error,
 )
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import (
+    canonical_durable_json_bytes,
+    copy_json_value,
+    require_clean_nonblank,
+)
 from cayu.core.events import Event, EventType, copy_event
 from cayu.core.messages import Message, MessageRole, ToolCallPart, ToolResultPart
 from cayu.core.thinking import ThinkingConfig
@@ -100,8 +104,11 @@ from cayu.runtime.loop_policies import LoopPolicy
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.sessions import (
     _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
+    RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS,
     CheckpointTransform,
+    EventOrder,
     EventQuery,
+    EventRecord,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionRecoveryResult,
@@ -163,6 +170,98 @@ _TOOL_ROUND_RECOVERABLE_SESSION_STATUSES = {
     SessionStatus.INTERRUPTED,
     SessionStatus.FAILED,
 }
+_MODEL_BOUNDARY_TOOL_TERMINAL_EVENT_TYPES = frozenset(
+    {
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.TOOL_CALL_FAILED,
+        EventType.TOOL_CALL_BLOCKED,
+        EventType.TOOL_CALL_APPROVAL_DENIED,
+    }
+)
+
+
+def _receiptless_pause_event_identity(
+    event: Event,
+) -> tuple[Literal["approval", "user-input"], str]:
+    """Return one exact pause identity without accepting ordinary tool evidence."""
+
+    has_approval_id = "approval_id" in event.payload
+    has_input_id = "input_id" in event.payload
+    if has_approval_id == has_input_id:
+        raise RuntimeError(
+            "Receipt-less tool evidence must carry exactly one approval_id or input_id."
+        )
+    field_name = "approval_id" if has_approval_id else "input_id"
+    try:
+        pause_id = require_clean_nonblank(event.payload[field_name], field_name)
+    except (KeyError, TypeError, ValueError):
+        raise RuntimeError("Receipt-less tool evidence has a malformed pause identity.") from None
+    return ("approval" if has_approval_id else "user-input"), pause_id
+
+
+def _receiptless_exact_execution_evidence(
+    records: list[EventRecord],
+    *,
+    identity: ToolRoundIdentity,
+    expected_call_ids: set[str],
+) -> list[tuple[int, Event]]:
+    """Select exact round evidence while rejecting partial or conflicting identity."""
+
+    evidence: list[tuple[int, Event]] = []
+    for record in records:
+        event = record.event
+        tool_call_id = event.payload.get("tool_call_id")
+        event_matches_call = type(tool_call_id) is str and tool_call_id in expected_call_ids
+        event_matches_round = event.payload.get("tool_round_id") == identity.tool_round_id
+        event_matches_attempt = (
+            event.payload.get("model_step_id") == identity.model_step_id
+            and event.payload.get("model_attempt_id") == identity.model_attempt_id
+        )
+        if not (event_matches_call or event_matches_round or event_matches_attempt):
+            continue
+        try:
+            event_identity = ToolRoundIdentity.model_validate(
+                {
+                    "model_step_id": event.payload.get("model_step_id"),
+                    "model_attempt_id": event.payload.get("model_attempt_id"),
+                    "tool_round_id": event.payload.get("tool_round_id"),
+                }
+            )
+        except (TypeError, ValueError):
+            if any(
+                event.payload.get(field_name) == expected
+                for field_name, expected in (
+                    ("model_step_id", identity.model_step_id),
+                    ("model_attempt_id", identity.model_attempt_id),
+                    ("tool_round_id", identity.tool_round_id),
+                )
+            ):
+                raise RuntimeError(
+                    "Durable tool lifecycle evidence has a partial execution identity."
+                ) from None
+            # Provider call ids can be reused. An unscoped historical event
+            # is not evidence for this round and cannot contradict exact
+            # round-owned terminal material.
+            continue
+        if event_identity != identity:
+            if (
+                event_matches_call
+                and event_identity.tool_round_id != identity.tool_round_id
+                and (
+                    event_identity.model_step_id,
+                    event_identity.model_attempt_id,
+                )
+                != (
+                    identity.model_step_id,
+                    identity.model_attempt_id,
+                )
+            ):
+                continue
+            raise RuntimeError(
+                "Durable tool lifecycle evidence conflicts with its source model step."
+            )
+        evidence.append((record.sequence, event))
+    return evidence
 
 
 def _optional_exception_type_name(
@@ -690,10 +789,11 @@ class RecoveryCoordinator:
         elif pointer.tool_round_id is not None:
             pending_pause = pending_approval if pending_approval is not None else pending_user_input
             assistant_message = transcript_page.records[0].message
+            assistant_call_parts = tuple(
+                part for part in assistant_message.content if type(part) is ToolCallPart
+            )
             assistant_calls = tuple(
-                (part.tool_call_id, part.tool_name, part.arguments)
-                for part in assistant_message.content
-                if type(part) is ToolCallPart
+                (part.tool_call_id, part.tool_name, part.arguments) for part in assistant_call_parts
             )
             if transcript_page.total_records == pointer.transcript_end_cursor:
                 if pending_pause is None:
@@ -760,6 +860,70 @@ class RecoveryCoordinator:
                         "The transcript after the durable model step does not exactly close "
                         "its assistant tool calls."
                     )
+                assistant_identities = {
+                    (
+                        part.model_step_id,
+                        part.model_attempt_id,
+                        part.tool_round_id,
+                    )
+                    for part in assistant_call_parts
+                }
+                if len(assistant_identities) != 1:
+                    raise RuntimeError(
+                        "The assistant tool calls do not share one complete execution identity."
+                    )
+                model_step_id, model_attempt_id, tool_round_id = next(iter(assistant_identities))
+                if (
+                    type(model_step_id) is not str
+                    or type(model_attempt_id) is not str
+                    or type(tool_round_id) is not str
+                ):
+                    raise RuntimeError(
+                        "The assistant tool-call identity is incomplete at recovery."
+                    )
+                if (
+                    model_step_id != pointer.logical_step_id
+                    or tool_round_id != pointer.tool_round_id
+                ):
+                    raise RuntimeError(
+                        "The assistant tool-call identity conflicts with its durable model step."
+                    )
+                tool_publication_id = f"tool-round:{pointer.tool_round_id}"
+                tool_receipt = await self._session_store.load_runtime_publication_receipt(
+                    session.id,
+                    tool_publication_id,
+                )
+                if tool_receipt is None:
+                    if not await self._tool_result_tail_has_durable_lifecycle_provenance(
+                        session=session,
+                        identity=ToolRoundIdentity(
+                            model_step_id=model_step_id,
+                            model_attempt_id=model_attempt_id,
+                            tool_round_id=tool_round_id,
+                        ),
+                        assistant_call_parts=assistant_call_parts,
+                        tool_result_message=next_record.message,
+                    ):
+                        raise RuntimeError(
+                            "The transcript contains tool results without durable tool-round "
+                            "publication provenance."
+                        )
+                elif (
+                    tool_receipt.publication_id != tool_publication_id
+                    or tool_receipt.kind != "tool-round"
+                    or tool_receipt.transcript_start_cursor != pointer.transcript_end_cursor
+                    or tool_receipt.transcript_end_cursor != pointer.transcript_end_cursor + 1
+                    or tool_receipt.intent.get("round_id") != pointer.tool_round_id
+                    or tool_receipt.intent.get("model_step_id") != model_step_id
+                    or tool_receipt.intent.get("model_attempt_id") != model_attempt_id
+                    or tool_receipt.intent.get("tool_round_id") != tool_round_id
+                    or tool_receipt.intent.get("tool_call_ids")
+                    != [tool_call_id for tool_call_id, _tool_name, _arguments in assistant_calls]
+                ):
+                    raise RuntimeError(
+                        "The durable tool-round publication receipt conflicts with its "
+                        "source model step."
+                    )
 
         await self._event_writer.fan_out_persisted([completion_event])
         return ModelCompletionBoundaryReconciliation(
@@ -770,6 +934,377 @@ class RecoveryCoordinator:
             pending_tool_round=pending_round,
             transcript_cursor=transcript_page.total_records,
         )
+
+    async def _tool_result_tail_has_durable_lifecycle_provenance(
+        self,
+        *,
+        session: Session,
+        identity: ToolRoundIdentity,
+        assistant_call_parts: tuple[ToolCallPart, ...],
+        tool_result_message: Message,
+    ) -> bool:
+        """Verify pause-resume results published outside the ordinary round protocol.
+
+        Approval and user-input continuations atomically append their grouped
+        result while clearing their pause checkpoint. They do not create an
+        ordinary tool-round receipt, so recovery reconstructs their exact
+        transcript message from bounded, round-scoped terminal evidence.
+        """
+
+        pending_calls = [
+            PendingToolCallApproval(
+                tool_call_id=part.tool_call_id,
+                tool_name=part.tool_name,
+                arguments=part.arguments,
+            )
+            for part in assistant_call_parts
+        ]
+        lifecycle_records = await self._session_store.query_events(
+            EventQuery(
+                session_id=session.id,
+                event_types=(
+                    EventType.TOOL_CALL_STARTED,
+                    *_MODEL_BOUNDARY_TOOL_TERMINAL_EVENT_TYPES,
+                ),
+                limit=RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS + 1,
+                order_by=EventOrder.SEQUENCE_DESC,
+            )
+        )
+        resume_records = await self._session_store.query_events(
+            EventQuery(
+                session_id=session.id,
+                event_type=EventType.SESSION_RESUMED,
+                limit=RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS + 1,
+                order_by=EventOrder.SEQUENCE_DESC,
+            )
+        )
+        interruption_records = await self._session_store.query_events(
+            EventQuery(
+                session_id=session.id,
+                event_type=EventType.SESSION_INTERRUPTED,
+                limit=RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS + 1,
+                order_by=EventOrder.SEQUENCE_DESC,
+            )
+        )
+        expected_call_ids = {call.tool_call_id for call in pending_calls}
+        lifecycle_evidence = _receiptless_exact_execution_evidence(
+            lifecycle_records,
+            identity=identity,
+            expected_call_ids=expected_call_ids,
+        )
+        resume_evidence = _receiptless_exact_execution_evidence(
+            resume_records,
+            identity=identity,
+            expected_call_ids=expected_call_ids,
+        )
+        interruption_evidence = _receiptless_exact_execution_evidence(
+            interruption_records,
+            identity=identity,
+            expected_call_ids=expected_call_ids,
+        )
+        if len(lifecycle_evidence) > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS:
+            raise RuntimeError("Durable tool lifecycle evidence exceeds the recovery bound.")
+        if len(resume_evidence) > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS:
+            raise RuntimeError("Durable pause-resume evidence exceeds the recovery bound.")
+        if len(interruption_evidence) > RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS:
+            raise RuntimeError("Durable pause-origin evidence exceeds the recovery bound.")
+        if not resume_evidence:
+            return False
+
+        pending_by_call_id = {call.tool_call_id: call for call in pending_calls}
+        if len(pending_by_call_id) != len(pending_calls):
+            raise RuntimeError("The assistant tool-call tail contains duplicate call identities.")
+
+        pause_kind: Literal["approval", "user-input"] | None = None
+        pause_id: str | None = None
+        resume_tool_call_id: str | None = None
+        approval_decision: str | None = None
+        for _sequence, event in resume_evidence:
+            if (
+                event.session_id != session.id
+                or event.agent_name != session.agent_name
+                or event.environment_name != session.environment_name
+                or not identity.matches_payload(event.payload)
+            ):
+                raise RuntimeError(
+                    "Durable pause-continuation anchor conflicts with its source model step."
+                )
+            event_pause_kind, event_pause_id = _receiptless_pause_event_identity(event)
+            if pause_kind is None:
+                pause_kind = event_pause_kind
+                pause_id = event_pause_id
+            elif pause_kind != event_pause_kind or pause_id != event_pause_id:
+                raise RuntimeError(
+                    "Durable pause-continuation evidence has conflicting pause identity."
+                )
+            tool_call_id = event.payload.get("tool_call_id")
+            if type(tool_call_id) is not str:
+                raise RuntimeError(
+                    "Durable pause-continuation anchor has no valid tool-call identity."
+                )
+            if tool_call_id not in pending_by_call_id:
+                raise RuntimeError(
+                    "Durable pause-continuation anchor conflicts with its assistant tool call."
+                )
+            if event.tool_name is not None:
+                raise RuntimeError(
+                    "Durable pause-continuation anchor contains an unexpected tool name."
+                )
+            if resume_tool_call_id is None:
+                resume_tool_call_id = tool_call_id
+            elif resume_tool_call_id != tool_call_id:
+                raise RuntimeError(
+                    "Durable pause-continuation anchors identify different tool calls."
+                )
+            if event_pause_kind == "approval":
+                decision = event.payload.get("decision")
+                if decision not in {
+                    ToolApprovalDecision.APPROVE.value,
+                    ToolApprovalDecision.DENY.value,
+                }:
+                    raise RuntimeError("Durable approval continuation has no valid decision.")
+                if approval_decision is None:
+                    approval_decision = decision
+                elif approval_decision != decision:
+                    raise RuntimeError(
+                        "Durable approval continuations contain conflicting decisions."
+                    )
+            elif event.payload.get("interruption_type") != _INTERRUPTION_TYPE_USER_INPUT_REQUIRED:
+                raise RuntimeError(
+                    "Durable user-input continuation has the wrong interruption type."
+                )
+
+        if pause_kind is None or pause_id is None or resume_tool_call_id is None:
+            raise RuntimeError("Durable pause-continuation anchor has no pause identity.")
+
+        expected_interruption_type = (
+            _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED
+            if pause_kind == "approval"
+            else _INTERRUPTION_TYPE_USER_INPUT_REQUIRED
+        )
+        expected_origin_field = "approval" if pause_kind == "approval" else "user_input"
+        expected_calls = [
+            {
+                "tool_call_id": call.tool_call_id,
+                "tool_name": call.tool_name,
+                "arguments": call.arguments,
+            }
+            for call in pending_calls
+        ]
+        origin_sequences: list[int] = []
+        for sequence, event in interruption_evidence:
+            if event.payload.get("interruption_type") != expected_interruption_type:
+                continue
+            if (
+                event.session_id != session.id
+                or event.agent_name != session.agent_name
+                or event.environment_name != session.environment_name
+                or not identity.matches_payload(event.payload)
+            ):
+                raise RuntimeError(
+                    "Durable pause-origin evidence conflicts with its source model step."
+                )
+            try:
+                if pause_kind == "approval":
+                    pending_pause = PendingToolApproval.model_validate(
+                        event.payload.get(expected_origin_field)
+                    )
+                    origin_pause_id = pending_pause.approval_id
+                else:
+                    pending_pause = PendingUserInput.model_validate(
+                        event.payload.get(expected_origin_field)
+                    )
+                    origin_pause_id = pending_pause.input_id
+            except (TypeError, ValueError):
+                raise RuntimeError(
+                    "Durable pause-origin evidence contains an invalid pause checkpoint."
+                ) from None
+            origin_identity = ToolRoundIdentity(
+                model_step_id=pending_pause.model_step_id,
+                model_attempt_id=pending_pause.model_attempt_id,
+                tool_round_id=pending_pause.tool_round_id,
+            )
+            origin_calls = [
+                {
+                    "tool_call_id": call.tool_call_id,
+                    "tool_name": call.tool_name,
+                    "arguments": call.arguments,
+                }
+                for call in pending_pause.tool_calls
+            ]
+            if (
+                origin_pause_id != pause_id
+                or origin_identity != identity
+                or pending_pause.agent_name != session.agent_name
+                or pending_pause.environment_name != session.environment_name
+                or pending_pause.tool_call_id != resume_tool_call_id
+                or canonical_durable_json_bytes(
+                    origin_calls,
+                    "pause_origin_tool_calls",
+                )
+                != canonical_durable_json_bytes(
+                    expected_calls,
+                    "assistant_tool_calls",
+                )
+            ):
+                raise RuntimeError("Durable pause-origin evidence conflicts with its continuation.")
+            origin_sequences.append(sequence)
+
+        if not origin_sequences:
+            raise RuntimeError("Receipt-less tool evidence has no authoritative pause origin.")
+        if min(origin_sequences) >= min(sequence for sequence, _event in resume_evidence):
+            raise RuntimeError("Durable pause-continuation evidence precedes its pause origin.")
+        if lifecycle_evidence and min(sequence for sequence, _event in lifecycle_evidence) <= min(
+            sequence for sequence, _event in resume_evidence
+        ):
+            raise RuntimeError("Durable tool lifecycle evidence precedes its pause continuation.")
+
+        started_by_call_id: dict[str, tuple[int, Event]] = {}
+        terminal_by_call_id: dict[str, tuple[int, Event]] = {}
+        for sequence, event in lifecycle_evidence:
+            if (
+                event.session_id != session.id
+                or event.agent_name != session.agent_name
+                or event.environment_name != session.environment_name
+                or not identity.matches_payload(event.payload)
+            ):
+                raise RuntimeError(
+                    "Durable tool lifecycle evidence conflicts with its source model step."
+                )
+            event_pause_kind, event_pause_id = _receiptless_pause_event_identity(event)
+            if pause_kind != event_pause_kind or pause_id != event_pause_id:
+                raise RuntimeError(
+                    "Durable pause-continuation evidence has conflicting pause identity."
+                )
+            tool_call_id = event.payload.get("tool_call_id")
+            if type(tool_call_id) is not str:
+                raise RuntimeError(
+                    "Durable tool lifecycle evidence has no valid tool-call identity."
+                )
+            pending_call = pending_by_call_id.get(tool_call_id)
+            if pending_call is None:
+                raise RuntimeError(
+                    "Durable tool lifecycle evidence conflicts with its assistant tool call."
+                )
+            if event.tool_name != pending_call.tool_name:
+                raise RuntimeError(
+                    "Durable tool lifecycle evidence conflicts with its assistant tool call."
+                )
+            expected_idempotency_key = tool_execution.tool_idempotency_key(
+                session_id=session.id,
+                tool_round_id=identity.tool_round_id,
+                tool_call_id=tool_call_id,
+                approval_id=pause_id if event_pause_kind == "approval" else None,
+                pause_id=pause_id if event_pause_kind == "user-input" else None,
+            )
+            if event.payload.get("idempotency_key") != expected_idempotency_key:
+                raise RuntimeError(
+                    "Durable pause-continuation evidence has a conflicting idempotency key."
+                )
+            if event.type == EventType.TOOL_CALL_STARTED:
+                if tool_call_id in started_by_call_id:
+                    raise RuntimeError(
+                        "Durable pause-continuation evidence contains duplicate started events."
+                    )
+                if canonical_durable_json_bytes(
+                    event.payload.get("arguments"),
+                    "started_arguments",
+                ) != canonical_durable_json_bytes(
+                    pending_call.arguments,
+                    "pending_arguments",
+                ):
+                    raise RuntimeError(
+                        "Durable pause-continuation started arguments conflict with "
+                        "the assistant tool call."
+                    )
+                started_by_call_id[tool_call_id] = (sequence, event)
+                continue
+            if event.type not in _MODEL_BOUNDARY_TOOL_TERMINAL_EVENT_TYPES:
+                continue
+            if tool_call_id in terminal_by_call_id:
+                raise RuntimeError(
+                    "Durable tool lifecycle evidence contains duplicate terminal results."
+                )
+            terminal_by_call_id[tool_call_id] = (sequence, event)
+
+        if set(terminal_by_call_id) != set(pending_by_call_id):
+            return False
+
+        outcomes: list[runtime_records.ToolCallOutcome] = []
+        for pending_call in pending_calls:
+            terminal_sequence, terminal = terminal_by_call_id[pending_call.tool_call_id]
+            started = started_by_call_id.get(pending_call.tool_call_id)
+            if (
+                terminal.type
+                in {
+                    EventType.TOOL_CALL_COMPLETED,
+                    EventType.TOOL_CALL_FAILED,
+                }
+                and started is None
+            ):
+                raise RuntimeError("Durable executed tool evidence has no preceding started event.")
+            if terminal.type == EventType.TOOL_CALL_APPROVAL_DENIED and started is not None:
+                raise RuntimeError(
+                    "Durable approval-denied tool evidence contains a started event."
+                )
+            if started is not None and started[0] >= terminal_sequence:
+                raise RuntimeError(
+                    "Durable pause-continuation terminal evidence precedes its start."
+                )
+            if (
+                pause_kind == "approval"
+                and approval_decision == ToolApprovalDecision.DENY.value
+                and terminal.type
+                not in {
+                    EventType.TOOL_CALL_BLOCKED,
+                    EventType.TOOL_CALL_APPROVAL_DENIED,
+                }
+            ):
+                raise RuntimeError(
+                    "Durable denied approval evidence contains an executed tool result."
+                )
+            if (
+                pause_kind == "approval"
+                and approval_decision == ToolApprovalDecision.DENY.value
+                and started is not None
+            ):
+                raise RuntimeError("Durable denied approval evidence contains a started event.")
+            if (
+                (
+                    pause_kind == "approval"
+                    and approval_decision == ToolApprovalDecision.APPROVE.value
+                )
+                or pause_kind == "user-input"
+            ) and terminal.type == EventType.TOOL_CALL_APPROVAL_DENIED:
+                raise RuntimeError(
+                    "Durable pause-continuation decision conflicts with its terminal result."
+                )
+            outcome = resume_ledger.tool_call_outcome_from_terminal_event(
+                event=terminal,
+                pending_tool_call=pending_call,
+            )
+            completed = terminal.type == EventType.TOOL_CALL_COMPLETED
+            if completed == outcome.result.is_error:
+                raise RuntimeError(
+                    "Durable terminal tool evidence conflicts with its result status."
+                )
+            outcomes.append(outcome)
+
+        expected_messages = transcript_helpers.tool_result_messages(
+            outcomes,
+            tool_round_identity=identity,
+        )
+        if canonical_durable_json_bytes(
+            [message.model_dump(mode="json") for message in expected_messages],
+            "expected_tool_result_messages",
+        ) != canonical_durable_json_bytes(
+            [tool_result_message.model_dump(mode="json")],
+            "tool_result_messages",
+        ):
+            raise RuntimeError(
+                "The tool-result transcript conflicts with its durable terminal evidence."
+            )
+        return True
 
     @staticmethod
     def _validate_active_model_completion_stage(session: Session, stage) -> None:
