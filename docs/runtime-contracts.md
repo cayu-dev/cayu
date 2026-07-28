@@ -1732,11 +1732,13 @@ range remain exact. It also makes the bounded `cost.billing_breakdown` projectio
 part of the usage-rollup response. Server contract version 3 applies the same
 lossless aggregate representation to session summaries, causal-budget summaries,
 session aggregate summaries, and usage breakdowns; those fields previously used
-the signed-64-bit, numeric per-model-step `UsageMetrics` shape. Clients generated
-against contract version 1 or 2 must regenerate from the current OpenAPI document
-and treat all aggregate counter fields as strings; independently hosted
-dashboards must not render control-plane routes against a server reporting a
-different contract version.
+the signed-64-bit, numeric per-model-step `UsageMetrics` shape. Server contract
+version 4 adds the required `surfaces.usage` capability so usage aggregation and
+the dashboard's configured pricing catalog are represented independently.
+Clients generated against contract version 1, 2, or 3 must regenerate from the
+current OpenAPI document. Version 1 and 2 clients must also treat all aggregate
+counter fields as strings. Independently hosted dashboards must not render
+control-plane routes against a server reporting a different contract version.
 The exported aggregate models—including the aggregate usage fields on session
 and causal-budget summaries—parse that canonical JSON representation back to
 Python integers, while direct Python construction remains strict and does not
@@ -1744,9 +1746,12 @@ accept string counters.
 
 The protected `GET /api/contract` response also carries the server-authoritative
 control-plane capability projection. It reports whether Tasks, reviewed
-Knowledge, registered artifact storage, and dashboard pricing are configured,
-with separate read and mutation availability and stable `not_configured` or
-`unsupported` reasons. Dashboard mounting is reported independently from its
+Knowledge, registered artifact storage, usage aggregation, and dashboard pricing
+are available, with separate read and mutation availability and stable
+`not_configured` or `unsupported` reasons. Usage aggregation is reported
+independently from dashboard pricing: a capable session store can provide
+activity and token totals without a default price book, while pricing controls
+only cost estimation. Dashboard mounting is reported independently from its
 access policy. Framework mutation families—including session execution,
 interruption, annotations, pending-action resolution, task lifecycle, and
 knowledge review—are reported separately so the dashboard can suppress controls
@@ -1804,14 +1809,15 @@ context in validated claims or application-owned state.
 Capabilities are discovery and presentation metadata, not authorization. Every
 route continues to run its configured authentication dependency and enforce its
 own runtime preconditions. Custom request-aware authentication may still reject
-an operation even when the operation is structurally enabled. The `pricing`
-surface is configured when the bundled dashboard received a default price book;
-its read operation is enabled only when the configured `SessionStore` also
-declares `supports_usage_aggregates = True`. Custom stores inherit a conservative
+an operation even when the operation is structurally enabled. The `usage` read
+operation is enabled when the configured `SessionStore` declares
+`supports_usage_aggregates = True`; callers may then submit a validated bounded
+price book directly to the usage endpoint. Custom stores inherit a conservative
 `False` default and must opt in after implementing the bounded aggregate
-contract. Callers of the usage endpoint may still submit a validated bounded
-price book directly when that read operation is supported; the configured flag
-specifically describes the dashboard's catalog. Dashboard configuration
+contract. The separate `pricing` surface reports whether the bundled dashboard
+received a default price book and is readable only when usage aggregation is
+also supported. Its configured flag specifically describes the dashboard's
+catalog, not whether callers may supply pricing. Dashboard configuration
 validates a non-null `priceBook` against those same usage-request bounds before
 mounting, so the capability cannot advertise a catalog that the dashboard's
 aggregate request would reject.

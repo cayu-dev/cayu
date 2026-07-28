@@ -9,8 +9,10 @@ import {
 } from "@tanstack/react-router"
 import { StrictMode } from "react"
 import { createRoot } from "react-dom/client"
+import { CapabilityRoute } from "./components/dashboard/server-contract"
 import { Layout } from "./Layout"
 import { dashboardConfig } from "./lib/config"
+import { DASHBOARD_ROUTE_REQUIREMENTS } from "./lib/dashboard-capabilities"
 import { parseDashboardSearch, stringifyDashboardSearch } from "./lib/search-params"
 import { validateSessionHistorySearch } from "./lib/session-history-search"
 import { validateSessionIndexSearch } from "./lib/session-index-search"
@@ -36,6 +38,7 @@ const SessionDetailPage = lazyRouteComponent(
 const SessionsPage = lazyRouteComponent(() => import("./routes/sessions"), "SessionsPage")
 const TasksPage = lazyRouteComponent(() => import("./routes/tasks"), "TasksPage")
 const UsagePage = lazyRouteComponent(() => import("./routes/usage"), "UsagePage")
+const SystemPage = lazyRouteComponent(() => import("./routes/system"), "SystemPage")
 
 function RoutePending() {
   return (
@@ -54,7 +57,11 @@ const rootRoute = createRootRoute({ component: Layout })
 const dashboardRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/",
-  component: DashboardPage,
+  component: () => (
+    <CapabilityRoute requirement={DASHBOARD_ROUTE_REQUIREMENTS["/"]} title="Dashboard">
+      <DashboardPage />
+    </CapabilityRoute>
+  ),
 })
 
 const sessionsRoute = createRoute({
@@ -68,13 +75,21 @@ const usageRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/usage",
   validateSearch: validateUsageRollupSearch,
-  component: UsagePage,
+  component: () => (
+    <CapabilityRoute requirement={DASHBOARD_ROUTE_REQUIREMENTS["/usage"]} title="Usage">
+      <UsagePage />
+    </CapabilityRoute>
+  ),
 })
 
 const tasksRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/tasks",
-  component: TasksPage,
+  component: () => (
+    <CapabilityRoute requirement={DASHBOARD_ROUTE_REQUIREMENTS["/tasks"]} title="Tasks">
+      <TasksPage />
+    </CapabilityRoute>
+  ),
 })
 
 const pendingActionsRoute = createRoute({
@@ -98,7 +113,11 @@ const environmentsRoute = createRoute({
 const artifactsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/artifacts",
-  component: ArtifactsPage,
+  component: () => (
+    <CapabilityRoute requirement={DASHBOARD_ROUTE_REQUIREMENTS["/artifacts"]} title="Artifacts">
+      <ArtifactsPage />
+    </CapabilityRoute>
+  ),
 })
 
 const sessionDetailRoute = createRoute({
@@ -112,13 +131,27 @@ const sessionDetailRoute = createRoute({
 const knowledgeRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/knowledge",
-  component: KnowledgePage,
+  component: () => (
+    <CapabilityRoute requirement={DASHBOARD_ROUTE_REQUIREMENTS["/knowledge"]} title="Knowledge">
+      <KnowledgePage />
+    </CapabilityRoute>
+  ),
 })
 
 const runRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/run",
-  component: RunPage,
+  component: () => (
+    <CapabilityRoute requirement={DASHBOARD_ROUTE_REQUIREMENTS["/run"]} title="New Run">
+      <RunPage />
+    </CapabilityRoute>
+  ),
+})
+
+const systemRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/system",
+  component: SystemPage,
 })
 
 const routeTree = rootRoute.addChildren([
@@ -133,6 +166,7 @@ const routeTree = rootRoute.addChildren([
   sessionDetailRoute,
   knowledgeRoute,
   runRoute,
+  systemRoute,
 ])
 
 const router = createRouter({

@@ -18,6 +18,7 @@ import {
   PayloadViewer,
   StateMessage,
 } from "../components/dashboard/layout"
+import { useDashboardCapability } from "../components/dashboard/server-contract"
 import { Badge } from "../components/ui/badge"
 import { Button } from "../components/ui/button"
 import {
@@ -29,6 +30,7 @@ import {
   type KnowledgePendingPage,
   rejectKnowledge,
 } from "../lib/api"
+import { dashboardCapabilityUnavailableText } from "../lib/dashboard-capabilities"
 import { formatCount, formatDateTime } from "../lib/format"
 import { cn } from "../lib/utils"
 
@@ -367,6 +369,12 @@ function KnowledgeDetail({
 
 export function KnowledgePage() {
   const queryClient = useQueryClient()
+  const knowledgeReviewCapability = useDashboardCapability({
+    kind: "mutation",
+    mutation: "knowledge_review",
+  })
+  const knowledgeReviewUnavailableText =
+    dashboardCapabilityUnavailableText(knowledgeReviewCapability)
   const [selectedEntryId, setSelectedEntryId] = useState<string | null>(null)
 
   const pending = useQuery({
@@ -412,11 +420,21 @@ export function KnowledgePage() {
   }
 
   const approve = useMutation<KnowledgeEntry, Error, string>({
-    mutationFn: approveKnowledge,
+    mutationFn: async (entryId) => {
+      if (!knowledgeReviewCapability.enabled) {
+        throw new Error(knowledgeReviewUnavailableText ?? "Knowledge review is unavailable.")
+      }
+      return approveKnowledge(entryId)
+    },
     onSuccess: (_entry, entryId) => onReviewSuccess(entryId),
   })
   const reject = useMutation<KnowledgeEntry, Error, string>({
-    mutationFn: rejectKnowledge,
+    mutationFn: async (entryId) => {
+      if (!knowledgeReviewCapability.enabled) {
+        throw new Error(knowledgeReviewUnavailableText ?? "Knowledge review is unavailable.")
+      }
+      return rejectKnowledge(entryId)
+    },
     onSuccess: (_entry, entryId) => onReviewSuccess(entryId),
   })
 
@@ -449,6 +467,13 @@ export function KnowledgePage() {
           </Button>
         }
       />
+
+      {knowledgeReviewUnavailableText && (
+        <StateMessage data-testid="knowledge-mutations-unavailable">
+          Review decisions are unavailable. {knowledgeReviewUnavailableText} Pending entries remain
+          readable.
+        </StateMessage>
+      )}
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <SummaryStat
@@ -537,7 +562,7 @@ export function KnowledgePage() {
             entry={selectedDetail}
             isLoading={detail.isLoading}
             error={detailError}
-            disabled={mutating}
+            disabled={mutating || !knowledgeReviewCapability.enabled}
             isLoadingSelection={isLoadingSelection}
             mutatingEntryId={mutatingEntryId}
             action={action}

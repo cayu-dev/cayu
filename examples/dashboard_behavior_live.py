@@ -706,6 +706,8 @@ async def _run_browser_contract(
         )
         try:
             await _exercise_contract_version_gate(page, base_url)
+            await _exercise_capability_contract(page, base_url)
+            await _exercise_system_page(page, base_url)
             await _exercise_dashboard(page, base_url, provider, faults)
             _require_no_browser_failures(browser_failures)
             run_observer_aborts = [
@@ -759,6 +761,11 @@ async def _run_browser_contract(
         "interactions": [
             "mutation_pre_frame_recovery",
             "contract_version_gate",
+            "capability_aware_routes",
+            "usage_without_default_pricing",
+            "unavailable_mutation_controls",
+            "overview_read_only_controls",
+            "manual_system_snapshot",
             "mutation_post_frame_recovery",
             "session_resume",
             "approval_resolution",
@@ -878,10 +885,18 @@ async def _exercise_contract_version_gate(page: Page, base_url: str) -> None:
     async def serve_incompatible_contract(route, request) -> None:
         path = urlsplit(request.url).path
         if path == "/api/contract":
+            response = await route.fetch()
+            body = await response.json()
+            # Reconstruct the immediately preceding valid v3 response. That
+            # contract predates the required usage surface and must be rejected
+            # before navigation evaluates any capability requirement.
+            body["contract_version"] = "3"
+            body["versioning"]["contract_version"] = "3"
+            usage = body["capabilities"]["surfaces"].pop("usage", None)
+            require(usage is not None, "the v4 fixture must expose the required usage surface")
             await route.fulfill(
-                status=200,
-                headers={"content-type": "application/json"},
-                body=json.dumps({"api_prefix": "/api", "contract_version": "1"}),
+                response=response,
+                json=body,
             )
             return
         api_requests_beyond_contract.append(f"{request.method} {path}")
@@ -895,16 +910,210 @@ async def _exercise_contract_version_gate(page: Page, base_url: str) -> None:
     try:
         await page.goto(f"{base_url}/cayu/usage", wait_until="networkidle")
         await expect(page.get_by_test_id("dashboard-contract-gate")).to_contain_text(
-            "Dashboard expects CAYU server contract v3, but the server reports v1."
+            "Dashboard expects CAYU server contract v4, but the server reports v3."
         )
         await expect(page.get_by_role("heading", name="Usage", exact=True)).to_have_count(0)
         require_equal(
             api_requests_beyond_contract,
             [],
-            "an incompatible dashboard must not start route-specific API requests",
+            "a previous valid v3 contract must not start route-specific API requests",
         )
     finally:
         await page.unroute("**/api/**", serve_incompatible_contract)
+
+
+async def _exercise_capability_contract(page: Page, base_url: str) -> None:
+    observed_requests: list[str] = []
+
+    def record_api_request(request) -> None:
+        path = urlsplit(request.url).path
+        if path.startswith("/api/"):
+            observed_requests.append(f"{request.method} {path}")
+
+    page.on("request", record_api_request)
+    try:
+        await page.goto(f"{base_url}/cayu/tasks", wait_until="networkidle")
+        await expect(page.get_by_test_id("dashboard-capability-unavailable")).to_contain_text(
+            "Tasks is unavailable"
+        )
+        await expect(page.get_by_role("link", name="Tasks", exact=True)).to_have_count(0)
+        await expect(page.get_by_role("link", name="Knowledge", exact=True)).to_have_count(0)
+        await expect(page.get_by_role("link", name="Artifacts", exact=True)).to_have_count(0)
+        await expect(page.get_by_role("link", name="Usage", exact=True)).to_be_visible()
+        await expect(page.get_by_role("link", name="System", exact=True)).to_be_visible()
+        require(
+            not any(request.startswith("GET /api/tasks") for request in observed_requests),
+            f"an unavailable direct task route issued a task request: {observed_requests!r}",
+        )
+
+        observed_requests.clear()
+        await page.goto(f"{base_url}/cayu/agents", wait_until="networkidle")
+        await expect(page.get_by_role("heading", name="Agents", exact=True)).to_be_visible()
+        await expect(page.get_by_text("Tasks are unavailable.", exact=False)).to_be_visible()
+        require(
+            not any(request.startswith("GET /api/tasks") for request in observed_requests),
+            f"the agent page probed unavailable tasks: {observed_requests!r}",
+        )
+
+        observed_requests.clear()
+        await page.goto(f"{base_url}/cayu/sessions/{SESSION_ID}", wait_until="networkidle")
+        await expect(page.get_by_role("heading", name=SESSION_ID)).to_be_visible()
+        require(
+            not any(request.startswith("GET /api/artifacts") for request in observed_requests),
+            f"the session page probed unavailable artifacts: {observed_requests!r}",
+        )
+    finally:
+        page.remove_listener("request", record_api_request)
+
+    async def serve_usage_without_pricing_contract(route) -> None:
+        response = await route.fetch()
+        body = await response.json()
+        body["capabilities"]["surfaces"]["pricing"] = {
+            "configured": False,
+            "read": {
+                "enabled": False,
+                "unavailable_reason": "not_configured",
+            },
+            "mutate": {
+                "enabled": False,
+                "unavailable_reason": "unsupported",
+            },
+        }
+        await route.fulfill(response=response, json=body)
+
+    async def serve_dashboard_without_pricebook(route) -> None:
+        response = await route.fetch()
+        html = await response.text()
+        marker = "window.__CAYU_DASHBOARD_CONFIG__="
+        config_start = html.index(marker) + len(marker)
+        config_end = html.index(";</script>", config_start)
+        config = json.loads(html[config_start:config_end])
+        require(
+            isinstance(config, dict) and "priceBook" in config,
+            "the no-pricing browser scenario requires a configured price book to remove",
+        )
+        config.pop("priceBook", None)
+        config_json = json.dumps(config, separators=(",", ":")).replace("<", "\\u003c")
+        await route.fulfill(
+            response=response,
+            body=f"{html[:config_start]}{config_json}{html[config_end:]}",
+        )
+
+    usage_request_without_pricing = False
+
+    async def observe_usage_without_pricing(route, request) -> None:
+        nonlocal usage_request_without_pricing
+        body = request.post_data_json
+        require(
+            isinstance(body, dict) and body.get("pricing") is None,
+            "usage without a dashboard price book must not submit pricing inputs",
+        )
+        usage_request_without_pricing = True
+        await route.continue_()
+
+    await page.route("**/api/contract", serve_usage_without_pricing_contract)
+    await page.route(f"{base_url}/cayu/usage", serve_dashboard_without_pricebook)
+    await page.route("**/api/usage/rollup", observe_usage_without_pricing)
+    try:
+        await page.goto(f"{base_url}/cayu/usage", wait_until="networkidle")
+        await expect(page.get_by_role("heading", name="Usage", exact=True)).to_be_visible()
+        await expect(page.get_by_role("link", name="Usage", exact=True)).to_be_visible()
+        await expect(
+            page.get_by_text(
+                "Usage remains available, but cost is unavailable rather than displayed as zero.",
+                exact=True,
+            )
+        ).to_be_visible()
+        require(
+            usage_request_without_pricing,
+            "usage without a dashboard price book must issue one aggregate request",
+        )
+    finally:
+        await page.unroute("**/api/usage/rollup", observe_usage_without_pricing)
+        await page.unroute(f"{base_url}/cayu/usage", serve_dashboard_without_pricebook)
+        await page.unroute("**/api/contract", serve_usage_without_pricing_contract)
+
+    async def serve_read_only_contract(route) -> None:
+        response = await route.fetch()
+        body = await response.json()
+        mutations = body["capabilities"]["mutations"]
+        for mutation_name in mutations:
+            mutations[mutation_name] = {
+                "enabled": False,
+                "unavailable_reason": "unsupported",
+            }
+        await route.fulfill(response=response, json=body)
+
+    await page.route("**/api/contract", serve_read_only_contract)
+    try:
+        await page.goto(f"{base_url}/cayu/", wait_until="networkidle")
+        await expect(page.get_by_role("button", name="New Run", exact=True)).to_be_disabled()
+        await expect(page.get_by_test_id("overview-session-execution-unavailable")).to_be_visible()
+
+        await page.goto(f"{base_url}/cayu/sessions", wait_until="networkidle")
+        await expect(page.get_by_role("button", name="New Run", exact=True)).to_be_disabled()
+        await expect(page.get_by_test_id("session-execution-unavailable")).to_be_visible()
+
+        await page.goto(
+            f"{base_url}/cayu/sessions/{INTERRUPT_SESSION_ID}", wait_until="networkidle"
+        )
+        interrupt = page.get_by_role("button", name="Interrupt session", exact=True)
+        await expect(interrupt).to_be_disabled()
+        await expect(page.get_by_test_id("session-interruption-unavailable")).to_be_visible()
+        await expect(page.get_by_role("button", name="Edit labels", exact=True)).to_be_disabled()
+        await expect(page.get_by_test_id("annotations-unavailable")).to_be_visible()
+        await expect(page.get_by_role("link", name="New Run", exact=True)).to_have_count(0)
+
+        await page.goto(f"{base_url}/cayu/sessions/{APPROVAL_SESSION_ID}", wait_until="networkidle")
+        await expect(page.get_by_role("button", name="Approve", exact=True)).to_be_disabled()
+        await expect(page.get_by_role("button", name="Deny", exact=True)).to_be_disabled()
+        await expect(page.get_by_test_id("pending-action-unavailable")).to_be_visible()
+
+        await page.goto(f"{base_url}/cayu/run", wait_until="networkidle")
+        await expect(page.get_by_test_id("dashboard-capability-unavailable")).to_contain_text(
+            "New Run is unavailable"
+        )
+        await expect(page.get_by_role("textbox")).to_have_count(0)
+    finally:
+        await page.unroute("**/api/contract", serve_read_only_contract)
+
+
+async def _exercise_system_page(page: Page, base_url: str) -> None:
+    diagnostics_requests = 0
+
+    def count_diagnostics_requests(request) -> None:
+        nonlocal diagnostics_requests
+        if urlsplit(request.url).path == "/api/system/diagnostics":
+            diagnostics_requests += 1
+
+    page.on("request", count_diagnostics_requests)
+    try:
+        await page.goto(f"{base_url}/cayu/system", wait_until="networkidle")
+        await expect(page.get_by_role("heading", name="System", exact=True)).to_be_visible()
+        await expect(page.get_by_test_id("system-snapshot-scope")).to_contain_text(
+            "does not probe databases, workers, networks, or external services"
+        )
+        await expect(page.get_by_text("Server contract", exact=True)).to_be_visible()
+        await expect(page.get_by_text("v4", exact=True)).to_be_visible()
+        require_equal(diagnostics_requests, 1, "the System page must load one initial snapshot")
+
+        await page.wait_for_timeout(5_500)
+        require_equal(
+            diagnostics_requests,
+            1,
+            "the System page must not refresh diagnostics in the background",
+        )
+        await page.get_by_role("button", name="Refresh snapshot", exact=True).click()
+        await expect(
+            page.get_by_role("button", name="Refresh snapshot", exact=True)
+        ).to_be_enabled()
+        require_equal(
+            diagnostics_requests,
+            2,
+            "manual System refresh must issue exactly one additional snapshot request",
+        )
+    finally:
+        page.remove_listener("request", count_diagnostics_requests)
 
 
 async def _exercise_operational_scope(page: Page, base_url: str) -> None:

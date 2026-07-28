@@ -8,6 +8,7 @@ import {
   PayloadViewer,
   StateMessage,
 } from "../components/dashboard/layout"
+import { useDashboardCapability } from "../components/dashboard/server-contract"
 import { Badge } from "../components/ui/badge"
 import { Button, buttonVariants } from "../components/ui/button"
 import { Input } from "../components/ui/input"
@@ -28,6 +29,7 @@ import {
   type Task,
   type ToolSummary,
 } from "../lib/api"
+import { dashboardCapabilityUnavailableText } from "../lib/dashboard-capabilities"
 import { formatCount, formatDateTime } from "../lib/format"
 import { currentQueryParam, dashboardPath, replaceDashboardLocation } from "../lib/links"
 import { cn } from "../lib/utils"
@@ -122,12 +124,16 @@ function AgentDetail({
   relatedSessionsLoading,
   relatedTasks,
   relatedTasksLoading,
+  tasksAvailable,
+  tasksUnavailableText,
 }: {
   agent: AgentSummary | null
   relatedSessions: SessionsSummary | undefined
   relatedSessionsLoading: boolean
   relatedTasks: Task[] | undefined
   relatedTasksLoading: boolean
+  tasksAvailable: boolean
+  tasksUnavailableText: string | null
 }) {
   if (agent === null) {
     return (
@@ -213,12 +219,14 @@ function AgentDetail({
             >
               Sessions
             </a>
-            <a
-              href={dashboardPath("/tasks", { assigned_agent_name: agent.name })}
-              className={buttonVariants({ variant: "outline", size: "sm" })}
-            >
-              Tasks
-            </a>
+            {tasksAvailable && (
+              <a
+                href={dashboardPath("/tasks", { assigned_agent_name: agent.name })}
+                className={buttonVariants({ variant: "outline", size: "sm" })}
+              >
+                Tasks
+              </a>
+            )}
           </div>
         </div>
         <div className="grid gap-4 p-4 lg:grid-cols-2">
@@ -247,7 +255,11 @@ function AgentDetail({
               Queue tasks
             </div>
             <div className="space-y-2">
-              {relatedTasksLoading ? (
+              {!tasksAvailable ? (
+                <StateMessage className="rounded-md border border-border py-6">
+                  Tasks are unavailable. {tasksUnavailableText}
+                </StateMessage>
+              ) : relatedTasksLoading ? (
                 <StateMessage className="rounded-md border border-border py-6">
                   Loading tasks...
                 </StateMessage>
@@ -283,6 +295,11 @@ function AgentDetail({
 }
 
 export function AgentsPage() {
+  const tasksCapability = useDashboardCapability({
+    kind: "surface",
+    surface: "tasks",
+  })
+  const tasksUnavailableText = dashboardCapabilityUnavailableText(tasksCapability)
   const [search, setSearch] = useState(() => currentQueryParam("q"))
   const [selectedAgentName, setSelectedAgentName] = useState<string | null>(null)
   const debouncedSearch = useDebouncedValue(search, 300)
@@ -321,7 +338,7 @@ export function AgentsPage() {
   const relatedTasks = useQuery({
     queryKey: ["agent-related-tasks", selectedAgent?.name],
     queryFn: () => fetchTasks({ assigned_agent_name: selectedAgent?.name, limit: 5 }),
-    enabled: selectedAgent !== null,
+    enabled: selectedAgent !== null && tasksCapability.enabled,
     staleTime: 10_000,
   })
   const error = agents.error instanceof Error ? agents.error.message : null
@@ -419,6 +436,8 @@ export function AgentsPage() {
             relatedSessionsLoading={relatedSessions.isLoading}
             relatedTasks={relatedTasks.data}
             relatedTasksLoading={relatedTasks.isLoading}
+            tasksAvailable={tasksCapability.enabled}
+            tasksUnavailableText={tasksUnavailableText}
           />
         </DataCard>
       </div>

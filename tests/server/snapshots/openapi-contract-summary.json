@@ -2933,6 +2933,9 @@
         },
         "tasks": {
           "$ref": "#/components/schemas/OptionalSurfaceCapability"
+        },
+        "usage": {
+          "$ref": "#/components/schemas/OptionalSurfaceCapability"
         }
       },
       "required": [
@@ -2940,6 +2943,7 @@
         "tasks",
         "reviewed_knowledge",
         "artifacts",
+        "usage",
         "pricing"
       ],
       "title": "ControlPlaneSurfaceCapabilities",
@@ -4702,7 +4706,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "3",
+          "default": "4",
           "title": "Contract Version",
           "type": "string"
         },
@@ -7477,7 +7481,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "3",
+          "default": "4",
           "title": "Contract Version",
           "type": "string"
         }

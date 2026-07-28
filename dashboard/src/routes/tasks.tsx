@@ -9,6 +9,7 @@ import {
   PayloadViewer,
   StateMessage,
 } from "../components/dashboard/layout"
+import { useDashboardCapability } from "../components/dashboard/server-contract"
 import { Badge } from "../components/ui/badge"
 import { Button } from "../components/ui/button"
 import { Input } from "../components/ui/input"
@@ -32,6 +33,7 @@ import {
   type TaskHold,
   type TaskListQuery,
 } from "../lib/api"
+import { dashboardCapabilityUnavailableText } from "../lib/dashboard-capabilities"
 import { formatDateTime } from "../lib/format"
 import { currentQueryParam, dashboardPath, replaceDashboardLocation } from "../lib/links"
 import { cn } from "../lib/utils"
@@ -138,6 +140,11 @@ function taskMatchesQuery(task: TaskDetail, query: TaskListQuery) {
 
 export function TasksPage() {
   const queryClient = useQueryClient()
+  const taskLifecycleCapability = useDashboardCapability({
+    kind: "mutation",
+    mutation: "task_lifecycle",
+  })
+  const taskLifecycleUnavailableText = dashboardCapabilityUnavailableText(taskLifecycleCapability)
   const [search, setSearch] = useState(() => currentQueryParam("q"))
   const [assignedAgentFilter, setAssignedAgentFilter] = useState(() =>
     currentQueryParam("assigned_agent_name"),
@@ -244,6 +251,7 @@ export function TasksPage() {
   }
 
   function runAction(nextAction: TaskAction, task: Task) {
+    if (!taskLifecycleCapability.enabled) return
     action.mutate({ action: nextAction, body: taskActionBody(reason), task, listQuery: query })
   }
 
@@ -260,6 +268,13 @@ export function TasksPage() {
         title="Tasks"
         description="Operate durable task queues, held work, and worker leases."
       />
+
+      {taskLifecycleUnavailableText && (
+        <StateMessage data-testid="task-mutations-unavailable">
+          Task lifecycle actions are unavailable. {taskLifecycleUnavailableText} Task inspection
+          remains available.
+        </StateMessage>
+      )}
 
       <DataCard>
         <div className="flex min-w-0 flex-wrap items-center gap-2 border-b border-border p-4">
@@ -570,12 +585,16 @@ export function TasksPage() {
                   value={reason}
                   onChange={(event) => setReason(event.target.value)}
                   placeholder="Optional status reason"
-                  disabled={action.isPending}
+                  disabled={action.isPending || !taskLifecycleCapability.enabled}
+                  title={taskLifecycleUnavailableText ?? undefined}
                 />
                 <div className="grid grid-cols-2 gap-2">
                   <Button
                     variant="outline"
-                    disabled={!canHold(selectedTask) || action.isPending}
+                    disabled={
+                      !taskLifecycleCapability.enabled || !canHold(selectedTask) || action.isPending
+                    }
+                    title={taskLifecycleUnavailableText ?? undefined}
                     onClick={() => runAction("pause", selectedTask)}
                   >
                     <CirclePause className="mr-1.5 h-4 w-4" />
@@ -583,7 +602,10 @@ export function TasksPage() {
                   </Button>
                   <Button
                     variant="outline"
-                    disabled={!canHold(selectedTask) || action.isPending}
+                    disabled={
+                      !taskLifecycleCapability.enabled || !canHold(selectedTask) || action.isPending
+                    }
+                    title={taskLifecycleUnavailableText ?? undefined}
                     onClick={() => runAction("block", selectedTask)}
                   >
                     <Ban className="mr-1.5 h-4 w-4" />
@@ -591,14 +613,22 @@ export function TasksPage() {
                   </Button>
                   <Button
                     variant="outline"
-                    disabled={!canHold(selectedTask) || action.isPending}
+                    disabled={
+                      !taskLifecycleCapability.enabled || !canHold(selectedTask) || action.isPending
+                    }
+                    title={taskLifecycleUnavailableText ?? undefined}
                     onClick={() => runAction("needs_attention", selectedTask)}
                   >
                     <TriangleAlert className="mr-1.5 h-4 w-4" />
                     {actionLabel("needs_attention")}
                   </Button>
                   <Button
-                    disabled={!canResume(selectedTask) || action.isPending}
+                    disabled={
+                      !taskLifecycleCapability.enabled ||
+                      !canResume(selectedTask) ||
+                      action.isPending
+                    }
+                    title={taskLifecycleUnavailableText ?? undefined}
                     onClick={() => runAction("resume", selectedTask)}
                   >
                     <Play className="mr-1.5 h-4 w-4" />

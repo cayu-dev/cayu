@@ -3,6 +3,7 @@ import { Link, useNavigate, useSearch } from "@tanstack/react-router"
 import { Search, SlidersHorizontal } from "lucide-react"
 import { useCallback, useEffect, useMemo, useState } from "react"
 import { DataCard, Page, PageHeader, StateMessage } from "../components/dashboard/layout"
+import { useDashboardCapability } from "../components/dashboard/server-contract"
 import { Badge } from "../components/ui/badge"
 import { Button, buttonVariants } from "../components/ui/button"
 import { Input } from "../components/ui/input"
@@ -16,6 +17,7 @@ import {
 } from "../components/ui/table"
 import { Textarea } from "../components/ui/textarea"
 import { fetchSessionsSummary, type SessionsSummary } from "../lib/api"
+import { dashboardCapabilityUnavailableText } from "../lib/dashboard-capabilities"
 import { formatDateTime } from "../lib/format"
 import { dashboardPath } from "../lib/links"
 import { summarizeSessionDebugState } from "../lib/session-debug"
@@ -331,6 +333,13 @@ function AdvancedFilters({
 }
 
 export function SessionsPage() {
+  const sessionExecutionCapability = useDashboardCapability({
+    kind: "mutation",
+    mutation: "session_execution",
+  })
+  const sessionExecutionUnavailableText = dashboardCapabilityUnavailableText(
+    sessionExecutionCapability,
+  )
   const navigate = useNavigate({ from: "/sessions" })
   const search = useSearch({ from: "/sessions" })
   const [filterResetVersion, setFilterResetVersion] = useState(0)
@@ -401,11 +410,24 @@ export function SessionsPage() {
       <PageHeader
         title="Sessions"
         actions={
-          <Link to="/run" className={buttonVariants()}>
-            New Run
-          </Link>
+          sessionExecutionCapability.enabled ? (
+            <Link to="/run" className={buttonVariants()}>
+              New Run
+            </Link>
+          ) : (
+            <Button type="button" disabled title={sessionExecutionUnavailableText ?? undefined}>
+              New Run
+            </Button>
+          )
         }
       />
+
+      {sessionExecutionUnavailableText && (
+        <StateMessage data-testid="session-execution-unavailable">
+          Starting new sessions is unavailable. {sessionExecutionUnavailableText} Existing sessions
+          remain readable.
+        </StateMessage>
+      )}
 
       <DataCard title="Sessions" description={pageDescription}>
         <div className="flex min-w-0 flex-wrap items-center gap-2 border-b border-border p-4">

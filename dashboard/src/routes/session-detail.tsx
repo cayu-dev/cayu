@@ -29,6 +29,7 @@ import {
   MutationTransportStatus,
   mutationTransportErrorMessage,
 } from "../components/dashboard/mutation-transport-status"
+import { useDashboardCapability } from "../components/dashboard/server-contract"
 import { SessionAnnotations } from "../components/dashboard/session-annotations"
 import { Badge } from "../components/ui/badge"
 import { Button, buttonVariants } from "../components/ui/button"
@@ -61,6 +62,7 @@ import {
   type SessionSummary,
   type SessionTranscriptPage,
 } from "../lib/api"
+import { dashboardCapabilityUnavailableText } from "../lib/dashboard-capabilities"
 import {
   formatBytes,
   formatCount,
@@ -768,6 +770,7 @@ function TranscriptPart({ part }: { part: Record<string, unknown> }) {
 function PendingActionBanner({
   action,
   resolving,
+  unavailableReason,
   error,
   onApprove,
   onDeny,
@@ -776,6 +779,7 @@ function PendingActionBanner({
 }: {
   action: PendingAction
   resolving: boolean
+  unavailableReason: string | null
   error: string | null
   onApprove: (reason: string | null) => void
   onDeny: (reason: string | null) => void
@@ -787,6 +791,7 @@ function PendingActionBanner({
   const [recoveryOutcome, setRecoveryOutcome] = useState<RecoveryOutcome>("completed")
   const [recoveryMessage, setRecoveryMessage] = useState("")
   const [recoveryAnswer, setRecoveryAnswer] = useState("")
+  const controlsDisabled = resolving || unavailableReason !== null
 
   if (action.kind === "approval") {
     return (
@@ -814,12 +819,17 @@ function PendingActionBanner({
             <div className="flex shrink-0 gap-2">
               <Button
                 variant="outline"
-                disabled={resolving}
+                disabled={controlsDisabled}
+                title={unavailableReason ?? undefined}
                 onClick={() => onDeny(reason.trim() || null)}
               >
                 Deny
               </Button>
-              <Button disabled={resolving} onClick={() => onApprove(reason.trim() || null)}>
+              <Button
+                disabled={controlsDisabled}
+                title={unavailableReason ?? undefined}
+                onClick={() => onApprove(reason.trim() || null)}
+              >
                 Approve
               </Button>
             </div>
@@ -828,8 +838,14 @@ function PendingActionBanner({
             value={reason}
             onChange={(event) => setReason(event.target.value)}
             placeholder="Optional decision reason"
-            disabled={resolving}
+            disabled={controlsDisabled}
+            title={unavailableReason ?? undefined}
           />
+          {unavailableReason && (
+            <p className="text-sm text-muted-foreground" data-testid="pending-action-unavailable">
+              Pending-action resolution is unavailable. {unavailableReason}
+            </p>
+          )}
           <PayloadViewer value={action.arguments} maxHeight="max-h-48" />
           {error && <p className="text-sm text-destructive">{error}</p>}
         </CardContent>
@@ -840,7 +856,7 @@ function PendingActionBanner({
   if (action.kind === "manual_recovery") {
     const requiresAnswer = action.inputId !== null
     const recoveryDisabled =
-      resolving || !recoveryMessage.trim() || (requiresAnswer && !recoveryAnswer.trim())
+      controlsDisabled || !recoveryMessage.trim() || (requiresAnswer && !recoveryAnswer.trim())
 
     return (
       <Card className="border-destructive/30 bg-destructive/5">
@@ -874,7 +890,8 @@ function PendingActionBanner({
               <select
                 value={recoveryOutcome}
                 onChange={(event) => setRecoveryOutcome(event.target.value as RecoveryOutcome)}
-                disabled={resolving}
+                disabled={controlsDisabled}
+                title={unavailableReason ?? undefined}
                 className="h-9 rounded-md border border-input bg-background px-3 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
                 aria-label="Recovery outcome"
               >
@@ -883,6 +900,7 @@ function PendingActionBanner({
               </select>
               <Button
                 disabled={recoveryDisabled}
+                title={unavailableReason ?? undefined}
                 onClick={() =>
                   onRecover(
                     recoveryOutcome,
@@ -900,15 +918,22 @@ function PendingActionBanner({
               value={recoveryAnswer}
               onChange={(event) => setRecoveryAnswer(event.target.value)}
               placeholder="Re-supply the user answer for recovery"
-              disabled={resolving}
+              disabled={controlsDisabled}
+              title={unavailableReason ?? undefined}
             />
           )}
           <Input
             value={recoveryMessage}
             onChange={(event) => setRecoveryMessage(event.target.value)}
             placeholder="Externally verified result or failure reason"
-            disabled={resolving}
+            disabled={controlsDisabled}
+            title={unavailableReason ?? undefined}
           />
+          {unavailableReason && (
+            <p className="text-sm text-muted-foreground" data-testid="pending-action-unavailable">
+              Pending-action resolution is unavailable. {unavailableReason}
+            </p>
+          )}
           <div className="space-y-2">
             <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
               Tool arguments
@@ -938,7 +963,11 @@ function PendingActionBanner({
               input_id: {action.inputId}
             </p>
           </div>
-          <Button disabled={resolving || !answer.trim()} onClick={() => onAnswer(answer.trim())}>
+          <Button
+            disabled={controlsDisabled || !answer.trim()}
+            title={unavailableReason ?? undefined}
+            onClick={() => onAnswer(answer.trim())}
+          >
             Submit Answer
           </Button>
         </div>
@@ -949,7 +978,8 @@ function PendingActionBanner({
                 key={option}
                 variant={answer === option ? "default" : "outline"}
                 size="sm"
-                disabled={resolving}
+                disabled={controlsDisabled}
+                title={unavailableReason ?? undefined}
                 onClick={() => setAnswer(option)}
               >
                 {option}
@@ -960,10 +990,18 @@ function PendingActionBanner({
         <Input
           value={answer}
           onChange={(event) => setAnswer(event.target.value)}
-          onKeyDown={(event) => event.key === "Enter" && answer.trim() && onAnswer(answer.trim())}
+          onKeyDown={(event) =>
+            event.key === "Enter" && !controlsDisabled && answer.trim() && onAnswer(answer.trim())
+          }
           placeholder="Answer the paused session..."
-          disabled={resolving}
+          disabled={controlsDisabled}
+          title={unavailableReason ?? undefined}
         />
+        {unavailableReason && (
+          <p className="text-sm text-muted-foreground" data-testid="pending-action-unavailable">
+            Pending-action resolution is unavailable. {unavailableReason}
+          </p>
+        )}
         {error && <p className="text-sm text-destructive">{error}</p>}
       </CardContent>
     </Card>
@@ -1073,6 +1111,31 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   const queryClient = useQueryClient()
   const navigate = useNavigate({ from: "/sessions/$sessionId" })
   const historySearch = useSearch({ from: "/sessions/$sessionId" })
+  const artifactsCapability = useDashboardCapability({
+    kind: "surface",
+    surface: "artifacts",
+  })
+  const sessionExecutionCapability = useDashboardCapability({
+    kind: "mutation",
+    mutation: "session_execution",
+  })
+  const sessionInterruptionCapability = useDashboardCapability({
+    kind: "mutation",
+    mutation: "session_interruption",
+  })
+  const pendingActionResolutionCapability = useDashboardCapability({
+    kind: "mutation",
+    mutation: "pending_action_resolution",
+  })
+  const sessionExecutionUnavailableText = dashboardCapabilityUnavailableText(
+    sessionExecutionCapability,
+  )
+  const sessionInterruptionUnavailableText = dashboardCapabilityUnavailableText(
+    sessionInterruptionCapability,
+  )
+  const pendingActionResolutionUnavailableText = dashboardCapabilityUnavailableText(
+    pendingActionResolutionCapability,
+  )
   const activeEventFilters = useMemo(() => eventHistoryFilters(historySearch), [historySearch])
   const activeTranscriptFilters = useMemo(
     () => transcriptHistoryFilters(historySearch),
@@ -1292,7 +1355,7 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   const sessionArtifacts = useQuery({
     queryKey: ["session-artifacts", sessionId],
     queryFn: () => fetchArtifacts({ session_id: sessionId, limit: 6 }),
-    enabled: !isError,
+    enabled: !isError && artifactsCapability.enabled,
     staleTime: 10_000,
   })
 
@@ -2039,6 +2102,7 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   }
 
   const handleInterrupt = async () => {
+    if (!sessionInterruptionCapability.enabled) return
     if (interruptRequested || sessionMutationKindRef.current === "interrupt") return
     abandonMutationObservationForInterrupt()
     setInterruptRequested(true)
@@ -2070,6 +2134,7 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   }
 
   const handleResume = async () => {
+    if (!sessionExecutionCapability.enabled) return
     if (!resumePrompt.trim() || resuming || mutationCommandsLocked) return
     setResuming(true)
     setResumeError(null)
@@ -2097,6 +2162,7 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   }
 
   const handleRetryCascade = async () => {
+    if (!sessionInterruptionCapability.enabled) return
     if (retryingCascade || mutationCommandsLocked) return
     setRetryingCascade(true)
     setCascadeRetryError(null)
@@ -2155,6 +2221,7 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
     decision: "approve" | "deny",
     reason: string | null,
   ) => {
+    if (!pendingActionResolutionCapability.enabled) return
     if (resolvingAction || mutationCommandsLocked) return
     setResolvingAction(true)
     setActionError(null)
@@ -2188,6 +2255,7 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
     action: Extract<PendingAction, { kind: "user_input" }>,
     answer: string,
   ) => {
+    if (!pendingActionResolutionCapability.enabled) return
     if (resolvingAction || mutationCommandsLocked) return
     setResolvingAction(true)
     setActionError(null)
@@ -2218,6 +2286,7 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
     message: string,
     answer: string | null,
   ) => {
+    if (!pendingActionResolutionCapability.enabled) return
     if (resolvingAction || mutationCommandsLocked) return
     setResolvingAction(true)
     setActionError(null)
@@ -2572,16 +2641,20 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
                 Environment
               </a>
             )}
-            <a
-              href={dashboardPath("/artifacts", { session_id: session.id })}
-              className={buttonVariants({ variant: "outline", size: "sm" })}
-            >
-              Artifacts
-            </a>
+            {artifactsCapability.enabled && (
+              <a
+                href={dashboardPath("/artifacts", { session_id: session.id })}
+                className={buttonVariants({ variant: "outline", size: "sm" })}
+              >
+                Artifacts
+              </a>
+            )}
             {canInterrupt && (
               <Button
                 variant="destructive"
                 size="sm"
+                disabled={!sessionInterruptionCapability.enabled}
+                title={sessionInterruptionUnavailableText ?? undefined}
                 onClick={() => {
                   setInterruptError(null)
                   setInterruptSheetOpen(true)
@@ -2607,7 +2680,8 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
               <Button
                 variant="outline"
                 size="sm"
-                disabled={retryingCascade}
+                disabled={retryingCascade || !sessionInterruptionCapability.enabled}
+                title={sessionInterruptionUnavailableText ?? undefined}
                 onClick={handleRetryCascade}
               >
                 {retryingCascade ? (
@@ -2619,6 +2693,22 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
               </Button>
             )}
           </div>
+          {canInterrupt && sessionInterruptionUnavailableText && (
+            <p
+              className="mt-2 text-xs text-muted-foreground"
+              data-testid="session-interruption-unavailable"
+            >
+              Session interruption is unavailable. {sessionInterruptionUnavailableText}
+            </p>
+          )}
+          {canRetryCascade && sessionInterruptionUnavailableText && (
+            <p
+              className="mt-2 text-xs text-muted-foreground"
+              data-testid="session-cascade-unavailable"
+            >
+              Background interruption retry is unavailable. {sessionInterruptionUnavailableText}
+            </p>
+          )}
           {cascadeRetryError && (
             <p className="mt-2 text-sm text-destructive">{cascadeRetryError}</p>
           )}
@@ -2797,7 +2887,12 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
         </CardContent>
       </Card>
 
-      <SessionArtifacts artifacts={sessionArtifacts.data?.artifacts ?? []} sessionId={session.id} />
+      {artifactsCapability.enabled && (
+        <SessionArtifacts
+          artifacts={sessionArtifacts.data?.artifacts ?? []}
+          sessionId={session.id}
+        />
+      )}
 
       <SessionAnnotations key={session.id} session={session} />
 
@@ -2812,6 +2907,7 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
           }
           action={pendingAction}
           resolving={resolvingAction || mutationCommandsLocked}
+          unavailableReason={pendingActionResolutionUnavailableText}
           error={actionError}
           onApprove={(reason) =>
             pendingAction.kind === "approval" &&
@@ -3161,16 +3257,33 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
                   onChange={(e) => setResumePrompt(e.target.value)}
                   onKeyDown={(e) => e.key === "Enter" && handleResume()}
                   placeholder="Continue with a new prompt..."
-                  disabled={resuming || mutationCommandsLocked}
+                  disabled={
+                    resuming || mutationCommandsLocked || !sessionExecutionCapability.enabled
+                  }
+                  title={sessionExecutionUnavailableText ?? undefined}
                 />
                 <Button
                   onClick={handleResume}
-                  disabled={resuming || mutationCommandsLocked || !resumePrompt.trim()}
+                  disabled={
+                    resuming ||
+                    mutationCommandsLocked ||
+                    !sessionExecutionCapability.enabled ||
+                    !resumePrompt.trim()
+                  }
+                  title={sessionExecutionUnavailableText ?? undefined}
                 >
                   <Send className="h-4 w-4 mr-2" />
                   {resuming ? "Running..." : "Resume"}
                 </Button>
               </div>
+              {sessionExecutionUnavailableText && (
+                <p
+                  className="mt-2 text-sm text-muted-foreground"
+                  data-testid="session-resume-unavailable"
+                >
+                  Session resume is unavailable. {sessionExecutionUnavailableText}
+                </p>
+              )}
             </CardContent>
           </Card>
         </div>

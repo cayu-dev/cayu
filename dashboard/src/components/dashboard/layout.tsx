@@ -1,9 +1,13 @@
-import type { ReactNode } from "react"
+import type { ComponentPropsWithoutRef, ReactNode } from "react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { cn } from "@/lib/utils"
 
-function Page({ className, children }: { className?: string; children: ReactNode }) {
-  return <div className={cn("min-w-0 space-y-6", className)}>{children}</div>
+function Page({ className, children, ...props }: ComponentPropsWithoutRef<"div">) {
+  return (
+    <div className={cn("min-w-0 space-y-6", className)} {...props}>
+      {children}
+    </div>
+  )
 }
 
 function PageHeader({
@@ -72,10 +76,9 @@ function StateMessage({
   children,
   tone = "muted",
   className,
-}: {
-  children: ReactNode
+  ...props
+}: ComponentPropsWithoutRef<"div"> & {
   tone?: "muted" | "danger"
-  className?: string
 }) {
   return (
     <div
@@ -84,6 +87,7 @@ function StateMessage({
         tone === "danger" ? "text-destructive" : "text-muted-foreground",
         className,
       )}
+      {...props}
     >
       {children}
     </div>

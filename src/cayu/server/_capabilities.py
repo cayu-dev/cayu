@@ -75,6 +75,11 @@ class ControlPlaneCapabilitySnapshot:
                     artifacts_configured,
                     mutation_supported=False,
                 ),
+                usage=_optional_surface(
+                    True,
+                    read_supported=self.session_usage_aggregates_supported,
+                    mutation_supported=False,
+                ),
                 pricing=_optional_surface(
                     self.dashboard_pricing_configured,
                     read_supported=self.session_usage_aggregates_supported,

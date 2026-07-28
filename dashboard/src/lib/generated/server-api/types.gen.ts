@@ -1551,6 +1551,7 @@ export type ControlPlaneSurfaceCapabilities = {
     pricing: OptionalSurfaceCapability;
     reviewed_knowledge: OptionalSurfaceCapability;
     tasks: OptionalSurfaceCapability;
+    usage: OptionalSurfaceCapability;
 };
 
 /**

@@ -52,7 +52,7 @@ from cayu.server.sse import (
 )
 
 SERVER_API_PREFIX = "/api"
-SERVER_CONTRACT_VERSION = "3"
+SERVER_CONTRACT_VERSION = "4"
 SSE_CONTENT_TYPE = "text/event-stream"
 SSE_LAST_EVENT_ID_FORMAT = "session_id:event_id"
 MAX_SYSTEM_ARTIFACT_STORE_REGISTRATIONS = 64
@@ -577,6 +577,7 @@ class ControlPlaneSurfaceCapabilities(ApiBaseModel):
     tasks: OptionalSurfaceCapability
     reviewed_knowledge: OptionalSurfaceCapability
     artifacts: OptionalSurfaceCapability
+    usage: OptionalSurfaceCapability
     pricing: OptionalSurfaceCapability
 
 

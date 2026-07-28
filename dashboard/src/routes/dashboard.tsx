@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query"
 import { Link } from "@tanstack/react-router"
 import { Activity, AlertTriangle, CheckCircle, Database, ListTodo, XCircle } from "lucide-react"
 import { DataCard, Page, PageHeader, StateMessage } from "../components/dashboard/layout"
+import { useDashboardCapability } from "../components/dashboard/server-contract"
 import { Badge } from "../components/ui/badge"
 import { Button, buttonVariants } from "../components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card"
@@ -21,6 +22,7 @@ import {
   type SessionsSummary,
   type Task,
 } from "../lib/api"
+import { dashboardCapabilityUnavailableText } from "../lib/dashboard-capabilities"
 import { formatCount, formatDateTime, sumCounts } from "../lib/format"
 import { summarizeSessionDebugState } from "../lib/session-debug"
 
@@ -130,9 +132,19 @@ function taskSnapshotStatus(snapshot: OperationalSnapshot): string {
 }
 
 export function DashboardPage() {
+  const tasksCapability = useDashboardCapability({ kind: "surface", surface: "tasks" })
+  const sessionExecutionCapability = useDashboardCapability({
+    kind: "mutation",
+    mutation: "session_execution",
+  })
+  const tasksUnavailableText = dashboardCapabilityUnavailableText(tasksCapability)
+  const sessionExecutionUnavailableText = dashboardCapabilityUnavailableText(
+    sessionExecutionCapability,
+  )
   const operations = useQuery({
-    queryKey: ["operational-snapshot", "dashboard"],
-    queryFn: ({ signal }) => fetchOperationalSnapshot({}, signal),
+    queryKey: ["operational-snapshot", "dashboard", tasksCapability.enabled],
+    queryFn: ({ signal }) =>
+      fetchOperationalSnapshot({ include_tasks: tasksCapability.enabled }, signal),
     retry: retryAggregateRequest,
     refetchInterval: (query) =>
       aggregateRequestFailureIsPermanent(query.state.error) ? false : 5000,
@@ -149,6 +161,7 @@ export function DashboardPage() {
   const tasks = useQuery({
     queryKey: ["tasks", "dashboard"],
     queryFn: () => fetchTasks({ limit: OVERVIEW_SOURCE_LIMIT }),
+    enabled: tasksCapability.enabled,
     refetchInterval: 5000,
     refetchIntervalInBackground: false,
   })
@@ -167,7 +180,8 @@ export function DashboardPage() {
   const pendingActionList = pendingActions.data?.actions || []
   const pendingActionIssues = pendingActions.data?.issues || []
   const sessionsError = summary.error instanceof Error ? summary.error.message : null
-  const tasksError = tasks.error instanceof Error ? tasks.error.message : null
+  const tasksError =
+    tasksCapability.enabled && tasks.error instanceof Error ? tasks.error.message : null
   const attentionTasks = taskList.filter(needsAttentionTask)
   const attentionSessionItems = sessionItems.filter(needsAttentionSessionItem)
   const attentionSessions = attentionSessionItems.map((item) => item.session)
@@ -179,7 +193,7 @@ export function DashboardPage() {
       )
     : `up to ${OVERVIEW_SOURCE_LIMIT} most recently updated sessions`
   const sessionSampleLoading = summary.isLoading && summary.data === undefined
-  const taskSampleLoading = tasks.isLoading && tasks.data === undefined
+  const taskSampleLoading = tasksCapability.enabled && tasks.isLoading && tasks.data === undefined
   const attentionSampleLoading =
     sessionSampleLoading ||
     taskSampleLoading ||
@@ -198,11 +212,13 @@ export function DashboardPage() {
     : operations.isError
       ? "Operational session snapshot unavailable."
       : "Loading the operational session snapshot."
-  const taskMetricDetail = operationalSnapshot
-    ? `${taskSnapshotStatus(operationalSnapshot)}${operations.isError ? "; refresh failed" : ""}.`
-    : operations.isError
-      ? "Operational task snapshot unavailable."
-      : "Loading the operational task snapshot."
+  const taskMetricDetail = !tasksCapability.enabled
+    ? `Task metrics unavailable. ${tasksUnavailableText}`
+    : operationalSnapshot
+      ? `${taskSnapshotStatus(operationalSnapshot)}${operations.isError ? "; refresh failed" : ""}.`
+      : operations.isError
+        ? "Operational task snapshot unavailable."
+        : "Loading the operational task snapshot."
   const operationalSnapshotIsWarning = aggregateSnapshotNeedsWarning(
     operationalSnapshot,
     operations.isError,
@@ -213,11 +229,24 @@ export function DashboardPage() {
       <PageHeader
         title="Dashboard"
         actions={
-          <Link to="/run" className={buttonVariants()}>
-            New Run
-          </Link>
+          sessionExecutionCapability.enabled ? (
+            <Link to="/run" className={buttonVariants()}>
+              New Run
+            </Link>
+          ) : (
+            <Button type="button" disabled title={sessionExecutionUnavailableText ?? undefined}>
+              New Run
+            </Button>
+          )
         }
       />
+
+      {sessionExecutionUnavailableText && (
+        <StateMessage data-testid="overview-session-execution-unavailable">
+          Starting new sessions is unavailable. {sessionExecutionUnavailableText} Existing
+          operational data remains readable.
+        </StateMessage>
+      )}
 
       {operations.isError && !operationalSnapshot ? (
         <StateMessage tone="danger">
@@ -322,9 +351,10 @@ export function DashboardPage() {
         <div className="space-y-1">
           <div className="font-medium">Recent lists — bounded drill-down</div>
           <div className="text-muted-foreground">
-            Recent sessions cover {sessionScope}. Attention and task lists independently load up to{" "}
-            {OVERVIEW_SOURCE_LIMIT} tasks and {OVERVIEW_SOURCE_LIMIT} pending actions; categories
-            can overlap and are not deployment totals.
+            Recent sessions cover {sessionScope}.{" "}
+            {tasksCapability.enabled
+              ? `Attention and task lists independently load up to ${OVERVIEW_SOURCE_LIMIT} tasks and ${OVERVIEW_SOURCE_LIMIT} pending actions; categories can overlap and are not deployment totals.`
+              : `The attention list loads up to ${OVERVIEW_SOURCE_LIMIT} pending actions; task samples are omitted because Tasks are unavailable. This is not a deployment total.`}
           </div>
         </div>
       </div>
@@ -343,10 +373,15 @@ export function DashboardPage() {
             <StateMessage className="py-6">Loading recent sessions...</StateMessage>
           ) : list.length === 0 ? (
             <StateMessage className="py-6">
-              No sessions yet.{" "}
-              <Link to="/run" className="text-primary underline">
-                Start a run
-              </Link>
+              No sessions yet.
+              {sessionExecutionCapability.enabled && (
+                <>
+                  {" "}
+                  <Link to="/run" className="text-primary underline">
+                    Start a run
+                  </Link>
+                </>
+              )}
             </StateMessage>
           ) : (
             <div className="space-y-2">
@@ -376,7 +411,11 @@ export function DashboardPage() {
 
         <DataCard
           title="Recent Needs Attention"
-          description={`Showing up to 20 entries from ${sessionScope}, ${OVERVIEW_SOURCE_LIMIT} recent tasks, and a pending-action page with a ${OVERVIEW_SOURCE_LIMIT}-action limit. Categories can overlap.`}
+          description={
+            tasksCapability.enabled
+              ? `Showing up to 20 entries from ${sessionScope}, ${OVERVIEW_SOURCE_LIMIT} recent tasks, and a pending-action page with a ${OVERVIEW_SOURCE_LIMIT}-action limit. Categories can overlap.`
+              : `Showing up to 20 entries from ${sessionScope} and a pending-action page with a ${OVERVIEW_SOURCE_LIMIT}-action limit. Task samples are unavailable.`
+          }
           contentClassName="p-4"
           actions={
             <Link
@@ -387,7 +426,9 @@ export function DashboardPage() {
             </Link>
           }
         >
-          {summary.isError || tasks.isError || pendingActions.isError ? (
+          {summary.isError ||
+          (tasksCapability.enabled && tasks.isError) ||
+          pendingActions.isError ? (
             <StateMessage tone="danger" className="py-6">
               {sessionsError ||
                 tasksError ||
@@ -401,7 +442,9 @@ export function DashboardPage() {
             pendingActionList.length === 0 &&
             pendingActionIssues.length === 0 ? (
             <StateMessage className="py-6">
-              No sampled sessions, tasks, or pending actions need attention.
+              {tasksCapability.enabled
+                ? "No sampled sessions, tasks, or pending actions need attention."
+                : "No sampled sessions or pending actions need attention. Task samples are unavailable."}
             </StateMessage>
           ) : (
             <div className="space-y-2">
@@ -488,10 +531,18 @@ export function DashboardPage() {
 
         <DataCard
           title="Recent Tasks"
-          description={`Showing up to ${OVERVIEW_VISIBLE_LIST_LIMIT} of the ${OVERVIEW_SOURCE_LIMIT} most recently updated tasks; no deployment-wide task total is shown.`}
+          description={
+            tasksCapability.enabled
+              ? `Showing up to ${OVERVIEW_VISIBLE_LIST_LIMIT} of the ${OVERVIEW_SOURCE_LIMIT} most recently updated tasks; no deployment-wide task total is shown.`
+              : "No task sample is requested when Tasks are unavailable."
+          }
           contentClassName="p-4"
         >
-          {tasks.isError ? (
+          {!tasksCapability.enabled ? (
+            <StateMessage className="py-6">
+              Tasks are unavailable. {tasksUnavailableText}
+            </StateMessage>
+          ) : tasks.isError ? (
             <StateMessage tone="danger" className="py-6">
               {tasksError || "Failed to load tasks."}
             </StateMessage>

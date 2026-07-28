@@ -2,6 +2,19 @@
 
 ## v0.1.0 (unreleased)
 
+### Usage and dashboard pricing advertise separate capabilities
+
+The control-plane contract now reports usage aggregation independently from the
+dashboard's configured pricing catalog. Deployments without a default price book
+can still expose activity and token totals, while cost estimation remains
+explicitly unavailable instead of hiding the complete Usage surface.
+
+This advances the server contract from version 3 to version 4 because
+`surfaces.usage` is a new required capability. Generated clients must be
+regenerated from the current OpenAPI document. Independently deployed dashboards
+and servers must be upgraded together; the dashboard rejects a version 3
+response before resolving navigation or starting route-specific API requests.
+
 ### Chat Completions usage dialects are explicit and subclass-safe
 
 `ChatCompletionsProvider` now accepts an explicit `usage_dialect`, preserves

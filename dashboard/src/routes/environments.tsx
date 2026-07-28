@@ -8,6 +8,7 @@ import {
   PayloadViewer,
   StateMessage,
 } from "../components/dashboard/layout"
+import { useDashboardCapability } from "../components/dashboard/server-contract"
 import { Badge } from "../components/ui/badge"
 import { Button, buttonVariants } from "../components/ui/button"
 import { Input } from "../components/ui/input"
@@ -27,6 +28,7 @@ import {
   fetchSessionsSummary,
   type SessionsSummary,
 } from "../lib/api"
+import { dashboardCapabilityUnavailableText } from "../lib/dashboard-capabilities"
 import { formatBytes, formatCount, formatDateTime } from "../lib/format"
 import { currentQueryParam, dashboardPath, replaceDashboardLocation } from "../lib/links"
 import { cn } from "../lib/utils"
@@ -144,12 +146,16 @@ function EnvironmentDetail({
   relatedSessionsLoading,
   relatedArtifacts,
   relatedArtifactsLoading,
+  artifactsAvailable,
+  artifactsUnavailableText,
 }: {
   environment: EnvironmentSummary | null
   relatedSessions: SessionsSummary | undefined
   relatedSessionsLoading: boolean
   relatedArtifacts: ArtifactSummary[] | undefined
   relatedArtifactsLoading: boolean
+  artifactsAvailable: boolean
+  artifactsUnavailableText: string | null
 }) {
   if (environment === null) {
     return (
@@ -228,12 +234,14 @@ function EnvironmentDetail({
             >
               Sessions
             </a>
-            <a
-              href={dashboardPath("/artifacts", { environment_name: environment.name })}
-              className={buttonVariants({ variant: "outline", size: "sm" })}
-            >
-              Artifacts
-            </a>
+            {artifactsAvailable && (
+              <a
+                href={dashboardPath("/artifacts", { environment_name: environment.name })}
+                className={buttonVariants({ variant: "outline", size: "sm" })}
+              >
+                Artifacts
+              </a>
+            )}
           </div>
         </div>
         <div className="grid gap-4 p-4 lg:grid-cols-2">
@@ -262,7 +270,11 @@ function EnvironmentDetail({
               Recent artifacts
             </div>
             <div className="space-y-2">
-              {relatedArtifactsLoading ? (
+              {!artifactsAvailable ? (
+                <StateMessage className="rounded-md border border-border py-6">
+                  Artifacts are unavailable. {artifactsUnavailableText}
+                </StateMessage>
+              ) : relatedArtifactsLoading ? (
                 <StateMessage className="rounded-md border border-border py-6">
                   Loading artifacts...
                 </StateMessage>
@@ -287,6 +299,11 @@ function EnvironmentDetail({
 }
 
 export function EnvironmentsPage() {
+  const artifactsCapability = useDashboardCapability({
+    kind: "surface",
+    surface: "artifacts",
+  })
+  const artifactsUnavailableText = dashboardCapabilityUnavailableText(artifactsCapability)
   const [search, setSearch] = useState(() => currentQueryParam("q"))
   const [selectedEnvironmentName, setSelectedEnvironmentName] = useState<string | null>(null)
   const debouncedSearch = useDebouncedValue(search, 300)
@@ -334,7 +351,7 @@ export function EnvironmentsPage() {
         environment_name: selectedEnvironment?.name,
         limit: 5,
       }),
-    enabled: selectedEnvironment !== null,
+    enabled: selectedEnvironment !== null && artifactsCapability.enabled,
     staleTime: 10_000,
   })
   const error = environments.error instanceof Error ? environments.error.message : null
@@ -431,6 +448,8 @@ export function EnvironmentsPage() {
             relatedSessionsLoading={relatedSessions.isLoading}
             relatedArtifacts={relatedArtifacts.data?.artifacts}
             relatedArtifactsLoading={relatedArtifacts.isLoading}
+            artifactsAvailable={artifactsCapability.enabled}
+            artifactsUnavailableText={artifactsUnavailableText}
           />
         </DataCard>
       </div>

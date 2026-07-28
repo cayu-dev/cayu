@@ -2831,7 +2831,13 @@ def test_server_aggregate_routes_reject_invalid_windows_and_unsupported_stores()
         )
     )
     assert client.post("/api/operations/snapshot", json={}).status_code == 501
-    assert client.get("/api/contract").json()["capabilities"]["surfaces"]["pricing"] == {
+    surfaces = client.get("/api/contract").json()["capabilities"]["surfaces"]
+    assert surfaces["usage"] == {
+        "configured": True,
+        "read": {"enabled": False, "unavailable_reason": "unsupported"},
+        "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
+    }
+    assert surfaces["pricing"] == {
         "configured": True,
         "read": {"enabled": False, "unavailable_reason": "unsupported"},
         "mutate": {"enabled": False, "unavailable_reason": "unsupported"},

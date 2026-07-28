@@ -29,6 +29,7 @@ import type {
   GetSessionsSummaryApiSessionsSummaryPostResponse,
   GetSessionTranscriptApiSessionsSessionIdTranscriptGetData,
   GetSessionTranscriptApiSessionsSessionIdTranscriptGetResponse,
+  GetSystemDiagnosticsApiSystemDiagnosticsGetResponse,
   GetTaskApiTasksTaskIdGetResponse,
   GetUsageRollupApiUsageRollupPostResponse,
   InterruptSessionBody,
@@ -61,7 +62,7 @@ import type {
   UserInputRecoveryBody,
 } from "./generated/server-api"
 
-export const SUPPORTED_SERVER_CONTRACT_VERSION = "3"
+export const SUPPORTED_SERVER_CONTRACT_VERSION = "4"
 
 export class ApiClientError extends Error {
   readonly status: number
@@ -119,6 +120,7 @@ export type OperationalSnapshot = GetOperationalSnapshotApiOperationsSnapshotPos
 export type OperationalSnapshotBody = OperationalSnapshotRequest
 export type UsageRollup = GetUsageRollupApiUsageRollupPostResponse
 export type UsageRollupBody = UsageRollupRequest
+export type SystemDiagnostics = GetSystemDiagnosticsApiSystemDiagnosticsGetResponse
 export type Task = ApiTaskListItem
 export type TaskDetail = ApiTaskDetail
 export type TaskHold = TaskHoldBody
@@ -227,6 +229,10 @@ export function isSupportedServerContract(contract: ServerContract): boolean {
 
 export async function fetchServerContract(): Promise<ServerContract> {
   return requestJson<ServerContract>("/contract")
+}
+
+export async function fetchSystemDiagnostics(signal?: AbortSignal): Promise<SystemDiagnostics> {
+  return requestJson<SystemDiagnostics>("/system/diagnostics", { signal })
 }
 
 export async function fetchAgents(): Promise<AgentsPage> {

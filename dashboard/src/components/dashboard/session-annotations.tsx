@@ -2,6 +2,7 @@ import { useQueryClient } from "@tanstack/react-query"
 import { Braces, LoaderCircle, Pencil, Tags } from "lucide-react"
 import { useEffect, useMemo, useRef, useState } from "react"
 import { type SessionDetail, updateSessionLabels, updateSessionMetadata } from "../../lib/api.ts"
+import { dashboardCapabilityUnavailableText } from "../../lib/dashboard-capabilities.ts"
 import {
   applyConfirmedSessionEdit,
   formatSessionEditDraft,
@@ -15,6 +16,7 @@ import { Button } from "../ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "../ui/card"
 import { Textarea } from "../ui/textarea"
 import { PayloadViewer } from "./layout"
+import { useDashboardCapability } from "./server-contract"
 
 type EditorState = {
   draft: string
@@ -23,6 +25,11 @@ type EditorState = {
 
 export function SessionAnnotations({ session }: { session: SessionDetail }) {
   const queryClient = useQueryClient()
+  const annotationCapability = useDashboardCapability({
+    kind: "mutation",
+    mutation: "session_annotations",
+  })
+  const annotationUnavailableText = dashboardCapabilityUnavailableText(annotationCapability)
   const [labelsEditor, setLabelsEditor] = useState<EditorState | null>(null)
   const [metadataEditor, setMetadataEditor] = useState<EditorState | null>(null)
   const [labelsSaving, setLabelsSaving] = useState(false)
@@ -58,15 +65,24 @@ export function SessionAnnotations({ session }: { session: SessionDetail }) {
   const savePending = labelsSaving || metadataSaving
 
   const beginLabelsEdit = () => {
+    if (!annotationCapability.enabled) return
     setAnnouncement("")
     setLabelsEditor({ draft: formatSessionEditDraft(session.labels), error: null })
   }
   const beginMetadataEdit = () => {
+    if (!annotationCapability.enabled) return
     setAnnouncement("")
     setMetadataEditor({ draft: formatSessionEditDraft(userMetadata), error: null })
   }
   const saveLabels = async () => {
-    if (labelsEditor === null || savePending || saveInFlightRef.current) return
+    if (
+      !annotationCapability.enabled ||
+      labelsEditor === null ||
+      savePending ||
+      saveInFlightRef.current
+    ) {
+      return
+    }
     const parsed = parseSessionLabelsDraft(labelsEditor.draft)
     if (!parsed.ok) {
       setLabelsEditor((current) =>
@@ -92,7 +108,14 @@ export function SessionAnnotations({ session }: { session: SessionDetail }) {
     }
   }
   const saveMetadata = async () => {
-    if (metadataEditor === null || savePending || saveInFlightRef.current) return
+    if (
+      !annotationCapability.enabled ||
+      metadataEditor === null ||
+      savePending ||
+      saveInFlightRef.current
+    ) {
+      return
+    }
     const parsed = parseSessionMetadataDraft(metadataEditor.draft)
     if (!parsed.ok) {
       setMetadataEditor((current) =>
@@ -128,6 +151,11 @@ export function SessionAnnotations({ session }: { session: SessionDetail }) {
         <p className="mt-1 text-xs text-muted-foreground">
           Operator-editable session context. Runtime history and lifecycle state are unchanged.
         </p>
+        {annotationUnavailableText && (
+          <p className="mt-2 text-xs text-muted-foreground" data-testid="annotations-unavailable">
+            Editing is unavailable. {annotationUnavailableText}
+          </p>
+        )}
         <p className="sr-only" role="status" aria-live="polite">
           {announcement}
         </p>
@@ -153,6 +181,8 @@ export function SessionAnnotations({ session }: { session: SessionDetail }) {
                 variant="outline"
                 size="sm"
                 onClick={beginLabelsEdit}
+                disabled={!annotationCapability.enabled}
+                title={annotationUnavailableText ?? undefined}
               >
                 <Pencil className="mr-1.5 h-3.5 w-3.5" />
                 Edit labels
@@ -257,6 +287,8 @@ export function SessionAnnotations({ session }: { session: SessionDetail }) {
                 variant="outline"
                 size="sm"
                 onClick={beginMetadataEdit}
+                disabled={!annotationCapability.enabled}
+                title={annotationUnavailableText ?? undefined}
               >
                 <Pencil className="mr-1.5 h-3.5 w-3.5" />
                 Edit metadata
