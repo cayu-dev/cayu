@@ -390,9 +390,12 @@ def session_usage_summary_payload(summary: SessionUsageSummary) -> dict[str, Any
 # Canonical usage dialects (string values mirror ``providers.base.UsageDialect``
 # so a declared enum can be passed straight through as ``str``).
 _DIALECT_ANTHROPIC = "anthropic"
+_DIALECT_GEMINI = "gemini"
 _DIALECT_OPENAI = "openai"
 _DIALECT_GENERIC = "generic"
-_KNOWN_DIALECTS = frozenset({_DIALECT_ANTHROPIC, _DIALECT_OPENAI, _DIALECT_GENERIC})
+_KNOWN_DIALECTS = frozenset(
+    {_DIALECT_ANTHROPIC, _DIALECT_GEMINI, _DIALECT_OPENAI, _DIALECT_GENERIC}
+)
 
 # Registered names whose raw usage payload follows the Anthropic shape (cache
 # tokens in separate fields, excluded from input_tokens). Claude on Vertex AI is
@@ -414,10 +417,11 @@ def normalize_usage_metrics(
     """Normalize provider usage payloads without hiding the original raw usage.
 
     ``usage_dialect`` (a ``providers.base.UsageDialect`` value or its string) lets
-    a provider declare how it encodes cache tokens. When omitted or ``"auto"``,
-    the dialect is inferred from the provider name and then the payload shape, so
-    Anthropic-shaped payloads (Claude via Bedrock/gateways/renamed adapters) fold
-    cache read/write tokens back into ``input_tokens`` instead of undercounting.
+    a provider declare how it encodes cache and reasoning tokens. When omitted or
+    ``"auto"``, the dialect is inferred from the provider name and then the payload
+    shape, so Anthropic-shaped payloads (Claude via Bedrock/gateways/renamed
+    adapters) fold cache read/write tokens back into ``input_tokens`` instead of
+    undercounting.
     """
 
     if type(raw_usage) is not dict:
@@ -462,15 +466,20 @@ def normalize_usage_metrics(
     reported_total_tokens, has_reported_total_tokens = strict_total_tokens
     cache_read_tokens, has_explicit_cache_read = strict_cache_read_tokens
     cache_write_tokens = strict_cache_write_tokens
-    if dialect == _DIALECT_OPENAI and (not has_input_tokens or not has_output_tokens):
+    if dialect in {_DIALECT_GEMINI, _DIALECT_OPENAI} and (
+        not has_input_tokens or not has_output_tokens
+    ):
         return None
 
-    if not _has_usage_counter(raw_usage) and dialect != _DIALECT_OPENAI:
+    if not _has_usage_counter(raw_usage) and dialect not in {
+        _DIALECT_GEMINI,
+        _DIALECT_OPENAI,
+    }:
         return None
     nested_cached_input = _nested_cached_input_tokens(raw_usage)
     has_nested_cached_container = _has_nested_cached_input_container(raw_usage)
     if nested_cached_input is None and (
-        dialect in {_DIALECT_OPENAI, _DIALECT_GENERIC}
+        dialect in {_DIALECT_GEMINI, _DIALECT_OPENAI, _DIALECT_GENERIC}
         or (dialect == _DIALECT_ANTHROPIC and has_nested_cached_container)
     ):
         return None
@@ -482,6 +491,7 @@ def normalize_usage_metrics(
     )
     if mixed_cache_evidence and authoritative_dialect not in {
         _DIALECT_OPENAI,
+        _DIALECT_GEMINI,
         _DIALECT_ANTHROPIC,
     }:
         return None
@@ -496,16 +506,24 @@ def normalize_usage_metrics(
             accepted_reported_totals.add(
                 computed_primary_total + cache_read_tokens + cache_write_tokens
             )
-        if reported_total_tokens not in accepted_reported_totals:
+        if dialect == _DIALECT_GEMINI:
+            if reported_total_tokens < computed_primary_total:
+                return None
+        elif reported_total_tokens not in accepted_reported_totals:
             return None
     total_tokens = reported_total_tokens if has_reported_total_tokens else computed_primary_total
 
-    if dialect in {_DIALECT_OPENAI, _DIALECT_GENERIC} and cached_input_tokens > input_tokens:
+    if (
+        dialect in {_DIALECT_GEMINI, _DIALECT_OPENAI, _DIALECT_GENERIC}
+        and cached_input_tokens > input_tokens
+    ):
         return None
     strict_reasoning_output = (
-        _nested_reasoning_output_tokens(raw_usage) if dialect == _DIALECT_OPENAI else None
+        _nested_reasoning_output_tokens(raw_usage)
+        if dialect in {_DIALECT_GEMINI, _DIALECT_OPENAI}
+        else None
     )
-    if dialect == _DIALECT_OPENAI and strict_reasoning_output is None:
+    if dialect in {_DIALECT_GEMINI, _DIALECT_OPENAI} and strict_reasoning_output is None:
         return None
     reasoning_output_tokens = 0
     input_details = raw_usage.get("input_tokens_details")
@@ -515,8 +533,21 @@ def normalize_usage_metrics(
         cached_input_tokens = _nonnegative_int(input_details.get("cached_tokens"))
 
     if strict_reasoning_output is not None:
-        reasoning_output_tokens, _ = strict_reasoning_output
-        if reasoning_output_tokens > output_tokens:
+        reasoning_output_tokens, has_reasoning_output = strict_reasoning_output
+        if dialect == _DIALECT_GEMINI:
+            hidden_output_tokens = total_tokens - computed_primary_total
+            if has_reasoning_output:
+                if hidden_output_tokens == 0:
+                    if reasoning_output_tokens > output_tokens:
+                        return None
+                elif reasoning_output_tokens == hidden_output_tokens:
+                    output_tokens += hidden_output_tokens
+                else:
+                    return None
+            else:
+                reasoning_output_tokens = hidden_output_tokens
+                output_tokens += hidden_output_tokens
+        elif reasoning_output_tokens > output_tokens:
             return None
     else:
         output_details = raw_usage.get("output_tokens_details")
@@ -577,7 +608,7 @@ def normalize_usage_metrics(
         cache_write_unknown_ttl_tokens += cache_write_tokens - detailed_cache_writes
 
     anthropic_shaped = dialect == _DIALECT_ANTHROPIC
-    if dialect == _DIALECT_OPENAI:
+    if dialect in {_DIALECT_GEMINI, _DIALECT_OPENAI}:
         if cache_write_tokens > 0:
             return None
         if has_explicit_cache_read and cache_read_tokens != cached_input_tokens:

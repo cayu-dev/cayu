@@ -1196,6 +1196,67 @@ def test_session_store_conformance_preserves_only_safe_bedrock_aggregate_evidenc
     asyncio.run(run())
 
 
+def test_session_store_conformance_reconstructs_gemini_thinking_usage(
+    session_store_case,
+) -> None:
+    class GeminiUsageProvider(ModelProvider):
+        name = "gemini"
+        usage_dialect = UsageDialect.GEMINI
+
+        async def stream(self, request):
+            del request
+            yield ModelStreamEvent.text_delta("OK.")
+            yield ModelStreamEvent.completed(
+                {
+                    "model": "gemini-3.5-flash",
+                    "usage": {
+                        "prompt_tokens": 5,
+                        "completion_tokens": 2,
+                        "total_tokens": 60,
+                    },
+                }
+            )
+
+    async def assert_usage(store: SessionStore, session_id: str) -> None:
+        inspection = await store.inspect_summary(session_id)
+        assert inspection.model_calls == 1
+        assert inspection.model_calls_with_usage == 1
+        assert inspection.usage.provider_names == ["gemini"]
+        assert inspection.usage.models == ["gemini-3.5-flash"]
+        assert inspection.usage.usage.input_tokens == 5
+        assert inspection.usage.usage.output_tokens == 55
+        assert inspection.usage.usage.reasoning_output_tokens == 53
+        assert inspection.usage.usage.total_tokens == 60
+
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = f"gemini-thinking-usage-{session_store_case[0]}"
+        try:
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(GeminiUsageProvider(), default=True)
+            app.register_agent(AgentSpec(name="assistant", model="gemini-3.5-flash"))
+            events = [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "Reply with OK.")],
+                    )
+                )
+            ]
+            completed = next(event for event in events if event.type == EventType.MODEL_COMPLETED)
+            assert "usage_normalization_failed" not in completed.payload
+            await assert_usage(store, session_id)
+
+            store = await _reopen_store(session_store_case, store)
+            await assert_usage(store, session_id)
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
 def test_session_store_conformance_context_usage_pages_past_compaction(
     session_store_case,
 ) -> None:

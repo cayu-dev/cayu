@@ -58,7 +58,9 @@ class UsageDialect(StrEnum):
 
     The runtime's usage normalizer folds cache tokens differently per dialect
     (Anthropic reports cache read/write tokens in separate fields excluded from
-    ``input_tokens``; OpenAI nests cached input in ``*_tokens_details``). A
+    ``input_tokens``; Gemini may exclude hidden thinking tokens from
+    ``completion_tokens`` while including them in ``total_tokens``; OpenAI nests
+    cached input in ``*_tokens_details``). A
     provider whose registered ``name`` is not one of the built-in aliases —
     Claude reached through Bedrock, a gateway, or a renamed adapter — must
     declare its dialect here so the normalizer folds cache tokens correctly
@@ -68,6 +70,7 @@ class UsageDialect(StrEnum):
 
     AUTO = "auto"
     ANTHROPIC = "anthropic"
+    GEMINI = "gemini"
     OPENAI = "openai"
     GENERIC = "generic"
 
@@ -88,7 +91,7 @@ def copy_usage_dialect(value: object, field_name: str = "usage_dialect") -> Usag
         return UsageDialect(value)
     except ValueError:
         raise ValueError(
-            f"{field_name} must be one of: auto, anthropic, openai, generic."
+            f"{field_name} must be one of: auto, anthropic, gemini, openai, generic."
         ) from None
 
 

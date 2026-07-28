@@ -1457,6 +1457,18 @@ must be a non-negative integer, and equivalent aliases must agree. When no
 authoritative dialect is declared, nested OpenAI cache evidence combined with
 top-level Anthropic cache evidence is ambiguous and therefore fails
 normalization even when the reported counts match.
+The Gemini dialect retains the OpenAI-compatible cache semantics but also
+accounts for Gemini thinking models whose `completion_tokens` contains visible
+candidate output while `total_tokens` additionally includes hidden thinking
+tokens. Cayu assigns that positive total delta to both billable output and
+`reasoning_output_tokens` when no explicit detail is available. If Gemini
+explicitly reports reasoning details, Cayu accepts either convention where
+`completion_tokens` includes that reasoning or where the positive total delta
+equals it. A negative or contradictory delta remains a normalization failure. The built-in
+`ChatCompletionsProvider` selects this dialect only for Google's
+`generativelanguage.googleapis.com` endpoint; gateways and other compatible
+endpoints retain ordinary OpenAI semantics unless their provider contract
+declares otherwise.
 Anthropic-shaped provider totals may describe either the provider's primary
 input-plus-output counters or the cache-inclusive total; Cayu validates either
 known convention and always emits one cache-inclusive normalized total.

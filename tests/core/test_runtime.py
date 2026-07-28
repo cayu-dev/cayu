@@ -33481,6 +33481,83 @@ def test_cayu_app_get_session_usage_summarizes_durable_events():
     assert summary.usage.cache.uncached_input_tokens == 22
 
 
+def test_cayu_app_reconstructs_gemini_thinking_usage() -> None:
+    class GeminiUsageProvider(FakeProvider):
+        name = "gemini"
+        usage_dialect = UsageDialect.GEMINI
+
+    provider = GeminiUsageProvider(
+        [
+            ModelStreamEvent.text_delta("OK."),
+            ModelStreamEvent.completed(
+                {
+                    "model": "gemini-3.5-flash",
+                    "usage": {
+                        "prompt_tokens": 5,
+                        "completion_tokens": 2,
+                        "total_tokens": 60,
+                    },
+                }
+            ),
+        ]
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="gemini-3.5-flash"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="gemini_thinking_usage",
+                messages=[Message.text("user", "Reply with OK.")],
+                limits=RunLimits(max_total_tokens=59),
+            ),
+        )
+    )
+
+    completed = next(event for event in events if event.type == EventType.MODEL_COMPLETED)
+    assert "usage_normalization_failed" not in completed.payload
+    assert completed.payload["usage_metrics"]["input_tokens"] == 5
+    assert completed.payload["usage_metrics"]["output_tokens"] == 55
+    assert completed.payload["usage_metrics"]["reasoning_output_tokens"] == 53
+    assert completed.payload["usage_metrics"]["total_tokens"] == 60
+    limit_reached = next(event for event in events if event.type == EventType.SESSION_LIMIT_REACHED)
+    assert limit_reached.payload["limit"] == "total_tokens"
+    assert limit_reached.payload["actual"] == 60
+    assert limit_reached.payload["maximum"] == 59
+
+    summary = asyncio.run(app.get_session_usage("gemini_thinking_usage"))
+    assert summary.model_steps == 1
+    assert summary.provider_names == ["gemini"]
+    assert summary.models == ["gemini-3.5-flash"]
+    assert summary.usage.input_tokens == 5
+    assert summary.usage.output_tokens == 55
+    assert summary.usage.reasoning_output_tokens == 53
+    assert summary.usage.total_tokens == 60
+
+    cost = asyncio.run(
+        app.get_session_cost(
+            "gemini_thinking_usage",
+            PriceBook(
+                prices=(
+                    ModelPrice.fixed(
+                        provider_name="gemini",
+                        model="gemini-3.5-flash",
+                        input_per_million=Decimal("1"),
+                        output_per_million=Decimal("1"),
+                    ),
+                )
+            ),
+        )
+    )
+    assert cost.priced_model_steps == 1
+    assert cost.line_items[0].input_tokens == 5
+    assert cost.line_items[0].output_tokens == 55
+    assert cost.total_cost == Decimal("0.000060")
+
+
 def test_cayu_app_get_session_usage_queries_only_usage_relevant_events():
     class TrackingStore(InMemorySessionStore):
         def __init__(self) -> None:

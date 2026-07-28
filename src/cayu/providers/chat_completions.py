@@ -5,7 +5,7 @@ import json
 import re
 from collections.abc import AsyncIterator, Mapping
 from typing import TYPE_CHECKING, Any, Protocol
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.artifacts import (
@@ -274,6 +274,12 @@ class ChatCompletionsProvider(ModelProvider):
             _validate_url(endpoint_url, "endpoint_url", allow_http=allow_http)
             if endpoint_url is not None
             else None
+        )
+        effective_url = self.endpoint_url or self.base_url
+        self.usage_dialect = (
+            UsageDialect.GEMINI
+            if urlsplit(effective_url).hostname == "generativelanguage.googleapis.com"
+            else UsageDialect.OPENAI
         )
         if type(timeout_s) not in {int, float}:
             raise TypeError("timeout_s must be a number.")

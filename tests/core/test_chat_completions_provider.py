@@ -1168,6 +1168,16 @@ def test_provider_declares_openai_usage_dialect_for_renamed_gateway() -> None:
     assert provider.usage_dialect is UsageDialect.OPENAI
 
 
+def test_provider_declares_gemini_usage_dialect_for_google_endpoint() -> None:
+    provider = ChatCompletionsProvider(
+        api_key="test-key",
+        name="google-ai",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+    )
+
+    assert provider.usage_dialect is UsageDialect.GEMINI
+
+
 def test_provider_endpoint_includes_api_version() -> None:
     provider = ChatCompletionsProvider(
         api_key="test-key",

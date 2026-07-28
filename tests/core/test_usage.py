@@ -2989,6 +2989,110 @@ def test_normalize_openai_usage_dialect_enum_marks_cached_tokens_as_reads() -> N
     assert metrics.cache.cached_input_tokens == 3
 
 
+def test_normalize_gemini_usage_retains_hidden_thinking_tokens() -> None:
+    metrics = normalize_usage_metrics(
+        provider_name="gemini",
+        model="gemini-3.5-flash",
+        raw_usage={
+            "prompt_tokens": 5,
+            "completion_tokens": 2,
+            "total_tokens": 60,
+        },
+        usage_dialect=UsageDialect.GEMINI,
+    )
+
+    assert metrics is not None
+    assert metrics.input_tokens == 5
+    assert metrics.output_tokens == 55
+    assert metrics.reasoning_output_tokens == 53
+    assert metrics.total_tokens == 60
+
+
+def test_normalize_gemini_usage_accepts_matching_explicit_thinking_tokens() -> None:
+    metrics = normalize_usage_metrics(
+        provider_name="gemini",
+        model="gemini-3.5-flash",
+        raw_usage={
+            "prompt_tokens": 5,
+            "completion_tokens": 2,
+            "total_tokens": 60,
+            "completion_tokens_details": {"reasoning_tokens": 53},
+        },
+        usage_dialect=UsageDialect.GEMINI,
+    )
+
+    assert metrics is not None
+    assert metrics.output_tokens == 55
+    assert metrics.reasoning_output_tokens == 53
+    assert metrics.total_tokens == 60
+
+
+def test_normalize_gemini_usage_accepts_thinking_included_in_completion_tokens() -> None:
+    metrics = normalize_usage_metrics(
+        provider_name="gemini",
+        model="gemini-2.5-flash",
+        raw_usage={
+            "prompt_tokens": 5,
+            "completion_tokens": 55,
+            "total_tokens": 60,
+            "completion_tokens_details": {"reasoning_tokens": 53},
+        },
+        usage_dialect=UsageDialect.GEMINI,
+    )
+
+    assert metrics is not None
+    assert metrics.output_tokens == 55
+    assert metrics.reasoning_output_tokens == 53
+    assert metrics.total_tokens == 60
+
+
+@pytest.mark.parametrize(
+    "raw_usage",
+    [
+        {
+            "prompt_tokens": 5,
+            "completion_tokens": 2,
+            "total_tokens": 6,
+        },
+        {
+            "prompt_tokens": 5,
+            "completion_tokens": 2,
+            "total_tokens": 60,
+            "completion_tokens_details": {"reasoning_tokens": 52},
+        },
+    ],
+    ids=["total-below-visible-counters", "explicit-reasoning-disagrees-with-delta"],
+)
+def test_normalize_gemini_usage_rejects_contradictory_totals(
+    raw_usage: dict[str, object],
+) -> None:
+    assert (
+        normalize_usage_metrics(
+            provider_name="gemini",
+            model="gemini-3.5-flash",
+            raw_usage=raw_usage,
+            usage_dialect=UsageDialect.GEMINI,
+        )
+        is None
+    )
+
+
+def test_normalize_openai_usage_rejects_unexplained_total_mismatch() -> None:
+    assert (
+        normalize_usage_metrics(
+            provider_name="openai-compatible-gateway",
+            model="chat-model",
+            raw_usage={
+                "prompt_tokens": 5,
+                "completion_tokens": 2,
+                "total_tokens": 60,
+            },
+            usage_dialect=UsageDialect.OPENAI,
+        )
+        is None
+    )
+
+
 def test_normalize_unknown_dialect_falls_back_to_detection() -> None:
     # An unrecognized dialect string is treated as "auto" and detection applies.
     metrics = normalize_usage_metrics(
