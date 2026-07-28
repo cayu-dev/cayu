@@ -1,15 +1,39 @@
 # Cayu
 
-Cayu is a runtime for building production AI agents in Python.
+Cayu is a production agent runtime for building and operating AI agents in
+Python.
 
-It provides the durable execution layer—sessions, model calls, tool execution,
-approvals, context management, budgets, recovery, events, and evals—while
-applications retain control of their UI, authentication, domain logic, and
-workflows.
+A harness turns a model into an agent by supplying its context, tools,
+permissions, and execution logic. Cayu gives applications control of the full
+agent execution lifecycle: how context is assembled, models and tools are
+invoked, where agent code runs, how state is persisted, authority is governed,
+failures are recovered, and behavior is observed and evaluated.
 
-Cayu is designed for agents that do consequential or long-running work. It is
-not a prompt-chain DSL, a visual workflow builder, or an application frontend;
-you compose its runtime primitives directly.
+Workflow engines coordinate work. Cayu is the runtime that executes, governs,
+and operates the agents doing it.
+
+Applications retain control of their UI, authentication, domain logic, and
+business workflows.
+
+Cayu is designed for agents that do consequential or long-running work. You
+compose its runtime primitives directly in your application.
+
+## Why we built Cayu
+
+Cayu was extracted from the production runtime behind an agent-operated
+software factory that built and deployed thousands of business applications.
+Specialized agents worked together as the AI SRE, AI product manager, AI coder,
+and FDE assistant behind that delivery process.
+
+We began by building agents with SDKs and frameworks including the Claude Agent
+SDK, Mastra, and LangGraph. They helped us implement the model-and-tool loop
+quickly. Production quality required deeper control of the loop itself: context
+assembly, model and tool invocation, output validation, and failure handling.
+
+Production quality also depended on everything around that loop: scheduling,
+durable state, credentials, execution environments, human intervention,
+recovery, cost attribution, and evaluation. Cayu gives applications control of
+that entire agent execution lifecycle.
 
 ## Why Cayu
 
@@ -42,7 +66,7 @@ deployments.
 | Execution boundaries | Environments, workspaces, runners, artifacts, vaults, egress |
 | Reviewed knowledge | Durable entries, approval state, keyword/vector retrieval, recall tools |
 | Provider flexibility | OpenAI API, experimental OpenAI subscription login, Anthropic, Bedrock, Vertex, OpenAI-compatible APIs |
-| Durable automation | Tasks, dispatchers, event watchers, subagents, runtime hooks |
+| Agent operations | Tasks, dispatchers, event watchers, subagents, runtime hooks |
 | Behavioral proof | Runtime tests, trajectory assertions, replay, eval reports |
 | Operations | FastAPI control plane and a packaged inspection dashboard |
 
@@ -123,11 +147,13 @@ asyncio.run(main())
 
 `CayuApp()` uses in-memory stores by default, which is appropriate for this
 one-shot example and for tests. The generated project configures all local Cayu
-stores in `data/cayu.db` so sessions survive process restarts. Multi-process production deployments should
-select a conforming shared store such as PostgreSQL.
+stores in `data/cayu.db` so sessions survive process restarts. Multi-process
+production deployments should select a conforming shared store such as
+PostgreSQL.
 
-`CayuApp.run(...)` is the lower-level event-stream API. Runtime failures are
-terminal `session.failed` events, not exceptions raised from iteration.
+`CayuApp.run(...)` is the lower-level event-stream API. Runtime failures arrive
+as terminal `session.failed` events instead of exceptions raised from
+iteration.
 `run_to_completion(...)` consumes that same stream and returns a typed outcome
 when an application only needs the result. It retains the complete event stream
 in `RunOutcome.events`; use it for bounded runs. Consume `CayuApp.run(...)`
@@ -191,7 +217,8 @@ ToolContext
 - **Agent** describes who is acting and how model work is configured.
 - **Environment** describes what that agent can touch.
 - **Session** records one durable execution and its lineage.
-- **Tool** is an explicitly registered capability, not arbitrary model code.
+- **Tool** is an explicitly registered capability that controls what model
+  requests can execute.
 - **Task** is an optional durable unit of background or orchestrated work.
 - **Workflow** is deterministic application orchestration around agent steps.
 
@@ -217,10 +244,10 @@ Do not add every Cayu primitive to every application.
 | Delegated model work | Subagent tools with bounded child-session policy |
 | Behavioral regression proof | `EvalSuite` and trajectory assertions |
 
-A conversation agent does not automatically need a workflow, task queue,
-environment, memory store, server, or multi-agent topology. A coding agent does
-not automatically need unrestricted shell access. Prefer narrow domain tools
-and add authority only when the behavior requires it.
+Start a conversation agent with the model and state it needs. Add workflows,
+task queues, environments, memory stores, servers, or multi-agent topology when
+the behavior requires them. Give coding agents narrow domain tools before
+granting broader shell access.
 
 ## Application UI and control plane
 
@@ -236,7 +263,7 @@ Cayu owns runtime execution and the operational state recorded by the
 application's configured stores. Its optional dashboard is a control plane for
 developers and operators: inspect sessions,
 events, transcripts, tasks, usage, artifacts, pending actions, and recovery
-state. It is not intended to replace the product experience your users need.
+state. Your application remains responsible for the product experience.
 
 Start work through the API that matches the trigger:
 
@@ -253,8 +280,9 @@ lifecycle responsibilities.
 ## Providers and environments
 
 The base package includes the provider contracts and built-in OpenAI, Anthropic,
-OpenAI-compatible HTTP, and experimental OpenAI-subscription adapters. Optional extras add integrations without
-forcing their dependencies into every deployment:
+OpenAI-compatible HTTP, and experimental OpenAI-subscription adapters. Optional
+extras add integrations without forcing their dependencies into every
+deployment:
 
 | Extra | Adds |
 | --- | --- |
@@ -270,9 +298,9 @@ forcing their dependencies into every deployment:
 | `cayu[console]` | Interactive application console |
 
 Providers normalize text, thinking, tool calls, usage, completion reasons, and
-typed failures behind one runtime contract. Cayu does not infer a provider from
-an arbitrary model name: applications register providers explicitly and may
-add deterministic model-pattern routing.
+typed failures behind one runtime contract. Applications register providers
+explicitly and may add deterministic model-pattern routing; an arbitrary model
+name never selects a provider.
 
 For local development without separate OpenAI API billing, users can sign in
 with their own ChatGPT subscription:
@@ -289,17 +317,15 @@ from cayu import OpenAISubscriptionProvider
 app.register_provider(OpenAISubscriptionProvider(), default=True)
 ```
 
-This integration is experimental and uses the Codex backend rather than the
-documented OpenAI Platform API. Cayu identifies itself with `originator: cayu`;
-it does not impersonate Codex or bypass an upstream rejection. OpenAI has not
-documented this raw backend as a general third-party provider API, so support
-may change or stop.
+This experimental integration uses the Codex backend. It does not use the
+documented OpenAI Platform API. Cayu identifies itself with `originator: cayu`
+and preserves upstream rejections. OpenAI has not documented this raw backend
+as a general third-party provider API, so support may change or stop.
 
-> **Intended-use boundary:** This path is intended for a subscription holder's
-> own local development and evaluation. It is not intended for production,
-> customer-facing or multi-user services, credential sharing, resale, or
-> bypassing plan limits. For production, use the OpenAI Platform API or another
-> officially supported provider.
+> **Intended-use boundary:** Use this path only for a subscription holder's own
+> local development and evaluation. For production, customer-facing or
+> multi-user services, use the OpenAI Platform API or another officially
+> supported provider. Do not share or resell credentials or bypass plan limits.
 
 See [OpenAI subscription authentication](docs/openai-subscription.md) for the
 support boundary, credential storage, and fallback options.
@@ -312,7 +338,8 @@ its identity or transcript contract.
 
 Cayu makes safety boundaries explicit, but configuration still matters:
 
-- `LocalRunner` is trusted local execution, not a sandbox.
+- `LocalRunner` executes directly on a trusted local machine and provides no
+  sandbox isolation.
 - `DockerRunner` is useful for development and CI; ordinary Docker isolation
   is not presented as a secure untrusted-code boundary.
 - Environment registration does not imply selection: mark a default explicitly
@@ -381,27 +408,35 @@ and the [Glossary](https://github.com/cayu-dev/cayu/blob/main/docs/glossary.md).
 
 ## Examples
 
-- [Examples index](https://github.com/cayu-dev/cayu/blob/main/examples/README.md) — find the smallest reference for a capability.
-- `cayu guide references#domain-tool` — credential-free domain-tool authoring and generator path.
-- [Local environment runtime](https://github.com/cayu-dev/cayu/blob/main/examples/local_environment_runtime.py) — files and commands.
-- [Server example](https://github.com/cayu-dev/cayu/blob/main/examples/server_example.py) — protected API and control plane.
-- [Cloud PR reviewer](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/pr-reviewer.md) — durable task, isolated workspace,
+- [Examples index](https://github.com/cayu-dev/cayu/blob/main/examples/README.md):
+  find the smallest reference for a capability.
+- `cayu guide references#domain-tool`: credential-free domain-tool authoring
+  and generator path.
+- [Local environment runtime](https://github.com/cayu-dev/cayu/blob/main/examples/local_environment_runtime.py):
+  files and commands.
+- [Server example](https://github.com/cayu-dev/cayu/blob/main/examples/server_example.py):
+  protected API and control plane.
+- [Cloud PR reviewer](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/pr-reviewer.md):
+  durable task, isolated workspace,
   QA, and an explicit external effect.
-- [Business approvals](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/business-approvals.md) — domain approval routing
+- [Business approvals](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/business-approvals.md):
+  domain approval routing
   over the binary runtime primitive.
-- [GitHub CLI through virtual egress](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/github-cli-virtual-egress.md) — an
+- [GitHub CLI through virtual egress](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/github-cli-virtual-egress.md):
+  an
   unmodified CLI with a virtual token, exact REST policy, and explicit mutation boundary.
-- [Advanced runtime examples](https://github.com/cayu-dev/cayu/blob/main/examples/ADVANCED_RUNTIME_EXAMPLES.md) — forks,
+- [Advanced runtime examples](https://github.com/cayu-dev/cayu/blob/main/examples/ADVANCED_RUNTIME_EXAMPLES.md):
+  forks,
   compaction, taint isolation, speculative approval, and measured evidence.
 
-Advanced examples are executable runtime specifications, not claims that one
-strategy fits every workload. Their evidence boundaries and measured results
-are described in
+Advanced examples are executable runtime specifications. Each example states
+its evidence boundary instead of presenting one strategy as suitable for every
+workload. Their measured results are described in
 [Advanced runtime strategies](https://github.com/cayu-dev/cayu/blob/main/docs/advanced-runtime-examples.md).
 
 ## Contributing and security
 
-Framework contributors should read
+Cayu contributors should read
 [CONTRIBUTING.md](https://github.com/cayu-dev/cayu/blob/main/CONTRIBUTING.md) for
 placement policy, setup, validation commands, and pull-request requirements.
 New third-party integrations normally live in their own packages against
