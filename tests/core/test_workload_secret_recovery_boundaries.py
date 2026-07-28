@@ -28,6 +28,7 @@ from cayu.runtime import (
 )
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
+from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 
@@ -52,6 +53,37 @@ def test_pending_tool_round_recovery_rejects_redaction_marker_arguments() -> Non
 
     with pytest.raises(ValueError, match="redaction marker"):
         tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+
+
+def test_pending_structured_output_round_retains_redacted_result_arguments() -> None:
+    spec = StructuredOutputSpec(
+        name="answer",
+        json_schema={
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": False,
+        },
+    )
+    checkpoint, pending = tool_round_recovery.checkpoint_with_pending_tool_round(
+        None,
+        agent_name="assistant",
+        environment_name=None,
+        task_id=None,
+        tool_calls=[
+            runtime_records.ToolCallRequest(
+                id="structured_output_redacted_call",
+                name=STRUCTURED_OUTPUT_TOOL_NAME,
+                arguments={"output": {"answer": REDACTED_SECRET}},
+            )
+        ],
+        policy_outcomes=None,
+        structured_output=spec,
+        tool_round_identity=tool_round_identity(),
+    )
+
+    assert pending.tool_calls[0].arguments == {"output": {"answer": REDACTED_SECRET}}
+    assert tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint) == pending
 
 
 def test_cayu_app_never_executes_new_tool_call_with_redaction_marker() -> None:
