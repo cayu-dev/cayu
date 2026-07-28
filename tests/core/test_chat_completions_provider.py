@@ -1168,6 +1168,41 @@ def test_provider_declares_openai_usage_dialect_for_renamed_gateway() -> None:
     assert provider.usage_dialect is UsageDialect.OPENAI
 
 
+def test_provider_preserves_subclass_usage_dialect_declaration() -> None:
+    class GeminiGatewayProvider(ChatCompletionsProvider):
+        usage_dialect = UsageDialect.GEMINI
+
+    provider = GeminiGatewayProvider(
+        api_key="test-key",
+        name="gemini-through-gateway",
+        base_url="https://gateway.example.com/openai/v1",
+    )
+
+    assert provider.usage_dialect is UsageDialect.GEMINI
+
+
+def test_explicit_usage_dialect_overrides_subclass_and_endpoint_detection() -> None:
+    class GeminiGatewayProvider(ChatCompletionsProvider):
+        usage_dialect = UsageDialect.GEMINI
+
+    provider = GeminiGatewayProvider(
+        api_key="test-key",
+        name="explicit-openai",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        usage_dialect="openai",
+    )
+
+    assert provider.usage_dialect is UsageDialect.OPENAI
+
+
+def test_explicit_usage_dialect_is_validated() -> None:
+    with pytest.raises(ValueError, match="usage_dialect must be one of"):
+        ChatCompletionsProvider(
+            api_key="test-key",
+            usage_dialect="unknown",
+        )
+
+
 def test_provider_declares_gemini_usage_dialect_for_google_endpoint() -> None:
     provider = ChatCompletionsProvider(
         api_key="test-key",
@@ -1176,6 +1211,33 @@ def test_provider_declares_gemini_usage_dialect_for_google_endpoint() -> None:
     )
 
     assert provider.usage_dialect is UsageDialect.GEMINI
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://aiplatform.googleapis.com/v1beta1/openapi",
+        "https://us-central1-aiplatform.googleapis.com/v1beta1/openapi",
+        "https://aiplatform.us.rep.googleapis.com/v1beta1/openapi",
+    ],
+)
+def test_vertex_endpoints_require_explicit_gemini_usage_dialect(
+    base_url: str,
+) -> None:
+    default_provider = ChatCompletionsProvider(
+        api_key="test-key",
+        name="vertex-gemini",
+        base_url=base_url,
+    )
+    gemini_provider = ChatCompletionsProvider(
+        api_key="test-key",
+        name="vertex-gemini",
+        base_url=base_url,
+        usage_dialect=UsageDialect.GEMINI,
+    )
+
+    assert default_provider.usage_dialect is UsageDialect.OPENAI
+    assert gemini_provider.usage_dialect is UsageDialect.GEMINI
 
 
 def test_provider_endpoint_includes_api_version() -> None:

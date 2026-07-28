@@ -50,6 +50,7 @@ from cayu.providers.base import (
     ModelRequest,
     ModelStreamEvent,
     UsageDialect,
+    copy_usage_dialect,
 )
 
 if TYPE_CHECKING:
@@ -65,6 +66,7 @@ DEFAULT_CHAT_COMPLETIONS_API_KEY_ENV = "OPENAI_API_KEY"
 # OpenAI/Together use `Authorization: Bearer <key>`; Azure uses `api-key: <key>`.
 DEFAULT_CHAT_COMPLETIONS_AUTH_HEADER = "Authorization"
 DEFAULT_CHAT_COMPLETIONS_AUTH_VALUE_PREFIX = "Bearer "
+_USAGE_DIALECT_UNDECLARED = object()
 
 _RESERVED_CHAT_COMPLETIONS_OPTIONS = {
     "model",
@@ -248,6 +250,7 @@ class ChatCompletionsProvider(ModelProvider):
         api_version: str | None = None,
         clean_schemas: bool = True,
         document_encoding: str = DEFAULT_DOCUMENT_ENCODING,
+        usage_dialect: UsageDialect | str | None = None,
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
         self.api_key_env = require_clean_nonblank(api_key_env, "api_key_env")
@@ -276,11 +279,21 @@ class ChatCompletionsProvider(ModelProvider):
             else None
         )
         effective_url = self.endpoint_url or self.base_url
-        self.usage_dialect = (
-            UsageDialect.GEMINI
-            if urlsplit(effective_url).hostname == "generativelanguage.googleapis.com"
-            else UsageDialect.OPENAI
-        )
+        if usage_dialect is not None:
+            self.usage_dialect = copy_usage_dialect(usage_dialect)
+        else:
+            declared_usage_dialect = _declared_subclass_usage_dialect(type(self))
+            if declared_usage_dialect is _USAGE_DIALECT_UNDECLARED:
+                self.usage_dialect = (
+                    UsageDialect.GEMINI
+                    if urlsplit(effective_url).hostname == "generativelanguage.googleapis.com"
+                    else UsageDialect.OPENAI
+                )
+            else:
+                self.usage_dialect = copy_usage_dialect(
+                    declared_usage_dialect,
+                    f"{type(self).__name__}.usage_dialect",
+                )
         if type(timeout_s) not in {int, float}:
             raise TypeError("timeout_s must be a number.")
         if timeout_s <= 0:
@@ -1060,6 +1073,17 @@ def _validate_document_encoding(value: str) -> str:
     if value not in _VALID_DOCUMENT_ENCODINGS:
         raise ValueError(f"document_encoding must be one of {sorted(_VALID_DOCUMENT_ENCODINGS)}.")
     return value
+
+
+def _declared_subclass_usage_dialect(
+    provider_type: type[ChatCompletionsProvider],
+) -> object:
+    for candidate in provider_type.__mro__:
+        if candidate is ChatCompletionsProvider:
+            break
+        if "usage_dialect" in candidate.__dict__:
+            return candidate.__dict__["usage_dialect"]
+    return _USAGE_DIALECT_UNDECLARED
 
 
 def _validate_base_url(base_url: str, *, allow_http: bool = False) -> str:

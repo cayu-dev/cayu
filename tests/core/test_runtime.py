@@ -33615,7 +33615,7 @@ def test_cayu_app_reconstructs_gemini_thinking_usage() -> None:
                         provider_name="gemini",
                         model="gemini-3.5-flash",
                         input_per_million=Decimal("1"),
-                        output_per_million=Decimal("1"),
+                        output_per_million=Decimal("10"),
                     ),
                 )
             ),
@@ -33624,7 +33624,7 @@ def test_cayu_app_reconstructs_gemini_thinking_usage() -> None:
     assert cost.priced_model_steps == 1
     assert cost.line_items[0].input_tokens == 5
     assert cost.line_items[0].output_tokens == 55
-    assert cost.total_cost == Decimal("0.000060")
+    assert cost.total_cost == Decimal("0.000555")
 
 
 def test_cayu_app_get_session_usage_queries_only_usage_relevant_events():

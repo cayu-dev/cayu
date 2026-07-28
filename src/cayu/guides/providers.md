@@ -41,3 +41,38 @@ routes across them. Set `AgentSpec.provider_name` for an explicit per-agent
 route, or register one provider with `default=True`. Model-pattern routing must
 resolve to exactly one provider; `cayu check` reports missing or ambiguous
 routes without calling a provider.
+
+## Gemini through an OpenAI-compatible endpoint
+
+Gemini thinking models can report visible candidate output in
+`completion_tokens` while `total_tokens` also includes hidden, billable thinking
+tokens. `ChatCompletionsProvider` automatically selects `UsageDialect.GEMINI`
+for Google's AI Studio OpenAI-compatible endpoint.
+
+Vertex AI and gateway endpoints require an explicit commercial usage contract.
+Vertex uses the same OpenAI-compatible endpoint family for Gemini and
+non-Gemini models, so its hostname alone cannot select accounting semantics
+safely:
+
+```python
+from cayu import ChatCompletionsProvider, UsageDialect
+
+provider = ChatCompletionsProvider(
+    name="vertex-gemini",
+    api_key_env="GEMINI_API_KEY",
+    base_url=(
+        "https://us-central1-aiplatform.googleapis.com/v1/projects/"
+        "PROJECT_ID/locations/us-central1/endpoints/openapi"
+    ),
+    usage_dialect=UsageDialect.GEMINI,
+)
+```
+
+The Gemini dialect attributes the positive difference between total tokens and
+reported prompt plus visible completion tokens to reasoning output, billing it
+once as output. Ordinary OpenAI-compatible endpoints retain
+`UsageDialect.OPENAI` and unexplained total mismatches fail closed.
+
+Provider subclasses can continue declaring `usage_dialect` as a class
+attribute. An explicit constructor value takes precedence over that declaration
+and automatic endpoint detection.

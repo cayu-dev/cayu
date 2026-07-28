@@ -2,6 +2,18 @@
 
 ## v0.1.0 (unreleased)
 
+### Chat Completions usage dialects are explicit and subclass-safe
+
+`ChatCompletionsProvider` now accepts an explicit `usage_dialect`, preserves
+subclass class-attribute declarations, and continues to recognize Google's AI
+Studio endpoint automatically. Explicit configuration wins over subclass and
+endpoint-derived values, so Vertex AI and gateways can declare their accounting
+semantics without unsafe hostname inference.
+
+`UsageDialect.GEMINI` preserves hidden thinking included in provider totals and
+bills it once as output. Ordinary OpenAI-compatible endpoints remain on
+`UsageDialect.OPENAI`, where unexplained token-total mismatches fail closed.
+
 ### Aggregate usage remains exact across every public summary
 
 Session, causal-budget, multi-session, and usage-breakdown summaries now use the
