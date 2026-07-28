@@ -53,8 +53,10 @@ def new_async_client() -> httpx.AsyncClient:
     """
     context = ssl.create_default_context(cafile=certifi.where())
     extra_ca_bundle = os.environ.get(_PROVIDER_CA_BUNDLE_ENV)
-    if extra_ca_bundle is not None and extra_ca_bundle.strip():
-        context.load_verify_locations(cafile=extra_ca_bundle)
+    if extra_ca_bundle is not None:
+        context.load_verify_locations(
+            cafile=require_nonblank(extra_ca_bundle, _PROVIDER_CA_BUNDLE_ENV)
+        )
     return httpx.AsyncClient(verify=context)
 
 

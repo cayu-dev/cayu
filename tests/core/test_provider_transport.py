@@ -139,6 +139,18 @@ def test_new_async_client_fails_closed_when_extra_ca_is_invalid(
         new_async_client()
 
 
+def test_new_async_client_fails_closed_when_extra_ca_is_blank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CAYU_PROVIDER_CA_BUNDLE", " \t ")
+
+    with pytest.raises(
+        ValueError,
+        match="`CAYU_PROVIDER_CA_BUNDLE` cannot be blank",
+    ):
+        new_async_client()
+
+
 class _StreamContext:
     def __init__(self, response: _StreamingResponse) -> None:
         self._response = response
