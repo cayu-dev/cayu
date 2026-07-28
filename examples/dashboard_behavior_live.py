@@ -58,6 +58,9 @@ if TYPE_CHECKING:
 
 SESSION_ID = "dashboard-contract-session"
 APPROVAL_SESSION_ID = "dashboard-contract-approval"
+APPROVAL_MODEL_STEP_ID = f"mstep_{'1' * 32}"
+APPROVAL_MODEL_ATTEMPT_ID = f"matt_{'2' * 32}"
+APPROVAL_TOOL_ROUND_ID = f"tround_{'3' * 32}"
 INTERRUPT_SESSION_ID = "dashboard-contract-interrupt"
 INTERRUPT_FAILURE_SESSION_ID = "dashboard-contract-interrupt-failure"
 RESUME_INTERRUPT_SESSION_ID = "dashboard-contract-resume-interrupt"
@@ -574,12 +577,33 @@ async def _seed_app() -> tuple[CayuApp, DashboardContractProvider, InMemorySessi
                 agent_name=AGENT_NAME,
                 tool_name="dashboard_contract_tool",
                 payload={
+                    "model_step_id": APPROVAL_MODEL_STEP_ID,
+                    "model_attempt_id": APPROVAL_MODEL_ATTEMPT_ID,
+                    "tool_round_id": APPROVAL_TOOL_ROUND_ID,
+                    "approval_id": "dashboard-approval",
+                    "tool_call_id": "dashboard-approval-call",
                     "approval": {
+                        "model_step_id": APPROVAL_MODEL_STEP_ID,
+                        "model_attempt_id": APPROVAL_MODEL_ATTEMPT_ID,
+                        "tool_round_id": APPROVAL_TOOL_ROUND_ID,
                         "approval_id": "dashboard-approval",
+                        "tool_call_id": "dashboard-approval-call",
                         "tool_name": "dashboard_contract_tool",
                         "reason": "browser contract decision",
                         "arguments": {"operation": "verify"},
-                    }
+                        "agent_name": AGENT_NAME,
+                        "tool_calls": [
+                            {
+                                "tool_call_id": "dashboard-approval-call",
+                                "tool_name": "dashboard_contract_tool",
+                                "arguments": {"operation": "verify"},
+                                "policy_decision": None,
+                                "reason": None,
+                                "metadata": {},
+                                "active_taint_labels": [],
+                            }
+                        ],
+                    },
                 },
             )
         ],
@@ -588,11 +612,15 @@ async def _seed_app() -> tuple[CayuApp, DashboardContractProvider, InMemorySessi
         APPROVAL_SESSION_ID,
         {
             "pending_tool_approval": {
+                "model_step_id": APPROVAL_MODEL_STEP_ID,
+                "model_attempt_id": APPROVAL_MODEL_ATTEMPT_ID,
+                "tool_round_id": APPROVAL_TOOL_ROUND_ID,
                 "approval_id": "dashboard-approval",
                 "tool_call_id": "dashboard-approval-call",
                 "tool_name": "dashboard_contract_tool",
                 "arguments": {"operation": "verify"},
                 "agent_name": AGENT_NAME,
+                "reason": "browser contract decision",
                 "tool_calls": [
                     {
                         "tool_call_id": "dashboard-approval-call",
