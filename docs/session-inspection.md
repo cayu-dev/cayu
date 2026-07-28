@@ -55,11 +55,13 @@ JSONL row also carries the schema version so independently consumed
 `model_call`, `unmatched_ledger`, and `aggregate` records cannot be mistaken for
 the version 1 representation.
 
-Session-inspection CLI schema version `2` encodes identity-free aggregate usage
+Session-inspection CLI schema version `3` adds durable `interaction_id`
+correlation to event and transcript records, an `interactions` collection, and
+response-scoped filters. It retains version `2`'s identity-free aggregate usage
 counters as canonical nonnegative decimal strings in `show.usage`,
 `usage.aggregate`, and the JSONL aggregate record. Per-model-call counters
-remain signed-64-bit JSON integers. Consumers of schema version `1` must update
-their aggregate-counter parsing before accepting version `2`.
+remain signed-64-bit JSON integers. Consumers must branch on `schema_version`
+before accepting the additive response-correlation fields.
 
 ```console
 # Newest activity first; filters may be combined.
@@ -69,19 +71,25 @@ cayu session list --status completed --agent reviewer --label tenant=acme
 # pending-action counts.
 cayu session show SESSION_ID
 
+# Newest response-scoped summaries first, using a stable sequence cursor.
+cayu session interactions SESSION_ID --limit 50
+
 # Per-model-call and aggregate token/cache usage. Missing prices stay unknown.
 cayu session usage SESSION_ID --output json
+cayu session usage SESSION_ID --interaction-id INTERACTION_ID --output json
 
 # Paired parallel tool calls, timing, status, and result sizes, without results.
-cayu session tools SESSION_ID
+cayu session tools SESSION_ID --interaction-id INTERACTION_ID
 
 # Stable sequence pagination. Payloads appear only when explicitly bounded.
 cayu session events SESSION_ID --type tool.call.completed --output jsonl
 cayu session events SESSION_ID --after-sequence 120 --include-payload 2048
+cayu session events SESSION_ID --interaction-id INTERACTION_ID
 
 # Bounded previews by default; --sizes identifies context-amplifying records.
 cayu session transcript SESSION_ID --offset 0 --limit 100 --sizes
 cayu session transcript SESSION_ID --include-content 4096 --output json
+cayu session transcript SESSION_ID --interaction-id INTERACTION_ID
 ```
 
 `events --include-payload` and `transcript --include-content` accept a per-record
@@ -114,11 +122,18 @@ independently; JSON reports each collection's total, continuation offset, and
 all durable model completions. Summary cost states distinguish `unknown`,
 `unpriced`, `partial`, `mixed_currency`, and fully `priced` evidence. Tool
 `artifact_bytes` measures the serialized artifact metadata carried by the
-durable result, not bytes in an external artifact store. Tool inspection groups
-paused rounds only by their complete durable model-step, model-attempt, and
-tool-round identity. It never derives synthetic identifiers from approval or
-user-input IDs; missing, malformed, or contradictory identity evidence is
-isolated and reported as unavailable.
+durable result, not bytes in an external artifact store. Tool rounds resumed
+from approval or user-input pauses are grouped only by their complete durable
+model-step, model-attempt, and tool-round identity. They never derive synthetic
+identifiers from approval or user-input IDs; missing, malformed, or contradictory
+identity evidence is isolated and reported as unavailable.
+Interaction listing is store-native and bounded; it does not group the complete
+event history in the CLI. `--interaction-id` applies at the store query, so
+adjacent responses cannot leak into scoped usage, tool, event, or transcript
+output. Transcript results retain their absolute session indices. Interaction
+`model_step_count` includes failed provider attempts and retries. Wall duration
+is unavailable until the interaction is terminal because a paused interaction's
+human wait is still increasing; active duration excludes that wait.
 
 ## Diagnostic examples
 

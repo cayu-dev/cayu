@@ -78,7 +78,15 @@ def test_export_sessions_writes_one_line_per_session_with_nested_state():
         assert len(lines) == 2
         assert all(line["type"] == "session" for line in lines)
         assert all(
-            {"session", "events", "transcript", "checkpoint"} <= line.keys() for line in lines
+            {
+                "session",
+                "events",
+                "transcript",
+                "checkpoint",
+                "deferred_interaction_input",
+            }
+            <= line.keys()
+            for line in lines
         )
 
         by_id = {line["session"]["id"]: line for line in lines}
@@ -96,6 +104,7 @@ def test_export_sessions_writes_one_line_per_session_with_nested_state():
         assert bare["events"] == []
         assert bare["transcript"] == []
         assert bare["checkpoint"] is None
+        assert bare["deferred_interaction_input"] is None
 
     asyncio.run(run())
 
@@ -107,6 +116,92 @@ def test_export_sessions_empty_store_returns_zero():
         count = await export_sessions(store, stream=stream)
         assert count == 0
         assert stream.getvalue() == ""
+
+    asyncio.run(run())
+
+
+def test_export_sessions_preserves_private_deferred_interaction_input():
+    async def run() -> None:
+        store = InMemorySessionStore()
+        source = [Message.text("user", "build the feature")]
+        await store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id="sess_deferred",
+                messages=source,
+            ),
+            identity=_identity(),
+            interaction_started_event=Event(
+                id="evt_interaction_started",
+                type=EventType.INTERACTION_STARTED,
+                session_id="sess_deferred",
+                interaction_id="interaction-deferred",
+            ),
+            interaction_source_messages=source,
+        )
+        try:
+            stream = io.StringIO()
+            assert await export_sessions(store, stream=stream) == 1
+
+            [line] = _lines(stream)
+            assert line["transcript"] == []
+            assert line["deferred_interaction_input"] == {
+                "interaction_id": "interaction-deferred",
+                "source_messages": [source[0].model_dump(mode="json")],
+            }
+
+            [imported] = list(import_sessions(io.StringIO(stream.getvalue())))
+            assert imported.deferred_interaction_input is not None
+            assert imported.deferred_interaction_input.interaction_id == "interaction-deferred"
+            assert imported.deferred_interaction_input.source_messages == source
+        finally:
+            await store.release_run_fence("sess_deferred")
+
+    asyncio.run(run())
+
+
+def test_export_sessions_preserves_materialized_transcript_interaction_attribution():
+    async def run() -> None:
+        store = InMemorySessionStore()
+        await store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id="sess_interaction_transcript",
+                messages=[],
+            ),
+            identity=_identity(),
+        )
+        await store.append_transcript_messages(
+            "sess_interaction_transcript",
+            [Message.text("user", "first"), Message.text("assistant", "one")],
+            interaction_id="interaction-one",
+        )
+        await store.append_transcript_messages(
+            "sess_interaction_transcript",
+            [Message.text("user", "second"), Message.text("assistant", "two")],
+            interaction_id="interaction-two",
+        )
+
+        stream = io.StringIO()
+        assert await export_sessions(store, stream=stream) == 1
+
+        [line] = _lines(stream)
+        assert [record["index"] for record in line["transcript_records"]] == [0, 1, 2, 3]
+        assert [record["interaction_id"] for record in line["transcript_records"]] == [
+            "interaction-one",
+            "interaction-one",
+            "interaction-two",
+            "interaction-two",
+        ]
+
+        [imported] = list(import_sessions(io.StringIO(stream.getvalue())))
+        assert [record.interaction_id for record in imported.transcript_records] == [
+            "interaction-one",
+            "interaction-one",
+            "interaction-two",
+            "interaction-two",
+        ]
+        assert [record.message for record in imported.transcript_records] == imported.transcript
 
     asyncio.run(run())
 
@@ -296,13 +391,43 @@ def test_import_sessions_round_trips_export():
         assert rich.events == await store.load_events("sess_rich")
         assert rich.transcript == await store.load_transcript("sess_rich")
         assert rich.checkpoint == {"step": 3}
+        assert rich.deferred_interaction_input is None
 
         bare = by_id["sess_bare"]
         assert bare.events == []
         assert bare.transcript == []
         assert bare.checkpoint is None
+        assert bare.deferred_interaction_input is None
 
     asyncio.run(run())
+
+
+def test_import_sessions_accepts_legacy_export_without_deferred_input():
+    session = SessionIdentity(provider_name="fake", model="fake-model")
+
+    async def build_line() -> str:
+        store = InMemorySessionStore()
+        created = await store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id="sess_legacy",
+                messages=[],
+            ),
+            identity=session,
+        )
+        return json.dumps(
+            {
+                "type": "session",
+                "session": created.model_dump(mode="json"),
+                "events": [],
+                "transcript": [],
+                "checkpoint": None,
+            }
+        )
+
+    [imported] = list(import_sessions([asyncio.run(build_line())]))
+    assert imported.deferred_interaction_input is None
+    assert imported.transcript_records == []
 
 
 def test_import_tasks_round_trips_export():

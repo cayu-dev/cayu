@@ -19,7 +19,13 @@ from cayu.core import (
     ThinkingPart,
     ToolCallPart,
 )
-from cayu.runtime import RunRequest, SessionIdentity, SessionStatus
+from cayu.runtime import (
+    InteractionStatus,
+    InteractionSummaryEvidence,
+    RunRequest,
+    SessionIdentity,
+    SessionStatus,
+)
 
 
 def _budget_limit_id(value: int) -> str:
@@ -132,7 +138,7 @@ def test_session_list_uses_project_target_and_emits_stable_json(
     assert payload == {
         "has_more": False,
         "next_cursor": None,
-        "schema_version": "2",
+        "schema_version": "3",
         "sessions": [
             {
                 "agent": "writer",
@@ -1229,7 +1235,7 @@ def test_session_usage_reports_per_call_cache_and_honest_pricing_state(
         "model_call",
         "unmatched_ledger",
     }
-    assert {row["schema_version"] for row in jsonl_rows} == {"2"}
+    assert {row["schema_version"] for row in jsonl_rows} == {"3"}
     aggregate_row = next(row for row in jsonl_rows if row["record_type"] == "aggregate")
     assert aggregate_row["total_tokens"] == "12"
 
@@ -1288,7 +1294,7 @@ def test_session_usage_json_serializes_aggregate_counters_losslessly(
         == 0
     )
     payload = json.loads(capsys.readouterr().out)
-    assert payload["schema_version"] == "2"
+    assert payload["schema_version"] == "3"
     assert payload["aggregate"]["input_tokens"] == expected
     assert payload["aggregate"]["total_tokens"] == expected
 
@@ -2603,3 +2609,204 @@ def test_session_event_and_transcript_pagination_stays_stable_at_scale(
     assert transcript["total_messages"] == 2001
     assert [item["index"] for item in transcript["messages"]] == [1999, 2000]
     assert transcript["has_more"] is False
+
+
+def test_session_cli_lists_and_filters_response_scoped_interactions(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    database = _write_project(tmp_path)
+    started_at = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def lifecycle_event(
+        *,
+        interaction_id: str,
+        suffix: str,
+        status: InteractionStatus,
+        timestamp: datetime,
+    ) -> Event:
+        start_id = f"{interaction_id}-started"
+        terminal = status is InteractionStatus.COMPLETED
+        return Event(
+            id=start_id if not terminal else f"{interaction_id}-{suffix}",
+            type=(
+                EventType.INTERACTION_STARTED if not terminal else EventType.INTERACTION_COMPLETED
+            ),
+            session_id="sess_interactions",
+            interaction_id=interaction_id,
+            timestamp=timestamp,
+            payload=InteractionSummaryEvidence(
+                status=status,
+                start_event_id=start_id,
+                source_transcript_start=0 if interaction_id == "interaction-a" else 2,
+                source_transcript_end=0 if interaction_id == "interaction-a" else 2,
+                result_transcript_start=1 if interaction_id == "interaction-a" else 3,
+                result_transcript_end=1 if interaction_id == "interaction-a" else 3,
+                started_at=(
+                    started_at
+                    if interaction_id == "interaction-a"
+                    else started_at + timedelta(seconds=10)
+                ),
+                completed_at=timestamp if terminal else None,
+                active_duration_ms=1000 if terminal else 0,
+                wall_duration_ms=1000 if terminal else None,
+                model_step_count=1 if terminal else 0,
+                tool_call_count=1 if terminal and interaction_id == "interaction-a" else 0,
+                provider_names=["fake"] if terminal else [],
+                models=["model"] if terminal else [],
+            ).model_dump(mode="json"),
+        )
+
+    async def seed() -> None:
+        store = SQLiteSessionStore(database)
+        try:
+            await store.create(
+                RunRequest(
+                    agent_name="operator",
+                    session_id="sess_interactions",
+                    messages=[Message.text("system", "bootstrap")],
+                ),
+                identity=SessionIdentity(provider_name="fake", model="model"),
+            )
+            for interaction_id, offset, with_tool in (
+                ("interaction-a", 0, True),
+                ("interaction-b", 10, False),
+            ):
+                await store.append_event(
+                    "sess_interactions",
+                    lifecycle_event(
+                        interaction_id=interaction_id,
+                        suffix="started",
+                        status=InteractionStatus.ACTIVE,
+                        timestamp=started_at + timedelta(seconds=offset),
+                    ),
+                )
+                await store.append_transcript_messages(
+                    "sess_interactions",
+                    [Message.text("user", f"question {interaction_id}")],
+                    interaction_id=interaction_id,
+                )
+                await store.append_event(
+                    "sess_interactions",
+                    Event(
+                        type=EventType.MODEL_COMPLETED,
+                        session_id="sess_interactions",
+                        interaction_id=interaction_id,
+                        timestamp=started_at + timedelta(seconds=offset, milliseconds=250),
+                        payload={
+                            "usage_metrics": {
+                                "input_tokens": 10 if with_tool else 20,
+                                "output_tokens": 2,
+                            }
+                        },
+                    ),
+                )
+                if with_tool:
+                    execution_identity = {
+                        "model_step_id": f"mstep_{'1' * 32}",
+                        "model_attempt_id": f"matt_{'2' * 32}",
+                        "tool_round_id": f"tround_{'3' * 32}",
+                    }
+                    await store.append_events(
+                        "sess_interactions",
+                        [
+                            Event(
+                                type=EventType.TOOL_CALL_STARTED,
+                                session_id="sess_interactions",
+                                interaction_id=interaction_id,
+                                tool_name="read_file",
+                                timestamp=started_at + timedelta(milliseconds=500),
+                                payload={
+                                    **execution_identity,
+                                    "tool_call_id": "call-a",
+                                    "arguments": {"path": "README.md"},
+                                },
+                            ),
+                            Event(
+                                type=EventType.TOOL_CALL_COMPLETED,
+                                session_id="sess_interactions",
+                                interaction_id=interaction_id,
+                                tool_name="read_file",
+                                timestamp=started_at + timedelta(milliseconds=750),
+                                payload={
+                                    **execution_identity,
+                                    "tool_call_id": "call-a",
+                                    "result": {
+                                        "content": "done",
+                                        "structured": None,
+                                        "artifacts": [],
+                                        "is_error": False,
+                                    },
+                                },
+                            ),
+                        ],
+                    )
+                await store.append_transcript_messages(
+                    "sess_interactions",
+                    [Message.text("assistant", f"answer {interaction_id}")],
+                    interaction_id=interaction_id,
+                )
+                await store.append_event(
+                    "sess_interactions",
+                    lifecycle_event(
+                        interaction_id=interaction_id,
+                        suffix="completed",
+                        status=InteractionStatus.COMPLETED,
+                        timestamp=started_at + timedelta(seconds=offset + 1),
+                    ),
+                )
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+
+    assert (
+        main(
+            [
+                "session",
+                "interactions",
+                "sess_interactions",
+                "--sqlite",
+                str(database),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    listed = json.loads(capsys.readouterr().out)
+    assert listed["schema_version"] == "3"
+    assert [item["interaction_id"] for item in listed["interactions"]] == [
+        "interaction-b",
+        "interaction-a",
+    ]
+    assert listed["interactions"][1]["tool_call_count"] == 1
+    assert listed["interactions"][1]["status"] == "completed"
+
+    scoped_commands = (
+        ("usage", "calls", 1),
+        ("tools", "calls", 1),
+        ("events", "events", 5),
+        ("transcript", "messages", 2),
+    )
+    for command, collection, expected_count in scoped_commands:
+        assert (
+            main(
+                [
+                    "session",
+                    command,
+                    "sess_interactions",
+                    "--sqlite",
+                    str(database),
+                    "--interaction-id",
+                    "interaction-a",
+                    "--json",
+                ]
+            )
+            == 0
+        )
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["interaction_id"] == "interaction-a"
+        assert len(payload[collection]) == expected_count
+
+    assert [item["index"] for item in payload["messages"]] == [0, 1]
+    assert {item["interaction_id"] for item in payload["messages"]} == {"interaction-a"}

@@ -39,10 +39,13 @@ from cayu._validation import (
 )
 from cayu.core import Event, Message
 from cayu.runtime.sessions import (
+    DeferredInteractionInput,
     Session,
     SessionOrder,
     SessionQuery,
     SessionStore,
+    TranscriptQuery,
+    TranscriptRecord,
 )
 from cayu.runtime.tasks import Task, TaskOrder, TaskQuery, TaskStore
 
@@ -67,7 +70,9 @@ async def export_sessions(store: SessionStore, *, stream: _TextStream) -> int:
     record with its events, transcript, and latest checkpoint::
 
         {"type": "session", "session": {...}, "events": [...],
-         "transcript": [...], "checkpoint": {...} | null}
+         "transcript": [...], "transcript_records": [...],
+         "checkpoint": {...} | null,
+         "deferred_interaction_input": {...} | null}
 
     Sessions are emitted oldest-first by creation time. Paging uses a keyset
     cursor (see the module docstring), so concurrent inserts and deletes cannot
@@ -86,8 +91,10 @@ async def export_sessions(store: SessionStore, *, stream: _TextStream) -> int:
         )
         for session in result.sessions:
             events = await store.load_events(session.id)
-            transcript = await store.load_transcript(session.id)
+            transcript_records = await _load_transcript_records(store, session.id)
+            transcript = [record.message for record in transcript_records]
             checkpoint = await store.load_checkpoint(session.id)
+            deferred_interaction_input = await store.load_deferred_interaction_input(session.id)
             _write_line(
                 stream,
                 {
@@ -95,13 +102,43 @@ async def export_sessions(store: SessionStore, *, stream: _TextStream) -> int:
                     "session": session.model_dump(mode="json"),
                     "events": [event.model_dump(mode="json") for event in events],
                     "transcript": [message.model_dump(mode="json") for message in transcript],
+                    "transcript_records": [
+                        record.model_dump(mode="json") for record in transcript_records
+                    ],
                     "checkpoint": checkpoint,
+                    "deferred_interaction_input": (
+                        None
+                        if deferred_interaction_input is None
+                        else deferred_interaction_input.model_dump(mode="json")
+                    ),
                 },
             )
             count += 1
         cursor = result.next_cursor
         if cursor is None:
             return count
+
+
+async def _load_transcript_records(
+    store: SessionStore,
+    session_id: str,
+) -> list[TranscriptRecord]:
+    records: list[TranscriptRecord] = []
+    offset = 0
+    while True:
+        page = await store.query_transcript(
+            TranscriptQuery(
+                session_id=session_id,
+                offset=offset,
+                limit=_EXPORT_PAGE_SIZE,
+            )
+        )
+        if not page.records:
+            return records
+        records.extend(page.records)
+        offset += len(page.records)
+        if offset >= page.total_records:
+            return records
 
 
 async def export_tasks(store: TaskStore, *, stream: _TextStream) -> int:
@@ -151,13 +188,16 @@ class ImportedSession:
 
     This is the inverse of one ``{"type": "session", ...}`` line produced by
     :func:`export_sessions`: the ``Session`` plus its events, transcript, and
-    latest checkpoint, all validated back into their typed models.
+    latest checkpoint, and any private deferred interaction input, all
+    validated back into their typed models.
     """
 
     session: Session
     events: list[Event]
     transcript: list[Message]
+    transcript_records: list[TranscriptRecord]
     checkpoint: dict[str, Any] | None
+    deferred_interaction_input: DeferredInteractionInput | None
 
 
 def _iter_json_lines(lines: Iterable[str]) -> Iterator[dict[str, Any]]:
@@ -210,11 +250,34 @@ def import_sessions(lines: Iterable[str]) -> Iterator[ImportedSession]:
         checkpoint = obj.get("checkpoint")
         if checkpoint is not None:
             checkpoint = copy_durable_json_object(checkpoint, "checkpoint")
+        transcript = [Message.model_validate(message) for message in obj.get("transcript", [])]
+        raw_transcript_records = obj.get("transcript_records")
+        transcript_records = (
+            [
+                TranscriptRecord(
+                    index=index,
+                    message=message,
+                )
+                for index, message in enumerate(transcript)
+            ]
+            if raw_transcript_records is None
+            else [TranscriptRecord.model_validate(record) for record in raw_transcript_records]
+        )
+        if [record.index for record in transcript_records] != list(range(len(transcript_records))):
+            raise ValueError("Session transcript record indices must be contiguous from zero.")
+        if [record.message for record in transcript_records] != transcript:
+            raise ValueError("Session transcript messages disagree with transcript_records.")
         yield ImportedSession(
             session=Session.model_validate(obj["session"]),
             events=[Event.model_validate(event) for event in obj.get("events", [])],
-            transcript=[Message.model_validate(message) for message in obj.get("transcript", [])],
+            transcript=transcript,
+            transcript_records=transcript_records,
             checkpoint=checkpoint,
+            deferred_interaction_input=(
+                None
+                if obj.get("deferred_interaction_input") is None
+                else DeferredInteractionInput.model_validate(obj["deferred_interaction_input"])
+            ),
         )
 
 

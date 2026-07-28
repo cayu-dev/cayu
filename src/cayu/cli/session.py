@@ -26,6 +26,7 @@ from cayu.runtime import (
     EventOrder,
     EventQuery,
     EventRecord,
+    InteractionSummaryEvidence,
     SessionOrder,
     SessionQuery,
     SessionStatus,
@@ -39,12 +40,13 @@ from cayu.runtime import (
 )
 from cayu.runtime.aggregates import summary_usage_metrics_from_event_payload
 from cayu.runtime.budgets import is_complete_budget_reconciliation_pricing
+from cayu.runtime.interactions import INTERACTION_TERMINAL_EVENT_TYPES
 from cayu.runtime.usage import count_model_steps_with_usage
 from cayu.storage import SQLiteSessionStore
 from cayu.storage import migrations as schema
 
 FORMAT_CHOICES = ("json", "table", "jsonl")
-CLI_SCHEMA_VERSION = "2"
+CLI_SCHEMA_VERSION = "3"
 _MAX_COLLECTED_EVENT_BYTES = 64 * 1024 * 1024
 _MAX_COLLECTED_EVENT_RECORDS = 100_000
 _MAX_TRANSCRIPT_CONTENT_BYTES = 1_048_576
@@ -103,6 +105,20 @@ def add_session_parser(subparsers: Any) -> None:
     _add_target_options(show_parser)
     add_output_options(show_parser, formats=FORMAT_CHOICES)
 
+    interactions_parser = commands.add_parser(
+        "interactions",
+        help="Page response-scoped interaction summaries.",
+        description=(
+            "Page durable interaction summaries newest first. Use an interaction id "
+            "with usage, tools, events, or transcript for response-scoped evidence."
+        ),
+    )
+    interactions_parser.add_argument("session_id")
+    _add_target_options(interactions_parser)
+    interactions_parser.add_argument("--before-sequence", type=_positive_int)
+    interactions_parser.add_argument("--limit", type=_positive_limit, default=50)
+    add_output_options(interactions_parser, formats=FORMAT_CHOICES)
+
     usage_parser = commands.add_parser(
         "usage",
         help="Show per-model-call token usage.",
@@ -117,6 +133,7 @@ def add_session_parser(subparsers: Any) -> None:
     usage_parser.add_argument("--limit", type=_positive_limit, default=100)
     usage_parser.add_argument("--after-sequence", type=_nonnegative_int)
     usage_parser.add_argument("--before-sequence", type=_positive_int)
+    usage_parser.add_argument("--interaction-id")
     add_output_options(usage_parser, formats=FORMAT_CHOICES)
 
     tools_parser = commands.add_parser(
@@ -133,6 +150,7 @@ def add_session_parser(subparsers: Any) -> None:
     tools_parser.add_argument("--limit", type=_positive_limit, default=100)
     tools_parser.add_argument("--after-sequence", type=_nonnegative_int)
     tools_parser.add_argument("--before-sequence", type=_positive_int)
+    tools_parser.add_argument("--interaction-id")
     add_output_options(tools_parser, formats=FORMAT_CHOICES)
 
     events_parser = commands.add_parser(
@@ -153,6 +171,7 @@ def add_session_parser(subparsers: Any) -> None:
     events_parser.add_argument("--until", type=_datetime_argument)
     events_parser.add_argument("--after-sequence", type=_nonnegative_int)
     events_parser.add_argument("--before-sequence", type=_positive_int)
+    events_parser.add_argument("--interaction-id")
     events_parser.add_argument("--limit", type=_positive_limit, default=100)
     events_parser.add_argument(
         "--include-payload",
@@ -175,6 +194,7 @@ def add_session_parser(subparsers: Any) -> None:
     _add_target_options(transcript_parser)
     transcript_parser.add_argument("--offset", type=_nonnegative_int, default=0)
     transcript_parser.add_argument("--limit", type=_positive_limit, default=100)
+    transcript_parser.add_argument("--interaction-id")
     transcript_parser.add_argument(
         "--sizes",
         action="store_true",
@@ -249,6 +269,8 @@ async def _run_session_command(
             return await _list_sessions(args, store)
         if args.session_command == "show":
             return await _show_session(args, store)
+        if args.session_command == "interactions":
+            return await _session_interactions(args, store)
         if args.session_command == "usage":
             return await _session_usage(args, store)
         if args.session_command == "tools":
@@ -406,6 +428,65 @@ async def _show_session(args: argparse.Namespace, store: SessionStore) -> int:
     return 0
 
 
+async def _session_interactions(args: argparse.Namespace, store: SessionStore) -> int:
+    await _require_session(store, args.session_id)
+    records = await store.query_latest_interaction_events(
+        args.session_id,
+        before_sequence=args.before_sequence,
+        limit=args.limit + 1,
+    )
+    has_more = len(records) > args.limit
+    page = records[: args.limit]
+    rows = [_interaction_row(record) for record in page]
+    next_sequence = page[-1].sequence if has_more and page else None
+    payload = {
+        "schema_version": CLI_SCHEMA_VERSION,
+        "session_id": args.session_id,
+        "interactions": rows,
+        "next_sequence": next_sequence,
+        "has_more": has_more,
+    }
+    _render_collection(
+        args.output_format,
+        payload,
+        rows,
+        headers=(
+            "interaction_id",
+            "status",
+            "started_at",
+            "completed_at",
+            "active_duration_ms",
+            "wall_duration_ms",
+            "model_step_count",
+            "tool_call_count",
+            "source_transcript_start",
+            "source_transcript_end",
+            "result_transcript_start",
+            "result_transcript_end",
+            "pending_action_kind",
+            "updated_at",
+        ),
+    )
+    return 0
+
+
+def _interaction_row(record: EventRecord) -> dict[str, Any]:
+    event = record.event
+    if event.interaction_id is None:
+        raise ValueError("Interaction lifecycle event has no interaction identity.")
+    evidence = InteractionSummaryEvidence.model_validate(event.payload)
+    terminal = event.type in INTERACTION_TERMINAL_EVENT_TYPES
+    return {
+        "interaction_id": event.interaction_id,
+        "session_id": event.session_id,
+        **evidence.model_dump(mode="json"),
+        "start_event_sequence": evidence.start_event_sequence or record.sequence,
+        "terminal_event_id": event.id if terminal else None,
+        "terminal_event_sequence": record.sequence if terminal else None,
+        "updated_at": event.timestamp.isoformat(),
+    }
+
+
 _USAGE_EVENT_TYPES = (
     EventType.MODEL_COMPLETED,
     EventType.TOOL_CALL_STARTED,
@@ -424,6 +505,7 @@ async def _session_usage(args: argparse.Namespace, store: SessionStore) -> int:
         project_record=_usage_inspection_record,
         after_sequence=args.after_sequence,
         before_sequence=args.before_sequence,
+        interaction_id=args.interaction_id,
     )
     usage_events = [
         record.event
@@ -443,6 +525,7 @@ async def _session_usage(args: argparse.Namespace, store: SessionStore) -> int:
     payload = {
         "schema_version": CLI_SCHEMA_VERSION,
         "session_id": args.session_id,
+        "interaction_id": args.interaction_id,
         "calls": page,
         "offset": args.offset,
         "next_offset": next_offset if has_more else None,
@@ -705,6 +788,7 @@ async def _session_tools(args: argparse.Namespace, store: SessionStore) -> int:
         project_record=_tool_inspection_record,
         after_sequence=args.after_sequence,
         before_sequence=args.before_sequence,
+        interaction_id=args.interaction_id,
     )
     calls = _tool_call_rows(records)
     page = calls[args.offset : args.offset + args.limit]
@@ -713,6 +797,7 @@ async def _session_tools(args: argparse.Namespace, store: SessionStore) -> int:
     payload = {
         "schema_version": CLI_SCHEMA_VERSION,
         "session_id": args.session_id,
+        "interaction_id": args.interaction_id,
         "calls": page,
         "offset": args.offset,
         "next_offset": next_offset if has_more else None,
@@ -1387,6 +1472,7 @@ async def _session_events(args: argparse.Namespace, store: SessionStore) -> int:
     records = await store.query_events(
         EventQuery(
             session_id=args.session_id,
+            interaction_id=args.interaction_id,
             event_types=tuple(args.event_types),
             tool_name=args.tool,
             agent_name=args.agent,
@@ -1406,6 +1492,7 @@ async def _session_events(args: argparse.Namespace, store: SessionStore) -> int:
     payload = {
         "schema_version": CLI_SCHEMA_VERSION,
         "session_id": args.session_id,
+        "interaction_id": args.interaction_id,
         "events": rows,
         "order": "sequence_asc",
         "next_sequence": next_sequence,
@@ -1415,6 +1502,7 @@ async def _session_events(args: argparse.Namespace, store: SessionStore) -> int:
         "sequence",
         "timestamp",
         "type",
+        "interaction_id",
         "tool",
         "agent",
         "environment",
@@ -1441,6 +1529,7 @@ def _event_row(record: EventRecord, *, payload_limit: int | None) -> dict[str, A
         "tool": event.tool_name,
         "agent": event.agent_name,
         "environment": event.environment_name,
+        "interaction_id": event.interaction_id,
         "payload_bytes": payload_bytes,
     }
     if payload_limit is not None:
@@ -1461,6 +1550,7 @@ async def _session_transcript(args: argparse.Namespace, store: SessionStore) -> 
     page = await store.query_transcript(
         TranscriptQuery(
             session_id=args.session_id,
+            interaction_id=args.interaction_id,
             offset=args.offset,
             limit=args.limit,
         )
@@ -1485,6 +1575,7 @@ async def _session_transcript(args: argparse.Namespace, store: SessionStore) -> 
     payload = {
         "schema_version": CLI_SCHEMA_VERSION,
         "session_id": args.session_id,
+        "interaction_id": args.interaction_id,
         "messages": rows,
         "offset": args.offset,
         "next_offset": next_offset if has_more else None,
@@ -1494,6 +1585,7 @@ async def _session_transcript(args: argparse.Namespace, store: SessionStore) -> 
     headers = (
         (
             "index",
+            "interaction_id",
             "role",
             "message_bytes",
             "content_part_count",
@@ -1504,6 +1596,7 @@ async def _session_transcript(args: argparse.Namespace, store: SessionStore) -> 
         if args.sizes
         else (
             "index",
+            "interaction_id",
             "role",
             "message_bytes",
             "content_part_count",
@@ -1536,6 +1629,7 @@ def _transcript_row(
     ]
     row: dict[str, Any] = {
         "index": record.index,
+        "interaction_id": record.interaction_id,
         "role": str(message.role),
         "message_bytes": compact_json_utf8_size(serialized),
         "content_part_count": len(message.content),
@@ -1604,6 +1698,7 @@ async def _query_all_event_records(
     project_record: Callable[[EventRecord], EventRecord] | None = None,
     after_sequence: int | None = None,
     before_sequence: int | None = None,
+    interaction_id: str | None = None,
 ) -> list[EventRecord]:
     records: list[EventRecord] = []
     retained_bytes = 0
@@ -1612,6 +1707,7 @@ async def _query_all_event_records(
         page = await store.query_events(
             EventQuery(
                 session_id=session_id,
+                interaction_id=interaction_id,
                 event_types=() if event_types is None else event_types,
                 after_sequence=cursor,
                 before_sequence=before_sequence,
