@@ -2301,7 +2301,7 @@ def test_sqlite_budget_ledger_revisions_21_through_23_add_identity_columns(
         }
         revisions = connection.execute(
             "SELECT revision, kind, compatible_from FROM cayu_schema_migrations "
-            "WHERE revision >= 21 ORDER BY revision"
+            "WHERE revision BETWEEN 21 AND 23 ORDER BY revision"
         ).fetchall()
     finally:
         connection.close()

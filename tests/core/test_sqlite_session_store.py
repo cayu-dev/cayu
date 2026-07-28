@@ -1125,12 +1125,13 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
         connection.execute("DROP TABLE cayu_mcp_manifest_baselines")
         connection.execute("DROP TABLE cayu_persisted_event_side_effects")
         connection.execute("DROP TABLE cayu_session_message_queue")
+        connection.execute("DROP INDEX idx_cayu_sessions_parent_created_id")
         connection.execute("PRAGMA user_version = 18")
         connection.commit()
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 23"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 24"):
         SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
     task_store = SQLiteTaskStore(
@@ -1171,6 +1172,13 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
         manifest_revision = connection.execute(
             "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 22"
         ).fetchone()
+        topology_revision = connection.execute(
+            "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 24"
+        ).fetchone()
+        topology_index = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_cayu_sessions_parent_created_id'"
+        ).fetchone()
         legacy_writer_trigger = connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'trigger' "
             "AND name = 'cayu_events_enqueue_persisted_side_effect'"
@@ -1188,6 +1196,8 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
     assert billing_revision == ("breaking", 21)
     assert manifest_baseline_table == ("cayu_mcp_manifest_baselines",)
     assert manifest_revision == ("breaking", 22)
+    assert topology_revision == ("additive", 23)
+    assert topology_index == ("idx_cayu_sessions_parent_created_id",)
     assert legacy_writer_trigger is None
     assert retention_guard == ("cayu_protect_undelivered_event_side_effects",)
 
@@ -1219,7 +1229,7 @@ def test_sqlite_session_store_revision_thirteen_requires_run_fencing_migration(t
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 23"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 24"):
         SQLiteSessionStore(db_path)
 
     reopened = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
@@ -1258,7 +1268,7 @@ def test_sqlite_session_store_revision_fourteen_requires_cascade_index_migration
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 23"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 24"):
         SQLiteSessionStore(db_path)
 
     reopened = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
@@ -1356,7 +1366,7 @@ def test_sqlite_session_store_revision_sixteen_requires_pending_action_index(tmp
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 23"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 24"):
         SQLiteSessionStore(db_path)
 
     reopened = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
@@ -1576,7 +1586,7 @@ def test_sqlite_revision_seventeen_requires_session_operation_migration(tmp_path
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 23"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 24"):
         SQLiteSessionStore(db_path)
 
     migrated = SQLiteSessionStore(
@@ -1913,7 +1923,7 @@ def test_sqlite_revision_twenty_three_preserves_existing_reservation_ownership(
 
     connection = sqlite3.connect(db_path)
     try:
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 23")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 23")
         connection.execute("DROP INDEX idx_cayu_events_budget_reservation_identity")
         connection.execute("DROP INDEX idx_cayu_events_pending_action_round_scope")
         connection.execute("DROP INDEX idx_cayu_events_pending_action_attempt_scope")
@@ -2201,7 +2211,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         "status_reason",
         "status_payload_json",
     }.issubset(task_columns)
-    # Revisions 2-7, 11-16, and 20 are additive. Revisions 17-19 and 21-23
+    # Revisions 2-7, 11-16, 20, and 24 are additive. Revisions 17-19 and 21-23
     # change durable writer/reader contracts and therefore raise the
     # compatibility floor.
     assert revisions == [(rev.revision, rev.compatible_from) for rev in schema_migrations.REVISIONS]
@@ -2229,6 +2239,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (21, 21),
         (22, 22),
         (23, 23),
+        (24, 23),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

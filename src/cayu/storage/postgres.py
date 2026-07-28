@@ -104,6 +104,7 @@ from cayu.runtime.sessions import (
     EnqueueSessionMessageRequest,
     EnqueueSessionMessageResult,
     EventQuery,
+    EventQueryResultTooLarge,
     EventRecord,
     EventSummary,
     ForkTranscriptValidator,
@@ -147,6 +148,10 @@ from cayu.runtime.sessions import (
     SessionStatusConflict,
     SessionStatusCounts,
     SessionStore,
+    SessionTopologyCycle,
+    SessionTopologyDepthExceeded,
+    SessionTopologyQuery,
+    SessionTopologyStoreResult,
     TranscriptPage,
     TranscriptQuery,
     TranscriptRecord,
@@ -215,6 +220,7 @@ from cayu.runtime.sessions import (
     _validate_tool_round_call_ids,
     _validate_tool_round_checkpoint_mutation,
     _validate_tool_round_publication,
+    build_session_topology_result,
     copy_enqueue_session_message_request,
     copy_event_query,
     copy_run_request,
@@ -226,6 +232,7 @@ from cayu.runtime.sessions import (
     copy_transcript_query,
     copy_usage_rollup_query,
     decode_session_cursor,
+    decode_session_topology_cursor,
     encode_session_cursor,
     enforce_pending_action_result_size,
     filter_transcript_records,
@@ -306,7 +313,7 @@ from cayu.storage.memory import (
 _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 _SCHEMA_ADVISORY_LOCK_POLL_SECONDS = 0.25
 _POSTGRES_MIN_REQUIRED_REVISION = 18
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 23
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 24
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL = """
     event_type IN (
@@ -1443,6 +1450,22 @@ _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] =
             """,
             drop_statement=(
                 "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_events_pending_action_attempt_scope"
+            ),
+        ),
+    ),
+    24: (
+        _ConcurrentIndexMigration(
+            index_name="idx_cayu_sessions_parent_created_id",
+            table_name="cayu_sessions",
+            key_definitions=("parent_session_id", "created_at", "id"),
+            predicate_definition=None,
+            create_statement=(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+                "idx_cayu_sessions_parent_created_id "
+                "ON cayu_sessions(parent_session_id, created_at, id)"
+            ),
+            drop_statement=(
+                "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_sessions_parent_created_id"
             ),
         ),
     ),
@@ -4741,6 +4764,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
 
     supports_usage_aggregates: ClassVar[bool] = True
     supports_mcp_manifest_history: ClassVar[bool] = True
+    supports_session_topology: ClassVar[bool] = True
     _min_required_revision = _POSTGRES_SESSION_MIN_REQUIRED_REVISION
     _supports_read_only = True
 
@@ -8294,6 +8318,69 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         async with self._connection() as conn, conn.cursor() as cur:
             return await self._query_events(cur, query, safe_insert_xid=None)
 
+    async def query_events_bounded(
+        self,
+        query: EventQuery,
+        *,
+        max_bytes: int,
+    ) -> list[EventRecord]:
+        query = copy_event_query(query)
+        if type(max_bytes) is not int or max_bytes < 1:
+            raise ValueError("max_bytes must be a positive integer.")
+        if len(query.session_ids) > _EVENT_QUERY_SESSION_IDS_BATCH_SIZE:
+            raise ValueError("Byte-bounded event queries require one bounded SQL batch.")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            needs_snapshot_cutoff = _event_query_needs_snapshot_cutoff(query)
+            safe_insert_xid = None
+            extra_clauses: tuple[session_store_sql.SqlClause, ...] = ()
+            if needs_snapshot_cutoff:
+                await cur.execute("SELECT pg_snapshot_xmin(pg_current_snapshot())")
+                snapshot_row = await cur.fetchone()
+                if snapshot_row is None:
+                    raise RuntimeError("Failed to read Postgres event visibility snapshot.")
+                safe_insert_xid = snapshot_row[0]
+                extra_clauses = (
+                    session_store_sql.SqlClause(
+                        "cayu_events.insert_xid < %s",
+                        (safe_insert_xid,),
+                    ),
+                )
+            plan = session_store_sql.build_event_query_sql(
+                query,
+                dialect=_SQL_DIALECT,
+                extra_after_sequence_clauses=extra_clauses,
+            )
+            await cur.execute(
+                cast(
+                    "LiteralString",
+                    f"""
+                    WITH bounded_candidates AS (
+                        SELECT octet_length(cayu_events.event::text) + 256
+                                   AS serialized_bytes
+                        FROM cayu_events
+                        JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
+                        {plan.where_sql}
+                        ORDER BY cayu_events.sequence {plan.order_direction}
+                        LIMIT %s
+                    )
+                    SELECT COALESCE(SUM(serialized_bytes), 0)
+                    FROM bounded_candidates
+                    """,
+                ),
+                (*plan.params, query.limit),
+            )
+            size_row = await cur.fetchone()
+            if size_row is None or int(size_row[0]) > max_bytes:
+                raise EventQueryResultTooLarge(max_bytes)
+            return await self._query_events(
+                cur,
+                query,
+                safe_insert_xid=safe_insert_xid,
+                force_snapshot_cutoff=needs_snapshot_cutoff,
+            )
+
     async def _query_events(
         self,
         cur: Any,
@@ -8482,6 +8569,176 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
 
     async def list_sessions(self, query: SessionQuery | None = None) -> SessionListResult:
         return await self._list_sessions(query, pending_interruption_cascade_only=False)
+
+    async def query_session_topology(
+        self,
+        query: SessionTopologyQuery,
+    ) -> SessionTopologyStoreResult:
+        if type(query) is not SessionTopologyQuery:
+            raise TypeError("Session topology queries must be SessionTopologyQuery instances.")
+        query = query.model_copy(deep=True)
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                    await cur.execute(
+                        cast(
+                            "LiteralString",
+                            f"""
+                            SELECT {pg_support.SESSION_TOPOLOGY_COLUMNS}
+                            FROM cayu_sessions
+                            WHERE id = %s
+                            """,
+                        ),
+                        (query.focus_session_id,),
+                    )
+                    focus_row = await cur.fetchone()
+                    if focus_row is None:
+                        raise KeyError(f"Session not found: {query.focus_session_id}")
+                    focus = pg_support.session_topology_node_from_row(focus_row)
+
+                    ancestors = []
+                    seen_ids = {focus.id}
+                    parent_session_id = focus.parent_session_id
+                    while parent_session_id is not None:
+                        if parent_session_id in seen_ids:
+                            raise SessionTopologyCycle(
+                                f"Session topology contains a parent cycle at {parent_session_id}."
+                            )
+                        if len(ancestors) >= query.ancestor_depth_limit:
+                            raise SessionTopologyDepthExceeded(
+                                "Session topology exceeds the "
+                                f"{query.ancestor_depth_limit}-ancestor limit."
+                            )
+                        await cur.execute(
+                            cast(
+                                "LiteralString",
+                                f"""
+                                SELECT {pg_support.SESSION_TOPOLOGY_COLUMNS}
+                                FROM cayu_sessions
+                                WHERE id = %s
+                                """,
+                            ),
+                            (parent_session_id,),
+                        )
+                        parent_row = await cur.fetchone()
+                        if parent_row is None:
+                            raise ValueError(
+                                f"Session topology references missing parent {parent_session_id}."
+                            )
+                        parent = pg_support.session_topology_node_from_row(parent_row)
+                        ancestors.append(parent)
+                        seen_ids.add(parent.id)
+                        parent_session_id = parent.parent_session_id
+                    ancestors.reverse()
+
+                    expanded_parents = []
+                    if query.expanded_parent_ids:
+                        await cur.execute(
+                            cast(
+                                "LiteralString",
+                                f"""
+                                SELECT {pg_support.SESSION_TOPOLOGY_COLUMNS}
+                                FROM cayu_sessions
+                                WHERE id = ANY(%s)
+                                """,
+                            ),
+                            (list(query.expanded_parent_ids),),
+                        )
+                        parents_by_id = {
+                            row[0]: pg_support.session_topology_node_from_row(row)
+                            for row in await cur.fetchall()
+                        }
+                        for parent_id in query.expanded_parent_ids:
+                            parent = parents_by_id.get(parent_id)
+                            if parent is None:
+                                raise KeyError(f"Session not found: {parent_id}")
+                            expanded_parents.append(parent)
+
+                    candidates_by_parent = {parent.id: [] for parent in expanded_parents}
+                    if expanded_parents:
+                        requested_parent_ids: list[str] = []
+                        cursor_created_ats: list[datetime | None] = []
+                        cursor_ids: list[str | None] = []
+                        for parent in expanded_parents:
+                            requested_parent_ids.append(parent.id)
+                            cursor = query.child_cursors.get(parent.id)
+                            if cursor is None:
+                                cursor_created_ats.append(None)
+                                cursor_ids.append(None)
+                                continue
+                            cursor_created_at, cursor_id = decode_session_topology_cursor(
+                                cursor,
+                                parent_session_id=parent.id,
+                            )
+                            cursor_created_ats.append(cursor_created_at)
+                            cursor_ids.append(cursor_id)
+                        await cur.execute(
+                            cast(
+                                "LiteralString",
+                                f"""
+                                WITH requested_branches AS (
+                                    SELECT parent_session_id, cursor_created_at, cursor_id,
+                                           branch_order
+                                    FROM unnest(
+                                        %s::text[],
+                                        %s::timestamptz[],
+                                        %s::text[]
+                                    ) WITH ORDINALITY AS requested(
+                                        parent_session_id,
+                                        cursor_created_at,
+                                        cursor_id,
+                                        branch_order
+                                    )
+                                )
+                                SELECT child.*
+                                FROM requested_branches AS requested
+                                CROSS JOIN LATERAL (
+                                    SELECT {pg_support.SESSION_TOPOLOGY_COLUMNS}
+                                    FROM cayu_sessions
+                                    WHERE cayu_sessions.parent_session_id =
+                                          requested.parent_session_id
+                                      AND (
+                                          requested.cursor_created_at IS NULL
+                                          OR (cayu_sessions.created_at, cayu_sessions.id) >
+                                             (
+                                                 requested.cursor_created_at,
+                                                 requested.cursor_id
+                                             )
+                                      )
+                                    ORDER BY cayu_sessions.created_at ASC,
+                                             cayu_sessions.id ASC
+                                    LIMIT %s
+                                ) AS child
+                                ORDER BY requested.branch_order ASC,
+                                         child.created_at ASC,
+                                         child.id ASC
+                                """,
+                            ),
+                            (
+                                requested_parent_ids,
+                                cursor_created_ats,
+                                cursor_ids,
+                                query.child_limit + 1,
+                            ),
+                        )
+                        for row in await cur.fetchall():
+                            candidates_by_parent[row[4]].append(
+                                pg_support.session_topology_node_from_row(row)
+                            )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+
+        return build_session_topology_result(
+            focus=focus,
+            ancestors=ancestors,
+            expanded_parents=expanded_parents,
+            branch_candidates=(candidates_by_parent[parent.id] for parent in expanded_parents),
+            child_limit=query.child_limit,
+        )
 
     async def aggregate_operational_snapshot(
         self,

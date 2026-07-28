@@ -160,6 +160,10 @@ REVISIONS: tuple[Revision, ...] = (
     # index prevents concurrent sessions from publishing the same id. All writers
     # must maintain these invariants, so mixed-version workers are unsafe.
     Revision(revision=23, kind=RevisionKind.BREAKING, compatible_from=23),
+    # Add the composite direct-child traversal index used by bounded workflow
+    # topology reads. The index is purely additive and older revision-23
+    # binaries continue to operate against the expanded schema.
+    Revision(revision=24, kind=RevisionKind.ADDITIVE, compatible_from=23),
 )
 
 #: The revision an empty database is initialized to.

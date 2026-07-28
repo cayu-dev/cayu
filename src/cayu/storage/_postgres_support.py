@@ -10,6 +10,7 @@ from cayu.runtime.sessions import (
     Session,
     SessionOrder,
     SessionStatus,
+    SessionTopologyNode,
 )
 from cayu.runtime.tasks import Task, TaskOrder, TaskStatus
 from cayu.storage import _session_store_sql as session_store_sql
@@ -216,6 +217,8 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     "ON cayu_sessions(environment_name)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_sessions_causal_budget_id "
     "ON cayu_sessions(causal_budget_id)",
+    "CREATE INDEX IF NOT EXISTS idx_cayu_sessions_parent_created_id "
+    "ON cayu_sessions(parent_session_id, created_at, id)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_session_labels_key_value_session "
     "ON cayu_session_labels(key, value, session_id)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_session_order "
@@ -400,6 +403,31 @@ SESSION_COLUMNS = (
     "runtime_name, runtime_version, environment_name, status, created_at, updated_at, "
     "last_activity_at, run_epoch, metadata"
 )
+
+SESSION_TOPOLOGY_COLUMNS = (
+    "id, agent_name, provider_name, model, parent_session_id, causal_budget_id, "
+    "runtime_name, runtime_version, environment_name, status, created_at, updated_at, "
+    "last_activity_at"
+)
+
+
+def session_topology_node_from_row(row: tuple[Any, ...]) -> SessionTopologyNode:
+    return SessionTopologyNode(
+        id=row[0],
+        agent_name=row[1],
+        provider_name=row[2],
+        model=row[3],
+        parent_session_id=row[4],
+        causal_budget_id=row[5],
+        runtime_name=row[6],
+        runtime_version=row[7],
+        environment_name=row[8],
+        status=SessionStatus(row[9]),
+        created_at=to_utc(row[10]),
+        updated_at=to_utc(row[11]),
+        last_activity_at=to_utc(row[12]),
+    )
+
 
 PENDING_ACTION_SESSION_COLUMNS = (
     "id, agent_name, provider_name, model, parent_session_id, causal_budget_id, "

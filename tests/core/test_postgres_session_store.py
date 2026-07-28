@@ -15,6 +15,9 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pydantic import ValidationError
 from tests.core.pending_action_conformance import assert_pending_action_store_conformance
+from tests.core.session_topology_conformance import (
+    assert_session_topology_store_conformance,
+)
 
 from cayu.core import Event, EventType, Message
 from cayu.runtime import (
@@ -28,9 +31,12 @@ from cayu.runtime import (
     SessionQuery,
     SessionRunFenced,
     SessionStatus,
+    SessionTopologyCycle,
+    SessionTopologyQuery,
     TranscriptQuery,
 )
 from cayu.runtime.sessions import (
+    EventQueryResultTooLarge,
     PendingActionKind,
     PendingActionQuery,
     _McpManifestBaselineEvidenceInvalid,
@@ -104,6 +110,186 @@ def _run(dsn: str, coro_factory) -> object:
 
 def test_postgres_pending_action_store_conformance(postgres_dsn: str) -> None:
     _run(postgres_dsn, assert_pending_action_store_conformance)
+
+
+def test_postgres_session_topology_store_conformance(postgres_dsn: str) -> None:
+    _run(postgres_dsn, assert_session_topology_store_conformance)
+
+
+def test_postgres_bounded_event_query_rejects_payload_bytes_before_return(
+    postgres_dsn: str,
+) -> None:
+    async def ops(store) -> None:
+        await store.create(
+            RunRequest(
+                agent_name="agent",
+                session_id="bounded-event-session",
+                messages=[Message.text("user", "test")],
+            ),
+            identity=_identity(),
+        )
+        await store.append_events(
+            "bounded-event-session",
+            [
+                Event(
+                    id="large-event",
+                    type=EventType.SESSION_STARTED,
+                    session_id="bounded-event-session",
+                    payload={"irrelevant": "x" * 4096},
+                )
+            ],
+        )
+        query = EventQuery(session_id="bounded-event-session", limit=1)
+
+        with pytest.raises(EventQueryResultTooLarge):
+            await store.query_events_bounded(query, max_bytes=1024)
+
+        records = await store.query_events_bounded(query, max_bytes=8192)
+        assert [record.event.id for record in records] == ["large-event"]
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_session_topology_rejects_durable_cycle(postgres_dsn: str) -> None:
+    async def ops(store) -> None:
+        await assert_session_topology_store_conformance(store)
+        import psycopg
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE cayu_sessions SET parent_session_id = %s WHERE id = %s",
+                    ("topology-focus", "topology-root"),
+                )
+            await conn.commit()
+
+        with pytest.raises(SessionTopologyCycle):
+            await store.query_session_topology(
+                SessionTopologyQuery(focus_session_id="topology-focus")
+            )
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_session_topology_rejects_expanded_branch_cycle(
+    postgres_dsn: str,
+) -> None:
+    async def ops(store) -> None:
+        await assert_session_topology_store_conformance(store)
+        import psycopg
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE cayu_sessions SET parent_session_id = id WHERE id = %s",
+                    ("topology-root-sibling",),
+                )
+            await conn.commit()
+
+        with pytest.raises(SessionTopologyCycle):
+            await store.query_session_topology(
+                SessionTopologyQuery(
+                    focus_session_id="topology-focus",
+                    expanded_parent_ids=("topology-root-sibling",),
+                )
+            )
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_session_topology_child_query_uses_composite_index(
+    postgres_dsn: str,
+) -> None:
+    async def ops(store) -> None:
+        import psycopg
+
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id="topology-plan-parent",
+                messages=[Message.text("user", "parent")],
+            ),
+            identity=_identity(),
+        )
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute(
+                """
+                INSERT INTO cayu_sessions (
+                    id, agent_name, provider_name, model, parent_session_id,
+                    causal_budget_id, runtime_name, runtime_version,
+                    environment_name, status, created_at, updated_at,
+                    last_activity_at, run_epoch, event_seq, metadata
+                )
+                SELECT
+                    'topology-plan-child-' || lpad(value::text, 6, '0'),
+                    'child', 'fake', 'fake-model', 'topology-plan-parent',
+                    'topology-plan-budget', 'cayu', NULL, NULL, 'pending',
+                    TIMESTAMPTZ '2026-01-01T00:00:00Z',
+                    TIMESTAMPTZ '2026-01-01T00:00:00Z',
+                    TIMESTAMPTZ '2026-01-01T00:00:00Z',
+                    0, 0, '{}'::jsonb
+                FROM generate_series(0, 99999) AS value
+                """
+            )
+            await conn.commit()
+            await cur.execute("SET LOCAL enable_seqscan = off")
+            await cur.execute(
+                """
+                EXPLAIN (ANALYZE, COSTS OFF, FORMAT JSON)
+                WITH requested_branches AS (
+                    SELECT parent_session_id, cursor_created_at, cursor_id,
+                           branch_order
+                    FROM unnest(
+                        %s::text[],
+                        %s::timestamptz[],
+                        %s::text[]
+                    ) WITH ORDINALITY AS requested(
+                        parent_session_id,
+                        cursor_created_at,
+                        cursor_id,
+                        branch_order
+                    )
+                )
+                SELECT child.*
+                FROM requested_branches AS requested
+                CROSS JOIN LATERAL (
+                    SELECT id, parent_session_id, created_at
+                    FROM cayu_sessions
+                    WHERE cayu_sessions.parent_session_id =
+                          requested.parent_session_id
+                      AND (
+                          requested.cursor_created_at IS NULL
+                          OR (cayu_sessions.created_at, cayu_sessions.id) >
+                             (requested.cursor_created_at, requested.cursor_id)
+                      )
+                    ORDER BY cayu_sessions.created_at ASC, cayu_sessions.id ASC
+                    LIMIT %s
+                ) AS child
+                ORDER BY requested.branch_order ASC,
+                         child.created_at ASC,
+                         child.id ASC
+                """,
+                (["topology-plan-parent"], [None], [None], 26),
+            )
+            plan_document = (await cur.fetchone())[0][0]["Plan"]
+
+        def plan_nodes(node):
+            yield node
+            for child in node.get("Plans", []):
+                yield from plan_nodes(child)
+
+        index_nodes = [
+            node
+            for node in plan_nodes(plan_document)
+            if node.get("Index Name") == "idx_cayu_sessions_parent_created_id"
+        ]
+        assert index_nodes
+        assert all(node["Actual Rows"] <= 26 for node in index_nodes)
+
+    _run(postgres_dsn, ops)
 
 
 def test_postgres_manifest_baseline_validation_redacts_corrupt_jsonb(postgres_dsn: str) -> None:

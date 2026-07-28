@@ -187,11 +187,12 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
                 await cur.execute("DROP TABLE cayu_mcp_manifest_baselines")
                 await cur.execute("DROP TABLE cayu_persisted_event_side_effects")
                 await cur.execute("DROP TABLE cayu_session_message_queue")
+                await cur.execute("DROP INDEX idx_cayu_sessions_parent_created_id")
             await conn.commit()
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 23"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 24"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -239,6 +240,12 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
             )
             assert await cur.fetchone() == ("breaking", 23)
             await cur.execute(
+                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 24"
+            )
+            assert await cur.fetchone() == ("additive", 23)
+            await cur.execute("SELECT to_regclass('idx_cayu_sessions_parent_created_id')")
+            assert (await cur.fetchone())[0] == "idx_cayu_sessions_parent_created_id"
+            await cur.execute(
                 "SELECT column_name FROM information_schema.columns "
                 "WHERE table_schema = current_schema() "
                 "AND table_name = 'cayu_budget_reservations' "
@@ -284,7 +291,7 @@ def test_validate_mode_rejects_pre_insert_xid_postgres_schema(postgres_dsn: str)
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 23"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 24"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -311,7 +318,7 @@ def test_revision_fourteen_requires_cascade_index_migration(postgres_dsn: str) -
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 23"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 24"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -355,7 +362,7 @@ def test_revision_fifteen_requires_session_sequence_index_migration(postgres_dsn
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 23"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 24"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -671,7 +678,7 @@ def test_revision_seventeen_requires_pending_action_index_migration(
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 23"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 24"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -858,7 +865,7 @@ def test_revision_seventeen_requires_session_operation_migration(postgres_dsn: s
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 23"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 24"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -1073,7 +1080,7 @@ def test_revision_twenty_three_preserves_existing_reservation_ownership(
 
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             async with conn.cursor() as cur:
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 23")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 23")
                 await cur.execute("DROP INDEX idx_cayu_events_budget_reservation_identity")
                 await cur.execute("DROP INDEX idx_cayu_events_pending_action_round_scope")
                 await cur.execute("DROP INDEX idx_cayu_events_pending_action_attempt_scope")

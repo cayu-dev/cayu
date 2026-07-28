@@ -41,6 +41,7 @@ from cayu.runtime.sessions import (
     EnqueueSessionMessageRequest,
     EnqueueSessionMessageResult,
     EventQuery,
+    EventQueryResultTooLarge,
     EventRecord,
     EventSummary,
     ForkTranscriptValidator,
@@ -84,6 +85,11 @@ from cayu.runtime.sessions import (
     SessionStatusConflict,
     SessionStatusCounts,
     SessionStore,
+    SessionTopologyCycle,
+    SessionTopologyDepthExceeded,
+    SessionTopologyNode,
+    SessionTopologyQuery,
+    SessionTopologyStoreResult,
     TranscriptPage,
     TranscriptQuery,
     TranscriptRecord,
@@ -152,6 +158,7 @@ from cayu.runtime.sessions import (
     _validate_tool_round_call_ids,
     _validate_tool_round_checkpoint_mutation,
     _validate_tool_round_publication,
+    build_session_topology_result,
     copy_enqueue_session_message_request,
     copy_event_query,
     copy_run_request,
@@ -163,6 +170,7 @@ from cayu.runtime.sessions import (
     copy_transcript_query,
     copy_usage_rollup_query,
     decode_session_cursor,
+    decode_session_topology_cursor,
     encode_session_cursor,
     enforce_pending_action_result_size,
     filter_transcript_records,
@@ -206,7 +214,7 @@ from cayu.storage import migrations as schema
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = 23
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = 24
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
     contains_style="sqlite_nocase_like",
@@ -462,6 +470,31 @@ def _load_session(connection: sqlite3.Connection, session_id: str) -> Session | 
     return sqlite_support.session_from_row(
         row,
         labels=_load_labels(connection, session_id),
+    )
+
+
+_SESSION_TOPOLOGY_COLUMNS = """
+    id, agent_name, provider_name, model, parent_session_id,
+    causal_budget_id, runtime_name, runtime_version, environment_name,
+    status, created_at, updated_at, last_activity_at
+"""
+
+
+def _session_topology_node_from_sqlite_row(row: sqlite3.Row) -> SessionTopologyNode:
+    return SessionTopologyNode(
+        id=row["id"],
+        agent_name=row["agent_name"],
+        provider_name=row["provider_name"],
+        model=row["model"],
+        parent_session_id=row["parent_session_id"],
+        causal_budget_id=row["causal_budget_id"],
+        runtime_name=row["runtime_name"],
+        runtime_version=row["runtime_version"],
+        environment_name=row["environment_name"],
+        status=SessionStatus(row["status"]),
+        created_at=sqlite_support.parse_datetime(row["created_at"]),
+        updated_at=sqlite_support.parse_datetime(row["updated_at"]),
+        last_activity_at=sqlite_support.parse_datetime(row["last_activity_at"]),
     )
 
 
@@ -807,6 +840,7 @@ class SQLiteSessionStore(SessionStore):
 
     supports_usage_aggregates: ClassVar[bool] = True
     supports_mcp_manifest_history: ClassVar[bool] = True
+    supports_session_topology: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -4252,6 +4286,70 @@ class SQLiteSessionStore(SessionStore):
 
         return await self._run_read(run_query)
 
+    async def query_events_bounded(
+        self,
+        query: EventQuery,
+        *,
+        max_bytes: int,
+    ) -> list[EventRecord]:
+        query = copy_event_query(query)
+        if type(max_bytes) is not int or max_bytes < 1:
+            raise ValueError("max_bytes must be a positive integer.")
+        if len(query.session_ids) > _EVENT_QUERY_SESSION_IDS_BATCH_SIZE:
+            raise ValueError("Byte-bounded event queries require one bounded SQL batch.")
+        plan = session_store_sql.build_event_query_sql(query, dialect=_SQL_DIALECT)
+        params = [*plan.params, query.limit]
+
+        def run_query(connection: sqlite3.Connection) -> list[EventRecord]:
+            event_columns = ", ".join(f"cayu_events.{name}" for name in _EVENT_COLUMN_NAMES)
+            serialized_bytes = " + ".join(
+                [
+                    "256",
+                    *(
+                        f"COALESCE(length(CAST(cayu_events.{name} AS BLOB)), 0)"
+                        for name in _EVENT_COLUMN_NAMES
+                    ),
+                ]
+            )
+            connection.execute("BEGIN")
+            try:
+                size_row = connection.execute(
+                    f"""
+                    WITH bounded_candidates AS (
+                        SELECT {serialized_bytes} AS serialized_bytes
+                        FROM cayu_events
+                        JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
+                        {plan.where_sql}
+                        ORDER BY cayu_events.sequence {plan.order_direction}
+                        LIMIT ?
+                    )
+                    SELECT COALESCE(SUM(serialized_bytes), 0)
+                    FROM bounded_candidates
+                    """,
+                    params,
+                ).fetchone()
+                if size_row is None or int(size_row[0]) > max_bytes:
+                    raise EventQueryResultTooLarge(max_bytes)
+                rows = connection.execute(
+                    f"""
+                    SELECT cayu_events.sequence, {event_columns}
+                    FROM cayu_events
+                    JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
+                    {plan.where_sql}
+                    ORDER BY cayu_events.sequence {plan.order_direction}
+                    LIMIT ?
+                    """,
+                    params,
+                ).fetchall()
+                return [
+                    EventRecord(sequence=row["sequence"], event=_event_from_row(row))
+                    for row in rows
+                ]
+            finally:
+                connection.rollback()
+
+        return await self._run_read(run_query)
+
     async def _query_events_by_session_id_batches(self, query: EventQuery) -> list[EventRecord]:
         records: list[EventRecord] = []
         for batch in _event_query_session_id_batches(query.session_ids):
@@ -4538,6 +4636,152 @@ class SQLiteSessionStore(SessionStore):
 
     async def list_sessions(self, query: SessionQuery | None = None) -> SessionListResult:
         return await self._list_sessions(query, pending_interruption_cascade_only=False)
+
+    async def query_session_topology(
+        self,
+        query: SessionTopologyQuery,
+    ) -> SessionTopologyStoreResult:
+        if type(query) is not SessionTopologyQuery:
+            raise TypeError("Session topology queries must be SessionTopologyQuery instances.")
+        query = query.model_copy(deep=True)
+
+        def read_topology_snapshot(
+            connection: sqlite3.Connection,
+        ) -> SessionTopologyStoreResult:
+            focus_row = connection.execute(
+                f"""
+                SELECT {_SESSION_TOPOLOGY_COLUMNS}
+                FROM cayu_sessions
+                WHERE id = ?
+                """,
+                (query.focus_session_id,),
+            ).fetchone()
+            if focus_row is None:
+                raise KeyError(f"Session not found: {query.focus_session_id}")
+            focus = _session_topology_node_from_sqlite_row(focus_row)
+
+            ancestors: list[SessionTopologyNode] = []
+            seen_ids = {focus.id}
+            parent_session_id = focus.parent_session_id
+            while parent_session_id is not None:
+                if parent_session_id in seen_ids:
+                    raise SessionTopologyCycle(
+                        f"Session topology contains a parent cycle at {parent_session_id}."
+                    )
+                if len(ancestors) >= query.ancestor_depth_limit:
+                    raise SessionTopologyDepthExceeded(
+                        f"Session topology exceeds the {query.ancestor_depth_limit}-ancestor limit."
+                    )
+                parent_row = connection.execute(
+                    f"""
+                    SELECT {_SESSION_TOPOLOGY_COLUMNS}
+                    FROM cayu_sessions
+                    WHERE id = ?
+                    """,
+                    (parent_session_id,),
+                ).fetchone()
+                if parent_row is None:
+                    raise ValueError(
+                        f"Session topology references missing parent {parent_session_id}."
+                    )
+                parent = _session_topology_node_from_sqlite_row(parent_row)
+                ancestors.append(parent)
+                seen_ids.add(parent.id)
+                parent_session_id = parent.parent_session_id
+            ancestors.reverse()
+
+            expanded_parents: list[SessionTopologyNode] = []
+            if query.expanded_parent_ids:
+                placeholders = ", ".join("?" for _ in query.expanded_parent_ids)
+                parent_rows = connection.execute(
+                    f"""
+                    SELECT {_SESSION_TOPOLOGY_COLUMNS}
+                    FROM cayu_sessions
+                    WHERE id IN ({placeholders})
+                    """,
+                    query.expanded_parent_ids,
+                ).fetchall()
+                parents_by_id = {
+                    row["id"]: _session_topology_node_from_sqlite_row(row) for row in parent_rows
+                }
+                for parent_id in query.expanded_parent_ids:
+                    parent = parents_by_id.get(parent_id)
+                    if parent is None:
+                        raise KeyError(f"Session not found: {parent_id}")
+                    expanded_parents.append(parent)
+
+            candidates_by_parent: dict[str, list[SessionTopologyNode]] = {
+                parent.id: [] for parent in expanded_parents
+            }
+            if expanded_parents:
+                branch_queries: list[str] = []
+                branch_params: list[object] = []
+                for branch_order, parent in enumerate(expanded_parents):
+                    cursor = query.child_cursors.get(parent.id)
+                    if cursor is None:
+                        cursor_clause = ""
+                        cursor_params: list[object] = []
+                    else:
+                        cursor_created_at, cursor_id = decode_session_topology_cursor(
+                            cursor,
+                            parent_session_id=parent.id,
+                        )
+                        cursor_clause = "AND (created_at > ? OR (created_at = ? AND id > ?))"
+                        formatted_cursor = sqlite_support.format_datetime(cursor_created_at)
+                        cursor_params = [formatted_cursor, formatted_cursor, cursor_id]
+                    branch_queries.append(
+                        f"""
+                        SELECT branch_order, {_SESSION_TOPOLOGY_COLUMNS}
+                        FROM (
+                            SELECT ? AS branch_order, {_SESSION_TOPOLOGY_COLUMNS}
+                            FROM cayu_sessions
+                            WHERE parent_session_id = ?
+                              {cursor_clause}
+                            ORDER BY created_at ASC, id ASC
+                            LIMIT ?
+                        )
+                        """
+                    )
+                    branch_params.extend(
+                        [
+                            branch_order,
+                            parent.id,
+                            *cursor_params,
+                            query.child_limit + 1,
+                        ]
+                    )
+                candidate_rows = connection.execute(
+                    f"""
+                    {" UNION ALL ".join(branch_queries)}
+                    ORDER BY branch_order ASC, created_at ASC, id ASC
+                    """,
+                    branch_params,
+                ).fetchall()
+                for row in candidate_rows:
+                    candidates_by_parent[row["parent_session_id"]].append(
+                        _session_topology_node_from_sqlite_row(row)
+                    )
+
+            return build_session_topology_result(
+                focus=focus,
+                ancestors=ancestors,
+                expanded_parents=expanded_parents,
+                branch_candidates=(candidates_by_parent[parent.id] for parent in expanded_parents),
+                child_limit=query.child_limit,
+            )
+
+        def read_topology(connection: sqlite3.Connection) -> SessionTopologyStoreResult:
+            # Multiple point reads plus the batched child query must describe one
+            # SQLite snapshot. A plain sequence of SELECT statements in Python's
+            # legacy transaction mode would otherwise observe commits made
+            # between statements.
+            connection.execute("BEGIN")
+            try:
+                return read_topology_snapshot(connection)
+            finally:
+                connection.rollback()
+
+        return await self._run_read(read_topology)
 
     async def aggregate_operational_snapshot(
         self,
