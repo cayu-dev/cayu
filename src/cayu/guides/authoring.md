@@ -166,6 +166,12 @@ hand-authored agents, declare every exact tool name that machine-owned workflow
 instructions expect through `AgentSpec.workflow_tool_names`; do not maintain an
 independent list in prose or tests.
 
+For a complete credential-free composition of durable work, per-session local
+environments, guarded file/command tools, failure recovery, and
+application-owned verification, see `examples/durable_file_workflow`. “File
+worker” describes that example's job; it is not an `AgentSpec` profile or a new
+runtime concept.
+
 ## 5. Treat effects as a security contract
 
 Every tool declares one effect:

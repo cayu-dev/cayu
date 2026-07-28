@@ -14,12 +14,25 @@ BUILTIN_DIAGNOSTIC_CODES = (
     "AGENT_GENERATED_TRACER_BULLET_UNFINISHED",
     "AGENT_PROVIDER_AMBIGUOUS",
     "AGENT_PROVIDER_NOT_FOUND",
+    "AGENT_WORKFLOW_COMMAND_POLICY_NOT_REGISTERED",
+    "AGENT_WORKFLOW_RUNNER_NOT_REGISTERED",
     "AGENT_WORKFLOW_TOOL_NOT_REGISTERED",
+    "AGENT_WORKFLOW_WORKSPACE_NOT_REGISTERED",
     "APP_NO_AGENTS",
     "EXTERNAL_TOOL_COVERAGE_UNKNOWN",
     "EXTERNAL_TOOL_UNGUARDED",
     "TOOL_INPUT_SCHEMA_UNCONSTRAINED",
 )
+_WORKSPACE_TOOL_NAMES = frozenset(
+    {
+        "delete_file",
+        "list_files",
+        "read_file",
+        "search_text",
+        "write_file",
+    }
+)
+_RUNNER_TOOL_NAMES = frozenset({"exec_command"})
 
 
 class DiagnosticSeverity(StrEnum):
@@ -191,6 +204,97 @@ def check_manifest(
                 )
             )
 
+        registered_workflow_tools = registered_tool_set.intersection(agent.workflow_tool_names)
+        workspace_workflow_tools = sorted(
+            registered_workflow_tools.intersection(_WORKSPACE_TOOL_NAMES)
+        )
+        if workspace_workflow_tools and not _has_workspace_provider(manifest):
+            diagnostics.append(
+                ProjectDiagnostic(
+                    code="AGENT_WORKFLOW_WORKSPACE_NOT_REGISTERED",
+                    severity=DiagnosticSeverity.ERROR,
+                    subject=f"agent:{agent.name}",
+                    path=(f"agents.{agent.name}.workflow_tool_names.{workspace_workflow_tools[0]}"),
+                    message=(
+                        f"Agent '{agent.name}' requires workspace-backed workflow tools, "
+                        "but no static workspace or environment factory is registered."
+                    ),
+                    hint=(
+                        "Register an Environment with a Workspace, or register an "
+                        "EnvironmentFactory that creates one for the session."
+                    ),
+                    tags=("authoring", "configuration", "deploy"),
+                    parameters={
+                        "agent": agent.name,
+                        "workflow_tools": workspace_workflow_tools,
+                    },
+                    documentation_anchor=(
+                        "cayu guide diagnostics#agent-workflow-workspace-not-registered"
+                    ),
+                    verification_command="cayu inspect --json && cayu check --json",
+                )
+            )
+
+        runner_workflow_tools = sorted(registered_workflow_tools.intersection(_RUNNER_TOOL_NAMES))
+        if runner_workflow_tools and not _has_runner_provider(manifest):
+            diagnostics.append(
+                ProjectDiagnostic(
+                    code="AGENT_WORKFLOW_RUNNER_NOT_REGISTERED",
+                    severity=DiagnosticSeverity.ERROR,
+                    subject=f"agent:{agent.name}",
+                    path=(f"agents.{agent.name}.workflow_tool_names.{runner_workflow_tools[0]}"),
+                    message=(
+                        f"Agent '{agent.name}' requires runner-backed workflow tools, "
+                        "but no static runner or environment factory is registered."
+                    ),
+                    hint=(
+                        "Register an Environment with a Runner, or register an "
+                        "EnvironmentFactory that creates one for the session."
+                    ),
+                    tags=("authoring", "configuration", "deploy"),
+                    parameters={
+                        "agent": agent.name,
+                        "workflow_tools": runner_workflow_tools,
+                    },
+                    documentation_anchor=(
+                        "cayu guide diagnostics#agent-workflow-runner-not-registered"
+                    ),
+                    verification_command="cayu inspect --json && cayu check --json",
+                )
+            )
+
+        exec_command = next(
+            (
+                tool
+                for tool in agent.tools
+                if tool.name == "exec_command" and tool.name in registered_workflow_tools
+            ),
+            None,
+        )
+        if exec_command is not None and exec_command.command_policy is None:
+            diagnostics.append(
+                ProjectDiagnostic(
+                    code="AGENT_WORKFLOW_COMMAND_POLICY_NOT_REGISTERED",
+                    severity=DiagnosticSeverity.ERROR,
+                    subject=f"tool:{agent.name}/exec_command",
+                    path=f"agents.{agent.name}.tools.exec_command.command_policy",
+                    message=(
+                        f"Agent '{agent.name}' requires exec_command in its workflow, "
+                        "but the tool has no enforcing CommandPolicy."
+                    ),
+                    hint=(
+                        "Attach a deny-by-default CommandPolicy such as "
+                        "ProcessCommandPolicy or GitCommandPolicy."
+                    ),
+                    tags=("authoring", "deploy", "security"),
+                    parameters={"agent": agent.name, "tool": "exec_command"},
+                    documentation_anchor=(
+                        "cayu guide diagnostics#agent-workflow-command-policy-not-registered"
+                    ),
+                    verification_command=("cayu inspect --json && cayu check --deploy --json"),
+                )
+            )
+
         for tool in agent.tools:
             if not tool.input_schema:
                 diagnostics.append(
@@ -279,6 +383,20 @@ def check_manifest(
     return ProjectCheckReport(
         manifest_fingerprint=manifest.fingerprint,
         diagnostics=tuple(selected),
+    )
+
+
+def _has_workspace_provider(manifest: AppManifest) -> bool:
+    return any(
+        environment.workspace is not None or environment.factory_backed
+        for environment in manifest.environments
+    )
+
+
+def _has_runner_provider(manifest: AppManifest) -> bool:
+    return any(
+        environment.runner is not None or environment.factory_backed
+        for environment in manifest.environments
     )
 
 

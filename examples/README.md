@@ -44,6 +44,8 @@ corresponding credentials or service.
 
 ## Durable orchestration
 
+- [`durable_file_workflow/`](durable_file_workflow/) — hermetic task worker with
+  per-session files and commands, failure recovery, and app-verified outcomes.
 - [`task_worker_loop.py`](task_worker_loop.py) — durable task claiming and completion.
 - [`dispatch_worker.py`](dispatch_worker.py) — dispatcher-owned placement.
 - [`workflow_helpers.py`](workflow_helpers.py) — deterministic orchestration helpers.

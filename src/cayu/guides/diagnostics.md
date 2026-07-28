@@ -47,6 +47,28 @@ same agent. Use the exact registered name, update the machine-owned tool-name
 source after a rename, or register the intended tool. Cayu checks this explicit
 contract and does not parse arbitrary natural-language prompt text.
 
+## agent-workflow-workspace-not-registered
+
+`AGENT_WORKFLOW_WORKSPACE_NOT_REGISTERED` means a registered file tool named in
+`workflow_tool_names` has no structurally available workspace. Register a
+static environment with a workspace, or an environment factory that supplies
+one per session.
+
+## agent-workflow-runner-not-registered
+
+`AGENT_WORKFLOW_RUNNER_NOT_REGISTERED` means `exec_command` is registered and
+named in `workflow_tool_names`, but no runner is structurally available.
+Register a static environment with a runner, or an environment factory that
+supplies one per session.
+
+## agent-workflow-command-policy-not-registered
+
+`AGENT_WORKFLOW_COMMAND_POLICY_NOT_REGISTERED` means an agent explicitly
+declares `exec_command` as part of its workflow but the registered
+`ExecCommandTool` has no `CommandPolicy`. Attach a deny-by-default policy such
+as `ProcessCommandPolicy`. Inspection reports only the policy type, never its
+allowed executables, directories, environment values, or other policy data.
+
 ## external-tool-unguarded
 
 `EXTERNAL_TOOL_UNGUARDED` means a tool declaring `ToolEffect.EXTERNAL` is under

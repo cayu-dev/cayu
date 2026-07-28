@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime.app import CayuApp
 
-APP_MANIFEST_SCHEMA_VERSION = "4"
+APP_MANIFEST_SCHEMA_VERSION = "5"
 _ABSOLUTE_PATH_PLACEHOLDER = "[ABSOLUTE_PATH]"
 _MEMORY_ADDRESS_PLACEHOLDER = "[MEMORY_ADDRESS]"
 _OBJECT_REPRESENTATION_PLACEHOLDER = "[OBJECT_REPRESENTATION]"
@@ -148,6 +148,7 @@ class ToolManifest(_ManifestModel):
     parallel_safe: bool
     input_schema: FrozenJsonObject = Field(default_factory=lambda: MappingProxyType({}))
     policy_coverage: Literal["allowed", "denied", "approval_required", "conditional", "unknown"]
+    command_policy: str | None = None
     registration_provenance: RegistrationProvenance
     implementation_provenance: RegistrationProvenance
 
@@ -231,7 +232,7 @@ class RuntimeManifest(_ManifestModel):
 
 
 class AppManifest(_ManifestModel):
-    schema_version: Literal["4"] = APP_MANIFEST_SCHEMA_VERSION
+    schema_version: Literal["5"] = APP_MANIFEST_SCHEMA_VERSION
     fingerprint: str
     agents: tuple[AgentManifest, ...]
     providers: tuple[ProviderManifest, ...]
@@ -390,6 +391,7 @@ def _describe_agent(
                 parallel_safe=tool.parallel_safe,
                 input_schema=app.redact_json(tool.schema),
                 policy_coverage=_tool_policy_coverage(registration.tool_policy, tool_name),
+                command_policy=_command_policy_name(tool.tool),
                 registration_provenance=registration_provenance,
                 implementation_provenance=_provenance(tool.tool, project_root),
             )
@@ -461,6 +463,14 @@ def _capabilities(
 
 def _type_name(value: object) -> str:
     return type(value).__name__
+
+
+def _command_policy_name(value: object) -> str | None:
+    from cayu.tools.commands import ExecCommandTool
+
+    if not isinstance(value, ExecCommandTool):
+        return None
+    return _optional_type_name(value.command_policy)
 
 
 def _optional_type_name(value: object | None) -> str | None:

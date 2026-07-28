@@ -15,7 +15,9 @@ from cayu import (
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
     EnvironmentSpec,
+    ExecCommandTool,
     ExecutionRequirements,
+    ProcessCommandPolicy,
     ScriptedModelProvider,
     SecretRedactor,
     Tool,
@@ -149,7 +151,7 @@ def test_describe_returns_a_deterministic_public_application_manifest() -> None:
     manifest = _described_app().describe()
     reversed_manifest = _described_app(reverse=True).describe()
 
-    assert manifest.schema_version == "4"
+    assert manifest.schema_version == "5"
     assert manifest.defaults.provider == "primary"
     assert manifest.defaults.environment == "local"
     assert [agent.name for agent in manifest.agents] == ["reviewer", "writer"]
@@ -235,6 +237,36 @@ def test_agent_execution_requirements_are_typed_and_fingerprinted() -> None:
     assert trusted_manifest.fingerprint != isolated_manifest.fingerprint
 
 
+def test_manifest_reports_command_policy_posture_without_policy_internals() -> None:
+    bare = CayuApp(enable_logging=False)
+    bare.register_agent(
+        AgentSpec(name="worker", model="model"),
+        tools=[ExecCommandTool()],
+    )
+
+    guarded = CayuApp(enable_logging=False)
+    guarded.register_agent(
+        AgentSpec(name="worker", model="model"),
+        tools=[
+            ExecCommandTool(
+                policy=ProcessCommandPolicy(
+                    allowed_executables=["python3"],
+                    allowed_cwds=["/workspace"],
+                )
+            )
+        ],
+    )
+
+    bare_tool = bare.describe().agents[0].tools[0]
+    guarded_manifest = guarded.describe()
+    guarded_tool = guarded_manifest.agents[0].tools[0]
+
+    assert bare_tool.command_policy is None
+    assert guarded_tool.command_policy == "ProcessCommandPolicy"
+    assert "python3" not in guarded_manifest.model_dump_json()
+    assert "/workspace" not in guarded_manifest.model_dump_json()
+
+
 def test_describe_reports_no_default_for_a_non_default_static_environment() -> None:
     app = CayuApp(enable_logging=False)
     app.register_environment(Environment(EnvironmentSpec(name="optional")), default=False)
@@ -316,7 +348,7 @@ def test_manifest_is_public_versioned_redacted_and_deeply_read_only(tmp_path: Pa
     payload = manifest.model_dump_json()
     schema = AppManifest.model_json_schema(mode="serialization")
 
-    assert schema["properties"]["schema_version"]["const"] == "4"
+    assert schema["properties"]["schema_version"]["const"] == "5"
     assert "manifest-secret" not in payload
     assert str(tmp_path) not in payload
     assert factory.called is False
@@ -425,7 +457,7 @@ def test_manifest_rejects_non_json_schema_payloads() -> None:
     with pytest.raises(ValidationError, match="JSON-compatible"):
         AppManifest.model_validate(
             {
-                "schema_version": "4",
+                "schema_version": "5",
                 "fingerprint": "0" * 64,
                 "agents": [
                     {

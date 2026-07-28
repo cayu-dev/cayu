@@ -8,7 +8,16 @@ from cayu import (
     AgentSpec,
     AlwaysRequireApprovalToolPolicy,
     CayuApp,
+    Environment,
+    EnvironmentFactory,
+    EnvironmentFactoryRequest,
+    EnvironmentFactoryResult,
+    EnvironmentSpec,
+    ExecCommandTool,
+    LocalRunner,
+    LocalWorkspace,
     ParameterConstrainedToolPolicy,
+    ProcessCommandPolicy,
     ProjectDiagnostic,
     RequiredFieldRule,
     ScriptedModelProvider,
@@ -18,6 +27,7 @@ from cayu import (
     ToolPolicyResult,
     ToolResult,
     ToolSpec,
+    WriteFileTool,
     check_manifest,
 )
 from cayu.runtime import BUILTIN_DIAGNOSTIC_CODES
@@ -61,12 +71,25 @@ class _PermissiveApprovalPolicy(AlwaysRequireApprovalToolPolicy):
         return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
 
 
+class _UncalledEnvironmentFactory(EnvironmentFactory):
+    def __init__(self) -> None:
+        self.called = False
+
+    async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
+        del request
+        self.called = True
+        raise AssertionError("project checks must not materialize environment factories")
+
+
 def test_builtin_diagnostic_codes_are_unique_and_compatibility_pinned() -> None:
     assert BUILTIN_DIAGNOSTIC_CODES == (
         "AGENT_GENERATED_TRACER_BULLET_UNFINISHED",
         "AGENT_PROVIDER_AMBIGUOUS",
         "AGENT_PROVIDER_NOT_FOUND",
+        "AGENT_WORKFLOW_COMMAND_POLICY_NOT_REGISTERED",
+        "AGENT_WORKFLOW_RUNNER_NOT_REGISTERED",
         "AGENT_WORKFLOW_TOOL_NOT_REGISTERED",
+        "AGENT_WORKFLOW_WORKSPACE_NOT_REGISTERED",
         "APP_NO_AGENTS",
         "EXTERNAL_TOOL_COVERAGE_UNKNOWN",
         "EXTERNAL_TOOL_UNGUARDED",
@@ -120,6 +143,93 @@ def test_workflow_tool_references_must_match_that_agents_registered_tools() -> N
     )
     assert "exact registered tool name" in report.diagnostics[0].hint
     assert deploy_report.diagnostics == report.diagnostics
+
+
+def test_workflow_file_and_command_tools_require_structural_environment_support() -> None:
+    app = CayuApp(enable_logging=False)
+    app.register_provider(ScriptedModelProvider([], name="scripted"), default=True)
+    app.register_agent(
+        AgentSpec(
+            name="operator",
+            model="test-model",
+            workflow_tool_names=("write_file", "exec_command"),
+        ),
+        tools=[WriteFileTool(), ExecCommandTool()],
+        tool_policy=AlwaysRequireApprovalToolPolicy(),
+    )
+
+    report = check_manifest(app.describe())
+
+    assert [item.code for item in report.diagnostics] == [
+        "AGENT_WORKFLOW_COMMAND_POLICY_NOT_REGISTERED",
+        "AGENT_WORKFLOW_RUNNER_NOT_REGISTERED",
+        "AGENT_WORKFLOW_WORKSPACE_NOT_REGISTERED",
+    ]
+    assert report.diagnostics[0].path == ("agents.operator.tools.exec_command.command_policy")
+    assert report.diagnostics[1].path == "agents.operator.workflow_tool_names.exec_command"
+    assert report.diagnostics[2].path == "agents.operator.workflow_tool_names.write_file"
+
+
+def test_workflow_environment_checks_accept_static_or_factory_backed_support(
+    tmp_path,
+) -> None:
+    static = CayuApp(enable_logging=False)
+    static.register_provider(ScriptedModelProvider([], name="scripted"), default=True)
+    static.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            workspace=LocalWorkspace(tmp_path),
+            runner=LocalRunner(tmp_path),
+        ),
+        default=True,
+    )
+    static.register_agent(
+        AgentSpec(
+            name="operator",
+            model="test-model",
+            workflow_tool_names=("write_file", "exec_command"),
+        ),
+        tools=[
+            WriteFileTool(),
+            ExecCommandTool(
+                policy=ProcessCommandPolicy(
+                    allowed_executables=["python3"],
+                    allowed_cwds=[str(tmp_path)],
+                )
+            ),
+        ],
+        tool_policy=AlwaysRequireApprovalToolPolicy(),
+    )
+
+    factory = _UncalledEnvironmentFactory()
+    dynamic = CayuApp(enable_logging=False)
+    dynamic.register_provider(ScriptedModelProvider([], name="scripted"), default=True)
+    dynamic.register_environment_factory(
+        EnvironmentSpec(name="dynamic"),
+        factory,
+        default=True,
+    )
+    dynamic.register_agent(
+        AgentSpec(
+            name="operator",
+            model="test-model",
+            workflow_tool_names=("write_file", "exec_command"),
+        ),
+        tools=[
+            WriteFileTool(),
+            ExecCommandTool(
+                policy=ProcessCommandPolicy(
+                    allowed_executables=["python3"],
+                    allowed_cwds=["/workspace"],
+                )
+            ),
+        ],
+        tool_policy=AlwaysRequireApprovalToolPolicy(),
+    )
+
+    assert check_manifest(static.describe()).diagnostics == ()
+    assert check_manifest(dynamic.describe()).diagnostics == ()
+    assert factory.called is False
 
 
 def test_generated_tracer_bullet_warning_is_explicit_deterministic_and_deploy_visible() -> None:
@@ -278,6 +388,20 @@ def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
     )
     misaligned_codes = {item.code for item in check_manifest(misaligned.describe()).diagnostics}
 
+    structurally_incomplete = CayuApp(enable_logging=False)
+    structurally_incomplete.register_agent(
+        AgentSpec(
+            name="operator",
+            model="model",
+            workflow_tool_names=("write_file", "exec_command"),
+        ),
+        tools=[WriteFileTool(), ExecCommandTool()],
+        tool_policy=AlwaysRequireApprovalToolPolicy(),
+    )
+    structurally_incomplete_codes = {
+        item.code for item in check_manifest(structurally_incomplete.describe()).diagnostics
+    }
+
     unfinished = CayuApp(enable_logging=False)
     unfinished.register_agent(
         AgentSpec(
@@ -304,6 +428,7 @@ def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
         | unsafe_codes
         | unknown_codes
         | misaligned_codes
+        | structurally_incomplete_codes
         | unfinished_codes
         | unconstrained_codes
         == set(BUILTIN_DIAGNOSTIC_CODES)

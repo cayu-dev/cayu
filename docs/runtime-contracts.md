@@ -306,6 +306,14 @@ tools that the agent's workflow instructions explicitly expect to call.
 and `check_manifest()` rejects any reference not registered for that same
 agent. It deliberately does not parse `system_prompt`: applications and
 generators own the exact-name declaration, while arbitrary prose remains prose.
+When a declared workflow tool is also registered, static checks additionally
+require the structural environment component that built-in file and command
+tools consume. A static environment proves its workspace or runner directly;
+an environment factory is accepted as a deferred provider without being
+materialized during inspection. Declared `exec_command` workflows also require
+an attached `CommandPolicy`. The manifest exposes only that policy's concrete
+type name, not its executable, path, environment, or secret-bearing
+configuration.
 
 Environment-scoped `workspace_instructions` are optional operating guidance for the active workspace. They are rendered into the initial system/instruction message for a new session as a labeled workspace section, not as a user message. Apps can pass explicit instruction text or a `WorkspaceInstructionsConfig` that loads bounded UTF-8 files from the workspace root, such as `AGENTS.md`, `.cayu/AGENTS.md`, or app-configured paths like `CLAUDE.md`. Missing files are ignored; absolute paths and parent-directory escapes are rejected. Workspace instructions are stored in the session's initial transcript system message for reproducible resume/fork behavior.
 

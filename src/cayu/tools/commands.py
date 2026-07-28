@@ -156,6 +156,12 @@ class ExecCommandTool(Tool):
             raise TypeError("ExecCommandTool policy must implement CommandPolicy.")
         self._policy = policy
 
+    @property
+    def command_policy(self) -> CommandPolicy | None:
+        """Return the enforcing command policy, if one is configured."""
+
+        return self._policy
+
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         runner = _require_runner(ctx)
