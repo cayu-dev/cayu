@@ -210,6 +210,67 @@ while the preassigned claim identity is reconciled and cleaned up.
 Explicit recovery-stream closure also reports a finalization or fence-release
 failure to its caller instead of silently consuming that cleanup failure.
 
+### Runtime publications have durable atomic receipts
+
+Session stores now expose `publish_runtime_publication(...)` for crash-sensitive
+model-step and tool-round commits. One call atomically publishes the detached
+transcript batch, replacement checkpoint, new events and their side-effect
+handoffs, session timestamps, and an insert-only, store-owned receipt. The
+receipt binds the logical publication identity, intent, source fences, transcript
+cursors, and ordered referenced events. References are typed ID-and-canonical-
+content-digest pairs derived from an exact `Event`; missing or changed referenced
+content fails before mutation and on every receipt load or replay.
+
+An exact replay loads and verifies the receipt before lifecycle, run-epoch, or
+transcript-cursor fences and performs no writes. Reusing a publication id with a
+different request, or finding a malformed receipt, fails closed with
+`SessionRuntimePublicationConflict`. Existing `publish_session_operation(...)`
+callers and custom-store overrides keep their current API; the new protected
+runtime-publication hook is non-abstract and raises `NotImplementedError` until a
+custom store implements the atomic boundary.
+
+Custom stores must also implement the model-completion prepare, complete,
+promote, active-load, and exact-abandon hooks with equivalent atomic semantics.
+These hooks remain non-abstract so an out-of-tree store can still be imported
+and migrated, but `CayuApp` has no lossy compatibility fallback: the first
+model/tool publication raises `NotImplementedError` until the store is updated
+and passes the shared publication conformance suite.
+
+Model completions also have a pre-dispatch staging boundary. A stable logical
+step id now groups per-dispatch stage ids and monotonic dispatch ordinals. Stores
+atomically publish a discoverable active-stage marker with preparation, retain
+immutable terminal provider material, and claim one per-logical-step winner in
+the same transaction as the final runtime publication. Zero-message attempts,
+live retries, recovery under a newer run epoch, concurrent promotion, and lost
+acknowledgements therefore converge without a second provider request or a
+second authoritative completion. `dispatch_authorized` is true only for the
+transaction that inserted a new preparation, so exact, superseded, stale-epoch,
+and already-published preparation calls cannot authorize another provider call.
+Superseded terminal evidence remains durable but cannot publish or refresh
+current-run liveness; historical receipt replay preserves unrelated later work.
+When the runtime can prove provider dispatch never began, it can atomically
+abandon that exact active preparation. The content-bound abandonment tombstone
+is acknowledgement-loss replayable and cannot remove a re-prepared generation;
+terminal evidence, a logical-step winner, or a publication receipt makes
+abandonment fail closed. Once provider dispatch may have begun, the stage remains
+in flight for conservative recovery instead of being discarded.
+
+Every authoritative assistant message, including an ordinary text response, is
+projected through workload-secret redaction before the atomic model publication.
+For tool-strategy structured output, schema validation still uses the original
+in-memory arguments. The same publication checkpoints a typed, redacted
+validation snapshot, and live closure, store verification, and recovery bind to
+that snapshot instead of recomputing validity from the altered durable value.
+
+Tool lifecycle lookup is now scoped by stable round identity as well as provider
+call id, bounded before materialization, and backed by the existing
+pending-action index. Reused call ids from older well-formed rounds are ignored;
+roundless or malformed evidence still fails closed. SQLite maintenance, session
+fork, and session deletion also preserve active stage and pending-round
+evidence. Because version-1 receipts bind positional transcript and event
+material, SQLite pruning and transcript compaction conservatively retain every
+session that already contains a receipt.
+
 ### Session metadata updates preserve runtime-owned state
 
 `SessionStore.update_metadata(...)` and
