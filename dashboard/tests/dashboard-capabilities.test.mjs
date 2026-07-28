@@ -106,6 +106,25 @@ test("navigation availability follows readable operations rather than configurat
   )
 })
 
+test("a previous v4 response without a newer optional surface fails closed", () => {
+  const snapshot = capabilities()
+
+  assert.deepEqual(
+    resolveDashboardCapability(snapshot, {
+      kind: "surface",
+      surface: "workflow",
+    }),
+    operation(false, "unsupported"),
+  )
+  assert.equal(
+    dashboardCapabilityEnabled(snapshot, {
+      kind: "surface",
+      surface: "workflow",
+    }),
+    false,
+  )
+})
+
 test("direct optional routes share the same server-authoritative requirements as navigation", () => {
   const snapshot = capabilities()
 

@@ -1668,6 +1668,151 @@
       "title": "ApiSessionSummaryItem",
       "type": "object"
     },
+    "ApiSessionTopologyBranch": {
+      "additionalProperties": false,
+      "properties": {
+        "children": {
+          "items": {
+            "$ref": "#/components/schemas/ApiSessionTopologyNode"
+          },
+          "maxItems": 100,
+          "title": "Children",
+          "type": "array"
+        },
+        "has_more": {
+          "title": "Has More",
+          "type": "boolean"
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Next Cursor"
+        },
+        "parent_session_id": {
+          "maxLength": 1024,
+          "minLength": 1,
+          "title": "Parent Session Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "parent_session_id",
+        "children",
+        "next_cursor",
+        "has_more"
+      ],
+      "title": "ApiSessionTopologyBranch",
+      "type": "object"
+    },
+    "ApiSessionTopologyNode": {
+      "additionalProperties": false,
+      "properties": {
+        "agent_name": {
+          "title": "Agent Name",
+          "type": "string"
+        },
+        "causal_budget_id": {
+          "maxLength": 1024,
+          "minLength": 1,
+          "title": "Causal Budget Id",
+          "type": "string"
+        },
+        "created_at": {
+          "title": "Created At",
+          "type": "string"
+        },
+        "environment_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Environment Name"
+        },
+        "id": {
+          "maxLength": 1024,
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "last_activity_at": {
+          "title": "Last Activity At",
+          "type": "string"
+        },
+        "model": {
+          "title": "Model",
+          "type": "string"
+        },
+        "parent_session_id": {
+          "anyOf": [
+            {
+              "maxLength": 1024,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Parent Session Id"
+        },
+        "provider_name": {
+          "title": "Provider Name",
+          "type": "string"
+        },
+        "runtime_name": {
+          "title": "Runtime Name",
+          "type": "string"
+        },
+        "runtime_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Runtime Version"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        },
+        "updated_at": {
+          "title": "Updated At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "agent_name",
+        "provider_name",
+        "model",
+        "parent_session_id",
+        "causal_budget_id",
+        "runtime_name",
+        "runtime_version",
+        "environment_name",
+        "status",
+        "created_at",
+        "updated_at",
+        "last_activity_at"
+      ],
+      "title": "ApiSessionTopologyNode",
+      "type": "object"
+    },
     "ApiTaskDetail": {
       "additionalProperties": false,
       "properties": {
@@ -2936,6 +3081,16 @@
         },
         "usage": {
           "$ref": "#/components/schemas/OptionalSurfaceCapability"
+        },
+        "workflow": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/OptionalSurfaceCapability"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -5074,6 +5229,117 @@
         "usage"
       ],
       "title": "SessionSummaryResponse",
+      "type": "object"
+    },
+    "SessionTopologyRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "ancestor_depth_limit": {
+          "default": 32,
+          "maximum": 32.0,
+          "minimum": 1.0,
+          "title": "Ancestor Depth Limit",
+          "type": "integer"
+        },
+        "child_cursors": {
+          "additionalProperties": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxProperties": 50,
+          "propertyNames": {
+            "maxLength": 1024,
+            "minLength": 1
+          },
+          "title": "Child Cursors",
+          "type": "object"
+        },
+        "child_limit": {
+          "default": 25,
+          "maximum": 100.0,
+          "minimum": 1.0,
+          "title": "Child Limit",
+          "type": "integer"
+        },
+        "expanded_parent_ids": {
+          "items": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 50,
+          "title": "Expanded Parent Ids",
+          "type": "array"
+        },
+        "max_result_bytes": {
+          "default": 1048576,
+          "maximum": 4194304.0,
+          "minimum": 1024.0,
+          "title": "Max Result Bytes",
+          "type": "integer"
+        }
+      },
+      "title": "SessionTopologyRequest",
+      "type": "object"
+    },
+    "SessionTopologyResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "ancestors": {
+          "items": {
+            "$ref": "#/components/schemas/ApiSessionTopologyNode"
+          },
+          "maxItems": 32,
+          "title": "Ancestors",
+          "type": "array"
+        },
+        "branches": {
+          "items": {
+            "$ref": "#/components/schemas/ApiSessionTopologyBranch"
+          },
+          "maxItems": 50,
+          "title": "Branches",
+          "type": "array"
+        },
+        "expanded_parents": {
+          "items": {
+            "$ref": "#/components/schemas/ApiSessionTopologyNode"
+          },
+          "maxItems": 50,
+          "title": "Expanded Parents",
+          "type": "array"
+        },
+        "focus": {
+          "$ref": "#/components/schemas/ApiSessionTopologyNode"
+        },
+        "observed_at": {
+          "format": "date-time",
+          "title": "Observed At",
+          "type": "string"
+        },
+        "scope": {
+          "const": "session_focus",
+          "default": "session_focus",
+          "title": "Scope",
+          "type": "string"
+        },
+        "unique_node_count": {
+          "maximum": 500.0,
+          "minimum": 1.0,
+          "title": "Unique Node Count",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "observed_at",
+        "focus",
+        "ancestors",
+        "expanded_parents",
+        "branches",
+        "unique_node_count"
+      ],
+      "title": "SessionTopologyResponse",
       "type": "object"
     },
     "SessionTranscriptResponse": {
@@ -7979,10 +8245,24 @@
               }
             }
           },
+          "413": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
           "422": {
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
               }
             }
           }
@@ -9985,6 +10265,75 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/sessions/{session_id}/topology": {
+      "post": {
+        "operation_id": "get_session_topology_api_sessions__session_id__topology_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/SessionTopologyRequest"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/SessionTopologyResponse"
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
               }
             }
           }

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any, Literal, cast
+from typing import Annotated, Any, Literal, cast
 
 from pydantic import (
     BaseModel,
@@ -13,6 +13,7 @@ from pydantic import (
     Field,
     StrictBool,
     StrictInt,
+    StringConstraints,
     field_validator,
     model_validator,
 )
@@ -34,6 +35,13 @@ from cayu.runtime.costs import (
 )
 from cayu.runtime.sessions import (
     MAX_USAGE_ROLLUP_WINDOW,
+    SESSION_TOPOLOGY_DEFAULT_CHILD_LIMIT,
+    SESSION_TOPOLOGY_MAX_ANCESTOR_DEPTH,
+    SESSION_TOPOLOGY_MAX_CHILD_LIMIT,
+    SESSION_TOPOLOGY_MAX_CURSOR_BYTES,
+    SESSION_TOPOLOGY_MAX_EXPANDED_PARENTS,
+    SESSION_TOPOLOGY_MAX_IDENTIFIER_BYTES,
+    SESSION_TOPOLOGY_MAX_NODES,
     SessionAggregateFilter,
     SessionOperationalSnapshot,
 )
@@ -58,6 +66,24 @@ SSE_LAST_EVENT_ID_FORMAT = "session_id:event_id"
 MAX_SYSTEM_ARTIFACT_STORE_REGISTRATIONS = 64
 MAX_SYSTEM_DEPLOYMENT_NAME_CHARS = 128
 MAX_SYSTEM_PRICING_METADATA_CHARS = 256
+DEFAULT_SESSION_TOPOLOGY_RESULT_BYTES = 1024 * 1024
+MAX_SESSION_TOPOLOGY_RESULT_BYTES = 4 * 1024 * 1024
+MAX_SESSION_TOPOLOGY_REQUEST_BYTES = 256 * 1024
+
+SessionTopologyIdentifier = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=SESSION_TOPOLOGY_MAX_IDENTIFIER_BYTES,
+    ),
+]
+SessionTopologyCursor = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=SESSION_TOPOLOGY_MAX_CURSOR_BYTES,
+    ),
+]
 
 
 class ApiBaseModel(BaseModel):
@@ -574,6 +600,10 @@ class OptionalSurfaceCapability(ApiBaseModel):
 
 class ControlPlaneSurfaceCapabilities(ApiBaseModel):
     dashboard: OptionalSurfaceCapability
+    # Added within control-plane contract v4. Keep the field optional so a v4
+    # dashboard can fail closed against an earlier v4 server response instead
+    # of dereferencing a capability that did not exist yet.
+    workflow: OptionalSurfaceCapability | None = None
     tasks: OptionalSurfaceCapability
     reviewed_knowledge: OptionalSurfaceCapability
     artifacts: OptionalSurfaceCapability
@@ -697,6 +727,130 @@ class ListSessionsResponse(ApiBaseModel):
     sessions: list[ApiSessionBase]
     next_cursor: str | None
     total_count: StrictInt | None = Field(default=None, ge=0)
+
+
+class SessionTopologyRequest(ApiBaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    expanded_parent_ids: tuple[SessionTopologyIdentifier, ...] = Field(
+        default_factory=tuple,
+        max_length=SESSION_TOPOLOGY_MAX_EXPANDED_PARENTS,
+    )
+    child_cursors: dict[SessionTopologyIdentifier, SessionTopologyCursor] = Field(
+        default_factory=dict,
+        max_length=SESSION_TOPOLOGY_MAX_EXPANDED_PARENTS,
+    )
+    ancestor_depth_limit: StrictInt = Field(
+        default=SESSION_TOPOLOGY_MAX_ANCESTOR_DEPTH,
+        ge=1,
+        le=SESSION_TOPOLOGY_MAX_ANCESTOR_DEPTH,
+    )
+    child_limit: StrictInt = Field(
+        default=SESSION_TOPOLOGY_DEFAULT_CHILD_LIMIT,
+        ge=1,
+        le=SESSION_TOPOLOGY_MAX_CHILD_LIMIT,
+    )
+    max_result_bytes: StrictInt = Field(
+        default=DEFAULT_SESSION_TOPOLOGY_RESULT_BYTES,
+        ge=1024,
+        le=MAX_SESSION_TOPOLOGY_RESULT_BYTES,
+    )
+
+    @field_validator("expanded_parent_ids")
+    @classmethod
+    def validate_expanded_parent_id_bytes(
+        cls,
+        values: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        for value in values:
+            try:
+                encoded = value.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ValueError(
+                    "Session topology identifiers must contain portable Unicode text."
+                ) from exc
+            if len(encoded) > SESSION_TOPOLOGY_MAX_IDENTIFIER_BYTES:
+                raise ValueError("A session topology identifier exceeds its byte limit.")
+        return values
+
+    @field_validator("child_cursors")
+    @classmethod
+    def validate_child_cursor_bytes(cls, values: dict[str, str]) -> dict[str, str]:
+        for parent_id, cursor in values.items():
+            try:
+                encoded_parent_id = parent_id.encode("utf-8")
+                encoded_cursor = cursor.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ValueError(
+                    "Session topology identifiers and cursors must contain portable Unicode text."
+                ) from exc
+            if len(encoded_parent_id) > SESSION_TOPOLOGY_MAX_IDENTIFIER_BYTES:
+                raise ValueError("A session topology identifier exceeds its byte limit.")
+            if len(encoded_cursor) > SESSION_TOPOLOGY_MAX_CURSOR_BYTES:
+                raise ValueError("A session topology cursor exceeds its byte limit.")
+        return values
+
+
+class ApiSessionTopologyNode(ApiBaseModel):
+    id: SessionTopologyIdentifier
+    agent_name: str
+    provider_name: str
+    model: str
+    parent_session_id: SessionTopologyIdentifier | None
+    causal_budget_id: SessionTopologyIdentifier
+    runtime_name: str
+    runtime_version: str | None
+    environment_name: str | None
+    status: str
+    created_at: str
+    updated_at: str
+    last_activity_at: str
+
+
+class ApiSessionTopologyBranch(ApiBaseModel):
+    parent_session_id: SessionTopologyIdentifier
+    children: list[ApiSessionTopologyNode] = Field(max_length=SESSION_TOPOLOGY_MAX_CHILD_LIMIT)
+    next_cursor: SessionTopologyCursor | None
+    has_more: StrictBool
+
+
+class SessionTopologyResponse(ApiBaseModel):
+    scope: Literal["session_focus"] = "session_focus"
+    observed_at: datetime
+    focus: ApiSessionTopologyNode
+    ancestors: list[ApiSessionTopologyNode] = Field(max_length=SESSION_TOPOLOGY_MAX_ANCESTOR_DEPTH)
+    expanded_parents: list[ApiSessionTopologyNode] = Field(
+        max_length=SESSION_TOPOLOGY_MAX_EXPANDED_PARENTS
+    )
+    branches: list[ApiSessionTopologyBranch] = Field(
+        max_length=SESSION_TOPOLOGY_MAX_EXPANDED_PARENTS
+    )
+    unique_node_count: StrictInt = Field(ge=1, le=SESSION_TOPOLOGY_MAX_NODES)
+
+
+SESSION_TOPOLOGY_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
+    404: {
+        "description": "The focus session or one requested expanded parent does not exist.",
+        "model": ApiErrorResponse,
+    },
+    409: {
+        "description": (
+            "Durable lineage is inconsistent, or continuation authority cannot "
+            "cross the configured redaction boundary."
+        ),
+        "model": ApiErrorResponse,
+    },
+    413: {
+        "description": (
+            "The request bytes, ancestor depth, or serialized response exceed a safety bound."
+        ),
+        "model": ApiErrorResponse,
+    },
+    501: {
+        "description": "The configured session store does not implement topology reads.",
+        "model": ApiErrorResponse,
+    },
+}
 
 
 class ApiEventSummary(ApiBaseModel):
@@ -899,6 +1053,24 @@ class CausalBudgetSummaryResponse(ApiBaseModel):
     sessions: list[ApiSessionSummaryItem]
     usage: CausalBudgetUsageSummary
     cost: CausalBudgetCostSummary
+
+
+CAUSAL_BUDGET_SUMMARY_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
+    413: {
+        "description": (
+            "The causal-budget summary exceeds its session, event-count, event-input-byte, "
+            "or serialized response safety bound."
+        ),
+        "model": ApiErrorResponse,
+    },
+    501: {
+        "description": (
+            "The configured session store cannot enforce byte-bounded event reads "
+            "for this legacy summary."
+        ),
+        "model": ApiErrorResponse,
+    },
+}
 
 
 class ListSessionEventsResponse(ApiBaseModel):

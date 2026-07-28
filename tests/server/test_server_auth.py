@@ -243,6 +243,7 @@ def test_protected_server_can_expose_generated_docs_explicitly() -> None:
         ("POST", "/api/causal-budgets/budget-1/cost", _PRICING_BODY),
         ("POST", "/api/causal-budgets/budget-1/summary", _PRICING_BODY),
         ("GET", "/api/sessions/session-1/summary", None),
+        ("POST", "/api/sessions/session-1/topology", {}),
         ("GET", "/api/sessions/session-1/events", None),
         ("GET", "/api/sessions/session-1/transcript", None),
         ("GET", "/api/sessions/session-1", None),

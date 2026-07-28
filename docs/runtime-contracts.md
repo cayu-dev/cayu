@@ -466,6 +466,23 @@ Usage aggregation is an optional store capability. The base
 unusable usage surface. Custom stores that fully implement the bounded usage
 aggregate contract must explicitly set `supports_usage_aggregates = True`.
 
+Session topology is also optional. `query_session_topology(...)` returns one
+complete, depth-bounded ancestor path plus independently pageable direct-child
+branches for a bounded set of expanded parent ids. It is a compact identity
+projection: no labels, metadata, prompts, transcripts, event payloads, or model
+and tool output cross this boundary. Built-in stores resolve all requested
+branches in one batch-oriented snapshot and order children by `(created_at,
+id)`. Custom stores must leave `supports_session_topology = False` unless they
+implement the same snapshot, ordering, corruption detection, node ceiling, and
+parent-bound continuation contract.
+
+`query_events_bounded(...)` is a separate optional safety primitive for legacy
+server compositions that still require event records. Built-in stores measure
+the selected page inside the same database snapshot and reject it before
+deserializing payloads when its cumulative serialized input exceeds the caller's
+byte ceiling. The base store raises `NotImplementedError`; callers must not fall
+back to `query_events(...)` when a pre-hydration byte guarantee is required.
+
 Checkpoint field updates that can race with runtime finalization use `transform_checkpoint(...)`; transcript repair uses `append_transcript_messages_and_transform_checkpoint(...)` when it must update both atomically. Built-in stores execute those transforms while holding their session/checkpoint write boundary (a process-local lock for the in-memory store, an immediate write transaction for SQLite, and a row lock for PostgreSQL). Interruption-aware checkpoint replacements explicitly take the current `pending_session_interrupt` and `pending_interruption_cascade` values—including their absence—from that transactional snapshot, so an older runtime snapshot can neither erase active interruption state nor resurrect cleared state.
 
 ### Durable session steering
@@ -694,6 +711,14 @@ wrong type, table, access method, columns, expression, or predicate fails with a
 actionable migration error rather than being accepted or retried indefinitely.
 SQLite already carries the equivalent index.
 
+Schema revision 24 adds `(parent_session_id, created_at, id)` for bounded direct
+child traversal. It is additive and preserves revision 23's rolling-compatibility
+floor, but current SQLite and PostgreSQL session stores require the migration
+before advertising topology reads. PostgreSQL builds and validates the index
+concurrently; SQLite installs the equivalent index through the normal migration
+step. This prevents a Workflow expansion from becoming one full session-table
+scan per parent.
+
 `query_pending_actions(PendingActionQuery(...))` is a required `SessionStore`
 operation and the bounded control-plane read for tool approvals, user-input
 waits, and manual recovery. The latest
@@ -903,6 +928,24 @@ implementations can use `copy_session_user_metadata` before acquiring their writ
 lock and `replace_session_user_metadata` inside the locked transaction to enforce
 the same ownership boundary without validating a large request while holding the
 lock.
+
+`POST /api/sessions/{session_id}/topology` is the protected control-plane
+topology read. The path session is the focus; the body can expand at most 50
+parent ids and carries a separate opaque cursor for each branch. The server
+returns the complete ancestor path or fails when it exceeds 32 levels, contains
+a cycle anywhere among the loaded nodes, or references a missing durable parent.
+Each identifier is limited to 1,024 UTF-8 bytes, each cursor to 4,096 bytes, and
+the complete request body to 256 KiB before JSON validation. Invalid requests
+receive a sanitized error that never echoes their values. Each branch defaults
+to 25 children and accepts at most 100, the complete response retains at most
+500 distinct session nodes, and serialized output is capped at 4 MiB. Built-in
+stores use bounded per-parent index seeks, so a 25-child page does not rank or
+hydrate every matching child. A branch that is not complete always returns
+`has_more=true` and a parent-bound cursor. Successful and expected error
+responses are `private, no-store`. If redaction would alter an ID, parent edge,
+causal-budget ID, or cursor authority, the endpoint fails closed rather than
+returning duplicate or unusable graph identities. The endpoint never fetches
+event or transcript history.
 
 The optional server also exposes `GET /api/sessions/{session_id}/transcript`
 for paginated transcript inspection. It accepts `offset`, `limit`, and `role`
@@ -1688,7 +1731,14 @@ observability. It accepts the same pricing body as the causal cost endpoint and
 returns the included sessions, each session's derived outcome and event counts,
 the grouped usage summary, and the grouped cost summary. This endpoint is a
 composition of durable session/event data; it does not add another accounting or
-budget-enforcement path.
+budget-enforcement path. It is intended for small operator snapshots and fails
+with `413` rather than accumulating beyond 500 sessions, 10,000 events, or a
+4 MiB serialized response. Its event input also has an independent cumulative
+4 MiB ceiling enforced by the store before SQL payload deserialization. A custom
+store that cannot provide that pre-hydration guarantee receives `501`; the
+server does not silently fall back to an unbounded event read. Large workflows
+should use the bounded topology endpoint for relationships and the store-native
+usage rollup for accounting.
 
 Sessions also carry app-owned `labels`: stable key/value dimensions such as
 `organization`, `project`, `owner`, `workflow`, `customer`, or `environment`.
@@ -1824,7 +1874,8 @@ Python integers, while direct Python construction remains strict and does not
 accept string counters.
 
 The protected `GET /api/contract` response also carries the server-authoritative
-control-plane capability projection. It reports whether Tasks, reviewed
+control-plane capability projection. It reports whether Workflow topology,
+Tasks, reviewed
 Knowledge, registered artifact storage, usage aggregation, and dashboard pricing
 are available, with separate read and mutation availability and stable
 `not_configured` or `unsupported` reasons. Usage aggregation is reported

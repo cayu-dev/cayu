@@ -59,20 +59,23 @@ function CapabilityTables({ diagnostics }: { diagnostics: SystemDiagnostics }) {
               </tr>
             </thead>
             <tbody>
-              {Object.entries(diagnostics.capabilities.surfaces).map(([name, surface]) => (
-                <tr key={name} className="border-b border-border last:border-b-0">
-                  <td className="py-3 pr-3 font-medium">{displayName(name)}</td>
-                  <td className="py-3 pr-3">
-                    <Badge variant="outline">{surface.configured ? "Yes" : "No"}</Badge>
-                  </td>
-                  <td className="py-3 pr-3">
-                    <OperationBadge operation={surface.read} />
-                  </td>
-                  <td className="py-3">
-                    <OperationBadge operation={surface.mutate} />
-                  </td>
-                </tr>
-              ))}
+              {Object.entries(diagnostics.capabilities.surfaces).map(([name, surface]) => {
+                if (surface === null || surface === undefined) return null
+                return (
+                  <tr key={name} className="border-b border-border last:border-b-0">
+                    <td className="py-3 pr-3 font-medium">{displayName(name)}</td>
+                    <td className="py-3 pr-3">
+                      <Badge variant="outline">{surface.configured ? "Yes" : "No"}</Badge>
+                    </td>
+                    <td className="py-3 pr-3">
+                      <OperationBadge operation={surface.read} />
+                    </td>
+                    <td className="py-3">
+                      <OperationBadge operation={surface.mutate} />
+                    </td>
+                  </tr>
+                )
+              })}
             </tbody>
           </table>
         </div>

@@ -7,6 +7,7 @@ import base64
 import contextlib
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import UTC, datetime
 from math import isfinite
 from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 from unicodedata import category as unicode_category
@@ -14,7 +15,9 @@ from urllib.parse import quote
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
-from fastapi.responses import Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, Response
+from fastapi.routing import APIRoute
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -32,8 +35,10 @@ if TYPE_CHECKING:
 
 from cayu._exception_groups import exception_tree_contains
 from cayu._validation import (
+    JsonUtf8SizeCounter,
     copy_json_value,
     copy_label_map,
+    json_utf8_size_within_limit,
     require_clean_nonblank,
     require_durable_json_text,
     require_unicode_scalar_text,
@@ -81,6 +86,7 @@ from cayu.runtime.sessions import (
     EnqueueSessionMessageRequest,
     EventOrder,
     EventQuery,
+    EventQueryResultTooLarge,
     EventRecord,
     InterruptSessionRequest,
     LabelSelectorOperator,
@@ -98,9 +104,15 @@ from cayu.runtime.sessions import (
     SessionOutcome,
     SessionQuery,
     SessionStatus,
+    SessionTopologyCycle,
+    SessionTopologyDepthExceeded,
+    SessionTopologyNode,
+    SessionTopologyQuery,
+    SessionTopologyStoreResult,
     TranscriptQuery,
     UsageRollupQuery,
     decode_session_cursor,
+    decode_session_topology_cursor,
     event_summary_from_records,
     session_outcome_from_records,
 )
@@ -126,9 +138,12 @@ from cayu.server.contracts import (
     AGGREGATE_ENDPOINT_RESPONSES,
     ARTIFACT_CONTENT_ENDPOINT_RESPONSES,
     ARTIFACT_ENDPOINT_ERROR_RESPONSES,
+    CAUSAL_BUDGET_SUMMARY_ENDPOINT_RESPONSES,
+    MAX_SESSION_TOPOLOGY_REQUEST_BYTES,
     MAX_SYSTEM_ARTIFACT_STORE_REGISTRATIONS,
     PENDING_ACTION_ENDPOINT_RESPONSES,
     SERVER_API_PREFIX,
+    SESSION_TOPOLOGY_ENDPOINT_RESPONSES,
     STREAMING_ENDPOINT_RESPONSES,
     AgentsResponse,
     ApiReviewedKnowledgeEntry,
@@ -152,6 +167,8 @@ from cayu.server.contracts import (
     SessionsSummaryResponse,
     SessionStateResponse,
     SessionSummaryResponse,
+    SessionTopologyRequest,
+    SessionTopologyResponse,
     SessionTranscriptResponse,
     SystemDiagnosticsResponse,
     UsageBreakdownItem,
@@ -183,6 +200,78 @@ from cayu.storage import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _session_topology_error_response(status_code: int, detail: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={"detail": detail},
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
+class _BoundedSessionTopologyRoute(APIRoute):
+    """Bound and sanitize topology bodies before FastAPI exposes validation input."""
+
+    def get_route_handler(self):
+        route_handler = super().get_route_handler()
+
+        async def bounded_route_handler(request: Request) -> Response:
+            content_length = request.headers.get("content-length")
+            if content_length is not None:
+                try:
+                    declared_bytes = int(content_length)
+                except ValueError:
+                    return _session_topology_error_response(
+                        422,
+                        "Invalid session topology request.",
+                    )
+                if declared_bytes < 0:
+                    return _session_topology_error_response(
+                        422,
+                        "Invalid session topology request.",
+                    )
+                if declared_bytes > MAX_SESSION_TOPOLOGY_REQUEST_BYTES:
+                    return _session_topology_error_response(
+                        413,
+                        "Session topology request exceeds the server byte limit.",
+                    )
+
+            received_bytes = 0
+            original_receive = request.receive
+
+            async def bounded_receive():
+                nonlocal received_bytes
+                message = await original_receive()
+                if message["type"] == "http.request":
+                    received_bytes += len(message.get("body", b""))
+                    if received_bytes > MAX_SESSION_TOPOLOGY_REQUEST_BYTES:
+                        raise HTTPException(
+                            status_code=413,
+                            detail="Session topology request exceeds the server byte limit.",
+                        )
+                return message
+
+            bounded_request = Request(request.scope, receive=bounded_receive)
+            try:
+                response = await route_handler(bounded_request)
+            except RequestValidationError:
+                return _session_topology_error_response(
+                    422,
+                    "Invalid session topology request.",
+                )
+            except HTTPException as exc:
+                headers = dict(exc.headers or {})
+                headers["Cache-Control"] = "private, no-store"
+                raise HTTPException(
+                    status_code=exc.status_code,
+                    detail=exc.detail,
+                    headers=headers,
+                ) from exc
+            response.headers["Cache-Control"] = "private, no-store"
+            return response
+
+        return bounded_route_handler
 
 
 class _ObserverLifecycleEventSourceResponse(EventSourceResponse):
@@ -261,6 +350,10 @@ _ARTIFACT_UNSAFE_FILENAME_UNICODE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"
 _KNOWLEDGE_REVIEW_PREVIEW_CHARS = 1200
 _KNOWLEDGE_PENDING_DETAIL_MAX_CHUNKS = 50
 _KNOWLEDGE_PENDING_DETAIL_MAX_BYTES = 128_000
+_CAUSAL_BUDGET_SUMMARY_MAX_SESSIONS = 500
+_CAUSAL_BUDGET_SUMMARY_MAX_EVENTS = 10_000
+_CAUSAL_BUDGET_SUMMARY_MAX_EVENT_INPUT_BYTES = 4 * 1024 * 1024
+_CAUSAL_BUDGET_SUMMARY_MAX_RESULT_BYTES = 4 * 1024 * 1024
 _SERVER_INTERRUPTIBLE_SESSION_STATUSES = {
     SessionStatus.PENDING,
     SessionStatus.RUNNING,
@@ -1269,6 +1362,71 @@ def _serialize_session(cayu_app: Any, session: Session) -> dict[str, Any]:
     }
 
 
+def _serialize_session_topology_node(
+    cayu_app: Any,
+    node: SessionTopologyNode,
+) -> dict[str, Any]:
+    return _redact_control_plane_values(
+        cayu_app,
+        {
+            "id": node.id,
+            "agent_name": node.agent_name,
+            "provider_name": node.provider_name,
+            "model": node.model,
+            "parent_session_id": node.parent_session_id,
+            "causal_budget_id": node.causal_budget_id,
+            "runtime_name": node.runtime_name,
+            "runtime_version": node.runtime_version,
+            "environment_name": node.environment_name,
+            "status": node.status.value,
+            "created_at": node.created_at.isoformat(),
+            "updated_at": node.updated_at.isoformat(),
+            "last_activity_at": node.last_activity_at.isoformat(),
+        },
+        "session_topology.node",
+        preserve_string_fields={
+            "created_at",
+            "last_activity_at",
+            "status",
+            "updated_at",
+        },
+    )
+
+
+def _require_safe_session_topology_authority(
+    cayu_app: Any,
+    result: SessionTopologyStoreResult,
+) -> None:
+    """Fail closed when redaction would corrupt graph identity or linkage."""
+
+    nodes = (
+        result.focus,
+        *result.ancestors,
+        *result.expanded_parents,
+        *(child for branch in result.branches for child in branch.children),
+    )
+    structural_values: set[str] = set()
+    for node in nodes:
+        structural_values.add(node.id)
+        structural_values.add(node.causal_budget_id)
+        if node.parent_session_id is not None:
+            structural_values.add(node.parent_session_id)
+    structural_values.update(branch.parent_session_id for branch in result.branches)
+    for value in structural_values:
+        redacted = _redact_control_plane_json(
+            cayu_app,
+            value,
+            "session_topology.authority",
+        )
+        if type(redacted) is not str or redacted != value:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Session topology identity cannot cross the configured redaction boundary."
+                ),
+            )
+
+
 def _serialize_session_cursor(cayu_app: Any, cursor: str | None) -> str | None:
     """Return a pagination cursor only when its keyset authority is secret-free."""
 
@@ -1310,6 +1468,59 @@ def _serialize_session_cursor(cayu_app: Any, cursor: str | None) -> str | None:
                 "contains a configured workload secret."
             ),
         )
+    return cursor
+
+
+def _serialize_session_topology_cursor(
+    cayu_app: Any,
+    cursor: str | None,
+    *,
+    parent_session_id: str,
+) -> str | None:
+    """Project a parent-bound topology cursor only when its authority is safe."""
+
+    if cursor is None:
+        return None
+    redacted_cursor = _redact_control_plane_json(
+        cayu_app,
+        cursor,
+        "session_topology.cursor",
+    )
+    if type(redacted_cursor) is not str or redacted_cursor != cursor:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Session topology cannot continue because its cursor authority "
+                "contains a configured workload secret."
+            ),
+        )
+    try:
+        _, child_session_id = decode_session_topology_cursor(
+            cursor,
+            parent_session_id=parent_session_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="The session store returned an invalid topology cursor.",
+        ) from exc
+    for field_name, value in (
+        ("parent_session_id", parent_session_id),
+        ("child_session_id", child_session_id),
+    ):
+        redacted_value = _redact_control_plane_json(
+            cayu_app,
+            value,
+            f"session_topology.cursor.{field_name}",
+        )
+        if type(redacted_value) is not str or redacted_value != value:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Session topology cannot continue because its cursor authority "
+                    "contains a configured workload secret."
+                ),
+            )
     return cursor
 
 
@@ -2075,6 +2286,7 @@ def create_router(
         knowledge_configured=knowledge_store is not None,
         dashboard_pricing_configured=dashboard_pricing_configured,
         session_usage_aggregates_supported=session_store.supports_usage_aggregates,
+        session_topology_supported=session_store.supports_session_topology,
     )
     if dashboard_access_authenticated is None and dashboard_configured:
         dashboard_access_authenticated = auth is not None
@@ -3515,6 +3727,142 @@ def create_router(
             "total_count": result.total_count,
         }
 
+    async def get_session_topology(
+        session_id: NonBlankString,
+        body: SessionTopologyRequest,
+        response: Response,
+    ):
+        expanded_parent_ids = (
+            body.expanded_parent_ids if body.expanded_parent_ids else (str(session_id),)
+        )
+        for parent_id, cursor in body.child_cursors.items():
+            try:
+                decode_session_topology_cursor(
+                    cursor,
+                    parent_session_id=parent_id,
+                )
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Invalid session topology cursor.",
+                ) from exc
+        try:
+            topology_query = SessionTopologyQuery(
+                focus_session_id=str(session_id),
+                expanded_parent_ids=expanded_parent_ids,
+                child_cursors=body.child_cursors,
+                ancestor_depth_limit=body.ancestor_depth_limit,
+                child_limit=body.child_limit,
+            )
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=exc.errors(include_input=False),
+            ) from exc
+        observed_at = datetime.now(UTC)
+        try:
+            result = await session_store.query_session_topology(topology_query)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail="The focus session or an expanded parent was not found.",
+            ) from exc
+        except SessionTopologyDepthExceeded as exc:
+            raise HTTPException(
+                status_code=413,
+                detail=("The focus session's ancestry exceeds the requested ancestor_depth_limit."),
+            ) from exc
+        except SessionTopologyCycle as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="The focus session's durable ancestry contains a cycle.",
+            ) from exc
+        except NotImplementedError as exc:
+            raise HTTPException(
+                status_code=501,
+                detail="The configured session store does not support topology queries.",
+            ) from exc
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="The session store returned an inconsistent topology projection.",
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="The focus session's durable ancestry is inconsistent.",
+            ) from exc
+
+        _require_safe_session_topology_authority(cayu_app, result)
+        serialized_branches = []
+        for branch in result.branches:
+            next_cursor = _serialize_session_topology_cursor(
+                cayu_app,
+                branch.next_cursor,
+                parent_session_id=branch.parent_session_id,
+            )
+            serialized_branches.append(
+                {
+                    "parent_session_id": _redact_control_plane_values(
+                        cayu_app,
+                        {"parent_session_id": branch.parent_session_id},
+                        "session_topology.branch",
+                    )["parent_session_id"],
+                    "children": [
+                        _serialize_session_topology_node(cayu_app, child)
+                        for child in branch.children
+                    ],
+                    "next_cursor": next_cursor,
+                    "has_more": branch.has_more,
+                }
+            )
+
+        unique_node_ids = {
+            result.focus.id,
+            *(node.id for node in result.ancestors),
+            *(node.id for node in result.expanded_parents),
+            *(child.id for branch in result.branches for child in branch.children),
+        }
+        response_value = SessionTopologyResponse.model_validate(
+            {
+                "observed_at": observed_at,
+                "focus": _serialize_session_topology_node(cayu_app, result.focus),
+                "ancestors": [
+                    _serialize_session_topology_node(cayu_app, node) for node in result.ancestors
+                ],
+                "expanded_parents": [
+                    _serialize_session_topology_node(cayu_app, node)
+                    for node in result.expanded_parents
+                ],
+                "branches": serialized_branches,
+                "unique_node_count": len(unique_node_ids),
+            }
+        )
+        response_payload = response_value.model_dump(mode="json")
+        if not json_utf8_size_within_limit(
+            response_payload,
+            body.max_result_bytes,
+        ):
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "Session topology exceeds max_result_bytes. Request fewer "
+                    "expanded branches or a smaller child_limit."
+                ),
+            )
+        response.headers["Cache-Control"] = "private, no-store"
+        return response_payload
+
+    router.add_api_route(
+        "/sessions/{session_id}/topology",
+        get_session_topology,
+        methods=["POST"],
+        response_model=SessionTopologyResponse,
+        responses=SESSION_TOPOLOGY_ENDPOINT_RESPONSES,
+        dependencies=protected,
+        route_class_override=_BoundedSessionTopologyRoute,
+    )
+
     @router.post(
         "/sessions/summary",
         response_model=SessionsSummaryResponse,
@@ -3731,18 +4079,31 @@ def create_router(
     @router.post(
         "/causal-budgets/{causal_budget_id}/summary",
         response_model=CausalBudgetSummaryResponse,
+        responses=CAUSAL_BUDGET_SUMMARY_ENDPOINT_RESPONSES,
         dependencies=protected,
     )
     async def get_causal_budget_summary(
         causal_budget_id: NonBlankString,
         body: SessionCostBody,
     ):
-        sessions = await _list_all_causal_sessions(causal_budget_id)
+        sessions = await _list_all_causal_sessions(
+            causal_budget_id,
+            max_sessions=_CAUSAL_BUDGET_SUMMARY_MAX_SESSIONS,
+        )
         if not sessions:
             raise HTTPException(status_code=404, detail="Causal budget not found")
 
         session_ids = [session.id for session in sessions]
-        causal_event_records = await _query_all_causal_event_records(causal_budget_id)
+        causal_event_records = await _query_all_causal_event_records(
+            causal_budget_id,
+            max_events=_CAUSAL_BUDGET_SUMMARY_MAX_EVENTS,
+            max_bytes=_CAUSAL_BUDGET_SUMMARY_MAX_EVENT_INPUT_BYTES,
+        )
+        event_records_by_session_id: dict[str, list[EventRecord]] = {
+            session_id: [] for session_id in session_ids
+        }
+        for record in causal_event_records:
+            event_records_by_session_id.setdefault(record.event.session_id, []).append(record)
         usage_event_records = [
             record
             for record in causal_event_records
@@ -3774,9 +4135,7 @@ def create_router(
         )
         session_items = []
         for session in sessions:
-            session_event_records = [
-                record for record in causal_event_records if record.event.session_id == session.id
-            ]
+            session_event_records = event_records_by_session_id[session.id]
             outcome = session_outcome_from_records(
                 session,
                 session_event_records,
@@ -3801,13 +4160,25 @@ def create_router(
                 }
             )
 
-        return {
+        response_value = {
             "causal_budget_id": causal_budget_id,
             "session_count": len(sessions),
             "sessions": session_items,
             "usage": usage_summary.model_dump(),
             "cost": cost_summary.model_dump(mode="json"),
         }
+        if not json_utf8_size_within_limit(
+            response_value,
+            _CAUSAL_BUDGET_SUMMARY_MAX_RESULT_BYTES,
+        ):
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "Causal-budget summary exceeds max_result_bytes. Use the bounded "
+                    "session topology and store-native usage rollup for large workflows."
+                ),
+            )
+        return response_value
 
     @router.get(
         "/sessions/{session_id}/state",
@@ -3862,26 +4233,38 @@ def create_router(
             "usage": usage_summary.model_dump(),
         }
 
-    async def _list_all_causal_sessions(causal_budget_id: str) -> list[Session]:
+    async def _list_all_causal_sessions(
+        causal_budget_id: str,
+        *,
+        max_sessions: int,
+    ) -> list[Session]:
         sessions: list[Session] = []
-        offset = 0
+        cursor = None
         while True:
-            page = (
-                await session_store.list_sessions(
-                    SessionQuery(
-                        causal_budget_id=causal_budget_id,
-                        limit=1000,
-                        offset=offset,
-                        order_by=SessionOrder.CREATED_AT_ASC,
-                    )
+            remaining_with_sentinel = max_sessions + 1 - len(sessions)
+            result = await session_store.list_sessions(
+                SessionQuery(
+                    causal_budget_id=causal_budget_id,
+                    limit=min(1000, remaining_with_sentinel),
+                    cursor=cursor,
+                    order_by=SessionOrder.CREATED_AT_ASC,
                 )
-            ).sessions
+            )
+            page = result.sessions
             if not page:
                 return sessions
             sessions.extend(page)
-            if len(page) < 1000:
+            if len(sessions) > max_sessions:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"Causal-budget summary exceeds the {max_sessions}-session "
+                        "safety limit. Use the bounded session topology."
+                    ),
+                )
+            if result.next_cursor is None:
                 return sessions
-            offset += len(page)
+            cursor = result.next_cursor
 
     async def _query_all_session_event_records(session_ids: list[str]) -> list[EventRecord]:
         if not session_ids:
@@ -3903,21 +4286,77 @@ def create_router(
                 return records
             after_sequence = page[-1].sequence
 
-    async def _query_all_causal_event_records(causal_budget_id: str) -> list[EventRecord]:
+    async def _query_all_causal_event_records(
+        causal_budget_id: str,
+        *,
+        max_events: int,
+        max_bytes: int,
+    ) -> list[EventRecord]:
         records: list[EventRecord] = []
         after_sequence = None
+        remaining_bytes = max_bytes
         while True:
-            page = await session_store.query_events(
-                EventQuery(
-                    causal_budget_id=causal_budget_id,
-                    after_sequence=after_sequence,
-                    limit=5000,
+            if remaining_bytes <= 0:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"Causal-budget summary exceeds the {max_bytes}-byte "
+                        "event-input safety limit. Use the bounded session topology "
+                        "and store-native usage rollup."
+                    ),
                 )
-            )
+            remaining_with_sentinel = max_events + 1 - len(records)
+            try:
+                page = await session_store.query_events_bounded(
+                    EventQuery(
+                        causal_budget_id=causal_budget_id,
+                        after_sequence=after_sequence,
+                        limit=min(5000, remaining_with_sentinel),
+                    ),
+                    max_bytes=remaining_bytes,
+                )
+            except EventQueryResultTooLarge as exc:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"Causal-budget summary exceeds the {max_bytes}-byte "
+                        "event-input safety limit. Use the bounded session topology "
+                        "and store-native usage rollup."
+                    ),
+                ) from exc
+            except NotImplementedError as exc:
+                raise HTTPException(
+                    status_code=501,
+                    detail=(
+                        "The configured session store cannot enforce byte-bounded "
+                        "causal-budget event reads."
+                    ),
+                ) from exc
             if not page:
                 return records
+            size_counter = JsonUtf8SizeCounter(remaining_bytes)
+            for record in page:
+                if not size_counter.value(record):
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"Causal-budget summary exceeds the {max_bytes}-byte "
+                            "event-input safety limit. Use the bounded session "
+                            "topology and store-native usage rollup."
+                        ),
+                    )
+            remaining_bytes = size_counter.remaining
             records.extend(page)
-            if len(page) < 5000:
+            if len(records) > max_events:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"Causal-budget summary exceeds the {max_events}-event "
+                        "safety limit. Use the bounded session topology and "
+                        "store-native usage rollup."
+                    ),
+                )
+            if len(page) < min(5000, remaining_with_sentinel):
                 return records
             after_sequence = page[-1].sequence
 

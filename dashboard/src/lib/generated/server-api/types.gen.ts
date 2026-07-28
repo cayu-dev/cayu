@@ -889,6 +889,86 @@ export type ApiSessionSummaryItem = {
 };
 
 /**
+ * ApiSessionTopologyBranch
+ */
+export type ApiSessionTopologyBranch = {
+    /**
+     * Children
+     */
+    children: Array<ApiSessionTopologyNode>;
+    /**
+     * Has More
+     */
+    has_more: boolean;
+    /**
+     * Next Cursor
+     */
+    next_cursor: string | null;
+    /**
+     * Parent Session Id
+     */
+    parent_session_id: string;
+};
+
+/**
+ * ApiSessionTopologyNode
+ */
+export type ApiSessionTopologyNode = {
+    /**
+     * Agent Name
+     */
+    agent_name: string;
+    /**
+     * Causal Budget Id
+     */
+    causal_budget_id: string;
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Environment Name
+     */
+    environment_name: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Last Activity At
+     */
+    last_activity_at: string;
+    /**
+     * Model
+     */
+    model: string;
+    /**
+     * Parent Session Id
+     */
+    parent_session_id: string | null;
+    /**
+     * Provider Name
+     */
+    provider_name: string;
+    /**
+     * Runtime Name
+     */
+    runtime_name: string;
+    /**
+     * Runtime Version
+     */
+    runtime_version: string | null;
+    /**
+     * Status
+     */
+    status: string;
+    /**
+     * Updated At
+     */
+    updated_at: string;
+};
+
+/**
  * ApiTaskDetail
  */
 export type ApiTaskDetail = {
@@ -1552,6 +1632,7 @@ export type ControlPlaneSurfaceCapabilities = {
     reviewed_knowledge: OptionalSurfaceCapability;
     tasks: OptionalSurfaceCapability;
     usage: OptionalSurfaceCapability;
+    workflow?: OptionalSurfaceCapability | null;
 };
 
 /**
@@ -2679,6 +2760,65 @@ export type SessionSummaryResponse = {
     session: ApiSession;
     transcript: TranscriptSummary;
     usage: SessionUsageSummary;
+};
+
+/**
+ * SessionTopologyRequest
+ */
+export type SessionTopologyRequest = {
+    /**
+     * Ancestor Depth Limit
+     */
+    ancestor_depth_limit?: number;
+    /**
+     * Child Cursors
+     */
+    child_cursors?: {
+        [key: string]: string;
+    };
+    /**
+     * Child Limit
+     */
+    child_limit?: number;
+    /**
+     * Expanded Parent Ids
+     */
+    expanded_parent_ids?: Array<string>;
+    /**
+     * Max Result Bytes
+     */
+    max_result_bytes?: number;
+};
+
+/**
+ * SessionTopologyResponse
+ */
+export type SessionTopologyResponse = {
+    /**
+     * Ancestors
+     */
+    ancestors: Array<ApiSessionTopologyNode>;
+    /**
+     * Branches
+     */
+    branches: Array<ApiSessionTopologyBranch>;
+    /**
+     * Expanded Parents
+     */
+    expanded_parents: Array<ApiSessionTopologyNode>;
+    focus: ApiSessionTopologyNode;
+    /**
+     * Observed At
+     */
+    observed_at: string;
+    /**
+     * Scope
+     */
+    scope?: 'session_focus';
+    /**
+     * Unique Node Count
+     */
+    unique_node_count: number;
 };
 
 /**
@@ -4236,9 +4376,17 @@ export type GetCausalBudgetSummaryApiCausalBudgetsCausalBudgetIdSummaryPostData 
 
 export type GetCausalBudgetSummaryApiCausalBudgetsCausalBudgetIdSummaryPostErrors = {
     /**
+     * The causal-budget summary exceeds its session, event-count, event-input-byte, or serialized response safety bound.
+     */
+    413: ApiErrorResponse;
+    /**
      * Validation Error
      */
     422: HttpValidationError;
+    /**
+     * The configured session store cannot enforce byte-bounded event reads for this legacy summary.
+     */
+    501: ApiErrorResponse;
 };
 
 export type GetCausalBudgetSummaryApiCausalBudgetsCausalBudgetIdSummaryPostError = GetCausalBudgetSummaryApiCausalBudgetsCausalBudgetIdSummaryPostErrors[keyof GetCausalBudgetSummaryApiCausalBudgetsCausalBudgetIdSummaryPostErrors];
@@ -5312,6 +5460,52 @@ export type GetSessionSummaryApiSessionsSessionIdSummaryGetResponses = {
 };
 
 export type GetSessionSummaryApiSessionsSessionIdSummaryGetResponse = GetSessionSummaryApiSessionsSessionIdSummaryGetResponses[keyof GetSessionSummaryApiSessionsSessionIdSummaryGetResponses];
+
+export type GetSessionTopologyApiSessionsSessionIdTopologyPostData = {
+    body: SessionTopologyRequest;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: never;
+    url: '/api/sessions/{session_id}/topology';
+};
+
+export type GetSessionTopologyApiSessionsSessionIdTopologyPostErrors = {
+    /**
+     * The focus session or one requested expanded parent does not exist.
+     */
+    404: ApiErrorResponse;
+    /**
+     * Durable lineage is inconsistent, or continuation authority cannot cross the configured redaction boundary.
+     */
+    409: ApiErrorResponse;
+    /**
+     * The request bytes, ancestor depth, or serialized response exceed a safety bound.
+     */
+    413: ApiErrorResponse;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+    /**
+     * The configured session store does not implement topology reads.
+     */
+    501: ApiErrorResponse;
+};
+
+export type GetSessionTopologyApiSessionsSessionIdTopologyPostError = GetSessionTopologyApiSessionsSessionIdTopologyPostErrors[keyof GetSessionTopologyApiSessionsSessionIdTopologyPostErrors];
+
+export type GetSessionTopologyApiSessionsSessionIdTopologyPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: SessionTopologyResponse;
+};
+
+export type GetSessionTopologyApiSessionsSessionIdTopologyPostResponse = GetSessionTopologyApiSessionsSessionIdTopologyPostResponses[keyof GetSessionTopologyApiSessionsSessionIdTopologyPostResponses];
 
 export type GetSessionTranscriptApiSessionsSessionIdTranscriptGetData = {
     body?: never;

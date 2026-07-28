@@ -184,6 +184,11 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
             "read": {"enabled": True, "unavailable_reason": None},
             "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
         },
+        "workflow": {
+            "configured": True,
+            "read": {"enabled": True, "unavailable_reason": None},
+            "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
+        },
         "tasks": {
             "configured": False,
             "read": {"enabled": False, "unavailable_reason": "not_configured"},
@@ -589,6 +594,20 @@ def test_contract_rejects_an_invalid_session_store_capability_declaration() -> N
     with pytest.raises(
         TypeError,
         match="session_usage_aggregates_supported must be a bool",
+    ):
+        create_server(
+            CayuApp(session_store=InvalidCapabilityStore()),
+            config=ServerConfig.local_development(),
+        )
+
+
+def test_contract_rejects_an_invalid_session_topology_capability_declaration() -> None:
+    class InvalidCapabilityStore(InMemorySessionStore):
+        supports_session_topology = "yes"  # type: ignore[assignment]
+
+    with pytest.raises(
+        TypeError,
+        match="session_topology_supported must be a bool",
     ):
         create_server(
             CayuApp(session_store=InvalidCapabilityStore()),

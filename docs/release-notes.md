@@ -43,6 +43,30 @@ guard.
 
 ## v0.1.0 (unreleased)
 
+### Session topology reads are bounded and indexed
+
+The protected server now exposes a session-focused topology read for control
+planes. It returns a bounded ancestor path and batched, independently pageable
+direct-child branches without loading transcripts, event histories, arbitrary
+metadata, or output payloads. In-memory, SQLite, and PostgreSQL stores share the
+same stable ordering, cursor, cycle, and node-limit contract; custom stores opt
+in explicitly through `supports_session_topology`.
+
+Schema revision 24 adds the composite parent/creation/id traversal index. The
+revision is additive and keeps revision 23's compatibility floor, but current
+session stores require `cayu storage migrate` before topology is advertised.
+Built-in topology reads use bounded per-parent index seeks instead of ranking or
+scanning complete child sets. Requests have independent identifier, cursor, and
+256 KiB body ceilings; validation errors never echo rejected values, all
+expected responses are private/no-store, every loaded graph cycle is rejected,
+and structural identity fails closed if redaction would make it ambiguous.
+
+The existing all-in-one causal-budget summary also fails clearly when its fixed
+session, event-count, 4 MiB pre-hydration event-input, or response-size safety
+ceilings are exceeded. Custom stores must implement the optional byte-bounded
+event query primitive for that legacy summary; the server does not substitute
+an unsafe full-payload read.
+
 ### Usage and dashboard pricing advertise separate capabilities
 
 The control-plane contract now reports usage aggregation independently from the

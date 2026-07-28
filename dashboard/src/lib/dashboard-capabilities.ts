@@ -6,11 +6,14 @@ import type {
 } from "./generated/server-api"
 
 export type DashboardSurface = keyof ControlPlaneSurfaceCapabilities
-export type DashboardSurfaceOperation = keyof Pick<
-  ControlPlaneSurfaceCapabilities[DashboardSurface],
-  "read" | "mutate"
->
+type DashboardSurfaceCapability = NonNullable<ControlPlaneSurfaceCapabilities[DashboardSurface]>
+export type DashboardSurfaceOperation = keyof Pick<DashboardSurfaceCapability, "read" | "mutate">
 export type DashboardMutation = keyof ControlPlaneMutationCapabilities
+
+const UNSUPPORTED_OPTIONAL_SURFACE: CapabilityOperation = {
+  enabled: false,
+  unavailable_reason: "unsupported",
+}
 
 export type DashboardCapabilityRequirement =
   | {
@@ -39,7 +42,8 @@ export function resolveDashboardCapability(
   if (requirement.kind === "mutation") {
     return capabilities.mutations[requirement.mutation]
   }
-  return capabilities.surfaces[requirement.surface][requirement.operation ?? "read"]
+  const surface = capabilities.surfaces[requirement.surface]
+  return surface?.[requirement.operation ?? "read"] ?? UNSUPPORTED_OPTIONAL_SURFACE
 }
 
 export function dashboardCapabilityUnavailableText(operation: CapabilityOperation): string | null {

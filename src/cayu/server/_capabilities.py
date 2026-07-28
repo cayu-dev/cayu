@@ -28,6 +28,7 @@ class ControlPlaneCapabilitySnapshot:
     knowledge_configured: bool
     dashboard_pricing_configured: bool
     session_usage_aggregates_supported: bool
+    session_topology_supported: bool
 
     def project(
         self,
@@ -61,6 +62,11 @@ class ControlPlaneCapabilitySnapshot:
             surfaces=ControlPlaneSurfaceCapabilities(
                 dashboard=_optional_surface(
                     self.dashboard_configured,
+                    mutation_supported=False,
+                ),
+                workflow=_optional_surface(
+                    True,
+                    read_supported=self.session_topology_supported,
                     mutation_supported=False,
                 ),
                 tasks=_optional_surface(
@@ -104,6 +110,7 @@ def inspect_control_plane_capabilities(
     knowledge_configured: bool,
     dashboard_pricing_configured: bool,
     session_usage_aggregates_supported: bool,
+    session_topology_supported: bool,
 ) -> ControlPlaneCapabilitySnapshot:
     """Capture fixed capability inputs once, without probing external services."""
 
@@ -113,6 +120,7 @@ def inspect_control_plane_capabilities(
         ("knowledge_configured", knowledge_configured),
         ("dashboard_pricing_configured", dashboard_pricing_configured),
         ("session_usage_aggregates_supported", session_usage_aggregates_supported),
+        ("session_topology_supported", session_topology_supported),
     ):
         if type(value) is not bool:
             raise TypeError(f"{field_name} must be a bool.")
@@ -126,6 +134,7 @@ def inspect_control_plane_capabilities(
         knowledge_configured=knowledge_configured,
         dashboard_pricing_configured=dashboard_pricing_configured,
         session_usage_aggregates_supported=session_usage_aggregates_supported,
+        session_topology_supported=session_topology_supported,
     )
 
 
